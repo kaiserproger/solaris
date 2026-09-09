@@ -51,12 +51,9 @@ port = 8080
 # Optional external plugin root. Each child directory contains plugin.toml and
 # strict Luau source in main.lua.
 directory = "plugins"
-# Server-embedded plugins are disabled unless explicitly listed here. Available:
-# basic-economy, colony-villager-scaffold, geological-mines, land-claims,
-# online-roster, settlement-prototype.
-bundled = []
-# Production deployments should set strict = true and list every external and
-# bundled plugin id exactly. Strict mode rejects malformed packages, stray files,
+# Deploy selected packages from the sibling solaris-default-plugins repository.
+# Production deployments should set strict = true and list every plugin id
+# exactly. Strict mode rejects malformed packages, stray files,
 # missing/unexpected ids, and plugins that fail host startup.
 strict = false
 expected = []
@@ -88,11 +85,8 @@ friendly_spawn_interval_ticks = 400
 # Natural hostile-mob attempts: 20 ticks = once per second. Set to 0 to
 # disable only hostile natural spawning.
 hostile_spawn_interval_ticks = 20
-# Population ceilings. Friendly covers land animals; aquatic and hostile are
-# counted independently. Eligibility checks still apply before these caps.
-friendly_spawn_cap = 32
-aquatic_spawn_cap = 20
-hostile_spawn_cap = 70
+# No population ceilings. Frequency above controls attempts; chunk budgets below
+# bound work per attempt, not the total number of living entities.
 # Chunks sampled per due attempt. Friendly sampling is intentionally broader
 # than hostile sampling so ordinary fauna fills in without multiplying the
 # once-per-second hostile workload.

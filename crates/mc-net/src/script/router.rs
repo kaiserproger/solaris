@@ -119,6 +119,7 @@ impl ScriptRouter {
             }
             ScriptCommand::SpawnEntity { .. }
             | ScriptCommand::DamageEntity { .. }
+            | ScriptCommand::SendCustomPayload { .. }
             | ScriptCommand::PluginStorageGet { .. }
             | ScriptCommand::PluginStorageCompareAndSwap { .. }
             | ScriptCommand::PluginStorageDelete { .. }
@@ -132,6 +133,7 @@ impl ScriptRouter {
             | ScriptCommand::RemoveZone { .. }
             | ScriptCommand::RequestVillagerBinding { .. }
             | ScriptCommand::SetVillagerGoal { .. }
+            | ScriptCommand::ReleaseVillagerBinding { .. }
             | ScriptCommand::TeleportPlayer { .. }
             | ScriptCommand::SetWorldTime { .. }
             | ScriptCommand::SetWorldBlock { .. }
@@ -178,6 +180,31 @@ impl ScriptRouter {
                 disconnect(context.sessions, player_id.value(), reason.clone());
                 ScriptRouterExit::Continue
             }
+            ScriptCommand::SendCustomPayload { .. } => {
+                let (_, player_id, channel, payload) = match admitted.into_send_custom_payload() {
+                    Ok(command) => command,
+                    Err(error) => {
+                        debug!(?error, "script custom payload extraction rejected");
+                        return ScriptRouterExit::Continue;
+                    }
+                };
+                match mc_protocol::codec::Identifier::parse(&channel) {
+                    Ok(channel) => {
+                        if !context.sessions.send_custom_payload(
+                            player_id.value(),
+                            channel,
+                            payload,
+                        ) {
+                            debug!(
+                                player_id = player_id.value(),
+                                "script custom payload targeted unknown player"
+                            );
+                        }
+                    }
+                    Err(error) => debug!(?error, "script custom payload channel rejected"),
+                }
+                ScriptRouterExit::Continue
+            }
             ScriptCommand::SpawnEntity { .. } => {
                 self.route_entity_spawn_admitted(admitted, context.config, context.simulation)
                     .await
@@ -192,12 +219,21 @@ impl ScriptRouter {
                 }
                 ScriptRouterExit::Continue
             }
-            ScriptCommand::OpenClientScreen { .. } => {
-                if let Err(error) = context.sessions.route_script_client_screen_command(
+            ScriptCommand::PresentClientUi { .. } => {
+                if let Err(error) = context.sessions.route_script_client_ui_command(
                     admitted,
                     context.config.loader_manifest.as_deref(),
                 ) {
                     debug!(?error, "admitted client screen command rejected");
+                }
+                ScriptRouterExit::Continue
+            }
+            ScriptCommand::ClientSound { .. } => {
+                if let Err(error) = context.sessions.route_script_client_sound_command(
+                    admitted,
+                    context.config.loader_manifest.as_deref(),
+                ) {
+                    debug!(?error, "admitted client sound command rejected");
                 }
                 ScriptRouterExit::Continue
             }
@@ -234,7 +270,8 @@ impl ScriptRouter {
                 ScriptRouterExit::Continue
             }
             ScriptCommand::RequestVillagerBinding { .. }
-            | ScriptCommand::SetVillagerGoal { .. } => {
+            | ScriptCommand::SetVillagerGoal { .. }
+            | ScriptCommand::ReleaseVillagerBinding { .. } => {
                 self.route_villager_admitted(admitted, context.sessions)
                     .await
             }
@@ -551,6 +588,11 @@ impl ScriptRouter {
             }
             ScriptCommand::SetVillagerGoal { .. } => {
                 self.villagers.route_goal_admitted(admitted, sessions).await
+            }
+            ScriptCommand::ReleaseVillagerBinding { .. } => {
+                self.villagers
+                    .route_release_admitted(admitted, sessions)
+                    .await
             }
             _ => Err(VillagerAdapterError::WrongCommand),
         };

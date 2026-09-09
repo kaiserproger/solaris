@@ -51,6 +51,18 @@ effective configuration as JSON, and exits without binding a listener. Review
 `operator_warnings`, `effective_autoscale`, and `discovered_plugins` before
 serving.
 
+For the exact locked release workspace build that release gates use, run it
+through the harness (never hand-roll the flags):
+
+```sh
+python3 -m tools.harness run build --release
+```
+
+That is `cargo build --locked --release --workspace`. Full harness
+interaction — profiles, preparation versus execution, credentials, artifact
+lookup, and current limits — is documented in
+[`docs/AGENT_TOOLING.md`](docs/AGENT_TOOLING.md#validation-harness).
+
 ## Network address and port
 
 The listen address and Minecraft port are ordinary, existing configuration
@@ -89,9 +101,9 @@ server to an untrusted network. Detailed examples are in
   It adapts bounded view distance and chunk work budgets to runtime pressure;
   `--check` prints the normalized limits and policy.
 - **Plugins:** external Luau packages are discovered below
-  `[plugins].directory` (normally `plugins/`). Bundled examples are disabled
-  unless named in `[plugins].bundled`. Use strict deployment and an exact
-  `expected` list for a controlled server.
+  `[plugins].directory` (normally `plugins/`). Deploy selected packages from
+  the sibling `solaris-default-plugins` repository. Use strict deployment and
+  an exact `expected` list for a controlled server.
 - **Vanilla data:** required baseline data is embedded. Setting
   `[data].vanilla_data_dir` opts into an authoritative extracted sidecar, which
   must be complete and exactly match 26.1.2.
@@ -110,7 +122,7 @@ requested permissions.
 
 - Operator and author guide: [`docs/PLUGINS.md`](docs/PLUGINS.md)
 - Fabric/NeoForge/Forge client installation: [`docs/SOLARIS_LOADER.md`](docs/SOLARIS_LOADER.md)
-- Inspectable examples: [`examples/plugins/`](examples/plugins/)
+- Inspectable packages: [`solaris-default-plugins`](https://github.com/kaiserproger/solaris-default-plugins)
 
 Solaris Loader is not needed for a server whose selected plugins are all
 `server_only`. `solaris --check --config server.toml` reports each discovered
@@ -122,9 +134,23 @@ and artifact size.
 Ordinary survival, persistence, multiplayer, entities, trading, and plugins are
 implemented far enough for active field testing, not full vanilla parity. Rare
 redstone/vehicle behavior, species-specific behavior, broad production
-performance envelopes, and parts of village behavior remain incomplete. The
-latest field test also identified movement/collision and item-pickup issues
-tracked as alpha-3 blockers.
+performance envelopes, and parts of village behavior remain incomplete.
+
+Known honest limits as of 2026-09-06: the full twenty-minute playable survival
+loop is **blocked** after natural spruce pickup/crafting because the scenario
+found no dry crafting-table placement target. This is not proof that survival
+works on other terrain. Stop tuning one fixed seed: owner field testing comes
+first, followed by varied-seed graphical exploration with seeds recorded for
+reproduction. The frozen load matrix remains 20 PASS / 22 FAIL with no owner
+terrain `ACCEPT`; the full core redesign is incomplete.
+
+The local field-test archive was built and its isolated startup was verified:
+`.analysis/releases/v0.0.3-alpha.1/solaris-x86_64-unknown-linux-gnu.tar.gz`.
+SHA-256: `925a825b709e5e44d8ad17957d741e3751ed955dba3e510ee4baa8ee78ed6b36`.
+It is frozen before the repository split, not published and not a full-survival
+acceptance. Extract it, run `./solaris --config example.toml`, and connect a
+Minecraft Java 26.1.2 client to `127.0.0.1:25565`. Choose `[data].seed` before
+first startup; use a new world directory to test another seed.
 
 Do not assume an existing Solaris world will remain compatible with a newer
 alpha. Solaris can read supported vanilla Anvil data, but unversioned imports
@@ -133,17 +159,22 @@ server replacement.
 
 ## Test
 
-The full repository gates are:
+Run the gates through the harness from the repository root so every run leaves
+a receipt under `.analysis/validation/`:
 
 ```sh
-cargo run -p xtask -- code-health
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
+python3 -m tools.harness list
+python3 -m tools.harness run correctness
+python3 -m tools.harness run inventory
+python3 -m tools.harness run playable --check   # preparation only, never a pass
 ```
 
-Debug builds are the normal development loop. Release and real-client gates are
-run only for their documented release/checkpoint scopes.
+`correctness` runs the four Rust L2 gates (formatter, strict workspace Clippy,
+code-health, workspace/all-target tests). Debug builds are the normal
+development loop. Release and real-client gates run only for their documented
+release/checkpoint scopes; see
+[`docs/AGENT_TOOLING.md`](docs/AGENT_TOOLING.md#validation-harness) before
+launching a graphical or twenty-minute profile.
 
 ## More documentation
 
@@ -157,12 +188,26 @@ run only for their documented release/checkpoint scopes.
 
 ```text
 crates/                              Rust workspace
-client-mod/solaris-client-agent/     Loader adapters and real-client tooling
-examples/plugins/                    Luau plugin examples
+../solaris-loader/                   Independent Loader/real-client Gradle repo
+../solaris-default-plugins/          Independent Luau package repo
 examples/loader-live-gate/           Loader-required integration fixture
 docs/                                contracts, guides, ADRs, and evidence
 tools/                               extraction and validation tools
 ```
+
+Core production builds need neither sibling repository. Java/client validation
+needs `../solaris-loader` (override with `SOLARIS_LOADER_ROOT`); integration tests
+of first-party plugin behavior need `../solaris-default-plugins`. Clone the
+companion repositories next to this checkout:
+
+```sh
+git clone https://github.com/kaiserproger/solaris-loader.git ../solaris-loader
+git clone https://github.com/kaiserproger/solaris-default-plugins.git ../solaris-default-plugins
+```
+
+Each repository owns its sources, development instructions and Git history.
+Hosted CI checks out this same sibling layout. Server tags and commit IDs do
+not identify Loader or plugin revisions; use compatible revisions together.
 
 ## License
 

@@ -30,6 +30,15 @@ async fn embedded_short_grass_break_delivers_wheat_seeds_over_wire() {
 
     let (mut client, _) = connect_to_play(addr, "P24WheatSeeds").await;
     drain_until_chunk(&mut client, (0, 0)).await;
+    move_without_position_correction(
+        &mut client,
+        f64::from(target.0) + 0.5,
+        f64::from(target.1),
+        f64::from(target.2) + 0.5,
+        0.0,
+        0.0,
+    )
+    .await;
 
     let packed = pack_block_pos(target.0, target.1, target.2);
     client

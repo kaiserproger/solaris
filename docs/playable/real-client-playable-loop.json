@@ -22,13 +22,13 @@
     "automation-driver.txt"
   ],
   "automation_runner": {
-    "script": "tools/run-playable-client-gate.sh",
-    "delegates_to": "tools/run-real-client-regression.sh",
+    "script": "python3 -m tools.harness run playable",
+    "delegates_to": "tools/harness/backends/regression.sh",
     "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
     "client_adapter_source": "auto-gradle-runclient",
     "server_config_env": "SOLARIS_REAL_CLIENT_SERVER_CONFIG",
     "server_config_value": "playable.toml",
-    "agent_driver": "tools/real-client-agent-driver.py",
+    "agent_driver": "tools/harness/backends/driver.py",
     "agent_bridge_url_env": "SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL",
     "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
     "agent_jar_env": "SOLARIS_REAL_CLIENT_AGENT_JAR",

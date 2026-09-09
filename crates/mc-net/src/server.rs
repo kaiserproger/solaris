@@ -19,11 +19,6 @@ use mc_data::items::ItemRegistry;
 use mc_data::loot::LootTables;
 use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
-use mc_extension::{
-    CustomPayloadPolicy, CustomPayloadRejection, ExtensionBoundary, InboundEvent,
-    OutboundCommand as ExtensionOutboundCommand, PlayerId, ProtocolPhase, QueueError,
-    QueueRecvError,
-};
 use mc_physics::{
     BlockCollisionBox, BlockCollisionHeight, BlockMaterial, BlockMaterialIds, BlockSampler,
     EntityBody, PhysicsConfig,
@@ -58,6 +53,9 @@ use crate::{login, play};
 
 mod entity_ticker;
 mod natural_spawn_ticker;
+mod runtime_control;
+
+use runtime_control::apply_runtime_control_decision;
 
 static CONSOLE_LINES: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 type PhysicsMaterialCache = HashMap<
@@ -453,7 +451,6 @@ pub struct BoundServer {
     sessions: Arc<play::SessionRegistry>,
     simulation: play::SimulationHandle,
     simulation_owner: play::SimulationOwner,
-    extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
     script_storage: Option<PluginStorageHandle>,
     script_zones: Option<PluginZoneAdapter>,
@@ -808,85 +805,6 @@ impl RuntimeTelemetryHandle {
 }
 
 #[derive(Clone)]
-pub(crate) struct ExtensionEventSink {
-    boundary: ExtensionBoundary,
-    custom_payload_policy: CustomPayloadPolicy,
-}
-
-impl ExtensionEventSink {
-    fn new(boundary: ExtensionBoundary, custom_payload_policy: CustomPayloadPolicy) -> Self {
-        Self {
-            boundary,
-            custom_payload_policy,
-        }
-    }
-
-    pub(crate) fn enqueue_event(&self, event: InboundEvent) {
-        match self.boundary.try_enqueue_event(event) {
-            Ok(()) => {}
-            Err(QueueError::Full(_)) => {
-                warn!("extension event queue full; dropping event");
-            }
-            Err(QueueError::Closed(_)) => {
-                warn!("extension event queue closed; dropping event");
-            }
-            Err(_) => {
-                warn!("extension event queue rejected event");
-            }
-        }
-    }
-
-    pub(crate) fn enqueue_custom_payload(
-        &self,
-        player_id: PlayerId,
-        phase: ProtocolPhase,
-        channel: &str,
-        payload: &[u8],
-    ) {
-        match self
-            .custom_payload_policy
-            .build_event(player_id, phase, channel, payload)
-        {
-            Ok(event) => self.enqueue_event(InboundEvent::CustomPayload(event)),
-            Err(CustomPayloadRejection::UnknownChannel { channel }) => {
-                debug!(channel = %channel, phase = ?phase, "extension custom payload denied by policy");
-            }
-            Err(CustomPayloadRejection::PayloadTooLarge { len, max }) => {
-                warn!(
-                    channel,
-                    phase = ?phase,
-                    len,
-                    max,
-                    "extension custom payload denied by size policy"
-                );
-            }
-            Err(error) => {
-                debug!(
-                    channel,
-                    phase = ?phase,
-                    payload_len = payload.len(),
-                    ?error,
-                    "extension custom payload denied by policy"
-                );
-            }
-        }
-    }
-
-    pub(crate) fn custom_payload_policy(&self) -> &CustomPayloadPolicy {
-        &self.custom_payload_policy
-    }
-
-    #[cfg(test)]
-    pub(crate) fn try_recv_command(&self) -> Result<ExtensionOutboundCommand, QueueRecvError> {
-        self.boundary.try_recv_command()
-    }
-
-    pub(crate) async fn recv_command(&self) -> Result<ExtensionOutboundCommand, QueueRecvError> {
-        self.boundary.recv_command().await
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct ScriptEventSink {
     boundary: ScriptBoundary,
 }
@@ -894,6 +812,25 @@ pub(crate) struct ScriptEventSink {
 impl ScriptEventSink {
     pub(crate) fn new(boundary: ScriptBoundary) -> Self {
         Self { boundary }
+    }
+
+    pub(crate) fn boundary(&self) -> &ScriptBoundary {
+        &self.boundary
+    }
+
+    pub(crate) fn enqueue_custom_payload(
+        &self,
+        player_id: mc_script::ScriptPlayerId,
+        phase: mc_script::ScriptProtocolPhase,
+        channel: &str,
+        payload: Vec<u8>,
+    ) {
+        if let Err(error) = self
+            .boundary
+            .try_enqueue_custom_payload(player_id, phase, channel, payload)
+        {
+            debug!(channel, ?phase, ?error, "script custom payload rejected");
+        }
     }
 
     pub(crate) fn try_enqueue_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
@@ -1041,35 +978,26 @@ struct ScriptCommitWorkers {
 }
 
 async fn forward_committed_script_events(
-    mut events: play::ScriptCommitEventReceiver,
+    mut events: mc_script::ScriptCommitEventReceiver,
     scripts: ScriptEventSink,
 ) -> Result<(), ScriptCommitForwardError> {
-    while let Some(envelope) = events.recv().await {
-        match envelope.delivery {
-            play::ScriptCommitDelivery::Required => {
-                match tokio::time::timeout(
-                    SCRIPT_COMMIT_FORWARD_TIMEOUT,
-                    scripts.enqueue_required_event(envelope.event),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        events.report_required_failure();
-                        return Err(ScriptCommitForwardError::Queue(error));
-                    }
-                    Err(_) => {
-                        events.report_required_failure();
-                        return Err(ScriptCommitForwardError::RequiredTimeout {
-                            timeout: SCRIPT_COMMIT_FORWARD_TIMEOUT,
-                        });
-                    }
-                }
+    while let Some(event) = events.recv().await {
+        match tokio::time::timeout(
+            SCRIPT_COMMIT_FORWARD_TIMEOUT,
+            scripts.enqueue_required_event(event),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                events.report_required_failure();
+                return Err(ScriptCommitForwardError::Queue(error));
             }
-            play::ScriptCommitDelivery::BestEffort => {
-                if scripts.try_enqueue_event(envelope.event).is_err() {
-                    events.record_best_effort_sink_drop();
-                }
+            Err(_) => {
+                events.report_required_failure();
+                return Err(ScriptCommitForwardError::RequiredTimeout {
+                    timeout: SCRIPT_COMMIT_FORWARD_TIMEOUT,
+                });
             }
         }
     }
@@ -1077,23 +1005,15 @@ async fn forward_committed_script_events(
 }
 
 async fn watch_script_commit_event_failure(
-    mut failure: tokio::sync::watch::Receiver<bool>,
+    monitor: Arc<mc_script::ScriptCommitEventMonitor>,
     shutdown: ShutdownHandle,
 ) {
-    loop {
-        if *failure.borrow_and_update() {
+    tokio::select! {
+        () = monitor.wait_for_failure() => {
             warn!("required committed script event delivery failed; requesting shutdown");
             shutdown.request();
-            return;
         }
-        tokio::select! {
-            changed = failure.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-            }
-            () = shutdown.notified() => return,
-        }
+        () = shutdown.notified() => {}
     }
 }
 
@@ -1109,7 +1029,7 @@ fn spawn_script_commit_workers(
         };
     };
     let events = sessions.install_script_commit_event_outbox();
-    let failure = sessions.subscribe_script_commit_event_failure();
+    let failure = sessions.script_commit_event_monitor();
     let failure_shutdown = shutdown.clone();
     ScriptCommitWorkers {
         worker: Some(tokio::spawn(forward_committed_script_events(
@@ -1579,11 +1499,19 @@ impl BoundServer {
     /// stops admission and enters the coordinated drain path.
     pub async fn serve(self) -> std::io::Result<()> {
         let prewarmed_entity_pathing_states = play::prewarm_entity_pathing_tables();
+        let physics_warm_started = Instant::now();
+        let prewarmed_physics_states = mc_entity::warm_physics_caches();
+        let physics_warm_us = physics_warm_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         info!(
             addr = %self.local_addr()?,
             registries = self.config.data.registry_count(),
             entries = self.config.data.entry_count(),
             pathing_states = prewarmed_entity_pathing_states.get(),
+            physics_states = prewarmed_physics_states.get(),
+            physics_warm_us,
             "Solaris is listening"
         );
         let config = self.config;
@@ -1592,7 +1520,7 @@ impl BoundServer {
         let connection_world = self.connection_world;
         let chunk_pipeline_resources = self.chunk_pipeline_resources;
         let runtime_control = self.runtime_control;
-        let mut runtime_control_signals = runtime_control
+        let runtime_control_signals = runtime_control
             .as_ref()
             .and_then(RuntimeControlHandle::take_signal_receiver);
         let runtime_tick_metrics = self.runtime_tick_metrics;
@@ -1600,7 +1528,6 @@ impl BoundServer {
         let mut entity_owner_failure = sessions.subscribe_entity_owner_failure();
         let simulation = self.simulation;
         let simulation_owner = self.simulation_owner;
-        let extension = self.extension;
         let scripts = self.scripts;
         let script_storage = self.script_storage;
         let script_zones = self.script_zones;
@@ -1628,25 +1555,17 @@ impl BoundServer {
         let entity_pathing_materials = entity_world_read
             .as_ref()
             .map(|_| cached_material_ids(&config));
-        let entity_sessions = Arc::clone(&sessions);
-        let entity_world_journal_failure = entity_sessions.subscribe_world_chunk_journal_failure();
-        let entity_config = Arc::clone(&config);
-        let entity_runtime_control = runtime_control.clone();
-        let entity_runtime_control_signals = runtime_control_signals.take();
-        let entity_tick_metrics = runtime_tick_metrics.clone();
-        let entity_chunk_pipeline_resources = chunk_pipeline_resources.clone();
-        let entity_scripts = scripts.clone();
-        let entity_script_zones = script_zones.clone();
+        let entity_world_journal_failure = sessions.subscribe_world_chunk_journal_failure();
         let (periodic_save_requests, periodic_save_worker) = spawn_periodic_save_coordinator(
             entity_world_root.is_some(),
-            &entity_config,
-            &entity_sessions,
+            &config,
+            &sessions,
             &simulation,
             &shutdown,
         );
-        install_dirty_high_water_notifier(&entity_config, periodic_save_requests.as_ref()).await;
+        install_dirty_high_water_notifier(&config, periodic_save_requests.as_ref()).await;
         if let Some(requests) = periodic_save_requests.as_ref() {
-            enqueue_startup_dirty_flush(&config, requests).await;
+            enqueue_startup_checkpoint(&config, requests).await;
         }
         let connection_services = ConnectionServices {
             config: Arc::clone(&config),
@@ -1658,7 +1577,6 @@ impl BoundServer {
             dirty_flush: periodic_save_requests.clone(),
             runtime_control: runtime_control.clone(),
             simulation: simulation.clone(),
-            extension: extension.clone(),
             scripts: scripts.clone(),
             script_zones: script_zones.clone(),
         };
@@ -1669,19 +1587,19 @@ impl BoundServer {
                 entity_world_journal_failure,
                 entity_shutdown_requested,
                 simulation_owner,
-                entity_config,
-                entity_sessions,
-                entity_chunk_pipeline_resources,
+                entity_config: Arc::clone(&config),
+                entity_sessions: Arc::clone(&sessions),
+                entity_chunk_pipeline_resources: chunk_pipeline_resources.clone(),
                 entity_world_read,
                 entity_world_mutation,
                 entity_scheduled_ticks,
                 periodic_save_requests: periodic_save_requests.clone(),
-                entity_runtime_control,
-                entity_runtime_control_signals,
-                entity_tick_metrics,
+                entity_runtime_control: runtime_control.clone(),
+                entity_runtime_control_signals: runtime_control_signals,
+                entity_tick_metrics: runtime_tick_metrics,
                 entity_pathing_materials,
-                entity_scripts,
-                entity_script_zones,
+                entity_scripts: scripts.clone(),
+                entity_script_zones: script_zones.clone(),
             },
         ));
         let RuntimeCommandTasks {
@@ -1693,7 +1611,6 @@ impl BoundServer {
             runtime_control: runtime_control.clone(),
             simulation: simulation.clone(),
             chunk_pipeline_resources: chunk_pipeline_resources.clone(),
-            extension: extension.clone(),
             scripts: scripts.clone(),
             script_storage,
             script_zones: script_zones.clone(),
@@ -1788,14 +1705,11 @@ impl BoundServer {
                     break;
                 }
                 () = shutdown.notified() => {
-                    if let Some(runtime_control) = runtime_control.as_ref() {
-                        request_runtime_control_drain(
-                            runtime_control,
-                            &chunk_pipeline_resources,
-                            &sessions,
-                            &shutdown,
-                        );
-                    }
+                    // Shutdown is already decided: do not request a runtime-control
+                    // drain here. Draining collapses entity-owner lanes to one
+                    // while the ticker and connection tasks are still draining,
+                    // so in-flight owner calls fail Closed and panic. Quiesce
+                    // below without touching lane topology.
                     info!("shutdown requested; listener stopping");
                     break;
                 }
@@ -1835,16 +1749,11 @@ impl BoundServer {
                 command_drain_error = Some(error);
             }
         }
-        if let Some(error) = accept_error {
-            return Err(error);
-        }
-        if let Some(error) = entity_owner_error {
-            return Err(error);
-        }
-        if let Some(error) = connection_task_error {
-            return Err(error);
-        }
-        if let Some(error) = command_drain_error {
+        if let Some(error) = accept_error
+            .or(entity_owner_error)
+            .or(connection_task_error)
+            .or(command_drain_error)
+        {
             return Err(error);
         }
         connection_drain_result?;
@@ -2027,7 +1936,7 @@ async fn flush_dirty_chunks_only(
     let mut stale_retries = 0usize;
     loop {
         let (plan, dirty_before) = {
-            let storage = crate::lock_metrics::timed_guard(
+            let mut storage = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::SaveAllFlush,
                 "dirty-only flush plan",
                 Instant::now(),
@@ -2133,15 +2042,15 @@ fn log_dirty_only_flush(
     crate::dirty_flush::DirtyFlushCompletion::Failed
 }
 
-async fn enqueue_startup_dirty_flush(
+async fn enqueue_startup_checkpoint(
     config: &ServerConfig,
     requests: &crate::dirty_flush::DirtyFlushNotifier,
 ) {
     let Some(dirty_chunks) = startup_dirty_flush_dirty_count(config).await else {
         return;
     };
-    info!(dirty = dirty_chunks, "startup dirty-only flush scheduled");
-    requests.request_dirty_flush();
+    info!(dirty = dirty_chunks, "startup checkpoint scheduled");
+    requests.request_full_checkpoint();
 }
 
 async fn startup_dirty_flush_dirty_count(config: &ServerConfig) -> Option<usize> {
@@ -2155,7 +2064,7 @@ async fn startup_dirty_flush_remaining_dirty_count(config: &ServerConfig) -> Opt
     let world = config.world.as_ref()?;
     let storage = crate::lock_metrics::timed_guard(
         crate::lock_metrics::LockMetricKind::WorldStorage,
-        "startup dirty-only flush dirty count",
+        "startup checkpoint dirty count",
         Instant::now(),
         world.lock().await,
     );
@@ -2170,7 +2079,6 @@ struct RuntimeCommandTaskContext {
     runtime_control: Option<RuntimeControlHandle>,
     simulation: play::SimulationHandle,
     chunk_pipeline_resources: ChunkPipelineResources,
-    extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
     script_storage: Option<PluginStorageHandle>,
     script_zones: Option<PluginZoneAdapter>,
@@ -2189,7 +2097,6 @@ fn spawn_runtime_command_tasks(context: RuntimeCommandTaskContext) -> RuntimeCom
         runtime_control,
         simulation,
         chunk_pipeline_resources,
-        extension,
         scripts,
         script_storage,
         script_zones,
@@ -2204,15 +2111,6 @@ fn spawn_runtime_command_tasks(context: RuntimeCommandTaskContext) -> RuntimeCom
         })
     });
     let mut command_tasks = tokio::task::JoinSet::new();
-    if let Some(extension_commands) = extension {
-        let extension_sessions = Arc::clone(&sessions);
-        let extension_shutdown = shutdown.clone();
-        command_tasks.spawn(async move {
-            run_extension_commands(extension_commands, extension_sessions, extension_shutdown)
-                .await;
-            "extension command"
-        });
-    }
     if let Some(script_commands) = scripts {
         let script_config = Arc::clone(&config);
         let script_sessions = Arc::clone(&sessions);
@@ -2248,29 +2146,6 @@ fn spawn_runtime_command_tasks(context: RuntimeCommandTaskContext) -> RuntimeCom
     RuntimeCommandTasks {
         command_tasks,
         runtime_control_signal_watcher,
-    }
-}
-
-async fn run_extension_commands(
-    extension: ExtensionEventSink,
-    sessions: Arc<play::SessionRegistry>,
-    shutdown: ShutdownHandle,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.notified() => return,
-            command = extension.recv_command() => {
-                match command {
-                    Ok(command) => handle_extension_command(&extension, &sessions, command),
-                    Err(QueueRecvError::Closed) => {
-                        debug!("extension command queue closed; stopping command drain");
-                        return;
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
     }
 }
 
@@ -2369,79 +2244,6 @@ fn log_command_task_exit(
             Ok(())
         }
         Err(error) => Err(runtime_task_join_error("command", error)),
-    }
-}
-
-fn validate_extension_custom_payload_command(
-    extension: &ExtensionEventSink,
-    player_id: PlayerId,
-    channel: String,
-    payload: bytes::Bytes,
-) -> Option<(mc_protocol::codec::Identifier, Vec<u8>)> {
-    let policy = extension.custom_payload_policy();
-    if !policy.allows_channel(&channel) {
-        debug!(
-            player_id = player_id.value(),
-            channel, "extension custom payload command rejected by channel policy"
-        );
-        return None;
-    }
-    let max_payload_bytes = policy.max_payload_bytes();
-    if payload.len() > max_payload_bytes {
-        warn!(
-            player_id = player_id.value(),
-            len = payload.len(),
-            max = max_payload_bytes,
-            "extension custom payload command rejected by size policy"
-        );
-        return None;
-    }
-    let channel = match mc_protocol::codec::Identifier::parse(&channel) {
-        Ok(channel) => channel,
-        Err(error) => {
-            debug!(
-                player_id = player_id.value(),
-                ?error,
-                "extension custom payload command rejected invalid channel"
-            );
-            return None;
-        }
-    };
-    Some((channel, payload.to_vec()))
-}
-
-fn handle_extension_command(
-    extension: &ExtensionEventSink,
-    sessions: &play::SessionRegistry,
-    command: ExtensionOutboundCommand,
-) {
-    match command {
-        ExtensionOutboundCommand::DisconnectPlayer { player_id, reason } => {
-            if !sessions.disconnect_player(player_id.value(), reason) {
-                debug!(
-                    player_id = player_id.value(),
-                    "extension disconnect command targeted unknown player"
-                );
-            }
-        }
-        ExtensionOutboundCommand::SendCustomPayload {
-            player_id,
-            channel,
-            payload,
-        } => {
-            let Some((channel, payload)) =
-                validate_extension_custom_payload_command(extension, player_id, channel, payload)
-            else {
-                return;
-            };
-            if !sessions.send_custom_payload(player_id.value(), channel, payload) {
-                debug!(
-                    player_id = player_id.value(),
-                    "extension custom payload command targeted unknown player"
-                );
-            }
-        }
-        _ => debug!("unknown extension command ignored"),
     }
 }
 
@@ -2776,51 +2578,6 @@ fn apply_runtime_control_operation(
     }
 }
 
-fn apply_runtime_control_decision(
-    resources: &ChunkPipelineResources,
-    sessions: &play::SessionRegistry,
-    decision: &crate::AutoscaleDecision,
-    draining: bool,
-) -> Result<(), RuntimeControlApplyError> {
-    let previous_cpu_limit = resources.cpu_limit();
-    if decision.action == crate::AutoscaleAction::Hold {
-        // Hold is the per-tick steady state. Avoid a synchronous regional-owner
-        // command that would invalidate read routes without changing capacity.
-        if decision.pressure == Some(crate::AutoscalePressure::Memory) {
-            let removed = sessions.shed_prepared_chunks();
-            if removed > 0 {
-                debug!(removed, "memory pressure released shared prepared chunks");
-            }
-        }
-        return Ok(());
-    }
-    let cpu_limit = resources.apply_runtime_control_action(decision.action, draining);
-    if draining || cpu_limit != previous_cpu_limit {
-        let entity_owner_lanes = sessions.reconfigure_entity_owner_lanes(cpu_limit);
-        if entity_owner_lanes != cpu_limit {
-            return Err(RuntimeControlApplyError::controlled_stop(format!(
-                "runtime CPU admission applied {cpu_limit} workers but entity authority applied {entity_owner_lanes} owner lanes"
-            )));
-        }
-    }
-    if cpu_limit != previous_cpu_limit {
-        info!(
-            action = ?decision.action,
-            cpu_limit,
-            entity_owner_lanes = cpu_limit,
-            reason = %decision.reason,
-            "runtime background CPU admission changed"
-        );
-    }
-    if decision.pressure == Some(crate::AutoscalePressure::Memory) {
-        let removed = sessions.shed_prepared_chunks();
-        if removed > 0 {
-            debug!(removed, "memory pressure released shared prepared chunks");
-        }
-    }
-    Ok(())
-}
-
 async fn recv_runtime_control_signal(
     signals: &mut Option<RuntimeControlSignalReceiver>,
 ) -> Option<RuntimeControlSignal> {
@@ -3127,6 +2884,9 @@ fn prepare_entity_physics_inputs(
 
 #[cfg(feature = "load-bench")]
 fn log_physics_sample_reuse(plans: &[EntityPhysicsSamplePlan]) {
+    if !tracing::enabled!(target: "mc_net::server", tracing::Level::INFO) {
+        return;
+    }
     if plans.len() <= ENTITY_PHYSICS_INLINE_LIMIT {
         return;
     }
@@ -3283,6 +3043,7 @@ async fn await_scheduled_block_tick_job_with_commands(
 struct CompletedEntityPhysics {
     tick: u64,
     expected: Vec<play::EntityPhysicsQuery>,
+    owner_fence: Option<mc_entity::VersionedEntityKinematics>,
     snapshot: Arc<EntityPhysicsSnapshot>,
     steps: Vec<play::EntityPhysicsStep>,
     projectile_physics_facts: play::EntityProjectilePhysicsFacts,
@@ -3291,6 +3052,7 @@ struct CompletedEntityPhysics {
 fn spawn_entity_physics_job(
     tick: u64,
     expected: Vec<play::EntityPhysicsQuery>,
+    owner_fence: Option<mc_entity::VersionedEntityKinematics>,
     cpu_resources: ChunkPipelineResources,
     inputs: Vec<EntityPhysicsInput>,
 ) -> tokio::task::JoinHandle<CompletedEntityPhysics> {
@@ -3305,6 +3067,7 @@ fn spawn_entity_physics_job(
         CompletedEntityPhysics {
             tick,
             expected,
+            owner_fence,
             snapshot,
             steps,
             projectile_physics_facts,
@@ -3352,13 +3115,14 @@ async fn apply_entity_physics_job_result(
         return;
     }
     let produced_steps = completed.steps.len();
-    let accepted_steps = simulation_owner.apply_entity_physics_if_current(
-        sessions,
+    let accepted_steps = sessions.apply_entity_physics_if_current_and_dispatch_regional(
         cpu_resources,
         completed.tick,
         &completed.expected,
         &completed.steps,
+        completed.owner_fence,
         &completed.projectile_physics_facts,
+        None,
     );
     if accepted_steps.len() != produced_steps {
         debug!(
@@ -3384,9 +3148,9 @@ fn entity_physics_snapshot_is_current(
     let positions = expected.chunks.keys().copied().collect::<Vec<_>>();
     let current = world_read.snapshot_chunks(&positions);
     expected.chunks.iter().all(|(&position, expected_chunk)| {
-        match (expected_chunk.as_ref(), current.chunk(position)) {
+        match (expected_chunk.as_ref(), current.chunk_ref(position)) {
             (Some(expected_chunk), Some(current_chunk)) => {
-                Arc::ptr_eq(expected_chunk, &current_chunk)
+                Arc::ptr_eq(expected_chunk, current_chunk)
             }
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
@@ -3407,27 +3171,15 @@ async fn step_entity_physics_inputs(
     }
 
     let input_count = inputs.len();
-    #[cfg(feature = "load-bench")]
-    let started = Instant::now();
-    #[cfg(feature = "load-bench")]
-    let kind_counts = entity_physics_kind_counts(&inputs);
     let workers = entity_physics_worker_count(&cpu_resources, input_count);
     let batch_size = input_count.div_ceil(workers);
     let mut batches = Vec::with_capacity(workers);
     let mut inputs = inputs.into_iter();
-    #[cfg(feature = "load-bench")]
-    let mut admission_wait_total_us: u64 = 0;
-    #[cfg(feature = "load-bench")]
-    let mut admission_wait_max_us: u64 = 0;
-    #[cfg(feature = "load-bench")]
-    let worker_us = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(workers)));
     for _ in 0..workers {
         let batch = inputs.by_ref().take(batch_size).collect::<Vec<_>>();
         if batch.is_empty() {
             break;
         }
-        #[cfg(feature = "load-bench")]
-        let admission_started = Instant::now();
         let permit = match cpu_resources.acquire_cpu().await {
             Ok(permit) => permit,
             Err(error) => {
@@ -3435,27 +3187,12 @@ async fn step_entity_physics_inputs(
                 break;
             }
         };
-        #[cfg(feature = "load-bench")]
-        {
-            let waited_us = elapsed_us(admission_started);
-            admission_wait_total_us = admission_wait_total_us.saturating_add(waited_us);
-            admission_wait_max_us = admission_wait_max_us.max(waited_us);
-        }
-        #[cfg(feature = "load-bench")]
-        let worker_us = std::sync::Arc::clone(&worker_us);
         batches.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            #[cfg(feature = "load-bench")]
-            let worker_started = Instant::now();
-            let steps = batch
+            batch
                 .into_iter()
                 .map(step_sampled_entity)
-                .collect::<Vec<_>>();
-            #[cfg(feature = "load-bench")]
-            if let Ok(mut samples) = worker_us.lock() {
-                samples.push(elapsed_us(worker_started));
-            }
-            steps
+                .collect::<Vec<_>>()
         }));
     }
 
@@ -3468,17 +3205,6 @@ async fn step_entity_physics_inputs(
         }
     }
 
-    #[cfg(feature = "load-bench")]
-    log_entity_physics_batch_profile(&EntityPhysicsBatchProfile {
-        input_count,
-        workers,
-        batch_size,
-        total_us: elapsed_us(started),
-        admission_wait_total_us,
-        admission_wait_max_us,
-        worker_us: &worker_us,
-        kind_counts: &kind_counts,
-    });
     steps
 }
 
@@ -3495,111 +3221,9 @@ fn entity_physics_worker_count(
         return 0;
     }
     cpu_resources
-        .cpu_limit()
+        .cpu_capacity()
         .min(input_count.div_ceil(ENTITY_PHYSICS_INLINE_LIMIT))
         .max(1)
-}
-
-#[cfg(feature = "load-bench")]
-const ENTITY_PHYSICS_BATCH_KIND_BUCKETS: [&str; 7] = [
-    "living",
-    "aquatic",
-    "immobile",
-    "flight",
-    "falling_block",
-    "projectile",
-    "default",
-];
-
-#[cfg(feature = "load-bench")]
-fn entity_physics_kind_counts(inputs: &[EntityPhysicsInput]) -> [usize; 7] {
-    let mut counts = [0usize; 7];
-    for input in inputs {
-        let bucket = match input.query.kind {
-            play::EntityPhysicsKind::Living | play::EntityPhysicsKind::PowderSnowWalkableLiving => {
-                0
-            }
-            play::EntityPhysicsKind::AquaticLiving => 1,
-            play::EntityPhysicsKind::Immobile => 2,
-            play::EntityPhysicsKind::ExternalFlight => 3,
-            play::EntityPhysicsKind::FallingBlock => 4,
-            play::EntityPhysicsKind::ArrowProjectile { .. }
-            | play::EntityPhysicsKind::ShulkerBullet { .. }
-            | play::EntityPhysicsKind::HurtingProjectile { .. }
-            | play::EntityPhysicsKind::ThrowableProjectile { .. } => 5,
-            play::EntityPhysicsKind::Default => 6,
-        };
-        counts[bucket] += 1;
-    }
-    counts
-}
-
-/// Returns `(min_us, median_us, max_us)`; even sample counts use the lower
-/// median.
-#[cfg(feature = "load-bench")]
-fn entity_physics_batch_us_summary(samples_us: &[u64]) -> (u64, u64, u64) {
-    let mut sorted = samples_us.to_vec();
-    sorted.sort_unstable();
-    let min_us = sorted.first().copied().unwrap_or(0);
-    let max_us = sorted.last().copied().unwrap_or(0);
-    let median_us = sorted
-        .get(sorted.len().saturating_sub(1) / 2)
-        .copied()
-        .unwrap_or(0);
-    (min_us, median_us, max_us)
-}
-
-#[cfg(feature = "load-bench")]
-struct EntityPhysicsBatchProfile<'a> {
-    input_count: usize,
-    workers: usize,
-    batch_size: usize,
-    total_us: u64,
-    admission_wait_total_us: u64,
-    admission_wait_max_us: u64,
-    worker_us: &'a std::sync::Mutex<Vec<u64>>,
-    kind_counts: &'a [usize; 7],
-}
-
-#[cfg(feature = "load-bench")]
-fn log_entity_physics_batch_profile(profile: &EntityPhysicsBatchProfile<'_>) {
-    let EntityPhysicsBatchProfile {
-        input_count,
-        workers,
-        batch_size,
-        total_us,
-        admission_wait_total_us,
-        admission_wait_max_us,
-        worker_us,
-        kind_counts,
-    } = profile;
-    let samples_us = worker_us
-        .lock()
-        .map(|samples| samples.clone())
-        .unwrap_or_default();
-    let (min_us, median_us, max_us) = entity_physics_batch_us_summary(&samples_us);
-    let kinds = ENTITY_PHYSICS_BATCH_KIND_BUCKETS
-        .iter()
-        .zip(kind_counts.iter())
-        .filter(|&(_, &count)| count > 0)
-        .map(|(bucket, count)| format!("{bucket}={count}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    eprintln!(
-        "PHYSICS_BATCH_PROFILE input_count={input_count} workers={workers} \
-         batch_size={batch_size} total_us={total_us} \
-         cpu_wait_total_us={admission_wait_total_us} cpu_wait_max_us={admission_wait_max_us} \
-         worker_us_min/median/max={min_us}/{median_us}/{max_us} kinds=[{kinds}]"
-    );
-}
-
-#[cfg(all(test, feature = "load-bench"))]
-#[test]
-fn entity_physics_batch_us_summary_is_min_lower_median_max() {
-    assert_eq!(entity_physics_batch_us_summary(&[]), (0, 0, 0));
-    assert_eq!(entity_physics_batch_us_summary(&[5]), (5, 5, 5));
-    assert_eq!(entity_physics_batch_us_summary(&[7, 3, 9]), (3, 7, 9));
-    assert_eq!(entity_physics_batch_us_summary(&[7, 3, 9, 5]), (3, 5, 9));
 }
 
 struct EntityPhysicsInput {
@@ -4476,22 +4100,7 @@ fn is_client_disconnect(err: &ConnectionError) -> bool {
 /// Bind to `config.bind_address` and return a [`BoundServer`] ready to
 /// `.serve()`.
 pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
-    bind_internal(config, None, None).await
-}
-
-/// Bind with an explicit extension boundary. The default [`bind`] path keeps
-/// extension dispatch disabled.
-pub async fn bind_with_extension(
-    config: ServerConfig,
-    boundary: ExtensionBoundary,
-    custom_payload_policy: CustomPayloadPolicy,
-) -> std::io::Result<BoundServer> {
-    bind_internal(
-        config,
-        Some(ExtensionEventSink::new(boundary, custom_payload_policy)),
-        None,
-    )
-    .await
+    bind_internal(config, None).await
 }
 
 /// Bind with the bounded server-side script API enabled.
@@ -4499,12 +4108,11 @@ pub async fn bind_with_scripts(
     config: ServerConfig,
     boundary: ScriptBoundary,
 ) -> std::io::Result<BoundServer> {
-    bind_internal(config, None, Some(ScriptEventSink::new(boundary))).await
+    bind_internal(config, Some(ScriptEventSink::new(boundary))).await
 }
 
 async fn bind_internal(
     mut config: ServerConfig,
-    extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
 ) -> std::io::Result<BoundServer> {
     if config.recipes.is_empty() {
@@ -4532,13 +4140,20 @@ async fn bind_internal(
     let script_zones = scripts
         .as_ref()
         .map(|scripts| PluginZoneAdapter::new(scripts.clone()));
+    let journal_writer = entity_world_root
+        .as_deref()
+        .map(play::world_journal::JournalWriter::open)
+        .transpose()?;
     let (sessions, pending_entity_commits) = if let Some(root) = entity_world_root.as_deref() {
-        let (journal, pending) = play::persistence::FileRegionalDecisionJournal::open(root)
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        let (journal, pending) = play::persistence::FileRegionalDecisionJournal::open(
+            root,
+            Arc::clone(journal_writer.as_ref().expect("persistent world journal")),
+        )
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
         (
             Arc::new(
                 play::SessionRegistry::try_new_with_entity_owner_journal(
-                    chunk_pipeline_resources.cpu_limit(),
+                    chunk_pipeline_resources.cpu_capacity(),
                     Box::new(journal),
                 )
                 .map_err(|error| {
@@ -4554,7 +4169,7 @@ async fn bind_internal(
         (
             Arc::new(
                 play::SessionRegistry::try_new_with_entity_owner_lanes(
-                    chunk_pipeline_resources.cpu_limit(),
+                    chunk_pipeline_resources.cpu_capacity(),
                 )
                 .map_err(|error| {
                     std::io::Error::other(format!(
@@ -4585,8 +4200,13 @@ async fn bind_internal(
             root,
             Arc::clone(&config.blocks),
             Arc::clone(&config.items),
+            Arc::clone(journal_writer.as_ref().expect("persistent world journal")),
         )
         .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        world.lock().await.set_journal_barrier({
+            let writer = Arc::clone(journal_writer.as_ref().expect("persistent world journal"));
+            Arc::new(move || writer.flush().map_err(std::io::Error::other))
+        });
         let chunks = journal
             .decode_pending(&pending)
             .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
@@ -4758,7 +4378,6 @@ async fn bind_internal(
         sessions,
         simulation,
         simulation_owner,
-        extension,
         scripts,
         script_storage,
         script_zones,
@@ -5071,12 +4690,26 @@ async fn save_all_with_context_snapshot_locked_impl(
         }
     };
 
+    if let Some(journal) = sessions.world_chunk_journal() {
+        match tokio::task::spawn_blocking(move || journal.writer.flush()).await {
+            Ok(Ok(())) => {}
+            result => {
+                sessions.report_world_chunk_journal_failure();
+                report
+                    .errors
+                    .push(format!("journal durability barrier failed: {result:?}"));
+                report.timings.total_us = elapsed_us(total_started);
+                return report;
+            }
+        }
+    }
+
     let mut world_flush_clean = false;
     let mut attempt = 0usize;
     loop {
         attempt = attempt.saturating_add(1);
         let started = Instant::now();
-        let storage = crate::lock_metrics::timed_guard(
+        let mut storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::SaveAllFlush,
             "save-all dirty flush plan",
             Instant::now(),
@@ -5463,7 +5096,7 @@ mod tests {
         .declare_player_command_root("hello")
         .validate()
         .unwrap();
-        endpoint.register_player_commands(&manifest).unwrap();
+        endpoint.register_plugin_routes(&manifest).unwrap();
         let sink = ScriptEventSink::new(boundary);
 
         assert_eq!(
@@ -5504,7 +5137,7 @@ mod tests {
         .declare_player_command_root("hello")
         .validate()
         .unwrap();
-        endpoint.register_player_commands(&manifest).unwrap();
+        endpoint.register_plugin_routes(&manifest).unwrap();
         let sink = ScriptEventSink::new(boundary);
         sink.enqueue_event(ScriptEvent::server_started());
 
@@ -5533,7 +5166,6 @@ mod tests {
         let receiver = sessions.install_script_commit_event_outbox();
         sessions
             .try_enqueue_script_commit_event_for_test(
-                play::ScriptCommitDelivery::Required,
                 ScriptEvent::try_player_died_with_context(
                     ScriptPlayerId::new(7),
                     ScriptPlayerContext::new(
@@ -5577,14 +5209,11 @@ mod tests {
         let receiver = sessions.install_script_commit_event_outbox();
         for tick in 1..=2 {
             sessions
-                .try_enqueue_script_commit_event_for_test(
-                    play::ScriptCommitDelivery::Required,
-                    ScriptEvent::server_tick(tick),
-                )
+                .try_enqueue_script_commit_event_for_test(ScriptEvent::server_tick(tick))
                 .unwrap();
         }
         sessions.close_script_commit_event_outbox();
-        let mut failure = sessions.subscribe_script_commit_event_failure();
+        let failure = sessions.script_commit_event_monitor();
         let worker = forward_committed_script_events(receiver, sink);
         tokio::pin!(worker);
         let waker = std::task::Waker::noop();
@@ -5601,11 +5230,10 @@ mod tests {
             Err(ScriptCommitForwardError::RequiredTimeout { timeout })
                 if timeout == SCRIPT_COMMIT_FORWARD_TIMEOUT
         ));
-        assert!(*failure.borrow_and_update());
+        assert!(failure.failed());
         let snapshot = sessions.script_commit_event_outbox_snapshot();
         assert_eq!(snapshot.depth, 0);
         assert_eq!(snapshot.dequeued, 1);
-        assert_eq!(snapshot.abandoned_on_receiver_drop, 1);
         assert_eq!(snapshot.required_abandoned_on_receiver_drop, 1);
     }
 
@@ -5616,24 +5244,20 @@ mod tests {
         let capacity = sessions.script_commit_event_outbox_snapshot().capacity;
         let shutdown = ShutdownHandle::default();
         let watcher = tokio::spawn(watch_script_commit_event_failure(
-            sessions.subscribe_script_commit_event_failure(),
+            sessions.script_commit_event_monitor(),
             shutdown.clone(),
         ));
 
         for tick in 0..capacity {
             sessions
-                .try_enqueue_script_commit_event_for_test(
-                    play::ScriptCommitDelivery::Required,
-                    ScriptEvent::server_tick(tick as u64),
-                )
+                .try_enqueue_script_commit_event_for_test(ScriptEvent::server_tick(tick as u64))
                 .unwrap();
         }
         assert!(
             sessions
-                .try_enqueue_script_commit_event_for_test(
-                    play::ScriptCommitDelivery::Required,
-                    ScriptEvent::server_stopping("required overflow"),
-                )
+                .try_enqueue_script_commit_event_for_test(ScriptEvent::server_stopping(
+                    "required overflow"
+                ),)
                 .is_err()
         );
 
@@ -5645,36 +5269,6 @@ mod tests {
         assert_eq!(snapshot.max_depth, capacity);
         assert_eq!(snapshot.required_overflow, 1);
         watcher.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn best_effort_committed_script_event_drop_is_counted_without_failure() {
-        let one = NonZeroUsize::new(1).unwrap();
-        let (boundary, _endpoint) = script_boundary_pair(one, one);
-        boundary
-            .try_enqueue_event(ScriptEvent::server_started())
-            .unwrap();
-        let sink = ScriptEventSink::new(boundary);
-        let sessions = play::SessionRegistry::new();
-        let receiver = sessions.install_script_commit_event_outbox();
-        sessions
-            .try_enqueue_script_commit_event_for_test(
-                play::ScriptCommitDelivery::BestEffort,
-                ScriptEvent::server_tick(1),
-            )
-            .unwrap();
-        sessions.close_script_commit_event_outbox();
-
-        forward_committed_script_events(receiver, sink)
-            .await
-            .unwrap();
-
-        let snapshot = sessions.script_commit_event_outbox_snapshot();
-        assert_eq!(snapshot.depth, 0);
-        assert_eq!(snapshot.best_effort_sink_dropped, 1);
-        assert_eq!(snapshot.required_overflow, 0);
-        assert_eq!(snapshot.required_closed, 0);
-        assert!(!*sessions.subscribe_script_commit_event_failure().borrow());
     }
 
     #[tokio::test]
@@ -5842,70 +5436,6 @@ mod tests {
         assert!(gate.accepts_off_tick_batch());
     }
 
-    #[test]
-    fn extension_outbound_custom_payload_obeys_channel_allowlist() {
-        let (boundary, _endpoint) = mc_extension::boundary_pair(
-            std::num::NonZeroUsize::new(4).unwrap(),
-            std::num::NonZeroUsize::new(4).unwrap(),
-        );
-        let extension = ExtensionEventSink::new(
-            boundary,
-            CustomPayloadPolicy::new(64, ["solaris:allowed".to_owned()]),
-        );
-        assert!(
-            validate_extension_custom_payload_command(
-                &extension,
-                PlayerId::new(91),
-                "solaris:denied".to_owned(),
-                bytes::Bytes::from_static(b"denied"),
-            )
-            .is_none()
-        );
-
-        let (channel, payload) = validate_extension_custom_payload_command(
-            &extension,
-            PlayerId::new(91),
-            "solaris:allowed".to_owned(),
-            bytes::Bytes::from_static(b"allowed"),
-        )
-        .expect("allowlisted payload");
-        assert_eq!(channel.as_str(), "solaris:allowed");
-        assert_eq!(payload, b"allowed");
-    }
-
-    #[tokio::test]
-    async fn extension_command_task_stops_without_draining_after_shutdown() {
-        let (boundary, endpoint) = mc_extension::boundary_pair(
-            std::num::NonZeroUsize::new(4).unwrap(),
-            std::num::NonZeroUsize::new(4).unwrap(),
-        );
-        let extension = ExtensionEventSink::new(
-            boundary,
-            CustomPayloadPolicy::new(64, ["solaris:allowed".to_owned()]),
-        );
-        endpoint
-            .try_submit_command(ExtensionOutboundCommand::DisconnectPlayer {
-                player_id: PlayerId::new(91),
-                reason: "queued before shutdown".to_owned(),
-            })
-            .unwrap();
-        let shutdown = ShutdownHandle::default();
-        shutdown.request();
-
-        run_extension_commands(
-            extension.clone(),
-            Arc::new(play::SessionRegistry::new()),
-            shutdown,
-        )
-        .await;
-
-        assert!(matches!(
-            extension.try_recv_command(),
-            Ok(ExtensionOutboundCommand::DisconnectPlayer { player_id, .. })
-                if player_id == PlayerId::new(91)
-        ));
-    }
-
     #[tokio::test]
     async fn script_command_task_drains_buffered_command_before_shutdown() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6024,31 +5554,6 @@ mod tests {
         assert!(gate.should_log(15, 50_001, policy));
         assert!(!gate.should_log(16, 49_999, policy));
         assert!(gate.should_log(17, 50_000, policy));
-    }
-
-    #[test]
-    fn entity_physics_uses_shared_cpu_worker_capacity() {
-        let resources = ChunkPipelineResources::with_limits(1, 3);
-
-        assert_eq!(entity_physics_worker_count(&resources, 0), 0);
-        assert_eq!(entity_physics_worker_count(&resources, 2), 1);
-        assert_eq!(entity_physics_worker_count(&resources, 512), 2);
-
-        resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
-        assert_eq!(entity_physics_worker_count(&resources, 768), 2);
-    }
-
-    #[test]
-    fn entity_physics_batches_small_jobs_before_parallelizing() {
-        let resources = ChunkPipelineResources::with_limits(1, 16);
-
-        assert_eq!(entity_physics_worker_count(&resources, 7), 1);
-        assert_eq!(entity_physics_worker_count(&resources, 8), 1);
-        assert_eq!(entity_physics_worker_count(&resources, 24), 1);
-        assert_eq!(entity_physics_worker_count(&resources, 64), 1);
-        assert_eq!(entity_physics_worker_count(&resources, 256), 1);
-        assert_eq!(entity_physics_worker_count(&resources, 257), 2);
-        assert_eq!(entity_physics_worker_count(&resources, 768), 3);
     }
 
     #[tokio::test]
@@ -6209,7 +5714,7 @@ mod tests {
                 complete_samples: false,
             })
             .collect();
-        let mut physics = spawn_entity_physics_job(9, queries, resources, inputs);
+        let mut physics = spawn_entity_physics_job(9, queries, None, resources, inputs);
         std::future::poll_fn(|cx| {
             assert!(
                 std::future::Future::poll(std::pin::Pin::new(&mut physics), cx).is_pending(),
@@ -6926,14 +6431,15 @@ mod tests {
 
         let resources = ChunkPipelineResources::with_limits(1, 8);
         let sessions = play::SessionRegistry::new();
+        let initial_owner_lanes = sessions.entity_owner_lane_count();
         let shutdown = ShutdownHandle::default();
         let decision =
             observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 49_001)
                 .unwrap();
         assert_eq!(decision.pressure, Some(crate::AutoscalePressure::Memory));
         assert_eq!(decision.action, crate::AutoscaleAction::ScaleDown);
-        assert_eq!(resources.cpu_limit(), 4);
-        assert_eq!(sessions.entity_owner_lane_count(), 4);
+        assert_eq!(resources.prepare_limit(), 4);
+        assert_eq!(sessions.entity_owner_lane_count(), initial_owner_lanes);
         assert_eq!(
             control.snapshot().last_decision.pressure,
             Some(crate::AutoscalePressure::Memory)
@@ -6945,68 +6451,6 @@ mod tests {
                 limit_mb: 1_000,
             }
         );
-    }
-
-    #[test]
-    fn runtime_control_applies_only_capacity_changes_and_preserves_special_paths() {
-        let resources = ChunkPipelineResources::with_limits(1, 8);
-        let sessions = play::SessionRegistry::new_with_entity_owner_lanes(8);
-        let limits = crate::RuntimeControlLimits {
-            view_distance: 8,
-            chunk_send_rate: 16,
-            chunk_load_rate: 32,
-            chunk_generate_rate: 16,
-        };
-        let decision = |action, pressure| crate::AutoscaleDecision {
-            action,
-            pressure,
-            limits,
-            reason: "test decision".to_string(),
-        };
-
-        apply_runtime_control_decision(
-            &resources,
-            &sessions,
-            &decision(crate::AutoscaleAction::Hold, None),
-            false,
-        )
-        .unwrap();
-        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 0);
-        assert_eq!(sessions.prepared_chunk_shed_calls(), 0);
-
-        apply_runtime_control_decision(
-            &resources,
-            &sessions,
-            &decision(
-                crate::AutoscaleAction::Hold,
-                Some(crate::AutoscalePressure::Memory),
-            ),
-            false,
-        )
-        .unwrap();
-        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 0);
-        assert_eq!(sessions.prepared_chunk_shed_calls(), 1);
-
-        apply_runtime_control_decision(
-            &resources,
-            &sessions,
-            &decision(crate::AutoscaleAction::ScaleUp, None),
-            false,
-        )
-        .unwrap();
-        assert_eq!(resources.cpu_limit(), 8);
-        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 0);
-
-        apply_runtime_control_decision(
-            &resources,
-            &sessions,
-            &decision(crate::AutoscaleAction::ScaleDown, None),
-            true,
-        )
-        .unwrap();
-        assert_eq!(resources.cpu_limit(), 1);
-        assert_eq!(sessions.entity_owner_lane_count(), 1);
-        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 1);
     }
 
     #[test]
@@ -7820,64 +7264,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_shutdown_notification_requests_runtime_control_drain() {
-        let shutdown = ShutdownHandle::default();
-        let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
-        let config = ServerConfig {
-            bind_address: "127.0.0.1:0".parse().unwrap(),
-            motd: "runtime-drain-shutdown-test".into(),
-            max_players: 0,
-            view_distance: 0,
-            data: Arc::new(mc_data::testing::stub()),
-            blocks,
-            world: None,
-            tags: Arc::new(TagsData::default()),
-            recipes: Arc::new(Vec::new()),
-            loot: Arc::new(mc_data::loot::LootTables::default()),
-            block_light: None,
-            items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
-            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: canonical_entity_types(),
-            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            chunk_pipeline: ChunkPipelinePolicy {
-                chunk_worker_threads: 8,
-                runtime_control: Some(crate::RuntimeControlConfig {
-                    policy: crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced),
-                    initial_limits: crate::RuntimeControlLimits {
-                        view_distance: 4,
-                        chunk_send_rate: 8,
-                        chunk_load_rate: 16,
-                        chunk_generate_rate: 16,
-                    },
-                }),
-                ..ChunkPipelinePolicy::default()
-            },
-            random_tick: play::RandomTickPolicy::default(),
-            command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
-            loader_manifest: None,
-            shutdown: shutdown.clone(),
-        };
-
-        let bound = bind(config).await.expect("bind");
-        let resources = bound.chunk_pipeline_resources.clone();
-        let runtime_control = bound
-            .runtime_control_handle()
-            .expect("runtime control enabled");
-        let serve = tokio::spawn(bound.serve());
-
-        shutdown.request();
-        let serve_result = tokio::time::timeout(Duration::from_secs(2), serve)
-            .await
-            .expect("serve exits after shutdown")
-            .expect("serve task joins");
-        serve_result.expect("serve exits cleanly");
-
-        assert!(runtime_control.snapshot().draining);
-        assert_eq!(resources.cpu_limit(), 1);
-    }
-
-    #[tokio::test]
     async fn serve_shutdown_drains_without_starting_final_save() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
@@ -8263,7 +7649,7 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
         assert!(shutdown.is_requested());
         assert!(runtime_control.snapshot().draining);
-        assert_eq!(resources.cpu_limit(), 1);
+        assert_eq!(resources.prepare_limit(), 1);
     }
 
     #[tokio::test]
@@ -8725,76 +8111,6 @@ mod tests {
         assert_eq!(dirty_calls.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
-    async fn startup_dirty_flush_drains_more_than_four_bounded_batches() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-        let blocks = Arc::new(
-            BlockRegistry::from_report(&[report("minecraft:air", &[], &[(0, true, &[])])]).unwrap(),
-        );
-        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = canonical_entity_types();
-        let world = Arc::new(Mutex::new(
-            WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&blocks), 257)
-                .unwrap()
-                .with_item_registry(Arc::clone(&items)),
-        ));
-        let mut config = save_all_test_config(
-            tmp.path(),
-            Arc::clone(&blocks),
-            Arc::clone(&items),
-            entity_types,
-        );
-        config.world = Some(Arc::clone(&world));
-        let config = Arc::new(config);
-        let biome = Identifier::parse("minecraft:plains").unwrap();
-        {
-            let mut storage = world.lock().await;
-            for x in 0..257 {
-                let position = mc_world::ChunkPos { x, z: 0 };
-                storage
-                    .insert_generated_chunk(
-                        position,
-                        mc_world::Chunk::empty(position, mc_world::BlockStateId(0), biome.clone()),
-                    )
-                    .unwrap();
-            }
-        }
-
-        let dirty_calls = Arc::new(AtomicUsize::new(0));
-        let coordinator = crate::dirty_flush::DirtyFlushCoordinator::spawn_actions(
-            {
-                let config = Arc::clone(&config);
-                let dirty_calls = Arc::clone(&dirty_calls);
-                move || {
-                    let config = Arc::clone(&config);
-                    let dirty_calls = Arc::clone(&dirty_calls);
-                    async move {
-                        dirty_calls.fetch_add(1, Ordering::SeqCst);
-                        log_dirty_only_flush(
-                            "startup dirty-only flush test",
-                            flush_dirty_chunks_only(&config, 0).await,
-                        )
-                    }
-                }
-            },
-            || async { panic!("startup dirty-only path must not run a full checkpoint") },
-        );
-        let requests = coordinator.notifier();
-
-        enqueue_startup_dirty_flush(&config, &requests).await;
-        coordinator.drain().await;
-
-        assert_eq!(dirty_calls.load(Ordering::SeqCst), 5);
-        assert_eq!(world.lock().await.stats().dirty_chunks, 0);
-        assert!(
-            play::persistence::load_world_metadata(tmp.path())
-                .unwrap()
-                .is_none(),
-            "startup dirty-only flush must exclude full-checkpoint metadata"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bind_prepares_spawn_chunk_without_holding_world_lock() {
         struct PausedGenerator {
@@ -8945,7 +8261,7 @@ mod tests {
         )
         .unwrap();
         let (mut journal, pending) =
-            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+            play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert!(pending.is_empty());
         mc_entity::RegionalDecisionJournal::record_commit(&mut journal, &decision).unwrap();
         drop(journal);
@@ -8958,7 +8274,7 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].snapshot, snapshot);
         let (_, pending) =
-            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+            play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0], decision);
         assert_eq!(pending[1].upserts(), std::slice::from_ref(&snapshot));
@@ -8994,7 +8310,7 @@ mod tests {
         };
         assert!(report.is_ok(), "save failed: {:?}", report.errors);
         let (_, pending) =
-            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+            play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert_eq!(pending.len(), 2, "checkpoint cleanup stays memory-only");
         let checkpoint = play::persistence::load_persisted_entities(
             tmp.path(),
@@ -9009,7 +8325,7 @@ mod tests {
 
         drop(bound);
         let (_, pending) =
-            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+            play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert!(
             pending.is_empty(),
             "normal shutdown compacts checkpointed WAL"
@@ -9057,7 +8373,7 @@ mod tests {
         )
         .unwrap();
         let (mut journal, _) =
-            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+            play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         mc_entity::RegionalDecisionJournal::record_commit(&mut journal, &decision).unwrap();
         drop(journal);
 
@@ -9074,7 +8390,7 @@ mod tests {
                 .is_empty()
         );
         let (_, pending) =
-            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+            play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert_eq!(pending, vec![decision]);
     }
 
@@ -9124,7 +8440,7 @@ mod tests {
         )
         .unwrap();
         let (mut journal, _) =
-            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+            play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         mc_entity::RegionalDecisionJournal::record_commit(&mut journal, &decision).unwrap();
         drop(journal);
         let journal_path = tmp.path().join("solaris/entity-owner-journal.json");
@@ -10016,7 +9332,7 @@ mod tests {
             .extras
             .push(("SolarisJournalLsn".to_owned(), mc_nbt::Tag::Long(1)));
 
-        let (journal, pending) = play::world_journal::WorldChunkJournal::open(
+        let (journal, pending) = play::world_journal::WorldChunkJournal::open_for_test(
             tmp.path(),
             Arc::clone(&blocks),
             Arc::clone(&items),
@@ -10056,7 +9372,8 @@ mod tests {
         drop(bound);
 
         let (_, pending) =
-            play::world_journal::WorldChunkJournal::open(tmp.path(), blocks, items).unwrap();
+            play::world_journal::WorldChunkJournal::open_for_test(tmp.path(), blocks, items)
+                .unwrap();
         assert!(pending.is_empty());
     }
 
@@ -10085,7 +9402,7 @@ mod tests {
         image_a
             .extras
             .push(("SolarisJournalLsn".to_owned(), mc_nbt::Tag::Long(1)));
-        let (journal, pending) = play::world_journal::WorldChunkJournal::open(
+        let (journal, pending) = play::world_journal::WorldChunkJournal::open_for_test(
             tmp.path(),
             Arc::clone(&blocks),
             Arc::clone(&items),
@@ -10186,7 +9503,8 @@ mod tests {
         };
         let sessions = play::SessionRegistry::new();
         let (journal, pending) =
-            play::world_journal::WorldChunkJournal::open(tmp.path(), blocks, items).unwrap();
+            play::world_journal::WorldChunkJournal::open_for_test(tmp.path(), blocks, items)
+                .unwrap();
         assert!(pending.is_empty());
         assert_eq!(journal.record_snapshots(1, vec![snapshot]).unwrap(), 1);
         sessions.install_world_chunk_journal(journal);

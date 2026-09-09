@@ -1,5 +1,6 @@
 use super::*;
 use mc_protocol::frame::Compression;
+use mc_protocol::packets::play::SetChunkCacheRadius;
 use mc_world::WorldStorage;
 use std::io;
 use std::pin::Pin;
@@ -51,6 +52,33 @@ fn test_stream(control: crate::RuntimeControlHandle, view_distance: i32) -> Chun
         policy,
     )
     .with_runtime_control(Some(control))
+}
+
+#[tokio::test]
+async fn published_radius_tracks_initial_limit_client_cap_and_recovery() {
+    let mut stream = test_stream(control(100, 4), 8);
+    let mut written = Vec::new();
+    let mut light_cache = LightCache::new();
+
+    for client_cap in [8, 8, 2, 2, 8] {
+        stream.replan_view_distance(client_cap, 0.0);
+        stream.step(&mut written, &mut light_cache).await.unwrap();
+    }
+
+    let mut buffer = BytesMut::from(written.as_slice());
+    let mut radii = Vec::new();
+    while let Some(mut frame) =
+        mc_protocol::frame::try_decode_frame(&mut buffer, Compression::Disabled).unwrap()
+    {
+        if frame.id == SetChunkCacheRadius::ID {
+            radii.push(SetChunkCacheRadius::decode(&mut frame.body).unwrap().radius);
+        }
+    }
+    assert_eq!(
+        radii,
+        [4, 2, 4],
+        "the client must receive the effective radius initially and on each change, not every step"
+    );
 }
 
 fn control(queue_pressure_percent: u8, view_distance: i32) -> crate::RuntimeControlHandle {

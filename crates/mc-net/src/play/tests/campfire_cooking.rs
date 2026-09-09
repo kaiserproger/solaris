@@ -480,7 +480,12 @@ async fn campfire_startup_hydration_only_reads_resident_chunks() {
             )
             .unwrap();
         storage.set_block_at(pos, BlockStateId(1)).unwrap();
-        storage.set_opaque_block_entity(pos, bytes).unwrap();
+        let token = storage.block_mutation_token(pos).unwrap();
+        assert!(
+            storage
+                .commit_opaque_block_entity_conditionally(pos, BlockStateId(1), token, bytes)
+                .unwrap()
+        );
         assert_eq!(storage.flush_dirty().unwrap(), 1);
     }
 
@@ -631,7 +636,7 @@ async fn campfire_tick_does_not_load_cold_chunks_and_is_durable_when_resident() 
         let storage = world.lock().await;
         (storage.read_view(), storage.mutation_view())
     };
-    let (journal, pending) = WorldChunkJournal::open(
+    let (journal, pending) = WorldChunkJournal::open_for_test(
         tmp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),

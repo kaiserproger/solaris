@@ -346,6 +346,7 @@ async fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory_
     mine_block_and_wait_for_stack(
         &mut client,
         (-1, surface_y, 0),
+        (-0.5, 0.5),
         401,
         hand_log_ticks,
         jungle_log_id,
@@ -355,6 +356,7 @@ async fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory_
     mine_block_and_wait_for_stack(
         &mut client,
         (1, surface_y, 0),
+        (1.5, 0.5),
         403,
         hand_log_ticks,
         jungle_log_id,

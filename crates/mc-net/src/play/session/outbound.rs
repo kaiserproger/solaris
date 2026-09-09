@@ -109,6 +109,7 @@ pub(in crate::play) enum OutboundCommand {
     },
     PickupCandidates(Vec<ServerEntitySnapshot>),
     DespawnEntity(ServerEntitySnapshot),
+    DespawnEntities(Vec<i32>),
     AnimatePlayer {
         entity_id: i32,
     },
@@ -237,6 +238,7 @@ impl OutboundCommand {
             | Self::TakeItemEntity { .. }
             | Self::PickupCandidates(_)
             | Self::DespawnEntity(_)
+            | Self::DespawnEntities(_)
             | Self::PlayerEntityData { .. }
             | Self::BlockEntityData { .. }
             | Self::FurnaceSlots { .. }
@@ -617,17 +619,15 @@ impl ReliableRetryQueue {
         if self.closing {
             return ReliableEnqueueResult::Dropped;
         }
+        let command = match try_coalesce_movement_suffix(&mut self.pending, command) {
+            None => return ReliableEnqueueResult::Queued,
+            Some(command) => command,
+        };
         let command = match self.pending.back_mut() {
-            Some(pending) => {
-                let command = match try_coalesce_entity_spawns(pending, command) {
-                    None => return ReliableEnqueueResult::Queued,
-                    Some(command) => command,
-                };
-                match try_coalesce_entity_movements(pending, command) {
-                    None => return ReliableEnqueueResult::Queued,
-                    Some(command) => command,
-                }
-            }
+            Some(pending) => match try_coalesce_entity_spawns(pending, command) {
+                None => return ReliableEnqueueResult::Queued,
+                Some(command) => command,
+            },
             None => command,
         };
         if self.pending.len() < self.capacity {
@@ -670,6 +670,50 @@ fn try_coalesce_entity_spawns(
     };
     existing.append(&mut incoming);
     None
+}
+
+fn try_coalesce_movement_suffix(
+    pending: &mut VecDeque<OutboundCommand>,
+    command: OutboundCommand,
+) -> Option<OutboundCommand> {
+    match command {
+        OutboundCommand::MovePlayer(incoming) => {
+            for command in pending.iter_mut().rev() {
+                match command {
+                    OutboundCommand::MovePlayer(existing)
+                        if existing.session_id == incoming.session_id =>
+                    {
+                        *existing = incoming;
+                        return None;
+                    }
+                    OutboundCommand::MovePlayer(_)
+                    | OutboundCommand::MoveEntityRelative(_)
+                    | OutboundCommand::MoveEntitiesRelative(_) => {}
+                    _ => break,
+                }
+            }
+            Some(OutboundCommand::MovePlayer(incoming))
+        }
+        command => {
+            if !matches!(
+                &command,
+                OutboundCommand::MoveEntityRelative(_) | OutboundCommand::MoveEntitiesRelative(_)
+            ) {
+                return Some(command);
+            }
+            for pending in pending.iter_mut().rev() {
+                match pending {
+                    OutboundCommand::MoveEntityRelative(_)
+                    | OutboundCommand::MoveEntitiesRelative(_) => {
+                        return try_coalesce_entity_movements(pending, command);
+                    }
+                    OutboundCommand::MovePlayer(_) => {}
+                    _ => break,
+                }
+            }
+            Some(command)
+        }
+    }
 }
 
 fn try_coalesce_entity_movements(

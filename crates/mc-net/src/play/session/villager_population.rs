@@ -18,6 +18,7 @@ use super::entity_lifecycle::{
     clear_removed_entity_tracking_locked, nearby_entity_candidate_ids_locked,
     track_entity_chunk_locked,
 };
+use super::entity_simulation::VillagerPopulationSelection;
 use super::interaction_geometry::entity_aabb;
 use super::visibility::{
     despawn_entity_visibility_locked, entity_event_dispatches_locked,
@@ -54,9 +55,11 @@ impl SessionRegistry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::play) fn tick_villager_population(
         &self,
         _authority: &SimulationAuthority,
+        population: &VillagerPopulationSelection,
         current_tick: u64,
         food_items: VillagerFoodItemIds,
         villager_type_id: i32,
@@ -66,8 +69,8 @@ impl SessionRegistry {
         if villager_type_id < 0 || item_type_id < 0 {
             return (0, Vec::new());
         }
-        let active_ids = self.active_simulation_entities.load_full();
-        if active_ids.is_empty() {
+        let active_chunks = self.active_simulation_chunks.load_full();
+        if active_chunks.is_empty() {
             return (0, Vec::new());
         }
 
@@ -75,38 +78,74 @@ impl SessionRegistry {
         if inner.villager_entities.is_empty() {
             return (0, Vec::new());
         }
-        let active_villager_ids = inner
-            .villager_entities
+        if population.candidates.is_empty()
+            && population.proximity_seeds.is_empty()
+            && inner.villager_birth_deadline_by_parent.is_empty()
+        {
+            return (0, Vec::new());
+        }
+        let all_active_villager_ids = &population.covered;
+        let mut active_villager_ids = all_active_villager_ids
             .iter()
             .copied()
-            .filter(|entity_id| active_ids.contains(entity_id))
+            .filter(|entity_id| {
+                population.candidates.contains(entity_id)
+                    || inner
+                        .villager_birth_deadline_by_parent
+                        .contains_key(entity_id)
+            })
             .collect::<HashSet<_>>();
+        let mut proximity_chunks = HashSet::new();
+        for position in &population.proximity_seeds {
+            let (min_cx, min_cz) = chunk_pos_from_coords(
+                position.x - VILLAGER_INTERACTION_RANGE,
+                position.z - VILLAGER_INTERACTION_RANGE,
+            );
+            let (max_cx, max_cz) = chunk_pos_from_coords(
+                position.x + VILLAGER_INTERACTION_RANGE,
+                position.z + VILLAGER_INTERACTION_RANGE,
+            );
+            proximity_chunks
+                .extend((min_cz..=max_cz).flat_map(|cz| (min_cx..=max_cx).map(move |cx| (cx, cz))));
+        }
+        for chunk in proximity_chunks {
+            if let Some(chunk_ids) = inner.simulation_inputs.entities_in_chunk(chunk) {
+                active_villager_ids.extend(
+                    chunk_ids
+                        .iter()
+                        .filter(|entity_id| all_active_villager_ids.contains(entity_id)),
+                );
+            }
+        }
         if active_villager_ids.is_empty() {
             return (0, Vec::new());
         }
+        let mut active_villagers = inner
+            .entities
+            .snapshots_for_ids_uncached(&active_villager_ids);
         let mut dispatches = Vec::new();
         dispatches.extend(advance_active_villager_ages_locked(
             &mut inner,
-            &active_villager_ids,
+            &mut active_villagers,
             elapsed_ticks,
         ));
-        cleanup_orphaned_active_courtships_locked(&mut inner, &active_villager_ids);
+        cleanup_orphaned_active_courtships_locked(&mut inner, &mut active_villagers);
         dispatches.extend(pick_up_villager_food_locked(
             &mut inner,
-            &active_villager_ids,
+            &mut active_villagers,
             current_tick,
             food_items,
         ));
         dispatches.extend(share_one_villager_food_stack_locked(
             &mut inner,
-            &active_villager_ids,
+            &mut active_villagers,
             current_tick,
             food_items,
             item_type_id,
         ));
         dispatches.extend(start_one_villager_courtship_locked(
             &mut inner,
-            &active_villager_ids,
+            &mut active_villagers,
             current_tick,
             food_items,
         ));
@@ -184,19 +223,16 @@ pub(super) fn rebuild_villager_population_indexes_locked(
 
 fn advance_active_villager_ages_locked(
     inner: &mut SessionEntityGuards<'_>,
-    active_ids: &HashSet<EntityId>,
+    active_villagers: &mut [EntitySnapshot],
     elapsed_ticks: u32,
 ) -> Vec<VisibilityDispatch> {
     if elapsed_ticks == 0 {
         return Vec::new();
     }
-    let mut ids = active_ids.iter().copied().collect::<Vec<_>>();
-    ids.sort_unstable();
+    let mut villagers = active_villagers.iter_mut().collect::<Vec<_>>();
+    villagers.sort_unstable_by_key(|snapshot| snapshot.id);
     let mut dispatches = Vec::new();
-    for entity_id in ids {
-        let Some(expected) = inner.entities.snapshot(entity_id) else {
-            continue;
-        };
+    for expected in villagers {
         if expected.lifecycle != EntityLifecycle::Alive
             || expected.type_name != "minecraft:villager"
         {
@@ -216,17 +252,21 @@ fn advance_active_villager_ages_locked(
         }
         if !inner
             .entities
-            .replace_snapshot_if_current(expected, next.clone())
+            .replace_snapshot_if_current(expected.clone(), next.clone())
         {
+            if let Some(current) = inner.entities.snapshot(expected.id) {
+                *expected = current;
+            }
             continue;
         }
+        *expected = next.clone();
         let published = server_entity_snapshot_from(next);
         inner
             .published_entity_snapshots
-            .insert(entity_id, published.clone());
+            .insert(expected.id, published.clone());
         if became_adult {
             let recipients =
-                session_recipients(inner, visible_entity_observers_locked(inner, entity_id));
+                session_recipients(inner, visible_entity_observers_locked(inner, expected.id));
             let updates = visibility_dispatches(recipients, || {
                 OutboundCommand::UpdateEntityData(published.clone())
             });
@@ -239,25 +279,31 @@ fn advance_active_villager_ages_locked(
 
 fn cleanup_orphaned_active_courtships_locked(
     inner: &mut SessionEntityGuards<'_>,
-    active_ids: &HashSet<EntityId>,
+    active_villagers: &mut [EntitySnapshot],
 ) {
-    let orphaned = active_ids
+    let orphaned = active_villagers
         .iter()
-        .copied()
-        .filter(|entity_id| {
-            inner.entities.snapshot(*entity_id).is_some_and(|snapshot| {
-                snapshot
-                    .retained
-                    .villager_population
-                    .as_ref()
-                    .is_some_and(|population| population.pending_birth.is_some())
-            }) && !inner
-                .villager_birth_deadline_by_parent
-                .contains_key(entity_id)
+        .filter(|snapshot| {
+            snapshot
+                .retained
+                .villager_population
+                .as_ref()
+                .is_some_and(|population| population.pending_birth.is_some())
+                && !inner
+                    .villager_birth_deadline_by_parent
+                    .contains_key(&snapshot.id)
         })
+        .map(|snapshot| snapshot.id)
         .collect::<Vec<_>>();
     for entity_id in orphaned {
         abort_villager_courtship_locked(inner, &[entity_id]);
+        if let Some(current) = inner.entities.snapshot(entity_id)
+            && let Some(snapshot) = active_villagers
+                .iter_mut()
+                .find(|snapshot| snapshot.id == entity_id)
+        {
+            *snapshot = current;
+        }
     }
 }
 
@@ -306,22 +352,28 @@ fn abort_villager_courtship_locked(inner: &mut SessionEntityGuards<'_>, entity_i
 
 fn pick_up_villager_food_locked(
     inner: &mut SessionEntityGuards<'_>,
-    active_ids: &HashSet<EntityId>,
+    active_villagers: &mut [EntitySnapshot],
     current_tick: u64,
     food_items: VillagerFoodItemIds,
 ) -> Vec<VisibilityDispatch> {
-    let mut villager_ids = active_ids.iter().copied().collect::<Vec<_>>();
-    villager_ids.sort_unstable();
+    if !inner
+        .published_entity_snapshots
+        .values()
+        .any(|snapshot| snapshot.type_name == "minecraft:item")
+    {
+        return Vec::new();
+    }
+    let mut villager_indices = (0..active_villagers.len()).collect::<Vec<_>>();
+    villager_indices.sort_unstable_by_key(|&index| active_villagers[index].id);
     let mut dispatches = Vec::new();
     let mut committed = 0_usize;
 
-    for villager_id in villager_ids {
+    for villager_index in villager_indices {
         if committed >= MAX_VILLAGER_FOOD_PICKUPS_PER_TICK {
             break;
         }
-        let Some(villager) = inner.entities.snapshot(villager_id) else {
-            continue;
-        };
+        let villager = active_villagers[villager_index].clone();
+        let villager_id = villager.id;
         if villager.lifecycle != EntityLifecycle::Alive
             || villager.type_name != "minecraft:villager"
             || villager.retained.villager_population.is_none()
@@ -383,13 +435,17 @@ fn pick_up_villager_food_locked(
             let transition = (item.clone(), item_next.clone());
             if !inner.entities.commit_villager_inventory_pickup_if_current(
                 mc_entity::VillagerInventoryPickupCommit {
-                    villager: (villager.clone(), villager_next),
+                    villager: (villager.clone(), villager_next.clone()),
                     item: transition.clone(),
                     item_max_stack_size: VILLAGER_FOOD_MAX_STACK_SIZE,
                 },
             ) {
+                if let Some(current) = inner.entities.snapshot(villager_id) {
+                    active_villagers[villager_index] = current;
+                }
                 continue;
             }
+            active_villagers[villager_index] = villager_next;
             dispatches.extend(publish_item_transition_locked(inner, &transition));
             committed += 1;
             break;
@@ -400,15 +456,14 @@ fn pick_up_villager_food_locked(
 
 fn share_one_villager_food_stack_locked(
     inner: &mut SessionEntityGuards<'_>,
-    active_ids: &HashSet<EntityId>,
+    active_villagers: &mut [EntitySnapshot],
     current_tick: u64,
     food_items: VillagerFoodItemIds,
     item_type_id: i32,
 ) -> Vec<VisibilityDispatch> {
-    let mut villagers = active_ids
-        .iter()
-        .filter_map(|entity_id| inner.entities.snapshot(*entity_id))
-        .filter(|snapshot| {
+    let mut villagers = (0..active_villagers.len())
+        .filter(|&index| {
+            let snapshot = &active_villagers[index];
             snapshot.lifecycle == EntityLifecycle::Alive
                 && snapshot.type_name == "minecraft:villager"
                 && snapshot
@@ -418,16 +473,19 @@ fn share_one_villager_food_stack_locked(
                     .is_some_and(|population| population.pending_birth.is_none())
         })
         .collect::<Vec<_>>();
-    villagers.sort_unstable_by_key(|snapshot| snapshot.id);
+    villagers.sort_unstable_by_key(|&index| active_villagers[index].id);
 
-    for donor in &villagers {
+    'donors: for &donor_index in &villagers {
+        let donor = &active_villagers[donor_index];
         let Some(donor_population) = donor.retained.villager_population.as_ref() else {
             continue;
         };
         if !donor_population.has_excess_food(food_items) {
             continue;
         }
-        for recipient in &villagers {
+        let donor = donor.clone();
+        for &recipient_index in &villagers {
+            let recipient = &active_villagers[recipient_index];
             if donor.id == recipient.id
                 || distance_squared(donor.position, recipient.position)
                     > VILLAGER_COURTSHIP_DISTANCE_SQUARED
@@ -491,7 +549,7 @@ fn share_one_villager_food_stack_locked(
             thrown.retained.villager_food_recipient = Some(recipient.id);
             let Some(thrown) = inner.entities.commit_villager_food_share_if_current(
                 mc_entity::VillagerFoodShareCommit {
-                    donor: (donor.clone(), donor_next),
+                    donor: (donor.clone(), donor_next.clone()),
                     recipient: recipient.clone(),
                     thrown_item: thrown,
                     food_items,
@@ -499,8 +557,12 @@ fn share_one_villager_food_stack_locked(
                     current_tick,
                 },
             ) else {
-                continue;
+                if let Some(current) = inner.entities.snapshot(donor.id) {
+                    active_villagers[donor_index] = current;
+                }
+                continue 'donors;
             };
+            active_villagers[donor_index] = donor_next;
 
             let thrown_id = thrown.id;
             inner
@@ -518,17 +580,16 @@ fn share_one_villager_food_stack_locked(
 
 fn start_one_villager_courtship_locked(
     inner: &mut SessionEntityGuards<'_>,
-    active_ids: &HashSet<EntityId>,
+    active_villagers: &mut [EntitySnapshot],
     current_tick: u64,
     food_items: VillagerFoodItemIds,
 ) -> Vec<VisibilityDispatch> {
     if MAX_NEW_COURTSHIPS_PER_TICK == 0 {
         return Vec::new();
     }
-    let mut villagers = active_ids
-        .iter()
-        .filter_map(|entity_id| inner.entities.snapshot(*entity_id))
-        .filter(|snapshot| {
+    let mut villagers = (0..active_villagers.len())
+        .filter(|&index| {
+            let snapshot = &active_villagers[index];
             snapshot.lifecycle == EntityLifecycle::Alive
                 && snapshot.type_name == "minecraft:villager"
                 && snapshot
@@ -538,18 +599,22 @@ fn start_one_villager_courtship_locked(
                     .is_some_and(|population| population.can_breed(false, food_items))
         })
         .collect::<Vec<_>>();
-    villagers.sort_unstable_by_key(|snapshot| snapshot.id);
+    villagers.sort_unstable_by_key(|&index| active_villagers[index].id);
 
-    for first_index in 0..villagers.len() {
-        for second_index in first_index + 1..villagers.len() {
-            let first = &villagers[first_index];
-            let second = &villagers[second_index];
+    for first_offset in 0..villagers.len() {
+        for second_offset in first_offset + 1..villagers.len() {
+            let first_index = villagers[first_offset];
+            let second_index = villagers[second_offset];
+            let first = &active_villagers[first_index];
+            let second = &active_villagers[second_index];
             if distance_squared(first.position, second.position)
                 > VILLAGER_INTERACTION_RANGE * VILLAGER_INTERACTION_RANGE
             {
                 continue;
             }
             let seed = courtship_seed(first, second, current_tick);
+            let first = first.clone();
+            let second = second.clone();
             let mut first_next = first.clone();
             let mut second_next = second.clone();
             let first_population = first_next
@@ -585,14 +650,25 @@ fn start_one_villager_courtship_locked(
                 speed: mc_entity::villager_population_26_1_2::VILLAGER_COURTSHIP_SPEED,
             };
             let commit = mc_entity::VillagerCourtshipCommit {
-                parents: [(first.clone(), first_next), (second.clone(), second_next)],
+                parents: [
+                    (first.clone(), first_next.clone()),
+                    (second.clone(), second_next.clone()),
+                ],
                 current_tick,
                 food_items,
                 deterministic_seed: seed,
             };
             if !inner.entities.commit_villager_courtship_if_current(commit) {
+                if let Some(current) = inner.entities.snapshot(first.id) {
+                    active_villagers[first_index] = current;
+                }
+                if let Some(current) = inner.entities.snapshot(second.id) {
+                    active_villagers[second_index] = current;
+                }
                 continue;
             }
+            active_villagers[first_index] = first_next;
+            active_villagers[second_index] = second_next;
 
             let pair = sorted_pair(first.id, second.id);
             schedule_villager_birth_locked(inner, pair, ready_tick);
@@ -1366,5 +1442,151 @@ mod bread_only_legacy_tests {
         );
         assert_eq!(VILLAGER_PARENT_COOLDOWN_TICKS, 6_000);
         assert!(Rotation::ZERO.is_finite());
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use std::sync::Arc;
+
+    use mc_entity::EntityItemStack;
+
+    use super::*;
+
+    const VILLAGER_TYPE_ID: i32 = 139;
+    const ITEM_TYPE_ID: i32 = 70;
+    const FOOD_ITEMS: VillagerFoodItemIds = VillagerFoodItemIds {
+        bread: 41,
+        potato: 42,
+        carrot: 43,
+        beetroot: 44,
+    };
+
+    fn spawn_population_villager(
+        registry: &SessionRegistry,
+        position: Vec3,
+        population: VillagerPopulationState,
+    ) -> EntityId {
+        let mut inner = registry.lock_session_entities("spawn population selection fixture");
+        let mut entity = SpawnEntity::new(VILLAGER_TYPE_ID, "minecraft:villager", position);
+        entity.retained.villager = Some(VillagerData::new(
+            VillagerKind::Plains,
+            VillagerProfession::None,
+            1,
+        ));
+        entity.retained.villager_population = Some(population);
+        entity.retained.villager_brain = Some(VillagerBrainState::adult(VillagerPoiSet::default()));
+        apply_entity_facts(&mut entity);
+        let id = inner.entities.spawn(entity);
+        let snapshot = inner.entities.snapshot(id).expect("spawned villager");
+        inner.villager_entities.insert(id);
+        track_entity_chunk_locked(&mut inner, id, snapshot.position);
+        let published = server_entity_snapshot_from(snapshot);
+        initialize_entity_wire_state_from_snapshot_locked(&mut inner, &published);
+        inner.published_entity_snapshots.insert(id, published);
+        id
+    }
+
+    fn activate(registry: &SessionRegistry, ids: impl IntoIterator<Item = EntityId>) {
+        let chunks = ids
+            .into_iter()
+            .filter_map(|entity| registry.simulation_inputs.entity_chunk(entity))
+            .collect();
+        registry.active_simulation_chunks.store(Arc::new(chunks));
+    }
+
+    #[test]
+    fn active_donor_selects_passive_nearby_recipient() {
+        let registry = SessionRegistry::new();
+        let mut donor_population = VillagerPopulationState::adult();
+        assert!(
+            donor_population
+                .add_to_inventory(EntityItemStack::new(FOOD_ITEMS.bread, 25), 64)
+                .expect("valid villager inventory")
+                .is_none()
+        );
+        let donor =
+            spawn_population_villager(&registry, Vec3::new(15.5, 64.0, 0.5), donor_population);
+        let recipient = spawn_population_villager(
+            &registry,
+            Vec3::new(16.5, 64.0, 0.5),
+            VillagerPopulationState::adult(),
+        );
+        activate(&registry, [donor, recipient]);
+        let selection = VillagerPopulationSelection {
+            candidates: HashSet::from([donor]),
+            covered: HashSet::from([donor, recipient]),
+            proximity_seeds: vec![Vec3::new(15.5, 64.0, 0.5)],
+        };
+
+        registry.tick_villager_population(
+            &SimulationAuthority::for_test(),
+            &selection,
+            100,
+            FOOD_ITEMS,
+            VILLAGER_TYPE_ID,
+            ITEM_TYPE_ID,
+            1,
+        );
+
+        let shared = registry
+            .lock_entities("verify passive food recipient")
+            .snapshots()
+            .find(|snapshot| {
+                snapshot.retained.villager_food_recipient == Some(recipient)
+                    && snapshot
+                        .item_stack
+                        .as_ref()
+                        .is_some_and(|stack| stack.item_id == FOOD_ITEMS.bread)
+            });
+        assert!(
+            shared.is_some(),
+            "nearby passive recipient was not selected"
+        );
+    }
+
+    #[test]
+    fn item_seed_selects_villager_across_chunk_boundary() {
+        let registry = SessionRegistry::new();
+        let villager = spawn_population_villager(
+            &registry,
+            Vec3::new(15.75, 64.0, 0.5),
+            VillagerPopulationState::adult(),
+        );
+        registry.spawn_item_drop(
+            ITEM_TYPE_ID,
+            Vec3::new(16.25, 64.0, 0.5),
+            EntityItemStack::new(FOOD_ITEMS.bread, 1),
+        );
+        activate(&registry, [villager]);
+        let selection = VillagerPopulationSelection {
+            candidates: HashSet::new(),
+            covered: HashSet::from([villager]),
+            proximity_seeds: vec![Vec3::new(16.25, 64.0, 0.5)],
+        };
+
+        registry.tick_villager_population(
+            &SimulationAuthority::for_test(),
+            &selection,
+            100,
+            FOOD_ITEMS,
+            VILLAGER_TYPE_ID,
+            ITEM_TYPE_ID,
+            1,
+        );
+
+        let snapshot = registry
+            .lock_entities("verify boundary food pickup")
+            .snapshot(villager)
+            .expect("villager remains alive");
+        assert_eq!(
+            snapshot
+                .retained
+                .villager_population
+                .expect("villager population")
+                .inventory
+                .food_points(FOOD_ITEMS),
+            4
+        );
     }
 }

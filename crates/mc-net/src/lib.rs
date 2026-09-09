@@ -60,7 +60,7 @@ pub use loader::{
     LOADER_ARTIFACT_CHUNK_BYTES, LOADER_PROTOCOL_VERSION, LoaderArtifactRequest, LoaderBundle,
     LoaderClientAck, LoaderContentKind, LoaderHandshakeError, LoaderManifest, LoaderPermission,
     LoaderPlatform, LoaderSession, loader_ack_channel, loader_artifact_channel,
-    loader_manifest_channel, loader_open_screen_channel, loader_request_channel,
+    loader_manifest_channel, loader_request_channel, loader_ui_channel,
 };
 #[cfg(feature = "load-bench")]
 pub use lock_metrics::reset_lock_pressure_metrics;
@@ -74,8 +74,7 @@ pub use operator_metrics::{
 };
 pub use play::{
     DEFAULT_VIEW_DISTANCE, EntityEffectHandle, EntityEffectRequestError, ITEM_DESPAWN_AGE_TICKS,
-    MAX_NATURAL_SPAWN_CAP, MAX_NATURAL_SPAWN_CHUNK_BUDGET, PlayerAttackObservation,
-    RandomTickPolicy,
+    MAX_NATURAL_SPAWN_CHUNK_BUDGET, PlayerAttackObservation, RandomTickPolicy,
 };
 pub use runtime_tick_metrics::{RuntimeLatencyPercentiles, RuntimeTickPercentiles};
 pub use script::PluginStorageStartError;
@@ -83,7 +82,7 @@ pub use server::{
     BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OperatorFactsHandle,
     OutboundPressureHandle, OutboundPressureSnapshot, RuntimeTelemetryHandle,
     RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle, ServerConfig,
-    ShutdownHandle, WorldHandle, bind, bind_with_extension, bind_with_scripts, run,
+    ShutdownHandle, WorldHandle, bind, bind_with_scripts, run,
 };
 #[cfg(feature = "load-bench")]
 pub use server::{

@@ -33,6 +33,9 @@ use crate::light::ChunkLight;
 use crate::resident::{ResidentChunkStore, WorldMutationView};
 use crate::section::SECTION_DIM;
 
+#[cfg(test)]
+mod admission_tests;
+mod block_edits;
 mod budget;
 mod dirty_flush;
 mod read_view;
@@ -44,6 +47,7 @@ use world_lease::{WorldRootLease, acquire_world_root_lease};
 
 pub use dirty_flush::{
     DirtyFlushCommit, DirtyFlushFinalize, DirtyFlushInstall, DirtyFlushPlan, DirtyFlushSynced,
+    JournalBarrier,
 };
 pub(crate) use read_view::ResidentPublicationState;
 pub use read_view::{
@@ -91,6 +95,8 @@ pub enum WorldError {
     },
     #[error("world was opened read-only and cannot be flushed: {0}")]
     ReadOnlyWorld(PathBuf),
+    #[error("journal durability barrier failed: {0}")]
+    JournalBarrier(#[source] std::io::Error),
     #[error(
         "chunk cache pressure: request {requested_bytes} bytes, resident {resident_bytes}/{resident_budget}, dirty {dirty_bytes}/{dirty_budget}, save_healthy={save_healthy}"
     )]
@@ -157,6 +163,8 @@ pub struct WorldStorage {
     world_root: Option<PathBuf>,
     _world_lease: Option<Arc<WorldRootLease>>,
     read_only: bool,
+    dirty_flush_cursor: Option<ChunkPos>,
+    journal_barrier: Option<JournalBarrier>,
     region_root: PathBuf,
     registry: Arc<BlockRegistry>,
     /// Canonical resident chunks, partitioned into independently locked 8x8 regions.
@@ -340,6 +348,8 @@ impl WorldStorage {
             world_root: Some(dir.to_path_buf()),
             _world_lease: world_lease,
             read_only,
+            dirty_flush_cursor: None,
+            journal_barrier: None,
             region_root,
             registry,
             resident,
@@ -384,6 +394,8 @@ impl WorldStorage {
             world_root: None,
             _world_lease: None,
             read_only: false,
+            dirty_flush_cursor: None,
+            journal_barrier: None,
             region_root: PathBuf::new(),
             registry,
             resident,
@@ -560,7 +572,13 @@ impl WorldStorage {
         if !self.can_cache_new_chunk(cpos) {
             return Ok(None);
         }
-        self.commit_chunk_snapshot(cpos, chunk).map(Some)
+        // The optimistic probe cannot account for retained clean entries or
+        // the incoming chunk's exact size. Actual admission may still defer.
+        match self.commit_chunk_snapshot(cpos, chunk) {
+            Ok(chunk) => Ok(Some(chunk)),
+            Err(WorldError::ChunkCachePressure { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     #[must_use]
@@ -569,11 +587,7 @@ impl WorldStorage {
             return true;
         }
         let (resident_bytes, dirty_bytes) = self.chunk_byte_usage();
-        let clean_evictable = self
-            .resident
-            .snapshots()
-            .into_iter()
-            .any(|(_, chunk)| !chunk.dirty);
+        let clean_evictable = self.resident.dirty_count() < self.resident.len();
         (clean_evictable
             || self.resident.len() < self.capacity && resident_bytes < self.resident_byte_budget)
             && dirty_bytes < self.dirty_byte_budget
@@ -827,26 +841,6 @@ impl WorldStorage {
         Ok(true)
     }
 
-    pub fn set_opaque_block_entity(
-        &mut self,
-        pos: BlockPos,
-        bytes: Vec<u8>,
-    ) -> Result<bool, WorldError> {
-        let cpos = chunk_pos_of(pos);
-        if self.ensure_chunk(cpos)?.is_none() {
-            return Ok(false);
-        }
-        self.resident
-            .mutate(cpos, |chunk| {
-                if chunk.block_entities.get(&pos) != Some(&bytes) {
-                    chunk.block_entities.insert(pos, bytes);
-                    chunk.mark_dirty();
-                }
-            })
-            .expect("ensured chunk remains resident");
-        Ok(true)
-    }
-
     pub fn scheduled_block_ticks(
         &mut self,
         cpos: ChunkPos,
@@ -1055,8 +1049,11 @@ impl WorldStorage {
             return Ok(false);
         }
         chunk.mark_dirty();
-        self.insert_chunk(cpos, chunk)?;
-        Ok(true)
+        match self.insert_chunk(cpos, chunk) {
+            Ok(()) => Ok(true),
+            Err(WorldError::ChunkCachePressure { .. }) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<ChunkSnapshot>, WorldError> {
@@ -2708,60 +2705,6 @@ mod tests {
         assert!(world.plan_dirty_flush().unwrap().is_empty());
         assert_eq!(mutation.clear_journal_pending_conditionally(7, &[cpos]), 1);
         assert_eq!(world.plan_dirty_flush().unwrap().chunk_count(), 1);
-    }
-
-    #[test]
-    fn resident_opaque_block_entity_commit_rejects_stale_token() {
-        let registry = air_stone_registry();
-        let mut world = WorldStorage::in_memory(registry);
-        let cpos = ChunkPos { x: 0, z: 0 };
-        let position = BlockPos { x: 1, y: 2, z: 3 };
-        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
-        world
-            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
-            .unwrap();
-        world.set_block_at(position, BlockStateId(1)).unwrap();
-        let stale_token = world.block_mutation_token(position).unwrap();
-        world.set_block_at(position, BlockStateId(0)).unwrap();
-        world.set_block_at(position, BlockStateId(1)).unwrap();
-        let current_token = world.block_mutation_token(position).unwrap();
-        let mutation = world.mutation_view();
-        let bytes = vec![10, 0, 0, 0];
-
-        assert_eq!(
-            mutation.commit_opaque_block_entity_conditionally(
-                position,
-                BlockStateId(1),
-                stale_token,
-                bytes.clone(),
-            ),
-            crate::ResidentOpaqueBlockEntityCommitResult::Stale
-        );
-        assert!(
-            !world
-                .cached_chunk(cpos)
-                .unwrap()
-                .block_entities
-                .contains_key(&position)
-        );
-
-        assert_eq!(
-            mutation.commit_opaque_block_entity_conditionally(
-                position,
-                BlockStateId(1),
-                current_token,
-                bytes.clone(),
-            ),
-            crate::ResidentOpaqueBlockEntityCommitResult::Applied
-        );
-        assert_eq!(
-            world
-                .cached_chunk(cpos)
-                .unwrap()
-                .block_entities
-                .get(&position),
-            Some(&bytes)
-        );
     }
 
     #[test]

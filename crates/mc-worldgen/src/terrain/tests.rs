@@ -485,51 +485,105 @@ fn land_biome_family(g: &TerrainGenerator, biome: &Identifier) -> Option<&'stati
 }
 
 #[test]
-fn generated_leaf_state_is_connected_but_not_persistent() {
+fn generated_leaf_distances_follow_nearest_logs_and_preserve_decay() {
     use mc_data::blocks::{BlockReport, BlockStateReport};
 
-    let properties = BTreeMap::from([
-        (
-            "distance".to_string(),
-            (1..=7).map(|value| value.to_string()).collect(),
-        ),
-        (
-            "persistent".to_string(),
-            vec!["true".to_string(), "false".to_string()],
-        ),
-        (
-            "waterlogged".to_string(),
-            vec!["true".to_string(), "false".to_string()],
-        ),
-    ]);
-    let leaf_properties = |distance: &str| {
-        BTreeMap::from([
-            ("distance".to_string(), distance.to_string()),
-            ("persistent".to_string(), "false".to_string()),
-            ("waterlogged".to_string(), "false".to_string()),
-        ])
-    };
-    let registry = BlockRegistry::from_report(&[BlockReport {
+    let mut report = [
+        "minecraft:air",
+        "minecraft:bedrock",
+        "minecraft:stone",
+        "minecraft:dirt",
+        "minecraft:grass_block",
+        "minecraft:iron_ore",
+        "minecraft:oak_log",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(id, name)| BlockReport {
+        id: Identifier::parse(name).unwrap(),
+        properties: BTreeMap::new(),
+        states: vec![BlockStateReport {
+            id: id as u32,
+            default: true,
+            properties: BTreeMap::new(),
+        }],
+    })
+    .collect::<Vec<_>>();
+    report.push(BlockReport {
         id: Identifier::parse("minecraft:oak_leaves").unwrap(),
-        properties,
-        states: vec![
-            BlockStateReport {
-                id: 0,
-                default: true,
-                properties: leaf_properties("7"),
-            },
-            BlockStateReport {
-                id: 1,
-                default: false,
-                properties: leaf_properties("1"),
-            },
-        ],
-    }])
+        properties: BTreeMap::from([
+            (
+                "distance".to_string(),
+                (1..=7).map(|distance| distance.to_string()).collect(),
+            ),
+            ("persistent".to_string(), vec!["false".to_string()]),
+            ("waterlogged".to_string(), vec!["false".to_string()]),
+        ]),
+        states: (1..=7)
+            .map(|distance| BlockStateReport {
+                id: 6 + distance,
+                default: distance == 7,
+                properties: BTreeMap::from([
+                    ("distance".to_string(), distance.to_string()),
+                    ("persistent".to_string(), "false".to_string()),
+                    ("waterlogged".to_string(), "false".to_string()),
+                ]),
+            })
+            .collect(),
+    });
+    let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+    let generator = TerrainGenerator::try_with_rules(
+        42,
+        registry.clone(),
+        BiomeRules::vanilla_overworld(),
+        OreRules::new(Vec::new()).unwrap(),
+    )
     .unwrap();
+    let mut chunk = generator.generate(ChunkPos { x: 0, z: 0 });
+    let y = generator.geometry.max_y() - 4;
+    let log = optional_block(&registry, "minecraft:oak_log").unwrap();
+    let initial_leaf = optional_generated_leaves(&registry, "minecraft:oak_leaves").unwrap();
+    chunk.set_block(0, y, 0, log);
+    chunk.set_block(1, y, 8, log);
+    let mut leaves = Vec::new();
+    for offset in (1..=8).rev() {
+        for (x, z) in [(offset, 0), (0, offset)] {
+            chunk.set_block(x, y, z, initial_leaf);
+            leaves.push((x, y, z));
+        }
+    }
+    chunk.set_block(15, y, 15, initial_leaf);
+    leaves.push((15, y, 15));
+    generator.initialize_leaf_distances(&mut chunk, &mut leaves);
 
+    for offset in 1..=8 {
+        for (x, z, expected) in [
+            (offset, 0, offset.min(7)),
+            (0, offset, offset.min(9 - offset)),
+        ] {
+            let state = chunk.get_block(x, y, z).unwrap();
+            assert_eq!(
+                mc_world::plant_rules_26_1_2::leaf_distance_from_state(&registry, state),
+                expected,
+                "leaf at ({x}, {y}, {z}) must use its nearest supporting log"
+            );
+            assert!(
+                registry
+                    .by_id(state)
+                    .unwrap()
+                    .properties
+                    .iter()
+                    .any(|(key, value)| key == "persistent" && value == "false")
+            );
+        }
+    }
     assert_eq!(
-        optional_generated_leaves(&registry, "minecraft:oak_leaves"),
-        Some(BlockStateId(1))
+        mc_world::plant_rules_26_1_2::leaf_distance_from_state(
+            &registry,
+            chunk.get_block(15, y, 15).unwrap()
+        ),
+        7,
+        "an isolated leaf remains eligible for natural decay"
     );
 }
 
@@ -2020,8 +2074,11 @@ fn surface_vegetation_density_is_moderate_and_biome_specific() {
             "sampled only {eligible_count} {label} columns"
         );
         assert!(decorated_count > 20, "{label} vegetation became too sparse");
+        // Jungle is the densest overworld forest; holding it to the same
+        // 1/8 cover cap as plains forces the sparse-jungle defect back.
+        let cover_limit = if index == 2 { 4 } else { 8 };
         assert!(
-            decorated_count * 8 <= eligible_count,
+            decorated_count * cover_limit <= eligible_count,
             "{label} vegetation is too dense: {decorated_count}/{eligible_count} eligible columns"
         );
     }
@@ -2033,6 +2090,114 @@ fn surface_vegetation_density_is_moderate_and_biome_specific() {
         decorated[1],
         eligible[1]
     );
+}
+
+#[test]
+fn jungle_admits_trees_more_often_than_forest_and_plains() {
+    let generator = TerrainGenerator::new(42, tiny_registry());
+    let mut eligible = [0usize; 3];
+    let mut candidates = [0usize; 3];
+    for chunk_x in (-256..=256).step_by(32) {
+        for chunk_z in (-256..=256).step_by(32) {
+            let pos = ChunkPos {
+                x: chunk_x,
+                z: chunk_z,
+            };
+            for lx in 0..16u8 {
+                for lz in 0..16u8 {
+                    let plan = generator.plan_column(pos, lx, lz);
+                    let category = if generator.biomes.jungle.contains(&plan.biome) {
+                        2
+                    } else if generator.biomes.temperate_forest.contains(&plan.biome) {
+                        1
+                    } else if generator.biomes.grassland.contains(&plan.biome) {
+                        0
+                    } else {
+                        continue;
+                    };
+                    eligible[category] += 1;
+                    candidates[category] += usize::from(
+                        generator
+                            .tree_spacing_for_biome(&plan.biome)
+                            .is_some_and(|spacing| plan.hash.is_multiple_of(spacing))
+                            && generator.tree_density_allows(&plan),
+                    );
+                }
+            }
+        }
+    }
+    for (index, label) in ["grassland", "forest", "jungle"].into_iter().enumerate() {
+        assert!(
+            eligible[index] > 256,
+            "sampled only {eligible_count} {label} columns",
+            eligible_count = eligible[index]
+        );
+    }
+    assert!(
+        candidates[2] * eligible[1] > candidates[1] * eligible[2],
+        "jungle must admit trees more often than forest: {}/{} versus {}/{}",
+        candidates[2],
+        eligible[2],
+        candidates[1],
+        eligible[1]
+    );
+    assert!(
+        candidates[2] * eligible[0] > candidates[0] * eligible[2],
+        "jungle must admit trees more often than plains: {}/{} versus {}/{}",
+        candidates[2],
+        eligible[2],
+        candidates[0],
+        eligible[0]
+    );
+}
+
+#[test]
+fn generated_jungles_have_both_bushes_and_trees_across_seeds() {
+    for (seed, x, z) in [
+        (5617830, 192i32, -64i32),
+        (712816, -3200, 7872),
+        (-17711, 1152, -192),
+    ] {
+        let generator = TerrainGenerator::with_worldgen_mode(
+            seed,
+            tiny_registry(),
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        let log = generator.decorations.jungle_log.unwrap();
+        let leaves = generator.decorations.oak_leaves.unwrap();
+        let mut bushes = 0;
+        let mut trees = 0;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let pos = ChunkPos {
+                    x: x.div_euclid(16) + dx,
+                    z: z.div_euclid(16) + dz,
+                };
+                let chunk = generator.generate(pos);
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let plan = generator.plan_column(pos, lx, lz);
+                        if !generator.biomes.jungle.contains(&plan.biome) {
+                            continue;
+                        }
+                        let root = plan.height + 1;
+                        if chunk.get_block(lx, root, lz) != Some(log) {
+                            continue;
+                        }
+                        if chunk.get_block(lx, root + 1, lz) == Some(log) {
+                            trees += 1;
+                        } else if chunk.get_block(lx, root + 1, lz) == Some(leaves)
+                            && chunk.get_block(lx, root + 2, lz) == Some(leaves)
+                        {
+                            bushes += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bushes > 0, "seed {seed} has no rooted jungle undergrowth");
+        assert!(trees > 0, "seed {seed} lost its jungle tree layer");
+    }
 }
 
 #[test]

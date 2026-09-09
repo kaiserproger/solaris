@@ -325,8 +325,7 @@ async fn cancelled_connection_cleanup_retains_owner_state_for_checkpoint() {
         Poll::Ready(())
     })
     .await;
-    let cleanup =
-        RegisteredSessionCleanup::new(Arc::clone(&sessions), session_id, None, None, None);
+    let cleanup = RegisteredSessionCleanup::new(Arc::clone(&sessions), session_id, None, None);
     drop(cleanup);
     tokio::time::timeout(Duration::from_secs(1), save_requested)
         .await
@@ -374,7 +373,6 @@ async fn periodic_checkpoint_persists_cancelled_connection_owner_state() {
     drop(RegisteredSessionCleanup::new(
         Arc::clone(&sessions),
         session_id,
-        None,
         None,
         None,
     ));

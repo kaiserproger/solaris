@@ -12,21 +12,19 @@ repository.workspace = true
 workspace = true
 
 [features]
-load-bench = ["mc-script/lua-runtime"]
+load-bench = ["mc-script/lua-runtime", "mc-entity/load-bench"]
 
 [dependencies]
 arc-swap = { workspace = true }
 mc-data = { path = "../mc-data" }
 mc-domain = { path = "../mc-domain" }
 mc-entity = { path = "../mc-entity" }
-mc-extension = { path = "../mc-extension" }
 mc-nbt = { path = "../mc-nbt" }
 mc-physics = { path = "../mc-physics" }
 mc-protocol = { path = "../mc-protocol" }
 mc-script = { path = "../mc-script" }
 mc-world = { path = "../mc-world" }
 bytes = { workspace = true }
-fd-lock = { workspace = true }
 flate2 = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

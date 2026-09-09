@@ -31,7 +31,7 @@ if [[ $# -eq 1 ]]; then
     esac
 fi
 
-for fixture_command in zip zipinfo sha256sum stat sed cmp; do
+for fixture_command in zip zipinfo sha256sum stat sed cmp ffmpeg; do
     if ! command -v "$fixture_command" >/dev/null 2>&1; then
         printf 'Missing fixture build command: %s\n' "$fixture_command" >&2
         exit 1
@@ -56,17 +56,26 @@ build_owner() {
     local stage_root="$FIXTURE_TMP/$owner-stage"
     local item_path="assets/$owner/items/$item_name.json"
     local block_path="assets/$owner/models/block/${item_name}_block.json"
+    local sound_path="assets/$owner/sounds/tone.ogg"
+    local frequency=440
+    [[ "$owner" == "sapphire-live" ]] && frequency=660
     local archive_output="$FIXTURE_TMP/$owner-rich-content.zip"
     local manifest_output="$FIXTURE_TMP/$owner-plugin.toml"
 
     mkdir -p "$stage_root"
     cp -R "$source_root/assets" "$stage_root/assets"
+    mkdir -p "$stage_root/assets/$owner/sounds"
+    ffmpeg -v error -f lavfi -i "sine=frequency=$frequency:sample_rate=48000:duration=8" \
+        -fflags +bitexact -flags:a +bitexact -c:a libvorbis -q:a 4 -map_metadata -1 \
+        "$stage_root/$sound_path"
 
     sed \
         -e "s/@ITEM_SHA256@/$(sha256 "$source_root/$item_path")/g" \
         -e "s/@ITEM_SIZE@/$(stat -c %s "$source_root/$item_path")/g" \
         -e "s/@BLOCK_SHA256@/$(sha256 "$source_root/$block_path")/g" \
         -e "s/@BLOCK_SIZE@/$(stat -c %s "$source_root/$block_path")/g" \
+        -e "s/@SOUND_SHA256@/$(sha256 "$stage_root/$sound_path")/g" \
+        -e "s/@SOUND_SIZE@/$(stat -c %s "$stage_root/$sound_path")/g" \
         "$source_root/solaris-client.json.in" > "$stage_root/solaris-client.json"
 
     find "$stage_root" -type f -exec chmod 0644 {} +

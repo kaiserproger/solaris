@@ -105,13 +105,15 @@ pub(in crate::play) fn apply_loader_item_grant(
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
 ) -> Result<(), ScriptPlayerInventoryFailure> {
-    let mut updated = inventory.clone();
-    let max_stack = item_max_stack(item_facts, items, stack);
-    let (remaining, _) = updated.merge_stack(stack.clone(), max_stack);
-    if !remaining.is_empty() {
-        return Err(ScriptPlayerInventoryFailure::InventoryFull);
-    }
-    *inventory = updated.clone();
-    persisted.replace_inventory(updated);
+    persisted.inventory.try_update(|current| {
+        let mut updated = current.clone();
+        let max_stack = item_max_stack(item_facts, items, stack);
+        let (remaining, _) = updated.merge_stack(stack.clone(), max_stack);
+        if !remaining.is_empty() {
+            return Err(ScriptPlayerInventoryFailure::InventoryFull);
+        }
+        Ok(updated)
+    })?;
+    *inventory = persisted.inventory.clone();
     Ok(())
 }

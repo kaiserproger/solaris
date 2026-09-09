@@ -19,11 +19,8 @@ use bytes::{Buf, BytesMut};
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::codec::read_varint_partial;
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
-use mc_protocol::packets::CustomPayload;
 use mc_protocol::packets::Packet;
-use mc_protocol::packets::configuration::{
-    ClientboundCustomPayload, ClientboundKnownPacks, UpdateEnabledFeatures,
-};
+use mc_protocol::packets::configuration::{ClientboundKnownPacks, UpdateEnabledFeatures};
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{
     EncryptionRequest, EncryptionResponse, GameProfileProperty, LoginAcknowledged, LoginDisconnect,
@@ -363,13 +360,6 @@ async fn login_offline_flow_completes() {
     // Acknowledge — this transitions to Configuration state.
     write_frame(&mut stream, &LoginAcknowledged, compression).await;
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundCustomPayload::ID);
-    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
-    let CustomPayload::Brand(brand) = brand.payload else {
-        panic!("the first configuration packet must publish the server brand");
-    };
-    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, UpdateEnabledFeatures::ID);
     let _ = UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
@@ -667,12 +657,6 @@ async fn online_mode_completes_encrypted_login_with_fake_session_verifier() {
     let mut frame =
         read_one_encrypted_frame(&mut stream, &mut rbuf, &mut clientbound_cipher, compression)
             .await;
-    assert_eq!(frame.id, ClientboundCustomPayload::ID);
-    ClientboundCustomPayload::decode(&mut frame.body).unwrap();
-    assert_eq!(frame.body.remaining(), 0);
-    let mut frame =
-        read_one_encrypted_frame(&mut stream, &mut rbuf, &mut clientbound_cipher, compression)
-            .await;
     assert_eq!(frame.id, UpdateEnabledFeatures::ID);
     UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
     assert_eq!(frame.body.remaining(), 0);
@@ -756,9 +740,6 @@ async fn login_toml_whitelist_allows_normalized_offline_profile() {
     assert_eq!(success.uuid, mc_net::offline_uuid("Notch"));
 
     write_frame(&mut stream, &LoginAcknowledged, compression).await;
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundCustomPayload::ID);
-    ClientboundCustomPayload::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, UpdateEnabledFeatures::ID);
     UpdateEnabledFeatures::decode(&mut frame.body).unwrap();

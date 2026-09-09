@@ -214,19 +214,17 @@ External plugin packages are child directories of the configured root:
 ```toml
 [plugins]
 directory = "plugins"
-bundled = []
 strict = false
 expected = []
 ```
 
 For local authoring, permissive discovery may skip an ordinary broken plugin.
 For a controlled deployment, enable strict mode and enumerate the complete
-external-plus-bundled set:
+deployed set. Copy selected packages from `../solaris-default-plugins` first:
 
 ```toml
 [plugins]
 directory = "plugins"
-bundled = ["online-roster"]
 strict = true
 expected = ["online-roster", "my-plugin"]
 ```

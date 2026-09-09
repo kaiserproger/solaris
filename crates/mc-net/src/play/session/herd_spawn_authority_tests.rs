@@ -253,19 +253,20 @@ fn periodic_scheduler_is_bounded_rotating_and_intervals_are_independent() {
 }
 
 #[test]
-fn default_friendly_policy_reaches_and_refills_a_bounded_visible_population() {
-    const ALPHA2_OBSERVED_FRIENDLY_POPULATION: usize = 10;
-
-    let chunks = (2..18).map(|x| (x, 0)).collect::<HashSet<_>>();
+fn periodic_spawning_has_no_population_cap_and_preserves_collision_admission() {
+    let chunks = (2..6)
+        .flat_map(|x| (-2..2).map(move |z| (x, z)))
+        .collect::<HashSet<_>>();
     let (world_read, materials) =
         spawn_world_chunks(chunks.iter().copied(), SpawnTerrain::Ground, 0);
     let registry = SessionRegistry::new();
     let (_player, _receiver) = register_player(&registry, "DefaultPopulation", chunks.clone(), 20);
     for &chunk in &chunks {
-        let templates = [4, 8, 12]
+        let templates = [2, 6, 10, 14]
             .into_iter()
+            .flat_map(|x| [4, 12].map(move |z| (x, z)))
             .enumerate()
-            .map(|(slot, local_x)| {
+            .map(|(slot, (local_x, local_z))| {
                 template_in_chunk(
                     chunk,
                     TEST_Y,
@@ -273,7 +274,7 @@ fn default_friendly_policy_reaches_and_refills_a_bounded_visible_population() {
                     11,
                     "minecraft:cow",
                     local_x,
-                    8,
+                    local_z,
                     false,
                 )
             })
@@ -287,19 +288,15 @@ fn default_friendly_policy_reaches_and_refills_a_bounded_visible_population() {
         tick_input(400, 400, 0, 20, Some(&world_read), Some(&materials)),
     );
     assert_eq!(initial.friendly.chunks_sampled, 16);
-    assert_eq!(initial.friendly.committed, 32);
-    assert_eq!(initial.friendly.rejected_cap, 16);
-    assert!(
-        registry.persisted_entity_records().len() > ALPHA2_OBSERVED_FRIENDLY_POPULATION,
-        "the default policy should materially exceed alpha2's observed sparse population"
-    );
+    assert_eq!(initial.friendly.committed, 128);
+    assert_eq!(registry.persisted_entity_records().len(), 128);
 
     let (at_cap, _) = registry.tick_periodic_natural_spawning(
         &mut scheduler,
         tick_input(800, 400, 0, 20, Some(&world_read), Some(&materials)),
     );
     assert_eq!(at_cap.friendly.committed, 0);
-    assert_eq!(registry.persisted_entity_records().len(), 32);
+    assert_eq!(registry.persisted_entity_records().len(), 128);
 
     let removed_id = registry.persisted_entity_records()[0].snapshot.id;
     {
@@ -311,160 +308,7 @@ fn default_friendly_policy_reaches_and_refills_a_bounded_visible_population() {
         tick_input(1_200, 400, 0, 20, Some(&world_read), Some(&materials)),
     );
     assert_eq!(refill.friendly.committed, 1);
-    assert_eq!(registry.persisted_entity_records().len(), 32);
-}
-
-#[test]
-fn natural_spawn_cap_is_global_across_separated_players() {
-    let chunks = HashSet::from([(2, 0), (18, 0)]);
-    let (world_read, materials) =
-        spawn_world_chunks(chunks.iter().copied(), SpawnTerrain::Ground, 0);
-    let registry = SessionRegistry::new();
-    let (_first, _first_receiver) = register_player_at(
-        &registry,
-        "GlobalCapA",
-        HashSet::from([(2, 0)]),
-        4,
-        (0, 0),
-        PlayerPose::new(0.5, f64::from(TEST_Y), 0.5),
-    );
-    let (_second, _second_receiver) = register_player_at(
-        &registry,
-        "GlobalCapB",
-        HashSet::from([(18, 0)]),
-        4,
-        (22, 0),
-        PlayerPose::new(352.5, f64::from(TEST_Y), 0.5),
-    );
-    for chunk in chunks {
-        let templates = [2, 4, 6, 8, 10, 12]
-            .into_iter()
-            .enumerate()
-            .map(|(slot, local_x)| {
-                template_in_chunk(
-                    chunk,
-                    TEST_Y,
-                    slot as u8,
-                    11,
-                    "minecraft:cow",
-                    local_x,
-                    8,
-                    false,
-                )
-            })
-            .collect();
-        assert!(registry.register_natural_spawn_templates(chunk, templates));
-    }
-
-    let mut input = tick_input(1, 1, 0, 4, Some(&world_read), Some(&materials));
-    input.policy.friendly_spawn_cap = 5;
-    input.policy.friendly_spawn_chunk_budget = 48;
-    let (report, _) =
-        registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
-
-    assert_eq!(report.friendly.chunks_sampled, 2);
-    assert_eq!(report.friendly.committed, 5);
-    assert!(report.friendly.rejected_cap > 0);
-    assert_eq!(registry.persisted_entity_records().len(), 5);
-}
-
-#[test]
-fn aquatic_spawn_cap_is_global_across_separated_players() {
-    let chunks = HashSet::from([(2, 0), (18, 0)]);
-    let (world_read, materials) =
-        spawn_world_chunks(chunks.iter().copied(), SpawnTerrain::Water, 0);
-    let registry = SessionRegistry::new();
-    let (_first, _first_receiver) = register_player_at(
-        &registry,
-        "AquaticCapA",
-        HashSet::from([(2, 0)]),
-        4,
-        (0, 0),
-        PlayerPose::new(0.5, f64::from(TEST_Y), 0.5),
-    );
-    let (_second, _second_receiver) = register_player_at(
-        &registry,
-        "AquaticCapB",
-        HashSet::from([(18, 0)]),
-        4,
-        (22, 0),
-        PlayerPose::new(352.5, f64::from(TEST_Y), 0.5),
-    );
-    for chunk in chunks {
-        assert!(registry.register_natural_spawn_templates(
-            chunk,
-            vec![template_in_chunk(
-                chunk,
-                TEST_Y,
-                0,
-                18,
-                "minecraft:cod",
-                8,
-                8,
-                false,
-            )],
-        ));
-    }
-
-    let mut input = tick_input(1, 1, 0, 4, Some(&world_read), Some(&materials));
-    input.policy.aquatic_spawn_cap = 1;
-    input.policy.friendly_spawn_chunk_budget = 48;
-    let (report, _) =
-        registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
-
-    assert_eq!(report.friendly.committed, 1);
-    assert_eq!(report.friendly.rejected_cap, 1);
-    assert_eq!(registry.persisted_entity_records().len(), 1);
-}
-
-#[test]
-fn hostile_spawn_cap_is_global_across_separated_players() {
-    let chunks = HashSet::from([(2, 0), (18, 0)]);
-    let (world_read, materials) =
-        spawn_world_chunks_with_light(chunks.iter().copied(), SpawnTerrain::Ground, 0, 0);
-    let registry = SessionRegistry::new();
-    registry.set_world_time(18_000);
-    let (_first, _first_receiver) = register_player_at(
-        &registry,
-        "HostileCapA",
-        HashSet::from([(2, 0)]),
-        4,
-        (0, 0),
-        PlayerPose::new(0.5, f64::from(TEST_Y), 0.5),
-    );
-    let (_second, _second_receiver) = register_player_at(
-        &registry,
-        "HostileCapB",
-        HashSet::from([(18, 0)]),
-        4,
-        (22, 0),
-        PlayerPose::new(352.5, f64::from(TEST_Y), 0.5),
-    );
-    for chunk in chunks {
-        assert!(registry.register_natural_spawn_templates(
-            chunk,
-            vec![template_in_chunk(
-                chunk,
-                TEST_Y,
-                0,
-                54,
-                "minecraft:zombie",
-                8,
-                8,
-                true,
-            )],
-        ));
-    }
-
-    let mut input = tick_input(1, 0, 1, 4, Some(&world_read), Some(&materials));
-    input.policy.hostile_spawn_cap = 1;
-    input.policy.hostile_spawn_chunk_budget = 48;
-    let (report, _) =
-        registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
-
-    assert_eq!(report.hostile.committed, 1);
-    assert_eq!(report.hostile.rejected_cap, 1);
-    assert_eq!(registry.persisted_entity_records().len(), 1);
+    assert_eq!(registry.persisted_entity_records().len(), 128);
 }
 
 #[test]
@@ -482,7 +326,6 @@ fn overlapping_players_do_not_duplicate_active_spawn_chunks() {
     assert!(registry.register_natural_spawn_templates(TEST_CHUNK, templates));
 
     let mut input = tick_input(1, 1, 0, 4, Some(&world_read), Some(&materials));
-    input.policy.friendly_spawn_cap = 32;
     input.policy.friendly_spawn_chunk_budget = 48;
     let (report, _) =
         registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
@@ -545,7 +388,6 @@ fn high_chunk_budget_keeps_entity_collision_fence_active() {
     ));
 
     let mut input = tick_input(1, 1, 0, 4, Some(&world_read), Some(&materials));
-    input.policy.friendly_spawn_cap = 64;
     input.policy.friendly_spawn_chunk_budget = 64;
     let (report, _) =
         registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
@@ -554,27 +396,6 @@ fn high_chunk_budget_keeps_entity_collision_fence_active() {
     assert_eq!(report.friendly.committed, 1);
     assert_eq!(report.friendly.rejected_collision, 1);
     assert_eq!(registry.persisted_entity_records().len(), 1);
-}
-
-#[test]
-fn zero_natural_spawn_cap_admits_no_entities() {
-    let (world_read, materials) = spawn_world(SpawnTerrain::Ground, 0);
-    let registry = SessionRegistry::new();
-    let (_player, _receiver) =
-        register_player(&registry, "ZeroCap", HashSet::from([TEST_CHUNK]), 4);
-    assert!(registry.register_natural_spawn_templates(
-        TEST_CHUNK,
-        vec![template(0, 11, "minecraft:cow", 8, 8, false)],
-    ));
-
-    let mut input = tick_input(1, 1, 0, 4, Some(&world_read), Some(&materials));
-    input.policy.friendly_spawn_cap = 0;
-    let (report, _) =
-        registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
-
-    assert_eq!(report.friendly.committed, 0);
-    assert_eq!(report.friendly.rejected_cap, 1);
-    assert!(registry.persisted_entity_records().is_empty());
 }
 
 #[test]
@@ -593,9 +414,8 @@ fn periodic_ground_spawns_obey_per_chunk_cap_and_support() {
         &mut scheduler,
         tick_input(1, 1, 0, 4, Some(&world_read), Some(&materials)),
     );
-    assert_eq!(report.friendly.committed, 6);
-    assert_eq!(report.friendly.rejected_cap, 1);
-    assert_eq!(registry.persisted_entity_records().len(), 6);
+    assert_eq!(report.friendly.committed, 7);
+    assert_eq!(registry.persisted_entity_records().len(), 7);
 
     let (unsupported_world, unsupported_materials) = spawn_world(SpawnTerrain::Unsupported, 0);
     let unsupported_registry = SessionRegistry::new();

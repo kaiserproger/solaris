@@ -43,7 +43,6 @@ pub(in crate::play) async fn publish_script_menu_click(
 impl SessionRegistry {
     /// Routes one admitted open/close command to the target player's ordered,
     /// reliable session lane. The script router is the only remaining caller.
-    #[allow(dead_code)]
     pub(crate) fn route_script_menu_command(
         &self,
         admitted: AdmittedScriptCommand,

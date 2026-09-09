@@ -52,15 +52,14 @@ async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug
     let planks_id = format!("minecraft:{wood_family}_planks");
     let planks_item_id = embedded_item_id(&data, &planks_id);
     let planks_recipe = embedded_recipe_display_id(&data, &planks_id);
-    let table_support = mc_world::BlockPos {
-        x: target.stand_x,
-        y: target.stand_surface_y,
-        z: target.stand_z,
-    };
     let table_pos = mc_world::BlockPos {
-        x: target.stand_x,
-        y: target.stand_surface_y + 1,
-        z: target.stand_z,
+        x: target.logs[0].0,
+        y: target.logs[0].1,
+        z: target.logs[0].2,
+    };
+    let table_support = mc_world::BlockPos {
+        y: table_pos.y - 1,
+        ..table_pos
     };
 
     let shutdown = mc_net::ShutdownHandle::default();
@@ -97,6 +96,7 @@ async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug
         mine_block_and_wait_for_stack(
             &mut client,
             pos,
+            (f64::from(target.stand_x) + 0.5, f64::from(target.stand_z) + 0.5),
             501 + (idx as i32 * 2),
             vanilla_stop_destroy_ticks(2.0, 1.0, true),
             log_item_id,
@@ -346,6 +346,7 @@ async fn embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table_inner()
         mine_block_and_wait_for_stack(
             &mut client,
             (x, target_y, 0),
+            (f64::from(x) + 0.5, 0.5),
             201 + (idx as i32 * 2),
             vanilla_stop_destroy_ticks(2.0, 1.0, true),
             oak_log_id,
@@ -560,6 +561,7 @@ async fn embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table_inner()
         mine_block_and_wait_for_stack(
             &mut client,
             (0, y, 1),
+            (1.5, 0.5),
             240 + (idx as i32 * 2),
             vanilla_stop_destroy_ticks(1.5, 2.0, true),
             cobblestone_id,

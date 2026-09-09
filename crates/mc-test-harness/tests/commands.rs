@@ -961,7 +961,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         client
             .write_packet(&ServerboundMovePlayerPos {
                 x: f64::from(survival_target.0) + 0.5,
-                y: f64::from(survival_target.1) + 1.0,
+                y: f64::from(survival_target.1),
                 z: f64::from(survival_target.2) + 0.5,
                 flags: MovePlayerFlags::new(true, false),
             })
@@ -1008,6 +1008,16 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
     }
 
     client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: f64::from(survival_target.0) + 0.5,
+            y: f64::from(survival_target.1) + 1.0,
+            z: f64::from(survival_target.2) + 0.5,
+            flags: MovePlayerFlags::new(false, false),
+        })
+        .await
+        .expect("jump clear of the survival placement");
+
+    client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
             position: pack_block_pos(survival_target.0, survival_target.1 - 1, survival_target.2),
@@ -1049,6 +1059,12 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
             }
         }
     }
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("land on the committed survival block");
 
     client
         .write_packet(&ServerboundUseItemOn {

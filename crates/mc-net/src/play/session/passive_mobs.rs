@@ -189,12 +189,6 @@ fn love_window_crossed(love_ticks: u16, elapsed_ticks: u16, courtship_complete: 
     first_tick >= 1 && last_tick <= courtship_complete
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct GrazingSheep {
-    pub(super) expected: mc_entity::EntitySnapshot,
-    pub(super) is_baby: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::play) struct SheepGrazingCandidate {
     pub(in crate::play) entity_id: EntityId,
@@ -218,21 +212,25 @@ pub(super) struct SheepGrazingAdvance {
     pub(super) timer_updates: Vec<SheepGrazingTimerUpdate>,
 }
 
-pub(super) fn advance_sheep_grazing(tick: u64, sheep: &[GrazingSheep]) -> SheepGrazingAdvance {
+pub(super) fn advance_sheep_grazing(
+    tick: u64,
+    sheep: &[mc_entity::EntitySnapshot],
+) -> SheepGrazingAdvance {
     let mut plan = SheepGrazingPlan::default();
     let mut timer_updates = Vec::with_capacity(sheep.len());
 
     for sheep in sheep {
         let candidate = SheepGrazingCandidate {
-            entity_id: sheep.expected.id,
+            entity_id: sheep.id,
             block_position: BlockPos {
-                x: sheep.expected.position.x.floor() as i32,
-                y: sheep.expected.position.y.floor() as i32,
-                z: sheep.expected.position.z.floor() as i32,
+                x: sheep.position.x.floor() as i32,
+                y: sheep.position.y.floor() as i32,
+                z: sheep.position.z.floor() as i32,
             },
         };
-        let Some(remaining) = sheep.expected.retained.sheep_grazing_ticks else {
-            if sheep_grazing_starts_on_tick(sheep.expected.id, tick, sheep.is_baby) {
+        let Some(remaining) = sheep.retained.sheep_grazing_ticks else {
+            let is_baby = sheep.animal.is_some_and(|animal| animal.is_baby());
+            if sheep_grazing_starts_on_tick(sheep.id, tick, is_baby) {
                 plan.starts.push(candidate);
             }
             continue;
@@ -241,12 +239,12 @@ pub(super) fn advance_sheep_grazing(tick: u64, sheep: &[GrazingSheep]) -> SheepG
         let remaining = remaining.saturating_sub(1);
         if remaining == 0 {
             timer_updates.push(SheepGrazingTimerUpdate {
-                expected: sheep.expected.clone(),
+                expected: sheep.clone(),
                 remaining: None,
             });
         } else {
             timer_updates.push(SheepGrazingTimerUpdate {
-                expected: sheep.expected.clone(),
+                expected: sheep.clone(),
                 remaining: Some(remaining),
             });
             if remaining == SHEEP_GRAZING_ACTION_TICK {

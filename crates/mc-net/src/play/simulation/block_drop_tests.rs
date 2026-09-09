@@ -317,7 +317,7 @@ async fn block_drop_rejects_drop_outside_owner_region_without_publication() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn journaled_resident_block_drop_append_failure_rejects_before_drop_publication() {
+async fn journaled_block_drop_accepts_in_ram_and_fail_stops_after_writer_error() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
     let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
@@ -339,24 +339,24 @@ async fn journaled_resident_block_drop_append_failure_rejects_before_drop_public
     let position = BlockPos { x: 1, y: 64, z: 1 };
     storage.set_block_at(position, BlockStateId(1)).unwrap();
     let token = storage.block_mutation_token(position).unwrap();
-    let following_position = BlockPos { x: 2, y: 64, z: 1 };
-    storage
-        .set_block_at(following_position, BlockStateId(1))
-        .unwrap();
-    let following_token = storage.block_mutation_token(following_position).unwrap();
     let read_view = storage.read_view();
     let mutation_view = storage.mutation_view();
     let world = Arc::new(tokio::sync::Mutex::new(storage));
     let sessions = Arc::new(SessionRegistry::new());
-    let (_, mut outbound) = register_observer(&sessions, "JournalFailureObserver");
+    let (_, _outbound) = register_observer(&sessions, "JournalFailureObserver");
     let mut journal_failure = sessions.subscribe_world_chunk_journal_failure();
-    let (journal, pending) = super::super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&blocks),
         Arc::clone(&items),
     )
     .unwrap();
     assert!(pending.is_empty());
+    let writer = Arc::clone(&journal.writer);
+    world.lock().await.set_journal_barrier({
+        let writer = Arc::clone(&writer);
+        Arc::new(move || writer.flush().map_err(std::io::Error::other))
+    });
     sessions.install_world_chunk_journal(journal);
 
     let (handle, mut owner) = simulation_channel_with_capacity(2);
@@ -365,13 +365,6 @@ async fn journaled_resident_block_drop_append_failure_rejects_before_drop_public
             position,
             token,
             vec![test_drop(Vec3::new(0.5, 64.5, 0.5))],
-        ))
-        .unwrap();
-    let following_response = handle
-        .enqueue(block_drop_command(
-            following_position,
-            following_token,
-            vec![test_drop(Vec3::new(1.5, 64.5, 0.5))],
         ))
         .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -391,7 +384,7 @@ async fn journaled_resident_block_drop_append_failure_rejects_before_drop_public
                     ..SimulationWorldAccess::default()
                 },
                 None,
-                2,
+                1,
             )
             .await
     });
@@ -399,30 +392,28 @@ async fn journaled_resident_block_drop_append_failure_rejects_before_drop_public
     tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
         .await
         .unwrap();
+    writer.flush().unwrap();
+    let (paused, resume_writer) = std::sync::mpsc::sync_channel(0);
+    writer
+        .requests
+        .send(super::super::world_journal::WriterRequest::Flush { reply: paused })
+        .unwrap();
     let journal_path = temp.path().join("solaris/world-chunk-journal.bin");
     std::fs::remove_file(&journal_path).unwrap();
     std::fs::create_dir(&journal_path).unwrap();
     release_tx.send(()).unwrap();
 
     assert_eq!(owner_task.await.unwrap().processed, 1);
-    assert!(matches!(
-        response.await.unwrap(),
-        Err(SimulationRequestError::WorldMutationFailed)
-    ));
-    assert!(matches!(
-        following_response.await.unwrap(),
-        Err(SimulationRequestError::OwnerStopped)
-    ));
+    response.await.unwrap().unwrap();
+    resume_writer.recv().unwrap();
     journal_failure.changed().await.unwrap();
     assert!(*journal_failure.borrow_and_update());
     assert_eq!(read_view.get_cached_block(position), Some(BlockStateId(0)));
-    assert_eq!(
-        read_view.get_cached_block(following_position),
-        Some(BlockStateId(1))
-    );
-    assert_eq!(persisted_item_drop_count(&sessions), 0);
-    assert_no_block_or_entity_publication(&mut outbound);
-    assert!(world.lock().await.plan_dirty_flush().unwrap().is_empty());
+    assert_eq!(persisted_item_drop_count(&sessions), 1);
+    assert!(matches!(
+        world.lock().await.plan_dirty_flush().unwrap().write(),
+        Err(mc_world::WorldError::JournalBarrier(_))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -805,7 +796,8 @@ async fn run_authority_recheck_case(
     let (actor, _) = register_observer(&sessions, "AwaitAuthorityActor");
     let (_, mut observer) = register_observer(&sessions, "AwaitAuthorityObserver");
     let (journal, pending) =
-        super::super::world_journal::WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
+        super::super::world_journal::WorldChunkJournal::open_for_test(temp.path(), blocks, items)
+            .unwrap();
     assert!(pending.is_empty());
     sessions.install_world_chunk_journal(journal);
 
@@ -914,7 +906,8 @@ async fn block_drop_waits_for_earlier_reserved_decision_without_reordering() {
     let world = Arc::new(tokio::sync::Mutex::new(storage));
     let sessions = Arc::new(SessionRegistry::new());
     let (journal, pending) =
-        super::super::world_journal::WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
+        super::super::world_journal::WorldChunkJournal::open_for_test(temp.path(), blocks, items)
+            .unwrap();
     assert!(pending.is_empty());
     let earlier_id = journal.reserve_decision_ids(1).unwrap()[0];
     assert_eq!(earlier_id, 1);
@@ -1009,7 +1002,8 @@ async fn block_drop_clear_mismatch_fail_stops_without_old_publication() {
     let (_, mut outbound) = register_observer(&sessions, "ClearMismatchObserver");
     let mut journal_failure = sessions.subscribe_world_chunk_journal_failure();
     let (journal, pending) =
-        super::super::world_journal::WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
+        super::super::world_journal::WorldChunkJournal::open_for_test(temp.path(), blocks, items)
+            .unwrap();
     assert!(pending.is_empty());
     sessions.install_world_chunk_journal(journal);
 

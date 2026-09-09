@@ -63,6 +63,29 @@ impl EntityMovementTrackers {
             .entry(entity_id)
             .or_insert(initial)
     }
+    pub(super) fn get_or_insert_many(
+        &self,
+        states: impl ExactSizeIterator<Item = (EntityId, LastSentEntityState)>,
+    ) -> Vec<LastSentEntityState> {
+        let mut by_shard: [Vec<_>; TRACKER_SHARD_COUNT] = std::array::from_fn(|_| Vec::new());
+        let mut current = vec![None; states.len()];
+        for (ordinal, (entity_id, initial)) in states.enumerate() {
+            by_shard[Self::shard_index(entity_id)].push((ordinal, entity_id, initial));
+        }
+        for (shard_index, states) in by_shard.into_iter().enumerate() {
+            if states.is_empty() {
+                continue;
+            }
+            let mut shard = self.lock_shard(shard_index);
+            for (ordinal, entity_id, initial) in states {
+                current[ordinal] = Some(*shard.entry(entity_id).or_insert(initial));
+            }
+        }
+        current
+            .into_iter()
+            .map(|state| state.expect("every batched tracker state is initialized"))
+            .collect()
+    }
 
     pub(super) fn remove(&self, entity_id: EntityId) {
         self.lock_shard(Self::shard_index(entity_id))

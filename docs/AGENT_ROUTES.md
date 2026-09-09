@@ -10,17 +10,16 @@ subagent output.
 | `plugins` | `docs/PLUGINS.md` | `crates/mc-script/`, `crates/mc-net/src/script/`, focused session endpoint, `tests/plugin_*.rs` |
 | `parity` | exact `docs/PROJECT_SPEC.md` or active milestone section | ADR 0002, local protocol dump/oracle, exact harness comparison |
 | `scaling` | exact active milestone and ADR 0004/0005 | measured benchmark/profile only; metric definitions in `docs/M52_OPERATOR_PERFORMANCE_NOTES.md` |
-| `architecture` | `docs/decisions/README.md`, then one owning ADR | exact module/callers; deeper map only when needed in `docs/CORE_INTERNALS_FOR_OWNER.md` |
+| `architecture` | `docs/ARCHITECTURE.md`, then the ADR owning the touched runtime constraint | exact modules/callers; new target and current implementation must remain distinct |
 
 Additional exact surfaces:
 
-- Long-goal recovery after compaction: `.memory/project/solaris/workflow/goal-continuity.md`, then `docs/MEMORY.md`.
-- No owner task and no active checkpoint: `docs/NEXT_SESSION.md`.
+- Long-goal recovery or unspecialized continuation: `docs/MEMORY.md`; use the active owner request and its next verified outcome.
 - Closeout/readiness claim: `docs/DEFINITION_OF_DONE.md`, exact milestone, and `docs/VALIDATION_LEDGER.md`.
-- Minecraft client MCP/tooling: `docs/AGENT_TOOLING.md` and `client-mod/solaris-client-agent/README.md`.
+- Minecraft client MCP/tooling: `docs/AGENT_TOOLING.md` and `../solaris-loader/README.md`.
 - Protocol packet ids/layouts: ADR 0002, `.analysis/protocol-dump.txt`, `tools/dump-vanilla-protocol.sh`, and `crates/mc-test-harness/src/bin/wire_probe.rs`.
 - Build/run: `README.md` and `example.toml`.
-- Owner-facing core explanation: `docs/CORE_INTERNALS_FOR_OWNER.md`.
+- Owner-facing architecture contract: `docs/ARCHITECTURE.md`.
 - CodexPro `/goal` launch, checkpoint granularity, and runtime wrapper:
   `docs/GOAL_WRAPPER_V2.md`.
 
@@ -42,7 +41,7 @@ checkpoint explicitly requests readiness.
 
 - `crates/` - Cargo workspace members.
 - `crates/mc-test-harness/tests/` - wire/integration gates.
-- `client-mod/solaris-client-agent/` - reusable client MCP and scenarios.
+- `../solaris-loader/` - independent reusable client MCP and scenarios.
 - `docs/` - canonical contracts, ADRs, milestone/evidence records.
 - `tools/` - vanilla extraction, protocol, and client runner scripts.
 - `example.toml` / `playable.toml` - documented debug runtime profiles.

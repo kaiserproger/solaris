@@ -32,7 +32,6 @@ use std::time::Duration;
 use bytes::{Buf, Bytes, BytesMut};
 use mc_data::VanillaData;
 use mc_data::tags::TagsData;
-use mc_extension::{CustomPayloadPolicy, DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES};
 use mc_nbt::Tag;
 use mc_protocol::codec::{DEFAULT_MAX_STRING_LEN, ReadMc};
 use mc_protocol::frame::Compression;
@@ -46,6 +45,7 @@ use mc_protocol::packets::configuration::{
     UpdateTagsRegistry,
 };
 use mc_protocol::{CodecError, State, TARGET_RELEASE};
+use mc_script::{MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, ScriptBoundary};
 use mc_world::{ChunkGeometry, OVERWORLD_GEOMETRY};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
@@ -166,14 +166,14 @@ fn prepare_registry_entry_payload(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigurationCustomPayload {
     pub(crate) channel: String,
-    pub(crate) payload: Bytes,
+    pub(crate) payload: Vec<u8>,
 }
 
 pub(crate) struct ConfigurationContext<'a> {
     pub(crate) data: &'a VanillaData,
     pub(crate) tags: &'a TagsData,
     pub(crate) chunk_geometry: ChunkGeometry,
-    pub(crate) custom_payload_policy: Option<&'a CustomPayloadPolicy>,
+    pub(crate) custom_payload_policy: Option<&'a ScriptBoundary>,
     pub(crate) loader_manifest: Option<&'a LoaderManifest>,
 }
 
@@ -214,16 +214,6 @@ where
     W: AsyncWriteExt + Unpin,
 {
     debug!(player = %profile.name, uuid = %profile.uuid, "entering Configuration state");
-    // Vanilla publishes its server brand in Configuration. The ordinary client
-    // surfaces this in F3 without requiring Solaris Loader or a custom resource.
-    write_packet(
-        writer,
-        &ClientboundCustomPayload {
-            payload: CustomPayload::Brand(server_brand()),
-        },
-        compression,
-    )
-    .await?;
 
     // Vanilla publishes feature flags before registry/known-pack negotiation.
     write_packet(
@@ -466,6 +456,21 @@ where
         }
     }
 
+    // Vanilla publishes the server brand after registry/tag negotiation and
+    // any modded configuration handshake, immediately before finishing the
+    // configuration phase. Sending it first breaks modded (NeoForge) clients,
+    // which complete their own payload-handler registration during the
+    // known-packs/registry exchange. The ordinary client still surfaces the
+    // brand in F3.
+    write_packet(
+        writer,
+        &ClientboundCustomPayload {
+            payload: CustomPayload::Brand(server_brand()),
+        },
+        compression,
+    )
+    .await?;
+
     // Step 4: tell the client we are done configuring.
     write_packet(writer, &FinishConfiguration, compression).await?;
 
@@ -634,7 +639,7 @@ async fn complete_loader_handshake<R, W>(
     buf: &mut BytesMut,
     budget: &mut PrePlayBudget,
     compression: Compression,
-    custom_payload_policy: Option<&CustomPayloadPolicy>,
+    custom_payload_policy: Option<&ScriptBoundary>,
     custom_payloads: &mut Vec<ConfigurationCustomPayload>,
     manifest: &LoaderManifest,
     loader_acknowledged: &mut bool,
@@ -722,17 +727,17 @@ fn note_ignored_configuration_packet(count: &mut usize) -> Result<(), Connection
 fn handle_configuration_custom_payload(
     mut body: Bytes,
     context: &'static str,
-    custom_payload_policy: Option<&CustomPayloadPolicy>,
+    custom_payload_policy: Option<&ScriptBoundary>,
     custom_payloads: &mut Vec<ConfigurationCustomPayload>,
     loader_manifest: Option<&LoaderManifest>,
     loader_acknowledged: &mut bool,
     loader_session: &mut Option<LoaderSession>,
     loader_requests: &mut BTreeSet<String>,
 ) -> Result<Option<LoaderArtifactRequest>, ConnectionError> {
-    if body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+    if body.len() > MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
         warn!(
             len = body.len(),
-            max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
+            max = MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES,
             context,
             "oversized Configuration custom payload rejected before decode"
         );
@@ -804,34 +809,24 @@ fn handle_configuration_custom_payload(
 
     let payload_len = body.remaining();
     if let Some(policy) = custom_payload_policy {
-        if !policy.allows_channel(channel.as_str()) {
+        if !policy.allows_custom_payload(channel.as_str()) {
             debug!(
                 channel = %channel.as_str(),
                 len = payload_len,
                 context,
-                "Configuration custom payload denied by extension policy"
-            );
-            return Ok(None);
-        }
-        if payload_len > policy.max_payload_bytes() {
-            warn!(
-                channel = %channel.as_str(),
-                len = payload_len,
-                max = policy.max_payload_bytes(),
-                context,
-                "Configuration custom payload denied by extension size policy"
+                "Configuration custom payload denied by script policy"
             );
             return Ok(None);
         }
         custom_payloads.push(ConfigurationCustomPayload {
             channel: channel.as_str().to_string(),
-            payload: body.copy_to_bytes(payload_len),
+            payload: body.copy_to_bytes(payload_len).to_vec(),
         });
         debug!(
             channel = %channel.as_str(),
             len = payload_len,
             context,
-            "Configuration custom payload retained for extension"
+            "Configuration custom payload retained for script host"
         );
         return Ok(None);
     }
@@ -1113,8 +1108,8 @@ mod tests {
                     LoaderPlatform::NeoForge,
                     LoaderPlatform::Forge,
                 ],
-                content: vec![LoaderContentKind::Screens],
-                permissions: vec![LoaderPermission::OpenScreens],
+                content: vec![LoaderContentKind::Ui],
+                permissions: vec![LoaderPermission::PresentUi],
                 cache_key: format!("example:screen/1/{}", "a".repeat(64)),
                 source_path: None,
                 artifact_bytes: None,
@@ -1153,7 +1148,7 @@ mod tests {
             protocol: LOADER_PROTOCOL_VERSION,
             platform: LoaderPlatform::Fabric,
             loader_version: "0.1.0".to_owned(),
-            accepted_permissions: vec![LoaderPermission::OpenScreens],
+            accepted_permissions: vec![LoaderPermission::PresentUi],
             cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
             carrier_block_state_ids: BTreeMap::new(),
         };
@@ -1188,7 +1183,7 @@ mod tests {
             protocol: LOADER_PROTOCOL_VERSION,
             platform: LoaderPlatform::Forge,
             loader_version: "0.1.0".to_owned(),
-            accepted_permissions: vec![LoaderPermission::OpenScreens],
+            accepted_permissions: vec![LoaderPermission::PresentUi],
             cached_bundles: Vec::new(),
             carrier_block_state_ids: BTreeMap::new(),
         };

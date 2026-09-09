@@ -1099,7 +1099,7 @@ fn write_framed_wal(world_root: &Path, frames: impl IntoIterator<Item = Vec<u8>>
 }
 
 fn open_journal_error(world_root: &Path) -> RegionalDecisionJournalOpenError {
-    match FileRegionalDecisionJournal::open(world_root) {
+    match FileRegionalDecisionJournal::open_for_test(world_root) {
         Ok(_) => panic!("regional decision journal unexpectedly opened"),
         Err(error) => error,
     }
@@ -1115,7 +1115,7 @@ fn malformed_decision_group(mut decision: serde_json::Value) -> Vec<u8> {
 fn regional_decision_journal_rejects_trailing_complete_junk() {
     let tmp = tempfile::tempdir().unwrap();
     let path = journal_path(tmp.path());
-    let (mut journal, pending) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (mut journal, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert!(pending.is_empty());
     journal.record_commit(&decision(1, 1)).unwrap();
     drop(journal);
@@ -1133,7 +1133,7 @@ fn regional_decision_journal_recovers_empty_prefix() {
     let path = journal_path(tmp.path());
     write_framed_wal(tmp.path(), []);
 
-    let (journal, pending) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (journal, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert!(pending.is_empty());
     drop(journal);
     assert_eq!(
@@ -1150,7 +1150,7 @@ fn regional_decision_journal_recovers_frame_header_prefix() {
         let path = journal_path(tmp.path());
         write_framed_wal(tmp.path(), [frame[..prefix_len].to_vec()]);
 
-        let (journal, pending) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+        let (journal, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert!(pending.is_empty());
         drop(journal);
         assert_eq!(
@@ -1172,7 +1172,7 @@ fn regional_decision_journal_recovers_frame_payload_prefix() {
         let path = journal_path(tmp.path());
         write_framed_wal(tmp.path(), [frame[..prefix_len].to_vec()]);
 
-        let (journal, pending) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+        let (journal, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert!(pending.is_empty());
         drop(journal);
         assert_eq!(
@@ -1196,7 +1196,7 @@ fn regional_decision_journal_recovers_exact_complete_prefix() {
         ],
     );
 
-    let (journal, pending) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (journal, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert_eq!(pending, vec![first.clone()]);
     drop(journal);
     let expected = [
@@ -1211,7 +1211,7 @@ fn regional_decision_journal_recovers_exact_complete_prefix() {
 fn regional_decision_journal_rejects_bit_flipped_payload() {
     let tmp = tempfile::tempdir().unwrap();
     let path = journal_path(tmp.path());
-    let (mut journal, _) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (mut journal, _) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     journal.record_commit(&decision(1, 1)).unwrap();
     drop(journal);
 
@@ -1405,7 +1405,7 @@ fn assert_wal_snapshot_rejected_atomically(snapshot: EntitySnapshot) {
     )
     .unwrap();
     write_framed_wal(tmp.path(), [framed_wal_group(&[decision])]);
-    let (journal, pending) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (journal, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     drop(journal);
     let registry = SessionRegistry::new();
 
@@ -1494,7 +1494,7 @@ fn regional_decision_journal_recovers_grouped_crash_prefix_as_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let path = journal_path(tmp.path());
     let decisions = [decision(1, 1), decision(2, 2)];
-    let (mut journal, _) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (mut journal, _) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     journal.record_commits(&decisions).unwrap();
     drop(journal);
 
@@ -1504,7 +1504,7 @@ fn regional_decision_journal_recovers_grouped_crash_prefix_as_empty() {
     bytes.truncate(bytes.len() - 1);
     std::fs::write(&path, bytes).unwrap();
 
-    let (journal, pending) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (journal, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert!(pending.is_empty());
     drop(journal);
     assert_eq!(

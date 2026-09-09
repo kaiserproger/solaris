@@ -11,14 +11,22 @@ use mc_entity::{EntityId, EntityLifecycle, GoalState, Rotation, SpawnEntity, Vec
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
 use crate::play::simulation::SimulationAuthority;
 
-use super::entity_lifecycle::{remove_server_entity_locked, track_entity_chunk_locked};
+use super::entity_lifecycle::{
+    move_entity_chunk_locked, remove_server_entity_locked, track_entity_chunk_locked,
+};
 use super::outbound::{OutboundCommand, VisibilityDispatch};
 use super::pickups::spawn_xp_orb_locked;
 use super::projectiles::{initial_hurting_projectile_state, projectile_identity};
 use super::visibility::{
-    initialize_entity_wire_state_locked, session_recipients, spawn_entity_visibility_locked,
+    advance_entity_tracker_update, initialize_entity_wire_state_locked,
+    publish_server_entity_snapshot_locked,
+    refresh_entity_target_visibility_with_old_observers_locked, session_recipients,
+    spawn_entity_visibility_locked, visible_entity_observers_locked,
 };
-use super::{SessionRegistry, apply_entity_facts};
+use super::{
+    ServerEntityMove, SessionEntityGuards, SessionRegistry, apply_entity_facts,
+    chunk_pos_from_coords, record_entity_dispatches_locked,
+};
 
 const DRAGON_CLOUD_HEIGHT: f64 = 0.5;
 const PLAYER_HEIGHT: f64 = 1.8;
@@ -151,14 +159,84 @@ fn dragon_contact_damage(
     None
 }
 
+// External flight bypasses generic entity physics, so its accepted pose must
+// publish routing, visibility and tracker updates here, including the dying rise.
+fn publish_dragon_motion_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    dragon_id: EntityId,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) {
+    let Some(snapshot) = publish_server_entity_snapshot_locked(inner, dragon_id) else {
+        return;
+    };
+    let old_observers = visible_entity_observers_locked(inner, dragon_id);
+    let new_chunk = chunk_pos_from_coords(snapshot.position.x, snapshot.position.z);
+    if let Some(old_chunk) = inner.simulation_inputs.entity_chunk(dragon_id)
+        && old_chunk != new_chunk
+    {
+        move_entity_chunk_locked(inner, dragon_id, old_chunk, new_chunk);
+        dispatches.extend(refresh_entity_target_visibility_with_old_observers_locked(
+            inner,
+            dragon_id,
+            old_chunk,
+            new_chunk,
+            &old_observers,
+        ));
+    }
+    let Some(last_sent) = inner.entity_movement_trackers.get(dragon_id) else {
+        initialize_entity_wire_state_locked(inner, dragon_id);
+        return;
+    };
+    let mut next_sent = last_sent;
+    let update = advance_entity_tracker_update(
+        &mut next_sent,
+        snapshot.position,
+        snapshot.velocity,
+        snapshot.rotation,
+        snapshot.on_ground,
+        true,
+    );
+    if !inner
+        .entity_movement_trackers
+        .compare_exchange(dragon_id, last_sent, next_sent)
+        || (update.wire_move.is_none() && !update.send_velocity && !update.send_head_rotation)
+    {
+        return;
+    }
+    let recipients = session_recipients(
+        inner,
+        old_observers.into_iter().filter(|observer_id| {
+            inner
+                .sessions
+                .get(observer_id)
+                .is_some_and(|observer| observer.visible_entities.contains(&dragon_id))
+        }),
+    );
+    let start = dispatches.len();
+    dispatches.extend(recipients.into_iter().map(|recipient| VisibilityDispatch {
+        recipient,
+        command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
+            id: dragon_id,
+            position: snapshot.position,
+            wire_move: update.wire_move,
+            velocity: snapshot.velocity,
+            rotation: snapshot.rotation,
+            on_ground: snapshot.on_ground,
+            send_velocity: update.send_velocity,
+            send_head_rotation: update.send_head_rotation,
+        }),
+    }));
+    record_entity_dispatches_locked(inner, &dispatches[start..]);
+}
+
 impl SessionRegistry {
     pub(in crate::play) fn tick_dragon_air_combat(
         &self,
         _authority: &SimulationAuthority,
         tick: u64,
     ) -> Vec<VisibilityDispatch> {
-        let active_ids = self.active_simulation_entities.load_full();
-        if active_ids.is_empty() {
+        let active_chunks = self.active_simulation_chunks.load_full();
+        if active_chunks.is_empty() {
             return Vec::new();
         }
 
@@ -168,7 +246,11 @@ impl SessionRegistry {
                 .ender_dragon_entities
                 .iter()
                 .copied()
-                .filter(|entity_id| active_ids.contains(entity_id))
+                .filter(|entity_id| {
+                    self.simulation_inputs
+                        .entity_chunk(*entity_id)
+                        .is_some_and(|chunk| active_chunks.contains(&chunk))
+                })
                 .collect::<Vec<_>>()
         };
         if dragon_ids.is_empty() {
@@ -231,6 +313,7 @@ impl SessionRegistry {
                 if !inner.entities.replace_snapshot_if_current(expected, next) {
                     continue;
                 }
+                publish_dragon_motion_locked(&mut inner, dragon_id, &mut dispatches);
                 if step.xp_award > 0
                     && let Some(xp_type_id) = inner.arrow_kill_rewards.xp_orb_entity_type_id
                 {
@@ -367,6 +450,7 @@ impl SessionRegistry {
             if !inner.entities.replace_snapshot_if_current(expected, next) {
                 continue;
             }
+            publish_dragon_motion_locked(&mut inner, dragon_id, &mut dispatches);
 
             if let (Some(fireball_type_id), Some(shot)) = (fireball_type_id, fireball) {
                 let Some(projectile_state) = initial_hurting_projectile_state(
@@ -435,8 +519,8 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         tick: u64,
     ) -> Vec<VisibilityDispatch> {
-        let active_ids = self.active_simulation_entities.load_full();
-        if active_ids.is_empty() {
+        let active_chunks = self.active_simulation_chunks.load_full();
+        if active_chunks.is_empty() {
             return Vec::new();
         }
 
@@ -449,7 +533,11 @@ impl SessionRegistry {
                 .area_effect_cloud_entities
                 .iter()
                 .copied()
-                .filter(|entity_id| active_ids.contains(entity_id))
+                .filter(|entity_id| {
+                    self.simulation_inputs
+                        .entity_chunk(*entity_id)
+                        .is_some_and(|chunk| active_chunks.contains(&chunk))
+                })
                 .collect::<Vec<_>>()
         };
         if cloud_ids.is_empty() {

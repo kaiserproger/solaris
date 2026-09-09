@@ -3,12 +3,11 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const PLUGIN_API_CRATES: &[&str] = &["mc-extension", "mc-script"];
+const PLUGIN_API_CRATES: &[&str] = &["mc-script"];
 const MC_NET_LOWER_CRATES: &[&str] = &[
     "mc-data",
     "mc-domain",
     "mc-entity",
-    "mc-extension",
     "mc-nbt",
     "mc-physics",
     "mc-protocol",
@@ -906,12 +905,12 @@ const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
         definition_anchor: "pub(super) async fn finalize_visible_block_edit_outcome",
     },
     OwnershipRule {
-        name: "opaque block entity conditional commit adapter",
-        module_file: "crates/mc-net/src/play/block_edit_commit.rs",
-        parent_file: "crates/mc-net/src/play.rs",
-        mod_declaration: "mod block_edit_commit;",
-        definition_file: "crates/mc-net/src/play/block_edit_commit.rs",
-        definition_anchor: "pub(super) fn apply_opaque_block_entity_to_storage_conditionally",
+        name: "headless opaque block entity conditional commit",
+        module_file: "crates/mc-world/src/storage/block_edits.rs",
+        parent_file: "crates/mc-world/src/storage.rs",
+        mod_declaration: "mod block_edits;",
+        definition_file: "crates/mc-world/src/storage/block_edits.rs",
+        definition_anchor: "pub fn commit_opaque_block_entity_conditionally",
     },
     OwnershipRule {
         name: "player block edit acknowledgement adapter",
@@ -1387,10 +1386,10 @@ const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
     },
     OwnershipRule {
         name: "periodic natural spawn planning",
-        module_file: "crates/mc-entity/src/natural_spawn_26_1_2/planning.rs",
+        module_file: "crates/mc-entity/src/natural_spawn_26_1_2/periodic.rs",
         parent_file: "crates/mc-entity/src/natural_spawn_26_1_2.rs",
-        mod_declaration: "mod planning;",
-        definition_file: "crates/mc-entity/src/natural_spawn_26_1_2/planning.rs",
+        mod_declaration: "mod periodic;",
+        definition_file: "crates/mc-entity/src/natural_spawn_26_1_2/periodic.rs",
         definition_anchor: "pub fn plan_periodic_category",
     },
     OwnershipRule {
@@ -2293,7 +2292,6 @@ fn scan_natural_spawn_template_boundary(path: &Path, lines: &[&str], findings: &
     let source = lines.join("\n");
     if path.ends_with("mc-entity/src/natural_spawn_26_1_2.rs") {
         for anchor in [
-            "pub fn passive_chunk_spawns(",
             "pub fn hostile_chunk_spawns(",
             "pub fn natural_sheep_color(",
             "pub fn sheep_color_for_rolls(",
@@ -2335,9 +2333,7 @@ fn scan_natural_spawn_template_boundary(path: &Path, lines: &[&str], findings: &
     for anchor in [
         "mc_entity::natural_spawn_26_1_2::plan_chunk_herd_templates",
         "mc_entity::natural_spawn_26_1_2::ChunkHerdPlanningContext",
-        "mc_entity::natural_spawn_26_1_2::passive_chunk_spawns",
         "mc_entity::natural_spawn_26_1_2::hostile_chunk_spawns",
-        "mc_entity::natural_spawn_26_1_2::natural_sheep_color",
         "mc_entity::natural_spawn_26_1_2::sheep_color_for_rolls",
     ] {
         if !source.contains(anchor) {

@@ -42,6 +42,7 @@ async fn scheduled_button_tick_releases_powered_button() {
     drop(storage);
     let (_simulation, owner) = simulation_channel();
     let resources = ChunkPipelineResources::with_limits(1, 1);
+    let occupied_cpu = resources.try_acquire_cpu().unwrap();
     let world_writer = world.lock().await;
     let block_tick = owner.run_scheduled_block_ticks_with_budget(
         &config,
@@ -55,9 +56,33 @@ async fn scheduled_button_tick_releases_powered_button() {
         120,
         1,
     );
-    let report = tokio::time::timeout(Duration::from_secs(1), block_tick)
-        .await
-        .expect("resident scheduled-block commit must not wait for the world writer");
+    tokio::pin!(block_tick);
+    std::future::poll_fn(|cx| {
+        assert!(Future::poll(block_tick.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let next_cpu = resources.acquire_cpu();
+    tokio::pin!(next_cpu);
+    std::future::poll_fn(|cx| {
+        assert!(Future::poll(next_cpu.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(occupied_cpu);
+    // Give planning one turn, then keep CPU occupied by the next consumer.
+    // The already-planned button release must not request another CPU turn.
+    let (report, _next_cpu) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            report = &mut block_tick => (report, None),
+            permit = &mut next_cpu => {
+                let permit = permit.unwrap();
+                (block_tick.await, Some(permit))
+            }
+        }
+    })
+    .await
+    .expect("planned scheduled-block commit must not reenter CPU admission");
     drop(world_writer);
 
     assert_eq!(report.drained, 1);
@@ -117,7 +142,7 @@ async fn scheduled_buttons_in_distinct_regions_do_not_wait_for_world_writer() {
     let _ = sessions.mark_loaded(session, (8, 0));
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),
@@ -381,7 +406,7 @@ async fn scheduled_button_crossing_region_boundary_commits_without_world_storage
     let _ = sessions.mark_loaded(session, (8, 0));
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),
@@ -441,7 +466,7 @@ async fn scheduled_button_crossing_region_boundary_commits_without_world_storage
 }
 
 #[tokio::test]
-async fn aborted_cross_region_scheduled_task_finishes_reserved_transaction() {
+async fn cross_region_scheduled_task_finishes_while_journal_writer_is_blocked() {
     let blocks = Arc::new(button_and_door_test_registry());
     let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
     let west_chunk = ChunkPos { x: 7, z: 0 };
@@ -483,18 +508,14 @@ async fn aborted_cross_region_scheduled_task_finishes_reserved_transaction() {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let (appended_tx, appended_rx) = tokio::sync::oneshot::channel();
     let worker = std::thread::spawn(move || {
-        let super::world_journal::WriterRequest::Replace { reply, .. } = receiver.recv().unwrap()
-        else {
+        let super::world_journal::WriterRequest::Reserve { .. } = receiver.recv().unwrap() else {
             panic!("expected reservation write");
         };
-        reply.send(Ok(())).unwrap();
-        let super::world_journal::WriterRequest::Append { reply, .. } = receiver.recv().unwrap()
-        else {
+        let super::world_journal::WriterRequest::Append { .. } = receiver.recv().unwrap() else {
             panic!("expected decision append");
         };
         append_started_tx.send(()).unwrap();
         release_rx.blocking_recv().unwrap();
-        reply.send(Ok(())).unwrap();
         appended_tx.send(()).unwrap();
         let super::world_journal::WriterRequest::Shutdown { reply } = receiver.recv().unwrap()
         else {
@@ -555,8 +576,7 @@ async fn aborted_cross_region_scheduled_task_finishes_reserved_transaction() {
         .await
     });
     append_started_rx.await.unwrap();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
+    task.await.unwrap().unwrap();
     release_tx.send(()).unwrap();
     appended_rx.await.unwrap();
 
@@ -607,7 +627,7 @@ async fn known_cross_region_append_failure_closes_reserved_decision_empty() {
     let temp = tempfile::tempdir().unwrap();
     let journal_blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
     let items = Arc::new(mc_data::items::solaris_required_items());
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&journal_blocks),
         Arc::clone(&items),
@@ -673,7 +693,8 @@ async fn known_cross_region_append_failure_closes_reserved_decision_empty() {
     drop(journal);
 
     let (reopened, pending) =
-        super::world_journal::WorldChunkJournal::open(temp.path(), journal_blocks, items).unwrap();
+        super::world_journal::WorldChunkJournal::open_for_test(temp.path(), journal_blocks, items)
+            .unwrap();
     assert_eq!(pending.len(), 1);
     assert!(reopened.decode_pending(&pending).unwrap().is_empty());
     let next_decision_id = reopened.reserve_decision_ids(1).unwrap()[0];
@@ -768,7 +789,7 @@ async fn scheduled_button_regions_commit_without_the_global_world_writer() {
     }
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),
@@ -907,7 +928,7 @@ async fn stale_resident_journal_commit_does_not_block_the_next_decision() {
     let sessions = SessionRegistry::new();
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),

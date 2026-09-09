@@ -272,27 +272,6 @@ impl BiomeRules {
         bucket[band].clone()
     }
 
-    pub(super) fn pick_region_band(
-        &self,
-        bucket: &[Identifier],
-        x: i32,
-        z: i32,
-        world_seed: i64,
-    ) -> Identifier {
-        if bucket.is_empty() {
-            return self.default.clone();
-        }
-        let value = fbm_2d(
-            x as f64 / 180.0,
-            z as f64 / 180.0,
-            world_seed ^ 0x4445_4550_4F43,
-            4,
-            0.55,
-        );
-        let band = (((value + 0.68) / 1.36).clamp(0.0, 0.999_999) * bucket.len() as f64) as usize;
-        bucket[band].clone()
-    }
-
     pub(super) fn is_ocean(&self, biome: &Identifier) -> bool {
         self.ocean.contains(biome) || self.deep_ocean.contains(biome)
     }

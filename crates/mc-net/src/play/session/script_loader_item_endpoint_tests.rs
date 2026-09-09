@@ -120,11 +120,12 @@ async fn loader_item_grant_waits_for_exact_acknowledged_session_owner_commit() {
     let OutboundCommand::LoaderItemGrant(command) = outbound.recv().await.unwrap() else {
         panic!("expected Loader item grant");
     };
-    assert_eq!(command.stack(), &stack);
     let mut owner_inventory = initial;
+    let authoritative_only = stack.clone();
     let result = {
         let _transaction_guard = command.begin_commit().expect("session remains active");
         let mut saved = persisted.lock().unwrap();
+        saved.inventory.slots[PlayerInventory::OFFHAND_SLOT] = authoritative_only.clone();
         apply_loader_item_grant(
             command.stack(),
             &mut owner_inventory,
@@ -139,6 +140,10 @@ async fn loader_item_grant_waits_for_exact_acknowledged_session_owner_commit() {
     let mut merged = stack;
     merged.count = 5;
     assert_eq!(owner_inventory.slots[9], merged);
+    assert_eq!(
+        owner_inventory.slots[PlayerInventory::OFFHAND_SLOT],
+        authoritative_only
+    );
     assert_eq!(
         persisted.lock().unwrap().inventory.slots,
         owner_inventory.slots

@@ -191,14 +191,14 @@ impl SessionRegistry {
             ScriptStoragePrepareOutcome::Rejected => return Ok(false),
         };
         storage.commit(prepared)?;
-        player_state.replace_inventory(plan.updated.clone());
+        player_state.replace_inventory(plan.clone());
         let carried_item = player_state.carried_item.clone();
         drop(player_state);
 
         dispatch_visibility_command(
             &recipient,
             OutboundCommand::AuthoritativeInventory {
-                inventory: Box::new(plan.updated),
+                inventory: Box::new(plan),
                 carried_item,
             },
         );

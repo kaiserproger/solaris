@@ -25,7 +25,7 @@ startup unless every bundle has:
 - a cache identity derived from plugin id, bundle id, version, and SHA-256.
 
 The server aggregates descriptors in deterministic plugin order. During the
-Minecraft Configuration state it sends protocol 1 on
+Minecraft Configuration state it sends Loader protocol 2 on
 `solaris:loader/manifest`. Before accepting the normal finish acknowledgement,
 it requires `solaris:loader/ack` with the same protocol, a supported platform,
 a bounded loader version, every required permission, and every exact cache
@@ -36,6 +36,14 @@ The Java `loader-core` module owns the matching codec and validation. Fabric,
 NeoForge, and Forge adapters supply only platform identity, loader version,
 granted permissions, and cached identities. Platform networking and lifecycle
 code must call this shared core rather than reinterpret the plugin manifest.
+
+Source ownership (2026-09-06): the complete Java/Gradle workspace lives in the
+independent sibling `solaris-loader` repository, not under the Rust core.
+The wire protocol and shared-core/platform split are unchanged. Core retains
+server-side protocol handling and cross-repository integration scenarios;
+`python3 -m tools.harness` resolves the sibling by default, with
+`SOLARIS_LOADER_ROOT` for another checkout. A core production build does not
+require Java or a Loader checkout.
 
 Downloaded bytes remain untrusted. A missing exact identity is requested
 explicitly; the server may answer only with the matching validated plugin
@@ -67,7 +75,7 @@ staging session.
 
 After every exact cache file passes verification, the shared core requires the
 first ZIP entry to be a closed `solaris-client.json` schema. The current
-activation slice accepts owner-namespaced screen, item, and interaction
+activation slice accepts owner-namespaced UI, item, and interaction
 definitions plus declared asset bytes, rejects unknown fields and archive
 entries, verifies each asset's exact size and SHA-256, and bounds the combined
 immutable registry. Fabric,
@@ -78,11 +86,20 @@ server from leaking into a later vanilla connection.
 
 The Configuration outcome carries the exact Loader acknowledgement into the
 same Play session. A host-attested plugin may request only an
-owner-namespaced activated screen backed by `screens` and `open_screens`.
-Solaris publishes the bounded raw id payload only to that Loader-eligible
-session. Each platform adapter captures the packet's originating connection
-before queueing client-thread work and opens the activated title/body view only
-if that exact connection is still current.
+owner-namespaced activated UI backed by `ui` and `present_ui`. One
+`present_client_ui` command carries the resource id, `screen`/`hud`/`hidden`
+mode, and optional bounded title/body overrides through `ScriptBoundary`.
+Solaris sends `solaris:loader/ui` only to that Loader-eligible session. Each
+adapter captures the originating connection before queueing client-thread work
+and discards work for a superseded connection.
+
+`loader-platform-common` owns the modal presenter and non-interactive HUD
+registry. The three adapters register only their native payload and HUD-layer
+hooks; they do not duplicate presentation policy. A HUD update replaces the
+same owned id, hiding removes only that id, and activation/logout clears HUD
+state. Omitted text comes from the verified definition. UI ids and titles are
+limited to 128 UTF-8 bytes, bodies to 8 KiB; HUD layout is viewport-bounded,
+at most eight rows and 256 GUI pixels wide, with no input interception.
 
 Verified asset entries are exposed through one shared in-memory Minecraft
 client pack, keyed by their exact `assets/<namespace>/<path>` archive
@@ -94,15 +111,55 @@ owned by the Configuration origin and is removed by that connection's close
 notification, so stale disconnect work cannot clear a newer mount. Blocks
 remain outside this stage.
 
-The interaction slice extends the closed archive index with bounded
-owner-namespaced actions. Each action references a screen from the same bundle
-and carries a bounded label plus static UTF-8 payload. All three adapters render
-those actions and send one raw Play payload only while the exact definition and
-originating connection remain active. The server accepts that channel only from
-the same Play session that completed Loader acknowledgement, requires the
-owner's `interactions` plus `send_interactions` declaration, and publishes a
-required targeted `loader.interaction` event solely to that Luau owner. The
-plugin receives the client payload as untrusted data.
+The sound slice adds at most 64 owner-namespaced `sounds` definitions (`id`)
+under `play_sounds`. Each resolves only a same-bundle hash-verified mono
+`assets/<owner>/sounds/<path>.ogg` asset. Shared preflight probes the Vorbis
+header and initial decoded audio; the same pack generates `sounds.json` and
+rejects resource collisions before acknowledgement. No Java/native plugin code
+or frozen sound-event registry mutation is involved.
+
+`play_client_sound` and `stop_client_sound` share one admitted command and
+`solaris:loader/sound` Play channel, with Loader protocol 2. Server ownership,
+permission and live-session checks precede ordered publication; adapters capture
+the source connection before scheduling and reject stale work. Shared playback
+resolves only activated definitions, uses native one-shot sound instances,
+master volume, bounded pitch and optional fixed-position linear attenuation.
+Stop affects all instances of that same owner sound id on that player;
+activation/disconnect stops old Loader sounds. No loops, moving sources or
+playback completion callbacks are introduced.
+
+The interaction contract uses at most 64 owner-namespaced actions with bounded
+labels and static UTF-8 payloads. Optional `ui_id` references same-bundle UI;
+optional `key` names a canonical Minecraft keyboard key. At least one source is
+required. UI buttons emit `trigger`; keyboard edges emit `press`/`release`
+through the same Play channel and targeted `loader.interaction` event.
+Protocol 2 adds the phase byte; no protocol-1 fallback is retained. The payload
+is big-endian `u16 protocol`, `u8 phase`, then `u16`-length-prefixed id/payload,
+bounded to 4,231 bytes. Plugin API remains `0.6.0`.
+
+One shared `KeyboardHandler.keyPress` HEAD mixin covers Fabric, NeoForge and
+Forge, including vanilla screenshot/fullscreen early returns. It observes the
+pre-callback menu/focus context and never cancels vanilla input. Shared
+`LoaderKeyActions` bounds held state by declarations and ignores autorepeat;
+`LoaderMinecraftInput` owns exact-connection binding, menu/overlay/window-focus
+release and activation/logout cleanup. There are no dynamic vanilla key
+mappings or platform-local held state machines. Fixed bindings do not add
+rebinding UI, chords, mouse/gamepad or client Lua execution.
+
+The shared mixin declares `JAVA_21` compatibility because Forge's bundled
+Mixin 0.8.7 does not recognize `JAVA_25`; Minecraft still runs on Java 25.
+Forge's packaged jar registers it through `MixinConfigs`; the development run,
+which loads class directories rather than that jar manifest, supplies
+`--mixin.config`. Fabric and NeoForge use their mod metadata registration.
+
+Only current definitions and the acknowledged originating Play connection may
+send. The server requires the owner's `interactions` plus `send_interactions`
+and delivers solely to that Luau owner through `ScriptBoundary`. Input-only
+content does not require `present_ui`. Client phases/payloads remain untrusted;
+no server physical-key authority table is introduced. Plugins own mechanic
+state and disconnect cleanup. MCP named-key batches are validated on the
+client thread before any input mutation; press and respawn release through
+`finally` after execution begins.
 
 The item-presentation slice adds up to 128 owner-namespaced item declarations.
 Each declaration names one known vanilla base item and derives its client model

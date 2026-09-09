@@ -38,35 +38,39 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let passable = vec![mc_world::BlockStateId(0)];
     let grass = mc_world::BlockStateId(1);
     let water = mc_world::BlockStateId(2);
-    for lx in 3..=12 {
-        for lz in 3..=12 {
+    for lx in 0..16 {
+        for lz in 0..16 {
             let _ = chunk.set_block(lx, 64, lz, grass);
         }
     }
 
-    let spawns = plan_passive_herd(
-        &chunk,
-        Some(grass),
-        &[],
-        Some(&[water]),
-        &passable,
-        &rules,
-        &entity_types,
-    );
-
-    assert!(!spawns.is_empty());
-    assert!(
-        spawns
-            .iter()
-            .all(|spawn| spawn.entity_type_name == "minecraft:pig")
-    );
-    assert!(spawns.iter().all(|spawn| spawn.position.y == 65.0));
-    assert!(spawns.iter().all(|spawn| spawn.entity_type_id == 100));
-    assert!(spawns.iter().all(|spawn| {
-        let fx = spawn.position.x.fract();
-        let fz = spawn.position.z.fract();
-        (0.48..=0.51).contains(&fx) && (0.48..=0.51).contains(&fz)
-    }));
+    for x in -8..8 {
+        chunk.pos = ChunkPos { x, z: 7 };
+        let spawns = plan_passive_herd(
+            &chunk,
+            Some(grass),
+            &[],
+            Some(&[water]),
+            &passable,
+            &rules,
+            &entity_types,
+        );
+        assert_eq!(spawns.len(), 2, "valid habitat at {:?} lost its pack", chunk.pos);
+        assert!(
+            spawns
+                .iter()
+                .all(|spawn| spawn.entity_type_name == "minecraft:pig")
+        );
+        assert!(spawns.iter().all(|spawn| spawn.position.y == 65.0));
+        let bounds = mc_entity::natural_spawn_26_1_2::entity_aabb("minecraft:pig");
+        let separation_x = (spawns[0].position.x - spawns[1].position.x).abs();
+        let separation_z = (spawns[0].position.z - spawns[1].position.z).abs();
+        assert!(
+            separation_x >= bounds.half_width * 2.0
+                || separation_z >= bounds.half_width * 2.0,
+            "pack members overlap and would be rejected by collision admission"
+        );
+    }
 
     let mut unsupported_chunk = Chunk::empty(
         ChunkPos { x: 0, z: 0 },
@@ -124,6 +128,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
         &entity_types,
     );
 
+    assert_eq!(spawns.len(), 3);
     assert!(
         spawns
             .iter()
@@ -135,45 +140,49 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
         ocean_chunk.get_block(lx, spawn.position.y as i32, lz) == Some(water)
     }));
 
-    let water_only_chunk_pos = (1..64)
-        .map(|x| (x, 0))
-        .find(|&pos| !passive_chunk_spawns(pos))
-        .expect("non-passive chunk sample");
-    let mut water_only_chunk = Chunk::empty(
-        ChunkPos {
-            x: water_only_chunk_pos.0,
-            z: water_only_chunk_pos.1,
-        },
-        mc_world::BlockStateId(0),
-        ocean,
-    );
-    for lx in 3..=12 {
-        for lz in 3..=12 {
-            let _ = water_only_chunk.set_block(lx, DEFAULT_SEA_LEVEL, lz, water);
+}
+
+#[test]
+fn blocked_pack_sites_do_not_reuse_hostile_spawn_identities() {
+    use mc_data::biomes::{BiomeSpawnEntry, BiomeSpawnRules};
+
+    let plains = mc_data::Identifier::parse("minecraft:plains").unwrap();
+    let rules = BiomeSpawnRules::from_entries(BTreeMap::from([(
+        plains.clone(),
+        BTreeMap::from([
+            ("creature".to_string(), vec![BiomeSpawnEntry {
+                entity_type: mc_data::Identifier::parse("minecraft:pig").unwrap(),
+                min_count: 4, max_count: 4, weight: 1,
+            }]),
+            ("monster".to_string(), vec![BiomeSpawnEntry {
+                entity_type: mc_data::Identifier::parse("minecraft:zombie").unwrap(),
+                min_count: 1, max_count: 1, weight: 1,
+            }]),
+        ]),
+    )]));
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
+    let air = mc_world::BlockStateId(0);
+    let grass = mc_world::BlockStateId(1);
+    let stone = mc_world::BlockStateId(2);
+    let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air, plains);
+    for x in 0..16 {
+        for z in 0..16 {
+            chunk.set_block(x, 64, z, grass).unwrap();
         }
     }
-
-    let spawns = plan_passive_herd(
-        &water_only_chunk,
-        Some(grass),
-        &[],
-        Some(&[water]),
-        &passable,
-        &ocean_rules,
-        &entity_types,
-    );
-
-    assert!(
-        spawns
-            .iter()
-            .any(|spawn| spawn.entity_type_name == "minecraft:cod"),
-        "water mobs should not be throttled by sparse land passive spawning"
-    );
-    assert!(spawns.iter().all(|spawn| {
-        let lx = (spawn.position.x.floor() as i32 - water_only_chunk.pos.x * 16) as u8;
-        let lz = (spawn.position.z.floor() as i32 - water_only_chunk.pos.z * 16) as u8;
-        water_only_chunk.get_block(lx, spawn.position.y as i32, lz) == Some(water)
-    }));
+    let plan = |chunk: &Chunk| {
+        plan_passive_herd(chunk, Some(grass), &[], None, &[air], &rules, &entity_types)
+    };
+    let initial = plan(&chunk);
+    let blocked = initial.iter().filter(|spawn| !spawn.hostile).nth(1).unwrap().position;
+    chunk.set_block(blocked.x.floor() as u8, 65, blocked.z.floor() as u8, stone).unwrap();
+    let spawns = plan(&chunk);
+    assert_eq!(spawns.iter().filter(|spawn| !spawn.hostile).count(), 3);
+    assert_eq!(spawns.iter().filter(|spawn| spawn.hostile).count(), 1);
+    let identities = spawns.iter().map(|spawn| {
+        mc_entity::natural_spawn_26_1_2::herd_uuid(spawn.chunk, spawn.slot)
+    }).collect::<HashSet<_>>();
+    assert_eq!(identities.len(), spawns.len(), "pack holes reused an entity identity");
 }
 
 #[test]
@@ -243,7 +252,7 @@ fn hostile_spawn_planner_uses_multiple_monster_facts() {
 
     let chunk_pos = (1..128)
         .map(|x| (x, 0))
-        .find(|&chunk| hostile_chunk_spawns(chunk) && passive_chunk_spawns(chunk))
+        .find(|&chunk| hostile_chunk_spawns(chunk))
         .expect("hostile chunk sample");
     let plains = mc_data::Identifier::parse("minecraft:plains").unwrap();
     let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
@@ -371,7 +380,7 @@ fn hostile_spawn_planner_surface_candidate_does_not_require_cover() {
 
     let chunk_pos = (1..128)
         .map(|x| (x, 0))
-        .find(|&chunk| hostile_chunk_spawns(chunk) && passive_chunk_spawns(chunk))
+        .find(|&chunk| hostile_chunk_spawns(chunk))
         .expect("hostile chunk sample");
     let plains = mc_data::Identifier::parse("minecraft:plains").unwrap();
     let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
@@ -436,63 +445,6 @@ fn hostile_spawn_planner_surface_candidate_does_not_require_cover() {
     assert_eq!(covered_spawns[0].entity_type_name, "minecraft:zombie");
 }
 
-#[test]
-fn hostile_spawn_planner_does_not_depend_on_passive_chunk_selection() {
-    use std::collections::BTreeMap;
-
-    let chunk_pos = (-4..=4)
-        .flat_map(|x| (-4..=4).map(move |z| (x, z)))
-        .find(|&chunk| hostile_chunk_spawns(chunk) && !passive_chunk_spawns(chunk))
-        .expect("hostile-only chunk sample");
-    let plains = mc_data::Identifier::parse("minecraft:plains").unwrap();
-    let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
-    let rules = mc_data::biomes::BiomeSpawnRules::from_entries(BTreeMap::from([(
-        plains.clone(),
-        BTreeMap::from([(
-            "monster".to_string(),
-            vec![mc_data::biomes::BiomeSpawnEntry {
-                entity_type: zombie.clone(),
-                min_count: 1,
-                max_count: 1,
-                weight: 1,
-            }],
-        )]),
-    )]));
-    let entity_types = mc_data::entity_types::solaris_required_entity_types();
-    let passable = vec![mc_world::BlockStateId(0)];
-    let grass = mc_world::BlockStateId(1);
-    let mut chunk = Chunk::empty(
-        ChunkPos {
-            x: chunk_pos.0,
-            z: chunk_pos.1,
-        },
-        mc_world::BlockStateId(0),
-        plains,
-    );
-    for lx in 3..=12 {
-        for lz in 3..=12 {
-            let _ = chunk.set_block(lx, 64, lz, grass);
-            let _ = chunk.set_block(lx, 67, lz, mc_world::BlockStateId(2));
-        }
-    }
-
-    let spawns = plan_passive_herd(
-        &chunk,
-        Some(grass),
-        &[],
-        None,
-        &passable,
-        &rules,
-        &entity_types,
-    );
-
-    assert!(
-        spawns
-            .iter()
-            .any(|spawn| spawn.hostile && spawn.entity_type_name == "minecraft:zombie"),
-        "covered hostile-only chunks must still seed playable combat"
-    );
-}
 
 #[test]
 fn creative_and_spectator_modes_grant_client_abilities() {
@@ -2237,11 +2189,7 @@ async fn checkpoint_only_random_ticks_in_distinct_regions_do_not_wait_for_world_
     }
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(temp.path(), Arc::clone(&config.blocks), Arc::clone(&config.items))
     .unwrap();
     assert!(pending.is_empty());
     sessions.install_world_chunk_journal(journal);
@@ -2312,11 +2260,7 @@ async fn resident_random_tick_uses_periodic_checkpoint_instead_of_per_tick_wal()
         mutating_random_tick_fixture("DurableRandomTick");
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(temp.path(), Arc::clone(&config.blocks), Arc::clone(&config.items))
     .unwrap();
     assert!(pending.is_empty());
     sessions.install_world_chunk_journal(journal);
@@ -2400,11 +2344,7 @@ async fn boundary_random_tick_coordinator_fallback_uses_periodic_checkpoint() {
     register_loaded_button_session(&sessions, "DurableBoundaryRandomTick");
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(temp.path(), Arc::clone(&config.blocks), Arc::clone(&config.items))
     .unwrap();
     assert!(pending.is_empty());
     sessions.install_world_chunk_journal(journal);
@@ -2920,11 +2860,7 @@ async fn resident_scheduled_fluid_tick_stays_off_the_synchronous_journal_path() 
     register_loaded_button_session(&sessions, "DurableFluidTick");
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        blocks,
-        Arc::clone(&config.items),
-    )
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(temp.path(), blocks, Arc::clone(&config.items))
     .unwrap();
     assert!(pending.is_empty());
     sessions.install_world_chunk_journal(journal.clone());

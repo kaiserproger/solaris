@@ -54,6 +54,7 @@ pub(in crate::play) async fn route_client_loader_interaction(
         owner,
         ScriptPlayerId::new(player_id),
         &action.interaction_id,
+        action.phase,
         &action.payload,
     )
     .map_err(LoaderInteractionRouteError::InvalidEvent)?;

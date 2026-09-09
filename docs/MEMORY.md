@@ -1,666 +1,758 @@
-# Solaris Durable Memory Index
+# Solaris current cursor
 
-This is the short continuity index for long `/goal` runs. It records current
-head and routes detail to its canonical owner. Historical checkpoint prose is
-kept in [`archive/status/2026-07-19-memory.md`](archive/status/2026-07-19-memory.md)
-and is not startup context.
+## Active owner request
 
-## Current Checkpoint
+Full core redesign: fewer mechanisms and lines, more reuse and clarity, preserved
+performance and vanilla invariants. One broad, uniform, stable addon API must
+serve server logic and Loader-backed client features. Replace the documentation
+and memory; delete obsolete material rather than preserve legacy guides.
 
-- Date: 2026-07-31.
-- Branch: `main`.
-- A 2026-07-31 Pro static-review bundle is now tracked through
-  `docs/CODE_REVIEW_REMEDIATION_2026-07-31.md`: 42 findings are grouped into
-  parser/data, persistence, network, ownership, authority, and loader/architecture
-  waves. Every item requires current-tree confirmation and focused evidence before
-  it is treated as complete. `SOL-023` canonical `Identifier` serde, `SOL-024`
-  validated resource paths, `SOL-016` world-journal parser/file budgets,
-  `SOL-035` count-prefixed protocol allocation safety, `SOL-009` aggregate NBT
-  budgets with atomic writer preflight, and `SOL-021` bounded exact gzip/NBT
-  loading, `SOL-032` bounded sidecar traversal, `SOL-013` bounded Anvil
-  region/chunk decompression, `SOL-014` atomic Anvil writer preflight, and
-  `SOL-015` Anvil sector/checksum integrity, `SOL-020` chunk-position identity,
-  `SOL-017` writable-world process leasing, `SOL-027` resident/dirty byte
-  backpressure, `SOL-040` portable atomic replace, `SOL-001` exact Play liveness,
-  `SOL-004` exact Configuration bodies, `SOL-003` absolute pre-Play deadlines and
-  admission permits, `SOL-028` weighted Play ingress budgets, `SOL-029`
-  simulation request deadlines with owner-health wake-up, and `SOL-007` bounded
-  Mojang session verification, `SOL-008` strict/offloaded compression framing,
-  and `SOL-030` canonical login-name validation and collision policy are complete;
-  `SOL-002` close-safe async extension boundaries, `SOL-012` bounded committed
-  script-event delivery with explicit required/best-effort policy, and `SOL-031`
-  crash-only regional-owner supervision, `SOL-041` named poisoned-lock policy,
-  `SOL-037` RAII host-admission cancellation, `SOL-039` strict exact plugin
-  deployment, and `SOL-038` aggregate plugin wall-clock/fairness budgeting are
-  complete; `SOL-019` authority-side displacement validation, `SOL-025` partial-horizontal-travel collision reporting, `SOL-026` public physics input validation, `SOL-005` immutable Loader artifact digest binding, `SOL-010` fallible byte-array codec bounds, `SOL-011` cancellation-safe encrypted writes, `SOL-018` plugin dependency/load-order execution, `SOL-022` bounded startup resource policy, `SOL-033` recipe semantic validation, `SOL-034` tag graph validation, and `SOL-036` negative ItemStack count rejection are complete. `SOL-006` is superseded by the explicit client-runtime carrier trust boundary. `SOL-042` gateway remediation is complete; the supplied review bundle has no remaining open finding.
-- Phase-2 crate ownership is actively shrinking touched `mc-net` domains. Movement geometry/admission primitives live in `mc-physics`; bounded world-bounds→chunk coverage plus chunk-stream spiral/directional/prewarm/desired-window planning live in `mc-world`; survival/mining/tag/food, ItemStack, item/enchanting/recipe semantics, and shared 26.1.2 block-name semantics live in `mc-data`; natural-spawn chunk-template planning, player survival/combat rules, and villager trade-input semantics live in `mc-entity`; shared GameMode/Direction/InteractionHand values live in zero-dependency `mc-domain`; deterministic placement state rules (direction primitives, stair shape, slab merge, waterlogging, torch/sign orientation) live in `mc-data::block_placement_26_1_2`. `mc-net` retains authoritative mutation, scheduler/IO state, registry adaptation, storage, transaction settlement, and wire publication. `xtask code-health` enforces these boundaries, forbids lower-crate reverse dependencies on `mc-net`, and rejects transport/session symbol leakage into semantic lower crates. Evidence includes `docs/evidence/movement-rules-crate-boundary.md`, `docs/evidence/survival-mining-crate-boundary.md`, `docs/evidence/chunk-stream-plan-crate-boundary.md`, `docs/evidence/natural-spawn-crate-boundary.md`, `docs/evidence/block-semantics-crate-boundary.md`, `docs/evidence/player-combat-crate-boundary.md`, `docs/evidence/domain-values-crate-boundary.md`, `docs/evidence/item-stack-crate-boundary.md`, `docs/evidence/item-semantics-crate-boundary.md`, `docs/evidence/recipe-semantics-crate-boundary.md`, `docs/evidence/merchant-semantics-crate-boundary.md`, and `docs/evidence/block-placement-crate-boundary.md`. CodexPro's direct `edit` operation can false-positive on giant files; validated `apply_patch` is preferred, while owner-authorized exact local shell rewrites are acceptable for mechanical large-range moves when the guarded edit path cannot express them cleanly.
-- Phase-2 closure 2026-08-18: all eight `PUBLIC_ALPHA_PLAN` boundary items are complete for the current migration set. The touched verticals have lower semantic owners/evidence; the unused staged `mc-entity::interaction_26_1_2` API and superseded survival/mining shims/aliases/tests are gone, with future cleanup tied to future caller cutovers rather than keeping Phase 2 open. `SOL-042` reduced the three roots to simulation `process_batch` **998 lines** from 1,439, `BoundServer::serve` **277** from 1,553, and `play_loop_inner` **731** from 1,522. The full entity-ticker runtime moved literally out of `serve` into `server/entity_ticker.rs` behind `EntityTickerContext`; it has its own **1,053-line** growth ceiling so the runtime debt is explicit rather than hidden. Play serverbound behavior is routed through explicit movement, player-state, use/interact, container, player-control, client-metadata, and chat/command families, with family-aware liveness coverage. Command/lifecycle ordering, admission order, queue fairness, authority, stale/cancel fences, metrics, slow-client close behavior, and publication ordering remain unchanged. Do not reopen Phase 2 merely for future touched domains; apply the standing ownership policy incrementally.
-- The first owner-run public-alpha session remains the routing authority for the
-  next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
-- The future full Luau addon platform is frozen in
-  `docs/LUAU_ADDON_API_1_0_SPEC.md`; its 145-task decomposition is in
-  `docs/LUAU_ADDON_API_1_0_TASKS.md`. Only the two documentation tasks are
-  complete and all 143 runtime tasks remain `BLOCKED-VP` until scoped vanilla
-  parity and explicit owner activation.
-- The interrupted colony checkpoint is already complete in `4902a3d`: colony
-  identity, roles, orders, and persistence live in Luau/plugin storage, while
-  Rust exposes only generic villager binding and movement/idle goal primitives.
-- Periodic natural spawning is implemented with independent friendly/hostile
-  cadences, bounded rotating loaded-chunk work, admission fences, refill after
-  movement/despawn, common-biome rules, and metrics. The no-operator 20-minute
-  client observation and restart-identity acceptance gates remain open.
-- Plugin deployment requirements are now fully operator-visible. Discovery,
-  startup logs, and `--check` derive deployment class, supported loaders,
-  permissions, bundle identities, artifact sizes, and totals from validated
-  manifests. Shipped examples carry explicit deployment labels, and a failed
-  required-Loader handshake receives a Configuration disconnect naming the
-  supported platforms and required bundles. The full graphical Loader matrix
-  remains external and must not be claimed from this headless workspace.
-- The strong baseline must be preserved: seed `712816`, VD16 and one local player
-  pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
-  without degradation or memory-pressure shedding, used roughly 300 MiB by owner
-  observation, and shut down with zero dirty chunks.
-- The P0 clock checkpoint is complete. The empty 26.1.2 clock-update map was
-  replaced by a typed overworld update: monotonic simulation tick remains packet
-  `game_time`, while persisted world time is the separate registry-id-0 clock at
-  rate `1.0`. Exact protocol/package/server/command/sleep gates and the real-client
-  day/sunset/night/dawn/restart graphical gate pass; evidence is in
-  `docs/evidence/world-clock-26.1.2.md`.
-- Worldgen revision 10 now removes the 384-block origin blend, forced stone/iron
-  outcrops, and starter-tree anchor. A bounded 32-seed Tellus gate, including seed
-  `712816`, finds distinct dry low-relief terrain; schema 3 persists the selected
-  spawn and startup generation/light plus final player support search use it. The
-  public default and `example.toml` are `tellus_like`, and the playable world moved
-  to `.analysis/test-world-v10`. Unversioned Anvil imports skip Solaris spawn
-  selection, retain the origin fallback, and do not gain a Solaris contract. The
-  single read-only worldgen reviewer consumed the diff but timed out at 180 seconds
-  without a verdict or actionable finding; no second reviewer was run. Final gates
-  pass for `mc-world` 229/229, `mc-worldgen` 94/94 plus 12/12, `mc-net` 1828/1828,
-  the complete `mc-server` package, and the five-seed real server/client spawn
-  harness. `cargo test --workspace --quiet` printed every executable group green
-  through the final worldgen group, then exceeded the 180-second wrapper limit;
-  workspace doc-tests pass separately (3/3).
-- Revision-10 vegetation is now seed-driven and regionally coherent instead of
-  uniform per-column modulo noise. One 192-block density field combines regional
-  noise with routed moisture, then biome thresholds create forest edges, grassland
-  copses and sparse savanna cover. Savannas use acacia logs/leaves; deserts,
-  snowy plains and ice spikes are treeless, while taiga and grove retain spruce.
-  A 32-seed 8192x8192 metric requires distinct biome/feature fingerprints, at
-  least 12 land biomes in aggregate and no more than eight sufficiently-landed
-  seeds above 90% one land biome. `mc-worldgen` passes 110/110 and the external
-  worldgen harness passes 5/5. The narrow single-thread debug probe measured
-  23.2 chunks/s versus 23.0 before the non-vegetated-column optimization; it is
-  not the owner i5-12600 release throughput gate. The single read-only vegetation
-  reviewer inspected the production and external-test diff, then timed out at
-  180 seconds without a verdict or actionable finding; no second reviewer was run.
-  Drainage, rendered 2048x2048 mosaics, clean seed-`712816` owner playtest and
-  release throughput remain active.
-- The current P0 lock checkpoint removes the confirmed public-alpha defect.
-  Production item-drop owner commits finish before short session publication.
-  Item pickup plans from immutable snapshots, installs one runtime-only regional
-  claim token, validates session and player state without nested waits, and resolves
-  that token against the current entity snapshot so rollback preserves newer motion.
-  The regional owner blocks competing stack/remove/merge/lifecycle/damage mutations
-  during the claim while allowing kinematics. Claim install/rollback/finalize are
-  checkpoint-only; the simulation `SaveBarrier`
-  captures matching player and entity state, while the direct save path is only used
-  after owner drain. Debug phase timings cover owner claim/finalize, session, player,
-  and publication. Deterministic lock, checkpoint, and interleaving tests prove
-  progress, conservation, and crash consistency. The reproducible 200-action
-  raw-TCP break/drop/pickup gate is now green: session-registry max hold fell from
-  5,266 us to 2,178 us, player-persistence max hold from 5,263 us to 285 us, and
-  the final exact 1,200-sample tick window peaked at 9,643 us. `mc-net` passes
-  1859/1859.
-- The single independent lock-diff review session exhausted its 180-second limit
-  without a verdict. It focused on the real risk that inverse full-snapshot rollback
-  could lose an interleaving motion update. No second reviewer was run; the reviewed
-  design was replaced by current-snapshot token resolution and checkpoint-only
-  durability, with dedicated regressions for both findings.
-- P1 natural spawning no longer relies on one-shot chunk materialization. The
-  periodic scheduler and common-biome rules are implemented; only the real-client
-  observation and restart-identity acceptance rows remain open.
-- Plugin deployment reporting is complete without a duplicate manifest flag.
-  Remaining Loader work is the external Fabric/NeoForge/Forge visual matrix and
-  any future addon-platform scope explicitly activated by the owner.
-- The worktree may contain unrelated owner files and local artifacts. Inspect
-  exact ownership before editing; never clean or stage them by accident.
-- Fresh-player spawn now chooses the nearest non-hazardous collidable support
-  with collision-free, non-fluid body space in the resident 11x11 spawn window.
-  Focused tests cover water, transparent collision, and magma support. A new
-  real 26.1.2 client on seed `20260721` changed the initial sampled cell below
-  spawn from water to air; this observation alone does not prove settled
-  landing. The final tested O3 binary is
-  `6be274ad51f43129e4949ad2a5eea39444d50d580bd694f5340e300b59b105d9`.
-- Creepers use server-owned 30-tick retained fuses, reverse fuse progress
-  beyond seven blocks,
-  stop navigation while swelling, never survive a prior lethal transition to
-  explode, do not persist natural swell across restart, and explode with power
-  3 through the same
-  ordered authority path as TNT. The source-specific explosion contract keeps
-  TNT at power 4 and resolves chained TNT from the canonical registry instead
-  of the exploding entity type. Unit and real TCP gates cover prime/cancel,
-  terminal removal, radius-3 explosion, and player damage. Exact 26.1.2
-  swell/ignited wire indexes and line-of-sight cancellation are still pending;
-  no manual-client gate was run.
-- Primed TNT/creeper expiry uses an exact retained-deadline index populated by
-  spawn, fuse updates, restore, and removal. Rescheduling removes the previous
-  bucket entry, and repeated owner calls cannot exceed one explosion per world
-  tick. An O3 full-path load with 4,096 background cows, 64 explosions, and a
-  fresh 27-block solid volume per explosion measured idle fuse p99 0 us and
-  explosion-tick p50/p95/p99 23,812/37,943/46,463 us. This is in-process
-  authority/world/entity evidence, not publication or socket throughput.
-- Block use/break, entity interaction, and default melee now use separate
-  26.1.2 eye-to-AABB verification contracts. Block and entity interactions are
-  strict at their buffered limits; attack is inclusive. Player and
-  server-entity combat both use the authoritative held item's attack range;
-  embedded and sidecar item facts cover the seven 26.1.2 spears. Player pose
-  selects standing, crouching, or swimming eye height and target bounds, and
-  non-finite inputs fail closed. Focused reach, mob damage/death, death timing,
-  and skeleton tests plus the full `mc-net` suite pass. A manual client gate
-  remains open.
-- Mob death completion is indexed by exact retained deadline instead of an
-  unconditional full entity scan. Lethal melee/projectile/effect paths and
-  persisted restore populate the index. Cleanup drains at most four deaths per
-  tick, keeping mass-death overload bounded. The explicit `-O3` 4,096-cow load
-  measured idle p99 11 us, sustained four-kill p99 13,668 us, and bounded
-  four-removal p99 24,367 us. Focused death/effect/arrow/restart tests pass;
-  this does not prove real socket throughput or manual combat feel.
-- `basic-economy` now owns one configurable physical item currency, a
-  zone-activated inventory shop, and a durable refund ledger. Purchase and
-  refund use one inventory/storage transaction, so currency, product, and
-  ledger never commit separately. The old virtual wallet and duplicate
-  `currency-catalog` fixture were removed. Stable product ids preserve original
-  refund terms across catalog edits and reject purchases until old terms are
-  cleared. A production TCP/Lua gate proves a configured gold-ingot purchase,
-  insufficient-funds rejection, refund, and zone-triggered menu refresh.
-  `land-claims` owns a bounded durable whole-chunk index. Direct break/place,
-  right-click block actions, containers, buckets, living-entity interaction,
-  explosion block damage, and the bounded common-fuel fire path are protected.
-  A direct lever/button can extend or retract one normal piston with one common
-  full block; its atomic base/head/destination edits consume the ambient
-  protection snapshot in direct and scheduled-button planning. No manual-client
-  gate has run.
-- Land-claim admission now covers right-click block actions, all halves of a
-  chest window, exact filled-bucket destinations, living-entity target
-  positions, and explosion block candidates in addition to direct break/place.
-  Every chest/furnace click rechecks the backing positions. Player actions keep
-  the bounded authoritative actor check. Explosion planning clones one
-  immutable generic protection snapshot only when an explosion is due and before the world
-  lock, so idle ticks do not copy zones and the candidate loop takes no zone
-  mutex. Random fire planning now consumes the same immutable snapshot and
-  skips protected burn targets while allowing the source fire to age. The
-  baseline normal-piston mutation is atomic and rejects the whole group if any
-  affected position is protected; sticky pistons, multi-block chains,
-  slime/honey, and moving animation remain outside this slice. The fire slice
-  does not yet reproduce the complete vanilla material/odds table, and the
-  bounded actor lookup still needs the published policy index described by ADR
-  0009. Rust contains no `land-claims` plugin-id or zone-id convention:
-  `solaris.upsert_protected_zone` carries a typed actor-or-operator policy, and
-  the Lua plugin owns claim identity, persistence, and lifecycle.
-- Current production Lua mutations hide regional/session ownership completely:
-  entity spawn and villager commands enter simulation/regional owners, while
-  menus, teleports, and standalone player-inventory transactions enter the
-  exact ordered session lane. Standalone inventory routing now waits for the
-  session owner to plan from live inventory and update the durable mirror;
-  dropped commands reject without mutation. The compound inventory/storage
-  transaction shares the same internal session gate, so it cannot plan past an
-  earlier owner command and its ledger and inventory cannot commit separately.
-  No lock, region key,
-  lease, epoch, or worker handle enters a Lua DTO.
-- The agent-run real-client hostile-combat functional gate is closed on an
-  isolated O3 server. Ordinary 26.1.2 client actions selected an iron sword,
-  killed a zombie, observed and collected its rotten-flesh drop, observed a
-  skeleton arrow and player damage, then observed creeper damage and removal
-  while remaining `in_play=true`; this is consistent with the exact explosion
-  path already proved by the TCP regression. The retained harness shows that
-  operator commands only created the deterministic fixture. The server logged
-  one `57.474 ms` tick after processing 62 simulation commands with 10 still
-  queued and no reliable drop, retry, or disconnect warning. Evidence:
-  `.analysis/mcp-combat-check.py`,
-  `.analysis/codex-logs/mcp-hostile-combat-result-v2.json` and
-  `.analysis/codex-logs/mcp-hostile-combat-server-v2.log`. Next: run a
-  20-minute MCP survival session with subagent-made decisions, no deterministic
-  scenario runner, and no operator setup; subjective combat feel remains open.
-- Hostile attack planning no longer holds `SessionRegistry.inner` across
-  regional entity-owner requests. It reads a dedicated active-hostile ID
-  publication, stable per-session target/visibility snapshots, and an atomic
-  skeleton arrow type, then runs creeper fuse CAS, arrow spawn, and melee
-  attacker validation through regional owners. Final melee admission uses
-  per-session immutable
-  combat-target/visibility snapshots and accepts an ordered reservation only if
-  their shared odd/even publication epoch stays unchanged. Disconnect publishes
-  non-targetable before queue close. Final melee does not reacquire the global
-  session registry. Focused races cover attacker/target death, movement,
-  Spectator, unregister, and completion while that registry is held elsewhere;
-  an ordinary whole melee tick also completes under that held lock. Regional
-  selection replaces the hostile publication before attacks on each goal turn;
-  unload and zero-live-session paths clear it without later owner reads. Manual
-  feel remains pending.
-- Ordinary entity goal-input collection no longer enters
-  `SessionRegistry.inner`. Active chunks, a 64-shard chunk-to-entity index,
-  terrain-pathing IDs, and per-session combat-target poses are immutable
-  publications. A revision fence prevents cross-shard moves from disappearing
-  from concurrent snapshots. The duplicate chunk/entity maps were removed from
-  `SessionRegistry.inner`; visibility, projectiles, grazing, lifecycle radius
-  queries, and player-body relocation now use the same routing authority.
-  Mutation paths remain centralized, so regional mutation ownership is still
-  incomplete.
-- Physics chunk crossings now release `SessionRegistry.inner`, update all
-  routing moves under one generation fence with one clone per touched shard,
-  then reacquire the session lock for visibility/tracker publication. Each move
-  requires its expected old route, so a concurrent newer relocation/removal
-  wins and the stale crossing is not published. Session membership can progress
-  independently.
-- Common physics publication updates only position, rotation, velocity, and
-  on-ground fields in the existing wire snapshot; it no longer rebuilds the
-  full entity DTO or repeats entity-type lookup under `SessionRegistry.inner`.
-  Tracker admission uses one sharded get-or-insert instead of separate
-  contains/owner-snapshot/insert/get operations. Visibility, arrow resolution,
-  and the freshness recheck still intentionally serialize on the session lock.
-- Ground wanderers retain independent deterministic 3-7-block targets until
-  arrival, pause without drift, and turn body/head at bounded rates. Physics
-  preserves goal-owned rotation when collision clips velocity; zero-speed
-  hostile melee still faces immediately. Animals in love use a courtship
-  follow goal and return to wandering after breeding. Exhausted wander paths
-  retarget instead of retrying forever. Old persisted path JSON defaults the
-  two added pause fields. Focused client evidence covers natural sheep, pig,
-  and cow motion with non-zero yaw change and no vertical rise.
-- The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
-  an unanswered keepalive challenge while valid movement packets still proved
-  the client alive. Solaris now preserves one pending challenge, requires both
-  challenge and total inbound inactivity before timeout, uses vanilla's
-  three-tick default movement interval, and rotates a 512-candidate movement
-  shard under extreme load; arrows, items, and XP remain latency-sensitive.
-  A real 26.1.2 MCP client completed 975 client ticks with 5,227 total server
-  entities and remained `in_play=true`; the server logged no keepalive
-  mismatch/timeout, reliable drop, or retry. Evidence:
-  `.analysis/codex-logs/dense-5132-spawn.json`,
-  `.analysis/codex-logs/dense-5132-release-build-v5.log`,
-  `.analysis/codex-logs/dense-5132-keepalive-fixed-v5.json`, and
-  `.analysis/codex-logs/dense-5132-fixed-v5-server.log`. The current
-  autoscaler slice removes per-tick owner-lane reconfiguration on `Hold`, skips
-  capacity-capped no-op actions, requires 20% recovery headroom, and coalesces
-  continuous slow-tick warnings to the 100-tick metrics cadence. Focused and
-  full workspace L2 gates pass. The
-  current water slice adds vanilla swimming metadata and server-owned
-  air/drowning/recovery. Aquatic entity physics uses fish drag without generic
-  buoyancy, removing the force that held fish at the surface. Canonical
-  `LivingAquatic` and `LivingAmphibious` contracts share that path. Focused
-  tests and full workspace tests, strict Clippy, fmt, and code-health pass; all
-  four prior reviewer findings were fixed. The follow-up sends the vanilla
-  enabled-feature packet before known packs, makes water plants passable, and
-  uses swimming/crouching body and eye heights for water/collision queries.
-  The follow-up fixes the root cause of zero client-local fluid height: chunk
-  encoding always published `fluid_count=0`, causing 26.1.2
-  `LevelChunkSection.hasFluid()` to skip `EntityFluidInteraction`. The wire
-  count now covers water, lava, water plants and waterlogged states. An O3 real
-  client entering source water reports `in_water=true` and
-  `water_fluid_height=0.8888889`; 81 chunks streamed with measured
-  `chunk_data_ms=0`. The follow-up O3 MCP gate observed ascent, diving,
-  swimming pose, air depletion, drowning damage and connection continuity.
-  Evidence is `.analysis/codex-logs/deep-water-real-client-final.json`. The
-  hostile-combat functional follow-up is recorded above.
-- The dense-world latency follow-up bounds work instead of treating every
-  artificial cow as a 20 Hz obligation. Populations within the autoscaler
-  budget remain full cadence; larger active sets rotate deterministic
-  `256 * cpu_limit` simulation cohorts, with 512 goal and dense natural-movement
-  limits. Sheep grazing uses a maintained sheep index, while breeding uses a
-  lock-free index of babies and animals in love without shrinking its full
-  active eligibility to the physics cohort. In the exact 5,227-entity O3
-  975-client-tick gate, over-budget warnings fell from 223 to 8, entity-goal
-  warning p50 from 78.237 ms to 17.473 ms, and grazing warning p50 from
-  8.389 ms to 0.234 ms. The client remained in play with no disconnect,
-  reliable-command loss, or runtime work-budget info spam. Representative
-  interaction is also green: a fresh agent-run 26.1.2 `playable-12` gate on the
-  optimized dev profile completed natural block breaks and drops, maximum-count
-  crafting, crafting-table and chest placement/opening, natural pig combat and
-  pickup, and a container transfer in 22 seconds with nine natural entities and
-  active chunk streaming. The server emitted no tick-budget, packet-dispatch,
-  reliable-command, or disconnect warning. This is representative ordinary-play
-  smoke evidence, not a per-action latency SLO or broad overload soak. Evidence is
-  `.analysis/real-client-runs/responsiveness-o3/20260723T103459Z-real-client-playable-loop-4vVxYV`.
-- Scheduled-block planning uses autoscaler CPU admission and the blocking pool.
-  The phase services pushed simulation commands while the job runs, then joins
-  it before fluid or later phases. One shared admission fence covers every
-  entry point. The deterministic 256-button regression proves owner command
-  responsiveness under CPU pressure, duplicate rejection, and complete commit.
-  Its optimized run took `1,666 us`; evidence is
-  `.analysis/codex-logs/scheduled-background-owner-256-o3-final.log`.
-- `7cdd917` fixes the ordinary active-game save path exposed by the natural
-  furnace loop. A resident mutation during out-of-lock whole-region encoding
-  now skips that Anvil region before filesystem installation and leaves it
-  dirty for bounded replanning; stable independent regions continue. A real
-  filesystem version mismatch remains `StaleRegion`, and exact barrier-save
-  semantics are unchanged. Focused tests cover one-time and continuous
-  resident conflict, whole-region skip, stable-region progress, cleanup, and
-  the typed bounded failure. Full workspace tests, strict workspace Clippy,
-  fmt, code-health `0 fail / KEEP`, and diff-check pass. The real-client
-  artifact
-  `.analysis/real-client-runs/20260721T112014Z-real-client-playable-loop-pURskM`
-  completed the natural wood -> furnace -> charcoal scenario with runner exit
-  0 and no dirty-flush degradation warning. This does not replace the pending
-  owner-played 20-minute session or a vanilla oracle.
-- `5e0d93b` adds bounded host-local Lua timers driven by pushed monotonic
-  simulation ticks. Tick admission coalesces the newest tick under queue
-  pressure without blocking the simulation thread; due callbacks run in
-  deterministic deadline/id order, at most eight per pushed tick, and share
-  one instruction and command budget with an optional `on_server_tick` handler.
-  Replacement, cancellation, capacity/input rejection, handler rollback,
-  same-tick cancellation, stale ticks, queue pressure, close/drain, and shared
-  fuel failure have focused coverage. A real TCP/Lua gate proves command ->
-  timer -> targeted client message without a `server.tick` subscription. Full
-  workspace tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`,
-  and diff-check pass. A `sol high` re-review found no remaining
-  blocker/high/medium issue. No manual-client or vanilla-oracle gate was run
-  for this plugin-only slice.
-- `d59bd57` adds optional per-plugin `config.toml`, loaded and recursively
-  bounded before plugin registration, plus a fresh-copy `solaris.config()` Lua
-  API. The then-separate currency catalog read currency, zone, and products
-  from that file and validated its exact schema at load. A production TCP/Lua gate
-  overrides the example with gold currency, a stone axe, and a moved zone, then
-  proves menu content, buy, stale rejection, unchanged state, and refund. Full
-  workspace tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`,
-  and diff-check pass. A `sol high` re-review found no remaining
-  blocker/high/medium issue. No manual-client or vanilla-oracle gate was run
-  for this plugin-only slice.
-- `9aee245` adds capability-gated Lua transactions over a connected player's
-  main inventory and hotbar. The session endpoint plans every resource delta
-  before replacing canonical persistence state and publishing one authoritative
-  inventory snapshot. Unknown items, insufficient input, full inventory,
-  absent/stale sessions, disconnect races, and worldless runtimes return exact
-  targeted failures without partial mutation. The real TCP/Lua gate proves
-  grant, exchange, failed overdraw, failed unknown-resource exchange, later
-  clearing of the unchanged inventory, targeted isolation, and the worldless
-  rejection. Full workspace tests, strict workspace Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check pass. A `sol high` re-review found no remaining
-  blocker/high/medium issue. No manual-client or vanilla-oracle gate was run for
-  this plugin-only slice.
-- `c82c344` adds capability-gated same-dimension Lua player teleports through
-  the exact reliable session and authoritative simulation owner. Success
-  survives cancellation after commit; missing/stale players, pending teleport
-  confirmation, and runtime failure remain distinct. The real TCP/Lua gate
-  proves the initial pending rejection, exact cross-chunk position sync and
-  center replan, zone observation, targeted result isolation, repeated pending
-  rejection, and authoritative follow-up pose. A direct queue test drops the
-  session waiter after owner commit and still proves success plus the persisted
-  pose. Full workspace tests, strict workspace Clippy, fmt, code-health `0 fail
-  / KEEP`, and diff-check pass. A `sol high` re-review found no blocker. No
-  manual-client or vanilla-oracle gate was run for this plugin-only slice.
-- `d9c0804` derives the default 26.1.2 furnace contract from the complete
-  resolved item-tag graph and carries a pinned 280-item fallback for embedded
-  startup. Startup rejects a partial or drifted sidecar. Furnace, smoker,
-  blast-furnace, container, and hopper paths share that immutable snapshot;
-  specialized furnaces halve duration and non-flammable wood remains rejected.
-  The local decompiled oracle and full sidecar match the fallback for all 280
-  ids and durations. The real TCP container test smelts with oak stairs, and
-  sad-path tests prove rejected menu/hopper transfers do not mutate state. Full
-  workspace tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`,
-  and diff-check pass. A `sol high` re-review found no remaining blocker. No
-  manual Prism-client gate was run. Pre-existing entity-scale and local
-  artifacts were not staged.
-- Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
-  ran; broad performance and dedicated concurrency gates did not.
-- The exact release entity-scale gate now covers 40,000 active hostile entities,
-  60 complete headless TCP clients, 16 regions, 200 warm-up ticks, and 1,200
-  measured ticks. Tick p50/p95/p99/max was
-  `37.289/41.932/43.886/52.863 ms`; goal and hostile-attack p99 were
-  `19.838/9.766 ms`. All clients stayed connected with zero reliable drops,
-  write timeouts, or pressure sheds, and the derived cohort rotated the full
-  population within 28 ticks. The separate 1,500-vs-1,500 regional battle
-  completed at `32.610 ms` tick p99 with no missing follow targets. This is
-  focused release profiling, not a broad deployment or long-soak claim.
+The new target contract is [ARCHITECTURE.md](ARCHITECTURE.md). It is not a claim
+that the runtime has already been migrated. Current plugin API: `0.6.0`;
+[current reference](PLUGINS.md). Loader has one common implementation and
+Fabric/NeoForge/Forge adapters.
 
-## Delivery Priority Lock
+Owner-approved overload policy: inside declared capacity, vanilla semantics;
+outside it, explicit pre-mutation rejection or local delay of expensive work is
+allowed to protect the kernel and healthy players. Never discard accepted
+mutations, delete items, or partially commit a transaction to relieve pressure.
 
-After compaction, resume in this order unless the owner explicitly changes it:
+Owner correction: finish one bounded area through design, implementation and
+verification before selecting the next. Do not reopen a whole-core design survey.
 
-1. Common vanilla-client gameplay and multiplayer parity.
-2. Production Lua plugin API and its gameplay adapters.
-3. Measured optimization, regional ownership, ECS, and autoscaling.
-4. Rare error-path hardening and uncommon parity edges.
+Current owner priority: finish RAM-backed asynchronous WAL, then the alpha-3
+worldgen and water-walking findings; reduce oversized files, duplication and
+one-use helpers; run varied load scenarios and fix measured hot paths. Loader
+feature development remains frozen. The owner now authorizes committing and
+pushing the entire accumulated core change, with local artifacts excluded, and
+creating/publishing the public `solaris-loader` and `solaris-default-plugins`
+repositories first so hosted CI can resolve them. No tags, release publication,
+or frozen-archive replacement is authorized.
 
-The current multi-region save recovery has a narrow deferred error path: a
-later-region install failure can synchronously `fsync` the already-installed
-prefix while the caller still holds the world mutex, and that recovered prefix
-is not included in aggregate flush metrics. The normal save path and ordinary
-crash-safety fences are covered. Do not resume this hardening before the first
-two priorities unless it becomes a common-play blocker or corruption risk.
+Owner explicitly requires continuous autonomous execution, without mandatory
+checkpoint stops. Evidence snapshots and validation are internal milestones,
+not permission gates or reasons to yield. Continue into the next bounded area
+unless a real blocker or material owner decision prevents progress.
 
-## Workflow Lock
+## Baseline and evidence
 
-- The persistent `/goal` is a north star. Execute one finite checkpoint using
-  the Autonomous Goal Protocol in `AGENTS.md`; select only the explicit
-  checkpoint route and never keyword-match injected goal/history text.
-- Route exact surfaces through `.memory/MEMORY.md` and
-  `docs/AGENT_ROUTES.md`; do not load the whole docs stack or raw session
-  history after compaction.
-- Finish the active request before accepting a later one unless the owner
-  explicitly interrupts or replaces it. On retry, verify current process and
-  worktree state before resuming.
-- Keep implementation direct and local. Ask only about a material ambiguity;
-  an explicit request does not need reconfirmation.
-- Use the checkpoint's L0/L1/L2 tier. L2 runs only for a completed code commit,
-  release, or milestone close and never repeats on an unchanged tree identity.
-  Markdown/instruction-only work gets static/path/diff checks, not Cargo tests.
-- Self-check every completed task and use exactly one independent read-only
-  reviewer. Extra workers require an explicit owner request.
-- Keep a checkpoint within 8 soft and 12 hard model roundtrips, six shell
-  batches, one stateless subagent, one L2 run, and zero compactions. Continue
-  the next checkpoint in a fresh session from a compact cursor.
-- Never use a full-history subagent fork. Give the reviewer or worker only its
-  bounded task, base commit, owned paths, acceptance checks, and relevant
-  evidence, then close it after its single result.
-- Batch independent calls. Treat repeated one-tool model rounds, broad
-  truncated discovery, progress polling, and L2 before a commit candidate as
-  workflow failures rather than normal execution.
-- Runtime event delivery, hard counters/fresh continuations, validation cache,
-  compact subagent results, and conditional completion/blocked audits remain
-  external Codex work described in `docs/GOAL_WRAPPER_V2.md`; repo prose must
-  not pretend those mechanisms already exist.
+- Base HEAD before the authorized publication:
+  `638543ab4771f7db9aef93cfaeed7e2fae832312`. Earlier dirty work is included by
+  explicit owner choice; local caches, world data and evidence remain excluded.
+  Historical no-commit notes below describe their original checkpoints, not the
+  current authorization.
+- Previous cutover: net −1,198 Rust lines, including tests. Core tests, Clippy,
+  formatting, code-health, and independent review passed. This did not close
+  broader acceptance. All eleven recorded workspace failures are now closed;
+  the full correctness gate and its final affected-target follow-up passed.
+- Frozen debug load matrix: 42 runs on one Ryzen 5 7535HS, CPU affinities 1/4/12;
+  **20 PASS / 22 FAIL**. Original assertions and workload sizes remain intact.
+  Both soaks fail setup; the twelve-CPU 40k/60-client run retains only 7 sessions.
+- Exact prior receipt, snapshots, and logs:
+  `.analysis/codex-logs/core-overhaul-2026-09-05/receipt.json` and `rnd/` beside it.
+  Graphical join smoke passed; full survival/multiplayer and owner terrain
+  acceptance were not established. Alpha is still draft, not release-ready.
+- Vanilla oracle: `.analysis/server.jar`, verified Minecraft 26.1.2. Reuse it.
 
-## Current Head
+## Current verified improvement: compact vehicle reads
 
-### Core And Ownership
+- Vehicle graph validation and passenger lookup now read live identity,
+  lifecycle and vehicle components instead of cloning every complete entity
+  snapshot. The existing vehicle API lives in `entity_vehicle.rs`; no new cache,
+  topology authority, scheduling policy or reduced entity selection was added.
+- Entity removal uses the canonical ECS passenger unlinking once, without the
+  former redundant full-population scan. Atomic graph rejection, lifecycle,
+  duplicate-passenger, cycle, rollback and publication rules are preserved.
+- In the same instrumented seeded route, unfenced owner-apply median/p95 fell
+  from 10.152/18.321 to 4.373/10.872 ms. All 3,738 baseline and 2,575 candidate
+  unfenced inputs committed. Work counts differ: these are elapsed distributions,
+  not equal-throughput, process CPU or whole-server claims.
+- A separate compact fenced batch applied 92 of 130 inputs. Its receipt remains
+  explicit; unchanged fence policy and the fully committed unfenced cohort do
+  not justify claiming universal input acceptance.
+- The external smoke checked 45 graph cases, 18 removals and 360 paired passenger
+  lookups. Existing vehicle/kinematics/rollback checks passed, and a permanent
+  chain-extension/atomic-cycle regression protects the uncertain graph edge.
+- Final correctness passes: 4,462 tests passed, zero failed, 194 ignored;
+  formatting, strict Clippy, code-health, debug build and three graphical seeds
+  pass. Each route observed land/water/bank transitions, with zero unsupported
+  samples in this run. Earlier isolated water evidence remains unresolved.
+- Native warning-only maxima remain 119.981 ms whole tick on the owner seed and
+  98.495 ms dispatch on seed -17711. This does not close the 50/60 ms gate.
+- One independent read-only optimization review passed. All ten temporary
+  profiling/configuration/launcher/smoke files were removed after verification;
+  their sources and exact evidence remain under
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/entity-dispatch-followup/receipt.json`.
+  Publication evidence and exact repository revisions are recorded separately
+  in `publication.json` beside it. Alpha remains draft.
 
-- `play.rs` is 13,108 lines, `session.rs` 1,571, `simulation.rs` 15,855,
-  `server.rs` 8,356, and `chunk_stream.rs` 8,221. The migration is staged, not
-  complete.
-- `simulation/queue.rs` owns bounded admission, accounting, pushed wakeup,
-  batching, shutdown, and channel construction.
-- `simulation/regional_mutation.rs` owns the existing regional block/container
-  mutation lane behind explicit imports and code-health tripwires. The parent
-  still owns classification, batching, world access, lighting/publication, and
-  `SimulationOwner`.
-- `EntityStore` is the production ECS runtime; the old vector comparison state,
-  `Shadow*` API, aliases, and `shadow-compare` feature are deleted. Exact
-  26.1.2 modules now cover entity contracts, attributes, effects, equipment,
-  living damage, navigation, projectiles, synced data, and runtime transactions.
-  Gameplay-significant side maps and live-scale propagation still need removal
-  or explicit authority fences, so broad sole-authority readiness is not yet
-  established. ADR 0004/0005 are the authority source of truth.
-- Runtime work control has no operator worker-percentage knobs. Capacity is
-  derived once; pushed measurements and bounded admissions drive allocation.
-- Serverbound protocol collections/strings/blobs have a complete bounded
-  allocation audit, symmetric encode limits, and no-partial-output tests.
-- Production worldgen revision 9 consumes explicit `ChunkGeometry` for terrain,
-  ores, structures, and biomes. Separate landform and cave stages provide
-  domain-warped continents, branching mountain ranges, substantially carved
-  river-valley contours, and bounded tunnel caves behind a 32-block surface shell.
-  Trees require exact planned support and a stable 5x5 footprint.
-  Solaris worlds persist revision/seed/mode/ore-profile/settlement-profile/geometry; unversioned
-  Anvil worlds open without fallback generation and reject plugin worldgen
-  profiles. The playable profile uses `.analysis/test-world-v9`. Revision 8
-  adds visible anisotropic mountain detail, stronger long relief, elevation-
-  aware mountain surfaces, and an explicit dry-spawn floor; the fresh-client
-  forest/coast/ocean/high-relief route is complete. Revision 9 removes filled
-  3x3 upper leaf boxes in favor of connected irregular oak/jungle crowns.
-- The optional startup-only `plains_village_prototype` Lua manifest profile
-  combines an extracted vanilla plains fountain, small house, and toolsmith at
-  stable offsets and consumes extracted village placement facts. Seed zero
-  fixes it near spawn; other seeds use deterministic grassland placement. The
-  selection shares the persisted plugin worldgen profile fence and requires the
-  vanilla sidecar. The bounded plan selects buildings, roles, named inhabitants,
-  jobs, and owner-scoped extensions. Extracted vanilla villager jigsaw slots
-  become persisted chunk markers; a dedicated simulation-owner command
-  materializes each villager once with durable profession metadata and a claim
-  separate from ambient herd spawning.
-- Lua API 0.6 has bounded DTO/files/batches, optional bounded startup-only TOML
-  configuration with fresh Lua copies, push-driven bounded simulation timers,
-  one-shot host admission, an attested `mc-net` router, and durable plugin
-  storage. Production adapters now cover menus, inventory/storage transactions,
-  zones, same-dimension player teleports, opaque ephemeral villager bindings,
-  bounded `idle`/`follow_position` goals through journaled regional ownership,
-  and required post-commit `player.block_broken` and `player.block_placed`
-  events. Colony records, homes, roles, order vocabulary, limits, and durable
-  member intent are Luau/plugin-storage state rather than Rust runtime concepts.
-  `player.item_crafted` now covers committed 2x2,
-  3x3, and recipe-book crafts with aggregate max-craft counts and required
-  queue admission. `player.item_picked_up` now reports exact authoritative
-  item-entity and grounded-arrow credits, including partial stack pickup.
-  Stationary item readiness is push-driven from an exact-tick index, and
-  deferred campfire outputs enter that index only after durable acknowledgement
-  and publication. `player.died` now publishes one immutable event from the
-  authoritative live-to-dead owner commit for common operator, fall, starvation,
-  contact, hostile, PvP, and projectile damage. It is captured before fallible
-  client writes and drained before required `server.stopping`; nonlethal,
-  shield-blocked, stale, unsupported-mode, already-dead, and respawn paths emit
-  nothing. Killer/cause attribution remains deliberately absent until every
-  source carries exact facts. Direct player melee entity kills publish a
-  separate exact `player.entity_killed` fact with target id/type and explicit
-  `source = melee`; nonlethal, unreachable, stale, repeated-dying, projectile,
-  explosion, environmental, and non-player paths do not claim attribution.
-  Accepted right-clicks now publish `player.entity_interacted` with an exact
-  reachable living target, actor pose/mode, hand, and secondary-action
-  snapshot. It is a gesture event, not proof of feeding, shearing, trading, or
-  another vanilla side effect. The vanilla interaction and client writes finish
-  before required Lua admission can wait; missing, nonliving, dying, far,
-  Spectator, and dead-actor paths publish nothing. The death/kill
-  owner-to-server outbox is unbounded to avoid waiting under owner locks;
-  do not revisit it before playable/Lua work unless a measured hostile workload
-  makes its memory material. Direct tests cover
-  cursor mismatch, full output inventory,
-  owner-stale rejection, no-op, queue closure after commit, aggregate counts
-  above `u32`, invalid pickup identities/modes, transition-tick deduplication,
-  and unpublished campfire outputs; the wire gate covers exact committed event
-  fields and rejected retries. Block DTOs expose player pose separately from
-  integer block coordinates. The consolidated item-currency economy now has a
-  production wire gate for zone activation, buy, insufficient-funds rejection,
-  unchanged ledger, and refund. The exact shipped colony scaffold now reads its
-  complete bounded domain configuration, persists colony metadata plus member
-  role/order intent in plugin storage, maps `home` to a configured movement goal
-  and `hold` to idle, and has a production wire gate for durable recruit, later
-  order application, and removed-villager recovery. It retains the opaque token
-  only in Luau memory, retries one typed rejected/stale binding, and reports an
-  applied order only after the targeted regional-owner result. The Lua API also
-  has a
-  capability-gated `list_online_players` query. It returns a
-  targeted, sorted, bounded point-in-time identity/pose/dimension snapshot and
-  marks truncation; closed session owners are excluded and no live handles are
-  exposed. The shipped `online-roster` plugin consumes that result for `/who`
-  and renders it through a server-owned inventory menu; its production TCP/Lua
-  gate checks the connected player's exact name and dimension. Focused Lua
-  coverage proves queue-rejection retry and the 128-byte menu-label bound.
-  Plugin readiness and the combat-cooldown fixture are push-fenced by exact Lua
-  messages and simulation ticks; timeouts only fail. General villager
-  roles/work orders and durable entity handles remain absent.
-- Production and test waits must remain event-driven. Timeouts only fail stuck
-  work and never prove success.
+## Previous verified improvement: shared collision classification
 
-### Playable And Client-Visible
+- Owner-local physics and pathing now reuse `vanilla_collision_class`, already
+  used by fallback physics. Empty and full-cube cells avoid repeated binary
+  shape decoding. Startup warms this existing immutable table before serving.
+- Block reads, snapshot/completeness checks, powder-snow context, complex boxes,
+  unknown-state fallbacks and publication fences are unchanged. No per-entity
+  block cache, duplicate classification table or reduced simulation work remains.
+- On 3,693,246 identical query/snapshot pairs, sampler construction plus physics
+  integration averaged 12.330 → 7.448 µs, a 39.6% elapsed reduction. Both execution
+  orders improved; the separate identical-implementation control had 0.90%
+  aggregate label bias. This is not process CPU or whole-server throughput.
+- The final pathing cutover preserved geometry for 29,873 catalog states and two
+  out-of-range cases. Existing publication and chicken-AABB checks passed.
+  The catalog smoke was temporary, not a new permanent test.
+- Final correctness passes: 4,461 tests passed, 194 ignored, formatting, strict
+  Clippy and code-health. Debug build and all three graphical routes pass.
+  Each observed land-to-water and water-to-bank transitions; sustained
+  unsupported samples were zero. Earlier isolated water evidence and broad
+  terrain acceptance remain unresolved; still images do not prove support.
+- Final owner warning-only tick maximum is 148.525 ms. Dispatch, preparation and
+  scheduled-block costs remain open; this is not a whole-tick latency win.
+- One independent read-only review passed. Production Rust grew by ten lines;
+  all probes and nine temporary launch/config/smoke files were removed.
+  Exact comparisons, controls, receipts, source delta and visual limitations:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/physics-sampling-followup/receipt.json`.
+  Alpha remains draft; no staging, commit, push, tag or archive replacement.
+- Prior publication-tail, periodic-planning and narrow-despawn evidence remains
+  in `regional-commit-followup/receipt.json`, `periodic-planning-followup/receipt.json`
+  and `unattributed-tick-followup/receipt.json` beside this receipt's parent.
 
-- P02 real-client artifact
-  `.analysis/real-client-runs/20260721T095305Z-real-client-playable-loop-hXlAv8`
-  passed a no-debug natural birch loop: three block breaks with visible
-  progress/drop/pickup, twelve planks, crafting table, sticks, wooden pickaxe,
-  and table open/close. The server reported sub-500 ms tick-budget warnings in
-  `animal_breeding`, with a 133 ms observed peak, but no client-visible failure.
-  This is focused real-client evidence, not an owner-played 20-minute session or
-  broad performance proof.
+## Previous verified improvement: background CPU headroom
 
-- Stair facing/half, slab top/bottom, adjacent matching-slab merge,
-  waterlogging, and stair neighbour-shape recomputation follow the inspected
-  local 26.1.2 rule. Unit and adapter coverage at `feba79a` includes all corner
-  shapes and stale dependency rejection; a dedicated raw-TCP corner assertion
-  remains absent.
-- Ordinary torches place as wall torches on horizontal conservative full-cube
-  supports, remain standing on `UP`, and reject `DOWN` or known partial
-  supports. Irregular sturdy-face parity and neighbour break cascades remain
-  open.
-- P47 real-client artifact
-  `.analysis/real-client-runs/20260720T122329Z-real-client-playable-loop-Dbzfoj`
-  passed stonecutter placement, menu open, normal take, close/reopen
-  conservation, and shift-click conservation. The scenario exited 0; the outer
-  runner was degraded by two startup slow-tick warnings. Setup used three
-  `giveAndSelect` debug commands, so this proves the real-client menu/wire path,
-  not earned survival. Earned setup and rejected invalid input remain open.
-- P48 real-client artifact
-  `.analysis/real-client-runs/20260720T124754Z-real-client-playable-loop-l8eWbc`
-  passed earned wall-torch, stair, and slab building through a no-debug Gradle
-  client with `server_op_users=NONE`; the scenario and driver exited 0. The
-  outer validator remained degraded by slow-tick warnings, so do not call the
-  combined gameplay/performance gate green.
-- P04 artifact
-  `.analysis/real-client-runs/20260720T143912Z-real-client-playable-loop-rjWZVp`
-  passes natural gather/craft, 27 continued resource cycles, all `24,000`
-  continuity ticks, clean server exit/restart, rejoin, placed-table
-  persistence, and wooden-pickaxe persistence. Its generated config disables
-  natural hostile spawning so bot tactics cannot invalidate the continuity
-  proof; manual play and separate combat scenarios still enable monsters.
-  Earlier real-client runs separately proved wooden-sword zombie and skeleton
-  kills. The P04 run had 44 tick-budget warnings, maximum 412.302 ms, and is not
-  broad performance evidence.
-- The embedded client MCP provides reusable connection, observation, movement,
-  interaction, and scenario tooling. Read `docs/AGENT_TOOLING.md` before
-  changing it; protocol bots do not replace the real-client gate.
+- Background preparation starts and recovers at `max(cpu_capacity - 1, 1)`.
+  The shared foreground ceiling, selected simulation work and job retention
+  are unchanged. Other foreground users can occupy the headroom; this is not
+  a planning deadline guarantee. Single-worker configurations remain serial.
+- A forwarding-waker probe attributed 98.516 ms of a 98.597 ms admission sample
+  to waiting for a permit, versus 0.081 ms to resume after notification.
+  In the matched route, admission p99/max fell from 2.084/98.597 ms to
+  0.016/3.020 ms; no candidate acquisition polled pending. Combined
+  admission/dispatch/planning p99 fell from 4.956 to 3.205 ms.
+- Realized work counts and finished stream windows differ between runs.
+  Do not claim equal chunk throughput or an across-the-board speedup.
+- Final workspace tests pass: 4,462 passed, 194 ignored. Final formatting,
+  code-health, strict Clippy, debug build and three graphical habitat routes
+  pass. One independent review accepted the production policy. Later test
+  migrations replace call-counter/default assertions with admission/drain
+  behavior; obsolete test-only counters were removed.
+- Original failed correctness/test receipts remain failed and retained.
+  An intermittent roster timeout did not recur in diagnostic runs; the wire
+  scenario now waits for the final menu's close, not any buffered close.
+  Stale-close causation of that timeout is not established.
+- Ten temporary files and the planning probe were removed. Exact source,
+  measurements, failures, final gates and review scope:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/scheduled-stall-followup/receipt.json`.
+- The owner route still has warning-only maxima of 155.537 ms whole tick,
+  118.228 ms unattributed time, 56.793 ms entity dispatch and 23.620 ms
+  scheduled-block work. The broad scheduled-block task and 50/60 ms gate remain
+  open. Alpha remains draft; no staging, commit, push, tag or archive replacement.
+- Previous coastal and session evidence remains in `coastal-boundaries/receipt.json`
+  and `session-lock-phases/receipt.json` beside this receipt's parent directory.
 
-### Known Runtime Evidence
+## Previous checkpoint: idle grazing snapshot construction avoided
 
-- Latest P44 artifact:
-  `.analysis/real-client-runs/20260720T120018Z-real-client-playable-loop-UJtsgc`.
-  Sheep and chicken passed, including chicken yaw. The selected cow moved 2.69
-  blocks on flat terrain and did not satisfy the climb condition. The preceding
-  P44 artifact observed a 1.0-block cow climb, so this is a nondeterministic
-  candidate-selection gap rather than evidence that step physics regressed.
-- The unrestricted run exposed a 3.47-second checkpoint stall caused by waiting
-  for entity-journal replacement while holding the regional journal mutex. The
-  checkpoint now acknowledges exact identities in memory after the durable
-  world watermark; gameplay appends never queue behind a replacement `fsync`.
-  Old replay-safe records are compacted on normal journal shutdown. Focused
-  append-order, crash-replay, and shutdown-compaction regressions and the full
-  workspace baseline are green.
+- Every loaded sheep ID still reaches an owner batch. Owners read the current
+  ECS timer and construct full snapshots only for active timers or possible
+  idle starts. The existing baby/adult phase relationship preserves both start
+  schedules; `Some(0)` cleanup and full-state atomic timer CAS remain intact.
+- No population cap, cadence change, persistent cache or journal bypass.
+  Filtered reads use the coordinator; complete reads retain their direct path
+  and do not receive partial route-cache publications.
+- Nine controlled debug A/B cases retain exact timers and start sets. At 1024
+  sheep, idle median falls 15.785→3.708 ms and mixed 19.439→13.691 ms; all-active
+  median rises 41.866→43.339 ms (+3.5%). This is a measured tradeoff, not a
+  whole-server latency claim.
+- Full L2, debug build and one independent read-only review pass. All three
+  unchanged graphical habitat routes pass their existing acceptance rule;
+  sampled dry pig movement and complete censuses remain, without reliable
+  overflow log lines. One nonconsecutive grounded-over-water observation on
+  the owner route remains unclassified; the gate rejects consecutive samples,
+  not every isolated observation. Do not claim clean water-surface parity.
+- Live grazing still reaches a 51.527 ms owner-route warning; the jungle frame
+  shows 14 FPS. Broader grazing, terrain/render and survival acceptance remain
+  open. Source, receipts, the surface observation and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/sheep-grazing-idle/checkpoint.json`.
+- Temporary probe and replay tools are removed with their sources retained.
+  No staging, commit, push or tag; frozen archive unchanged. Alpha stays draft.
 
-## Active Risks
+## Previous checkpoint: duplicated grazing batch validation removed
 
-1. Complete worldgen revision 10 beyond the now-landed spawn, vegetation, and
-   drainage work: rendered height/biome/vegetation mosaics, seed-`712816` owner
-   playtest, restart, and release-host throughput evidence remain.
-2. Run the no-operator 20-minute survival and restart gates for the landed
-   periodic friendly/hostile spawn runtime; do not infer client visibility or
-   retained identity from unit scheduling coverage.
-3. Run the real Fabric/NeoForge/Forge Loader matrix for the landed deployment
-   reporting and disconnect contract. Headless packet and harness gates do not
-   replace graphical permission, artifact, screen, asset, and reconnect evidence.
-4. Close `v0.0.2-alpha.1` only after the exact gates in
-   `docs/PUBLIC_ALPHA_PLAN.md`; do not substitute warning suppression, unit-only
-   seed checks or a merely uncommented `tellus_like` setting.
+- In-place conditional replacement batches with unchanged passenger links now
+  use owner preparation for full-state comparison, without another coordinator
+  snapshot read. Structural, claim, routing, committed-state and atomic
+  rollback/journal fences remain. Topology-changing batches retain preflight.
+- Removed the redundant grazing-action ID filter; every action belongs to the
+  same atomic timer batch. The borrowed planner remains: an ownership cutover
+  increased measured planning cost and was rejected.
+- Nine matched debug workloads retain every loaded sheep and exact timer
+  decrements. At 1024 active sheep, median/p95 fell from 52.756/54.448 ms to
+  42.323/46.913 ms on the same four CPUs. Idle reads did not improve consistently.
+- Final full L2, debug build and independent read-only review pass. The unchanged
+  three-seed graphical habitat routes pass with complete natural censuses,
+  sampled dry pig movement and no reliable queue overflow.
+- The broader sheep-grazing bottleneck task stays open: idle snapshot reads
+  remain material, and the owner route still warns about expensive grazing.
+  Dense-canopy client FPS remains low. Warning-only samples and still images
+  do not prove full-server latency, seamless distant terrain or survival parity.
+- Complete evidence, rejected trial, source and next action:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/sheep-grazing/checkpoint.json`.
+  Temporary profiling/replay tools are removed, with sources retained. No
+  staging, commit, push or tag; frozen archive unchanged. Alpha remains draft.
 
-## Canonical Routes
+## Previous checkpoint: dense natural despawn reads reduced
 
-| Need | Read |
-| --- | --- |
-| Playable/client behavior | `docs/playable/README.md`, then `docs/playable/ACTIVE.md` |
-| Architecture/ownership | `docs/decisions/README.md`, then the exact ADR |
-| Detailed core internals and pitfalls | `docs/CORE_INTERNALS_FOR_OWNER.md` |
-| Current M100 milestone | `docs/milestones/M100.md` |
-| Readiness claim | `docs/DEFINITION_OF_DONE.md` and `docs/VALIDATION_LEDGER.md` |
-| Protocol | ADR 0002 and local protocol tools |
-| Client MCP | `docs/AGENT_TOOLING.md` and the client-agent README |
-| Server Lua API | `docs/PLUGINS.md` |
+- Every tracked natural entity now uses the existing compact owner projection;
+  only conditional removals need full retained snapshots. Population, cadence,
+  distances, idle/damage rules and UUID-based rolls remain unchanged.
+- Fifteen unchanged debug cases cover five population mixes and three sizes.
+  Homogeneous 1024-entity median read/scan costs fell by 20.3–27.0%. A two-pass
+  ground-animal trial was rejected because it regressed other ground species.
+- Independent review identified a vanished-snapshot idle-clock leak. Its
+  deterministic reproduction fails before and passes after the cleanup; the
+  regression remains in a focused sibling test module.
+- Full L2 passed before that one-line review correction. Final affected-scope
+  formatting, code-health, strict Clippy, 21 despawn tests, debug build and the
+  unchanged three-seed graphical habitat routes pass after it. Reliable unload
+  batching remains intact; final client logs have no reliable queue overflows.
+- The session lock still spans owner reads. Sheep grazing is now the larger
+  warned cost on the retained owner route; dense-jungle client FPS remains low.
+  Warning samples are not unbiased percentiles or throughput evidence. Neither
+  distant render/fog acceptance nor full survival acceptance is closed.
+- Receipt, exact measurements, source, review resolution and next action:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/despawn-cost/checkpoint.json`.
+  Temporary profiling/replay tooling is removed, with sources retained. No
+  staging, commit, push or tag; frozen archive unchanged. Alpha remains draft.
 
-## Update Rules
+## Previous checkpoint: populated habitat traversal verified
 
-- Replace stale current-head facts; do not append a wave-by-wave diary.
-- Put architecture decisions in ADRs and playable observations in
-  `docs/playable/ACTIVE.md`.
-- Keep raw run output under `.analysis/` and out of commits.
-- Use archives only to recover a specific old fact.
+- Fresh revision-18 agent-run graphical Minecraft 26.1.2 routes pass on
+  `5617830`, `712816` and `-17711`, with unchanged natural-spawn intervals,
+  work budgets and observation deadlines. No animals were summoned or moved,
+  and no terrain was edited. Both retained owner barren sites now show jungle
+  trees, undergrowth, grass and flowers; river samples include natural mangrove
+  habitat, while other seeds retain intentionally open grassy lowlands.
+- The final complete 60-block censuses at the two owner sites contain 190 and
+  209 land animals. Sampled dry pig movement is observed for 146, 58 and 32
+  distinct pigs across the three seeds; no unsupported dry-ground water-footprint
+  samples were recorded. This is not full movement parity or survival acceptance.
+- The first owner route failed during its third-site view change. Server evidence
+  identifies reliable-queue overflow (321 dropped commands) before the secondary
+  client-thread timeout. Chunk unload emitted a separate ordered command and full
+  snapshot per entity, unlike already batched chunk-load publication.
+- Unloading a dense chunk now publishes compact removal IDs in the existing
+  `RemoveEntities` packet and ordered reliable lane. Singleton lifecycle
+  commands retain their behavior; queue limits and authoritative entities do not
+  change. A 400-entity/one-slot receiver regression fails before, then passes
+  with exact-once removal and all authoritative entities retained. The unchanged
+  real-client route subsequently passes; all three final logs have zero reliable
+  backlog overflows.
+- Final L2, debug build and independent read-only review pass. Existing uncapped
+  spawning, independent frequency/disable controls, collision admission and
+  movement/refill tests also pass; the population-policy task is verified.
+- Performance remains open: the owner screenshot shows 16 FPS, and warning-only
+  samples reach 202.351 ms per tick, 150.476 ms holding the distant-despawn session
+  lock and 40.498 ms in sheep grazing. These are not unbiased percentiles or a
+  controlled throughput comparison. Distant render/fog rectangles remain visible.
+- Full receipts, source, review, failing/passing reproduction and next action:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/habitat-population/checkpoint.json`.
+  Temporary executable tooling is removed; replayable sources remain. No staging,
+  commit, push or tag; frozen archive unchanged. Alpha remains draft.
+
+## Previous checkpoint: coastal climate classification verified
+
+- Worldgen revision 18 routes ocean temperature variants and snowy beaches
+  through the shared inland/riparian climate field in both modes. The unrelated
+  deep-ocean noise picker is removed; no extra noise field or height adjustment.
+- Existing erosion selects rocky shoreline within the existing two-block band.
+  Stony shore now produces gravel over stone rather than the generic beach sand.
+  The retained raised bank stays grass. Cold and warm variants remain reachable.
+- Both new coastal regressions fail against the inherited routing and pass after
+  the fix. Final L2 passes formatter, strict workspace Clippy, code-health and
+  all-target workspace tests; the debug server builds. Independent read-only
+  review passed without findings.
+- Fresh agent-run graphical Minecraft 26.1.2 routes pass on `5617830`, `712816`
+  and `-17711`: nine coastal/bank samples retain their expected ground after
+  120 live ticks, with connected clients. Inspected aerial and ground images
+  show warm jungle/mangrove coasts, snowy inland/coast adjacency, rocky shores
+  and the retained grass bank. Before/after height images are byte-identical
+  across all three sampled mosaics; this is not exhaustive terrain parity.
+- Distant aerial images still show rectangular render/fog boundaries whose
+  cause is unestablished. This checkpoint proves nearby coastal classification
+  and ground, not seamless distant rendering or vanilla frozen-water features.
+  Broader visual acceptance remains open; retained barren habitat is verified above.
+- Receipts, images, review, source snapshot and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/coastal-climate/checkpoint.json`.
+  Temporary executable tooling is removed, with reproducible source retained.
+  No staging or commit; frozen archive untouched. Fresh generated worlds are
+  required by the revision fence. Alpha remains draft.
+
+## Previous checkpoint: natural riparian wetlands verified
+
+- Worldgen revision 17 replaces blanket humid-lowland swamp coloring with
+  river-connected warm/moist shoulders, shallow pockets and dry hummocks.
+  Weak dry reaches retain their surrounding climate; no fixed-width ring or
+  seed-specific override. River and wetland variants now follow that climate.
+- Mangroves have mud, native logs/leaves and soil-anchored, waterlogged roots.
+  Temperate wetlands have oaks, grass and blue orchids. Tree placement is shared
+  in `terrain/trees.rs`; chunk orchestration shrank from 2,495 to 2,353 lines.
+- Fresh agent-run graphical Minecraft 26.1.2 habitat and dry-inland checks pass
+  on `5617830`, `712816` and `-17711`. Inspected aerial and ground views show the
+  natural transitions. Native trunks remain after 120 live ticks; sampled
+  mangrove roots retain source water before and after. Dry inland columns retain
+  grass and their surrounding vegetation.
+- The first `-17711` run exposed a real disconnect during the second-site stream:
+  optimistic cache admission missed retained clean entries and actual pressure
+  escaped the storage `try_` APIs as an error. Both try-publication paths now
+  return their existing backpressure outcomes for that typed condition, while
+  preserving other errors. Cache limits and scenario requirements are unchanged.
+  The deterministic reproduction fails before and passes after; the unchanged
+  graphical route then passes with 12 deferrals and no disconnect or abandoned
+  delivery.
+- Final L2 passes formatter, strict workspace Clippy, code-health and all-target
+  workspace tests; the revised debug server builds. One independent read-only
+  wetland review passed. The later pressure correction has its retained failing/
+  passing regression, non-pressure-error coverage and real-client reproduction.
+- Evidence, final source snapshot and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/habitat/checkpoint.json`.
+  Active throwaway tooling is removed; reproducible source and receipts remain.
+  No staging or commit; the frozen archive is unchanged. Revision fencing
+  requires fresh generated worlds. Alpha remains draft; broader population,
+  coastal climate coherence and scheduled-block performance are not closed.
+
+## Previous checkpoint: natural pig population and swimming verified
+
+- Fresh agent-run graphical Minecraft 26.1.2 worlds pass on `5617830`, `712816`
+  and `-17711`. Natural pigs populate the retained owner sites and actual river
+  neighborhoods; no summons, animal interactions, attacks or animal teleports.
+- Same-UUID client samples establish dry movement, immersed movement and later
+  grounded dry-bank exits with matching solid footprint scans on all three seeds.
+  This is sampled behavior, not full movement parity or a continuous path capture.
+- The complete census covers 60 blocks. Wider 128-block queries that reach the
+  bridge's 512-entry maximum are explicitly lower bounds, not population totals.
+  Spawning remains at 400 ticks / 48 chunks, with view and simulation distance 8;
+  no population caps or reduced simulation work were introduced.
+- The old water coordinate is now dry ground at `y=81` after the terrain changes.
+  New water observations use client-confirmed open rivers, not the obsolete site.
+- Inspected images show immersed natural pigs on the owner and `712816` seeds
+  and a dry-land pig on `-17711`. The owner land close-up is tree-occluded; exact
+  submersion and bank support are established by the retained client state.
+- No production changes were needed. The unchanged Rust scope was not rerun;
+  one independent read-only evidence review passed. Dense-view screenshots show
+  15 FPS, so this does not close the separate performance/load queue.
+- Evidence, review, source snapshot and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/pigs/checkpoint.json`.
+- Active throwaway drivers removed; reproducible source and receipts retained.
+  No staging or commit, frozen archive unchanged, alpha remains draft.
+
+## Previous checkpoint: raised coastal sand strips removed
+
+- The remaining strip was a beach, not a desert-climate boundary. Revision 16
+  removes the Tellus-only six-block beach height and uses the existing two-block
+  shoreline band in both modes. Climate fields and river geometry are unchanged.
+- Altitude/climate routing now lives in `terrain/biome_routing.rs`; assembly and
+  structure placement consume its shared shoreline bound. The assembly file
+  shrank from 2,679 to 2,495 lines without duplicating the moved decisions.
+- The retained generated-block regression now keeps raised land grassy while
+  preserving sand at the true shoreline. In the 16,384-sample diagnostic window,
+  only 2,682 beach samples change to grassland; the height image is byte-identical.
+- Final L2 passed: **4,455 passed / 194 ignored**, formatter, strict Clippy and
+  code-health. One independent read-only review passed; its source files remain
+  unchanged and CodeGraph is synced.
+- Fresh agent-run graphical worlds pass on `5617830`, `712816` and `-17711`.
+  Inspected images remove the retained raised sand strip. The real client checks
+  both the new grassy column and preserved shoreline sand.
+- The reported river/raised-beach defects are closed. The swamp-colored lowland
+  mismatch left by this checkpoint is addressed by revision 17 above; broader
+  population, full survival and general terrain parity are not established here.
+- Evidence, final source snapshot and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/biome-coherence/checkpoint.json`.
+- Temporary client tooling removed; evidence snapshots remain. No staging or
+  commit, frozen archive unchanged, alpha still draft.
+
+## Previous checkpoint: curved rivers and natural inland banks
+
+- Revision 15 replaces the two straight halves of a river reach with a smooth
+  parabolic bend. Shared endpoints, downstream topology and runoff remain.
+  Search bounds include the complete curved reach and its relief-dependent
+  width; the old small-scale cell-boundary clipping regression now passes.
+- Taller banks widen instead of cutting steeper cliffs. The existing three-block
+  terrain-step check passes without relaxing it. Both biome routes now reserve
+  beaches for the continental coast; inland banks retain local ground and life.
+- Final L2 passed: **4,454 passed / 194 ignored**, formatter, strict Clippy and
+  code-health. One independent read-only review passed the geometry change;
+  those reviewed files are unchanged. The later coastal-biome correction passed
+  its generated-block regression, biome reachability, final L2 and client checks.
+- Fresh agent-run graphical worlds pass on `5617830`, `712816` and `-17711`.
+  Inspected images show curved reaches and grassy inland banks; the real client
+  confirms the formerly sandy regression column is now grass.
+- **The broader artificial-terrain item remains open.** The final `-17711`
+  view still shows an abrupt sandy biome strip. Biome transitions, population,
+  full survival and general performance acceptance are not established here.
+- Evidence, before/after regressions, final snapshot and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/rivers/checkpoint.json`.
+- Temporary probes and client tooling removed; their evidence snapshots remain.
+  No staging or commit; the frozen archive is unchanged. Alpha remains draft.
+
+## Previous checkpoint: full-volume skylight boundary scan removed
+
+- Profiling isolated sky-boundary seeding as the dominant chunk-light cost.
+  It now derives the same boundary from adjacent columns' open-sky bottoms,
+  rather than scanning every volume cell and its six neighbours. Removed the
+  one-use dark-neighbour helper; no new cache, executor, limit or bypass.
+- Instrumented mean seeding wall time fell from 169.7 ms across 589 calls to
+  12.5 ms across 578 calls. Calls are not paired; this is not a whole-server
+  throughput ratio. Profiles and original source are retained in the receipt.
+- The new sibling regression compares all light values with independently
+  seeded full-source propagation across uneven, open, closed and low-opacity
+  columns. Existing incremental checks pass, including the explicitly enabled
+  `incremental_relight_wire_matches_full_recompute` wire test.
+- Full L2 passed: **4,452 passed / 194 ignored**, formatter, strict Clippy and
+  code-health. One independent read-only review passed; CodeGraph is synced.
+- Both final graphical jungle workloads pass unchanged on `5617830` and
+  `-17711`. Inspected images retain trees, undergrowth and lighting. No lock-wait
+  warnings or CPU-limit changes occurred. Maximum block ticks are 59.3/39.7 ms,
+  down from the preceding 119.6/135.7 ms; slow-tick warning counts are 5/1.
+- Occasional tick-budget overruns remain; general performance acceptance and the
+  broader scheduled-stalls task are still open. With destination streaming green,
+  return to the owner's remaining ordinary terrain/habitat findings before
+  chasing the residual performance tail.
+- Evidence, source snapshot and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/streaming-light/checkpoint.json`.
+- Temporary profiling and client driver removed. No staging or commit; the
+  frozen archive is unchanged. Alpha remains draft.
+
+## Previous checkpoint: duplicate scheduled-plan admission removed
+
+- The unchanged jungle workload produced 169 sampled slow, nonempty planning
+  calls: 5.93 seconds waiting for CPU admission versus 15.8 milliseconds doing
+  planning. These are sampled wall spans, not a normalized CPU benchmark.
+- The serial path now consumes its first existing plan instead of discarding it
+  and entering CPU admission again. Later groups still re-snapshot and replan;
+  state/token and due-prefix fences still retain stale work.
+- Removed the one-use single-region wrapper. Plan types and synchronous planning
+  stay in `scheduled_blocks.rs`; CPU admission and blocking-worker dispatch stay
+  in existing play orchestration. The architecture gate caught and rejected the
+  initial async-wrapper relocation; it was corrected without a guard exception.
+- The strengthened one-permit FIFO button regression fails with the duplicate
+  admission and passes without it. Repeated-region and ABA coverage also passes.
+  Final L2 scope passed through the individual formatter, code-health, strict
+  Clippy and workspace-test profiles: **4,451 passed / 194 ignored**.
+  One independent read-only review passed the semantic change; the later
+  ownership correction restores the original orchestration boundary.
+- Final agent-run graphical harnesses pass on `5617830` and `-17711`, with the
+  unchanged 9x9 destination window, 30-second deadline and warning checks.
+  Both inspected images show trees and undergrowth; neither run has lock-wait
+  warnings. Maximum observed block ticks are 119.6 and 135.7 ms, respectively,
+  versus 179.9 and 198.8 ms in the preceding checkpoint's runs.
+- **Scheduled-block stalls remain open.** These samples do not establish general
+  performance acceptance. The owner-seed run still triggered TickTime CPU
+  scaling from 6 to 3 and back to 6; that existing policy was not changed.
+- Profiling, before/after regression, final source snapshot, gates, review and
+  next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/scheduled-admission/checkpoint.json`.
+- Temporary profiler and client driver removed. No staging or commit; the frozen
+  archive is unchanged. Alpha remains draft.
+
+## Previous checkpoint: resident-accounting lock stalls removed
+
+- Profiling the unchanged jungle workload attributed the dominant measured
+  chunk-publication lock holds to repeated resident heap-accounting scans.
+  Receipts contain the wall-time samples; kernel `perf` was unavailable under
+  `perf_event_paranoid=4`, so temporary in-process timing was used and removed.
+- Resident/dirty byte totals now update with the existing publication counters,
+  using the unchanged heap estimator and before/after mutation footprints.
+  Admission no longer clones and scans every resident chunk. Budgets, save-health
+  checks, clean eviction and cross-region publication fences remain unchanged.
+- Counter storage shares one `Arc`; no additional executor, resident authority,
+  cache limit or lock. This also avoids enlarging resident transaction values.
+- The lifecycle regression covers admission through growth, shrinkage, dirty
+  flush finalization and clean eviction. **4,451 tests passed / 194 ignored**.
+  Final formatter, strict Clippy and code-health gates passed. The initial L2
+  attempt exposed the enlarged enum; after compacting counter storage, the
+  remaining L2 scope completed through the individual harness profiles.
+  One independent read-only source review passed.
+- **Both full graphical harnesses now pass** on `5617830` and `-17711`, preserving
+  the exact 9x9 destination window, 30-second deadline and warning checks.
+  Neither run logged a lock-wait warning; inspected images still show jungle
+  trees and undergrowth. The prior chunk-publication lock-wait failure is closed.
+- **Scheduled-block stalls remain unresolved.** Both runs still logged long
+  block ticks. These graphical passes are not general performance acceptance.
+- Source snapshot, profiling, final gate receipts, review and next outcome:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/streaming-accounting/checkpoint.json`.
+- The preceding queue-backpressure correction and closure of the water-walking/
+  sparse-jungle finding remain recorded in `streaming/checkpoint.json` beside it.
+- Temporary profiling and client driver removed. No staging or commit; frozen
+  archive unchanged. Alpha remains draft.
+
+## Previous checkpoint: jungle undergrowth and leaf initialization
+
+- Revision 14 mixes low jungle-log/oak-leaf bushes with ordinary jungle trunks
+  of 4–12 blocks. Existing density, exact-surface, stable-5x5 and chunk-margin
+  fences remain. Mega trees, vines and full vanilla jungle parity are not claimed.
+- Natural leaves are initialized to their nearest in-chunk supporting logs
+  before publication, with `persistent=false`. Generation and scheduled runtime
+  updates share the existing `mc-world` plant support rule. Removed the one-use
+  leaf-state helper. There is no separate CPU admission or permanent-leaf bypass.
+- Full L2 passed: **4,449 tests passed / 194 ignored**, strict workspace Clippy,
+  formatting and code-health. The nearest-log/unsupported-leaf boundary test,
+  three-seed bush/tree test and existing scheduled log-removal propagation test
+  all passed. One independent read-only source review passed; CodeGraph is synced.
+- Agent-run graphical seed `712816` shows taller trees and low bushes in a
+  natural valley. Seed `5617830` client block observations contain natural leaf
+  distances 1–3, and its pre-generated startup terrain renders.
+- At that checkpoint, destination streaming remained blocked: `5617830`
+  showed all-sky views and failed the stronger 9x9/30-second gate; `-17711`
+  failed even the original four-corner gate. The current checkpoint above
+  supersedes those destination failures, not the remaining performance failures.
+- Profiling measured shared CPU admission dominating slow scheduled ticks;
+  CPU capacity fell to 1 and view distance changed 8→7→6. The leaf correction
+  storm was reduced. All temporary runtime profiling was removed.
+- L2 receipt:
+  `.analysis/validation/20260906T184530-correctness-pr61axb6/result.json`.
+  Source snapshot, review, visual evidence, failed gates and next reproduction:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/jungle/checkpoint.json`.
+
+This closes the source capability, not the complete jungle finding or alpha
+acceptance. The old alpha archive is unchanged; no staging or commit is authorized.
+
+## Previous verified slice: sheep/pig swimming and shore exit
+
+- Agent-run graphical Minecraft 26.1.2 verified immersed ascent and actual
+  grounded dry-bank landings for both sheep and pigs. The final fixture uses
+  existing water corridors with two-block dry banks; support is checked across
+  the entity footprint, not only its center. Both landed at `y=95`,
+  `on_ground=true`, `in_water=false`.
+- Inspected screenshots show immersed bodies and subsequent dry-stone landings.
+  Exact underwater foot depth is established by client state, not guessed from
+  the water-obscured images. A cod control remained in water for 20 samples;
+  its screenshot does not resolve the fish, so that control is state evidence.
+- Local vanilla bytecode confirms depth-gated float jumps and the `0.3/tick`
+  bank impulse. Solaris uses bounded deterministic lift, not full vanilla
+  probabilistic movement parity. Corrected the stale head-submersion comment.
+- One independent read-only review passed. Formatter and code-health passed;
+  CodeGraph is synchronized. The preceding full workspace gate already covers
+  the unchanged physics behavior; this checkpoint adds real-client evidence.
+- Final graphical receipt:
+  `.analysis/validation/20260906T164401-regression-oopflzwf/result.json`.
+  Snapshot, state measurements, images, review and rejected probe assumptions:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/swimming/checkpoint.json`.
+
+This closes the sheep/pig buoyancy findings, not jungle density, natural-world
+population, river/biome appearance, full movement parity or load acceptance.
+
+## Previous verified slice: RAM write-behind WAL
+
+Chunk and regional-entity decisions share one world-owned writer, bounded queue,
+grouped disk sync and failure signal. Gameplay acknowledges RAM acceptance;
+the owner explicitly accepts losing the unflushed tail on a crash. Save-all,
+background/pressure dirty flush and clean shutdown fence accepted work before
+acknowledging durable storage. The writer owns the world lease until shutdown.
+The contract is in [ADR 0005](decisions/0005-regional-simulation.md#journal-durability).
+
+- Removed synchronous reservation rewrites, separate journal workers and obsolete
+  persistence bypasses. Moved the substantial journal tests to a sibling file;
+  removed the unused `fd-lock` dependency.
+- Final workspace tests: **4,448 passed / 194 ignored**. Workspace strict Clippy
+  passed; later worldgen/xtask edits passed focused strict Clippy. Final formatter
+  and code-health passed. Original failed receipts and successful follow-ups
+  remain preserved; the original composite receipt was not rewritten as green.
+- The full test run caught a tree-placement regression. Restored the existing
+  surrounding-terrain stability guard; the original assertion and exact failing
+  test remain intact and pass. Removed three stale code-health anchors that
+  required deleted passive-spawn gating and adapter wrappers.
+- Agent-run graphical Minecraft: mining changed a block to air; clean shutdown,
+  restart/rejoin, recovered block state and manual save-all passed. The actual
+  in-game screenshot was inspected. Survival pickup was interrupted by player
+  death; crowded-world performance remains unresolved. Neither is called green.
+- One executing independent WAL reviewer found no evidence-backed corruption
+  or false durable-save acknowledgement. The old field reviewer could not be
+  revived; its earlier verdict was not reused as WAL evidence.
+- Receipt, owned snapshot, exact gates, review and runtime evidence:
+  `.analysis/codex-logs/owner-field-5617830-2026-09-06/wal-write-behind/checkpoint.json`.
+
+This closes WAL delivery, not the full owner request. Alpha remains **draft**.
+The delivered local alpha archive remains frozen and was not overwritten.
+
+## Previous verified slice: local inventory candidates
+
+Window-0 clicks, recipe-book crafting, offhand swaps and normal/debug grants
+prepare local inventory/cursor candidates. The connection baseline stays
+unchanged until the existing owner returns a committed or rejected snapshot.
+Removed speculative projection writes, rollback branches and redundant clones.
+Other menu handlers and broader core ownership remain unfinished.
+
+- L2 passed: **4,449 tests passed / 194 ignored**, code-health, workspace Clippy
+  `-D warnings` and formatting. Java bridge-core/java-agent tests passed.
+- Real Minecraft passed natural mining/pickup/economy, one oak log → four planks,
+  cursor pickup/return of two apples, and selection of the crafted stack:
+  `.analysis/plugin-client-compat/20260906T145930/result.json`.
+  Crafting setup used an isolated operator fixture; this is not full survival,
+  multiplayer, performance or owner terrain acceptance.
+- The old crafting scenario used fixed recipe ID 697; the server advertises 18.
+  It now uses existing recipe-book lookup. Two tests pinning mocked call order
+  and the fixed ID were removed rather than repinned. Actual count assertions
+  remain in the real-client scenario.
+- One independent read-only review passed. The throwaway smoke launcher was
+  removed; its source and observations remain with the evidence.
+- Receipt: `.analysis/codex-logs/core-inventory-candidates-2026-09-06/checkpoint.json`.
+  No commit, staging, push or tag.
+
+## Previous verified slice: owner-selected held-item gameplay
+
+Route: `architecture`; contract: `docs/ARCHITECTURE.md` and ADR 0006.
+Removed `InteractionState.selected_hotbar_slot` and its constructor/update paths.
+Mining, combat, item use, shields, arrows and drops now read the exact owner's
+shared selected slot. No replacement cache or compatibility path was introduced.
+
+- Reproduced a stale gameplay read: after owner selection of an enchanted weapon,
+  connection gameplay still computed **5 damage instead of 7**. The regression
+  now passes and also covers invalid selection preserving the weapon and return
+  to the original slot. Existing arrow-selection coverage remains.
+- L2 passed: **4,449 tests passed / 194 ignored**, code-health, workspace Clippy
+  `-D warnings` and formatting. One independent read-only review passed.
+- Agent-run graphical Minecraft gate passed without changing this checkpoint's
+  scenario: `.analysis/plugin-client-compat/20260906T142622/result.json`.
+  Natural mining/pickup, economy purchase and ledger persistence passed.
+- Receipt, checkpoint-local diff and validation logs:
+  `.analysis/codex-logs/core-player-selection-2026-09-06/checkpoint.json`.
+  No commit, staging, push or tag.
+
+This closes held-item selection authority, not all player/session mirrors or the
+whole core redesign. Inventory/cursor projections and broader ownership remain.
+
+## Previous verified slice: core startup data
+
+Route: `architecture`; contract: `docs/ARCHITECTURE.md` and ADR 0006.
+`mc_server::startup_data::StartupData` assembles and validates immutable gameplay
+tables before terrain/world preparation. The CLI orchestrates the resulting
+bundle; per-table `Effective<T>` wrappers are removed.
+
+- Runtime smoke: malformed recipe output is rejected before creating a new
+  world or changing an existing sentinel world. Configuration-only `--check`
+  still emits valid JSON and does not create a world.
+- Agent-run graphical Minecraft compatibility gate passed:
+  `.analysis/plugin-client-compat/20260906T140305/result.json`.
+  Natural dirt mining/pickup, economy purchase and persisted ledger assertions
+  passed. The scenario now clears natural snow cover before harvesting dirt;
+  positive pickup and purchase assertions remain intact. This is not an
+  unchanged harness run or a full survival/multiplayer acceptance gate.
+- L2 passed: **4,448 tests passed / 194 ignored**, code-health, workspace
+  Clippy `-D warnings`, formatting; Java bridge-core and java-agent tests passed.
+- One independent read-only startup-cutover review passed without findings.
+  This review predates the subsequent snow-clearing harness adjustment.
+- Evidence and owned-change receipt:
+  `.analysis/codex-logs/core-startup-2026-09-06/checkpoint.json`.
+  No commit, staging, push or tag.
+
+## Previous verified slice: Loader sounds
+
+Route: `plugins`; current contract: `docs/PLUGINS.md` and ADR 0010.
+`play_client_sound`/`stop_client_sound` use owner `sounds` definitions,
+`play_sounds`, verified mono OGG assets and the existing resource pack.
+One shared native presenter supports personal and fixed-position one-shots,
+volume, pitch, vanilla attenuation, owner-local stop and disconnect cleanup.
+Loader wire protocol remains **2**; plugin API remains `0.6.0`.
+
+- Final agent-run real Minecraft 26.1.2 MCP/Xvfb audio gates passed:
+  `20260906T131829-fabric`, `20260906T131958-neoforge`, and
+  `20260906T132202-forge`, under `.analysis/loader-live-gate/runs/`.
+  Recorded actual audio proves quarter-volume scaling, 440→660 Hz pitch,
+  near/mid/far attenuation, concurrent owners, owner-local/foreign stop,
+  disconnect silence, reconnect silence and newly requested playback.
+  Both owner frequencies are zero after the final stop in all three runs.
+  Post-play and clean-reconnect screenshots were also inspected.
+- One independent read-only reviewer found one P2 gap in the audio gate:
+  Sapphire's final stop was recorded but not asserted. Both owner frequencies
+  are now asserted silent. A real-client dropped-Sapphire-stop probe correctly
+  failed with `stop_client_sound left owner audio audible`
+  (`20260906T131622-fabric`); the expected-rejection wrapper exited successfully.
+  No second reviewer was spawned.
+- Initial failures are preserved: Rust's closed artifact index lacked `sounds`;
+  the audio capture initially listened to a different sink; an adversarial run
+  then exposed background-music interference. The isolated client now selects
+  its private sink and disables vanilla music, without changing the desktop sink
+  or relaxing spectral thresholds.
+- L2 passed once: code-health, **4,450 tests passed / 194 ignored**, workspace
+  Clippy `-D warnings`, and formatting. Focused sound-boundary tests, all four
+  Java Loader test tasks, three distributable jars and reproducible fixtures
+  passed. Only owned Rust files were formatted.
+- No loops, moving sources, completion events or arbitrary client scripts.
+  Forge retains owner-approved isolated `earlyWindowControl=false`; these runs
+  are not owner Prism/terrain acceptance, performance or full-alpha evidence.
+- No commit/staging/push/tag. Preserve inherited dirty work.
+
+Exact receipt, review resolution, source snapshots and audio/visual evidence:
+`.analysis/codex-logs/loader-sound-2026-09-06/checkpoint.json`.
+The preceding input slice is closed; its full evidence remains at
+`.analysis/codex-logs/loader-input-2026-09-06/checkpoint.json`.
+
+## Previous verified slice: unified client UI
+
+- One `solaris.present_client_ui(player_id, ui_id, options)` command handles
+  `screen`, `hud`, and `hidden` through `ScriptBoundary`. The `ui` resource
+  schema, `present_ui` permission, and `solaris:loader/ui` transport replace the
+  screen-only API without aliases. Exact-session and owner fences remain.
+- One shared Minecraft presenter owns modal item/block/action views and
+  non-interactive HUD panels. Text overrides are bounded; omitted values come
+  from the verified resource, not earlier dynamic state. Hiding is id-local;
+  activation/disconnect clears HUD state.
+- Agent-run real Minecraft 26.1.2 MCP/Xvfb gates passed on Fabric, NeoForge and
+  Forge. Captured images confirm both owner HUDs, text updates, owner-local
+  hiding and no stale HUD after reconnect; ordinary jump input remained live.
+  Capture now waits for the actual loading overlay to disappear, not merely Play.
+- Forge's default FML early-window GL-context handoff fails on this Xvfb host,
+  before Solaris initializes. The owner approved `earlyWindowControl=false` in
+  the isolated QA profile. The normal game renderer/HUD passed; early-window
+  GL features are not covered. This is not owner-run Prism/terrain acceptance.
+- Full L2 passed: **4,449 tests passed, 194 ignored**, code-health, workspace
+  Clippy and formatting. Java core and all three adapter test tasks passed.
+  The missing non-exhaustive API marker was fixed; a runner deadline interrupted
+  Clippy, which then completed separately without replaying successful tests.
+- One independent read-only review passed without findings. The later
+  non-exhaustive invariant and approved QA-profile setting are recorded in the
+  receipt. No load/performance or full-alpha readiness claim; no commit,
+  staging, push or tag.
+
+UI receipt:
+`.analysis/codex-logs/unified-client-ui-2026-09-05/checkpoint.json`.
+The preceding configuration/workspace receipt remains
+`.analysis/codex-logs/configuration-workspace-2026-09-05/checkpoint.json` and links
+the earlier NPC, movement/pickup, inventory and world-commit evidence.
+
+## Next outcome
+
+After the authorized three-repository publication, attribute and reduce the
+remaining dispatch tail on retained seed -17711, with the owner jungle route
+as a comparison. Separate computation, admission and owner-response waits before
+choosing another narrow change; do not reduce selected entities or reorder
+goal/gameplay/physics phases.
+
+The final native negative-seed trace reaches 98.495 ms entity dispatch and
+41.896 ms physics preparation; the owner trace retains 24.754 ms block work.
+These are warning-only maxima, not whole-run percentiles. Acceptance: lower
+matched attributed cost with unchanged selection, transaction and publication
+fences, plus the retained three-seed graphical routes. Evidence:
+`entity-dispatch-followup/native-stage-maxima.json` beside the owner evidence root.
+Primary route: `docs/decisions/0005-regional-simulation.md`.
+Continue autonomously after recording evidence; this is not a checkpoint stop.
+
+Keep broader visual acceptance open; the radius repair does not establish full
+terrain, frozen-water or client-frame parity.
+The latest owner route also retains one unclassified, nonconsecutive
+grounded-over-water pig observation in the idle-grazing receipt. Preserve that
+evidence; a passing sustained-surface gate does not clear shorter artifacts.
+
+Keep residual scheduled-block latency in the measured performance queue, not
+marked complete. Grid population was the largest light stage in the retained
+streaming-light profile. The final session-contention route also retained a
+28.305 ms apply-despawn session hold; do not claim all session stalls eliminated.
+Preserve settled accounting, queue-backpressure, first-plan reuse and
+leaf-initialization fixes.
+
+Then finish the bounded refactoring and varied load matrix. The original
+sheep-grazing bottleneck is resolved, not a reason to repeat its completed work.
+Do not restore population caps or reduce selected simulation work to hide costs.
+
+Broader core ownership, integration finalization and full gameplay/load acceptance
+remain open. The old frozen load matrix and missing owner terrain acceptance
+remain unresolved. Do not return to Loader feature development.

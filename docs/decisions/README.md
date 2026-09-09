@@ -4,6 +4,10 @@ Read this index, then only the ADR that owns the decision. Later ADRs take
 priority where they explicitly narrow or replace an older design. Milestone
 notes record progress; they do not silently change an ADR.
 
+The new core target is [ARCHITECTURE.md](../ARCHITECTURE.md). These ADRs retain
+the constraints of existing runtime paths until their implementation is replaced;
+staged migration text is not proof of current behavior.
+
 | ADR | Status | Scope |
 | --- | --- | --- |
 | [0001](0001-vanilla-data-as-runtime-input.md) | Accepted | Mojang data as local runtime/build input; vendor bytes stay out of git |

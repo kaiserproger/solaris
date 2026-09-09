@@ -16,6 +16,22 @@ fn cow(position: Vec3) -> SpawnEntity {
     SpawnEntity::new(4, "minecraft:cow", position)
 }
 
+#[test]
+fn passenger_ids_match_attached_vehicle_links() {
+    let mut store = EntityStore::new();
+    let passenger = store.spawn(cow(Vec3::new(1.5, 64.0, 0.5)));
+    let mut boat = SpawnEntity::vehicle(
+        crate::VehicleKind::Boat,
+        1,
+        "minecraft:oak_boat",
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    boat.vehicle.as_mut().expect("boat state").passenger = Some(passenger);
+    store.spawn(boat);
+
+    assert_eq!(store.passenger_ids(), HashSet::from([passenger]));
+}
+
 fn villager(position: Vec3) -> SpawnEntity {
     SpawnEntity::new(119, "minecraft:villager", position)
 }

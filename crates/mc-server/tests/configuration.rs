@@ -11,7 +11,6 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, ProtocolPhase};
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::TARGET_RELEASE;
 use mc_protocol::codec::{Identifier, WriteMc};
@@ -27,14 +26,18 @@ use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, S
 use mc_protocol::packets::play::LoginPlay;
 use mc_protocol::packets::{ChatVisibility, ClientInformation, MainHand, ParticleStatus};
 use mc_protocol::packets::{CustomPayload, Packet};
+use mc_script::{
+    MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, SCRIPT_API_VERSION, ScriptEvent, ScriptEventKind,
+    ScriptHostEndpoint, ScriptPluginManifest, ScriptProtocolPhase, ValidatedScriptPluginManifest,
+};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
-const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1;
-const EXTENSION_CHANNEL: &str = "solaris:test";
+const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES + 1;
+const SCRIPT_CHANNEL: &str = "solaris:test";
 
 async fn start_server() -> SocketAddr {
     start_server_with_data(std::sync::Arc::new(mc_data::testing::stub())).await
@@ -96,8 +99,8 @@ fn loader_manifest() -> mc_net::LoaderManifest {
                 mc_net::LoaderPlatform::NeoForge,
                 mc_net::LoaderPlatform::Forge,
             ],
-            content: vec![mc_net::LoaderContentKind::Screens],
-            permissions: vec![mc_net::LoaderPermission::OpenScreens],
+            content: vec![mc_net::LoaderContentKind::Ui],
+            permissions: vec![mc_net::LoaderPermission::PresentUi],
             cache_key: format!("example:screen/1/{}", "a".repeat(64)),
             source_path: None,
             artifact_bytes: None,
@@ -138,10 +141,17 @@ fn full_registry_sidecar() -> TempDir {
     dir
 }
 
-async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEndpoint) {
+fn script_channel_manifest() -> ValidatedScriptPluginManifest {
+    ScriptPluginManifest::new("test-payload", "Test Payload", "0.1.0", SCRIPT_API_VERSION)
+        .declare_custom_payload_channel(SCRIPT_CHANNEL)
+        .validate()
+        .expect("test payload channel manifest validates")
+}
+
+async fn start_server_with_script_payloads() -> (SocketAddr, ScriptHostEndpoint) {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M100 configuration extension".into(),
+        motd: "M100 configuration script payloads".into(),
         max_players: 8,
         view_distance: 10,
         data: std::sync::Arc::new(mc_data::testing::stub()),
@@ -164,10 +174,14 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
         loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
-    let (boundary, endpoint) =
-        mc_extension::boundary_pair(NonZeroUsize::new(8).unwrap(), NonZeroUsize::new(1).unwrap());
-    let policy = mc_extension::CustomPayloadPolicy::new(16, [EXTENSION_CHANNEL.to_owned()]);
-    let bound = mc_net::bind_with_extension(cfg, boundary, policy)
+    let (boundary, endpoint) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+    endpoint
+        .register_plugin_routes(&script_channel_manifest())
+        .expect("test payload channel registers");
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
         .await
         .expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -197,11 +211,23 @@ async fn write_oversized_custom_payload_frame(
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn recv_extension_event(endpoint: &mc_extension::ExtensionEndpoint) -> InboundEvent {
-    tokio::time::timeout(Duration::from_secs(2), endpoint.recv_event())
-        .await
-        .expect("extension event was not delivered within 2s")
-        .expect("extension event queue closed")
+async fn recv_script_event(
+    endpoint: &mut ScriptHostEndpoint,
+    matches: impl Fn(&ScriptEvent) -> bool,
+) -> ScriptEvent {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = endpoint
+                .recv_event()
+                .await
+                .expect("script event queue closed");
+            if matches(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("script event was not delivered within 2s")
 }
 
 async fn read_one_frame(
@@ -223,15 +249,6 @@ async fn read_configuration_preamble(
     buf: &mut BytesMut,
     compression: Compression,
 ) -> ClientboundKnownPacks {
-    let mut frame = read_one_frame(stream, buf, compression).await;
-    assert_eq!(frame.id, ClientboundCustomPayload::ID);
-    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
-    assert_eq!(frame.body.remaining(), 0);
-    let CustomPayload::Brand(brand) = brand.payload else {
-        panic!("the first configuration packet must publish the server brand");
-    };
-    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
-
     let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, UpdateEnabledFeatures::ID);
     let features = UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
@@ -293,6 +310,13 @@ async fn read_to_finish_configuration(
     let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, UpdateTags::ID);
     let _ = UpdateTags::decode(&mut frame.body).unwrap();
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    let CustomPayload::Brand(brand) = brand.payload else {
+        panic!("the server must publish its brand immediately before finishing configuration");
+    };
+    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
     let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
@@ -416,6 +440,15 @@ async fn configuration_known_packs_and_finish_complete() {
     );
     assert_eq!(frame.body.remaining(), 0);
 
+    // Then the server brand, immediately before Finish Configuration.
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    let CustomPayload::Brand(brand) = brand.payload else {
+        panic!("the server must publish its brand immediately before finishing configuration");
+    };
+    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
+
     // Then Finish Configuration.
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
@@ -518,7 +551,7 @@ async fn configuration_loader_manifest_requires_valid_ack_before_play() {
         protocol: mc_net::LOADER_PROTOCOL_VERSION,
         platform: mc_net::LoaderPlatform::NeoForge,
         loader_version: "0.1.0".to_owned(),
-        accepted_permissions: vec![mc_net::LoaderPermission::OpenScreens],
+        accepted_permissions: vec![mc_net::LoaderPermission::PresentUi],
         cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
         carrier_block_state_ids: std::collections::BTreeMap::new(),
     };
@@ -533,6 +566,13 @@ async fn configuration_loader_manifest_requires_valid_ack_before_play() {
         compression,
     )
     .await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    let CustomPayload::Brand(brand) = brand.payload else {
+        panic!("the server must publish its brand immediately before finishing configuration");
+    };
+    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
@@ -646,7 +686,7 @@ async fn configuration_loader_streams_only_the_exact_requested_artifact() {
         protocol: mc_net::LOADER_PROTOCOL_VERSION,
         platform: mc_net::LoaderPlatform::Fabric,
         loader_version: "0.1.0".to_owned(),
-        accepted_permissions: vec![mc_net::LoaderPermission::OpenScreens],
+        accepted_permissions: vec![mc_net::LoaderPermission::PresentUi],
         cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
         carrier_block_state_ids: std::collections::BTreeMap::new(),
     };
@@ -661,6 +701,13 @@ async fn configuration_loader_streams_only_the_exact_requested_artifact() {
         compression,
     )
     .await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    let CustomPayload::Brand(brand) = brand.payload else {
+        panic!("the server must publish its brand immediately before finishing configuration");
+    };
+    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     FinishConfiguration::decode(&mut frame.body).unwrap();
@@ -780,6 +827,13 @@ async fn configuration_sends_full_registry_data_without_known_pack_echo() {
     assert_eq!(frame.id, UpdateTags::ID);
     let _ = UpdateTags::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    let CustomPayload::Brand(brand) = brand.payload else {
+        panic!("the server must publish its brand immediately before finishing configuration");
+    };
+    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
 
@@ -845,8 +899,8 @@ async fn configuration_ignores_unknown_custom_payload_before_known_packs() {
 }
 
 #[tokio::test]
-async fn configuration_extension_boundary_receives_allowed_payloads() {
-    let (addr, endpoint) = start_server_with_extension().await;
+async fn configuration_script_boundary_receives_allowed_payloads() {
+    let (addr, mut endpoint) = start_server_with_script_payloads().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "ConfigExtension").await;
@@ -868,7 +922,7 @@ async fn configuration_extension_boundary_receives_allowed_payloads() {
         &mut stream,
         &ServerboundCustomPayload {
             payload: CustomPayload::Unknown {
-                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
                 payload: b"before".to_vec(),
             },
         },
@@ -888,7 +942,7 @@ async fn configuration_extension_boundary_receives_allowed_payloads() {
         &mut stream,
         &ServerboundCustomPayload {
             payload: CustomPayload::Unknown {
-                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
                 payload: b"before_ack".to_vec(),
             },
         },
@@ -902,36 +956,42 @@ async fn configuration_extension_boundary_receives_allowed_payloads() {
         read_one_frame(&mut stream, &mut rbuf, compression),
     )
     .await
-    .expect("server did not advance to Play after Configuration extension payloads");
+    .expect("server did not advance to Play after Configuration script payloads");
     assert_eq!(frame.id, LoginPlay::ID);
 
-    let joined = recv_extension_event(&endpoint).await;
-    let InboundEvent::PlayerJoined {
+    let joined = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerJoined { .. })
+    })
+    .await;
+    let ScriptEventKind::PlayerJoined {
         player_id,
         username,
-    } = joined
+        ..
+    } = joined.kind()
     else {
         panic!("expected PlayerJoined event, got {joined:?}");
     };
     assert_eq!(username, "ConfigExtension");
 
-    let payload = recv_extension_event(&endpoint).await;
-    let InboundEvent::CustomPayload(payload) = payload else {
-        panic!("expected CustomPayload event, got {payload:?}");
-    };
-    assert_eq!(payload.player_id, player_id);
-    assert_eq!(payload.phase, ProtocolPhase::Configuration);
-    assert_eq!(payload.channel, EXTENSION_CHANNEL);
-    assert_eq!(payload.payload.as_ref(), b"before");
-
-    let payload = recv_extension_event(&endpoint).await;
-    let InboundEvent::CustomPayload(payload) = payload else {
-        panic!("expected CustomPayload event, got {payload:?}");
-    };
-    assert_eq!(payload.player_id, player_id);
-    assert_eq!(payload.phase, ProtocolPhase::Configuration);
-    assert_eq!(payload.channel, EXTENSION_CHANNEL);
-    assert_eq!(payload.payload.as_ref(), b"before_ack");
+    for expected in [b"before".as_slice(), b"before_ack".as_slice()] {
+        let payload = recv_script_event(&mut endpoint, |event| {
+            matches!(event.kind(), ScriptEventKind::CustomPayload { .. })
+        })
+        .await;
+        let ScriptEventKind::CustomPayload {
+            player_id: payload_player,
+            phase,
+            channel,
+            payload,
+        } = payload.kind()
+        else {
+            panic!("expected CustomPayload event, got {payload:?}");
+        };
+        assert_eq!(*payload_player, *player_id);
+        assert_eq!(*phase, ScriptProtocolPhase::Configuration);
+        assert_eq!(channel, SCRIPT_CHANNEL);
+        assert_eq!(payload, expected);
+    }
 }
 
 #[tokio::test]
@@ -1062,6 +1122,13 @@ async fn configuration_skips_unexpected_packets() {
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, UpdateTags::ID);
     let _ = UpdateTags::decode(&mut frame.body).unwrap();
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    let CustomPayload::Brand(brand) = brand.payload else {
+        panic!("the server must publish its brand immediately before finishing configuration");
+    };
+    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();

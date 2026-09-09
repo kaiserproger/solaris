@@ -21,12 +21,15 @@ fn m78_real_client_scenario_names_required_evidence() {
         manifest.pointer("/client/command_env").is_none(),
         "M78 scenario must not expose a free-form real-client command env hook"
     );
+    // Adapter command is Main-owned shared-manifest text; the loader workspace
+    // lives at SOLARIS_LOADER_ROOT (default ../solaris-loader) and `-p` is
+    // required when Gradle is launched from the core cwd.
     assert_eq!(
         manifest.pointer("/client/adapter").and_then(Value::as_str),
         Some(
-            "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent"
+            "../solaris-loader/gradlew -p ../solaris-loader --no-configuration-cache :fabric-agent:runClientAgent"
         ),
-        "M78 scenario must name the repo-native Gradle runClient adapter"
+        "M78 scenario must name the sibling Gradle runClient adapter"
     );
     assert_eq!(
         manifest

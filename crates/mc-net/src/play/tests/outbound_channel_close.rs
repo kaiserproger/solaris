@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use mc_extension::PlayerId;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::play::{ClientboundRespawn, GameMode};
@@ -68,8 +67,6 @@ async fn play_loop_exits_when_outbound_channel_closes() {
             0,
             "ClosedOutbound".to_string(),
             "ClosedOutbound".to_string(),
-            None,
-            PlayerId::new(0),
             None,
             None,
         ),

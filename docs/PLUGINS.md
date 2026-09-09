@@ -18,11 +18,9 @@ This guide has two layers:
   [Solaris Loader installation](SOLARIS_LOADER.md) only when the operator's
   selected plugins require client bundles.
 
-The future full server/client addon platform is specified separately in
-[`LUAU_ADDON_API_1_0_SPEC.md`](LUAU_ADDON_API_1_0_SPEC.md), with its parked
-implementation backlog in
-[`LUAU_ADDON_API_1_0_TASKS.md`](LUAU_ADDON_API_1_0_TASKS.md). It does not
-represent current API `0.6.0` behavior.
+The replacement server/client addon design is part of
+[`ARCHITECTURE.md`](ARCHITECTURE.md#one-addon-contract-server-and-client).
+This reference describes current API `0.6.0`, not the unimplemented replacement.
 
 `mc-net` currently provides plugin storage, zones, server-owned inventory menus,
 inventory/storage and player-inventory transactions, same-dimension teleports,
@@ -56,12 +54,11 @@ must be a valid package, every selected plugin must pass compile/startup, and
 `strict = false` only for local authoring where skipping an ordinary broken
 package is intentional.
 
-Bundled examples are disabled until selected explicitly:
+Deploy selected package directories before enabling strict validation:
 
 ```toml
 [plugins]
 directory = "plugins"
-bundled = ["basic-economy", "online-roster"]
 strict = true
 expected = ["basic-economy", "online-roster", "my-plugin"]
 ```
@@ -70,14 +67,14 @@ expected = ["basic-economy", "online-roster", "my-plugin"]
 
 Beyond the demonstration examples, Solaris ships an optional first-party
 **standard plugin pack** under
-[`../examples/plugins/`](../examples/plugins/): `solaris-permissions`,
+[`../../solaris-default-plugins/`](../../solaris-default-plugins/): `solaris-permissions`,
 `solaris-essentials`, `solaris-economy`, `solaris-towns`, and `solaris-audit`.
 All five are independent server-only API 0.6 packages; copy their directories
 into `[plugins].directory` to install, and list them under `plugins.strict`
 `expected` when running strict. Integration coverage lives in
 `crates/mc-test-harness/tests/plugin_standard_pack.rs`. Scope decisions and
 intentional omissions are recorded in
-[`../examples/plugins/standard-pack/README.md`](../examples/plugins/standard-pack/README.md).
+[`../../solaris-default-plugins/standard-pack/README.md`](../../solaris-default-plugins/standard-pack/README.md).
 The remaining shipped examples are demonstrations; read their `plugin.toml`,
 `config.toml`, `main.lua`, and README before enabling them.
 
@@ -165,15 +162,14 @@ one sandboxed Luau VM with bounded memory and interrupt fuel. In permissive deve
 declaring startup worldgen or client content still fails server startup instead
 of silently changing the world/client contract. Production should use strict
 deployment mode: every filesystem entry must be a valid plugin directory, every
-plugin must finish host startup, and the final merged external/bundled id set must
+plugin must finish host startup, and the discovered external id set must
 match the configured expected set exactly.
 
-External and server-embedded plugins can be selected together:
+All production plugins are deployed through the external directory:
 
 ```toml
 [plugins]
 directory = "plugins" # optional external root
-bundled = ["basic-economy", "online-roster"]
 strict = true
 expected = ["basic-economy", "online-roster", "my-external-plugin"]
 ```
@@ -181,18 +177,16 @@ expected = ["basic-economy", "online-roster", "my-external-plugin"]
 `expected` is valid only when `strict = true`. Duplicate expected ids, missing
 plugins, unexpected plugins, malformed packages, stray non-directory entries,
 player-command registration conflicts, and Luau compile/startup failures reject
-`--check` and normal server startup. The expected set is evaluated after external
-and bundled packages are merged, so one operator contract covers the complete
-production deployment. Keep `strict = false` only for local iteration where
+`--check` and normal server startup. The expected set covers the complete
+discovered deployment. Keep `strict = false` only for local iteration where
 skipping an ordinary broken package is intentional.
 
-The available bundled ids are `basic-economy`, `colony-villager-scaffold`,
-`geological-mines`, `land-claims`, `online-roster`, and
-`settlement-prototype`. They are disabled unless explicitly listed. Duplicate
-plugin ids across either source fail startup before command, Loader, or worldgen
-metadata can diverge. Ore and settlement ownership conflicts remain fail-fast.
+Core no longer embeds first-party packages or accepts `plugins.bundled`.
+Their source authority is the independent `solaris-default-plugins` repository.
+Duplicate plugin ids fail startup before command, Loader, or worldgen metadata
+can diverge. Ore and settlement ownership conflicts remain fail-fast.
 
-Every currently shipped bundled example is **Server-only** and accepts an
+Every currently shipped first-party example is **Server-only** and accepts an
 ordinary vanilla 26.1.2 client. The separate
 `examples/loader-live-gate` fixture is **Requires Solaris Loader on client** and
 exists for the Fabric/NeoForge/Forge compatibility matrix.
@@ -240,13 +234,13 @@ id = "work-orders"
 building = "smithy"
 ```
 
-Installing `examples/plugins/geological-mines` selects large deterministic
+Installing `../solaris-default-plugins/geological-mines` selects large deterministic
 cross-chunk deposits under the canonical `realistic_deposits` profile and
 disables the vanilla ore pass for that world. Without a declaration the ore
 profile remains `vanilla`. Manifests must use the canonical `realistic_deposits`
 name; changing the ore profile changes the persisted world contract.
 
-Installing `examples/plugins/settlement-prototype` selects one bounded plains
+Installing `../solaris-default-plugins/settlement-prototype` selects one bounded plains
 village prototype. Solaris loads the vanilla fountain, small-house, and
 toolsmith NBT templates from `data.vanilla_data_dir`, combines the declared
 building templates at stable offsets, and uses the extracted vanilla village
@@ -302,13 +296,14 @@ artifact = "client/rich-content.zip"
 sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 size_bytes = 4096
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "screens", "assets", "interactions"]
+content = ["blocks", "items", "ui", "assets", "interactions", "sounds"]
 permissions = [
   "register_blocks",
   "register_items",
-  "open_screens",
+  "present_ui",
   "load_assets",
   "send_interactions",
+  "play_sounds",
 ]
 ```
 
@@ -320,7 +315,7 @@ lowercase 64-character SHA-256. The cache identity is
 even if an operator reuses a display version.
 
 When at least one bundle is declared, Solaris sends the combined manifest
-during Configuration. The client must acknowledge protocol 1, its exact
+during Configuration. The client must acknowledge Loader protocol 2, its exact
 platform and loader version, all required permissions, and every cache identity
 before the server accepts `AcknowledgeFinishConfiguration`. A server with no
 client bundles sends no Solaris Loader payload and preserves the vanilla
@@ -358,31 +353,60 @@ artifact.
 A denial emits no artifact request, creates no staging file, and disconnects
 without acknowledgement. Once every cache file is verified, the client reads a
 closed `solaris-client.json` index from the first ZIP entry. The implemented
-index schema accepts owned `screens` (`id`, `title`, `body`, optional
+index schema accepts owned `ui` (`id`, `title`, `body`, optional
 `item_id`/`block_id`), one owned `blocks` entry (`id`, `model`, `name`), up to 128
 owned `items` (`id`, `base_item`, `name`), and `assets`
 (`id`, canonical `assets/...` path, exact SHA-256, and exact byte size), rejects
-all undeclared archive entries, and bounds the activated registry to 64 screens,
+all undeclared archive entries, and bounds the activated registry to 64 UI definitions,
 one block, 128 items, 128 assets, and 64 MiB of asset bytes. A block requires
 `register_blocks` and its exact verified owner model under
 `assets/<namespace>/models/<path>.json`. Every item requires
 `register_items`, a known `minecraft:*` base item, and its exact verified
 `assets/<namespace>/items/<path>.json` definition. It also accepts up to 64 owned
-`interactions` (`id`, `screen_id`, `label`, `payload`). An interaction must
-reference a screen declared by the same bundle; one screen has at most eight
-actions, labels are at most 64 bytes, and the UTF-8 payload is at most 4 KiB.
+`interactions` with required `id`, `label`, and static `payload`, plus optional
+`ui_id` and `key`. At least one source is required; both may be supplied.
+`ui_id` must reference UI declared by the same bundle; one screen-mode view has
+at most eight actions. Labels are at most 64 UTF-8 bytes, payloads at most
+4 KiB, and ids at most 128 bytes. A key-only bundle needs `interactions` and
+`send_interactions`, not dummy UI or `present_ui`.
+The index also accepts up to 64 owned `sounds` entries, each containing only
+`id`. A sound requires `sounds`/`play_sounds` and a same-bundle verified asset at
+`assets/<owner>/sounds/<id-path>.ogg`, under the existing `assets`/`load_assets`
+contract and byte limits. The shared Minecraft adapter checks mono OGG Vorbis
+headers and initial decoded audio, then generates `assets/<owner>/sounds.json`;
+an asset may not overwrite that generated index.
 Fabric, NeoForge, and Forge publish the same immutable registry before
 acknowledgement and retain it into Play. Denied, malformed, or unverified
-bundles never publish content. A plugin
-whose bundle declares
-`screens` plus `open_screens` may call
-`solaris.open_client_screen(player_id, "plugin-id:screen-id")`. Solaris routes
-that Play payload only to the exact player session that completed the Loader
-acknowledgement; vanilla, disconnected, closed, and unknown sessions are
-rejected. Fabric, NeoForge, and Forge resolve the id only from the activated
-registry belonging to the packet's exact originating connection and open the
-bounded title/body screen on the client thread. All three clients clear the
-registry on logout before another server connection can reuse the process.
+bundles never publish content. A plugin whose bundle declares `ui` plus
+`present_ui` uses one presentation API:
+
+```lua
+solaris.present_client_ui(player_id, "plugin-id:status", {
+    mode = "hud", -- "screen", "hud", or "hidden"; required
+    title = "Status", -- optional
+    body = "Ready", -- optional
+})
+```
+
+`screen` opens a modal view with its declared item/block display and interaction
+buttons. `hud` shows or replaces a non-interactive title/body panel without
+taking input focus; it closes only a modal view of that same UI id. `hidden`
+removes that id's HUD or modal view without closing another owner's UI.
+Omitted text uses the verified bundle definition, not a previous dynamic value;
+an empty string is an explicit empty override. UI ids and titles are bounded to
+128 UTF-8 bytes each, bodies to 8 KiB. HUD panels use at most eight rows and 256
+GUI pixels of width, stay within the viewport, and respect Minecraft's hide-GUI
+setting. They are not an arbitrary layout or client-scripting API.
+
+Solaris routes `solaris:loader/ui` only to the exact player session that
+completed Loader acknowledgement; vanilla, disconnected, closed, and unknown
+sessions are rejected. The payload is big-endian protocol `u16`, mode `u8`
+(`0=screen`, `1=hud`, `2=hidden`), then `u16`-length-prefixed id, title and body.
+An optional text length of `0xffff` means use the bundle value; the maximum
+payload is 8,457 bytes. Invalid modes, UTF-8, lengths and trailing bytes are
+rejected. All three adapters resolve only an activated id from the packet's
+exact originating connection and use the shared Minecraft presenter.
+Activation/logout clears HUD state before another connection can reuse it.
 Every verified asset path under `assets/<namespace>/...` is also published as
 that exact Minecraft resource id through one transient required pack. The
 client sends the Loader acknowledgement only after the pack reload exposes the
@@ -390,14 +414,79 @@ exact verified bytes. A close event from that same Configuration connection
 removes the pack and reloads resources; a stale close cannot remove a newer
 connection's pack.
 
-An activated screen renders its declared interactions as buttons. Pressing one
-sends `solaris:loader/interaction` only if the screen definition and originating
-connection are still current. Solaris accepts the bounded action only from that
-player's exact Loader-acknowledged Play session, requires an owner bundle with
-`interactions` plus `send_interactions`, and targets only that owner plugin's
-Luau `on_loader_interaction(event)` handler. The event fields are `player_id`,
-`interaction_id`, and `payload`. Client payloads remain untrusted plugin input;
-the namespace fence prevents one bundle from addressing another plugin.
+### Declared keyboard actions and UI interactions
+
+An activated screen renders its `ui_id` interactions as buttons. Keyboard
+actions use canonical Minecraft names, for example:
+
+```json
+{"id":"my-plugin:ability","key":"key.keyboard.g","label":"Ability","payload":"activate"}
+```
+
+Letters, digits, F1–F25, keypad and named special keys are supported.
+Unknown keys, `key.keyboard.unknown`, and mouse names are rejected. These are
+fixed bundle declarations, not rebinding, chords, mouse/scroll/gamepad support
+or arbitrary client scripting.
+
+Both sources use `solaris:loader/interaction` while the exact definition and
+originating connection remain current. Solaris accepts it only from that
+player's Loader-acknowledged Play session, requires the owner's `interactions`
+and `send_interactions`, and targets only that owner's
+`on_loader_interaction(event)` handler:
+
+```lua
+function on_loader_interaction(event)
+    -- event.player_id, event.interaction_id, event.payload
+    -- event.phase: "trigger" for a UI button, "press" or "release" for a key
+end
+```
+
+Held state is bounded by declared actions; autorepeat produces no extra edges.
+Two owners may bind the same key and each receives its own action. Menu,
+overlay, or window-focus loss releases held actions; a fresh press is required
+after suppression. All three adapters observe the start of the native keyboard
+callback without cancelling vanilla handling. A menu-closing Escape remains
+menu input; screenshot, fullscreen, inventory and movement remain vanilla.
+Activation/disconnect discards old bindings and cannot address a new session.
+
+Loader wire protocol **2** encodes big-endian `u16 protocol`, `u8 phase`
+(`0=trigger`, `1=press`, `2=release`), then `u16`-length-prefixed UTF-8 id and
+payload, at most 4,231 bytes. Unknown versions/phases, invalid UTF-8 or lengths,
+truncation and trailing bytes are rejected. There is no protocol-1 decoder;
+build Loader and server from the same source revision. Plugin API stays `0.6.0`.
+
+Client phases and payloads remain untrusted input, not proof of a physical
+device or authority to mutate gameplay. The server does not track physical held
+keys; plugins own their mechanic state and player-disconnect cleanup. The
+namespace/session fences only authorize delivery to the owning plugin.
+
+A plugin can play or stop its activated owner sound for one player:
+
+```lua
+solaris.play_client_sound(player_id, "plugin-id:bell", {
+    volume = 1.0, -- optional, finite 0..1
+    pitch = 1.0, -- optional, finite 0.5..2
+    -- position = { x = 0.5, y = 64.0, z = 0.5 }, -- optional world position
+})
+solaris.stop_client_sound(player_id, "plugin-id:bell")
+```
+
+Without `position`, the one-shot is listener-relative and does not attenuate
+with distance. A position uses Minecraft's native linear distance attenuation.
+Both modes respect the player's master sound volume. Repeated plays may overlap;
+stop ends all playing instances of that same sound id for the target player,
+never another owner's sound. There are no loops, moving sources, or playback
+completion events. Disconnect stops Loader playback; reconnect does not resume it.
+
+Both commands pass through `ScriptBoundary`, require the caller's namespace and
+declared `sounds`/`play_sounds`, and route only to a live acknowledged Loader
+session. The client independently requires that exact connection and activated
+sound definition. The Play channel `solaris:loader/sound` uses protocol **2**:
+big-endian `u16 protocol`, `u8 mode` (`0=stop`, `1=personal`, `2=positioned`),
+`u16` byte length and UTF-8 sound id (at most 128 bytes); play adds `f32 volume`
+and `f32 pitch`; positioned play adds `f64 x`, `y`, `z`. The total is at most
+165 bytes. Invalid modes, lengths, UTF-8, non-finite/out-of-range parameters,
+truncation, and trailing bytes cannot produce playback.
 
 When a screen references an activated item, Fabric, NeoForge, and Forge build
 the same local vanilla stack after the verified resource pack reload, assign
@@ -507,12 +596,12 @@ fail synchronously; an unknown capability rejects discovery.
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
 | `player_inventory` | `inventory_transaction` |
 | `zones` | `upsert_zone`, `upsert_protected_zone`, `remove_zone`, owned zone entry/exit events |
-| `villagers` | `bind_nearest_villager`, `set_villager_idle`, `move_villager_to` |
+| `villagers` | `bind_nearest_villager`, `set_villager_idle`, `move_villager_to`, `release_villager_binding` |
 | `player_teleport` | `teleport_player` |
 | `player_queries` | `list_online_players` |
 | `entity_damage` | `damage_entity` |
 | `world_time` | `set_world_time` |
-| `world_blocks` | `set_block` |
+| `custom_payload:<namespace:path>` | `send_custom_payload` on that channel, owned `player.custom_payload` delivery |
 
 An undeclared privileged call fails synchronously in Luau before it enters the
 bounded command batch. Unknown capabilities reject the plugin during discovery.
@@ -593,6 +682,8 @@ targeted event does not need a broad subscription to reach its owner.
 | `server.tick` | `on_server_tick` | `tick` |
 | `plugin.timer` | `on_plugin_timer` | `name`, `timer_id`, `scheduled_tick`, `fired_tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
+| `player.custom_payload` | `on_player_custom_payload` | `player_id`, `phase` (`configuration` or `play`), `channel`, binary-safe `payload` |
+| `player.client_brand` | `on_player_client_brand` | `player_id`, `brand` |
 | `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
 | `plugin.storage.cas_result` | `on_plugin_storage_cas_result` | `request_id`, `key`, `applied`, `version`, `failure` |
 | `plugin.storage.delete_result` | `on_plugin_storage_delete_result` | `request_id`, `key`, `deleted`, `version`, `failure` |
@@ -612,6 +703,24 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.online_result` | `on_player_online_result` | `request_id`, `players`, `truncated` |
 | `villager.binding_result` | `on_villager_binding_result` | `request_id`, `binding_token`, `binding_expires_at_tick`, `failure` |
 | `villager.goal_result` | `on_villager_goal_result` | `request_id`, `goal`, `accepted`, `failure`, optional `x`, `y`, `z`, `speed` |
+| `villager.release_result` | `on_villager_release_result` | `request_id`, `accepted`, `failure` |
+
+`player.custom_payload` is targeted like `player.command`: the host routes it
+only to the plugin that owns `channel`, never broadcasts it. A handler must
+declare `custom_payload:<namespace:path>` for that exact channel to receive
+the event and to call `send_custom_payload` on it. `phase` is
+`configuration` for payloads sent before the play transition and `play`
+afterwards. `payload` is a binary-safe Luau string up to the fixed
+32768-byte host bound; unknown channels and larger bodies are rejected
+before event retention. Channel ownership is exclusive: a second plugin
+claiming the same channel fails registration, and reload/disable releases
+the owner's routes. `player.client_brand` carries the client's
+`minecraft:brand` payload (`player_id`, `brand`) with no capability
+required.
+
+The `solaris:loader/` channel namespace is reserved for Loader control traffic.
+Raw payload manifests and command admission reject it. Use the typed Loader
+APIs, which enforce bundle permissions and resource ownership.
 
 A gameplay-event player snapshot contains `player_id`, `uuid`, `username`,
 `operator`, `x`, `y`, and `z`, captured by the server at publication. The
@@ -754,7 +863,7 @@ not roll those timer changes back.
 
 The existing bounded presentation commands remain available:
 
-```luau
+solaris.send_custom_payload(player_id, channel, payload)
 solaris.send_message(player_id, text)
 solaris.broadcast(text)
 solaris.disconnect(player_id, reason)
@@ -800,6 +909,19 @@ owner rejection return `damaged = false`, `health = nil`, `killed = false`, and
 `failure = "rejected"`. Queue pressure returns `busy`; a closed/stopped/timed-out/
 shutting-down/unavailable owner returns `runtime_unavailable`. The result reports the
 simulation-owner combat commit, not eventual client packet/rendering state.
+
+Custom payloads share one script boundary: `send_custom_payload` sends data,
+and `player.custom_payload` receives it.
+The plugin must declare `custom_payload:<namespace:path>` for the exact
+`channel`; sending on another owner's channel fails synchronously before
+the bounded command batch, like any undeclared capability. `payload` is a
+binary-safe Luau string of at most 32768 bytes; larger bodies are rejected
+by host admission and never reach the wire. After admission the router
+writes one `ClientboundCustomPayload` with the same channel and bytes to
+the connected player's ordered reliable session lane. Inbound payloads on
+owned channels arrive as targeted `player.custom_payload` events described
+above; the client's `minecraft:brand` payload additionally arrives as
+`player.client_brand`.
 
 Plugins with `player_queries` may request one bounded point-in-time snapshot:
 
@@ -1059,7 +1181,7 @@ coroutine suspension API.
 
 ## Shipped Economy And Claims
 
-`examples/plugins/basic-economy` uses one configurable physical item, such as
+`../solaris-default-plugins/basic-economy` uses one configurable physical item, such as
 emeralds or gold ingots, as currency. Entering its configured cuboid opens a
 server-owned inventory shop; `/economy` opens the same shop manually. A primary
 click removes currency, grants the product, and advances the durable refund
@@ -1070,7 +1192,7 @@ inventory, stale storage, or a concurrent purchase rejects the whole mutation.
 the values an operator edits. Player-to-player payment, auctions, and multiple
 simultaneous currencies are intentionally outside this basic plugin.
 
-`examples/plugins/land-claims` provides `/claim status`, `/claim create`, and
+`../solaris-default-plugins/land-claims` provides `/claim status`, `/claim create`, and
 `/claim remove`. Claims cover one whole chunk in the configured dimension and
 vertical range, persist in one versioned storage record, and allow removal by
 the owner or an operator. API `0.6.0` player command snapshots do not expose a
@@ -1182,6 +1304,12 @@ return `failure = "binding_unavailable"`; temporary owner pressure returns
 `failure = "busy"` while retaining the unexpired token. If result publication
 closes after the owner commits the goal, the committed goal remains in effect
 and the router stops instead of pretending the mutation was rejected.
+`release_villager_binding` drops a previously claimed binding token from both
+the adapter ownership map and the regional entity owner, so the bound villager
+becomes claimable again immediately instead of lingering until its
+simulation-tick expiry. A missing, expired, or foreign token returns `failure =
+"binding_unavailable"`; temporary owner pressure returns `failure = "busy"`.
+The result carries no goal because no new goal is installed.
 
 The shipped colony scaffold owns all colony vocabulary in Luau. Its
 `config.toml` defines colony identity, display name, dimension, home, zone,
@@ -1234,7 +1362,7 @@ cannot construct an arbitrary targeted result. Directly matching and trusting
 the fields of `HostAttached` is not an adapter API. Luau exposes no filesystem,
 network, process, debug, paths, locks, NBT, sessions, or entity pointers.
 
-See [the contract examples](../examples/plugins/) for the configurable
+See [the contract examples](../../solaris-default-plugins/) for the configurable
 item-currency economy, land claims, `/who` inventory roster, and the
 intentionally limited colony/villager scaffold.
 

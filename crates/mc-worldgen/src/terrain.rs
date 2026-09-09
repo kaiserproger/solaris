@@ -27,11 +27,14 @@ use mc_world::{
 use crate::noise::fbm_2d;
 use crate::structures::{StructureRules, StructureTemplate};
 
+mod biome_routing;
 mod biome_rules;
 mod geological_ores;
 mod ore_rules;
 mod overworld;
+mod trees;
 
+use biome_routing::BEACH_HEIGHT_ABOVE_SEA;
 pub use biome_rules::BiomeRules;
 use geological_ores::GeologicalOreRules;
 pub use ore_rules::{
@@ -50,9 +53,6 @@ pub enum TerrainGeneratorError {
 }
 
 pub const SEA_LEVEL: i32 = 63;
-const RIVER_BIOME_WIDTH: f64 = 0.025;
-const CLIMATE_TRANSITION_WIDTH: f64 = 0.08;
-const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
 const ORE_VEIN_RADIUS: i32 = 4;
@@ -368,6 +368,13 @@ struct DecorationBlocks {
     jungle_leaves: Option<BlockStateId>,
     acacia_log: Option<BlockStateId>,
     acacia_leaves: Option<BlockStateId>,
+    mangrove_log: Option<BlockStateId>,
+    mangrove_leaves: Option<BlockStateId>,
+    mangrove_roots: Option<BlockStateId>,
+    wet_mangrove_roots: Option<BlockStateId>,
+    muddy_mangrove_roots: Option<BlockStateId>,
+    mud: Option<BlockStateId>,
+    blue_orchid: Option<BlockStateId>,
     short_grass: Option<BlockStateId>,
     dandelion: Option<BlockStateId>,
     poppy: Option<BlockStateId>,
@@ -377,11 +384,13 @@ struct DecorationBlocks {
     seagrass: Option<BlockStateId>,
     kelp_plant: Option<BlockStateId>,
     kelp: Option<BlockStateId>,
+    leaf_distances: [Option<[BlockStateId; 7]>; 6],
+    leaf_supports: Vec<bool>,
 }
 
 impl DecorationBlocks {
     fn new(registry: &BlockRegistry) -> Self {
-        Self {
+        let mut decorations = Self {
             oak_log: optional_block(registry, "minecraft:oak_log"),
             oak_leaves: optional_generated_leaves(registry, "minecraft:oak_leaves"),
             forest_log: optional_block(registry, "minecraft:birch_log")
@@ -400,6 +409,13 @@ impl DecorationBlocks {
                 .or_else(|| optional_block(registry, "minecraft:oak_log")),
             acacia_leaves: optional_generated_leaves(registry, "minecraft:acacia_leaves")
                 .or_else(|| optional_generated_leaves(registry, "minecraft:oak_leaves")),
+            mangrove_log: optional_block(registry, "minecraft:mangrove_log"),
+            mangrove_leaves: optional_generated_leaves(registry, "minecraft:mangrove_leaves"),
+            mangrove_roots: optional_block(registry, "minecraft:mangrove_roots"),
+            wet_mangrove_roots: None,
+            muddy_mangrove_roots: optional_block(registry, "minecraft:muddy_mangrove_roots"),
+            mud: optional_block(registry, "minecraft:mud"),
+            blue_orchid: optional_block(registry, "minecraft:blue_orchid"),
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
@@ -409,7 +425,44 @@ impl DecorationBlocks {
             seagrass: optional_block(registry, "minecraft:seagrass"),
             kelp_plant: optional_block(registry, "minecraft:kelp_plant"),
             kelp: optional_block(registry, "minecraft:kelp"),
-        }
+            leaf_distances: [None; 6],
+            leaf_supports: registry
+                .states()
+                .map(|state| {
+                    mc_world::plant_rules_26_1_2::leaf_distance_from_state(registry, state.id) == 0
+                })
+                .collect(),
+        };
+        decorations.wet_mangrove_roots = decorations.mangrove_roots.and_then(|root| {
+            let state = registry.by_id(root)?;
+            let mut properties = state.properties.clone();
+            properties
+                .iter_mut()
+                .find(|(name, _)| name == "waterlogged")?
+                .1 = "true".to_owned();
+            registry.by_name_and_props(&state.block.id, &properties)
+        });
+        decorations.leaf_distances = [
+            decorations.oak_leaves,
+            decorations.forest_leaves,
+            decorations.cold_leaves,
+            decorations.jungle_leaves,
+            decorations.acacia_leaves,
+            decorations.mangrove_leaves,
+        ]
+        .map(|leaf| {
+            let leaf = leaf?;
+            let state = registry.by_id(leaf)?;
+            let mut properties = state.properties.clone();
+            let property = properties.iter().position(|(key, _)| key == "distance")?;
+            let mut distances = [leaf; 7];
+            for (index, distance) in distances.iter_mut().enumerate() {
+                properties[property].1 = (index + 1).to_string();
+                *distance = registry.by_name_and_props(&state.block.id, &properties)?;
+            }
+            Some(distances)
+        });
+        decorations
     }
 }
 
@@ -419,7 +472,9 @@ enum TreeKind {
     Birch,
     Spruce,
     Jungle,
+    JungleBush,
     Acacia,
+    Mangrove,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -450,8 +505,14 @@ fn tree_canopy_radius(kind: TreeKind, relative_y: i32) -> Option<i8> {
         (TreeKind::Spruce, 1) => Some(0),
         (TreeKind::Jungle, -2..=0) => Some(2),
         (TreeKind::Jungle, 1) => Some(1),
+        (TreeKind::JungleBush, 0) => Some(2),
+        (TreeKind::JungleBush, 1) => Some(1),
+        (TreeKind::JungleBush, 2) => Some(0),
         (TreeKind::Acacia, -1 | 0) => Some(2),
         (TreeKind::Acacia, 1) => Some(1),
+        (TreeKind::Mangrove, -3..=-1) => Some(2),
+        (TreeKind::Mangrove, 0) => Some(1),
+        (TreeKind::Mangrove, 1) => Some(0),
         _ => None,
     }
 }
@@ -479,20 +540,16 @@ fn optional_block(registry: &BlockRegistry, name: &str) -> Option<BlockStateId> 
 
 fn optional_generated_leaves(registry: &BlockRegistry, name: &str) -> Option<BlockStateId> {
     let id = Identifier::parse(name).expect("static identifier");
-    generated_leaf_state(registry, &id)
-}
-
-fn generated_leaf_state(registry: &BlockRegistry, id: &Identifier) -> Option<BlockStateId> {
     registry
         .by_name_and_props(
-            id,
+            &id,
             &[
-                ("distance".to_string(), "1".to_string()),
+                ("distance".to_string(), "7".to_string()),
                 ("persistent".to_string(), "false".to_string()),
                 ("waterlogged".to_string(), "false".to_string()),
             ],
         )
-        .or_else(|| registry.block(id).map(|block| block.default))
+        .or_else(|| registry.block(&id).map(|block| block.default))
 }
 
 fn checked_y_offset(y: i32, offset: i32) -> Option<i32> {
@@ -508,16 +565,6 @@ fn heightmap_value_for_top(geometry: ChunkGeometry, top: i32) -> Option<u32> {
 fn world_block_coordinate(chunk: i32, local: u8) -> i32 {
     let coordinate = i64::from(chunk) * 16 + i64::from(local);
     i32::try_from(coordinate).expect("chunk lies outside the supported i32 block-coordinate range")
-}
-
-fn climate_above(value: f64, threshold: f64, domain: f64) -> bool {
-    if value <= threshold - CLIMATE_TRANSITION_WIDTH {
-        false
-    } else if value >= threshold + CLIMATE_TRANSITION_WIDTH {
-        true
-    } else {
-        value + domain.clamp(-1.0, 1.0) * CLIMATE_TRANSITION_WIDTH > threshold
-    }
 }
 
 impl TerrainGenerator {
@@ -798,176 +845,6 @@ impl TerrainGenerator {
         OverworldRouter::new(self.seed, self.geometry, self.worldgen_mode)
     }
 
-    fn biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
-        let sample = self.density_router().sample(world_x, world_z);
-        match self.worldgen_mode {
-            WorldgenMode::VanillaLike => self.vanilla_biome_for(world_x, world_z, height, sample),
-            WorldgenMode::TellusLike(settings) => {
-                self.tellus_biome_for(world_x, world_z, height, settings, sample)
-            }
-        }
-    }
-
-    fn vanilla_biome_for(
-        &self,
-        world_x: i32,
-        world_z: i32,
-        height: i32,
-        sample: TerrainSample,
-    ) -> Identifier {
-        let continental = sample.continentalness;
-        let ridges = sample.ridges;
-        let river = sample.river;
-
-        if height < SEA_LEVEL - 8 {
-            return self.biomes.pick_region_band(
-                &self.biomes.deep_ocean,
-                world_x,
-                world_z,
-                self.seed,
-            );
-        }
-        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.05 && height < SEA_LEVEL {
-            return self
-                .biomes
-                .pick(&self.biomes.river, world_x, world_z, self.seed, 0x5249_5645);
-        }
-        if height < SEA_LEVEL - 1 {
-            return self
-                .biomes
-                .pick(&self.biomes.ocean, world_x, world_z, self.seed, 0x4F43_4541);
-        }
-        if height <= SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA {
-            return self
-                .biomes
-                .pick(&self.biomes.beach, world_x, world_z, self.seed, 0x4245_4143);
-        }
-        if height > 118 || ridges > 0.22 {
-            return self.biomes.pick(
-                &self.biomes.mountain,
-                world_x,
-                world_z,
-                self.seed,
-                0x4D4F_554E,
-            );
-        }
-        if height < 18 {
-            return self
-                .biomes
-                .pick(&self.biomes.cave, world_x, world_z, self.seed, 0x4341_5645);
-        }
-        if sample.moisture > 0.32 && height <= SEA_LEVEL + 8 {
-            return self
-                .biomes
-                .pick(&self.biomes.swamp, world_x, world_z, self.seed, 0x5357_414D);
-        }
-        self.climate_biome_for(world_x, world_z, sample, 0)
-    }
-
-    fn tellus_biome_for(
-        &self,
-        world_x: i32,
-        world_z: i32,
-        height: i32,
-        settings: TellusWorldgenSettings,
-        sample: TerrainSample,
-    ) -> Identifier {
-        let sea_level = settings.sea_level;
-        let height_y = i64::from(height);
-        let sea_y = i64::from(sea_level);
-        let land_mask = sample.continentalness;
-        let mountain = sample.ridges;
-        let river = sample.river;
-
-        if settings.water_enabled {
-            if river.abs() < RIVER_BIOME_WIDTH * 0.65 && land_mask > -0.02 && height_y < sea_y {
-                return self.biomes.pick(
-                    &self.biomes.river,
-                    world_x,
-                    world_z,
-                    self.seed,
-                    0x5452_4956,
-                );
-            }
-            if height_y < sea_y - 18 {
-                return self.biomes.pick(
-                    &self.biomes.deep_ocean,
-                    world_x,
-                    world_z,
-                    self.seed,
-                    0x5444_4545,
-                );
-            }
-            if height_y < sea_y - 1 {
-                return self.biomes.pick(
-                    &self.biomes.ocean,
-                    world_x,
-                    world_z,
-                    self.seed,
-                    0x544F_434E,
-                );
-            }
-        }
-        let near_coast = land_mask.abs() < 0.025 && height_y <= sea_y + 6;
-        if near_coast || height_y <= sea_y + i64::from(BEACH_HEIGHT_ABOVE_SEA) {
-            return self
-                .biomes
-                .pick(&self.biomes.beach, world_x, world_z, self.seed, 0x5442_4541);
-        }
-        // A ridge field may cross its threshold on a low coastal shelf. Only
-        // route that shelf to a rocky mountain surface once the terrain has
-        // actually risen above ordinary lowland.
-        if height_y > sea_y + 86 || (mountain > 0.22 && land_mask > 0.08 && height_y >= sea_y + 18)
-        {
-            return self.biomes.pick(
-                &self.biomes.mountain,
-                world_x,
-                world_z,
-                self.seed,
-                0x544D_4F55,
-            );
-        }
-        if height < 18 {
-            return self
-                .biomes
-                .pick(&self.biomes.cave, world_x, world_z, self.seed, 0x5443_4156);
-        }
-        if sample.moisture > 0.32 && height_y <= sea_y + 8 {
-            return self
-                .biomes
-                .pick(&self.biomes.swamp, world_x, world_z, self.seed, 0x5453_5741);
-        }
-        self.climate_biome_for(world_x, world_z, sample, 0x5400_0000)
-    }
-
-    fn climate_biome_for(
-        &self,
-        world_x: i32,
-        world_z: i32,
-        sample: TerrainSample,
-        salt: u64,
-    ) -> Identifier {
-        let temperature = sample.temperature;
-        let moisture = sample.moisture;
-        let domain = sample.climate_domain;
-        let (bucket, bucket_salt) = if !climate_above(temperature, -0.25, domain) {
-            (&self.biomes.cold, 0x434F_4C44)
-        } else if climate_above(temperature, 0.12, domain)
-            && !climate_above(moisture, 0.08, -domain)
-        {
-            (&self.biomes.hot_dry, 0x484F_5444)
-        } else if climate_above(temperature, 0.14, domain) && climate_above(moisture, 0.12, -domain)
-        {
-            (&self.biomes.jungle, 0x4A55_4E47)
-        } else if climate_above(moisture, 0.12, -domain) {
-            (&self.biomes.temperate_forest, 0x464F_5253)
-        } else {
-            (&self.biomes.grassland, 0x4752_4153)
-        };
-        self.biomes
-            .pick(bucket, world_x, world_z, self.seed, bucket_salt ^ salt)
-    }
-
     #[cfg(test)]
     fn biome_for_cell(
         &self,
@@ -1004,6 +881,7 @@ impl TerrainGenerator {
         self.biomes.grassland.contains(biome)
             || self.biomes.temperate_forest.contains(biome)
             || self.biomes.jungle.contains(biome)
+            || self.biomes.swamp.contains(biome)
             || Self::is_cold_forest(biome)
             || Self::is_savanna(biome)
     }
@@ -1080,6 +958,9 @@ impl TerrainGenerator {
 
     fn surface_materials(&self, biome: &Identifier) -> (BlockStateId, BlockStateId) {
         let path = biome.path();
+        if path == "stony_shore" {
+            return (self.gravel, self.stone);
+        }
         if self.biomes.is_surface_water(biome) || self.biomes.is_beach_or_shore(biome) {
             return (self.sand, self.sand);
         }
@@ -1088,6 +969,11 @@ impl TerrainGenerator {
         }
         if path == "desert" {
             return (self.sand, self.sand);
+        }
+        if path == "mangrove_swamp"
+            && let Some(mud) = self.decorations.mud
+        {
+            return (mud, self.dirt);
         }
         if self.biomes.mountain.contains(biome) || path.contains("stony") {
             return (self.gravel, self.stone);
@@ -1390,12 +1276,12 @@ impl TerrainGenerator {
                             if !(min_y..=max_y).contains(&anchor_y) {
                                 continue;
                             }
-                            if !rule.biomes.is_any() {
-                                let surface_y = self.surface_height(anchor_x, anchor_z);
-                                let biome = self.biome_for(anchor_x, anchor_z, surface_y);
-                                if !rule.biomes.matches(&biome) {
-                                    continue;
-                                }
+                            if !rule.biomes.is_any()
+                                && !column_cache
+                                    .get_or_plan(self, anchor_x, anchor_z)
+                                    .is_some_and(|column| rule.biomes.matches(&column.biome))
+                            {
+                                continue;
                             }
                             let vein_hash = feature_hash(
                                 self.seed,
@@ -1627,6 +1513,7 @@ impl TerrainGenerator {
 
     fn apply_decorations(&self, chunk: &mut Chunk, columns: &[ColumnPlan; 256]) {
         let mut touched = [None; 256];
+        let mut leaves = Vec::new();
         for lz in 0..16u8 {
             for lx in 0..16u8 {
                 let idx = lz as usize * 16 + lx as usize;
@@ -1653,7 +1540,13 @@ impl TerrainGenerator {
                 if tree_spacing.is_some_and(|spacing| h.is_multiple_of(spacing))
                     && self.tree_density_allows(plan)
                     && self.tree_site_is_stable(plan)
-                    && self.place_tree(chunk, plan, self.tree_blocks_for_biome(biome), &mut touched)
+                    && self.place_tree(
+                        chunk,
+                        plan,
+                        self.tree_blocks_for_biome(biome),
+                        &mut touched,
+                        &mut leaves,
+                    )
                 {
                     continue;
                 }
@@ -1664,7 +1557,9 @@ impl TerrainGenerator {
                 {
                     continue;
                 }
-                if (self.biomes.beach.contains(biome) || self.biomes.river.contains(biome))
+                if (self.biomes.beach.contains(biome)
+                    || self.biomes.river.contains(biome)
+                    || self.biomes.swamp.contains(biome))
                     && h.is_multiple_of(29)
                     && self.place_sugar_cane(chunk, lx, base_y, lz, &mut touched)
                 {
@@ -1673,9 +1568,10 @@ impl TerrainGenerator {
                 if (self.biomes.grassland.contains(biome)
                     || self.biomes.temperate_forest.contains(biome)
                     || self.biomes.jungle.contains(biome)
+                    || self.biomes.swamp.contains(biome)
                     || Self::is_savanna(biome))
-                    && (surface == self.grass_block || surface == self.podzol)
                     && self.ground_cover_density_allows(plan)
+                    && (surface == self.grass_block || surface == self.podzol)
                 {
                     let (grass_spacing, dandelion_spacing, poppy_spacing) =
                         self.plant_spacing_for_biome(biome);
@@ -1687,6 +1583,14 @@ impl TerrainGenerator {
                         }
                     } else if h.is_multiple_of(1021) {
                         self.decorations.pumpkin
+                    } else if self.biomes.swamp.contains(biome) {
+                        if h.is_multiple_of(dandelion_spacing) {
+                            self.decorations.blue_orchid
+                        } else if h.is_multiple_of(grass_spacing) {
+                            self.decorations.short_grass
+                        } else {
+                            None
+                        }
                     } else if h.is_multiple_of(dandelion_spacing) {
                         self.decorations.dandelion
                     } else if h.is_multiple_of(poppy_spacing) {
@@ -1719,6 +1623,7 @@ impl TerrainGenerator {
                 }
             }
         }
+        self.initialize_leaf_distances(chunk, &mut leaves);
         for lz in 0..16u8 {
             for lx in 0..16u8 {
                 if let Some(top) = touched[lz as usize * 16 + lx as usize] {
@@ -1728,7 +1633,76 @@ impl TerrainGenerator {
         }
     }
 
+    fn initialize_leaf_distances(&self, chunk: &mut Chunk, leaves: &mut Vec<(u8, i32, u8)>) {
+        let palettes = &self.decorations.leaf_distances;
+        let neighbours = |(x, y, z): (u8, i32, u8)| {
+            [
+                (-1, 0, 0),
+                (1, 0, 0),
+                (0, -1, 0),
+                (0, 1, 0),
+                (0, 0, -1),
+                (0, 0, 1),
+            ]
+            .into_iter()
+            .filter_map(move |(dx, dy, dz)| {
+                let x = x.checked_add_signed(dx)?;
+                let y = y.checked_add(dy)?;
+                let z = z.checked_add_signed(dz)?;
+                (x < 16 && z < 16).then_some((x, y, z))
+            })
+        };
+        // Resolve the complete generated leaf graph before publishing the chunk.
+        // Persistent remains false; later log removal uses ordinary scheduled decay.
+        leaves.retain(|&(x, y, z)| {
+            let state = chunk
+                .get_block(x, y, z)
+                .expect("generated leaf is in the chunk");
+            let Some(palette) = palettes
+                .iter()
+                .flatten()
+                .find(|palette| palette[6] == state)
+            else {
+                return false;
+            };
+            let supported = neighbours((x, y, z)).any(|(nx, ny, nz)| {
+                chunk.get_block(nx, ny, nz).is_some_and(|state| {
+                    self.decorations
+                        .leaf_supports
+                        .get(state.0 as usize)
+                        .copied()
+                        .unwrap_or(false)
+                })
+            });
+            if supported {
+                chunk.set_block(x, y, z, palette[0]);
+            }
+            supported
+        });
+        let mut start = 0;
+        for distance in 2..=6 {
+            let end = leaves.len();
+            for index in start..end {
+                for (x, y, z) in neighbours(leaves[index]) {
+                    let Some(state) = chunk.get_block(x, y, z) else {
+                        continue;
+                    };
+                    if let Some(palette) = palettes
+                        .iter()
+                        .flatten()
+                        .find(|palette| palette[6] == state)
+                    {
+                        chunk.set_block(x, y, z, palette[distance - 1]);
+                        leaves.push((x, y, z));
+                    }
+                }
+            }
+            start = end;
+        }
+    }
+
     fn tree_site_is_stable(&self, plan: &ColumnPlan) -> bool {
+        // Keep the trunk and nearby canopy footprint off sharp terrain ledges.
         for dz in -2..=2 {
             for dx in -2..=2 {
                 let Some(wx) = plan.wx.checked_add(dx) else {
@@ -1759,10 +1733,13 @@ impl TerrainGenerator {
             -0.55
         } else if self.biomes.temperate_forest.contains(&plan.biome) {
             -0.25
-        } else if Self::is_cold_forest(&plan.biome) {
+        } else if self.biomes.swamp.contains(&plan.biome) {
+            // Swamp trees root in wet soil wherever the tightened swamp band
+            // applies; previously swamp had no branch here at all, which made
+            // every swamp column barren by construction.
+            -0.45
+        } else if Self::is_cold_forest(&plan.biome) || Self::is_savanna(&plan.biome) {
             -0.05
-        } else if Self::is_savanna(&plan.biome) {
-            0.18
         } else if self.biomes.grassland.contains(&plan.biome) {
             0.40
         } else {
@@ -1774,7 +1751,9 @@ impl TerrainGenerator {
     fn ground_cover_density_allows(&self, plan: &ColumnPlan) -> bool {
         let threshold = if self.biomes.jungle.contains(&plan.biome) {
             -0.75
-        } else if self.biomes.temperate_forest.contains(&plan.biome) {
+        } else if self.biomes.temperate_forest.contains(&plan.biome)
+            || self.biomes.swamp.contains(&plan.biome)
+        {
             -0.55
         } else if Self::is_savanna(&plan.biome) {
             -0.05
@@ -1788,9 +1767,13 @@ impl TerrainGenerator {
 
     fn tree_spacing_for_biome(&self, biome: &Identifier) -> Option<u64> {
         if self.biomes.jungle.contains(biome) {
-            Some(23)
+            // Vanilla jungle vegetation makes about 50 attempts per chunk,
+            // mixing trees with a low bush layer rather than sparse trunks.
+            Some(5)
         } else if self.biomes.temperate_forest.contains(biome) {
             Some(37)
+        } else if self.biomes.swamp.contains(biome) {
+            Some(31)
         } else if Self::is_cold_forest(biome) {
             Some(47)
         } else if Self::is_savanna(biome) {
@@ -1806,185 +1789,16 @@ impl TerrainGenerator {
         if Self::is_savanna(biome) {
             (31, 127, 137)
         } else if self.biomes.jungle.contains(biome) {
-            (17, 103, 109)
+            (13, 89, 97)
+        } else if self.biomes.swamp.contains(biome) {
+            (15, 71, 79)
         } else if self.biomes.temperate_forest.contains(biome) {
             (29, 127, 137)
         } else {
-            (19, 61, 67)
+            // Common lowlands at 1/19 grass read as featureless lawns from
+            // any distance; 1/15 keeps the existing moderate-cover test cap.
+            (15, 61, 67)
         }
-    }
-
-    fn place_tree(
-        &self,
-        chunk: &mut Chunk,
-        plan: &ColumnPlan,
-        blocks: Option<TreeBlocks>,
-        touched: &mut [Option<i32>; 256],
-    ) -> bool {
-        let lx = plan.lx;
-        let lz = plan.lz;
-        let Some(base_y) = checked_y_offset(plan.height, 1) else {
-            return false;
-        };
-        let Some(blocks) = blocks else {
-            return false;
-        };
-        let trunk_height = match blocks.kind {
-            TreeKind::Oak => 4 + (plan.hash % 2) as i32,
-            TreeKind::Birch => 5 + (plan.hash % 2) as i32,
-            TreeKind::Spruce => 5 + (plan.hash % 3) as i32,
-            TreeKind::Jungle => 6 + (plan.hash % 2) as i32,
-            TreeKind::Acacia => 4 + (plan.hash % 3) as i32,
-        };
-        let Some(trunk_top_y) = checked_y_offset(base_y, trunk_height - 1) else {
-            return false;
-        };
-        let Some(top_y) = checked_y_offset(trunk_top_y, 1) else {
-            return false;
-        };
-        if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || top_y >= self.geometry.max_y() {
-            return false;
-        }
-        let Some(support_y) = checked_y_offset(base_y, -1) else {
-            return false;
-        };
-        if chunk.get_block(lx, support_y, lz) != Some(plan.surface) {
-            return false;
-        }
-        for y in base_y..=top_y {
-            if chunk.get_block(lx, y, lz) != Some(self.air) {
-                return false;
-            }
-        }
-        for y in base_y..=trunk_top_y {
-            self.place_single(chunk, lx, y, lz, blocks.log, touched);
-        }
-        for relative_y in -4..=1 {
-            let Some(radius) = tree_canopy_radius(blocks.kind, relative_y) else {
-                continue;
-            };
-            let Some(y) = checked_y_offset(trunk_top_y, relative_y) else {
-                continue;
-            };
-            for dz in -radius..=radius {
-                for dx in -radius..=radius {
-                    let offset = TreeLeafOffset {
-                        relative_y,
-                        dx,
-                        dz,
-                        radius,
-                    };
-                    if !self.tree_leaf_is_present(plan, blocks.kind, trunk_top_y, offset) {
-                        continue;
-                    }
-                    let x = lx.wrapping_add_signed(dx);
-                    let z = lz.wrapping_add_signed(dz);
-                    if chunk.get_block(x, y, z) == Some(self.air) {
-                        self.place_single(chunk, x, y, z, blocks.leaves, touched);
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    fn tree_blocks_for_biome(&self, biome: &Identifier) -> Option<TreeBlocks> {
-        let (kind, log, leaves) = if Self::is_savanna(biome) {
-            (
-                TreeKind::Acacia,
-                self.decorations.acacia_log,
-                self.decorations.acacia_leaves,
-            )
-        } else if self.biomes.jungle.contains(biome) {
-            (
-                TreeKind::Jungle,
-                self.decorations.jungle_log,
-                self.decorations.jungle_leaves,
-            )
-        } else if Self::is_cold_forest(biome) {
-            (
-                TreeKind::Spruce,
-                self.decorations.cold_log,
-                self.decorations.cold_leaves,
-            )
-        } else if self.biomes.temperate_forest.contains(biome) {
-            (
-                TreeKind::Birch,
-                self.decorations.forest_log,
-                self.decorations.forest_leaves,
-            )
-        } else {
-            (
-                TreeKind::Oak,
-                self.decorations.oak_log,
-                self.decorations.oak_leaves,
-            )
-        };
-        log.zip(leaves)
-            .map(|(log, leaves)| TreeBlocks { kind, log, leaves })
-    }
-
-    fn tree_leaf_is_present(
-        &self,
-        plan: &ColumnPlan,
-        kind: TreeKind,
-        trunk_top_y: i32,
-        offset: TreeLeafOffset,
-    ) -> bool {
-        let TreeLeafOffset {
-            relative_y,
-            dx,
-            dz,
-            radius,
-        } = offset;
-        let y = trunk_top_y + relative_y;
-        if radius == 0 {
-            return dx == 0 && dz == 0;
-        }
-        let edge_x = dx.unsigned_abs() == radius as u8;
-        let edge_z = dz.unsigned_abs() == radius as u8;
-        if edge_x && edge_z {
-            if radius >= 2 {
-                return false;
-            }
-            let corner = match (dx.is_positive(), dz.is_positive()) {
-                (false, false) => 0,
-                (true, false) => 1,
-                (true, true) => 2,
-                (false, true) => 3,
-            };
-            let salt = match kind {
-                TreeKind::Oak => 0x0A4,
-                TreeKind::Birch => 0xB17C,
-                TreeKind::Spruce => 0x5A9C,
-                TreeKind::Jungle => 0xA6E1,
-                TreeKind::Acacia => 0xACA1,
-            };
-            let rotation = feature_hash(self.seed, plan.wx, trunk_top_y, plan.wz, salt) as u8 & 3;
-            return if relative_y > 0 {
-                corner == rotation
-            } else {
-                corner != rotation
-            };
-        }
-        if radius < 2 || !(edge_x || edge_z) {
-            return true;
-        }
-        let salt = match kind {
-            TreeKind::Oak => 0x0A4,
-            TreeKind::Birch => 0xB17C,
-            TreeKind::Spruce => 0x5A9C,
-            TreeKind::Jungle => 0xA6E1,
-            TreeKind::Acacia => 0xACA1,
-        };
-        !feature_hash(
-            self.seed,
-            plan.wx + i32::from(dx),
-            y,
-            plan.wz + i32::from(dz),
-            salt,
-        )
-        .is_multiple_of(5)
     }
 
     fn place_cactus(
@@ -2536,3 +2350,11 @@ impl ChunkGenerator for TerrainGenerator {
 #[cfg(test)]
 #[path = "terrain/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "terrain/wetland_tests.rs"]
+mod wetland_tests;
+
+#[cfg(test)]
+#[path = "terrain/coastal_tests.rs"]
+mod coastal_tests;

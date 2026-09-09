@@ -1,8 +1,8 @@
 # Install Solaris Loader on a client
 
 Solaris Loader is an optional **client-side** mod for Solaris plugins that ship
-verified screens, assets, items, blocks, or interactions. It is not needed when
-every selected server plugin is `server_only`.
+verified UI (screens/HUD), assets, sounds, items, blocks, or UI/keyboard interactions. It is not
+needed when every selected server plugin is `server_only`.
 
 The current Loader prototype targets exactly **Minecraft Java Edition 26.1.2**
 and **Java 25**. Use the adapter matching the mod loader in that Minecraft
@@ -29,11 +29,23 @@ Solaris alpha release claim.
 ## Build the client jars
 
 Prebuilt Loader publishing is not yet part of the released-alpha installer.
-Build from the **same Solaris tag or commit as the server**; alpha protocol and
-bundle contracts can change between revisions. From that source checkout:
+Build compatible sources from
+[`solaris-loader`](https://github.com/kaiserproger/solaris-loader), checked out
+beside the server repository. Their Git histories are independent: a server
+tag or commit is not a Loader revision. Alpha protocol and bundle contracts
+can change between revisions. Current Loader wire protocol is **2**, with no
+protocol-1 compatibility path; plugin API is still `0.6.0`.
+Declared keyboard actions leave vanilla movement, menus, screenshots and
+fullscreen handling intact. They are suppressed in menus/overlays or without
+window focus; bindings reset on reconnect. Rebinding, chords and mouse/gamepad
+actions are not implemented. Sound bundles request `play_sounds` alongside
+`load_assets`; they support personal and world-positioned one-shots, volume,
+pitch and owner-local stop. Playback respects master volume and ends on
+disconnect. Loops and moving sound sources are not implemented.
+From that source checkout:
 
 ```sh
-cd client-mod/solaris-client-agent
+cd ../solaris-loader
 ./gradlew --no-configuration-cache \
   :loader-fabric:jar \
   :loader-neoforge:jar \
@@ -130,9 +142,9 @@ login during Configuration. The server disconnect reason names the supported
 loader platforms and required bundle identities where available; Solaris does
 not silently replace custom content with vanilla content.
 
-Loader clears activated registries and transient resources when the connection
-closes, so one server's content cannot be reused by a later connection merely
-because the Minecraft process stayed open.
+Loader clears activated registries, HUD state, and transient resources when the
+connection closes, so one server's content cannot be reused by a later
+connection merely because the Minecraft process stayed open.
 
 ## How operators know Loader is required
 
@@ -197,9 +209,9 @@ The repository includes a Loader-required fixture and isolated real-client
 checks:
 
 ```sh
-python3 tools/run-loader-live-gate.py fabric
-python3 tools/run-loader-live-gate.py neoforge
-python3 tools/run-loader-live-gate.py forge
+python3 -m tools.harness run loader-live --platform fabric
+python3 -m tools.harness run loader-live --platform neoforge
+python3 -m tools.harness run loader-live --platform forge
 ```
 
 See [`../examples/loader-live-gate/README.md`](../examples/loader-live-gate/README.md)

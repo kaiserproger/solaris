@@ -293,11 +293,12 @@ pub(super) fn recipe_fits_grid(
 
 fn matching_ingredient_slot(
     state: &InteractionState,
+    inventory: &PlayerInventory,
     available: &[i32; 46],
     ingredient: &mc_data::recipes::Ingredient,
 ) -> Option<usize> {
     for (slot, available_count) in available.iter().enumerate().take(45).skip(9) {
-        let current = &state.inventory.slots[slot];
+        let current = &inventory.slots[slot];
         if *available_count > 0
             && ingredient_accepts_item(&state.items, &state.tags, current.item_id, ingredient)
         {
@@ -316,7 +317,12 @@ pub(super) fn ingredient_accepts_item(
     mc_data::recipes::ingredient_accepts_item(items, tags, item_id, ingredient)
 }
 
-fn inventory_has_room_for_output(state: &InteractionState, item_id: u32, count: i32) -> bool {
+fn inventory_has_room_for_output(
+    state: &InteractionState,
+    inventory: &PlayerInventory,
+    item_id: u32,
+    count: i32,
+) -> bool {
     let mut remaining = count;
     let max_stack = item_max_stack(
         &state.item_facts,
@@ -324,7 +330,7 @@ fn inventory_has_room_for_output(state: &InteractionState, item_id: u32, count: 
         &ItemStack::new(item_id, count),
     );
     for slot in 9..=44 {
-        let current = &state.inventory.slots[slot];
+        let current = &inventory.slots[slot];
         if current.is_empty() {
             remaining -= remaining.min(max_stack);
         } else if current.item_id == item_id
@@ -341,7 +347,8 @@ fn inventory_has_room_for_output(state: &InteractionState, item_id: u32, count: 
 }
 
 fn craft_recipe_once(
-    state: &mut InteractionState,
+    state: &InteractionState,
+    inventory: &mut PlayerInventory,
     recipe: &mc_data::recipes::Recipe,
 ) -> Option<Vec<(usize, ItemStack)>> {
     let ingredients = recipe_ingredients(recipe)?;
@@ -350,21 +357,23 @@ fn craft_recipe_once(
     }
     let output_item_id = state.items.id_of(&recipe.result.item)?;
     let output_count = i32::try_from(recipe.result.count).ok()?;
-    if output_count <= 0 || !inventory_has_room_for_output(state, output_item_id, output_count) {
+    if output_count <= 0
+        || !inventory_has_room_for_output(state, inventory, output_item_id, output_count)
+    {
         return None;
     }
 
-    let mut available = std::array::from_fn(|slot| state.inventory.slots[slot].count.max(0));
+    let mut available = std::array::from_fn(|slot| inventory.slots[slot].count.max(0));
     let mut consumed_slots = Vec::with_capacity(ingredients.len());
     for ingredient in ingredients {
-        let slot = matching_ingredient_slot(state, &available, ingredient)?;
+        let slot = matching_ingredient_slot(state, inventory, &available, ingredient)?;
         available[slot] -= 1;
         consumed_slots.push(slot);
     }
 
     let mut changed = BTreeMap::new();
     for slot in consumed_slots {
-        let current = &mut state.inventory.slots[slot];
+        let current = &mut inventory.slots[slot];
         current.count -= 1;
         if current.count <= 0 {
             *current = ItemStack::EMPTY;
@@ -374,7 +383,7 @@ fn craft_recipe_once(
 
     let output = ItemStack::new(output_item_id, output_count);
     let max_stack = item_max_stack(&state.item_facts, &state.items, &output);
-    let (remaining, output_changed) = state.inventory.merge_stack(output, max_stack);
+    let (remaining, output_changed) = inventory.merge_stack(output, max_stack);
     if !remaining.is_empty() {
         return None;
     }
@@ -411,23 +420,28 @@ pub(super) struct CraftRecipeOutcome {
 }
 
 pub(super) fn craft_recipe(
-    state: &mut InteractionState,
+    state: &InteractionState,
     recipe: &mc_data::recipes::Recipe,
     use_max_items: bool,
-) -> Option<CraftRecipeOutcome> {
+) -> Option<(PlayerInventory, CraftRecipeOutcome)> {
     let item_id = state.items.id_of(&recipe.result.item)?;
+    let mut inventory = state.inventory.clone();
     if !use_max_items {
-        return Some(CraftRecipeOutcome {
-            changed_slots: craft_recipe_once(state, recipe)?,
-            crafted: CraftedItem {
-                item_id,
-                count: u64::from(recipe.result.count),
-                craft_count: 1,
+        let changed_slots = craft_recipe_once(state, &mut inventory, recipe)?;
+        return Some((
+            inventory,
+            CraftRecipeOutcome {
+                changed_slots,
+                crafted: CraftedItem {
+                    item_id,
+                    count: u64::from(recipe.result.count),
+                    craft_count: 1,
+                },
             },
-        });
+        ));
     }
 
-    let max_crafts = state.inventory.slots[9..=44]
+    let max_crafts = inventory.slots[9..=44]
         .iter()
         .map(|stack| {
             let max_stack = item_max_stack(&state.item_facts, &state.items, stack);
@@ -437,7 +451,7 @@ pub(super) fn craft_recipe(
     let mut all_changed = BTreeMap::new();
     let mut craft_count = 0_u32;
     for _ in 0..max_crafts {
-        let Some(changed) = craft_recipe_once(state, recipe) else {
+        let Some(changed) = craft_recipe_once(state, &mut inventory, recipe) else {
             break;
         };
         craft_count += 1;
@@ -446,13 +460,18 @@ pub(super) fn craft_recipe(
         }
     }
     let count = u64::from(recipe.result.count) * u64::from(craft_count);
-    (!all_changed.is_empty()).then(|| CraftRecipeOutcome {
-        changed_slots: all_changed.into_iter().collect(),
-        crafted: CraftedItem {
-            item_id,
-            count,
-            craft_count,
-        },
+    (!all_changed.is_empty()).then(|| {
+        (
+            inventory,
+            CraftRecipeOutcome {
+                changed_slots: all_changed.into_iter().collect(),
+                crafted: CraftedItem {
+                    item_id,
+                    count,
+                    craft_count,
+                },
+            },
+        )
     })
 }
 

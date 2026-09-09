@@ -662,27 +662,19 @@ where
     Ok(())
 }
 
-pub(super) async fn send_entity_despawn<W>(
+pub(super) async fn send_entities_despawn<W>(
     writer: &mut W,
     compression: Compression,
-    entity: &ServerEntitySnapshot,
+    entity_ids: Vec<i32>,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
     debug!(
-        entity_id = entity.id.0,
-        entity_type = %entity.type_name,
-        "despawning visible server entity"
+        count = entity_ids.len(),
+        "despawning visible server entities"
     );
-    write_packet(
-        writer,
-        &RemoveEntities {
-            entity_ids: vec![entity.id.0],
-        },
-        compression,
-    )
-    .await
+    write_packet(writer, &RemoveEntities { entity_ids }, compression).await
 }
 
 pub(super) async fn send_take_item_entity<W>(

@@ -295,7 +295,8 @@ impl SessionEntityOwners {
             failure: Arc::clone(&self.failure),
             snapshots: RefCell::new(HashMap::new()),
             selected_snapshots: RefCell::new(None),
-            pending_goal_kinematics: RefCell::new(None),
+            #[cfg(feature = "load-bench")]
+            fenced_apply: std::cell::Cell::new(false),
             #[cfg(test)]
             owner_requests: Arc::clone(&self.owner_requests),
         }
@@ -317,6 +318,54 @@ impl SessionEntityOwners {
         call: impl FnOnce(&RegionalOwnerHandle) -> Result<T, mc_entity::RegionOwnerLaneError>,
     ) -> T {
         owner_call(&self.failure, &self.handle, call)
+    }
+
+    pub(super) fn tick_owned_regions(
+        &self,
+        input: mc_entity::RegionalEntityTickInput,
+    ) -> mc_entity::RegionalEntityTickOutput {
+        self.call(|handle| handle.tick_owned_regions(input))
+    }
+
+    pub(super) fn commit_owned_region_physics(
+        &self,
+        prepared: mc_entity::RegionalPreparedEntityPhysics,
+    ) -> mc_entity::RegionalEntityPhysicsOutput {
+        self.call(|handle| handle.commit_owned_region_physics(prepared))
+    }
+
+    pub(super) fn versioned_snapshots_are_current(
+        &self,
+        selected: &VersionedEntitySnapshots,
+    ) -> bool {
+        matches!(
+            try_owner_call(&self.failure, &self.handle, |handle| {
+                handle.versioned_snapshots_are_current(selected)
+            }),
+            Ok(true)
+        )
+    }
+
+    pub(super) fn alive_kinematics_for_ids_versioned(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> (
+        Vec<EntityKinematics>,
+        Option<mc_entity::VersionedEntityKinematics>,
+    ) {
+        self.call(|handle| handle.alive_kinematics_for_ids_versioned(entities))
+    }
+
+    pub(super) fn versioned_kinematics_are_current(
+        &self,
+        selected: &mc_entity::VersionedEntityKinematics,
+    ) -> bool {
+        matches!(
+            try_owner_call(&self.failure, &self.handle, |handle| {
+                handle.versioned_kinematics_are_current(selected)
+            }),
+            Ok(true)
+        )
     }
 
     pub(super) fn subscribe_failure(
@@ -397,6 +446,11 @@ impl SessionEntityOwners {
         outcome
     }
 }
+enum SelectedKinematicsCommit {
+    Unavailable,
+    Rejected(Option<Vec<EntityMotionState>>),
+    Committed(Vec<EntityKinematics>),
+}
 
 pub(super) struct EntityOwnerAccess {
     handle: RegionalOwnerHandle,
@@ -404,7 +458,8 @@ pub(super) struct EntityOwnerAccess {
     failure: Arc<EntityOwnerFailureState>,
     snapshots: RefCell<HashMap<EntityId, Option<EntitySnapshot>>>,
     selected_snapshots: RefCell<Option<VersionedEntitySnapshots>>,
-    pending_goal_kinematics: RefCell<Option<mc_entity::VersionedEntityKinematics>>,
+    #[cfg(feature = "load-bench")]
+    fenced_apply: std::cell::Cell<bool>,
     #[cfg(test)]
     owner_requests: Arc<AtomicU64>,
 }
@@ -432,37 +487,129 @@ impl EntityOwnerAccess {
         self.owner_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(super) fn snapshots_for_ids_uncached(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> Vec<EntitySnapshot> {
+        #[cfg(test)]
+        self.record_owner_request();
+        self.resolve(self.handle.snapshots_for_ids(ids))
+    }
+
     pub(super) fn prefetch(&self, ids: &HashSet<EntityId>) {
-        let missing = ids
-            .iter()
-            .filter(|id| !self.snapshots.borrow().contains_key(id))
-            .copied()
-            .collect::<HashSet<_>>();
+        let missing = {
+            let cached = self.snapshots.borrow();
+            let selected = self.selected_snapshots.borrow();
+            ids.iter()
+                .filter(|id| {
+                    !cached.contains_key(id)
+                        && !selected.as_ref().is_some_and(|selected| {
+                            selected
+                                .snapshots()
+                                .binary_search_by_key(*id, |snapshot| snapshot.id)
+                                .is_ok()
+                        })
+                })
+                .copied()
+                .collect::<HashSet<_>>()
+        };
         if missing.is_empty() {
             return;
+        }
+        if self.selected_snapshots.borrow().is_some() {
+            self.materialize_selected_snapshots();
+            self.selected_snapshots.borrow_mut().take();
         }
         #[cfg(test)]
         self.record_owner_request();
         let selected = self.resolve(self.handle.snapshots_for_ids_versioned(&missing));
         let mut snapshots = self.snapshots.borrow_mut();
-        for id in missing {
-            snapshots.insert(id, None);
+        for id in &missing {
+            if selected
+                .snapshots()
+                .binary_search_by_key(id, |snapshot| snapshot.id)
+                .is_err()
+            {
+                snapshots.insert(*id, None);
+            }
         }
-        for snapshot in selected.snapshots() {
-            snapshots.insert(snapshot.id, Some(snapshot.clone()));
-        }
+        drop(snapshots);
         self.selected_snapshots.replace(Some(selected));
+    }
+
+    pub(super) fn prefetch_kinematics(
+        &self,
+        ids: &HashSet<EntityId>,
+        preferred: Option<mc_entity::VersionedEntityKinematics>,
+    ) -> (Option<mc_entity::VersionedEntityKinematics>, usize) {
+        if ids.is_empty() {
+            return (None, 0);
+        }
+        if let Some(preferred) = preferred
+            && preferred.covers_ids(ids.iter().copied())
+            && preferred
+                .motion_states()
+                .is_some_and(|motions| motions.len() == ids.len())
+            && self.versioned_kinematics_are_current(&preferred)
+        {
+            return (Some(preferred), 0);
+        }
+        let missing = {
+            let cached = self.snapshots.borrow();
+            let selected = self.selected_snapshots.borrow();
+            ids.iter()
+                .filter(|id| {
+                    !cached.contains_key(id)
+                        && !selected.as_ref().is_some_and(|selected| {
+                            selected
+                                .snapshots()
+                                .binary_search_by_key(*id, |snapshot| snapshot.id)
+                                .is_ok()
+                        })
+                })
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        if missing.is_empty() {
+            return (None, 0);
+        }
+        let missing_len = missing.len();
+        #[cfg(test)]
+        self.record_owner_request();
+        let (states, fence) =
+            self.resolve(self.handle.alive_kinematics_for_ids_versioned(&missing));
+        if states.len() == missing.len()
+            && states.iter().all(|state| missing.contains(&state.id))
+            && let Some(fence) = fence
+            && fence
+                .motion_states()
+                .is_some_and(|motions| motions.len() == missing.len())
+        {
+            return (Some(fence), missing_len);
+        }
+        self.prefetch(&missing);
+        (None, missing_len)
+    }
+
+    fn materialize_selected_snapshots(&self) {
+        let selected = self.selected_snapshots.borrow();
+        let mut cached = self.snapshots.borrow_mut();
+        for snapshot in selected
+            .as_ref()
+            .into_iter()
+            .flat_map(VersionedEntitySnapshots::snapshots)
+        {
+            cached.insert(snapshot.id, Some(snapshot.clone()));
+        }
     }
 
     pub(super) fn invalidate(&self, id: EntityId) {
         self.snapshots.borrow_mut().remove(&id);
         self.selected_snapshots.borrow_mut().take();
-        self.pending_goal_kinematics.borrow_mut().take();
     }
-
     /// Refreshes the cached snapshots for `ids` from a versioned owner batch
-    /// fetched without holding the session publication lock, and retains and
-    /// returns the opaque versioned fence for that batch.
+    /// fetched without holding the session publication lock, and returns the
+    /// opaque versioned fence for that batch.
     pub(super) fn refresh_publication_snapshots(
         &self,
         ids: &HashSet<EntityId>,
@@ -488,8 +635,59 @@ impl EntityOwnerAccess {
             cached.insert(snapshot.id, Some(snapshot.clone()));
         }
         drop(cached);
-        self.selected_snapshots.replace(Some(selected.clone()));
-        Some(selected)
+        Some(selected.without_snapshots())
+    }
+    pub(super) fn take_current_publication_snapshots(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> Option<VersionedEntitySnapshots> {
+        let selected = self.selected_snapshots.borrow();
+        let selected = selected.as_ref()?;
+        if selected.snapshots().is_empty() {
+            return selected
+                .covers_ids(ids.iter().copied())
+                .then(|| selected.fence_only());
+        }
+        let cached = self.snapshots.borrow();
+        let present = ids
+            .iter()
+            .filter(|id| cached.get(id).is_some_and(Option::is_some))
+            .count();
+        let selected_ids_match_cached = selected.snapshots().iter().all(|snapshot| {
+            cached
+                .get(&snapshot.id)
+                .is_some_and(|cached| cached.is_some())
+        }) && ids
+            .iter()
+            .filter(|id| cached.get(id).is_some_and(|cached| cached.is_some()))
+            .all(|id| {
+                selected
+                    .snapshots()
+                    .binary_search_by_key(id, |snapshot| snapshot.id)
+                    .is_ok()
+            });
+        let selected_covers_ids = selected.snapshots().len() == ids.len()
+            && selected
+                .snapshots()
+                .iter()
+                .all(|snapshot| ids.contains(&snapshot.id));
+        let complete = ids.iter().all(|id| {
+            cached.contains_key(id)
+                || selected
+                    .snapshots()
+                    .binary_search_by_key(id, |snapshot| snapshot.id)
+                    .is_ok()
+        }) && selected
+            .snapshots()
+            .iter()
+            .all(|snapshot| ids.contains(&snapshot.id))
+            && ((present == selected.snapshots().len() && selected_ids_match_cached)
+                || (present == 0 && selected_covers_ids));
+        if !complete {
+            return None;
+        }
+        drop(cached);
+        Some(selected.fence_only())
     }
 
     /// Checks only the captured routing/version fence and never fetches entity
@@ -500,6 +698,16 @@ impl EntityOwnerAccess {
     ) -> bool {
         matches!(
             self.try_call(|handle| handle.versioned_snapshots_are_current(selected)),
+            Ok(true)
+        )
+    }
+
+    fn versioned_kinematics_are_current(
+        &self,
+        selected: &mc_entity::VersionedEntityKinematics,
+    ) -> bool {
+        matches!(
+            self.try_call(|handle| handle.versioned_kinematics_are_current(selected)),
             Ok(true)
         )
     }
@@ -521,8 +729,27 @@ impl EntityOwnerAccess {
     }
 
     pub(super) fn snapshot(&self, id: EntityId) -> Option<EntitySnapshot> {
-        if let Some(snapshot) = self.snapshots.borrow().get(&id) {
-            return snapshot.clone();
+        let cached_negative = {
+            let cached = self.snapshots.borrow();
+            if let Some(Some(snapshot)) = cached.get(&id) {
+                return Some(snapshot.clone());
+            }
+            cached.contains_key(&id)
+        };
+        {
+            let selected = self.selected_snapshots.borrow();
+            if let Some(snapshot) = selected.as_ref().and_then(|selected| {
+                selected
+                    .snapshots()
+                    .binary_search_by_key(&id, |snapshot| snapshot.id)
+                    .ok()
+                    .and_then(|index| selected.snapshots().get(index))
+            }) {
+                return Some(snapshot.clone());
+            }
+        }
+        if cached_negative {
+            return None;
         }
         #[cfg(test)]
         self.record_owner_request();
@@ -531,10 +758,57 @@ impl EntityOwnerAccess {
         snapshot
     }
 
+    // Physics steps preserve the sorted query order, but tests and other
+    // callers may provide arbitrary IDs. The cursor only skips work for a
+    // nondecreasing run; every out-of-order or missing lookup falls back to
+    // the existing authoritative lookup path.
+    pub(super) fn motion_state_with_fence_cursor(
+        &self,
+        fence: Option<&mc_entity::VersionedEntityKinematics>,
+        id: EntityId,
+        cursor: &mut Option<(EntityId, usize)>,
+    ) -> Option<EntityMotionState> {
+        let Some(states) = fence.and_then(mc_entity::VersionedEntityKinematics::motion_states)
+        else {
+            cursor.take();
+            return self.motion_state(id);
+        };
+        let index = cursor
+            .as_ref()
+            .filter(|(previous_id, _)| id >= *previous_id)
+            .and_then(|(_, previous_index)| {
+                states.get(*previous_index..).and_then(|remaining| {
+                    remaining
+                        .iter()
+                        .position(|state| state.id == id)
+                        .map(|offset| *previous_index + offset)
+                })
+            })
+            .or_else(|| states.binary_search_by_key(&id, |state| state.id).ok());
+        if let Some(index) = index {
+            *cursor = Some((id, index));
+            return states.get(index).copied();
+        }
+        cursor.take();
+        self.motion_state(id)
+    }
+
     pub(super) fn motion_state(&self, id: EntityId) -> Option<EntityMotionState> {
         {
             let cached = self.snapshots.borrow();
             if let Some(snapshot) = cached.get(&id).and_then(Option::as_ref) {
+                return Some(motion_state_from_snapshot(snapshot));
+            }
+        }
+        {
+            let selected = self.selected_snapshots.borrow();
+            if let Some(snapshot) = selected.as_ref().and_then(|selected| {
+                selected
+                    .snapshots()
+                    .binary_search_by_key(&id, |snapshot| snapshot.id)
+                    .ok()
+                    .and_then(|index| selected.snapshots().get(index))
+            }) {
                 return Some(motion_state_from_snapshot(snapshot));
             }
         }
@@ -824,6 +1098,7 @@ impl EntityOwnerAccess {
         let removed = self.resolve(self.handle.remove_if_current(expected));
         if removed.is_some() {
             self.observation.record_entity_remove();
+            self.selected_snapshots.borrow_mut().take();
             self.snapshots.borrow_mut().insert(id, None);
         } else {
             self.invalidate(id);
@@ -1013,10 +1288,133 @@ impl EntityOwnerAccess {
         }
         child
     }
+    #[cfg(feature = "load-bench")]
+    pub(super) fn take_fenced_apply(&self) -> bool {
+        self.fenced_apply.replace(false)
+    }
+
+    fn update_cached_kinematics(&self, states: &[EntityKinematics]) {
+        let mut cached = self.snapshots.borrow_mut();
+        for state in states {
+            let Some(snapshot) = cached.get_mut(&state.id).and_then(Option::as_mut) else {
+                continue;
+            };
+            snapshot.position = state.position;
+            snapshot.rotation = state.rotation;
+            snapshot.velocity = state.velocity;
+            snapshot.on_ground = state.on_ground;
+        }
+    }
+
+    fn retain_committed_snapshots(&self, selected: VersionedEntitySnapshots) {
+        let ids = selected
+            .snapshots()
+            .iter()
+            .map(|snapshot| snapshot.id)
+            .collect::<Vec<_>>();
+        {
+            let mut cached = self.snapshots.borrow_mut();
+            for id in ids {
+                // Selected snapshots are newer than any cache entry left by
+                // the failed compact attempt. Remove the old entry so the
+                // selected publication remains the sole authority for these
+                // IDs without cloning full snapshots into the cache.
+                cached.remove(&id);
+            }
+        }
+        self.selected_snapshots.replace(Some(selected));
+    }
+
+    fn rebase_versioned_publication(
+        &self,
+        committed: &mc_entity::VersionedKinematicsCommit,
+    ) -> bool {
+        let mut selected = match self.selected_snapshots.borrow_mut().take() {
+            Some(selected) => selected,
+            None => return false,
+        };
+        if !committed.rebase_snapshots(&mut selected) {
+            self.selected_snapshots.replace(Some(selected));
+            return false;
+        }
+        self.selected_snapshots.replace(Some(selected));
+        true
+    }
+    fn apply_kinematics_from_fence(
+        &self,
+        states: &[EntityKinematics],
+        fence: Option<mc_entity::VersionedEntityKinematics>,
+    ) -> SelectedKinematicsCommit {
+        let (compact, expected, motion_states) = match fence {
+            Some(fence) => {
+                // Regional validation requires the fence and state batch to
+                // cover the same IDs. Partial physics batches must commit
+                // the matching subset, not the original full-batch fence.
+                if states.windows(2).all(|pair| pair[0].id <= pair[1].id)
+                    && fence.covers_ids(states.iter().map(|state| state.id))
+                {
+                    let mut expected = fence;
+                    let motion_states = expected.take_motion_states();
+                    (true, expected, motion_states)
+                } else {
+                    let Some(mut expected) = fence.subset_for_states(states) else {
+                        return SelectedKinematicsCommit::Unavailable;
+                    };
+                    let motion_states = expected.take_motion_states();
+                    (true, expected, motion_states)
+                }
+            }
+            None => {
+                let selected = self.selected_snapshots.borrow();
+                let Some(expected) = selected
+                    .as_ref()
+                    .and_then(VersionedEntitySnapshots::kinematics_fence)
+                else {
+                    return SelectedKinematicsCommit::Unavailable;
+                };
+                (false, expected, None)
+            }
+        };
+        #[cfg(test)]
+        self.record_owner_request();
+        let committed = self.resolve(
+            self.handle
+                .try_apply_kinematics_if_versioned_deferred_journal_with_fence(
+                    expected,
+                    states.to_vec(),
+                ),
+        );
+        let Some(committed) = committed else {
+            return SelectedKinematicsCommit::Rejected(motion_states);
+        };
+        #[cfg(feature = "load-bench")]
+        {
+            self.fenced_apply.set(true);
+        }
+        {
+            let mut cached = self.snapshots.borrow_mut();
+            for state in committed.states() {
+                cached.remove(&state.id);
+            }
+        }
+        if compact {
+            self.selected_snapshots
+                .replace(Some(committed.publication_fence()));
+            let result = committed.into_states();
+            return SelectedKinematicsCommit::Committed(result);
+        }
+        if !self.rebase_versioned_publication(&committed) {
+            self.materialize_selected_snapshots();
+            self.update_cached_kinematics(committed.states());
+        }
+        let result = committed.into_states();
+        SelectedKinematicsCommit::Committed(result)
+    }
 
     fn apply_kinematics_conditionally(
         &mut self,
         states: Vec<EntityKinematics>,
+        expected_motion_states: Option<Vec<EntityMotionState>>,
         commit: impl FnOnce(
             &RegionalOwnerHandle,
             Vec<(EntitySnapshot, EntityKinematics)>,
@@ -1025,175 +1423,197 @@ impl EntityOwnerAccess {
             mc_entity::RegionOwnerLaneError,
         >,
     ) -> Vec<EntityKinematics> {
-        #[cfg(feature = "load-bench")]
-        let mut profile = Some(KinematicsProfile::started());
         let ids = states.iter().map(|state| state.id).collect::<HashSet<_>>();
-        #[cfg(feature = "load-bench")]
-        {
-            if states.len() <= 256 {
-                profile = None;
-            } else if let Some(profile) = profile.as_mut() {
-                let collect_ids_us = profile.end_phase();
-                profile.collect_ids_us = collect_ids_us;
-            }
-        }
         self.prefetch(&ids);
-        #[cfg(feature = "load-bench")]
-        {
-            if let Some(profile) = profile.as_mut() {
-                let prefetch_us = profile.end_phase();
-                profile.prefetch_us = prefetch_us;
-            }
-        }
-        // `prefetch` left a cache entry for every requested id: `Some` for
-        // entities the owner still holds and `None` for absent ones. Clone
-        // each present snapshot exactly once, straight into `conditional`.
+        // The selected owner batch is the same full snapshot authority as
+        // the fallback CAS. Read it directly so the rejection path clones
+        // each present snapshot only once; materializing it into the cache
+        // first would duplicate the full snapshot copy for every entity.
+        let expected_motion_by_id = expected_motion_states.map(|expected| {
+            expected
+                .into_iter()
+                .map(|state| (state.id, state))
+                .collect::<HashMap<_, _>>()
+        });
         let conditional = {
             let cache = self.snapshots.borrow();
+            let selected = self.selected_snapshots.borrow();
             states
                 .iter()
                 .filter_map(|state| {
-                    cache
-                        .get(&state.id)
-                        .and_then(Option::as_ref)
-                        .map(|snapshot| (snapshot.clone(), *state))
+                    let snapshot = selected
+                        .as_ref()
+                        .and_then(|selected| {
+                            selected
+                                .snapshots()
+                                .binary_search_by_key(&state.id, |snapshot| snapshot.id)
+                                .ok()
+                                .map(|index| &selected.snapshots()[index])
+                        })
+                        .or_else(|| cache.get(&state.id).and_then(Option::as_ref));
+                    snapshot.and_then(|snapshot| {
+                        let current = motion_state_from_snapshot(snapshot);
+                        expected_motion_by_id
+                            .as_ref()
+                            .is_none_or(|expected| expected.get(&state.id) == Some(&current))
+                            .then(|| (snapshot.clone(), *state))
+                    })
                 })
                 .collect::<Vec<_>>()
         };
-        #[cfg(feature = "load-bench")]
-        {
-            if let Some(profile) = profile.as_mut() {
-                let conditional_build_us = profile.end_phase();
-                profile.conditional_build_us = conditional_build_us;
-            }
-        }
         let conditional_count = conditional.len();
         if conditional.is_empty() {
-            #[cfg(feature = "load-bench")]
-            if let Some(profile) = profile.as_ref() {
-                profile.emit(states.len(), conditional_count, conditional_count, 0, 0);
-            }
             return Vec::new();
         }
         #[cfg(test)]
         self.record_owner_request();
         let (committed, committed_snapshots) = self.resolve(commit(&self.handle, conditional));
-        #[cfg(feature = "load-bench")]
-        {
-            if let Some(profile) = profile.as_mut() {
-                let regional_commit_us = profile.end_phase();
-                profile.regional_commit_us = regional_commit_us;
-            }
-        }
         if committed.len() != conditional_count {
-            #[cfg(feature = "load-bench")]
-            if let Some(profile) = profile.as_ref() {
-                profile.emit(
-                    states.len(),
-                    conditional_count,
-                    conditional_count,
-                    committed.len(),
-                    0,
-                );
-            }
             return Vec::new();
         }
-        // Every committed id was cloned from a `Some` cache entry above and
-        // nothing else can touch this private cache while this method runs,
-        // so the entry must still be present here.
-        let mut cache = self.snapshots.borrow_mut();
-        for state in &committed {
-            let snapshot = cache
-                .get_mut(&state.id)
-                .and_then(Option::as_mut)
-                .expect("prefetch cached a present snapshot for every committed id");
-            snapshot.position = state.position;
-            snapshot.rotation = state.rotation;
-            snapshot.velocity = state.velocity;
-            snapshot.on_ground = state.on_ground;
-        }
-        drop(cache);
         if let Some(selected) = committed_snapshots {
-            self.selected_snapshots.replace(Some(selected));
-        }
-        #[cfg(feature = "load-bench")]
-        {
-            if let Some(profile) = profile.as_mut() {
-                let cache_update_us = profile.end_phase();
-                profile.emit(
-                    states.len(),
-                    conditional_count,
-                    conditional_count,
-                    committed.len(),
-                    cache_update_us,
-                );
-            }
+            // Retain the authoritative result while evicting older cache
+            // entries; this avoids a full snapshot clone per entity.
+            self.retain_committed_snapshots(selected);
+        } else {
+            self.update_cached_kinematics(&committed);
         }
         committed
     }
 
+    pub(super) fn apply_entity_physics_from_fence(
+        &mut self,
+        expected: mc_entity::VersionedEntityKinematics,
+        queries: &[mc_entity::EntityPhysicsQuery],
+        steps: &[mc_entity::EntityPhysicsStep],
+        publish_ids: HashSet<EntityId>,
+    ) -> Option<(Vec<EntityId>, Vec<EntityMotionState>, Vec<EntityKinematics>)> {
+        #[cfg(test)]
+        self.record_owner_request();
+        let (rejected, accepted, committed, publication_fence) =
+            self.resolve(self.handle.try_apply_entity_physics_from_selected_routes(
+                &expected,
+                queries,
+                steps,
+                &publish_ids,
+            ))?;
+        {
+            let mut cached = self.snapshots.borrow_mut();
+            for state in &committed {
+                cached.remove(&state.id);
+            }
+        }
+        self.selected_snapshots.replace(Some(publication_fence));
+        #[cfg(feature = "load-bench")]
+        self.fenced_apply.set(true);
+        Some((rejected, accepted, committed))
+    }
+
+    #[cfg(test)]
     pub(super) fn apply_kinematics_authoritative(
         &mut self,
         states: impl IntoIterator<Item = EntityKinematics>,
     ) -> Vec<EntityKinematics> {
-        let states = states.into_iter().collect::<Vec<_>>();
-        if let Some(expected) = self.pending_goal_kinematics.borrow_mut().take() {
-            #[cfg(test)]
-            self.record_owner_request();
-            if let Some(committed) = self.resolve(
-                self.handle
-                    .try_apply_kinematics_if_versioned_deferred_journal(expected, states.clone()),
-            ) {
-                return committed;
-            }
-        }
-        self.apply_kinematics_conditionally(states, |handle, conditional| {
-            handle
-                .apply_kinematics_if_current_deferred_journal_committed(conditional)
-                .map(|committed| (committed, None))
-        })
+        self.apply_kinematics_authoritative_with_fence(states, None)
     }
 
+    pub(super) fn apply_kinematics_authoritative_with_fence(
+        &mut self,
+        states: impl IntoIterator<Item = EntityKinematics>,
+        fence: Option<mc_entity::VersionedEntityKinematics>,
+    ) -> Vec<EntityKinematics> {
+        let states = states.into_iter().collect::<Vec<_>>();
+        let expected_motion_states = match self.apply_kinematics_from_fence(&states, fence) {
+            SelectedKinematicsCommit::Committed(committed) => return committed,
+            SelectedKinematicsCommit::Rejected(expected) => expected,
+            SelectedKinematicsCommit::Unavailable => None,
+        };
+        self.apply_kinematics_conditionally(
+            states,
+            expected_motion_states,
+            |handle, conditional| {
+                handle
+                    .apply_kinematics_if_current_deferred_journal_committed_versioned(conditional)
+                    .map(|selected| {
+                        let committed = selected
+                            .snapshots()
+                            .iter()
+                            .map(|snapshot| EntityKinematics {
+                                id: snapshot.id,
+                                position: snapshot.position,
+                                rotation: snapshot.rotation,
+                                velocity: snapshot.velocity,
+                                on_ground: snapshot.on_ground,
+                            })
+                            .collect();
+                        (committed, Some(selected))
+                    })
+            },
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn apply_kinematics_parallel_authoritative(
         &mut self,
         states: impl IntoIterator<Item = EntityKinematics>,
         max_workers: usize,
     ) -> Vec<EntityKinematics> {
+        self.apply_kinematics_parallel_authoritative_with_fence(states, None, max_workers)
+    }
+
+    pub(super) fn apply_kinematics_parallel_authoritative_with_fence(
+        &mut self,
+        states: impl IntoIterator<Item = EntityKinematics>,
+        fence: Option<mc_entity::VersionedEntityKinematics>,
+        max_workers: usize,
+    ) -> Vec<EntityKinematics> {
         let states = states.into_iter().collect::<Vec<_>>();
-        if let Some(expected) = self.pending_goal_kinematics.borrow_mut().take() {
-            #[cfg(test)]
-            self.record_owner_request();
-            if let Some(committed) = self.resolve(
-                self.handle
-                    .try_apply_kinematics_if_versioned_deferred_journal(expected, states.clone()),
-            ) {
-                return committed;
-            }
-        }
-        self.apply_kinematics_conditionally(states, |handle, conditional| {
-            if let Some(selected) = handle
-                .try_apply_kinematics_if_current_parallel_deferred_journal_versioned(
-                    &conditional,
-                    max_workers,
-                )?
-            {
-                let committed = selected
-                    .snapshots()
-                    .iter()
-                    .map(|snapshot| EntityKinematics {
-                        id: snapshot.id,
-                        position: snapshot.position,
-                        rotation: snapshot.rotation,
-                        velocity: snapshot.velocity,
-                        on_ground: snapshot.on_ground,
+        let expected_motion_states = match self.apply_kinematics_from_fence(&states, fence) {
+            SelectedKinematicsCommit::Committed(committed) => return committed,
+            SelectedKinematicsCommit::Rejected(expected) => expected,
+            SelectedKinematicsCommit::Unavailable => None,
+        };
+        self.apply_kinematics_conditionally(
+            states,
+            expected_motion_states,
+            |handle, conditional| {
+                if let Some(selected) = handle
+                    .try_apply_kinematics_if_current_parallel_deferred_journal_versioned(
+                        &conditional,
+                        max_workers,
+                    )?
+                {
+                    let committed = selected
+                        .snapshots()
+                        .iter()
+                        .map(|snapshot| EntityKinematics {
+                            id: snapshot.id,
+                            position: snapshot.position,
+                            rotation: snapshot.rotation,
+                            velocity: snapshot.velocity,
+                            on_ground: snapshot.on_ground,
+                        })
+                        .collect();
+                    return Ok((committed, Some(selected)));
+                }
+                handle
+                    .apply_kinematics_if_current_deferred_journal_committed_versioned(conditional)
+                    .map(|selected| {
+                        let committed = selected
+                            .snapshots()
+                            .iter()
+                            .map(|snapshot| EntityKinematics {
+                                id: snapshot.id,
+                                position: snapshot.position,
+                                rotation: snapshot.rotation,
+                                velocity: snapshot.velocity,
+                                on_ground: snapshot.on_ground,
+                            })
+                            .collect();
+                        (committed, Some(selected))
                     })
-                    .collect();
-                return Ok((committed, Some(selected)));
-            }
-            handle
-                .apply_kinematics_if_current_deferred_journal_committed(conditional)
-                .map(|committed| (committed, None))
-        })
+            },
+        )
     }
 
     #[cfg(test)]
@@ -1204,45 +1624,98 @@ impl EntityOwnerAccess {
         self.apply_kinematics_authoritative(states).len()
     }
 
+    #[cfg(test)]
     pub(super) fn prepare_goal_tick_with_pathing_for_ids(
         &mut self,
         tick: u64,
-        active_ids: &HashSet<EntityId>,
+        active_ids: Arc<HashSet<EntityId>>,
     ) -> mc_entity::RegionalPreparedGoalTick {
-        self.pending_goal_kinematics.borrow_mut().take();
+        self.prepare_goal_tick_with_pathing_for_ids_with_inputs(
+            tick,
+            active_ids,
+            mc_entity::RegionalGoalTickInputs::default(),
+        )
+    }
+
+    pub(super) fn prepare_goal_tick_with_pathing_for_ids_with_inputs(
+        &mut self,
+        tick: u64,
+        active_ids: Arc<HashSet<EntityId>>,
+        inputs: mc_entity::RegionalGoalTickInputs,
+    ) -> mc_entity::RegionalPreparedGoalTick {
         #[cfg(test)]
         self.record_owner_request();
         let selected = self.selected_snapshots.borrow_mut().take();
         self.resolve(match selected {
             Some(selected) => self
                 .handle
-                .prepare_goal_tick_with_pathing_for_versioned_snapshots(tick, active_ids, selected),
+                .prepare_goal_tick_with_pathing_for_versioned_snapshots_with_inputs(
+                    tick, active_ids, selected, inputs,
+                ),
             None => self
                 .handle
-                .prepare_goal_tick_with_pathing_for_ids(tick, active_ids),
+                .prepare_goal_tick_with_pathing_for_ids_with_inputs(tick, active_ids, inputs),
         })
     }
 
-    pub(super) fn apply_prepared_goal_tick_and_alive_kinematics(
+    pub(super) fn apply_prepared_goal_tick_and_simulation_results(
         &mut self,
         resolved: mc_entity::RegionalResolvedGoalTick,
-        ids: &HashSet<EntityId>,
-    ) -> Option<(mc_entity::GoalTickStats, Vec<EntityKinematics>)> {
+        ids: Arc<HashSet<EntityId>>,
+    ) -> Option<(
+        mc_entity::GoalTickStats,
+        Vec<mc_entity::EntitySimulationResult>,
+        Option<mc_entity::VersionedEntityKinematics>,
+    )> {
         #[cfg(test)]
         self.record_owner_request();
         let result = self.resolve(
             self.handle
-                .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(resolved, ids),
+                .apply_prepared_goal_tick_and_simulation_results_for_ids_deferred_journal(
+                    resolved, ids,
+                ),
         );
-        let mut cache = self.snapshots.borrow_mut();
-        for id in ids {
-            cache.remove(id);
-        }
+        self.snapshots.borrow_mut().clear();
         self.selected_snapshots.borrow_mut().take();
-        result.map(|(stats, states, versioned)| {
-            self.pending_goal_kinematics.replace(versioned);
-            (stats, states)
-        })
+        result
+    }
+
+    pub(super) fn current_simulation_results_for_ids(
+        &mut self,
+        ids: &HashSet<EntityId>,
+    ) -> (
+        Vec<mc_entity::EntitySimulationResult>,
+        Option<mc_entity::VersionedEntityKinematics>,
+    ) {
+        #[cfg(test)]
+        self.record_owner_request();
+        self.resolve(self.handle.simulation_results_for_ids_versioned(ids))
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_prepared_goal_tick_and_alive_kinematics(
+        &mut self,
+        resolved: mc_entity::RegionalResolvedGoalTick,
+        ids: &HashSet<EntityId>,
+    ) -> Option<(
+        mc_entity::GoalTickStats,
+        Vec<EntityKinematics>,
+        Option<mc_entity::VersionedEntityKinematics>,
+    )> {
+        self.apply_prepared_goal_tick_and_simulation_results(resolved, Arc::new(ids.clone()))
+            .map(|(stats, results, fence)| {
+                let states = results
+                    .into_iter()
+                    .map(|result| EntityKinematics {
+                        id: result.physics.id,
+                        position: result.physics.position,
+                        rotation: result.rotation,
+                        velocity: result.physics.velocity,
+                        on_ground: result.physics.on_ground,
+                    })
+                    .collect();
+                (stats, states, fence)
+            })
     }
 
     pub(super) fn visit_simulation_entities(
@@ -1263,6 +1736,15 @@ impl EntityOwnerAccess {
         self.resolve(self.handle.simulation_projections_for_ids(ids))
     }
 
+    pub(super) fn despawn_projections_for_ids(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> Vec<mc_entity::EntityDespawnProjection> {
+        #[cfg(test)]
+        self.record_owner_request();
+        self.resolve(self.handle.despawn_projections_for_ids(ids))
+    }
+
     pub(super) fn visit_simulation_entities_for_ids(
         &self,
         ids: &HashSet<EntityId>,
@@ -1272,33 +1754,43 @@ impl EntityOwnerAccess {
         let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
         ordered_ids.sort_unstable();
         let cache = self.snapshots.borrow();
+        let selected = self.selected_snapshots.borrow();
         for id in ordered_ids {
             if let Some(Some(snapshot)) = cache.get(&id) {
+                visitor(entity_snapshot_view(snapshot));
+                continue;
+            }
+            if let Some(snapshot) = selected.as_ref().and_then(|selected| {
+                selected
+                    .snapshots()
+                    .binary_search_by_key(&id, |snapshot| snapshot.id)
+                    .ok()
+                    .and_then(|index| selected.snapshots().get(index))
+            }) {
                 visitor(entity_snapshot_view(snapshot));
             }
         }
     }
 
-    pub(super) fn visit_sheep_entities_for_ids(
+    pub(super) fn sheep_grazing_candidates(
         &self,
         ids: &HashSet<EntityId>,
-        mut visitor: impl FnMut(&EntitySnapshot),
-    ) {
+        include_idle: HashSet<EntityId>,
+    ) -> Vec<EntitySnapshot> {
         #[cfg(test)]
         self.record_owner_request();
-        for snapshot in self
-            .resolve(self.handle.snapshots_for_ids(ids))
-            .into_iter()
-            .filter(|snapshot| {
-                snapshot.lifecycle == EntityLifecycle::Alive
-                    && snapshot.type_name == "minecraft:sheep"
-                    && snapshot
-                        .animal
-                        .is_some_and(|animal| animal.sheep_wool.is_some())
-            })
-        {
-            visitor(&snapshot);
-        }
+        let mut snapshots = self.resolve(
+            self.handle
+                .sheep_grazing_snapshots_for_ids(ids, include_idle),
+        );
+        snapshots.retain(|snapshot| {
+            snapshot.lifecycle == EntityLifecycle::Alive
+                && snapshot.type_name == "minecraft:sheep"
+                && snapshot
+                    .animal
+                    .is_some_and(|animal| animal.sheep_wool.is_some())
+        });
+        snapshots
     }
 }
 
@@ -1364,60 +1856,6 @@ fn entity_snapshot_view(snapshot: &EntitySnapshot) -> mc_entity::EntityView<'_> 
         vehicle: snapshot.vehicle,
         animal: snapshot.animal,
         retained: snapshot.retained.clone(),
-    }
-}
-
-#[cfg(feature = "load-bench")]
-struct KinematicsProfile {
-    started_at: std::time::Instant,
-    phase_started_at: std::time::Instant,
-    collect_ids_us: u64,
-    prefetch_us: u64,
-    conditional_build_us: u64,
-    regional_commit_us: u64,
-}
-
-#[cfg(feature = "load-bench")]
-impl KinematicsProfile {
-    fn started() -> Self {
-        let now = std::time::Instant::now();
-        Self {
-            started_at: now,
-            phase_started_at: now,
-            collect_ids_us: 0,
-            prefetch_us: 0,
-            conditional_build_us: 0,
-            regional_commit_us: 0,
-        }
-    }
-
-    fn end_phase(&mut self) -> u64 {
-        let now = std::time::Instant::now();
-        let us = now.duration_since(self.phase_started_at).as_micros() as u64;
-        self.phase_started_at = now;
-        us
-    }
-
-    fn emit(
-        &self,
-        states_count: usize,
-        expected_count: usize,
-        conditional_count: usize,
-        committed_count: usize,
-        cache_update_us: u64,
-    ) {
-        let total_us = self.started_at.elapsed().as_micros() as u64;
-        eprintln!(
-            "OWNER_KINEMATICS_PROFILE states={states_count} expected={expected_count} \
-             conditional={conditional_count} committed={committed_count} \
-             collect_ids_us={} prefetch_us={} conditional_build_us={} \
-             regional_commit_us={} cache_update_us={cache_update_us} \
-             total_us={total_us}",
-            self.collect_ids_us,
-            self.prefetch_us,
-            self.conditional_build_us,
-            self.regional_commit_us,
-        );
     }
 }
 
@@ -1493,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn post_goal_dense_kinematics_uses_one_fenced_owner_commit() {
+    fn post_goal_dense_physics_uses_one_owner_lane_commit() {
         let owners =
             SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
                 .expect("test entity owners");
@@ -1507,28 +1945,404 @@ mod tests {
                 ))
             })
             .collect::<HashSet<_>>();
-        let prepared = access.prepare_goal_tick_with_pathing_for_ids(1, &ids);
+        let prepared = access.prepare_goal_tick_with_pathing_for_ids(1, Arc::new(ids.clone()));
         let resolved = prepared.resolve(&WalkableGoalProbe, mc_entity::PathingBudget::DEFAULT);
-        let (_, post_goal) = access
-            .apply_prepared_goal_tick_and_alive_kinematics(resolved, &ids)
+        let (_, post_goal, goal_fence) = access
+            .apply_prepared_goal_tick_and_simulation_results(resolved, Arc::new(ids.clone()))
             .expect("goal apply");
-        owners.reset_owner_requests_for_test();
+        let goal_fence = goal_fence.expect("post-goal owner fence");
+        let inputs = post_goal
+            .iter()
+            .map(|result| {
+                (
+                    result.physics,
+                    mc_entity::EntityPhysicsStep {
+                        id: result.physics.id,
+                        position: Vec3::new(
+                            result.physics.position.x + 0.25,
+                            result.physics.position.y,
+                            result.physics.position.z,
+                        ),
+                        velocity: result.physics.velocity,
+                        on_ground: result.physics.on_ground,
+                        horizontal_collision: false,
+                    },
+                )
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
         let targets = post_goal
             .iter()
-            .map(|state| EntityKinematics {
-                position: Vec3::new(state.position.x + 0.25, state.position.y, state.position.z),
-                ..*state
+            .map(|result| EntityKinematics {
+                id: result.physics.id,
+                position: Vec3::new(
+                    result.physics.position.x + 0.25,
+                    result.physics.position.y,
+                    result.physics.position.z,
+                ),
+                rotation: result.rotation,
+                velocity: result.physics.velocity,
+                on_ground: result.physics.on_ground,
             })
             .collect::<Vec<_>>();
+        let mut physics_access = owners.access();
+        owners.reset_owner_requests_for_test();
+
+        let (rejected, accepted, committed) = physics_access
+            .apply_entity_physics_from_fence(goal_fence, &inputs.0, &inputs.1, HashSet::new())
+            .expect("owner-local physics route");
+
+        assert!(rejected.is_empty());
+        assert!(accepted.is_empty());
+        assert!(committed.is_empty());
+        assert_eq!(
+            owners.owner_requests_for_test(),
+            1,
+            "physics must validate and commit in one owner-lane request"
+        );
+        let updated = physics_access
+            .snapshots_for_ids_uncached(&ids)
+            .into_iter()
+            .map(|snapshot| EntityKinematics {
+                id: snapshot.id,
+                position: snapshot.position,
+                rotation: snapshot.rotation,
+                velocity: snapshot.velocity,
+                on_ground: snapshot.on_ground,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updated, targets);
+    }
+
+    #[test]
+    fn owner_lane_physics_handles_noop_without_publication_payload() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut access = owners.access();
+        let id = access.spawn(SpawnEntity::new(
+            1,
+            "minecraft:zombie",
+            Vec3::new(0.5, 64.0, 0.5),
+        ));
+        let ids = HashSet::from([id]);
+        let prepared = access.prepare_goal_tick_with_pathing_for_ids(1, Arc::new(ids.clone()));
+        let resolved = prepared.resolve(&WalkableGoalProbe, mc_entity::PathingBudget::DEFAULT);
+        let (stats, results, goal_fence) = access
+            .apply_prepared_goal_tick_and_simulation_results(resolved, Arc::new(ids.clone()))
+            .expect("goal apply");
+        assert_eq!(stats.alive_entities, 1);
+        assert_eq!(stats.decisions_applied, 1);
+        let query = results[0].physics;
+        let step = mc_entity::EntityPhysicsStep {
+            id,
+            position: query.position,
+            velocity: query.velocity,
+            on_ground: query.on_ground,
+            horizontal_collision: false,
+        };
+
+        let (rejected, accepted, committed) = access
+            .apply_entity_physics_from_fence(
+                goal_fence.expect("post-goal owner fence"),
+                &[query],
+                &[step],
+                HashSet::new(),
+            )
+            .expect("owner-local physics route");
+
+        assert!(rejected.is_empty());
+        assert!(accepted.is_empty());
+        assert!(committed.is_empty());
+    }
+    #[test]
+    fn owner_lane_physics_rejects_stale_query_after_goal_fence() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut access = owners.access();
+        let id = access.spawn(SpawnEntity::new(
+            1,
+            "minecraft:zombie",
+            Vec3::new(0.5, 64.0, 0.5),
+        ));
+        let ids = HashSet::from([id]);
+        let prepared = access.prepare_goal_tick_with_pathing_for_ids(1, Arc::new(ids.clone()));
+        let resolved = prepared.resolve(&WalkableGoalProbe, mc_entity::PathingBudget::DEFAULT);
+        let (_, results, goal_fence) = access
+            .apply_prepared_goal_tick_and_simulation_results(resolved, Arc::new(ids.clone()))
+            .expect("goal apply");
+        let result = results[0];
+        let goal_fence = goal_fence.expect("post-goal owner fence");
+        let stale = access.snapshot(id).expect("goal snapshot");
+        let mut intervening = stale.clone();
+        intervening.velocity = Vec3::new(0.5, 0.0, 0.0);
+        assert!(access.replace_snapshot_if_current(stale, intervening.clone()));
+        let input = (
+            result.physics,
+            mc_entity::EntityPhysicsStep {
+                id,
+                position: Vec3::new(
+                    result.physics.position.x + 0.25,
+                    result.physics.position.y,
+                    result.physics.position.z,
+                ),
+                velocity: result.physics.velocity,
+                on_ground: result.physics.on_ground,
+                horizontal_collision: false,
+            },
+        );
+        let mut physics_access = owners.access();
+        owners.reset_owner_requests_for_test();
+
+        if let Some((rejected, accepted, committed)) = physics_access
+            .apply_entity_physics_from_fence(goal_fence, &[input.0], &[input.1], HashSet::new())
+        {
+            assert_eq!(rejected, vec![id]);
+            assert!(accepted.is_empty());
+            assert!(committed.is_empty());
+        }
+        assert_eq!(owners.owner_requests_for_test(), 1);
+        assert_eq!(
+            owners
+                .access()
+                .motion_state(id)
+                .expect("intervening authoritative motion"),
+            motion_state_from_snapshot(&intervening)
+        );
+    }
+    #[test]
+    fn owner_lane_physics_falls_back_after_lane_reconfiguration() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut access = owners.access();
+        let west = access.spawn(SpawnEntity::new(
+            1,
+            "minecraft:zombie",
+            Vec3::new(0.5, 64.0, 0.5),
+        ));
+        let east = access.spawn(SpawnEntity::new(
+            2,
+            "minecraft:zombie",
+            Vec3::new(128.5, 64.0, 0.5),
+        ));
+        let ids = HashSet::from([west, east]);
+        let prepared = access.prepare_goal_tick_with_pathing_for_ids(1, Arc::new(ids.clone()));
+        let resolved = prepared.resolve(&WalkableGoalProbe, mc_entity::PathingBudget::DEFAULT);
+        let (_, results, goal_fence) = access
+            .apply_prepared_goal_tick_and_simulation_results(resolved, Arc::new(ids.clone()))
+            .expect("goal apply");
+        let (queries, steps) = results
+            .into_iter()
+            .map(|result| {
+                (
+                    result.physics,
+                    mc_entity::EntityPhysicsStep {
+                        id: result.physics.id,
+                        position: result.physics.position,
+                        velocity: result.physics.velocity,
+                        on_ground: result.physics.on_ground,
+                        horizontal_collision: false,
+                    },
+                )
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+        drop(access);
+        assert_eq!(owners.reconfigure_lanes(2), 2);
+
+        let direct = owners.access().apply_entity_physics_from_fence(
+            goal_fence.expect("post-goal owner fence"),
+            &queries,
+            &steps,
+            HashSet::new(),
+        );
+
+        assert!(direct.is_none_or(|(rejected, accepted, committed)| {
+            rejected.len() == queries.len() && accepted.is_empty() && committed.is_empty()
+        }));
+        assert!(owners.access().snapshot(west).is_some());
+        assert!(owners.access().snapshot(east).is_some());
+    }
+    #[test]
+    fn prefetched_explicit_fence_updates_motion_reads_without_stale_cache() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut access = owners.access();
+        let ids = (0..32)
+            .map(|index| {
+                access.spawn(SpawnEntity::new(
+                    1,
+                    "minecraft:zombie",
+                    Vec3::new(0.5 + f64::from(index), 64.0, 0.5),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let ids = {
+            let mut ids = ids;
+            ids.sort_unstable();
+            ids
+        };
+        let requested = ids.iter().copied().collect::<HashSet<_>>();
+        access.prefetch(&requested);
+        let targets = ids
+            .iter()
+            .map(|&id| {
+                let source = access.snapshot(id).expect("prefetched snapshot");
+                kinematics_for(
+                    id,
+                    Vec3::new(
+                        source.position.x + 0.25,
+                        source.position.y,
+                        source.position.z,
+                    ),
+                    &source,
+                )
+            })
+            .collect::<Vec<_>>();
+        owners.reset_owner_requests_for_test();
 
         assert_eq!(
             access.apply_kinematics_authoritative(targets.clone()),
             targets
         );
+        for target in &targets {
+            assert_eq!(
+                access
+                    .motion_state(target.id)
+                    .expect("updated motion")
+                    .position,
+                target.position
+            );
+        }
         assert_eq!(
             owners.owner_requests_for_test(),
             1,
-            "the fenced commit must avoid the snapshot prefetch plus full-snapshot CAS"
+            "selected fence commit must not fetch or clone full snapshots"
+        );
+    }
+
+    #[test]
+    fn compact_kinematics_prefetch_supplies_motion_without_snapshot_fanout() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut access = owners.access();
+        let ids = (0..32)
+            .map(|index| {
+                access.spawn(SpawnEntity::new(
+                    1,
+                    "minecraft:zombie",
+                    Vec3::new(0.5 + f64::from(index), 64.0, 0.5),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let requested = ids.iter().copied().collect::<HashSet<_>>();
+        owners.reset_owner_requests_for_test();
+        let (physics_fence, _) = access.prefetch_kinematics(&requested, None);
+        let mut ascending_cursor = None;
+        let ascending_motion = ids
+            .iter()
+            .map(|&id| {
+                access
+                    .motion_state_with_fence_cursor(
+                        physics_fence.as_ref(),
+                        id,
+                        &mut ascending_cursor,
+                    )
+                    .expect("ascending compact motion state")
+            })
+            .collect::<Vec<_>>();
+        let mut descending_cursor = None;
+        let descending_motion = ids
+            .iter()
+            .rev()
+            .map(|&id| {
+                access
+                    .motion_state_with_fence_cursor(
+                        physics_fence.as_ref(),
+                        id,
+                        &mut descending_cursor,
+                    )
+                    .expect("descending compact motion state")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ascending_motion,
+            descending_motion.into_iter().rev().collect::<Vec<_>>()
+        );
+        let targets = ids
+            .iter()
+            .zip(&ascending_motion)
+            .map(|(&id, source)| EntityKinematics {
+                id,
+                position: Vec3::new(
+                    source.position.x + 0.25,
+                    source.position.y,
+                    source.position.z,
+                ),
+                rotation: source.rotation,
+                velocity: source.velocity,
+                on_ground: source.on_ground,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owners.owner_requests_for_test(),
+            1,
+            "compact motion input must not fan out into per-entity snapshots"
+        );
+        owners.reset_owner_requests_for_test();
+
+        assert_eq!(
+            access.apply_kinematics_parallel_authoritative_with_fence(
+                targets.clone(),
+                physics_fence,
+                1,
+            ),
+            targets
+        );
+        assert_eq!(
+            owners.owner_requests_for_test(),
+            1,
+            "compact motion input must use one fenced commit without per-entity snapshots"
+        );
+        let publication = access
+            .take_current_publication_snapshots(&requested)
+            .expect("compact commit publication fence");
+        assert!(access.versioned_snapshots_are_current(&publication));
+        assert_eq!(
+            owners.owner_requests_for_test(),
+            1,
+            "publication fence reuse must not fetch snapshots"
+        );
+        assert_eq!(
+            owners.owner_requests_for_test(),
+            1,
+            "post-commit motion publication must not fan out into owner reads"
+        );
+    }
+    #[test]
+
+    fn prefetched_selected_snapshots_serve_snapshot_without_second_owner_call() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut access = owners.access();
+        let id = access.spawn(SpawnEntity::new(
+            1,
+            "minecraft:zombie",
+            Vec3::new(0.5, 64.0, 0.5),
+        ));
+        let ids = HashSet::from([id]);
+        owners.reset_owner_requests_for_test();
+
+        access.prefetch(&ids);
+        assert_eq!(owners.owner_requests_for_test(), 1);
+        assert_eq!(access.snapshot(id).expect("selected snapshot").id, id);
+        assert_eq!(
+            owners.owner_requests_for_test(),
+            1,
+            "selected snapshots must satisfy immediate snapshot consumers"
         );
     }
 
@@ -1545,32 +2359,108 @@ mod tests {
         ));
         let ids = HashSet::from([id]);
         let resolved = access
-            .prepare_goal_tick_with_pathing_for_ids(1, &ids)
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(ids.clone()))
             .resolve(&WalkableGoalProbe, mc_entity::PathingBudget::DEFAULT);
-        access
-            .apply_prepared_goal_tick_and_alive_kinematics(resolved, &ids)
+        let (_, goal_results, goal_fence) = access
+            .apply_prepared_goal_tick_and_simulation_results(resolved, Arc::new(ids.clone()))
             .expect("goal apply");
-        owners.reset_owner_requests_for_test();
-        let crossing = EntityKinematics {
+        assert_eq!(goal_results.len(), 1);
+        let query = goal_results[0].physics;
+        let crossing_step = mc_entity::EntityPhysicsStep {
             id,
             position: Vec3::new(128.5, 64.0, 0.5),
-            rotation: mc_entity::Rotation::ZERO,
             velocity: Vec3::ZERO,
             on_ground: true,
+            horizontal_collision: false,
         };
+        let crossing = EntityKinematics {
+            id,
+            position: crossing_step.position,
+            rotation: goal_results[0].rotation,
+            velocity: crossing_step.velocity,
+            on_ground: crossing_step.on_ground,
+        };
+        owners.reset_owner_requests_for_test();
 
+        assert!(
+            access
+                .apply_entity_physics_from_fence(
+                    goal_fence.expect("post-goal owner fence"),
+                    &[query],
+                    &[crossing_step],
+                    HashSet::new(),
+                )
+                .is_none(),
+            "region crossing must reject the owner-local route"
+        );
         assert_eq!(
             access.apply_kinematics_authoritative([crossing]),
             vec![crossing]
         );
         assert!(
             owners.owner_requests_for_test() > 1,
-            "crossing must reject the fence and use the snapshot CAS requests"
+            "crossing must bypass the owner-local path and use the snapshot CAS fallback"
         );
         assert_eq!(
             access.snapshot(id).expect("crossed snapshot").position,
             crossing.position
         );
+    }
+
+    #[test]
+    fn post_goal_partial_lane_commit_exposes_only_committed_motion() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 2, None)
+                .expect("test entity owners");
+        let mut access = owners.access();
+        let first = access.spawn(SpawnEntity::new(
+            1,
+            "minecraft:zombie",
+            Vec3::new(0.5, 64.0, 0.5),
+        ));
+        let second = access.spawn(SpawnEntity::new(
+            1,
+            "minecraft:zombie",
+            Vec3::new(128.5, 64.0, 0.5),
+        ));
+        let ids = HashSet::from([first, second]);
+        let resolved = access
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(ids.clone()))
+            .resolve(&WalkableGoalProbe, mc_entity::PathingBudget::DEFAULT);
+        let (_, goal_states, goal_fence) = access
+            .apply_prepared_goal_tick_and_alive_kinematics(resolved, &ids)
+            .expect("goal apply");
+        let (physics_fence, _) = access.prefetch_kinematics(&ids, goal_fence);
+        let stale_velocity = Vec3::new(0.25, 0.0, 0.0);
+        owners
+            .handle
+            .set_velocities([(second, stale_velocity)])
+            .expect("make second lane stale");
+        let targets = goal_states
+            .iter()
+            .map(|state| EntityKinematics {
+                position: Vec3::new(state.position.x + 0.25, state.position.y, state.position.z),
+                ..*state
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            access.apply_kinematics_parallel_authoritative_with_fence(
+                targets.clone(),
+                physics_fence,
+                2,
+            ),
+            vec![targets[0]]
+        );
+        assert_eq!(
+            access
+                .motion_state(first)
+                .expect("committed motion")
+                .position,
+            targets[0].position
+        );
+        let stale_lane_motion = access.motion_state(second).expect("stale lane motion");
+        assert_eq!(stale_lane_motion.position, goal_states[1].position);
+        assert_eq!(stale_lane_motion.velocity, stale_velocity);
     }
 
     #[test]

@@ -148,7 +148,7 @@ async fn stable_leaf_tick_is_checkpoint_only_without_world_journal_decision() {
     register_loaded_button_session(&sessions, "StableLeafNoop");
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),
@@ -172,7 +172,7 @@ async fn stable_leaf_tick_is_checkpoint_only_without_world_journal_decision() {
     );
     drop(storage);
     drop(sessions);
-    let (_reopened, pending) = super::world_journal::WorldChunkJournal::open(
+    let (_reopened, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),

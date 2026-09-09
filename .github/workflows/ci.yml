@@ -23,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - run: python3 -m tools.harness run fmt
 
   clippy:
     name: cargo clippy
@@ -34,7 +34,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: python3 -m tools.harness run clippy
 
   code-health:
     name: xtask code-health
@@ -43,16 +43,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
-      - run: cargo run -p xtask -- code-health
+      - run: python3 -m tools.harness run code-health
 
   test:
     name: cargo test
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: solaris
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: solaris
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/solaris-default-plugins
+          path: solaris-default-plugins
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/solaris-loader
+          path: solaris-loader
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets
+        with:
+          workspaces: solaris -> target
+      - run: python3 -m tools.harness run test
 
   build:
     name: cargo build
@@ -61,32 +76,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release --workspace
+      - run: python3 -m tools.harness run build --release
 
   loader:
     name: Loader modules
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: solaris
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: solaris
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/solaris-loader
+          path: solaris-loader
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "25"
           cache: gradle
       - name: Verify reproducible Loader fixture
-        run: tools/build-loader-live-gate-fixture.sh --check
+        run: python3 -m tools.harness run fixture-check
       - name: Test shared and platform Loader modules
-        working-directory: client-mod/solaris-client-agent
         run: |
           set -u -o pipefail
           status=1
           for attempt in 1 2 3; do
-            if ./gradlew \
-              :loader-core:test \
-              :loader-fabric:test \
-              :loader-neoforge:test \
-              :loader-forge:test \
-              --no-daemon; then
+            if python3 -m tools.harness run java; then
               status=0
               break
             fi
@@ -101,8 +119,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Validate harness lifecycle and engine syntax
+        run: python3 -m tools.harness run harness-check
       - name: Validate installer
-        run: tools/test-install.sh
+        run: python3 -m tools.harness run installer
 
   release-build:
     name: Release binary (${{ matrix.target }})

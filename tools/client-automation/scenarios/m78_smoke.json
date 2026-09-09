@@ -35,7 +35,7 @@
     "version": "26.1.2",
     "launcher": "repo-native Gradle runClient adapter",
     "offline_user": "SolarisPrimary",
-    "adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "adapter": "../solaris-loader/gradlew -p ../solaris-loader --no-configuration-cache :fabric-agent:runClientAgent",
     "adapter_source": "auto-gradle-runclient"
   },
   "evidence": {

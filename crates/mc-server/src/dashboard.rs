@@ -35,7 +35,6 @@ pub struct SpawnCategoryReport {
     pub rejected_block_or_fluid: u64,
     pub rejected_darkness: u64,
     pub rejected_collision: u64,
-    pub rejected_cap: u64,
     pub rejected_duplicate: u64,
 }
 
@@ -468,7 +467,7 @@ const spawnRows = (r) => rows([
   ["rejected player distance", r.rejected_player_distance],
   ["rejected block/fluid", r.rejected_block_or_fluid],
   ["rejected darkness", r.rejected_darkness], ["rejected collision", r.rejected_collision],
-  ["rejected cap", r.rejected_cap], ["rejected duplicate", r.rejected_duplicate]]);
+  ["rejected duplicate", r.rejected_duplicate]]);
 
 function render(p) {
   $("summary").textContent =

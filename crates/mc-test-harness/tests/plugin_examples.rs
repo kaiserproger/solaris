@@ -909,14 +909,21 @@ async fn shipped_inventory_plugins_work_over_wire() {
         })
         .await
         .expect("leave economy zone");
-    client
-        .wait_for_frame_id_with_timeout_and_limits(
-            ClientboundContainerClose::ID,
-            Duration::from_secs(5),
-            FRAME_LIMITS,
-        )
-        .await
-        .expect("economy menu close");
+    loop {
+        let closed = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundContainerClose::ID,
+                Duration::from_secs(5),
+                FRAME_LIMITS,
+            )
+            .await
+            .expect("economy menu close");
+        let closed = ClientboundContainerClose::decode(&mut closed.frame.body.clone())
+            .expect("decode economy menu close");
+        if closed.container_id == final_menu.container_id {
+            break;
+        }
+    }
 
     send_command(&mut client, "who").await;
     wait_for_roster_menu(&mut client, roster_item_id, "CatalogPlayer").await;
@@ -1048,7 +1055,7 @@ async fn shipped_colony_scaffold_recruits_and_applies_updated_order_over_wire() 
     send_command(&mut client, "colony status").await;
     wait_for_system_chat(
         &mut client,
-        "Starter Colony: status=active, role=worker, order=home, generation=2.",
+        "Starter Colony member 1: status=active, role=worker, order=home, generation=2.",
     )
     .await;
 
@@ -1057,7 +1064,7 @@ async fn shipped_colony_scaffold_recruits_and_applies_updated_order_over_wire() 
     send_command(&mut client, "colony status").await;
     wait_for_system_chat(
         &mut client,
-        "Starter Colony: status=active, role=worker, order=hold, generation=3.",
+        "Starter Colony member 1: status=active, role=worker, order=hold, generation=3.",
     )
     .await;
 
@@ -1078,9 +1085,450 @@ async fn shipped_colony_scaffold_recruits_and_applies_updated_order_over_wire() 
     wait_for_entity_removal(&mut client, villager_entity_id).await;
 
     send_command(&mut client, "colony order home").await;
+    wait_for_system_chat(&mut client, "Applied Luau order home.").await;
+    send_command(&mut client, "colony status").await;
     wait_for_system_chat(
         &mut client,
-        "Stored order intent, but binding failed: not_found.",
+        "Starter Colony member 1: status=active, role=worker, order=home, generation=4.",
+    )
+    .await;
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn shipped_colony_scaffold_role_defaults_and_role_switch_over_wire() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("colony-villager-scaffold", plugins.path());
+    write_villager_fixture_plugin(plugins.path());
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start shipped colony scaffold");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
+    let villager_type_id = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:villager").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded villager entity type");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
+            .expect("open disk-backed world")
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator);
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Colony role defaults wire test".into(),
+        max_players: 1,
+        view_distance: 1,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types,
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local address");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "ColonyRoles")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("report grounded spawn pose");
+    let _ = wait_for_colony_startup(
+        &mut client,
+        villager_type_id,
+        (sync.x + 1.0, sync.y, sync.z),
+    )
+    .await;
+
+    send_command(&mut client, "colony recruit guard").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+    send_command(&mut client, "colony status").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 1: status=active, role=guard, order=follow, generation=2.",
+    )
+    .await;
+
+    send_command(&mut client, "colony role worker").await;
+    wait_for_system_chat(&mut client, "Applied Luau order home.").await;
+    send_command(&mut client, "colony status").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 1: status=active, role=worker, order=home, generation=3.",
+    )
+    .await;
+
+    send_command(&mut client, "colony role guard").await;
+    wait_for_system_chat(&mut client, "Applied Luau order follow.").await;
+    send_command(&mut client, "colony status").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 1: status=active, role=guard, order=follow, generation=4.",
+    )
+    .await;
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn shipped_colony_scaffold_growth_recruit_limit_over_wire() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("colony-villager-scaffold", plugins.path());
+    write_villager_fixture_plugin(plugins.path());
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start shipped colony scaffold");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
+    let villager_type_id = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:villager").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded villager entity type");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
+            .expect("open disk-backed world")
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator);
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Colony growth wire test".into(),
+        max_players: 1,
+        view_distance: 1,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types,
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local address");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "ColonyGrowth")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("report grounded spawn pose");
+    let _ = wait_for_colony_startup(
+        &mut client,
+        villager_type_id,
+        (sync.x + 1.0, sync.y, sync.z),
+    )
+    .await;
+
+    send_command(&mut client, "colony recruit worker").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+    send_command(&mut client, "colony recruit guard").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+    send_command(&mut client, "colony recruit farmer").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+    send_command(&mut client, "colony recruit worker").await;
+    wait_for_system_chat(
+        &mut client,
+        "Recruitment rejected: member limit reached (3). Dismiss a member first.",
+    )
+    .await;
+
+    send_command(&mut client, "colony status").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 1: status=active, role=worker, order=home, generation=2.",
+    )
+    .await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 2: status=active, role=guard, order=follow, generation=2.",
+    )
+    .await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 3: status=active, role=farmer, order=home, generation=2.",
+    )
+    .await;
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn shipped_colony_scaffold_growth_order_dismiss_rerecruit_over_wire() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("colony-villager-scaffold", plugins.path());
+    write_villager_fixture_plugin(plugins.path());
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start shipped colony scaffold");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
+    let villager_type_id = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:villager").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded villager entity type");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
+            .expect("open disk-backed world")
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator);
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Colony growth dismiss wire test".into(),
+        max_players: 1,
+        view_distance: 1,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types,
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local address");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "ColonyDismiss")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("report grounded spawn pose");
+    let _ = wait_for_colony_startup(
+        &mut client,
+        villager_type_id,
+        (sync.x + 1.0, sync.y, sync.z),
+    )
+    .await;
+
+    // Three setup recruits stay inside the ingress command burst on their own;
+    // the counted commands below (order, status, dismiss, recruit, status)
+    // plus refill keep the whole test under the platform command budget.
+    send_command(&mut client, "colony recruit worker").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+    send_command(&mut client, "colony recruit guard").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+    send_command(&mut client, "colony recruit farmer").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+
+    send_command(&mut client, "colony order hold 2").await;
+    wait_for_system_chat(&mut client, "Applied Luau order hold.").await;
+    send_command(&mut client, "colony status").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 1: status=active, role=worker, order=home, generation=2.",
+    )
+    .await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 2: status=active, role=guard, order=hold, generation=3.",
+    )
+    .await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 3: status=active, role=farmer, order=home, generation=2.",
+    )
+    .await;
+
+    send_command(&mut client, "colony dismiss 2").await;
+    wait_for_system_chat(&mut client, "Member 2 dismissed: slot released.").await;
+    send_command(&mut client, "colony recruit guard").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
+    send_command(&mut client, "colony status").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 1: status=active, role=worker, order=home, generation=2.",
+    )
+    .await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 2: status=active, role=guard, order=follow, generation=6.",
+    )
+    .await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony member 3: status=active, role=farmer, order=home, generation=2.",
     )
     .await;
 
@@ -1242,7 +1690,7 @@ async fn shipped_colony_scaffold_hire_by_interact_and_follow_order() {
     send_command(&mut client, "colony status").await;
     wait_for_system_chat(
         &mut client,
-        "Starter Colony: status=active, role=worker, order=home, generation=2.",
+        "Starter Colony member 1: status=active, role=worker, order=home, generation=2.",
     )
     .await;
 
@@ -1350,10 +1798,20 @@ async fn wait_for_villager_within(
     }
 }
 
-fn copy_example_plugin(name: &str, destination_root: &Path) {
+fn sibling_plugin_source(name: &str) -> std::path::PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/plugins")
+        .join("../../../solaris-default-plugins")
         .join(name);
+    assert!(
+        source.is_dir(),
+        "sibling plugin checkout missing at {}: clone solaris-default-plugins next to solaris",
+        source.display()
+    );
+    source
+}
+
+fn copy_example_plugin(name: &str, destination_root: &Path) {
+    let source = sibling_plugin_source(name);
     let destination = destination_root.join(name);
     std::fs::create_dir(&destination).expect("create copied example plugin directory");
     for file in ["plugin.toml", "main.lua"] {
@@ -1476,6 +1934,22 @@ fn write_villager_fixture_plugin(destination_root: &Path) {
                     event.player_id,
                     "minecraft:villager",
                     event.x + 1,
+                    event.y,
+                    event.z
+                )
+                solaris.spawn_entity(
+                    "fixture-villager-2",
+                    event.player_id,
+                    "minecraft:villager",
+                    event.x + 2,
+                    event.y,
+                    event.z
+                )
+                solaris.spawn_entity(
+                    "fixture-villager-3",
+                    event.player_id,
+                    "minecraft:villager",
+                    event.x + 3,
                     event.y,
                     event.z
                 )

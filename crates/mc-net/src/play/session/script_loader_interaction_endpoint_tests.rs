@@ -35,6 +35,7 @@ fn manifest(owner: &str) -> LoaderManifest {
 fn payload(id: &str, body: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&LOADER_PROTOCOL_VERSION.to_be_bytes());
+    payload.push(1);
     payload.extend_from_slice(&(id.len() as u16).to_be_bytes());
     payload.extend_from_slice(id.as_bytes());
     payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -81,11 +82,30 @@ async fn interaction_routes_only_from_acknowledged_session_to_exact_plugin() {
         ScriptEventKind::LoaderInteraction {
             player_id,
             interaction_id,
+            phase: mc_script::ScriptLoaderInteractionPhase::Press,
             payload,
         } if player_id.value() == 17
             && interaction_id == "example:continue"
             && payload == "accepted"
     ));
+
+    let mut release = payload("example:continue", "accepted");
+    release[2] = 2;
+    route_client_loader_interaction(Some(&sink), 17, true, Some(&manifest), &release)
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::LoaderInteraction {
+            phase: mc_script::ScriptLoaderInteractionPhase::Release,
+            ..
+        }
+    ));
+    release[2] = 3;
+    assert_eq!(
+        route_client_loader_interaction(Some(&sink), 17, true, Some(&manifest), &release).await,
+        Err(LoaderInteractionRouteError::Malformed)
+    );
 
     assert_eq!(
         route_client_loader_interaction(

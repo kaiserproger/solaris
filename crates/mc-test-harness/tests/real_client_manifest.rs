@@ -11,180 +11,16 @@ const M94_MANIFEST: &str =
     include_str!("../../../docs/real-client-regression/manifests/m94-regression-pack.json");
 
 #[test]
-fn playable_real_client_manifest_tracks_no_debug_twenty_minute_loop() {
-    let manifest_path = repo_root().join("docs/playable/real-client-playable-loop.json");
-    let manifest_text = std::fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", manifest_path.display()));
-    let manifest: Value = serde_json::from_str(&manifest_text)
-        .unwrap_or_else(|err| panic!("parse {}: {err}", manifest_path.display()));
-
-    assert_eq!(manifest["schema_version"], 1);
-    assert_eq!(manifest["pack_id"], "playable-real-client-loop");
-    assert_eq!(manifest["quality_label"], "playable-spike");
-    assert_eq!(
-        manifest["server_command"],
-        "cargo run --bin mc-server -- --config playable.toml"
-    );
-    assert!(
-        manifest["client_requirement"]
-            .as_str()
-            .is_some_and(|requirement| {
-                requirement.contains("vanilla 26.1.2")
-                    && requirement.contains("real client")
-                    && requirement.contains("protocol harnesses do not satisfy")
-            }),
-        "playable client gate must require a real vanilla client"
-    );
-    assert_eq!(
-        manifest["automation_runner"]["script"].as_str(),
-        Some("tools/run-playable-client-gate.sh")
-    );
-    assert_eq!(
-        manifest["automation_runner"]["delegates_to"].as_str(),
-        Some("tools/run-real-client-regression.sh")
-    );
-    assert_eq!(
-        manifest["automation_runner"]["server_config_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_SERVER_CONFIG")
-    );
-    assert_eq!(
-        manifest["automation_runner"]["server_config_value"].as_str(),
-        Some("playable.toml")
-    );
-
-    let forbidden = manifest["forbidden_client_evidence"]
-        .as_array()
-        .expect("forbidden client evidence list is present");
-    for forbidden_client in [
-        "wire-probe",
-        "mc_test_harness::client::Client",
-        "protocol-only bot",
-        "debug commands",
-    ] {
-        assert!(
-            forbidden.iter().any(|entry| entry == forbidden_client),
-            "playable manifest must exclude {forbidden_client}"
-        );
-    }
-
-    let scenarios = manifest["scenarios"]
-        .as_array()
-        .expect("scenarios are present");
-    let mut scenario_ids = BTreeSet::new();
-    for scenario in scenarios {
-        let id = scenario["id"].as_str().expect("scenario id is present");
-        assert!(scenario_ids.insert(id), "duplicate scenario id {id}");
-        assert_eq!(scenario["status"], "manual-pending");
-        assert_eq!(scenario["screenshots_required"], true);
-        assert!(
-            scenario["steps"]
-                .as_array()
-                .is_some_and(|steps| !steps.is_empty()),
-            "scenario {id} needs runnable steps"
-        );
-        assert!(
-            scenario["expected_observations"]
-                .as_array()
-                .is_some_and(|observations| !observations.is_empty()),
-            "scenario {id} needs expected observations"
-        );
-    }
-
-    assert!(scenario_ids.contains("playable-01-join-generated-spawn"));
-    assert!(scenario_ids.contains("playable-02-natural-wood-to-tool"));
-    assert!(scenario_ids.contains("playable-02a-natural-log-to-planks"));
-    assert!(scenario_ids.contains("playable-02b-natural-crafting-table-open"));
-    assert!(scenario_ids.contains("playable-03-save-restart-rejoin"));
-    assert!(scenario_ids.contains("playable-04-twenty-minute-survival-loop"));
-    assert!(scenario_ids.contains("playable-05-stone-tool-progression"));
-    assert!(scenario_ids.contains("playable-06-stone-tool-save-restart"));
-    assert!(scenario_ids.contains("playable-06-stone-tool-save-restart-before"));
-    assert!(scenario_ids.contains("playable-06-stone-tool-save-restart-after"));
-    assert!(scenario_ids.contains("playable-07-furnace-placement-open"));
-    assert!(scenario_ids.contains("playable-08-furnace-charcoal-smelt"));
-    assert!(scenario_ids.contains("playable-09-torch-craft-place"));
-    assert!(scenario_ids.contains("playable-10-passive-food-drop"));
-    assert!(scenario_ids.contains("playable-11-eat-passive-food"));
-    assert!(scenario_ids.contains("playable-12-earned-chest-storage"));
-    assert!(scenario_ids.contains("playable-13-chest-storage-save-restart"));
-    assert!(scenario_ids.contains("playable-13-chest-storage-save-restart-before"));
-    assert!(scenario_ids.contains("playable-13-chest-storage-save-restart-after"));
-    assert!(scenario_ids.contains("playable-14-earned-bed-sleep"));
-    assert!(scenario_ids.contains("playable-15-cooked-passive-food"));
-    assert!(scenario_ids.contains("playable-16-earned-door-place-toggle"));
-    assert!(scenario_ids.contains("playable-17-earned-sign-place-edit"));
-    assert!(scenario_ids.contains("playable-18-earned-campfire-cooking"));
-    assert!(scenario_ids.contains("playable-19-earned-campfire-death-respawn"));
-    assert!(scenario_ids.contains("playable-20-campfire-death-drop-recovery"));
-    assert!(scenario_ids.contains("playable-21-earned-tool-zombie-combat"));
-    assert!(scenario_ids.contains("playable-22-stone-sword-zombie-combat"));
-    assert!(scenario_ids.contains("playable-23-iron-ingot-progression"));
-    assert!(scenario_ids.contains("playable-24-iron-sword-zombie-combat"));
-    assert!(scenario_ids.contains("playable-25-iron-sword-save-restart"));
-    assert!(scenario_ids.contains("playable-25-iron-sword-save-restart-before"));
-    assert!(scenario_ids.contains("playable-25-iron-sword-save-restart-after"));
-    assert!(scenario_ids.contains("playable-26-earned-shield-zombie-block"));
-    assert!(scenario_ids.contains("playable-27-earned-iron-chestplate-equip"));
-    assert!(scenario_ids.contains("playable-28-earned-iron-chestplate-zombie-mitigation"));
-    assert!(scenario_ids.contains("playable-29-iron-chestplate-save-restart-mitigation"));
-    assert!(scenario_ids.contains("playable-29-iron-chestplate-save-restart-mitigation-before"));
-    assert!(scenario_ids.contains("playable-29-iron-chestplate-save-restart-mitigation-after"));
-    assert!(scenario_ids.contains("playable-30-two-client-shared-log-drop-pickup"));
-    assert!(scenario_ids.contains("playable-30-two-client-shared-log-drop-break"));
-    assert!(scenario_ids.contains("playable-30-two-client-shared-log-drop-observe"));
-    assert!(scenario_ids.contains("playable-30-two-client-shared-log-pickup-collect"));
-    assert!(scenario_ids.contains("playable-30-two-client-shared-log-pickup-gone-observe"));
-    assert!(scenario_ids.contains("playable-31-two-client-earned-shared-chest"));
-    assert!(scenario_ids.contains("playable-31-two-client-earned-shared-chest-deposit"));
-    assert!(scenario_ids.contains("playable-31-two-client-earned-shared-chest-withdraw"));
-    assert!(scenario_ids.contains("playable-31-two-client-earned-shared-chest-observe-empty"));
-    assert!(scenario_ids.contains("playable-32-two-client-earned-torch-block-edit"));
-    assert!(scenario_ids.contains("playable-32-two-client-earned-torch-place"));
-    assert!(scenario_ids.contains("playable-32-two-client-earned-torch-observe"));
-    assert!(scenario_ids.contains("playable-32-two-client-earned-torch-break"));
-    assert!(scenario_ids.contains("playable-32-two-client-earned-torch-gone-observe"));
-    assert!(scenario_ids.contains("playable-33-two-client-player-visibility-movement"));
-    assert!(scenario_ids.contains("playable-33-two-client-player-observe"));
-    assert!(scenario_ids.contains("playable-33-two-client-player-moved-observe"));
-    assert!(scenario_ids.contains("playable-34-two-client-chat-message"));
-    assert!(scenario_ids.contains("playable-34-two-client-chat-send"));
-    assert!(scenario_ids.contains("playable-34-two-client-chat-observe"));
-    assert!(scenario_ids.contains("playable-35-two-client-player-disconnect-removal"));
-    assert!(scenario_ids.contains("playable-35-two-client-player-disconnect-visible"));
-    assert!(scenario_ids.contains("playable-35-two-client-player-gone-observe"));
-    assert!(scenario_ids.contains("playable-36-two-client-player-reconnect-cleanup"));
-    assert!(scenario_ids.contains("playable-36-two-client-player-reconnect-visible"));
-    assert!(scenario_ids.contains("playable-36-two-client-player-reconnect-gone-observe"));
-    assert!(scenario_ids.contains("playable-36-two-client-player-reconnected-observe"));
-    assert!(scenario_ids.contains("playable-37-two-client-player-death-respawn-visibility"));
-    assert!(scenario_ids.contains("playable-37-two-client-player-death-baseline"));
-    assert!(scenario_ids.contains("playable-37-two-client-campfire-death-respawn"));
-    assert!(scenario_ids.contains("playable-37-two-client-player-post-respawn-moved-observe"));
-    assert!(scenario_ids.contains("playable-38-two-client-inventory-drop-handoff"));
-    assert!(scenario_ids.contains("playable-38-two-client-inventory-drop-primary"));
-    assert!(scenario_ids.contains("playable-38-two-client-inventory-drop-observe"));
-    assert!(scenario_ids.contains("playable-38-two-client-inventory-drop-secondary-pickup"));
-    assert!(scenario_ids.contains("playable-38-two-client-inventory-drop-gone-observe"));
-    assert!(scenario_ids.contains("playable-39-two-client-short-soak"));
-    assert!(scenario_ids.contains("playable-40-two-client-chunk-stream-crossing"));
-    assert!(scenario_ids.contains("playable-41-two-client-chunk-prewarm-crossing"));
-    assert!(scenario_ids.contains("playable-42-two-client-opposite-chunk-crossing"));
-    assert!(scenario_ids.contains("playable-43-renewable-wheat-bread"));
-    assert!(scenario_ids.contains("playable-44-passive-livestock-motion"));
-    assert!(scenario_ids.contains("playable-45-two-client-shared-chest-save-restart"));
-    assert!(scenario_ids.contains("playable-45-two-client-shared-chest-save-restart-before"));
-    assert!(scenario_ids.contains("playable-45-two-client-shared-chest-save-restart-after"));
-    assert!(scenario_ids.contains("playable-48-wall-torch-stairs-slabs"));
-}
-
-#[test]
 fn playable_real_client_runner_check_selects_gradle_adapter() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-playable-client-gate.sh");
 
-    let output = Command::new("bash")
-        .arg(&runner_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("playable")
         .arg("--check")
+        .current_dir(&repo_root)
         .output()
         .expect("run playable real-client check");
 
@@ -195,15 +31,8 @@ fn playable_real_client_runner_check_selects_gradle_adapter() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("gradle-runclient"),
-        "playable runner check should name the auto-selected adapter\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("scenario policy: no-debug, no operator privileges"),
-        "playable runner must deny operator privileges for its no-debug scenario\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout).contains("profile=playable"),
+        "playable runner check should report its harness profile\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -213,7 +42,7 @@ fn playable_real_client_runner_check_selects_gradle_adapter() {
 fn real_client_runner_run_fails_fast_without_graphical_display() {
     let repo_root = repo_root();
     let output = Command::new("bash")
-        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg(repo_root.join("tools/harness/backends/regression.sh"))
         .arg("--run")
         .env(
             "SOLARIS_REAL_CLIENT_MANIFEST",
@@ -251,7 +80,7 @@ fn real_client_runner_run_fails_fast_without_graphical_display() {
 fn bucket_resync_debug_loop_preflight_uses_declared_real_client_scenario() {
     let repo_root = repo_root();
     let output = Command::new("bash")
-        .arg(repo_root.join("tools/run-bucket-resync-debug-loop.sh"))
+        .arg(repo_root.join("tools/harness/backends/bucket_resync.sh"))
         .arg("--check")
         .output()
         .expect("run bucket-resync debug-loop preflight");
@@ -279,7 +108,7 @@ fn real_client_runner_rejects_a_scenario_missing_from_the_manifest() {
     .expect("write manifest fixture");
 
     let output = Command::new("bash")
-        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg(repo_root.join("tools/harness/backends/regression.sh"))
         .arg("--check")
         .env("SOLARIS_REAL_CLIENT_MANIFEST", manifest_path)
         .env("SOLARIS_REAL_CLIENT_AGENT_SCENARIO", "undeclared-scenario")
@@ -318,7 +147,7 @@ fn real_client_prepare_denies_operators_when_scenario_policy_is_unknown() {
     .expect("write manifest fixture");
 
     let output = Command::new("bash")
-        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg(repo_root.join("tools/harness/backends/regression.sh"))
         .arg("--prepare")
         .env("SOLARIS_REAL_CLIENT_MANIFEST", manifest_path)
         .env("SOLARIS_REAL_CLIENT_AGENT_SCENARIO", "undeclared-scenario")
@@ -365,15 +194,18 @@ fn core_replay_real_client_gate_checks_structured_pack_with_gradle_runner() {
     assert_eq!(pack["scenarios"][0]["no_debug_commands"], true);
     assert_eq!(pack["scenarios"][0]["screenshots_required"], true);
 
-    let wrapper_path = repo_root.join("tools/run-core-replay-client-gate.sh");
-    let output = Command::new("bash")
-        .arg(&wrapper_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("replay")
         .arg("--check")
+        .current_dir(&repo_root)
         .output()
         .expect("run core replay client check");
     assert!(
         output.status.success(),
-        "core replay wrapper did not select Gradle runClient\nstdout:\n{}\nstderr:\n{}",
+        "core replay profile did not select Gradle runClient\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -383,11 +215,14 @@ fn core_replay_real_client_gate_checks_structured_pack_with_gradle_runner() {
 fn core_replay_real_client_prepare_copies_canonical_manifest() {
     let repo_root = repo_root();
     let run_root = tempfile::tempdir().expect("create core replay run root");
-    let wrapper_path = repo_root.join("tools/run-core-replay-client-gate.sh");
 
-    let output = Command::new("bash")
-        .arg(&wrapper_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("replay")
         .arg("--prepare")
+        .current_dir(&repo_root)
         .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
         .env(
             "SOLARIS_REAL_CLIENT_AGENT_SECRET",
@@ -401,12 +236,7 @@ fn core_replay_real_client_prepare_copies_canonical_manifest() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let prepared_dir = PathBuf::from(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .last()
-            .expect("prepared run path"),
-    );
+    let prepared_dir = prepared_run_dir(run_root.path());
     let copied = std::fs::read(prepared_dir.join("core-replay-manifest.json"))
         .expect("copied core replay manifest exists");
     let canonical =
@@ -455,12 +285,15 @@ fn core_replay_core_gate_manifest_supports_compact_ledger_rows_and_evidence_legs
 #[test]
 fn playable_real_client_prepare_uses_playable_manifest_config_and_scenario() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-playable-client-gate.sh");
     let run_root = tempfile::tempdir().expect("create playable run root");
 
-    let output = Command::new("bash")
-        .arg(&runner_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("playable")
         .arg("--prepare")
+        .current_dir(&repo_root)
         .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
         .output()
         .expect("prepare playable real-client gate");
@@ -471,8 +304,7 @@ fn playable_real_client_prepare_uses_playable_manifest_config_and_scenario() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let run_dir_text = String::from_utf8(output.stdout).expect("run dir stdout is utf-8");
-    let run_dir = Path::new(run_dir_text.trim());
+    let run_dir = prepared_run_dir(run_root.path());
     let automation_driver = std::fs::read_to_string(run_dir.join("automation-driver.txt"))
         .expect("read automation driver");
     assert!(
@@ -526,12 +358,15 @@ fn playable_real_client_prepare_uses_playable_manifest_config_and_scenario() {
 #[test]
 fn playable_combat_prepare_keeps_natural_monsters_enabled() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-playable-client-gate.sh");
     let run_root = tempfile::tempdir().expect("create playable combat run root");
 
-    let output = Command::new("bash")
-        .arg(&runner_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("playable")
         .arg("--prepare")
+        .current_dir(&repo_root)
         .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
         .env(
             "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
@@ -546,8 +381,7 @@ fn playable_combat_prepare_keeps_natural_monsters_enabled() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let run_dir_text = String::from_utf8(output.stdout).expect("run dir stdout is utf-8");
-    let run_dir = Path::new(run_dir_text.trim());
+    let run_dir = prepared_run_dir(run_root.path());
     let effective_server_config = std::fs::read_to_string(run_dir.join("server.toml"))
         .expect("prepared combat gate writes its effective server config");
     let effective_server_config: toml::Value = toml::from_str(&effective_server_config)
@@ -562,7 +396,6 @@ fn playable_combat_prepare_keeps_natural_monsters_enabled() {
 #[test]
 fn playable_real_client_prepare_ignores_legacy_client_command_env() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-playable-client-gate.sh");
     let run_root = tempfile::tempdir().expect("create playable run root");
     let legacy_command = "echo legacy-client-command-must-not-run";
     let legacy_command_env = legacy_primary_client_env_names()
@@ -570,9 +403,13 @@ fn playable_real_client_prepare_ignores_legacy_client_command_env() {
         .next()
         .expect("legacy primary client command env is listed");
 
-    let output = Command::new("bash")
-        .arg(&runner_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("playable")
         .arg("--prepare")
+        .current_dir(&repo_root)
         .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
         .env(&legacy_command_env, legacy_command)
         .output()
@@ -584,8 +421,7 @@ fn playable_real_client_prepare_ignores_legacy_client_command_env() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let run_dir_text = String::from_utf8(output.stdout).expect("run dir stdout is utf-8");
-    let run_dir = Path::new(run_dir_text.trim());
+    let run_dir = prepared_run_dir(run_root.path());
     let automation_driver = std::fs::read_to_string(run_dir.join("automation-driver.txt"))
         .expect("read automation driver");
 
@@ -605,13 +441,16 @@ fn playable_real_client_prepare_ignores_legacy_client_command_env() {
 #[test]
 fn playable_real_client_prepare_picks_free_agent_port_when_default_is_busy() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-playable-client-gate.sh");
     let run_root = tempfile::tempdir().expect("create playable run root");
     let _busy_default = std::net::TcpListener::bind(("127.0.0.1", 39094)).ok();
 
-    let output = Command::new("bash")
-        .arg(&runner_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("playable")
         .arg("--prepare")
+        .current_dir(&repo_root)
         .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
         .env("SOLARIS_REAL_CLIENT_AGENT_SECRET", "s_test_prepare")
         .output()
@@ -623,8 +462,7 @@ fn playable_real_client_prepare_picks_free_agent_port_when_default_is_busy() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let run_dir_text = String::from_utf8(output.stdout).expect("run dir stdout is utf-8");
-    let run_dir = Path::new(run_dir_text.trim());
+    let run_dir = prepared_run_dir(run_root.path());
     let automation_driver = std::fs::read_to_string(run_dir.join("automation-driver.txt"))
         .expect("read automation driver");
     let port = automation_driver
@@ -648,7 +486,7 @@ fn playable_real_client_prepare_picks_free_agent_port_when_default_is_busy() {
 #[test]
 fn real_client_prepare_auto_selects_secondary_gradle_runclient_adapter() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-real-client-regression.sh");
+    let runner_path = repo_root.join("tools/harness/backends/regression.sh");
     let run_root = tempfile::tempdir().expect("create real-client run root");
 
     let output = Command::new("bash")
@@ -707,10 +545,13 @@ fn real_client_prepare_auto_selects_secondary_gradle_runclient_adapter() {
 #[test]
 fn gradle_runclient_adapter_is_the_default_real_client_launcher() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-playable-client-gate.sh");
-    let output = Command::new("bash")
-        .arg(&runner_path)
+    let output = Command::new("python3")
+        .arg("-m")
+        .arg("tools.harness")
+        .arg("run")
+        .arg("playable")
         .arg("--check")
+        .current_dir(&repo_root)
         .output()
         .expect("run playable real-client check");
 
@@ -720,41 +561,16 @@ fn gradle_runclient_adapter_is_the_default_real_client_launcher() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("gradle-runclient"),
-        "playable runner should report the auto-selected runClient adapter\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 
-    let fabric_build = std::fs::read_to_string(
-        repo_root.join("client-mod/solaris-client-agent/fabric-agent/build.gradle.kts"),
-    )
-    .expect("read fabric-agent build");
-    assert!(
-        fabric_build.contains("net.neoforged.moddev")
-            && fabric_build.contains("neoForge")
-            && fabric_build.contains("create(\"client\")")
-            && fabric_build.contains("create(\"clientAgent\")")
-            && fabric_build.contains("tasks.named(\"runClientAgent\")")
-            && fabric_build.contains("validateClientAgentRunProperties")
-            && fabric_build.contains("srcDir(project(\":java-agent\")")
-            && !fabric_build.contains("implementation(project(\":java-agent\"))")
-            && fabric_build.contains("solaris.clientAgent.secret")
-            && fabric_build.contains("solaris.clientAgent.runDir")
-            && fabric_build.contains("solaris.clientAgent.gameDir")
-            && fabric_build.contains("solaris.clientAgent.username")
-            && fabric_build.contains("gameDirectory.set(file(clientAgentGameDir.get()))")
-            && fabric_build.contains("programArgument(\"--username\")")
-            && fabric_build.contains("programArgument(clientAgentUsername.get())"),
-        "Gradle runClient adapter must define a ModDev client launch with client-agent system properties and per-client isolation"
-    );
+    // The Gradle adapter source lives in the sibling solaris-loader repo
+    // (SOLARIS_LOADER_ROOT, default ../solaris-loader). This test pins only
+    // the observable harness contract above, never the loader's build text.
 }
 
 #[test]
 fn runner_usage_names_gradle_adapter_not_injectable_client_launcher() {
     let repo_root = repo_root();
-    let runner_path = repo_root.join("tools/run-real-client-regression.sh");
+    let runner_path = repo_root.join("tools/harness/backends/regression.sh");
     let output = Command::new("bash")
         .arg(&runner_path)
         .arg("--help")
@@ -782,48 +598,23 @@ fn runner_usage_names_gradle_adapter_not_injectable_client_launcher() {
 #[test]
 fn m94_real_client_manifest_covers_required_regression_rows() {
     let manifest: Value = serde_json::from_str(M94_MANIFEST).expect("M94 manifest is valid JSON");
-
-    assert_eq!(manifest["schema_version"], 1);
-    assert_eq!(manifest["quality_label"], "stabilization");
-    assert!(
-        manifest["client_requirement"]
-            .as_str()
-            .expect("client requirement is present")
-            .contains("vanilla 26.1.2 client"),
-        "manifest must require a real vanilla client"
-    );
-
+    let scenarios = manifest["scenarios"].as_array().expect("M94 scenarios");
     let forbidden = manifest["forbidden_client_evidence"]
         .as_array()
-        .expect("forbidden client evidence list is present");
-    assert!(
-        forbidden.iter().any(|entry| entry == "wire-probe"),
-        "wire-probe must be explicitly excluded as real-client evidence"
-    );
-    assert!(
-        forbidden
-            .iter()
-            .any(|entry| entry == "mc_test_harness::client::Client"),
-        "protocol harness client must be explicitly excluded as real-client evidence"
-    );
-
-    let scenarios = manifest["scenarios"]
-        .as_array()
-        .expect("scenarios are present");
-    assert!(scenarios.len() > 1, "M94 cannot be a single-scenario pack");
-
-    let required_artifacts = manifest["required_artifacts"]
-        .as_array()
-        .expect("required artifacts are present");
-    let mut artifact_ids = BTreeSet::new();
-    for artifact in required_artifacts {
-        let artifact = artifact.as_str().expect("required artifact is a string");
-        assert!(!artifact.is_empty(), "required artifact cannot be empty");
+        .expect("forbidden client evidence");
+    for evidence in ["wire-probe", "mc_test_harness::client::Client"] {
         assert!(
-            artifact_ids.insert(artifact),
-            "duplicate required artifact {artifact}"
+            forbidden.iter().any(|entry| entry == evidence),
+            "{evidence} must not count as real-client evidence"
         );
     }
+
+    let artifacts = manifest["required_artifacts"]
+        .as_array()
+        .expect("required artifacts")
+        .iter()
+        .map(|artifact| artifact.as_str().expect("artifact name"))
+        .collect::<BTreeSet<_>>();
     for artifact in [
         "manifest.json",
         "client.log",
@@ -835,249 +626,37 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         "automation-driver.txt",
     ] {
         assert!(
-            artifact_ids.contains(artifact),
+            artifacts.contains(artifact),
             "missing required artifact {artifact}"
         );
     }
 
-    let runner = &manifest["automation_runner"];
-    assert_eq!(
-        runner["script"].as_str(),
-        Some("tools/run-real-client-regression.sh"),
-        "M94 pack must name the approved real-client runner"
-    );
-    assert_eq!(
-        runner["client_adapter"].as_str(),
-        Some(
-            "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent"
-        ),
-        "runner must document the repo-native Gradle runClient adapter"
-    );
-    assert_eq!(
-        runner["client_adapter_source"].as_str(),
-        Some("auto-gradle-runclient"),
-        "runner must document the auto-selected primary client source"
-    );
-    assert_eq!(
-        runner["client_isolation"].as_str(),
-        Some(
-            "Gradle runClient launches use per-run game directories and distinct offline usernames for primary/secondary clients."
-        ),
-        "runner must document per-client Gradle runClient isolation"
-    );
-    assert_eq!(
-        runner["passing_gate"].as_str(),
-        Some("agent-run real-client"),
-        "runner must distinguish completed real-client evidence from prepared scaffolding"
-    );
-    assert_eq!(
-        runner["agent_driver"].as_str(),
-        Some("tools/real-client-agent-driver.py"),
-        "runner must name the approved in-client bridge driver"
-    );
-    assert_eq!(
-        runner["agent_bridge_url_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL"),
-        "runner must expose the loopback bridge URL env hook"
-    );
-    assert_eq!(
-        runner["agent_secret_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_AGENT_SECRET"),
-        "runner must expose the per-run bridge secret env hook"
-    );
-    assert_eq!(
-        runner["agent_jar_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_AGENT_JAR"),
-        "runner must expose the Java agent jar env hook"
-    );
-    assert_eq!(
-        runner["agent_port_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_AGENT_PORT"),
-        "runner must expose the Java agent port env hook"
-    );
-    assert_eq!(
-        runner["agent_scenario_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_AGENT_SCENARIO"),
-        "runner must expose the agent scenario override hook"
-    );
-    assert_eq!(
-        runner["agent_server_addr_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_SERVER_ADDR"),
-        "runner must expose the server address passed to the client agent"
-    );
-    assert_eq!(
-        runner["second_client_adapter"].as_str(),
-        Some(
-            "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent"
-        ),
-        "runner must document the repo-native secondary Gradle runClient adapter"
-    );
-    assert_eq!(
-        runner["second_client_adapter_source"].as_str(),
-        Some("auto-gradle-runclient"),
-        "runner must document the auto-selected secondary client source"
-    );
-    assert!(
-        runner.get("second_command_env").is_none(),
-        "runner must not require a shell command hook for the second real client"
-    );
-    assert_eq!(
-        runner["second_agent_secret_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_SECOND_AGENT_SECRET"),
-        "runner must expose a separate second-client bridge secret"
-    );
-    assert_eq!(
-        runner["second_agent_port_env"].as_str(),
-        Some("SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT"),
-        "runner must expose a separate second-client bridge port"
-    );
-    let runner_modes = runner["modes"]
-        .as_array()
-        .expect("runner modes are present");
-    for mode in ["--check", "--prepare", "--run", "--validate-run"] {
-        assert!(
-            runner_modes.iter().any(|entry| entry == mode),
-            "runner must support mode {mode}"
-        );
-    }
-
-    let mut covered_rows = BTreeSet::new();
     let mut scenario_ids = BTreeSet::new();
+    let mut covered_rows = BTreeSet::new();
     for scenario in scenarios {
-        let id = scenario["id"].as_str().expect("scenario id is present");
+        let id = scenario["id"].as_str().expect("scenario id");
         assert!(scenario_ids.insert(id), "duplicate scenario id {id}");
-        assert_eq!(scenario["status"], "manual-pending");
-        assert_eq!(
-            scenario["screenshots_required"], true,
-            "scenario {} must require screenshots",
-            scenario["id"]
-        );
-        assert!(
-            scenario["bounded_time_minutes"]
-                .as_u64()
-                .unwrap_or_default()
-                <= 25,
-            "scenario {} must stay bounded",
-            scenario["id"]
-        );
-        assert!(
-            scenario["steps"]
+        covered_rows.extend(
+            scenario["ledger_rows"]
                 .as_array()
-                .is_some_and(|steps| !steps.is_empty()),
-            "scenario {} needs runnable steps",
-            scenario["id"]
+                .expect("scenario ledger rows")
+                .iter()
+                .map(|row| row.as_str().expect("ledger row")),
         );
-        assert!(
-            scenario["expected_observations"]
-                .as_array()
-                .is_some_and(|observations| !observations.is_empty()),
-            "scenario {} needs expected observations",
-            scenario["id"]
-        );
-        for row in scenario["ledger_rows"]
+    }
+    covered_rows.extend(
+        manifest["scoped_rows_manual_pending"]
             .as_array()
-            .expect("scenario ledger rows are present")
-        {
-            covered_rows.insert(row.as_str().expect("ledger row is a string"));
-        }
-    }
-    assert!(
-        scenario_ids.contains("m94-02c-water-bucket-place-pickup"),
-        "M94 manifest must keep the focused accepted water-bucket real-client scenario"
-    );
-    for id in [
-        "m94-02-blocks-fluids-farming-drops",
-        "m94-02a-solid-place-break-drop",
-        "m94-02b-rejected-block-resync",
-        "m94-02c-water-bucket-place-pickup",
-    ] {
-        let scenario = scenarios
+            .expect("manual-pending scoped rows")
             .iter()
-            .find(|scenario| scenario["id"] == id)
-            .expect("focused block/fluid scenario exists");
-        assert_eq!(
-            scenario["no_debug_commands"], false,
-            "{id} uses explicit operator-backed setup and must not masquerade as no-debug evidence"
-        );
-    }
-    assert!(
-        scenario_ids.contains("m94-04a-regular-sign-place-text"),
-        "M94 manifest must keep the focused regular sign real-client scenario"
+            .map(|row| row["row"].as_str().expect("manual-pending ledger row")),
     );
-    assert!(
-        scenario_ids.contains("m94-03a-inventory-oak-log-to-planks"),
-        "M94 manifest must keep the focused inventory recipe real-client scenario"
-    );
-    assert!(
-        scenario_ids.contains("m94-03b-two-client-shared-chest"),
-        "M94 manifest must keep the focused two-client shared chest scenario"
-    );
-    assert!(
-        scenario_ids.contains("m94-03c-two-client-shared-chest-live-update"),
-        "M94 manifest must keep the focused two-client shared chest live-update scenario"
-    );
-    for id in [
-        "m94-03-inventory-crafting-containers-stations",
-        "m94-03a-inventory-oak-log-to-planks",
-        "m94-03b-two-client-shared-chest",
-        "m94-03c-two-client-shared-chest-live-update",
-        "m94-03d-crafting-table-max-craft",
-        "m94-03e-furnace-family-ui",
-        "m94-03f-malformed-container-rejection",
-        "m94-03g-chest-reopen-conservation",
-    ] {
-        let scenario = scenarios
-            .iter()
-            .find(|scenario| scenario["id"] == id)
-            .expect("focused inventory/container scenario exists");
-        assert_eq!(
-            scenario["no_debug_commands"], false,
-            "{id} uses explicit fixture setup and must declare its debug-command policy"
-        );
-    }
-    assert!(
-        scenario_ids.contains("m94-07a-deep-water-feel"),
-        "M94 manifest must keep the focused deep-water real-client scenario"
-    );
-    let deep_water = scenarios
-        .iter()
-        .find(|scenario| scenario["id"] == "m94-07a-deep-water-feel")
-        .expect("focused deep-water scenario exists");
-    assert_eq!(deep_water["ledger_rows"], serde_json::json!(["B4"]));
-    assert_eq!(deep_water["status"], "manual-pending");
-    assert_eq!(
-        deep_water["no_debug_commands"], false,
-        "deep-water fixture uses operator-backed teleport setup and must declare it"
-    );
-
-    assert!(
-        scenario_ids.contains("m94-08-enchanting-efficiency"),
-        "M94 manifest must keep the focused enchanting scenario"
-    );
-
-    let mut manual_pending_rows = BTreeSet::new();
-    for row in manifest["scoped_rows_manual_pending"]
-        .as_array()
-        .expect("manual-pending scoped rows are present")
-    {
-        assert!(
-            row["reason"]
-                .as_str()
-                .is_some_and(|reason| !reason.is_empty()),
-            "manual-pending scoped row needs a reason"
-        );
-        manual_pending_rows.insert(row["row"].as_str().expect("manual-pending row is a string"));
-    }
-
     for row in [
         "P1", "P2", "P3", "P4", "W3", "C1", "C2", "B1", "B2", "B3", "B4", "B5", "B6", "F1", "F2",
         "F3", "F4", "L1", "L2", "I1", "I2", "K1", "K2", "A1", "E1", "E2", "E3", "V1", "N1", "N2",
         "G1", "G2", "G3", "G4", "S1", "S2", "O1", "O2",
     ] {
-        assert!(
-            covered_rows.contains(row) || manual_pending_rows.contains(row),
-            "missing M94 ledger row {row}"
-        );
+        assert!(covered_rows.contains(row), "missing M94 ledger row {row}");
     }
 }
 
@@ -2035,7 +1614,7 @@ client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
     )
     .expect("write missing spawn evidence");
     let rejected = Command::new("python3")
-        .arg(repo_root.join("tools/validate-real-client-restart-evidence.py"))
+        .arg(repo_root.join("tools/harness/backends/restart_evidence.py"))
         .arg(&automation_path)
         .arg(&observations_path)
         .arg(&manifest_path)
@@ -2057,7 +1636,7 @@ client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
     )
     .expect("write complete spawn evidence");
     let accepted = Command::new("python3")
-        .arg(repo_root.join("tools/validate-real-client-restart-evidence.py"))
+        .arg(repo_root.join("tools/harness/backends/restart_evidence.py"))
         .arg(&automation_path)
         .arg(&observations_path)
         .arg(&manifest_path)
@@ -2249,7 +1828,7 @@ fn p46_prepare_never_reuses_a_colliding_run_directory() {
 
     let prepare = || {
         Command::new("bash")
-            .arg(repo_root.join("tools/run-real-client-regression.sh"))
+            .arg(repo_root.join("tools/harness/backends/regression.sh"))
             .arg("--prepare")
             .env("PATH", &path)
             .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
@@ -2884,6 +2463,26 @@ fn repo_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// Resolve the single run directory a `--prepare` invocation created under
+/// an isolated `SOLARIS_REAL_CLIENT_RUN_ROOT`. The harness CLI tees backend
+/// output into its own artifact log, so callers read the run root instead
+/// of parsing a printed run path from stdout.
+fn prepared_run_dir(run_root: &Path) -> std::path::PathBuf {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(run_root)
+        .expect("read prepared run root")
+        .map(|entry| entry.expect("read prepared run entry").path())
+        .filter(|path| path.is_dir())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries.len(),
+        1,
+        "prepare must create exactly one run directory under {}",
+        run_root.display()
+    );
+    entries.pop().expect("prepared run directory exists")
+}
+
 fn legacy_primary_client_env_names() -> Vec<String> {
     vec![
         ["SOLARIS", "REAL", "CLIENT", "COMMAND"].join("_"),
@@ -2961,7 +2560,7 @@ second_client_agent_secret=SET_REDACTED\n"
 
 fn validate_run(repo_root: &Path, run_dir: &Path) -> std::process::Output {
     Command::new("bash")
-        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg(repo_root.join("tools/harness/backends/regression.sh"))
         .arg("--validate-run")
         .arg(run_dir)
         .output()

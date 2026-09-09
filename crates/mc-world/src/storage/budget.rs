@@ -24,16 +24,7 @@ impl WorldStorage {
     }
 
     pub(crate) fn chunk_byte_usage(&self) -> (usize, usize) {
-        let mut resident_bytes = 0usize;
-        let mut dirty_bytes = 0usize;
-        for (_, chunk) in self.resident.snapshots() {
-            let bytes = chunk.estimated_heap_bytes();
-            resident_bytes = resident_bytes.saturating_add(bytes);
-            if chunk.dirty {
-                dirty_bytes = dirty_bytes.saturating_add(bytes);
-            }
-        }
-        (resident_bytes, dirty_bytes)
+        self.read_view.byte_usage()
     }
 
     fn chunk_cache_pressure(

@@ -11,7 +11,7 @@ fn session_owner_script_inventory_commit_updates_live_and_durable_state_together
     let emerald = items
         .id_of(&Identifier::parse("minecraft:emerald").unwrap())
         .unwrap();
-    state.inventory.slots[9] = ItemStack::new(apple, 3);
+    state.player_persistence.lock().unwrap().inventory.slots[9] = ItemStack::new(apple, 3);
     let transaction = mc_script::ScriptPlayerInventoryTransaction::try_new(
         "owner-exchange",
         mc_script::ScriptPlayerId::new(state.session_id),

@@ -2886,6 +2886,28 @@ impl Packet for SetCenterChunk {
     }
 }
 
+/// Clientbound effective chunk-cache radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetChunkCacheRadius {
+    pub radius: i32,
+}
+
+impl Packet for SetChunkCacheRadius {
+    // Verified via `javap` of vanilla 26.1.2: game-CB index 95, one VarInt.
+    const ID: i32 = 0x5F;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.radius);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            radius: buf.read_varint()?,
+        })
+    }
+}
+
 // -----------------------------------------------------------------------
 // Serverbound
 // -----------------------------------------------------------------------

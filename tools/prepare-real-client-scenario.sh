@@ -7,7 +7,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCENARIO="${M78_SCENARIO:-$REPO_ROOT/tools/client-automation/scenarios/m78_smoke.json}"
 RUN_ROOT="${M78_RUN_ROOT:-$REPO_ROOT/.analysis/client-automation/runs}"
-AGENT_ROOT="$REPO_ROOT/client-mod/solaris-client-agent"
+AGENT_ROOT="${SOLARIS_LOADER_ROOT:-$REPO_ROOT/../solaris-loader}"
 GRADLE_RUNCLIENT_TASK=":fabric-agent:runClientAgent"
 CLIENT_ADAPTER_SOURCE="auto-gradle-runclient"
 MODE="prepare"
@@ -116,7 +116,7 @@ Client gate: prepared owner-run until a real vanilla 26.1.2 client fills this fi
 ## Commands
 
 - Server: \`cargo run --bin mc-server -- --config example.toml\`
-- Client adapter: \`client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent\`
+- Client adapter: \`$AGENT_ROOT/gradlew -p '$AGENT_ROOT' --no-configuration-cache :fabric-agent:runClientAgent\`
 
 ## Steps
 
@@ -141,7 +141,7 @@ cat > "$run_dir/OWNER_STEPS.md" <<EOF
 2. Check that the repo-native Gradle adapter is available:
    \`bash tools/prepare-real-client-scenario.sh --check\`
 3. Launch the real client through the Gradle adapter:
-   \`client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent\`
+   \`$AGENT_ROOT/gradlew -p '$AGENT_ROOT' --no-configuration-cache :fabric-agent:runClientAgent\`
 4. Connect to \`127.0.0.1:25565\` and execute \`$SCENARIO\`.
 5. Copy the client log to \`$run_dir/client.log\` and screenshots to \`$run_dir/screenshots/\`.
 6. Fill \`$run_dir/observations.md\` with exact pass/fail notes.

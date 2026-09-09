@@ -20,7 +20,7 @@ use crate::connection::{
 };
 use crate::error::ConnectionError;
 use crate::script::PluginZoneAdapter;
-use crate::server::{ConnectionWorld, ExtensionEventSink, ScriptEventSink, ServerConfig};
+use crate::server::{ConnectionWorld, ScriptEventSink, ServerConfig};
 use crate::{RuntimeControlHandle, configuration, login, play, status};
 
 #[derive(Clone)]
@@ -34,7 +34,6 @@ pub(crate) struct ConnectionServices {
     pub(crate) dirty_flush: Option<crate::dirty_flush::DirtyFlushNotifier>,
     pub(crate) runtime_control: Option<RuntimeControlHandle>,
     pub(crate) simulation: play::SimulationHandle,
-    pub(crate) extension: Option<ExtensionEventSink>,
     pub(crate) scripts: Option<ScriptEventSink>,
     pub(crate) script_zones: Option<PluginZoneAdapter>,
 }
@@ -149,9 +148,9 @@ pub(crate) async fn handle_connection(
                         tags: services.config.tags.as_ref(),
                         chunk_geometry: services.chunk_geometry,
                         custom_payload_policy: services
-                            .extension
+                            .scripts
                             .as_ref()
-                            .map(ExtensionEventSink::custom_payload_policy),
+                            .map(ScriptEventSink::boundary),
                         loader_manifest: services
                             .config
                             .loader_manifest
@@ -179,7 +178,6 @@ pub(crate) async fn handle_connection(
                 services.simulation,
                 configuration_outcome.custom_payloads,
                 configuration_outcome.loader_session,
-                services.extension,
                 services.scripts,
                 services.script_zones,
             ))

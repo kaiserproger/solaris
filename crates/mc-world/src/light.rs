@@ -1417,16 +1417,10 @@ fn seed_sky_from_open_columns(
     queue: &mut VecDeque<u32>,
     world_height: usize,
 ) {
-    // Two-pass seed. Pass 1: walk each column top-down, marking
-    // every cell as `sky=15` while `propagates_sky` holds. Don't
-    // touch the queue yet — pushing every interior open-sky cell
-    // would queue ~884k entries on a flat world and dominate the
-    // BFS runtime (each interior cell's six neighbours are also
-    // sky=15, so the BFS does no work but the pop/push churn does).
-    //
-    // Pass 2: push only "boundary" sky=15 cells — those with at
-    // least one neighbour that is *not* sky=15. These are the
-    // cells where BFS will actually drive an update.
+    // Each column's direct sky is one interval [bottom, world_height).
+    // Its boundary consists of the bottom cell and the portions below
+    // neighbouring columns' bottoms; no full-volume neighbour scan is needed.
+    let mut bottoms = [0; N_X * N_Z];
     for gx in 0..N_X {
         for gz in 0..N_Z {
             for ly in (0..world_height).rev() {
@@ -1434,53 +1428,37 @@ fn seed_sky_from_open_columns(
                 if propagates_sky[idx] {
                     sky[idx] = 15;
                 } else {
+                    bottoms[gz * N_X + gx] = ly + 1;
                     break;
                 }
             }
         }
     }
-    for ly in 0..world_height {
-        for gz in 0..N_Z {
-            for gx in 0..N_X {
-                let idx = grid_idx(gx, ly, gz);
-                if sky[idx] != 15 {
-                    continue;
-                }
-                if has_dark_neighbour(sky, gx, ly, gz, world_height) {
-                    queue.push_back(idx as u32);
-                }
+    for gz in 0..N_Z {
+        for gx in 0..N_X {
+            let column = gz * N_X + gx;
+            let bottom = bottoms[column];
+            if bottom == world_height {
+                continue;
+            }
+            let mut end = if bottom > 0 { bottom + 1 } else { 0 };
+            if gx > 0 {
+                end = end.max(bottoms[column - 1]);
+            }
+            if gx + 1 < N_X {
+                end = end.max(bottoms[column + 1]);
+            }
+            if gz > 0 {
+                end = end.max(bottoms[column - N_X]);
+            }
+            if gz + 1 < N_Z {
+                end = end.max(bottoms[column + N_X]);
+            }
+            for ly in bottom..end {
+                queue.push_back(grid_idx(gx, ly, gz) as u32);
             }
         }
     }
-}
-
-fn has_dark_neighbour(sky: &[u8], gx: usize, ly: usize, gz: usize, world_height: usize) -> bool {
-    const NEIGHBOURS: [(isize, isize, isize); 6] = [
-        (-1, 0, 0),
-        (1, 0, 0),
-        (0, -1, 0),
-        (0, 1, 0),
-        (0, 0, -1),
-        (0, 0, 1),
-    ];
-    for (dx, dy, dz) in NEIGHBOURS {
-        let nx = gx as isize + dx;
-        let ny = ly as isize + dy;
-        let nz = gz as isize + dz;
-        if nx < 0 || nx >= N_X as isize {
-            continue;
-        }
-        if ny < 0 || ny >= world_height as isize {
-            continue;
-        }
-        if nz < 0 || nz >= N_Z as isize {
-            continue;
-        }
-        if sky[grid_idx(nx as usize, ny as usize, nz as usize)] != 15 {
-            return true;
-        }
-    }
-    false
 }
 
 /// Generic 6-neighbour BFS used by both passes.
@@ -1696,6 +1674,10 @@ fn unpack_idx(idx: usize) -> (usize, usize, usize) {
     let gx = rem % N_X;
     (gx, ly, gz)
 }
+
+#[cfg(test)]
+#[path = "light_boundary_tests.rs"]
+mod boundary_tests;
 
 #[cfg(test)]
 mod tests {

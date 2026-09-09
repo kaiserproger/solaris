@@ -64,8 +64,8 @@ fn transaction_grant_and_remove_plan_only_player_slots() {
     )
     .unwrap();
 
-    assert_eq!(plan.updated.slots[8].count, 64);
-    assert_eq!(plan.updated.slots[9].count, 1);
+    assert_eq!(plan.slots[8].count, 64);
+    assert_eq!(plan.slots[9].count, 1);
 }
 
 #[test]

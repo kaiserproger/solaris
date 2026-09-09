@@ -379,7 +379,6 @@ mod tests {
         let held_slot = PlayerInventory::HOTBAR_BASE;
         let held = ItemStack::new(water_bucket, 1);
         state.inventory.slots[held_slot] = held.clone();
-        state.selected_hotbar_slot = 0;
         let (session_id, _) = register_survival_test_player(
             &mut state,
             "BucketResponse",

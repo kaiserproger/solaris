@@ -1,5 +1,4 @@
 use bytes::{Buf, Bytes};
-use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ConfirmTeleportation, ServerboundAttack, ServerboundChangeGameMode, ServerboundChat,
@@ -14,6 +13,7 @@ use mc_protocol::packets::play::{
     ServerboundSelectTrade, ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundSwing,
     ServerboundUseItem, ServerboundUseItemOn,
 };
+use mc_script::MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES;
 
 use crate::error::ConnectionError;
 
@@ -77,7 +77,7 @@ pub(super) fn validate_serverbound_play_frame(
     id: i32,
     body: &Bytes,
 ) -> Result<bool, ConnectionError> {
-    if id == ServerboundCustomPayload::ID && body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+    if id == ServerboundCustomPayload::ID && body.len() > MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
         return Ok(false);
     }
 
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn oversized_custom_payload_is_ignored_without_refreshing_activity() {
-        let body = Bytes::from(vec![0_u8; DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1]);
+        let body = Bytes::from(vec![0_u8; MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES + 1]);
         assert!(!validate_serverbound_play_frame(ServerboundCustomPayload::ID, &body).unwrap());
     }
 

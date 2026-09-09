@@ -21,9 +21,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use mc_extension::{
-    DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, OutboundCommand, PlayerId, ProtocolPhase,
-};
 use mc_nbt::Tag;
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::codec::{Identifier, WriteMc};
@@ -45,13 +42,17 @@ use mc_protocol::packets::play::{
     SetDefaultSpawnPosition, SynchronizePlayerPosition, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
-use mc_script::{ScriptCommand, ScriptEvent, ScriptEventKind, ScriptHostEndpoint, ScriptPlayerId};
+use mc_script::{
+    MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, SCRIPT_API_VERSION, ScriptCommand, ScriptEvent,
+    ScriptEventKind, ScriptHostEndpoint, ScriptPlayerId, ScriptPluginManifest, ScriptProtocolPhase,
+    ValidatedScriptPluginManifest,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
-const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1;
-const EXTENSION_CHANNEL: &str = "solaris:test";
+const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES + 1;
+const SCRIPT_CHANNEL: &str = "solaris:test";
 
 async fn start_server() -> SocketAddr {
     start_server_with_max(8).await
@@ -95,10 +96,17 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
     addr
 }
 
-async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEndpoint) {
+fn script_channel_manifest(plugin_id: &str) -> ValidatedScriptPluginManifest {
+    ScriptPluginManifest::new(plugin_id, "Test Payload", "0.1.0", SCRIPT_API_VERSION)
+        .declare_custom_payload_channel(SCRIPT_CHANNEL)
+        .validate()
+        .expect("test payload channel manifest validates")
+}
+
+async fn start_server_with_script_payloads() -> (SocketAddr, ScriptHostEndpoint) {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M100 extension".into(),
+        motd: "M100 script payloads".into(),
         max_players: 8,
         view_distance: 10,
         data: std::sync::Arc::new(mc_data::testing::stub()),
@@ -121,10 +129,14 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
         loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
-    let (boundary, endpoint) =
-        mc_extension::boundary_pair(NonZeroUsize::new(8).unwrap(), NonZeroUsize::new(8).unwrap());
-    let policy = mc_extension::CustomPayloadPolicy::new(16, [EXTENSION_CHANNEL.to_owned()]);
-    let bound = mc_net::bind_with_extension(cfg, boundary, policy)
+    let (boundary, endpoint) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+    );
+    endpoint
+        .register_plugin_routes(&script_channel_manifest("test-payload"))
+        .expect("test payload channel registers");
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
         .await
         .expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -235,13 +247,6 @@ async fn write_oversized_custom_payload_frame(
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn recv_extension_event(endpoint: &mc_extension::ExtensionEndpoint) -> InboundEvent {
-    tokio::time::timeout(Duration::from_secs(2), endpoint.recv_event())
-        .await
-        .expect("extension event was not delivered within 2s")
-        .expect("extension event queue closed")
-}
-
 async fn recv_script_event(
     endpoint: &mut ScriptHostEndpoint,
     matches: impl Fn(&ScriptEvent) -> bool,
@@ -307,27 +312,6 @@ async fn read_play_custom_payload(
     })
     .await
     .expect("play custom payload was not delivered within 2s")
-}
-
-async fn read_play_disconnect_rejecting_custom_payload(
-    stream: &mut TcpStream,
-    buf: &mut BytesMut,
-    compression: Compression,
-) -> PlayDisconnect {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let mut frame = read_one_frame(stream, buf, compression).await;
-            if frame.id == ClientboundCustomPayload::ID {
-                let payload = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
-                panic!("unexpected custom payload before disconnect: {payload:?}");
-            }
-            if frame.id == PlayDisconnect::ID {
-                return PlayDisconnect::decode(&mut frame.body).unwrap();
-            }
-        }
-    })
-    .await
-    .expect("play disconnect was not delivered within 2s")
 }
 
 async fn assert_damage_command_still_processed(
@@ -526,12 +510,6 @@ async fn drive_to_play(
 
     // Configuration: enabled features, KnownPacks round trip, registries, ack.
     let mut frame = read_one_frame(stream, buf, compression).await;
-    assert_eq!(
-        frame.id,
-        mc_protocol::packets::configuration::ClientboundCustomPayload::ID
-    );
-    mc_protocol::packets::configuration::ClientboundCustomPayload::decode(&mut frame.body).unwrap();
-    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, UpdateEnabledFeatures::ID);
     let _ = UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(stream, buf, compression).await;
@@ -556,6 +534,13 @@ async fn drive_to_play(
     let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, UpdateTags::ID);
     let _ = UpdateTags::decode(&mut frame.body).unwrap();
+
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(
+        frame.id,
+        mc_protocol::packets::configuration::ClientboundCustomPayload::ID
+    );
+    mc_protocol::packets::configuration::ClientboundCustomPayload::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
@@ -909,21 +894,25 @@ async fn play_state_ignores_oversized_custom_payload() {
 }
 
 #[tokio::test]
-async fn play_extension_boundary_receives_join_payload_brand_and_leave() {
-    let (addr, endpoint) = start_server_with_extension().await;
+async fn play_script_boundary_receives_join_payload_brand_and_leave() {
+    let (addr, mut endpoint) = start_server_with_script_payloads().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtPlayer").await;
 
-    let joined = recv_extension_event(&endpoint).await;
-    let InboundEvent::PlayerJoined {
+    let joined = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerJoined { .. })
+    })
+    .await;
+    let ScriptEventKind::PlayerJoined {
         player_id,
         username,
-    } = joined
+        ..
+    } = joined.kind()
     else {
         panic!("expected PlayerJoined event, got {joined:?}");
     };
-    assert_eq!(player_id, PlayerId::new(1));
+    assert_eq!(*player_id, ScriptPlayerId::new(1));
     assert_eq!(username, "ExtPlayer");
 
     drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
@@ -932,21 +921,30 @@ async fn play_extension_boundary_receives_join_payload_brand_and_leave() {
         &mut stream,
         &ServerboundCustomPayload {
             payload: CustomPayload::Unknown {
-                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
                 payload: b"ok".to_vec(),
             },
         },
         compression,
     )
     .await;
-    let payload = recv_extension_event(&endpoint).await;
-    let InboundEvent::CustomPayload(payload) = payload else {
+    let payload = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::CustomPayload { .. })
+    })
+    .await;
+    let ScriptEventKind::CustomPayload {
+        player_id: payload_player,
+        phase,
+        channel,
+        payload,
+    } = payload.kind()
+    else {
         panic!("expected CustomPayload event, got {payload:?}");
     };
-    assert_eq!(payload.player_id, player_id);
-    assert_eq!(payload.phase, ProtocolPhase::Play);
-    assert_eq!(payload.channel, EXTENSION_CHANNEL);
-    assert_eq!(payload.payload.as_ref(), b"ok");
+    assert_eq!(*payload_player, *player_id);
+    assert_eq!(*phase, ScriptProtocolPhase::Play);
+    assert_eq!(channel, SCRIPT_CHANNEL);
+    assert_eq!(payload, b"ok");
 
     write_frame(
         &mut stream,
@@ -956,26 +954,47 @@ async fn play_extension_boundary_receives_join_payload_brand_and_leave() {
         compression,
     )
     .await;
-    let brand = recv_extension_event(&endpoint).await;
+    let brand = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::ClientBrand { .. })
+    })
+    .await;
     assert_eq!(
-        brand,
-        InboundEvent::ClientBrand {
-            player_id,
+        brand.kind(),
+        &ScriptEventKind::ClientBrand {
+            player_id: *player_id,
             brand: "solar-client".to_owned(),
         }
     );
 
     drop(stream);
-    let left = recv_extension_event(&endpoint).await;
-    assert_eq!(
-        left,
-        InboundEvent::PlayerLeft {
-            player_id,
-            reason: "disconnected".to_owned(),
-        }
-    );
+    let left = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerLeft { .. })
+    })
+    .await;
+    assert_eq!(left, ScriptEvent::player_left(*player_id, "disconnected"));
 }
 
+#[test]
+fn script_payload_channel_ownership_rejects_collisions_until_released() {
+    let (_boundary, endpoint) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+    );
+    endpoint
+        .register_plugin_routes(&script_channel_manifest("first-owner"))
+        .expect("first channel owner registers");
+    assert!(
+        endpoint
+            .register_plugin_routes(&script_channel_manifest("second-owner"))
+            .is_err(),
+        "a second plugin must not claim an owned payload channel"
+    );
+    endpoint.unregister_plugin_routes("first-owner");
+    endpoint
+        .register_plugin_routes(&script_channel_manifest("second-owner"))
+        .expect("released channel re-registers to a new owner");
+    endpoint.unregister_plugin_routes("second-owner");
+}
 #[tokio::test]
 async fn play_script_boundary_carries_lifecycle_chat_tick_and_targeted_reply() {
     let (addr, mut endpoint) = start_server_with_scripts().await;
@@ -1080,7 +1099,7 @@ async fn plugin_owned_command_argument_limits_do_not_terminate_play_ingress() {
     .declare_player_command_root("owned")
     .validate()
     .unwrap();
-    endpoint.register_player_commands(&manifest).unwrap();
+    endpoint.register_plugin_routes(&manifest).unwrap();
     recv_script_event(&mut endpoint, |event| {
         matches!(event.kind(), ScriptEventKind::ServerStarted)
     })
@@ -1595,103 +1614,218 @@ async fn lua_player_command_context_distinguishes_operator_and_exposes_identity_
 }
 
 #[tokio::test]
-async fn play_extension_disconnect_command_disconnects_player() {
-    let (addr, endpoint) = start_server_with_extension().await;
+async fn play_script_disconnect_command_disconnects_player() {
+    let (addr, mut endpoint) = start_server_with_script_payloads().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtKick").await;
 
-    let joined = recv_extension_event(&endpoint).await;
-    let InboundEvent::PlayerJoined { player_id, .. } = joined else {
+    let joined = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerJoined { .. })
+    })
+    .await;
+    let ScriptEventKind::PlayerJoined { player_id, .. } = joined.kind() else {
         panic!("expected PlayerJoined event, got {joined:?}");
     };
+    let player_id = *player_id;
 
     endpoint
-        .try_submit_command(OutboundCommand::DisconnectPlayer {
+        .try_submit_command(ScriptCommand::DisconnectPlayer {
             player_id,
-            reason: "extension requested disconnect".to_owned(),
+            reason: "script requested disconnect".to_owned(),
         })
         .unwrap();
 
     let disconnect = read_play_disconnect(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(
-        disconnect_text(&disconnect),
-        "extension requested disconnect"
-    );
+    assert_eq!(disconnect_text(&disconnect), "script requested disconnect");
 
-    let left = recv_extension_event(&endpoint).await;
-    assert_eq!(
-        left,
-        InboundEvent::PlayerLeft {
-            player_id,
-            reason: "disconnected".to_owned(),
-        }
-    );
+    let left = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerLeft { .. })
+    })
+    .await;
+    assert_eq!(left, ScriptEvent::player_left(player_id, "disconnected"));
 }
 
 #[tokio::test]
-async fn play_extension_custom_payload_command_reaches_player() {
-    let (addr, endpoint) = start_server_with_extension().await;
+async fn lua_script_payload_round_trip_reaches_player() {
+    let plugins = tempfile::tempdir().unwrap();
+    let plugin = plugins.path().join("echo");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "echo"
+            name = "Echo"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.joined", "player.custom_payload"]
+            capabilities = ["custom_payload:solaris:test"]
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            --!strict
+
+            function on_player_joined(event: any)
+                solaris.send_custom_payload(event.player_id, "solaris:test", "server-payload")
+            end
+
+            function on_player_custom_payload(event: any)
+                solaris.send_custom_payload(event.player_id, event.channel, event.payload)
+            end
+        "#,
+    )
+    .unwrap();
+    let (boundary, host) =
+        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let config = script_server_config(shutdown.clone());
+    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    let server = tokio::spawn(async move { bound.serve().await });
+
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
-    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtPayloadOut").await;
-
-    let joined = recv_extension_event(&endpoint).await;
-    let InboundEvent::PlayerJoined { player_id, .. } = joined else {
-        panic!("expected PlayerJoined event, got {joined:?}");
-    };
-
-    endpoint
-        .try_submit_command(OutboundCommand::SendCustomPayload {
-            player_id,
-            channel: EXTENSION_CHANNEL.to_owned(),
-            payload: bytes::Bytes::from_static(b"server-payload"),
-        })
-        .unwrap();
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "EchoPlayer").await;
 
     let payload = read_play_custom_payload(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         payload,
         ClientboundCustomPayload {
             payload: CustomPayload::Unknown {
-                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
                 payload: b"server-payload".to_vec(),
             },
         }
     );
 
+    // Binary bodies must survive the Luau round-trip byte-for-byte.
+    let binary = vec![0x00, 0xff, 0x01, 0x80, 0xfe, 0x42, 0x7f];
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
+                payload: binary.clone(),
+            },
+        },
+        compression,
+    )
+    .await;
+    let echo = read_play_custom_payload(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        echo,
+        ClientboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
+                payload: binary,
+            },
+        }
+    );
+
     drop(stream);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server did not stop within 2s")
+        .expect("server task failed")
+        .expect("server returned an error");
+    let report = tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task failed")
+        .expect("Lua host thread panicked");
+    assert!(
+        report.disabled_plugins().is_empty(),
+        "admitted payload round-trip must not disable the plugin, got {:?}",
+        report.disabled_plugins()
+    );
 }
 
 #[tokio::test]
-async fn play_extension_oversized_custom_payload_command_is_rejected() {
-    let (addr, endpoint) = start_server_with_extension().await;
+async fn lua_script_oversized_payload_is_rejected_before_the_wire() {
+    let plugins = tempfile::tempdir().unwrap();
+    let plugin = plugins.path().join("oversized");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "oversized"
+            name = "Oversized"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.joined"]
+            capabilities = ["custom_payload:solaris:test"]
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            --!strict
+
+            function on_player_joined(event: any)
+                local accepted = pcall(function()
+                    solaris.send_custom_payload(event.player_id, "solaris:test", string.rep("x", 32769))
+                end)
+                assert(not accepted, "oversized payload was admitted")
+                solaris.send_custom_payload(event.player_id, "solaris:test", "bounded")
+            end
+        "#,
+    )
+    .unwrap();
+    let (boundary, host) =
+        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let config = script_server_config(shutdown.clone());
+    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    let server = tokio::spawn(async move { bound.serve().await });
+
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
-    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtPayloadBig").await;
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PayloadBig").await;
 
-    let joined = recv_extension_event(&endpoint).await;
-    let InboundEvent::PlayerJoined { player_id, .. } = joined else {
-        panic!("expected PlayerJoined event, got {joined:?}");
-    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+            if frame.id == ClientboundCustomPayload::ID {
+                let packet = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+                assert_eq!(
+                    packet.payload,
+                    CustomPayload::Unknown {
+                        channel: Identifier::parse("solaris:test").unwrap(),
+                        payload: b"bounded".to_vec(),
+                    },
+                    "only the valid payload following rejection may reach the wire"
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .expect("valid payload after the rejected oversized send was not delivered");
 
-    endpoint
-        .try_submit_command(OutboundCommand::SendCustomPayload {
-            player_id,
-            channel: EXTENSION_CHANNEL.to_owned(),
-            payload: bytes::Bytes::from(vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES]),
-        })
-        .unwrap();
-    endpoint
-        .try_submit_command(OutboundCommand::DisconnectPlayer {
-            player_id,
-            reason: "after rejected payload".to_owned(),
-        })
-        .unwrap();
-
-    let disconnect =
-        read_play_disconnect_rejecting_custom_payload(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(disconnect_text(&disconnect), "after rejected payload");
+    drop(stream);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server did not stop within 2s")
+        .expect("server task failed")
+        .expect("server returned an error");
+    let report = tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task failed")
+        .expect("Lua host thread panicked");
+    assert!(
+        report.disabled_plugins().is_empty(),
+        "a caught payload validation error must not disable the plugin: {:?}",
+        report.disabled_plugins()
+    );
 }
 
 #[tokio::test]

@@ -10,6 +10,9 @@ use mc_protocol::packets::play::{
 };
 use mc_test_harness::client::Client;
 
+#[path = "support/combat_world.rs"]
+mod combat_world;
+
 const VIEW_DISTANCE: i32 = 2;
 const SLOWNESS_EFFECT_ID_26_1_2: u32 = 2;
 const POISON_EFFECT_ID_26_1_2: u32 = 19;
@@ -22,12 +25,7 @@ async fn embedded_witch_throws_status_potion_that_splashes_and_discards_over_tcp
         mc_world::BlockRegistry::from_report(&blocks_report)
             .expect("build embedded block registry"),
     );
-    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
-        Arc::clone(&blocks),
-        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    )
-    .with_generator(generator);
+    let storage = combat_world::world(&blocks, &blocks_report, VIEW_DISTANCE);
     let items = Arc::new(mc_data::items::solaris_required_items());
     let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     let witch_type_id = entity_type_id(&entity_types, "minecraft:witch");

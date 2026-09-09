@@ -19,8 +19,8 @@ use mc_protocol::codec::ReadMc;
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
-    AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
-    ServerboundKnownPacks, UpdateTags,
+    AcknowledgeFinishConfiguration, ClientboundCustomPayload, ClientboundKnownPacks,
+    FinishConfiguration, RegistryData, ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
@@ -292,6 +292,11 @@ impl Client {
                 continue;
             }
             if frame.id == UpdateTags::ID {
+                continue;
+            }
+            if frame.id == ClientboundCustomPayload::ID {
+                // The server brand is published immediately before
+                // FinishConfiguration.
                 continue;
             }
             if frame.id == FinishConfiguration::ID {

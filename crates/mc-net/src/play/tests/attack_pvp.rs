@@ -89,7 +89,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_speed(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
         ),
         4.0,
     );
@@ -97,7 +97,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             Some(100),
             102,
         ),
@@ -107,7 +107,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             Some(100),
             105,
         ),
@@ -117,7 +117,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             None,
             0,
         ),
@@ -135,7 +135,7 @@ fn sword_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_speed(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
         ),
         1.6,
     );
@@ -143,7 +143,7 @@ fn sword_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             Some(100),
             106,
         ),
@@ -153,7 +153,7 @@ fn sword_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             Some(100),
             112,
         ),
@@ -170,7 +170,7 @@ fn axe_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_speed(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
         ),
         0.8,
     );
@@ -178,7 +178,7 @@ fn axe_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             Some(100),
             112,
         ),
@@ -188,7 +188,7 @@ fn axe_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             Some(100),
             125,
         ),
@@ -206,7 +206,7 @@ fn attack_damage_scales_all_playable_modes_without_recording_before_validation()
         let damage = begin_player_attack_attempt(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             game_mode,
             state.last_entity_attack_tick,
             106,
@@ -222,7 +222,7 @@ fn attack_damage_scales_all_playable_modes_without_recording_before_validation()
         begin_player_attack_attempt(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot).unwrap(),
+            state.inventory.held(state.selected_hotbar_slot()).unwrap(),
             GameMode::Spectator,
             state.last_entity_attack_tick,
             106,

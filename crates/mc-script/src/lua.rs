@@ -22,20 +22,19 @@ mod worldgen_tests;
 use crate::{
     CommandBatch, CommandBatchError, CommandCapabilities, HostCommandAdmission,
     MAX_ONLINE_PLAYER_QUERY_LIMIT, MAX_SCRIPT_CHAT_MESSAGE_BYTES,
-    MAX_SCRIPT_DISCONNECT_REASON_BYTES, PlayerCommandRegistrationError, RuntimeContext,
-    RuntimeError, RuntimeResult, ScriptApiVersion, ScriptAxisAlignedZone,
-    ScriptBatchSubmissionError, ScriptBoundary, ScriptCommand, ScriptDtoError,
-    ScriptEntityDamageRequest, ScriptEvent, ScriptEventKind, ScriptHostEndpoint, ScriptHostInput,
-    ScriptInventoryMenu, ScriptInventoryMenuItem, ScriptInventoryMenuSlot,
-    ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction,
+    MAX_SCRIPT_DISCONNECT_REASON_BYTES, RuntimeContext, RuntimeError, RuntimeResult,
+    ScriptApiVersion, ScriptAxisAlignedZone, ScriptBatchSubmissionError, ScriptBoundary,
+    ScriptCommand, ScriptDtoError, ScriptEntityDamageRequest, ScriptEvent, ScriptEventKind,
+    ScriptHostEndpoint, ScriptHostInput, ScriptInventoryMenu, ScriptInventoryMenuItem,
+    ScriptInventoryMenuSlot, ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction,
     ScriptLoaderBlockPlacementRequest, ScriptLoaderItemGrantRequest, ScriptOnlinePlayersRequest,
     ScriptPlayerId, ScriptPlayerInventoryTransaction, ScriptPlayerTeleportRequest,
     ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
     ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition,
-    ScriptReloadCommitError, ScriptRuntime, ScriptStorageMutation, ScriptVillagerBindingRequest,
-    ScriptVillagerGoal, ScriptVillagerGoalRequest, ScriptWorldBlockSetRequest,
-    ScriptWorldTimeSetRequest, ScriptZoneProtection, ValidatedScriptPluginManifest,
-    script_boundary_pair,
+    ScriptReloadCommitError, ScriptRouteRegistrationError, ScriptRuntime, ScriptStorageMutation,
+    ScriptVillagerBindingRequest, ScriptVillagerGoal, ScriptVillagerGoalRequest,
+    ScriptVillagerReleaseRequest, ScriptWorldBlockSetRequest, ScriptWorldTimeSetRequest,
+    ScriptZoneProtection, ValidatedScriptPluginManifest, script_boundary_pair,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 1_024;
@@ -70,37 +69,6 @@ const MAX_PLUGIN_TIMER_CALLBACKS_PER_TICK: usize = 8;
 const MAX_PLUGIN_TIMER_DELAY_TICKS: u64 = 630_720_000;
 const MAX_PLUGIN_DISABLE_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 const SOLARIS_LUAU_PRELUDE: &str = "local solaris: any = nil :: any\n";
-
-/// One server-embedded Luau plugin package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BundledLuauPlugin {
-    directory_name: &'static str,
-    manifest: &'static str,
-    config: Option<&'static str>,
-    source: &'static str,
-}
-
-impl BundledLuauPlugin {
-    #[must_use]
-    pub const fn new(
-        directory_name: &'static str,
-        manifest: &'static str,
-        source: &'static str,
-    ) -> Self {
-        Self {
-            directory_name,
-            manifest,
-            config: None,
-            source,
-        }
-    }
-
-    #[must_use]
-    pub const fn with_config(mut self, config: &'static str) -> Self {
-        self.config = Some(config);
-        self
-    }
-}
 
 /// Filesystem configuration for the built-in Luau plugin host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,7 +239,7 @@ impl LuaPluginDisableDiagnostic {
 pub enum LuaHostExitReason {
     EventQueueClosed,
     CommandQueueClosed,
-    PlayerCommandAuthorityUnavailable,
+    PluginRouteAuthorityUnavailable,
     ProgressObserverClosed,
     StartupAborted,
 }
@@ -282,7 +250,7 @@ impl LuaHostExitReason {
         match self {
             Self::EventQueueClosed => "event_queue_closed",
             Self::CommandQueueClosed => "command_queue_closed",
-            Self::PlayerCommandAuthorityUnavailable => "player_command_authority_unavailable",
+            Self::PluginRouteAuthorityUnavailable => "plugin_route_authority_unavailable",
             Self::ProgressObserverClosed => "progress_observer_closed",
             Self::StartupAborted => "startup_aborted",
         }
@@ -557,9 +525,10 @@ impl LuaClientLoader {
 pub enum LuaClientContentKind {
     Blocks,
     Items,
-    Screens,
+    Ui,
     Assets,
     Interactions,
+    Sounds,
 }
 
 impl LuaClientContentKind {
@@ -568,9 +537,10 @@ impl LuaClientContentKind {
         match self {
             Self::Blocks => "blocks",
             Self::Items => "items",
-            Self::Screens => "screens",
+            Self::Ui => "ui",
             Self::Assets => "assets",
             Self::Interactions => "interactions",
+            Self::Sounds => "sounds",
         }
     }
 
@@ -578,9 +548,10 @@ impl LuaClientContentKind {
         match self {
             Self::Blocks => LuaClientPermission::RegisterBlocks,
             Self::Items => LuaClientPermission::RegisterItems,
-            Self::Screens => LuaClientPermission::OpenScreens,
+            Self::Ui => LuaClientPermission::PresentUi,
             Self::Assets => LuaClientPermission::LoadAssets,
             Self::Interactions => LuaClientPermission::SendInteractions,
+            Self::Sounds => LuaClientPermission::PlaySounds,
         }
     }
 }
@@ -590,9 +561,10 @@ impl LuaClientContentKind {
 pub enum LuaClientPermission {
     RegisterBlocks,
     RegisterItems,
-    OpenScreens,
+    PresentUi,
     LoadAssets,
     SendInteractions,
+    PlaySounds,
 }
 
 impl LuaClientPermission {
@@ -601,9 +573,10 @@ impl LuaClientPermission {
         match self {
             Self::RegisterBlocks => "register_blocks",
             Self::RegisterItems => "register_items",
-            Self::OpenScreens => "open_screens",
+            Self::PresentUi => "present_ui",
             Self::LoadAssets => "load_assets",
             Self::SendInteractions => "send_interactions",
+            Self::PlaySounds => "play_sounds",
         }
     }
 }
@@ -1208,48 +1181,6 @@ pub fn prepare_lua_plugins(config: LuaHostConfig) -> Result<PreparedLuaPlugins, 
     )
 }
 
-pub fn prepare_bundled_luau_plugins(
-    plugins: &[BundledLuauPlugin],
-) -> Result<PreparedLuaPlugins, LuaHostError> {
-    if plugins.is_empty() {
-        return prepare_plugin_sources(Vec::new());
-    }
-    let staging = tempfile::tempdir().map_err(|error| LuaHostError::Io {
-        path: std::env::temp_dir(),
-        message: format!("creating bundled Luau plugin staging directory: {error}"),
-    })?;
-    for plugin in plugins {
-        validate_settlement_descriptor_id(plugin.directory_name, "bundled plugin directory")
-            .map_err(|message| LuaHostError::InvalidStartupPlugin {
-                path: PathBuf::from(plugin.directory_name),
-                message,
-            })?;
-        let directory = staging.path().join(plugin.directory_name);
-        fs::create_dir(&directory).map_err(|error| LuaHostError::Io {
-            path: directory.clone(),
-            message: error.to_string(),
-        })?;
-        for (name, contents) in [
-            ("plugin.toml", plugin.manifest),
-            ("main.lua", plugin.source),
-        ] {
-            let path = directory.join(name);
-            fs::write(&path, contents).map_err(|error| LuaHostError::Io {
-                path,
-                message: error.to_string(),
-            })?;
-        }
-        if let Some(config) = plugin.config {
-            let path = directory.join("config.toml");
-            fs::write(&path, config).map_err(|error| LuaHostError::Io {
-                path,
-                message: error.to_string(),
-            })?;
-        }
-    }
-    prepare_lua_plugins(LuaHostConfig::new(staging.path()))
-}
-
 fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugins, LuaHostError> {
     let sources = order_plugin_sources(sources)?;
     let mut selected_ore = None;
@@ -1542,9 +1473,10 @@ enum DiskClientLoader {
 enum DiskClientContentKind {
     Blocks,
     Items,
-    Screens,
+    Ui,
     Assets,
     Interactions,
+    Sounds,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1552,9 +1484,10 @@ enum DiskClientContentKind {
 enum DiskClientPermission {
     RegisterBlocks,
     RegisterItems,
-    OpenScreens,
+    PresentUi,
     LoadAssets,
     SendInteractions,
+    PlaySounds,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1933,9 +1866,10 @@ fn materialize_client_bundles(
             bundle.content.into_iter().map(|content| match content {
                 DiskClientContentKind::Blocks => LuaClientContentKind::Blocks,
                 DiskClientContentKind::Items => LuaClientContentKind::Items,
-                DiskClientContentKind::Screens => LuaClientContentKind::Screens,
+                DiskClientContentKind::Ui => LuaClientContentKind::Ui,
                 DiskClientContentKind::Assets => LuaClientContentKind::Assets,
                 DiskClientContentKind::Interactions => LuaClientContentKind::Interactions,
+                DiskClientContentKind::Sounds => LuaClientContentKind::Sounds,
             }),
             "content",
             &bundle.id,
@@ -1947,9 +1881,10 @@ fn materialize_client_bundles(
                 .map(|permission| match permission {
                     DiskClientPermission::RegisterBlocks => LuaClientPermission::RegisterBlocks,
                     DiskClientPermission::RegisterItems => LuaClientPermission::RegisterItems,
-                    DiskClientPermission::OpenScreens => LuaClientPermission::OpenScreens,
+                    DiskClientPermission::PresentUi => LuaClientPermission::PresentUi,
                     DiskClientPermission::LoadAssets => LuaClientPermission::LoadAssets,
                     DiskClientPermission::SendInteractions => LuaClientPermission::SendInteractions,
+                    DiskClientPermission::PlaySounds => LuaClientPermission::PlaySounds,
                 }),
             "permissions",
             &bundle.id,
@@ -2435,6 +2370,9 @@ fn declare_disk_capability(
         "entity_damage" => Ok(manifest.declare_entity_damage()),
         "world_time" => Ok(manifest.declare_world_time()),
         "world_blocks" => Ok(manifest.declare_world_blocks()),
+        channel if channel.starts_with("custom_payload:") => {
+            Ok(manifest.declare_custom_payload_channel(&channel["custom_payload:".len()..]))
+        }
         _ => Err(format!("unknown plugin capability {capability:?}")),
     }
 }
@@ -2632,11 +2570,11 @@ fn run_lua_host_inner(
             warn!(plugin = %plugin_id, "Lua plugin skipped because its id is already loaded");
             continue;
         }
-        if let Err(error) = endpoint.register_player_commands(&source.manifest) {
+        if let Err(error) = endpoint.register_plugin_routes(&source.manifest) {
             if strict_startup {
                 let _ = startup.send(Err(LuaHostError::StrictStartupPlugin {
                     id: plugin_id,
-                    message: format!("registering player commands: {error:?}"),
+                    message: format!("registering plugin routes: {error:?}"),
                 }));
                 return LuaHostExitReport::new(
                     plugins.len(),
@@ -2645,7 +2583,7 @@ fn run_lua_host_inner(
                 );
             }
             match error {
-                PlayerCommandRegistrationError::RootConflict {
+                ScriptRouteRegistrationError::RootConflict {
                     root,
                     owner_plugin_id,
                 } => warn!(
@@ -2654,19 +2592,34 @@ fn run_lua_host_inner(
                     owner = %owner_plugin_id,
                     "Lua plugin skipped because its player command root is already owned"
                 ),
-                PlayerCommandRegistrationError::RootLimitExceeded { limit, requested } => warn!(
+                ScriptRouteRegistrationError::ChannelConflict {
+                    channel,
+                    owner_plugin_id,
+                } => warn!(
+                    plugin = %plugin_id,
+                    %channel,
+                    owner = %owner_plugin_id,
+                    "Lua plugin skipped because its custom payload channel is already owned"
+                ),
+                ScriptRouteRegistrationError::RootLimitExceeded { limit, requested } => warn!(
                     plugin = %plugin_id,
                     limit,
                     requested,
                     "Lua plugin skipped because the aggregate player command limit was exceeded"
                 ),
-                PlayerCommandRegistrationError::AuthorityPoisoned => {
-                    warn!("Lua host disabled because player-command authority was poisoned");
+                ScriptRouteRegistrationError::ChannelLimitExceeded { limit, requested } => warn!(
+                    plugin = %plugin_id,
+                    limit,
+                    requested,
+                    "Lua plugin skipped because the aggregate custom payload channel limit was exceeded"
+                ),
+                ScriptRouteRegistrationError::AuthorityPoisoned => {
+                    warn!("Lua host disabled because plugin-route authority was poisoned");
                     let _ = startup.send(Ok(0));
                     return LuaHostExitReport::new(
                         0,
                         disabled_plugins,
-                        LuaHostExitReason::PlayerCommandAuthorityUnavailable,
+                        LuaHostExitReason::PluginRouteAuthorityUnavailable,
                     );
                 }
             }
@@ -2679,7 +2632,7 @@ fn run_lua_host_inner(
                 plugins.push(plugin);
             }
             Err(error) => {
-                endpoint.unregister_player_commands(&plugin_id);
+                endpoint.unregister_plugin_routes(&plugin_id);
                 if strict_startup {
                     let _ = startup.send(Err(LuaHostError::StrictStartupPlugin {
                         id: plugin_id,
@@ -2791,7 +2744,7 @@ fn run_lua_host_inner(
                 Ok(batch) => batch,
                 Err(error) => {
                     warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after handler failure");
-                    endpoint.unregister_player_commands(&plugin.id);
+                    endpoint.unregister_plugin_routes(&plugin.id);
                     plugin.disabled = true;
                     disabled_plugins.push(LuaPluginDisableDiagnostic::new(
                         plugin.id.clone(),
@@ -2817,7 +2770,7 @@ fn run_lua_host_inner(
                         plugin.notify_batch_rejected("queue_full", command_count, timeout)
                     {
                         warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after batch-rejection handler failure");
-                        endpoint.unregister_player_commands(&plugin.id);
+                        endpoint.unregister_plugin_routes(&plugin.id);
                         plugin.disabled = true;
                         disabled_plugins.push(LuaPluginDisableDiagnostic::new(
                             plugin.id.clone(),
@@ -2840,7 +2793,7 @@ fn run_lua_host_inner(
                 }
                 Err(ScriptBatchSubmissionError::Rejected { error, .. }) => {
                     warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after command admission rejection");
-                    endpoint.unregister_player_commands(&plugin.id);
+                    endpoint.unregister_plugin_routes(&plugin.id);
                     plugin.disabled = true;
                     disabled_plugins.push(LuaPluginDisableDiagnostic::new(
                         plugin.id.clone(),
@@ -3158,6 +3111,11 @@ impl LuaScriptRuntime {
             if target_plugin_id != self.manifest.plugin_id() {
                 return Ok(context.command_batch());
             }
+            if let ScriptEventKind::CustomPayload { channel, .. } = event.kind()
+                && !self.capabilities.allows_custom_payload_channel(channel)
+            {
+                return Ok(context.command_batch());
+            }
         } else if !self
             .manifest
             .event_subscriptions()
@@ -3448,23 +3406,108 @@ fn install_solaris_api(
         )?,
     )?;
     let open_menu_invocation = Arc::clone(&invocation);
-    let open_client_screen_invocation = Arc::clone(&invocation);
+    let present_client_ui_invocation = Arc::clone(&invocation);
     api.set(
-        "open_client_screen",
-        lua.create_function(move |_, (player_id, screen_id): (u64, LuaString)| {
-            let screen_id = bounded_lua_string(
-                screen_id,
-                "screen_id",
+        "present_client_ui",
+        lua.create_function(
+            move |_, (player_id, ui_id, options): (u64, LuaString, Table)| {
+                validate_record_shape(&options, &["mode", "title", "body"], "client UI")?;
+                let mode = match options.raw_get::<Value>("mode")? {
+                    Value::String(mode) => match mode.as_bytes().as_ref() {
+                        b"screen" => crate::ScriptClientUiMode::Screen,
+                        b"hud" => crate::ScriptClientUiMode::Hud,
+                        b"hidden" => crate::ScriptClientUiMode::Hidden,
+                        _ => return Err(lua_input_error("UI mode", "invalid")),
+                    },
+                    _ => return Err(lua_input_error("UI mode", "type")),
+                };
+                if ui_id.as_bytes().len() > crate::MAX_SCRIPT_RESOURCE_ID_BYTES {
+                    return Err(lua_input_error("ui_id", "too_long"));
+                }
+                let ui_id = ui_id
+                    .to_str()
+                    .map_err(|_| lua_input_error("ui_id", "utf8"))?;
+                let title = raw_optional_bounded_string_field(
+                    &options,
+                    "title",
+                    "UI title",
+                    crate::MAX_CLIENT_UI_TITLE_BYTES,
+                    true,
+                )?;
+                let body = raw_optional_bounded_string_field(
+                    &options,
+                    "body",
+                    "UI body",
+                    crate::MAX_CLIENT_UI_BODY_BYTES,
+                    true,
+                )?;
+                let presentation =
+                    crate::ScriptClientUiPresentation::try_new(&ui_id, mode, title, body)
+                        .map_err(dto_error)?;
+                push_command(
+                    &present_client_ui_invocation,
+                    ScriptCommand::PresentClientUi {
+                        player_id: ScriptPlayerId::new(player_id),
+                        presentation,
+                    },
+                )
+            },
+        )?,
+    )?;
+    let play_client_sound_invocation = Arc::clone(&invocation);
+    api.set(
+        "play_client_sound",
+        lua.create_function(
+            move |_, (player_id, sound_id, options): (u64, LuaString, Table)| {
+                validate_record_shape(&options, &["volume", "pitch", "position"], "client sound")?;
+                let sound_id = bounded_lua_string(
+                    sound_id,
+                    "sound_id",
+                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
+                let volume = options.raw_get::<Option<f32>>("volume")?.unwrap_or(1.0);
+                let pitch = options.raw_get::<Option<f32>>("pitch")?.unwrap_or(1.0);
+                let position = options
+                    .raw_get::<Option<Table>>("position")?
+                    .map(|position| {
+                        validate_record_shape(&position, &["x", "y", "z"], "sound position")?;
+                        ScriptPosition::try_new(
+                            position.raw_get("x")?,
+                            position.raw_get("y")?,
+                            position.raw_get("z")?,
+                        )
+                        .ok_or_else(|| dto_error(ScriptDtoError::InvalidBounds))
+                    })
+                    .transpose()?;
+                let sound = crate::ScriptClientSound::play(&sound_id, volume, pitch, position)
+                    .map_err(dto_error)?;
+                push_command(
+                    &play_client_sound_invocation,
+                    ScriptCommand::ClientSound {
+                        player_id: ScriptPlayerId::new(player_id),
+                        sound,
+                    },
+                )
+            },
+        )?,
+    )?;
+    let stop_client_sound_invocation = Arc::clone(&invocation);
+    api.set(
+        "stop_client_sound",
+        lua.create_function(move |_, (player_id, sound_id): (u64, LuaString)| {
+            let sound_id = bounded_lua_string(
+                sound_id,
+                "sound_id",
                 crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
                 false,
             )?;
-            crate::validate_script_resource_id(&screen_id)
-                .map_err(|_| lua_input_error("screen_id", "invalid"))?;
+            let sound = crate::ScriptClientSound::stop(&sound_id).map_err(dto_error)?;
             push_command(
-                &open_client_screen_invocation,
-                ScriptCommand::OpenClientScreen {
+                &stop_client_sound_invocation,
+                ScriptCommand::ClientSound {
                     player_id: ScriptPlayerId::new(player_id),
-                    screen_id,
+                    sound,
                 },
             )
         })?,
@@ -3844,6 +3887,51 @@ fn install_solaris_api(
                 push_command(
                     &move_villager_invocation,
                     ScriptCommand::SetVillagerGoal { request },
+                )
+            },
+        )?,
+    )?;
+    let release_villager_invocation = Arc::clone(&invocation);
+    api.set(
+        "release_villager_binding",
+        lua.create_function(
+            move |_, (request_id, binding_token): (LuaString, LuaString)| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let binding_token = bounded_script_id(binding_token, "binding_token")?;
+                let request = ScriptVillagerReleaseRequest::try_new(request_id, binding_token)
+                    .map_err(dto_error)?;
+                push_command(
+                    &release_villager_invocation,
+                    ScriptCommand::ReleaseVillagerBinding { request },
+                )
+            },
+        )?,
+    )?;
+    let send_payload_invocation = Arc::clone(&invocation);
+    api.set(
+        "send_custom_payload",
+        lua.create_function(
+            move |_, (player_id, channel, payload): (u64, LuaString, LuaString)| {
+                let channel = bounded_lua_string(
+                    channel,
+                    "custom_payload_channel",
+                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
+                crate::validate_contract_resource_id(&channel)
+                    .map_err(|_| lua_input_error("custom_payload_channel", "invalid"))?;
+                let payload = payload.as_bytes();
+                if payload.len() > crate::MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
+                    return Err(lua_input_error("custom_payload", "too_long"));
+                }
+                let payload = payload.to_vec();
+                push_command(
+                    &send_payload_invocation,
+                    ScriptCommand::SendCustomPayload {
+                        player_id: ScriptPlayerId::new(player_id),
+                        channel,
+                        payload,
+                    },
                 )
             },
         )?,
@@ -4659,14 +4747,39 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             }
             table.set("speed", goal.speed())?;
         }
+        ScriptEventKind::VillagerReleaseResult {
+            request_id,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("accepted", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
         ScriptEventKind::LoaderInteraction {
             player_id,
             interaction_id,
+            phase,
             payload,
         } => {
             table.set("player_id", player_id.value())?;
             table.set("interaction_id", interaction_id.as_str())?;
+            table.set("phase", phase.as_str())?;
             table.set("payload", payload.as_str())?;
+        }
+        ScriptEventKind::ClientBrand { player_id, brand } => {
+            table.set("player_id", player_id.value())?;
+            table.set("brand", brand.as_str())?;
+        }
+        ScriptEventKind::CustomPayload {
+            player_id,
+            phase,
+            channel,
+            payload,
+        } => {
+            table.set("player_id", player_id.value())?;
+            table.set("phase", phase.as_str())?;
+            table.set("channel", channel.as_str())?;
+            table.set("payload", lua.create_string(payload)?)?;
         }
     }
     Ok(table)
@@ -4722,7 +4835,10 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::OnlinePlayersResult { .. } => "on_player_online_result",
         ScriptEventKind::VillagerBindingResult { .. } => "on_villager_binding_result",
         ScriptEventKind::VillagerGoalResult { .. } => "on_villager_goal_result",
+        ScriptEventKind::VillagerReleaseResult { .. } => "on_villager_release_result",
         ScriptEventKind::LoaderInteraction { .. } => "on_loader_interaction",
+        ScriptEventKind::ClientBrand { .. } => "on_player_client_brand",
+        ScriptEventKind::CustomPayload { .. } => "on_player_custom_payload",
     }
 }
 
@@ -4781,6 +4897,21 @@ mod tests {
             .unwrap()
     }
 
+    /// Package directory from the independent `solaris-default-plugins` sibling
+    /// checkout. Fails loudly instead of skipping: behavior coverage must run
+    /// against the real packages, and a missing checkout is a setup error.
+    fn sibling_plugin_dir(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../solaris-default-plugins")
+            .join(name);
+        assert!(
+            dir.is_dir(),
+            "sibling plugin checkout missing at {}: clone solaris-default-plugins next to solaris",
+            dir.display()
+        );
+        dir
+    }
+
     fn world_time_manifest(events: &[&str]) -> ValidatedScriptPluginManifest {
         let mut manifest =
             ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
@@ -4805,6 +4936,16 @@ mod tests {
         let mut manifest =
             ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
                 .declare_entity_damage();
+        for event in events {
+            manifest = manifest.subscribe_event(*event);
+        }
+        manifest.validate().unwrap()
+    }
+
+    fn payload_manifest(events: &[&str]) -> ValidatedScriptPluginManifest {
+        let mut manifest =
+            ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
+                .declare_custom_payload_channel("test-plugin:telemetry");
         for event in events {
             manifest = manifest.subscribe_event(*event);
         }
@@ -5318,40 +5459,202 @@ capabilities = ["entity_damage"]
     }
 
     #[test]
-    fn targeted_loader_interaction_reaches_only_its_owner_handler() {
+    fn loader_input_phases_drive_plugin_state() {
         let mut runtime = LuaScriptRuntime::from_source(
             manifest(&[]),
             r#"
+                local held = {}
                 function on_loader_interaction(event)
-                    solaris.send_message(
-                        event.player_id,
-                        event.interaction_id .. "=" .. event.payload)
+                    if event.phase == "press" then
+                        held[event.player_id] = true
+                    elseif event.phase == "release" and held[event.player_id] then
+                        held[event.player_id] = nil
+                        solaris.send_message(event.player_id, "released")
+                    end
                 end
             "#,
             LuaRuntimeLimits::default(),
         )
         .unwrap();
         let controls = RuntimeControls::unrestricted();
-        let event = ScriptEvent::loader_interaction(
-            "test-plugin",
-            ScriptPlayerId::new(7),
-            "test-plugin:continue",
-            "accepted",
+        use crate::ScriptLoaderInteractionPhase::{Press, Release};
+        for (phase, emits_message) in [
+            (Release, false),
+            (Press, false),
+            (Release, true),
+            (Release, false),
+        ] {
+            let event = ScriptEvent::loader_interaction(
+                "test-plugin",
+                ScriptPlayerId::new(7),
+                "test-plugin:continue",
+                phase,
+                "",
+            )
+            .unwrap();
+            let batch = runtime
+                .handle_event(
+                    &event,
+                    RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+                )
+                .unwrap();
+            if emits_message {
+                assert_eq!(
+                    batch.commands(),
+                    &[ScriptCommand::SendChatMessage {
+                        player_id: ScriptPlayerId::new(7),
+                        message: "released".to_owned(),
+                    }]
+                );
+            } else {
+                assert!(batch.commands().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn custom_payload_binary_round_trip_through_handler() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            payload_manifest(&["player.custom_payload"]),
+            r#"
+                function on_player_custom_payload(event)
+                    assert(event.player_id == 7)
+                    assert(event.channel == "test-plugin:telemetry")
+                    if event.phase == "play" then
+                        assert(#event.payload == 4)
+                        assert(event.payload:byte(1) == 0)
+                        assert(event.payload:byte(2) == 255)
+                        assert(event.payload:byte(3) == 0x42)
+                        assert(event.payload:byte(4) == 0)
+                    else
+                        assert(event.phase == "configuration")
+                        assert(#event.payload == 3)
+                    end
+                    solaris.send_custom_payload(event.player_id, event.channel, event.phase)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
         )
         .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let context = RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap());
 
+        let play = ScriptEvent::custom_payload(
+            "test-plugin",
+            ScriptPlayerId::new(7),
+            crate::ScriptProtocolPhase::Play,
+            "test-plugin:telemetry",
+            vec![0x00, 0xff, 0x42, 0x00],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.handle_event(&play, context).unwrap().commands(),
+            &[ScriptCommand::SendCustomPayload {
+                player_id: ScriptPlayerId::new(7),
+                channel: "test-plugin:telemetry".to_owned(),
+                payload: b"play".to_vec(),
+            }]
+        );
+
+        let configuration = ScriptEvent::custom_payload(
+            "test-plugin",
+            ScriptPlayerId::new(7),
+            crate::ScriptProtocolPhase::Configuration,
+            "test-plugin:telemetry",
+            vec![0x01, 0x02, 0x03],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .handle_event(&configuration, context)
+                .unwrap()
+                .commands(),
+            &[ScriptCommand::SendCustomPayload {
+                player_id: ScriptPlayerId::new(7),
+                channel: "test-plugin:telemetry".to_owned(),
+                payload: b"configuration".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn custom_payload_handler_requires_declared_channel_capability() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["player.custom_payload"]),
+            r#"
+                function on_player_custom_payload(_event)
+                    solaris.broadcast("must-not-fire")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::custom_payload(
+            "test-plugin",
+            ScriptPlayerId::new(7),
+            crate::ScriptProtocolPhase::Play,
+            "test-plugin:telemetry",
+            vec![1, 2, 3],
+        )
+        .unwrap();
         let batch = runtime
             .handle_event(
                 &event,
                 RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
             )
             .unwrap();
+        assert!(batch.commands().is_empty());
+    }
 
+    #[test]
+    fn send_custom_payload_without_capability_traps() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.send_custom_payload(7, "test-plugin:telemetry", "abc")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let result = runtime.handle_event(
+            &ScriptEvent::server_tick(1),
+            RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+        );
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Trap { message })
+                if message.contains("command capability denied: custom_payload")
+        ));
+    }
+
+    #[test]
+    fn client_brand_event_reaches_subscriber() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["player.client_brand"]),
+            r#"
+                function on_player_client_brand(event)
+                    solaris.broadcast(event.player_id .. ":" .. event.brand)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::client_brand(ScriptPlayerId::new(7), "vanilla").unwrap();
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
         assert_eq!(
             batch.commands(),
-            &[ScriptCommand::SendChatMessage {
-                player_id: ScriptPlayerId::new(7),
-                message: "test-plugin:continue=accepted".to_owned(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "7:vanilla".to_owned(),
             }]
         );
     }
@@ -6364,8 +6667,7 @@ capabilities = ["entity_damage"]
 
     #[tokio::test]
     async fn shipped_basic_economy_releases_pending_read_after_batch_rejection() {
-        let examples =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/basic-economy");
+        let examples = sibling_plugin_dir("basic-economy");
         let source = read_plugin_source(&examples).unwrap();
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(2).unwrap());
@@ -6663,6 +6965,16 @@ capabilities = ["entity_damage"]
                 "solaris.move_villager_to('move', string.rep('x', 65), 0, 64, 0, 0.3)",
                 "binding_token:too_long",
             ),
+            (
+                "release_villager_binding.request_id",
+                "solaris.release_villager_binding(string.rep('x', 65), 'binding-1')",
+                "request_id:too_long",
+            ),
+            (
+                "release_villager_binding.binding",
+                "solaris.release_villager_binding('release', string.rep('x', 65))",
+                "binding_token:too_long",
+            ),
         ];
         let controls = RuntimeControls::unrestricted();
 
@@ -6948,7 +7260,7 @@ capabilities = ["entity_damage"]
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(1).unwrap());
         boundary
-            .player_command_owners
+            .plugin_routes
             .disabled
             .store(true, Ordering::Release);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
@@ -6958,7 +7270,7 @@ capabilities = ["entity_damage"]
         let report = host.join().unwrap();
         assert_eq!(
             report.exit_reason(),
-            LuaHostExitReason::PlayerCommandAuthorityUnavailable
+            LuaHostExitReason::PluginRouteAuthorityUnavailable
         );
         assert_eq!(report.loaded_plugins(), 0);
         assert_eq!(report.enabled_plugins_at_exit(), 0);
@@ -7623,7 +7935,7 @@ capabilities = ["entity_damage"]
     }
 
     #[tokio::test]
-    async fn disabled_plugin_loses_player_command_ownership_before_host_progresses() {
+    async fn disabled_plugin_loses_plugin_route_ownership_before_host_progresses() {
         let bad = PluginSource {
             manifest: command_manifest("bad", "hello"),
             config: toml::Table::new(),
@@ -8035,7 +8347,6 @@ capabilities = ["entity_damage"]
 
     #[test]
     fn example_plugins_load_against_the_contract_without_live_server_adapters() {
-        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
         let controls = RuntimeControls::unrestricted();
         for (name, expected_commands) in [
             ("basic-economy", 1_usize),
@@ -8045,7 +8356,7 @@ capabilities = ["entity_damage"]
             ("online-roster", 0_usize),
             ("settlement-prototype", 0_usize),
         ] {
-            let source = read_plugin_source(&examples.join(name)).unwrap();
+            let source = read_plugin_source(&sibling_plugin_dir(name)).unwrap();
             assert_eq!(source.manifest.requested_api_version(), SCRIPT_API_VERSION);
             let mut runtime = LuaScriptRuntime::from_source_with_config(
                 source.manifest,
@@ -8066,8 +8377,7 @@ capabilities = ["entity_damage"]
 
     #[test]
     fn online_roster_recovers_rejected_queries_and_bounds_menu_labels() {
-        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
-        let source = read_plugin_source(&examples.join("online-roster")).unwrap();
+        let source = read_plugin_source(&sibling_plugin_dir("online-roster")).unwrap();
         let mut runtime = LuaScriptRuntime::from_source_with_config(
             source.manifest,
             &source.source,

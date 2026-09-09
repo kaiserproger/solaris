@@ -2,7 +2,7 @@
   "schema_version": 1,
   "pack_id": "worldgen-seed-712816-preflight",
   "quality_label": "playable-worldgen-graphical-preflight",
-  "server_command": "SOLARIS_REAL_CLIENT_MANIFEST=docs/playable/worldgen-seed-712816-preflight.json SOLARIS_REAL_CLIENT_AGENT_SCENARIO=playable-01-join-generated-spawn SOLARIS_REAL_CLIENT_SERVER_SEED=712816 SOLARIS_REAL_CLIENT_TIMEOUT_SECONDS=240 bash tools/run-playable-client-gate.sh --run",
+  "server_command": "SOLARIS_REAL_CLIENT_MANIFEST=docs/playable/worldgen-seed-712816-preflight.json SOLARIS_REAL_CLIENT_AGENT_SCENARIO=playable-01-join-generated-spawn SOLARIS_REAL_CLIENT_SERVER_SEED=712816 SOLARIS_REAL_CLIENT_TIMEOUT_SECONDS=240 python3 -m tools.harness run playable --run",
   "client_requirement": "A real Minecraft Java 26.1.2 client must connect through the repo-native Gradle runClient adapter to a fresh world generated from playable.toml with seed 712816.",
   "forbidden_client_evidence": [
     "wire-probe",
@@ -23,8 +23,8 @@
     "server.toml"
   ],
   "automation_runner": {
-    "script": "tools/run-playable-client-gate.sh",
-    "delegates_to": "tools/run-real-client-regression.sh",
+    "script": "python3 -m tools.harness run playable",
+    "delegates_to": "tools/harness/backends/regression.sh",
     "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
     "server_config_env": "SOLARIS_REAL_CLIENT_SERVER_CONFIG",
     "server_config_value": "playable.toml",

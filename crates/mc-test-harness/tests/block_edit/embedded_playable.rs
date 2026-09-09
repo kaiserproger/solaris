@@ -8,7 +8,8 @@ async fn embedded_playable_flat_move_jump_input_and_wall_collision_behave() {
     let surface_y = top_non_air_y(&mut world, 0, 0, air_state).expect("spawn column terrain");
     let player_y = surface_y + 2;
     for x in -1..=3 {
-        for z in 8..=12 {
+        for z in 0..=12 {
+            if z >= 8 {
             world
                 .set_block_at(
                     mc_world::BlockPos {
@@ -20,6 +21,7 @@ async fn embedded_playable_flat_move_jump_input_and_wall_collision_behave() {
                 )
                 .expect("seed movement floor")
                 .expect("replace movement floor");
+            }
             for y in player_y..=player_y + 2 {
                 world
                     .set_block_at(mc_world::BlockPos { x, y, z }, air_state)

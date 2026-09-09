@@ -140,3 +140,68 @@ fn clean_eviction_recovers_reserved_capacity() {
             .is_some()
     );
 }
+
+#[test]
+fn byte_admission_tracks_mutation_flush_and_eviction() {
+    let position = ChunkPos { x: 0, z: 0 };
+    let next_position = ChunkPos { x: 1, z: 0 };
+    let first = empty_chunk(position);
+    let chunk_bytes = first.estimated_heap_bytes();
+    let mut world = WorldStorage::in_memory_with_capacity(single_air_registry(), 8);
+    world
+        .set_chunk_byte_budgets(chunk_bytes * 8, chunk_bytes * 2)
+        .unwrap();
+    world.commit_chunk_snapshot(position, first).unwrap();
+    world
+        .resident
+        .mutate(position, |chunk| {
+            chunk
+                .block_entities
+                .insert(BlockPos { x: 0, y: 0, z: 0 }, vec![0; chunk_bytes * 4]);
+            chunk.mark_dirty();
+        })
+        .unwrap();
+    assert!(matches!(
+        world.insert_generated_chunk(next_position, empty_chunk(next_position)),
+        Err(WorldError::ChunkCachePressure { .. })
+    ));
+    assert!(world.cached_chunk_snapshot(next_position).is_none());
+
+    world
+        .resident
+        .mutate(position, |chunk| {
+            chunk.block_entities.clear();
+            chunk.block_entities.shrink_to_fit();
+        })
+        .unwrap();
+    world
+        .insert_generated_chunk(next_position, empty_chunk(next_position))
+        .unwrap();
+    assert!(world.cached_chunk_snapshot(next_position).is_some());
+    assert_eq!(world.stats().dirty_bytes, chunk_bytes * 2);
+
+    let flushed = world.cached_chunk_snapshot(position).unwrap();
+    assert_eq!(
+        world
+            .resident
+            .finalize_region_flush(vec![(position, flushed.dirty_generation, flushed,)]),
+        1
+    );
+    let third_position = ChunkPos { x: 2, z: 0 };
+    world
+        .insert_generated_chunk(third_position, empty_chunk(third_position))
+        .unwrap();
+    assert!(world.cached_chunk_snapshot(third_position).is_some());
+    assert_eq!(world.stats().dirty_bytes, chunk_bytes * 2);
+
+    world
+        .set_chunk_byte_budgets(chunk_bytes * 3, chunk_bytes * 2)
+        .unwrap();
+    let fourth_position = ChunkPos { x: 3, z: 0 };
+    world
+        .commit_chunk_snapshot(fourth_position, empty_chunk(fourth_position))
+        .unwrap();
+    assert!(world.cached_chunk_snapshot(position).is_none());
+    assert!(world.cached_chunk_snapshot(fourth_position).is_some());
+    assert_eq!(world.stats().resident_bytes, chunk_bytes * 3);
+}

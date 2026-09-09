@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "screens": [{
+  "ui": [{
     "id": "sapphire-live:showcase",
     "title": "Sapphire Loader Fixture",
     "body": "Owner sapphire-live: custom item, block carrier, asset pack, and interaction.",
@@ -27,11 +27,22 @@
     "path": "assets/sapphire-live/models/block/sapphire_block.json",
     "sha256": "@BLOCK_SHA256@",
     "size_bytes": @BLOCK_SIZE@
+  }, {
+    "id": "sapphire-live:tone_audio",
+    "path": "assets/sapphire-live/sounds/tone.ogg",
+    "sha256": "@SOUND_SHA256@",
+    "size_bytes": @SOUND_SIZE@
   }],
+  "sounds": [{"id": "sapphire-live:tone"}],
   "interactions": [{
     "id": "sapphire-live:confirm",
-    "screen_id": "sapphire-live:showcase",
+    "ui_id": "sapphire-live:showcase",
     "label": "Confirm Sapphire",
     "payload": "sapphire-confirmed"
+  }, {
+    "id": "sapphire-live:key",
+    "key": "key.keyboard.g",
+    "label": "Sapphire action",
+    "payload": "sapphire-key"
   }]
 }

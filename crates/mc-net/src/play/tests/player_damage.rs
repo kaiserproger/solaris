@@ -7,7 +7,6 @@ use mc_protocol::{
     codec::Identifier,
     packets::play::{GameMode, ItemStack},
 };
-use tokio::sync::mpsc;
 
 use super::super::combat::{
     PlayerDamageKind, PlayerDamageRequest, SHIELD_FALLBACK_MAX_DAMAGE, shield_use_from_stack,
@@ -115,10 +114,7 @@ async fn committed_campfire_death_survives_client_write_failure() {
             ..
         } if context.username() == "CampfireFail"
     ));
-    assert!(matches!(
-        deaths.try_recv_required(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(deaths.try_recv_required().is_none());
 }
 
 #[tokio::test]

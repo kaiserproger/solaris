@@ -780,3 +780,86 @@ async fn closed_registry_and_closed_event_queue_are_explicit() {
         Err(ZoneAdapterError::Closed)
     );
 }
+
+#[tokio::test]
+async fn protection_snapshot_refreshes_on_upsert_and_remove() {
+    let owner_uuid = "12345678123456781234567812345678";
+    let mut commands = admitted_zone_commands(
+        "fresh-plugin",
+        &format!(
+            "    solaris.upsert_protected_zone(\"owned-area\", \"minecraft:overworld\", \"{owner_uuid}\", 0, -64, 0, 15, 319, 15)\n    solaris.remove_zone(\"owned-area\")"
+        ),
+        2,
+    )
+    .await;
+    let (adapter, _events) = adapter_with_limits(ZoneLimits::production());
+    let claimed = mc_world::BlockPos { x: 7, y: 64, z: 7 };
+    assert!(
+        adapter
+            .protection_snapshot()
+            .unwrap()
+            .ambient_block_mutation_allowed("minecraft:overworld", claimed)
+    );
+    assert_eq!(
+        adapter.route_admitted(commands.remove(0)),
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    assert!(
+        !adapter
+            .protection_snapshot()
+            .unwrap()
+            .ambient_block_mutation_allowed("minecraft:overworld", claimed)
+    );
+    assert_eq!(
+        adapter.route_admitted(commands.remove(0)),
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    assert!(
+        adapter
+            .protection_snapshot()
+            .unwrap()
+            .ambient_block_mutation_allowed("minecraft:overworld", claimed)
+    );
+}
+
+#[tokio::test]
+async fn protection_snapshot_refreshes_on_async_upsert_and_remove() {
+    let owner_uuid = "12345678123456781234567812345678";
+    let mut commands = admitted_zone_commands(
+        "fresh-async-plugin",
+        &format!(
+            "    solaris.upsert_protected_zone(\"owned-area\", \"minecraft:overworld\", \"{owner_uuid}\", 0, -64, 0, 15, 319, 15)\n    solaris.remove_zone(\"owned-area\")"
+        ),
+        2,
+    )
+    .await;
+    let (adapter, mut events) = adapter_with_limits(ZoneLimits::production());
+    let claimed = mc_world::BlockPos { x: 7, y: 64, z: 7 };
+    let allowed = || {
+        adapter
+            .protection_snapshot()
+            .unwrap()
+            .ambient_block_mutation_allowed("minecraft:overworld", claimed)
+    };
+    assert!(allowed());
+    assert_eq!(
+        adapter.route_admitted_with_result(commands.remove(0)).await,
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::ZoneCommandResult { zone_id, accepted }
+            if zone_id == "owned-area" && *accepted
+    ));
+    assert!(!allowed());
+    assert_eq!(
+        adapter.route_admitted_with_result(commands.remove(0)).await,
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::ZoneCommandResult { zone_id, accepted }
+            if zone_id == "owned-area" && *accepted
+    ));
+    assert!(allowed());
+}

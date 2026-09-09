@@ -32,8 +32,7 @@ impl SerializedPythonCommand {
         let Some(driver_path) = args.first() else {
             return self.0.output();
         };
-        if std::path::Path::new(driver_path).file_name()
-            != Some(std::ffi::OsStr::new("real-client-agent-driver.py"))
+        if std::path::Path::new(driver_path).file_name() != Some(std::ffi::OsStr::new("driver.py"))
         {
             return self.0.output();
         }
@@ -172,7 +171,7 @@ client_agent_bridge_wait_status_primary=ready\n",
     .expect("write pre-provenance automation driver");
 
     let output = Command::new("bash")
-        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg(repo_root.join("tools/harness/backends/regression.sh"))
         .arg("--validate-run")
         .arg(run_dir.path())
         .output()
@@ -210,7 +209,7 @@ fn agent_driver_executes_checked_core_replay_manifest_and_emits_valid_result() {
     let bridge = FakeBridge::start(13);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -333,7 +332,7 @@ fn agent_driver_rejects_malformed_core_replay_before_bridge_rpcs() {
     let bridge = FakeBridge::start(1);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -383,7 +382,7 @@ fn agent_driver_writes_passed_observation_from_loopback_bridge() {
     let bridge = FakeBridge::start(6);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -474,7 +473,7 @@ fn agent_driver_runs_generated_ruin_cache_phases_without_screenshots() {
         let bridge = FakeBridge::start(5);
 
         let output = SerializedPythonCommand::new("python3")
-            .arg(repo_root.join("tools/real-client-agent-driver.py"))
+            .arg(repo_root.join("tools/harness/backends/driver.py"))
             .arg("--bridge-url")
             .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
             .arg("--secret")
@@ -526,7 +525,7 @@ fn agent_driver_rejects_non_loopback_server_addr() {
     let bridge = FakeBridge::start(6);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -577,7 +576,7 @@ fn agent_driver_connects_when_client_is_not_already_in_play() {
     let bridge = FakeBridge::start_with_wait_play(8, vec![false, true]);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -638,7 +637,7 @@ fn agent_driver_waits_when_client_is_already_connecting() {
     );
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -706,7 +705,7 @@ fn agent_driver_waits_for_interactive_play_screen_before_scenario() {
     );
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -752,7 +751,7 @@ fn agent_driver_waits_for_interactive_play_screen_before_scenario() {
 #[test]
 fn interactive_pause_close_waits_for_the_client_thread_response() {
     let repo_root = repo_root();
-    let driver = repo_root.join("tools/real-client-agent-driver.py");
+    let driver = repo_root.join("tools/harness/backends/driver.py");
     let probe = r#"
 import importlib.util
 import pathlib
@@ -819,7 +818,7 @@ fn agent_driver_waits_for_async_screenshot_file() {
     let bridge = FakeBridge::start_with_deferred_screenshot(6);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -866,7 +865,7 @@ fn agent_driver_rejects_invalid_screenshot_artifact() {
     let bridge = FakeBridge::start_with_screenshot_bytes(5, b"fake png");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -921,7 +920,7 @@ fn agent_driver_rejects_passed_broad_blocked_only_scenario() {
     let bridge = FakeBridge::start(6);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -989,7 +988,7 @@ fn agent_driver_runs_join_rejoin_movement_scenario_without_run_scenario_rpc() {
     let bridge = FakeBridge::start(13);
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -1081,7 +1080,7 @@ fn agent_driver_waits_for_server_session_release_before_rejoin() {
         FakeBridge::start_requiring_server_release_before_connect(13, server_log_path.clone());
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -1154,7 +1153,7 @@ fn agent_driver_appends_phase_observations_and_recomputes_blocked_result() {
     let bridge = FakeBridge::start_with_scenario_result(6, "blocked");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -1211,7 +1210,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_06_visibility() {
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -1329,7 +1328,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_06_shared_drop() {
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -1412,7 +1411,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_03b_shared_chest() {
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -1495,7 +1494,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_03c_shared_chest_liv
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -1591,7 +1590,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_06_shared_pickup() {
     let secondary = FakeBridge::start_with_scenario_result(7, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -1690,7 +1689,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_38_inventory_dr
     let secondary = FakeBridge::start_with_scenario_result(7, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -1807,7 +1806,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_39_short_soak()
     let secondary = FakeBridge::start_with_scenario_result(17, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -1915,7 +1914,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_40_chunk_crossi
     let secondary = FakeBridge::start_with_scenario_result(29, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -2009,7 +2008,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_41_chunk_prewar
     let secondary = FakeBridge::start_with_scenario_result(29, "passed");
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -2105,7 +2104,7 @@ fn agent_driver_fails_closed_without_bridge() {
     let unused_port = reserve_then_release_port();
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{unused_port}/rpc"))
         .arg("--secret")
@@ -2152,7 +2151,7 @@ fn agent_driver_reports_structured_bridge_error_body() {
     let bridge = FailingWaitPlayBridge::start();
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
         .arg("--secret")
@@ -2226,7 +2225,7 @@ fn agent_driver_coordinates_two_client_shared_chest_across_restart_phases() {
     let run_phase = |scenario: &str, append: bool| {
         let mut command = SerializedPythonCommand::new("python3");
         command
-            .arg(repo_root.join("tools/real-client-agent-driver.py"))
+            .arg(repo_root.join("tools/harness/backends/driver.py"))
             .arg("--bridge-url")
             .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
             .arg("--secret")
@@ -2407,7 +2406,7 @@ fn agent_driver_rejects_restart_snapshot_missing_typed_field_before_bridge_calls
     let secondary_port = reserve_then_release_port();
 
     let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{primary_port}/rpc"))
         .arg("--secret")
@@ -2472,7 +2471,7 @@ fn agent_driver_rejects_restart_marker_drift_across_phases() {
     );
 
     let before = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
         .arg("--secret")
@@ -2503,7 +2502,7 @@ fn agent_driver_rejects_restart_marker_drift_across_phases() {
     let primary_port = reserve_then_release_port();
     let secondary_port = reserve_then_release_port();
     let after = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg(repo_root.join("tools/harness/backends/driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{primary_port}/rpc"))
         .arg("--secret")

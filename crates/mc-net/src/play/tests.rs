@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::play::chunk_stream::{hostile_chunk_spawns, passive_chunk_spawns, prioritized_spiral};
+use crate::play::chunk_stream::{hostile_chunk_spawns, prioritized_spiral};
 use mc_data::blocks::{BlockReport, BlockStateReport, solaris_required_blocks_report};
 use mc_data::items::ItemReport;
 use mc_world::light::compute_chunk_light_in;
@@ -555,10 +555,8 @@ pub(super) fn interaction_state_for_blocks(
         sessions: Arc::new(SessionRegistry::new()),
         simulation: simulation_channel().0,
         session_id: 1,
-        workspace: LightWorkspace::new(),
         light_cache: LightCache::new(),
         compression: Compression::Disabled,
-        selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(
@@ -1167,10 +1165,8 @@ pub(super) fn interaction_state_for_items_and_blocks(
         sessions: Arc::new(SessionRegistry::new()),
         simulation: simulation_channel().0,
         session_id: 1,
-        workspace: LightWorkspace::new(),
         light_cache: LightCache::new(),
         compression: Compression::Disabled,
-        selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(
@@ -1331,9 +1327,10 @@ pub(super) fn register_survival_test_player(
     persisted.survival = survival;
     persisted.inventory = state.inventory.clone();
     persisted.carried_item = state.carried_item.clone();
-    persisted.selected_hotbar_slot = state.selected_hotbar_slot;
+    persisted.selected_hotbar_slot = state.selected_hotbar_slot();
     persisted.xp = xp.clone();
     let persisted = Arc::new(Mutex::new(persisted));
+    state.player_persistence = Arc::clone(&persisted);
     state
         .sessions
         .register_player_persistence(session_id, Arc::clone(&persisted));
@@ -1409,10 +1406,8 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
         sessions: Arc::new(SessionRegistry::new()),
         simulation: simulation_channel().0,
         session_id: 1,
-        workspace: LightWorkspace::new(),
         light_cache: LightCache::new(),
         compression: Compression::Disabled,
-        selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(

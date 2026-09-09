@@ -64,8 +64,61 @@ const ENTITY_SCALE_DEFAULT_REGIONS: usize = 16;
 const ENTITY_SCALE_DEFAULT_ENTITIES_PER_REGION: usize = 2_500;
 const ENTITY_SCALE_DEFAULT_WARMUP_TICKS: u64 = 200;
 const ENTITY_SCALE_DEFAULT_MEASURE_TICKS: u64 = 1_200;
-const ENTITY_SCALE_REGION_SIZE_BLOCKS: i32 = 128;
+const ENTITY_SCALE_DEFAULT_VIEW_DISTANCE: i32 = 2;
+const ENTITY_SCALE_DEFAULT_REGION_SPACING_BLOCKS: i32 = 128;
 const ENTITY_SCALE_DEFAULT_ENTITY_TYPE: &str = "minecraft:husk";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EntityScalePopulationEntry {
+    type_name: String,
+    count: usize,
+}
+
+fn entity_scale_population(
+    regions: usize,
+    entities_per_region: usize,
+    default_type_name: String,
+) -> Vec<EntityScalePopulationEntry> {
+    let Some(raw) = std::env::var("SOLARIS_ENTITY_BENCH_ENTITY_MIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return vec![EntityScalePopulationEntry {
+            type_name: default_type_name,
+            count: regions.saturating_mul(entities_per_region),
+        }];
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (type_name, count) = entry
+                .split_once('=')
+                .unwrap_or_else(|| panic!("invalid SOLARIS_ENTITY_BENCH_ENTITY_MIX entry {entry:?}; expected minecraft:type=count"));
+            let type_name = type_name.trim();
+            let count = count
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("invalid entity count in {entry:?}: {error}"));
+            assert!(!type_name.is_empty(), "entity mix type must not be empty");
+            assert!(count > 0, "entity mix count must be positive for {type_name}");
+            EntityScalePopulationEntry {
+                type_name: type_name.to_owned(),
+                count,
+            }
+        })
+        .collect()
+}
+
+fn expected_entity_scale_hostiles_for_population(
+    population: &[EntityScalePopulationEntry],
+) -> usize {
+    population
+        .iter()
+        .filter(|entry| mc_entity::natural_spawn_26_1_2::is_hostile_entity(&entry.type_name))
+        .map(|entry| entry.count)
+        .sum()
+}
 
 fn entity_scale_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -3344,24 +3397,60 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         "SOLARIS_ENTITY_BENCH_OWNER_LANES",
         entity_scale_default_owner_lanes(),
     );
+    let benchmark_view_distance = i32::try_from(entity_scale_env_usize(
+        "SOLARIS_ENTITY_BENCH_VIEW_DISTANCE",
+        usize::try_from(ENTITY_SCALE_DEFAULT_VIEW_DISTANCE)
+            .expect("default view distance fits usize"),
+    ))
+    .expect("entity-scale view distance fits i32");
+    let region_spacing_blocks = i32::try_from(entity_scale_env_usize(
+        "SOLARIS_ENTITY_BENCH_REGION_SPACING_BLOCKS",
+        usize::try_from(ENTITY_SCALE_DEFAULT_REGION_SPACING_BLOCKS)
+            .expect("default region spacing fits usize"),
+    ))
+    .expect("entity-scale region spacing fits i32");
+    let p95_budget_us = entity_scale_env_u64("SOLARIS_ENTITY_BENCH_P95_BUDGET_US", 0);
+    let p99_budget_us = entity_scale_env_u64("SOLARIS_ENTITY_BENCH_P99_BUDGET_US", 0);
+    let connect_wave = entity_scale_env_usize("SOLARIS_ENTITY_BENCH_CONNECT_WAVE", 4);
     assert!(
-        (1..=64).contains(&clients),
-        "benchmark supports 1-64 clients; the capacity profile uses 50-60"
+        (1..=128).contains(&clients),
+        "benchmark supports 1-128 clients; the capacity profile uses 50-60"
     );
-    assert!((1..=3_000).contains(&entities_per_region));
+    assert!((1..=100_000).contains(&entities_per_region));
     assert!((1..=12).contains(&owner_lanes));
+    assert!((1..=clients).contains(&connect_wave));
+    assert!((1..=16).contains(&benchmark_view_distance));
+    assert!(
+        region_spacing_blocks >= mc_entity::REGION_SIZE_CHUNKS * 16
+            && region_spacing_blocks % (mc_entity::REGION_SIZE_CHUNKS * 16) == 0,
+        "benchmark region spacing must be a positive multiple of one regional-owner width"
+    );
     let region_side = (1..=regions)
         .find(|side| side * side == regions)
         .expect("benchmark region count must be a perfect square");
-    let entity_count = regions * entities_per_region;
-    let benchmark_view_distance = 2;
+    let default_entity_type_name =
+        entity_scale_entity_type_name(std::env::var("SOLARIS_ENTITY_BENCH_ENTITY_TYPE").ok());
+    let population =
+        entity_scale_population(regions, entities_per_region, default_entity_type_name);
+    assert!(
+        !population.is_empty(),
+        "entity-scale population must not be empty"
+    );
+    let entity_count = population.iter().map(|entry| entry.count).sum::<usize>();
+    let expected_hostiles = expected_entity_scale_hostiles_for_population(&population);
+    let expected_max_entities_per_region = population
+        .iter()
+        .map(|entry| entry.count.div_ceil(regions))
+        .sum::<usize>();
+    let client_window_edge = (benchmark_view_distance as usize * 2) + 1;
+    let client_window_chunks = client_window_edge * client_window_edge;
     let chunk_capacity =
         clients.saturating_mul(((2 * benchmark_view_distance + 5) as usize).pow(2));
 
+    let entity_scale_log_filter = std::env::var("SOLARIS_ENTITY_BENCH_LOG_FILTER")
+        .unwrap_or_else(|_| "mc_net::lock_metrics=warn,mc_net::server=warn".to_owned());
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "mc_net::lock_metrics=warn,mc_net::server=warn",
-        ))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(entity_scale_log_filter))
         .with_test_writer()
         .try_init();
     let server = start_load_server_with_options(LoadServerOptions {
@@ -3384,10 +3473,12 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
     let addr = server.addr;
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let connect_admission = Arc::new(tokio::sync::Semaphore::new(connect_wave));
     let mut connect_tasks = Vec::with_capacity(clients);
     for index in 0..clients {
         let region = index % regions;
-        let (center_x, center_z) = entity_scale_region_center(region, region_side);
+        let (center_x, center_z) =
+            entity_scale_region_center(region, region_side, region_spacing_blocks);
         let (offset_x, offset_z) = entity_scale_client_offset(index / regions);
         let x = center_x + offset_x + 8.5;
         let z = center_z + offset_z + 8.5;
@@ -3400,7 +3491,12 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         let load_bench = server.load_bench.clone();
         let crafting_recipe = server.crafting_recipe;
         let crafted_item_id = server.crafted_item_id;
+        let connect_admission = Arc::clone(&connect_admission);
         connect_tasks.push(tokio::spawn(async move {
+            let _connect_permit = connect_admission
+                .acquire_owned()
+                .await
+                .expect("entity-scale connect admission remains open");
             let mut client = connect_entity_scale_client(
                 addr,
                 &name,
@@ -3452,7 +3548,11 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         |readiness| readiness.sessions == clients && readiness.pending_chunks == 0,
     )
     .await;
-    assert_eq!(pre_seed_readiness.desired_chunks, clients * 25);
+    assert_eq!(
+        pre_seed_readiness.desired_chunks,
+        clients * client_window_chunks,
+        "all client chunk windows must be retained before the entity population is seeded",
+    );
     assert_eq!(
         pre_seed_readiness.desired_loaded_chunks,
         pre_seed_readiness.desired_chunks
@@ -3463,15 +3563,12 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         pre_seed_readiness.desired_loaded_chunks
     );
 
-    let entity_type_name =
-        entity_scale_entity_type_name(std::env::var("SOLARIS_ENTITY_BENCH_ENTITY_TYPE").ok());
-    let expected_hostiles = expected_entity_scale_hostiles(&entity_type_name, entity_count);
-    let specs = entity_scale_entity_specs(
+    let specs = entity_scale_population_specs(
         &server,
         regions,
         region_side,
-        entities_per_region,
-        &entity_type_name,
+        region_spacing_blocks,
+        &population,
     );
     assert_eq!(specs.len(), entity_count);
     let seed_started = Instant::now();
@@ -3483,7 +3580,10 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         "seeded benchmark hostiles must follow the canonical hostile category contract"
     );
     assert_eq!(seed_report.regions, regions);
-    assert!(seed_report.max_entities_per_region <= 3_000);
+    assert!(
+        seed_report.max_entities_per_region <= expected_max_entities_per_region,
+        "regional-owner population exceeded the configured per-region distribution: report={seed_report:?} expected_max={expected_max_entities_per_region}",
+    );
     eprintln!(
         "ENTITY_SCALE_PHASE phase=entities_seeded elapsed_ms={} seed_ms={} spawn_dispatches={}",
         benchmark_started.elapsed().as_millis(),
@@ -3495,11 +3595,11 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         &server,
         &mut simulation_ticks,
         readiness_timeout,
-        "all seeded hostiles to become active",
+        "the complete seeded population to become active",
         |activity| {
-            activity.active_simulation_entities == entity_count
-                && activity.entity_update_active_population == entity_count
-                && activity.entity_update_selected == entity_count
+            activity.active_simulation_entities >= entity_count
+                && activity.entity_update_active_population >= entity_count
+                && activity.entity_update_selected >= entity_count
                 && activity.active_hostile_entities == expected_hostiles
         },
     )
@@ -3530,7 +3630,7 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
                 &server,
                 &mut simulation_ticks,
                 warmup_end_tick,
-                Duration::from_secs(30),
+                readiness_timeout,
             )
             .await;
             let measure_start_source = measure_start_profile.source_tick;
@@ -3570,26 +3670,47 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
     assert_eq!(telemetry.active_sessions, clients);
     assert!(telemetry.server_entities >= entity_count);
     let final_activity = server.load_bench.activity();
-    assert_eq!(
-        final_activity.active_simulation_entities, entity_count,
-        "the measured window must keep the complete simulation population active"
+    assert!(
+        final_activity.active_simulation_entities >= entity_count,
+        "the measured window must keep the complete seeded simulation population active"
     );
-    assert_eq!(
-        final_activity.entity_update_active_population, entity_count,
-        "the measured window must keep the complete entity population eligible"
+    assert!(
+        final_activity.entity_update_active_population >= entity_count,
+        "the measured window must keep the complete seeded entity population eligible"
     );
-    assert_eq!(
-        final_activity.entity_update_selected, entity_count,
-        "the measured window must select the complete active population for entity updates"
+    assert!(
+        final_activity.entity_update_selected >= entity_count,
+        "the measured window must select the complete seeded active population for entity updates"
     );
     assert_eq!(
         final_activity.active_hostile_entities, expected_hostiles,
         "active benchmark hostiles must follow the canonical hostile category contract"
     );
+    let final_readiness = server.load_bench.readiness();
     assert_eq!(
-        pre_seed_readiness.pending_chunks, 0,
-        "benchmark movement remains inside the preloaded client windows"
+        final_readiness.desired_chunks, pre_seed_readiness.desired_chunks,
+        "client chunk residency set changed during the measured window",
     );
+    assert_eq!(
+        final_readiness.desired_loaded_chunks, final_readiness.desired_chunks,
+        "all aggressively preloaded client chunks must remain resident through measurement",
+    );
+    assert_eq!(
+        final_readiness.pending_chunks, 0,
+        "benchmark must not finish with chunk loads pending",
+    );
+    if p95_budget_us > 0 {
+        assert!(
+            tick_profile.tick.p95_us <= p95_budget_us,
+            "entity-scale p95 tick latency exceeded hard budget: profile={tick_profile:?} budget_us={p95_budget_us}",
+        );
+    }
+    if p99_budget_us > 0 {
+        assert!(
+            tick_profile.tick.p99_us <= p99_budget_us,
+            "entity-scale p99 tick latency exceeded hard budget: profile={tick_profile:?} budget_us={p99_budget_us}",
+        );
+    }
 
     let outbound = server.outbound_pressure_snapshot();
     let locks = mc_net::lock_pressure_snapshot();
@@ -3628,10 +3749,15 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
             "clients": clients,
             "regions": regions,
             "entities": entity_count,
-            "entities_per_region": entities_per_region,
-            "entity_type": entity_type_name,
+            "population": population,
+            "max_entities_per_region": seed_report.max_entities_per_region,
+            "view_distance": benchmark_view_distance,
+            "region_spacing_blocks": region_spacing_blocks,
+            "retained_client_chunks": final_readiness.desired_loaded_chunks,
             "warmup_ticks": warmup_ticks,
             "measured_ticks": measure_ticks,
+            "p95_budget_us": p95_budget_us,
+            "p99_budget_us": p99_budget_us,
             "owner_lanes": seed_report.owner_lanes,
             "requested_owner_lanes": owner_lanes,
             "chunk_capacity": chunk_capacity,
@@ -3691,7 +3817,8 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
     );
 
     eprintln!(
-        "ENTITY_SCALE_BENCH clients={clients} entity_type={entity_type_name} regions={regions} entities={entity_count} per_region={entities_per_region} owner_lanes={} seed_ms={} tick_p50_us={} tick_p95_us={} tick_p99_us={} tick_max_us={} goals_p99_us={} physics_p99_us={} attacks_p99_us={} dispatch_p99_us={} rotation_ticks_est={} movement_budget={} memory_mb={} client_frames={} client_bytes={} report={}",
+        "ENTITY_SCALE_BENCH clients={clients} regions={regions} entities={entity_count} population={population:?} view_distance={benchmark_view_distance} region_spacing_blocks={region_spacing_blocks} retained_chunks={} owner_lanes={} seed_ms={} tick_p50_us={} tick_p95_us={} tick_p99_us={} tick_max_us={} goals_p99_us={} physics_p99_us={} attacks_p99_us={} dispatch_p99_us={} rotation_ticks_est={} movement_budget={} memory_mb={} client_frames={} client_bytes={} report={}",
+        final_readiness.desired_loaded_chunks,
         seed_report.owner_lanes,
         seed_elapsed.as_millis(),
         tick_profile.tick.p50_us,
@@ -3718,13 +3845,18 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         .expect("entity-scale server exits cleanly");
 }
 
-fn entity_scale_region_center(region: usize, side: usize) -> (f64, f64) {
+fn entity_scale_region_center(
+    region: usize,
+    side: usize,
+    region_spacing_blocks: i32,
+) -> (f64, f64) {
     let half = i32::try_from(side / 2).expect("region side half fits i32");
     let region_x = i32::try_from(region % side).expect("region x fits i32") - half;
     let region_z = i32::try_from(region / side).expect("region z fits i32") - half;
+    let owner_region_half = mc_entity::REGION_SIZE_CHUNKS * 16 / 2;
     (
-        f64::from(region_x * ENTITY_SCALE_REGION_SIZE_BLOCKS + ENTITY_SCALE_REGION_SIZE_BLOCKS / 2),
-        f64::from(region_z * ENTITY_SCALE_REGION_SIZE_BLOCKS + ENTITY_SCALE_REGION_SIZE_BLOCKS / 2),
+        f64::from(region_x * region_spacing_blocks + owner_region_half),
+        f64::from(region_z * region_spacing_blocks + owner_region_half),
     )
 }
 
@@ -3732,49 +3864,77 @@ fn entity_scale_client_offset(slot: usize) -> (f64, f64) {
     [(0.0, 0.0), (-20.0, -20.0), (20.0, 20.0), (20.0, -20.0)][slot % 4]
 }
 
-fn entity_scale_entity_specs(
+fn entity_scale_population_specs(
     server: &LoadServer,
     regions: usize,
     region_side: usize,
-    entities_per_region: usize,
-    entity_type_name: &str,
+    region_spacing_blocks: i32,
+    population: &[EntityScalePopulationEntry],
 ) -> Vec<mc_net::LoadBenchEntitySpec> {
-    let entity_type = mc_data::Identifier::parse(entity_type_name).unwrap_or_else(|error| {
-        panic!("SOLARIS_ENTITY_BENCH_ENTITY_TYPE {entity_type_name:?} is not a valid entity identifier: {error}")
-    });
-    let entity_type_id = server
-        .entity_types
-        .id_of(&entity_type)
-        .and_then(|type_id| i32::try_from(type_id).ok())
-        .unwrap_or_else(|| {
-            panic!("SOLARIS_ENTITY_BENCH_ENTITY_TYPE {entity_type_name:?} is missing from the entity type registry (default: {ENTITY_SCALE_DEFAULT_ENTITY_TYPE})")
-        });
-    let type_name = entity_type.as_str().to_string();
-    let grid_side = (1..=entities_per_region)
-        .find(|side| side * side >= entities_per_region)
+    let resolved = population
+        .iter()
+        .map(|entry| {
+            let entity_type =
+                mc_data::Identifier::parse(&entry.type_name).unwrap_or_else(|error| {
+                    panic!(
+                        "entity-scale type {:?} is not a valid entity identifier: {error}",
+                        entry.type_name
+                    )
+                });
+            let entity_type_id = server
+                .entity_types
+                .id_of(&entity_type)
+                .and_then(|type_id| i32::try_from(type_id).ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "entity-scale type {:?} is missing from the entity type registry",
+                        entry.type_name
+                    )
+                });
+            (entity_type_id, entity_type.as_str().to_owned(), entry.count)
+        })
+        .collect::<Vec<_>>();
+    let total = population.iter().map(|entry| entry.count).sum::<usize>();
+    let max_per_region = population
+        .iter()
+        .map(|entry| entry.count.div_ceil(regions))
+        .sum::<usize>();
+    let grid_side = (1..=max_per_region)
+        .find(|side| side * side >= max_per_region)
         .expect("entity-scale grid side");
     let spacing = 1.2_f64;
     let half_width = (grid_side.saturating_sub(1)) as f64 * spacing * 0.5;
-    let mut specs = Vec::with_capacity(regions * entities_per_region);
+    assert!(
+        half_width < f64::from(mc_entity::REGION_SIZE_CHUNKS * 16 / 2) - 1.0,
+        "entity-scale regional population does not fit inside one regional-owner cell: max_per_region={max_per_region} grid_side={grid_side}",
+    );
+
+    let mut specs = Vec::with_capacity(total);
     for region in 0..regions {
-        let (center_x, center_z) = entity_scale_region_center(region, region_side);
-        for index in 0..entities_per_region {
-            let local_x = index % grid_side;
-            let local_z = index / grid_side;
-            let x = center_x + local_x as f64 * spacing - half_width;
-            let z = center_z + local_z as f64 * spacing - half_width;
-            let y = f64::from(
-                server
-                    .generator
-                    .surface_height(x.round() as i32, z.round() as i32),
-            ) + 1.0;
-            specs.push(mc_net::LoadBenchEntitySpec::new(
-                entity_type_id,
-                type_name.clone(),
-                x,
-                y,
-                z,
-            ));
+        let (center_x, center_z) =
+            entity_scale_region_center(region, region_side, region_spacing_blocks);
+        let mut local_index = 0usize;
+        for (entity_type_id, type_name, count) in &resolved {
+            let region_count = count / regions + usize::from(region < count % regions);
+            for _ in 0..region_count {
+                let local_x = local_index % grid_side;
+                let local_z = local_index / grid_side;
+                let x = center_x + local_x as f64 * spacing - half_width;
+                let z = center_z + local_z as f64 * spacing - half_width;
+                let y = f64::from(
+                    server
+                        .generator
+                        .surface_height(x.round() as i32, z.round() as i32),
+                ) + 1.0;
+                specs.push(mc_net::LoadBenchEntitySpec::new(
+                    *entity_type_id,
+                    type_name.clone(),
+                    x,
+                    y,
+                    z,
+                ));
+                local_index += 1;
+            }
         }
     }
     specs

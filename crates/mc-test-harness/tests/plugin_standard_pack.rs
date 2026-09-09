@@ -1,12 +1,17 @@
 //! Integration coverage for the first-party Solaris standard plugin pack.
 //!
-//! `examples/plugins/standard-pack/README.md` ships five independent API 0.6
-//! server-only packages. Every test below copies the whole pack into one temp
-//! root, strict-loads it, satisfies each plugin's `server.started` contract,
-//! and then drives representative player commands through the script boundary
-//! exactly like `plugin_examples.rs` does: enqueue with a server-authored
+//! The `standard-pack` set in the independent `solaris-default-plugins`
+//! sibling checkout ships five independent API 0.6 server-only packages.
+//! Every test below copies the whole pack into one temp root, strict-loads
+//! it, satisfies each plugin's `server.started` contract, and then drives
+//! representative player commands through the script boundary exactly like
+//! `plugin_examples.rs` does: enqueue with a server-authored
 //! `ScriptPlayerContext`, receive the emitted host command, deliver its result,
 //! and observe the chat reply the player actually sees.
+//!
+//! The sibling checkout must sit next to the core checkout
+//! (`../solaris-default-plugins`); a missing checkout fails loudly instead
+//! of silently skipping coverage.
 
 use std::path::Path;
 use std::time::Duration;
@@ -16,7 +21,8 @@ use mc_script::{
     ScriptGameMode, ScriptPlayerContext, ScriptPlayerId,
 };
 
-/// Startup order recommended by `examples/plugins/standard-pack/README.md`.
+/// Startup order recommended by `standard-pack/README.md` in the
+/// `solaris-default-plugins` sibling checkout.
 const STANDARD_PACK: [&str; 5] = [
     "solaris-permissions",
     "solaris-essentials",
@@ -776,10 +782,20 @@ fn copy_standard_pack(destination_root: &Path) {
     }
 }
 
-fn copy_example_plugin(name: &str, destination_root: &Path) {
+fn sibling_plugin_source(name: &str) -> std::path::PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/plugins")
+        .join("../../../solaris-default-plugins")
         .join(name);
+    assert!(
+        source.is_dir(),
+        "sibling plugin checkout missing at {}: clone solaris-default-plugins next to solaris",
+        source.display()
+    );
+    source
+}
+
+fn copy_example_plugin(name: &str, destination_root: &Path) {
+    let source = sibling_plugin_source(name);
     let destination = destination_root.join(name);
     std::fs::create_dir(&destination).expect("create copied example plugin directory");
     for file in ["plugin.toml", "main.lua"] {

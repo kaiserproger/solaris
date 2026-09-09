@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
+use mc_entity::RegionKey;
 use mc_world::{
     BlockRegistry, BlockStateId, ChunkPos, FurnaceBlockEntity, FurnaceSlot, SECTION_DIM,
     ScheduledBlockTick, WorldStorage,
@@ -31,6 +32,12 @@ use crate::script::ZoneProtectionSnapshot;
 pub(super) struct ScheduledBlockTickPlan {
     pub(super) edits: Vec<BlockEdit>,
     pub(super) preconditions: Vec<SnapshotReadPrecondition>,
+}
+
+pub(super) struct ScheduledBlockRegionPlan {
+    pub(super) region: RegionKey,
+    pub(super) due: Vec<ScheduledBlockTick>,
+    pub(super) plan: ScheduledBlockTickPlan,
 }
 
 pub(super) fn scheduled_block_planning_chunks(ticks: &[ScheduledBlockTick]) -> Vec<ChunkPos> {
@@ -987,9 +994,23 @@ fn persist_campfire_block_entity_in_storage(
     position: mc_world::BlockPos,
     cooking: &CampfireCookingState,
 ) -> bool {
-    let block_entity_id = storage
-        .get_cached_block(position)
-        .and_then(|block_state| campfire_block_entity_id(blocks, block_state));
+    let Some((expected_state, expected_token)) = storage
+        .cached_chunk_snapshot(mc_world::ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        })
+        .and_then(|chunk| {
+            let x = position.x.rem_euclid(16) as u8;
+            let z = position.z.rem_euclid(16) as u8;
+            Some((
+                chunk.get_block(x, position.y, z)?,
+                chunk.block_mutation_token(x, position.y, z)?,
+            ))
+        })
+    else {
+        return false;
+    };
+    let block_entity_id = campfire_block_entity_id(blocks, expected_state);
     let Some(block_entity_id) = block_entity_id else {
         return false;
     };
@@ -998,11 +1019,18 @@ fn persist_campfire_block_entity_in_storage(
     else {
         return false;
     };
-    if let Err(err) = storage.set_opaque_block_entity(position, bytes) {
-        warn!(error = %err, ?position, "campfire block entity save failed");
-        return false;
+    match storage.commit_opaque_block_entity_conditionally(
+        position,
+        expected_state,
+        expected_token,
+        bytes,
+    ) {
+        Ok(committed) => committed,
+        Err(err) => {
+            warn!(error = %err, ?position, "campfire block entity save failed");
+            false
+        }
     }
-    true
 }
 
 fn insert_hopper_stack_into_furnace(

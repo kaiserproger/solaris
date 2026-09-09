@@ -26,7 +26,7 @@ pub use terrain::{
 };
 
 /// Changes whenever Solaris intentionally changes newly generated terrain.
-pub const WORLDGEN_REVISION: u32 = 12;
+pub const WORLDGEN_REVISION: u32 = 18;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

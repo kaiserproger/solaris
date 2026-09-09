@@ -41,7 +41,7 @@ fn dirty_flush_rejects_snapshot_position_mismatch_before_writing() {
         registry,
         item_registry: None,
         unix_time: 0,
-        payload_encode_count: Arc::new(AtomicU64::new(0)),
+        journal_barrier: None,
     };
 
     assert!(matches!(
@@ -620,25 +620,6 @@ fn dirty_flush_does_not_overwrite_newer_region_with_stale_cached_snapshot() {
 }
 
 #[test]
-fn dirty_flush_plan_retains_the_live_snapshot_without_payload_encoding() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-    let registry = single_air_registry();
-    let cpos = ChunkPos { x: 0, z: 0 };
-    let biome = Identifier::parse("minecraft:plains").unwrap();
-    let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-    chunk.mark_dirty();
-    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
-    world.insert_chunk(cpos, chunk).unwrap();
-
-    let plan = world.plan_dirty_flush().unwrap();
-    let planned = &plan.regions[0].dirty_payloads[0];
-    let snapshot = world.resident.snapshot(cpos).unwrap();
-
-    assert!(Arc::ptr_eq(&planned.snapshot, &snapshot));
-}
-
-#[test]
 fn bounded_dirty_flush_plan_commits_one_batch_and_leaves_remainder() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
@@ -672,52 +653,38 @@ fn bounded_dirty_flush_plan_commits_one_batch_and_leaves_remainder() {
 }
 
 #[test]
-fn dirty_flush_plan_clones_snapshots_without_encoding_payloads() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-    let registry = single_air_registry();
-    let cpos = ChunkPos { x: 0, z: 0 };
+fn bounded_dirty_flush_persists_every_chunk_under_continuous_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("region")).unwrap();
+    let registry = air_stone_registry();
+    let mut world =
+        WorldStorage::open_with_capacity(temp.path(), Arc::clone(&registry), 3).unwrap();
     let biome = Identifier::parse("minecraft:plains").unwrap();
-    let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-    chunk.mark_dirty();
-    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
-    world.insert_chunk(cpos, chunk).unwrap();
-
-    let plan = world.plan_dirty_flush().unwrap();
-    let payload_encode_count = plan.payload_encode_counter();
-
-    assert_eq!(
-        payload_encode_count.load(Ordering::Relaxed),
-        0,
-        "dirty flush planning should only clone snapshots while the world lock is held"
-    );
-
-    let commit = plan.write().unwrap();
-
-    assert_eq!(payload_encode_count.load(Ordering::Relaxed), 1);
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
-    assert_eq!(world.dirty_count(), 0);
-}
-
-#[test]
-fn dirty_flush_write_carries_retained_snapshot_fast_path_metadata_into_commit() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-    let registry = single_air_registry();
-    let cpos = ChunkPos { x: 0, z: 0 };
-    let biome = Identifier::parse("minecraft:plains").unwrap();
-    let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-    chunk.mark_dirty();
-    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
-    world.insert_chunk(cpos, chunk).unwrap();
-
-    let plan = world.plan_dirty_flush().unwrap();
-    let planned = &plan.regions[0].dirty_payloads[0];
-    let expected_snapshot = Arc::clone(&planned.snapshot);
-    let commit = plan.write().unwrap();
-    let committed = &commit.regions[0].chunks[0];
-
-    assert!(Arc::ptr_eq(&committed.snapshot, &expected_snapshot));
+    let positions = [
+        ChunkPos { x: -1, z: 0 },
+        ChunkPos { x: 0, z: 0 },
+        ChunkPos { x: 32, z: 0 },
+    ];
+    for position in positions {
+        let mut chunk = Chunk::empty(position, BlockStateId(0), biome.clone());
+        chunk.status = "minecraft:full".into();
+        world.insert_generated_chunk(position, chunk).unwrap();
+    }
+    for _ in positions {
+        let plan = world.plan_dirty_flush_at_tick_bounded(0, 1).unwrap();
+        assert_eq!(world.commit_dirty_flush(plan.write().unwrap()).unwrap(), 1);
+        for position in positions {
+            world.get_chunk_mut(position).unwrap().unwrap().mark_dirty();
+        }
+    }
+    let mut disk = WorldStorage::open_read_only(temp.path(), registry).unwrap();
+    for position in positions {
+        assert!(
+            disk.get_chunk(position).unwrap().is_some(),
+            "continuously dirty chunk {position:?} was starved by an earlier batch"
+        );
+    }
+    assert_eq!(world.dirty_count(), positions.len());
 }
 
 #[test]

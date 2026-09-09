@@ -1,18 +1,18 @@
 use bytes::Bytes;
-use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
+use mc_script::MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES;
 
 use super::{PlayCustomPayloadAction, classify_play_custom_payload};
 
 #[test]
 fn oversized_play_custom_payload_is_rejected_before_decode() {
-    let body = Bytes::from(vec![0x80; DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1]);
+    let body = Bytes::from(vec![0x80; MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES + 1]);
 
     let action = classify_play_custom_payload(body).unwrap();
 
     assert_eq!(
         action,
         PlayCustomPayloadAction::Oversized {
-            len: DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1
+            len: MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES + 1
         }
     );
 }

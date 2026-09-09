@@ -1,974 +1,446 @@
 # ADR 0005 - Regional simulation ownership
 
-**Date:** 2026-07-16
-**Status:** Accepted, staged migration
-**Supersedes:** The single synchronous writer rule in `PROJECT_SPEC.md` only
-for domains explicitly migrated to regional ownership. ADR 0004 remains in
-force for simulation commands and domains still owned by its coordinator.
-
-## Problem
-
-Solaris now has one ECS-authoritative `EntityStore`, but the store is still
-behind one global mutex. Recent work shortened common holds and removed several
-`SessionRegistry + EntityStore` critical sections. That improves latency, but
-it does not provide true multicore simulation: unrelated herds, projectiles,
-and players in distant parts of the world still serialize on the same store.
-
-The current `PROJECT_SPEC.md` says that one thread is the sole world writer.
-This ADR replaces that rule with one writer per region through a staged
-production migration.
+**Date:** 2026-07-16  
+**Status:** Accepted; production authority for moving entities  
+**Supersedes:** ADR 0004's single entity writer
 
 ## Decision
 
-The final simulation model is regional single-writer ownership. Solaris does
-not pursue a globally lock-free mutable world: combat, transfers, persistence,
-and cross-region transactions require deterministic ordered commits. Lock-free
-techniques are limited to immutable snapshots, versioned publications, and
-read indexes. Mutable state stays on region owners and crosses boundaries by
-bounded messages and explicit phase fences.
+Moving entities use regional single-writer ownership. The world is partitioned
+into fixed 8-by-8-chunk `RegionKey` values using Euclidean division. Each active
+region has exactly one `RegionLease` and one lane-owned `EntityStore`. A lane may
+own several regions; a region never executes on two lanes at once.
 
-Regional ownership is an internal scheduler and authority boundary, not a Lua
-API concept. Plugins never receive region keys, owner handles, mutable ECS
-references, or locks. ADR 0009 defines the serial plugin actor, immutable event,
-and transactional command boundary that hides routing and migration.
+Mutable ECS state stays on its owner lane. Immutable tick input, compact
+semantic results, and versioned publications may cross lanes. Cross-region work
+uses deterministic ordered transactions. Region keys, leases, ECS references,
+and owner handles remain internal and are not plugin API.
 
-This ADR accepts the regional target and its staged migration rules. It does
-not claim that the migration is complete: current production uses persistent
-regional entity-owner lanes, while coordinator metadata, cross-domain
-transactions, and several publication paths remain centralized. Each later
-authority move must retain the fencing and acceptance gates below and update
-this ADR's implementation status.
+This is a modular-monolith boundary, not a second server or a distributed
+consensus design.
 
-Partition loaded chunks into fixed 8 by 8 chunk regions. A `RegionKey` uses
-Euclidean division, so negative chunk coordinates have the same stable
-boundaries as positive coordinates.
+## Current authority
 
-Each active region has exactly one owner at a time. Owners run on a bounded set
-of worker lanes. A lane may own many regions, but no region may run on two
-lanes. Once regional lanes exist, the existing autoscaler will choose their
-count from current CPU and runtime pressure; there will be no operator
-worker-percentage setting.
+The regional ECS owns entity identity, UUID uniqueness, lifecycle, retained
+state, goals, paths, physics inputs, kinematics, combat state, vehicle links,
+item and experience state, and entity persistence snapshots.
 
-Ownership is identified by `(RegionKey, RegionEpoch)`. Every routed command,
-worker result, migration, and save snapshot carries the expected epoch. A stale
-epoch is rejected without mutation. Reassigning a region is allowed only at a
-completed phase boundary: the old lane publishes its final snapshot and tail,
-the coordinator increments the epoch, and only then may the new lane accept
-commands.
+The coordinator owns only shared topology and exceptions:
 
-Region-owned state is not protected by a shared simulation mutex. Network,
-plugins, IO, and other regions send bounded commands. A blocked owner waits on
-the exact channel or barrier notification that can advance it. Timeouts only
-fail a stuck operation.
+- `EntityId` and UUID routing to the current lease;
+- lease/epoch changes and lane reconfiguration at completed boundaries;
+- deterministic multi-owner prepare, commit, finalize, rollback, and recovery;
+- cross-region transfers and interactions;
+- save and publication fences;
+- exceptional entities or operations that cannot complete inside one owner.
 
-The first authority move covers moving entities only. Sessions, connections,
-static registries, chunk storage, and block entities remain outside regional
-ECS ownership until separate evidence justifies moving them.
+Session visibility, tracker state, chunk indexes, and outbound queues are
+post-commit publication state. They do not authorize entity mutation.
 
-## Tick Phases
+## CPU work admission
 
-Every simulation tick has explicit phases:
+`ChunkPipelineResources` keeps one fixed shared CPU-worker semaphore, sized
+once. Foreground physics, pathing, random/scheduled block planning and regional
+fanout use `cpu_capacity()`, not the autoscaler's background target.
 
-1. The coordinator routes accepted commands to the region that owns the
-   affected entity or position.
-2. Each lane drains its regions in `RegionKey` order. Commands inside a region
-   retain their global enqueue sequence.
-3. Regions run local AI and physics against immutable chunk snapshots plus a
-   one-chunk read halo.
-4. Regions emit migrations and cross-region intents. They do not mutate a
-   neighbour directly.
-5. The coordinator sorts those messages by tick, command sequence, source
-   region, and entity id, then publishes the next phase.
-6. Visibility and wire events are emitted only after accepted migrations are
-   installed at their destination.
+Autoscaling changes `prepare_limit()` only: the existing background chunk
+prepare-request admission and stream fanout. It does not shrink the shared CPU
+semaphore or introduce a priority queue. Already admitted work is not cancelled.
+Chunk-queue pressure retains capacity to drain pending preparation; entity-owner
+reconfiguration still uses the existing drain fence.
 
-The phase boundary is a push-driven barrier. The coordinator waits for one
-completion message from every scheduled lane, not for elapsed time or an
-arbitrary tick count.
+Background preparation starts and recovers at at most `max(cpu_capacity() - 1, 1)`.
+This leaves headroom from background work on multi-worker configurations without
+reducing the shared foreground ceiling or dropping jobs. Other foreground work
+can still occupy that headroom; it is not a scheduled-planning deadline guarantee.
+Single-worker configurations retain serial admission.
 
-## Cross-Region Rules
+## Session critical sections
 
-- Entity ids and UUIDs survive migration.
-- Every migration has a stable `TransferId` containing the tick, source region
-  epoch, and entity id. The source prepares one immutable entity snapshot and
-  keeps authority while the destination validates its epoch and reserves that
-  transfer id. Neither side exposes the entity twice.
-- The coordinator writes one deterministic commit decision at the phase
-  boundary. A committed transfer removes the source snapshot and installs the
-  destination snapshot as one ownership transition. A rejected or absent
-  decision leaves the entity at the source for the next tick.
-- Prepare, commit, and acknowledgement are idempotent by `TransferId`. Recovery
-  replays the commit decision; it never guesses from which messages happened
-  to arrive before a crash.
-- Combat, pickup, mounting, and breeding commit in the target entity's region.
-  The command carries the observed actor/session generation and position. The
-  owner rechecks lifecycle, distance, and permissions before mutation.
-- Projectiles crossing a boundary migrate before their next local physics
-  step. Segment collision at the boundary uses the captured halo so a target
-  is neither skipped nor hit twice.
-- Save barriers collect immutable snapshots from every lane for the same
-  completed phase. Disk IO remains outside lane ownership.
-- Entity checkpoint acknowledgement is memory-only. The saved checkpoint's
-  lifecycle and owner-sequence watermark makes older append-only WAL records
-  replay-safe, so checkpoint cleanup removes their exact identities from the
-  in-memory pending set without queueing a rewrite or `fsync`. New durable
-  mutations therefore append directly instead of waiting behind checkpoint
-  compaction. Normal journal shutdown compacts the retained pending set before
-  stopping and joining the single FIFO writer. A failed shutdown compaction may
-  leave replay-safe old records on disk but cannot invalidate already durable
-  appends.
-- Disconnect and shutdown close queues, reject unapplied player commands, and
-  wait for exact lane completion before the final save snapshot.
+Natural despawn captures the complete natural-candidate set under the session
+mutex, then releases that mutex for the six-field despawn projection.
+Owner access and lifecycle context stay with the operation. Apply reacquires
+the session mutex and refreshes eligible player positions and natural membership;
+full current snapshots and conditional removal still fence entity changes.
 
-## Migration Strategy
+Chunk unload updates references for every actually removed chunk, then scans
+and publishes visibility once against the complete removed-chunk set. It does
+not delete authoritative entities or bypass ordered outbound backpressure.
 
-### Pre-R1: Ownership and fencing model
+## Current execution path
 
-Implement and test region boundaries, deterministic lease order, phase tokens,
-epoch fencing, and stale command/result rejection without touching production
-authority. This is correctness scaffolding, not routing or a speedup.
+The ordinary entity tick is intentionally direct:
 
-### R1: Routing without authority duplication
+```text
+immutable tick inputs
+  -> owner lane: local selection, AI/goals, bounded pathing, ECS mutation
+  -> compact goal motion + semantic IDs + region leases
+  -> central hostile/breeding/villager transactions that must occur here
+  -> owner lane: reread current ECS, exact collision physics, ECS mutation
+  -> compact committed tracking motion + exceptional fallback IDs
+  -> publication adapter after the regional fence remains current
+```
 
-Add `RegionKey` and deterministic entity-to-region routing. Run all regions on
-one lane using the current ECS authority. Replay output must be bit-identical
-to the unpartitioned path. This stage is structure evidence, not a speedup.
+Owner lanes process their regions in deterministic `RegionKey` order. Goal
+selection and application remain on the same lane, so the owner-local resolver
+may trust that uninterrupted fence; coordinator-driven goal batches retain full
+checkpoints. Physics uses a fresh post-goal/post-transaction ECS read and checks
+sampled chunk identities immediately before mutation.
 
-### R2: Independent regional stores
+Living, powder-snow-walkable living, and aquatic living entities stay on the
+local path while they remain in the same chunk and their world snapshot is
+current. Chunk crossings, vehicles, projectiles, items, experience, falling
+blocks, stale world reads, and unsupported kinds use the existing central
+exception path. The local path never changes an entity category to avoid work.
 
-Move entities into region-owned stores. Start with two separated loaded
-regions and no cross-region interactions. Run their AI and physics on two
-lanes, then compare snapshots, semantic events, persistence, and wire order
-against R1.
+Owner-local collision and pathing reuse the existing immutable
+`mc_data::collision_shapes::vanilla_collision_class` table used by central
+physics. Empty/full-cube states avoid per-cell binary shape decoding. Canonical
+state compatibility and entity-dependent powder-snow rules remain before the
+fast path; complex geometry and unknown-state fallbacks retain their behavior.
+Every block read and world/publication fence remains. There is no per-entity
+block cache or duplicate class table. Startup warms shared classes and canonical
+pathing facts before simulation begins.
 
-Current implementation: `RegionalEntityStore` keeps independent physical stores
-with global entity-id, UUID, and location indexes. Epoch leases fence access,
-and exact per-lane acknowledgements fence phase completion. Vehicle/passenger
-references remain co-located. `FollowTarget` may cross a region boundary and
-uses an immutable target snapshot captured for that goal batch.
-`SessionRegistry` owns the persistent regional entity owner runtime directly.
-Physical `EntityStore` values live only on their assigned owner lanes; the
-coordinator retains ownership indexes, transfer metadata, and phase sequencing,
-not a second mutable entity store.
-The first R3 primitive uses stable `TransferId` prepare/decision/apply records
-inside the coordinator-owned store. Source authority remains visible until
-commit, commit preserves id and UUID, reject leaves the source unchanged, and
-all three operations are idempotent during their phase. Completed phases clear
-their transfer records. This is not yet a durable prepare/commit/ack journal
-and cannot recover a decision after process loss.
-Regional physics application now updates same-region kinematics directly and
-turns boundary motion into a prepared transfer carrying position, rotation,
-velocity, and on-ground state. The destination still remains invisible until
-the coordinator commits that transfer. A vehicle and its passenger chain use
-one transfer record, reserve every member, and move through batch remove/insert
-as one ownership change. A deterministic top-level vehicle leader prevents
-physics input order from changing the group delta. Reject and rollback release
-or restore every member together.
-The store also exposes global id/UUID lookup, deterministic id-ordered
-snapshots and simulation visitors, indexed breeding/sheep visitors, and
-phase-fenced point mutations for velocity, animal state, goals, and damage.
-Goal ticks now prepare active ids per physical region, resolve pathing outside
-the stores, and apply the region batches with aggregate statistics. Results
-are fenced by store authority, phase, and unacknowledged lane, so a foreign,
-stale, or late batch cannot mutate a store. Cross-region follow batches also
-carry the complete target and follower input snapshots; movement, migration,
-identity replacement, or goal changes between prepare and apply reject the
-batch before mutation. Production now resolves independent regional pathing
-batches concurrently after releasing the authority mutex. The ticker resolves
-one batch inline; additional batches run on Rayon's persistent pool and each
-holds one non-blocking permit from the shared autoscaler CPU budget. Idle
-regions do not enter the parallel path. The same permit-backed lanes now apply
-the resolved region batches concurrently after one authority/lease/source/input
-preflight. If any input is stale, no region mutates; otherwise each worker owns
-one disjoint mutable store and aggregate statistics merge after the exact scope
-barrier. This proves concurrent goal compute and mutation, not a measured
-speedup.
-The runtime controller changes persistent owner-lane count only when shared CPU
-admission changes. Its per-tick `Hold` path never sends a reconfiguration
-command or clears selected read routes; drain remains an explicit forced
-transition to one lane.
-The network owner may reuse its already-selected active snapshot batch for
-goal preparation through an opaque authority/version token. The regional actor
-accepts the token only while it still owns the same authority and global
-version and only when the batch completely covers the requested ids; otherwise
-it performs a fresh coordinator read. Any owner mutation invalidates the local
-cache. Apply remains independently fenced by exact lane snapshots and CAS, so
-prepare reuse is a read-amplification optimization rather than borrowed
-authority or a mutation lease.
-Every active goal entity now carries its complete prepared snapshot through
-resolve. Apply rejects the regional result if any input changed, so non-pathing
-goals such as Idle and AquaticWander cannot overwrite newer motion or
-lifecycle state. Physics apply likewise returns accepted authoritative
-kinematics after local mutation or boundary migration; session publication,
-chunk indexes, visibility, and movement packets consume those states instead
-of speculative worker steps.
-The owner CAS now returns the exact committed kinematics batch. The network
-adapter projects that acknowledged batch into its short-lived access cache and
-performs one current-state read before publication, instead of acknowledging a
-boolean, rereading the owner immediately, invalidating that result, and reading
-the same entities again. A stale all-or-nothing CAS returns an empty batch.
-Movement publication now copies accepted kinematics and prior tracker state,
-then builds the wire plan without holding the session registry. Recipient
-discovery reads an `ArcSwap` index rebuilt only when a session connects or
-disconnects. Each entry references that session's own immutable `ArcSwap`
-visibility set, so ordinary movement ticks do not traverse sessions or
-visibility edges under the global registry mutex. Visibility writers publish a
-replacement set only after reserving the corresponding ordered spawn/despawn
-command; movement therefore cannot reserve an earlier sequence for a newly
-visible entity. Wire tracker state now lives in 64 independently locked shards.
-Commit compares the copied tracker state in those shards, reloads the published
-session index and current per-session visibility, and records its metric
-atomically without reacquiring `SessionRegistry.inner`. Session unregister
-closes the per-session ordered queue before publishing removal; the same queue
-lock fences a movement that already passed recipient validation.
-The same snapshot boundary now copies player positions and tracker inputs, then
-releases both ECS access and the session registry for pickup-distance filtering
-and movement-plan computation. Pickup admission and chunk/visibility mutation
-still reacquire the registry. Tracker shards and per-session ordered outbound
-queues are not lock-free, but ordinary movement publication no longer enters
-the global session mutex and stale tracker, session, and visibility plans are
-still rejected.
-Goal input snapshots exclude dead sessions before hostile target selection.
-Each regional goal-selection turn publishes its current active hostile ID set
-separately from the full active entity set before hostile attacks run. Command-
-spawned hostiles in loaded chunks join immediately. If a prior entity physics
-job is still in flight, goal selection is skipped and both publications remain
-from the prior turn. A live-session generation fence prevents selection or a
-command spawn from republishing hostiles after the final player disconnects.
-Hostile attacks read that immutable set and stable per-session combat-target and
-visibility snapshots without taking the session lock before planning or
-touching regional owners. The skeleton arrow type is an atomically published
-startup resource, so ordinary target discovery has no registry read either.
-Creeper fuse CAS, arrow spawning, and the batched current-melee-attacker read
-therefore run without `SessionRegistry.inner`. Each session publishes one
-immutable combat-target snapshot containing its current pose and combined
-alive/non-spectator admission beside its immutable entity-visibility set.
-The target and visibility publications share an odd/even epoch. Every mutation
-opens the epoch before changing current state or reserving visibility output and
-closes it after the immutable snapshot is stored. Melee publication reads both
-snapshots, validates range, reserves ordered damage/swing output, and accepts
-only if the epoch stayed at the same even value. Disconnect first publishes a
-non-targetable state, then closes the ordered queue and removes the index entry.
-An attacker that died or moved before its owner-lane read and a target that
-died, moved, became Spectator, lost visibility, or disconnected during admission
-are rejected without damage or swing. This is ordered regional ownership with
-lock-free reads and per-session queue locks, not a claim that the whole server
-is lock-free. A melee hostile already in range uses a zero-speed
-`FollowPosition`: it skips pathfinding and translation but still turns body and
-head toward the live target for movement publication.
-Goal apply now also exposes a narrow typed projection for the active physics
-set. It reads sorted alive kinematics from the lane-owned ECS stores after the
-successful CAS and avoids a second full-snapshot materialization on the common
-path. A stale or empty batch returns no typed projection; the network caller
-uses a rare current full-state fallback to rebuild active membership and
-physics metadata coherently. Cross-region movement of a prepared local input
-is rejected before lane mutation. Only ids present in the fenced goal input set
-use typed projection; active grazing entities excluded from goal CAS always use
-the current full-state path. Owner/lane/journal errors remain errors. This is
-an incremental ECS boundary, not removal of the full-snapshot CAS input or
-direct shared access to lane worlds.
-ID-filtered simulation-projection reads treat an entity removed after interest
-selection as an omitted result, matching ID-filtered snapshot reads. Every
-returned projection still has to match the requested set and coordinator route.
-This keeps ordinary same-tick removals from turning a stale read set into an
-owner failure.
-Goal-owned rotation remains authoritative through the later physics phase:
-collision resolution may clip position and velocity but does not derive a new
-living-mob yaw from that clipped vector. Moving ground goals use bounded turns;
-zero-speed melee may face immediately for its attack fence.
-Wander targets and per-entity pauses are retained ECS state, so regional
-prepare/apply keeps them behind the same complete-snapshot CAS. Newly added
-retained fields use explicit persistence defaults so an existing saved
-checkpoint remains loadable.
-Local physics application now also mutates independent physical region stores
-concurrently inside one fenced production phase. The coordinator keeps
-boundary transfers serial, including atomic vehicle/passenger migration, while
-the caller and permit-backed Rayon tasks apply same-region kinematics. Batches
-smaller than 257 states stay inline, matching the existing physics-compute
-threshold, and autoscaler scale-down to one CPU disables extra workers. The
-global authority mutex still excludes unrelated point mutations during this
-phase, so this is concurrent regional mutation but not final region ownership.
-Physics prepare now reads owner snapshots and versioned chunk-routing snapshots
-without acquiring `SessionRegistry.inner`. It filters stale inputs,
-captures prior motion, and builds the regional kinematics batch before the
-remaining session lock is acquired for the current owner re-read, despawn,
-arrow, visibility, and wire publication. This shortens the global mutable
-boundary but does not remove it.
-The actor-side cached kinematics path groups multi-entity updates into one
-`SetKinematicsBatchIfCurrent` mutation per affected region. If every cached
-standalone route belongs to the same owner lane, that lane commits the batch
-directly, so independent lanes retain cross-call concurrency. A multi-lane or
-uncached update falls back to the coordinator's equivalent regional grouping.
-This prevents the ECS `PhysicsApply` schedule from traversing a region once per
-entity while retaining the single-entity low-latency path and the batch CAS
-fence. Deterministic tests count one physics schedule run for 76 same-region
-entities, one per region for same-lane and multi-lane updates, zero on stale
-rejection, and prove journal-failure rollback restores the complete batch.
-If any multi-lane rollback cannot be confirmed, or if finalization succeeds on
-only a subset, the coordinator marks the outcome unknown and fail-stops later
-reads, mutations, fallback, and retries until controlled recovery.
-Collision-backed canonical pathing facts are initialized synchronously before
-the entity ticker is spawned. The prewarm returns a non-zero readiness value
-that is moved into the ticker task, so first-use table construction cannot land
-inside a simulation tick. Startup logs expose the initialized state count.
-Cross-region batch spawn and restore now share an all-input preflight and
-publish global indexes only after every physical store accepts its group.
-EntityStore batch restore inserts all snapshots before rebuilding vehicle
-links, so forward passenger references survive and invalid passenger graphs
-fail instead of being silently sanitized. References to an entity already in
-transfer are also rejected before insertion.
-Vehicle/passenger groups now migrate atomically, while followers stay in their
-own region and consume fenced remote target snapshots. Regional goal compute
-and dense local physics mutation now use autoscaled parallel paths, but real
-region-owned command workers, removal of the global authority mutex, durable
-recovery, cross-region interaction fanout, and measured throughput evidence
-remain before a full multicore claim.
+Published movement is compact. Full snapshots are created only for semantic
+operations that require them. A stale publication fence is revalidated against
+current owner state before any wire-visible result is emitted.
 
-The persistent owner-lane runtime uses bounded push queues to wake long-lived
-workers that physically own
-multiple `EntityStore` values. A coordinator consumes `RegionalEntityStore`,
-keeps only ownership/global indexes/transfer metadata, and moves the physical
-stores to deterministic lanes without duplicating authority. Reads use exact
-request/reply messages. Mutation phases use prepare, commit, and finalization;
-if any lane rejects prepare or commit, ready or committed peers receive abort
-or rollback before the coordinator closes the phase. Every lane applies in
-`(RegionKey, sequence)` order and advances a coordinator-supplied sequence
-watermark, including empty batches, so old commands cannot replay after region
-reassignment. Failed startup returns the handed-off stores, empty cutover
-starts the requested owner lanes, unfinalized shutdown rolls back, and
-coordinator shutdown drains every lane before returning full or explicitly
-partial recovered state. Tests cover reverse arrival, same-phase corrected
-retry, cross-phase replay rejection, commit rollback, cross-lane stale-lease
-abort, clean round-trip, empty-world region install/spawn, and startup recovery.
-Lua villager binding discovery is an owner command, not a session-snapshot
-scan. A validated radius of at most 64 blocks intersects at most four 128-block
-regions; the coordinator sends every relevant lane request before receiving
-results, and each lane scans only the requested stores. Selection requires an
-alive exact `minecraft:villager`, a full three-dimensional squared-distance
-match, and a deterministic entity-ID tie-break. The same coordinator turn
-installs a bounded opaque claim and reverse entity index, so concurrent callers
-cannot bind one villager twice. Claims expire after 600 simulation ticks and
-are purged by the pushed lifecycle-epoch command, with no timer, polling, or
-wall-clock wait. Claims are ephemeral and are deliberately omitted from world
-persistence and owner shutdown snapshots.
-New regions use a stable least-loaded-lane assignment. The worker creates the
-empty physical store after an exact install message, and authoritative spawn
-publishes coordinator ID/UUID/location indexes only after prepare, commit, and
-finalization succeed. Removal uses the same protocol, returns its exact
-snapshot, restores it on rollback, and drops global indexes only after
-finalization. Insert rollback also restores the physical store's ID allocation
-watermark, and lane preflight rejects duplicate inserted IDs or UUIDs across
-regions before mutation. Batch reads fan requests out to every owner before
-waiting for exact replies, merge by entity ID, and validate coordinator
-ID/UUID/location indexes. Conditional animal updates carry complete expected
-snapshots into each owner; one stale parent aborts the cross-lane phase with no
-partial cooldown, while a retry from fresh snapshots commits both lanes.
-Same-region kinematics use the same complete-snapshot fence. Standalone region
-crossings conditionally remove from the source owner and insert the updated
-snapshot at the target owner in one coordinator phase; location changes publish
-only after finalization. A stale source aborts an already-prepared target with
-no duplicate or movement. Vehicle/passenger and referenced-goal crossings are
-rejected until their group protocol moves to owner lanes. Every touched store
-also checkpoints pending and published semantic event queue lengths. Rollback
-restores state first and then truncates speculative events,
-so insert/remove/damage rollback cannot leak plugin or wire-visible output.
-Damage uses complete-snapshot CAS and returns the authoritative post-finalize
-health/lifecycle result; stale damage is a zero-mutation rejection. This runtime
-also prepares AI goal work on the persistent owners and applies resolved goal
-batches through the same atomic phase. Complete follower and remote-target
-snapshots fence commit; rollback restores kinematics and truncates speculative
-semantic events, so one stale region cannot publish partial movement.
-Save barriers send the expected finalized sequence watermark and complete lease
-set to every physical owner before collecting immutable snapshots. A lane with
-pending work, a different watermark, or a different lease epoch rejects the
-barrier. Restore batches preserve identities and local vehicle graphs in one
-phase. Vehicle crossings remove the complete exact-snapshot group from the
-source and insert a leader-delta-adjusted group at the target; coordinator
-locations change only after finalize and ordinary rollback restores the source
-graph plus event checkpoints.
-Callers reach the coordinator through a bounded actor handle. Each typed command
-has an exact reply channel; current commands cover reads, restore, atomic point
-and herd spawn/remove, animal/goal/item CAS, conditional physics, damage, goal
-prepare/apply, save, and shutdown.
-Goal pathing resolves outside the actor and only the fenced result returns for
-apply. The actor owns coordinator metadata and the coordinator continues to fan
-work to physical regional owners. Actor startup
-does not transfer coordinator ownership until thread creation succeeds, and
-joined shutdown returns the recovered regional store. This removes the need
-for a caller-side store mutex once the complete production command surface is
-routed through the handle.
-The handle also provides ID-filtered reads, lane status, and complete-snapshot
-conditional remove. Conditional remove
-updates coordinator ID, UUID, and location indexes only after owner finalize;
-stale input leaves both the physical store and indexes unchanged. Owner runtime
-construction preserves the configured entity-ID allocation watermark needed by
-the production server protocol range. Selected reads reject disagreement with
-coordinator location or UUID indexes.
-`SessionRegistry` owns this runtime directly without a
-`Mutex<RegionalEntityAuthority>`; direct and combined session guards carry a
-cloned owner handle rather than a borrowed store. Complete snapshot CAS protects
-partial pickup and removal. Production item-drop creation and item pickup never
-wait for that owner handle while a session or player-persistence guard is held:
-committed drop snapshots are published afterward, while pickup uses a runtime-only
-owner claim token, separate session/player validation, exact token resolution on
-the current snapshot, and only then short visibility publication. Claim install,
-rollback, and finalize are checkpoint-only owner mutations: the simulation
-`SaveBarrier` is the durable pairing point for player and entity state, and the
-direct snapshot path is used only after simulation-owner drain. Split
-owner/session publication rechecks exact snapshots before updating the published
-projection, so delayed player push, breeding, grazing, or hostile-arrow output
-cannot overwrite a newer owner mutation. ID-filtered reads are grouped into one
-request per lane, breeding uses owner-maintained indexes, UUID checks use the
-coordinator index, and physics reuses a batch-prefetched snapshot set.
-Villager inventory pickup applies the same distinction as other conditional
-owner mutations: a stale snapshot or finite geometric miss returns `false`
-without mutation, while malformed non-finite input remains an error. Food thrown
-between villagers carries its persisted recipient identity; only that villager
-may collect it within the bounded shared-food pickup radius, and item merging
-requires the same recipient. A committed courtship installs reciprocal follow
-goals; scheduled villager-brain transitions preserve those goals while the
-pending birth exists, and birth, no-bed, or abort resolution returns both
-parents to `Idle`.
-Owner lanes now support live scale-up and scale-down. At an idle owner-command
-boundary, the source lane detaches the physical store, the coordinator advances
-the region lease epoch, and the target lane installs that same store. A failed
-target install restores the store to the source under a newer lease. Retiring
-lanes are joined only after every region has moved. The runtime control-plane
-pushes its changed CPU admission limit to `SessionRegistry`, so chunk admission
-and owner-lane count change from the same autoscale decision; production startup
-uses that same automatic CPU limit instead of a separate worker percentage.
-Push pressure uses one fixed-size coalescing state cell, not an event backlog.
-Each chunk stream owns separate queue-saturation and first-chunk-SLA tokens.
-Queue pressure changes at the profile's `queue_pressure_percent` threshold.
-First-chunk pressure is measured from stream creation or replan to the first
-successful chunk packet write and compared with `target_first_chunk_ms`; tick
-observations do not guess it. Completion, write failure, replan, and `Drop`
-recover only that stream's active tokens exactly once.
+Chunk-view removal publishes a compact batch of entity IDs per departing chunk,
+using the existing vanilla `RemoveEntities` packet. Dense natural populations
+must not turn one view change into hundreds of reliable queue entries and
+disconnect an otherwise responsive client. Visibility removal is still reserved
+under the session lock and delivered through the same ordered reliable lane;
+player removals and singleton entity lifecycle publications retain their order.
+The queue bounds, population policy, collision admission and authoritative
+entities do not change. Only client visibility is removed, and packet encoding
+consumes the ID vector without cloning full entity snapshots.
 
-The shared cell tracks current source counts plus one pending peak for each
-pressure kind. This remains fixed-size while preserving a short
-`active -> recovered` transition when both edges occur before the consumer
-runs: the peak is delivered first and the current recovery second. One stream's
-recovery therefore cannot clear another stream's queue or first-chunk pressure.
-State mutation, pending flags, peaks, and the `Notify` wake happen under one
-mutex, and the receiver registers its notification before checking the state.
-This closes both the full-to-drained parking race and terminal-edge loss without
-polling or an unbounded overflow queue. Slow-client shed events coalesce in a
-separate fixed pending flag and are pushed from the outbound pressure
-notification path.
+Natural despawn reads every tracked natural entity through `EntityDespawnProjection`:
+ID, UUID, type name, position, lifecycle and last-damage tick. Other simulation
+readers retain their existing projection. Both kinds share deterministic batching,
+committed-state checks, owner-lease validation and returned-location validation
+in focused projection modules; there is no separate fast-path authority.
+No full retained snapshots or persistent snapshot caches are built for entities
+the despawn scan keeps. Categories, player eligibility, distances, idle clocks,
+damage resets and deterministic rolls retain their rules. Existing persistent
+types skip the unused contract lookup, and missing IDs clear their stale clocks.
 
-The controller retains active queue and first-chunk pressure until matching
-source recovery. Ordinary zero-depth tick observations therefore continue the
-pressure hysteresis while any token remains active; recovery of one kind keeps
-the other kind active. Only event-driven recovery of the last source permits
-healthy observations to begin scale-up hysteresis.
+Only a removal candidate requires a full snapshot. UUID, type, position,
+lifecycle and damage clock must still match before full-state conditional removal
+commits. Owner state remains authoritative; publication snapshots never classify
+persistence. The owner read runs outside the session mutex as described above;
+the apply phase still holds it. This does not eliminate every session stall.
 
-`RuntimeControlHandle` has no production decision-only `observe`,
-`observe_work`, or `request_drain` method. Its crate-internal mutation surface
-is one `apply(RuntimeControlOperation, applicator)` transaction. The operation
-is a tick observation, pushed pressure signal, completed work observation, or
-drain request; the result is a typed autoscale or work-budget outcome. The
-handle owns the controller mutex while it derives that outcome, snapshots the
-complete proposed controller state, invokes the applicator, and records the
-applicator result. CPU admission and entity-owner lane reconfiguration therefore
-linearize with the decision that requested them. A drain that linearizes first
-causes every later observation to produce `Hold`, but the `Hold` still passes
-through the applicator while the same mutex is held. No pre-drain decision can
-apply permits or reconfigure lanes after the drain application.
+Conditional snapshot replacement batches that keep regions and passenger links unchanged
+use owner preparation as the full-state comparison fence. The coordinator keeps
+identity/uniqueness, position, claim, routing and committed-state checks, but
+does not first fetch another full batch of the same snapshots. Cross-region or
+passenger-topology changes retain that preflight before planning index updates.
+All-participant preparation, rollback and durable commit ordering are unchanged.
+Grazing timer actions are emitted only when their entire update batch succeeds;
+they are already a subset of that batch and need no second ID-set filter.
 
-The applicator returns `RuntimeControlApplyError::Rejected` only when it made no
-externally visible change or restored its prior resources. That outcome restores
-the exact prior controller state and permits an exact retry. If CPU admission or
-lane application may have partially completed, the applicator returns
-`ControlledStop`; the controller restores its prior policy state, records
-`application_stop_reason`, and rejects every later mutation without calling an
-applicator. An applicator panic follows the same rollback and fence before the
-panic resumes. The caller must turn `ControlledStop` into process shutdown; it
-must not retry an outcome-unknown resource change. Test-only decision helpers
-remain under `cfg(test)` for isolated policy tests and are absent from production
-and downstream public APIs.
+Grazing reads still route every loaded sheep ID in one selected-snapshot batch.
+The owner reads the current ECS timer before constructing a full snapshot for
+IDs outside the possible idle-start phase. `Some(0)` still enters timer cleanup.
+The existing 50-tick baby phase includes every 1,000-tick adult start; the
+unchanged planner uses the snapshot's actual age for the final start decision.
+This immutable per-request selection is not a population or persistence cache.
+Filtered reads use the coordinator and do not publish partial results into the
+complete-read route cache. Lease/commit checks and full-state timer-batch CAS
+remain unchanged; ordinary complete snapshot reads retain their direct path.
 
-Focused in-module regressions cover exact rejection rollback for throughput and
-work budgets, drain followed by an applied `Hold` with equal CPU/lane targets,
-two concurrent observations with callback ordering inside the controller lock,
-outcome-unknown fencing, and panic rollback. Compile-fail examples on
-`RuntimeControlHandle` cover the removed public decision-only methods. These
-are API and controller-ordering checks, not gameplay, soak, performance, or
-replacement-readiness evidence.
+Single conditional replacements now use the same topology criterion to avoid
+rebuilding passenger indexes through a full-population snapshot for in-place
+state changes. Their existing coordinator expected-state read and owner
+preparation remain; relocation or passenger-link changes still validate the
+complete graph. This also applies to the existing conversion entrypoint.
+The grazing planner borrows the retained owner snapshot vector directly rather
+than repacking each large snapshot into a second vector and duplicating age.
 
-On 2026-07-20,
-`cargo test -p mc-net --lib control_plane::tests -- --nocapture` passed all 32
-focused tests, and `cargo check -p mc-net --tests` completed with five existing
-dead-code warnings outside `control_plane.rs`. Production `mc-net` check and
-strict Clippy are not evidence for this slice yet: the separately owned
-`server.rs` still calls the removed decision-only and compatibility methods and
-must move to `apply` before those gates can compile the non-test target.
+## Cross-region protocol
 
-Mutation phases now derive their participant set from non-empty lane batches.
-A local mutation no longer sends empty prepare/commit/finalize barriers through
-every configured owner lane. Prepare and commit are still sent to all touched
-lanes before the coordinator waits for any reply, preserving concurrent
-cross-region execution and atomic rollback. Global mutation sequences are
-therefore sparse per lane; the save barrier accepts a finalized local
-watermark below the coordinator watermark and still rejects a lane that is
-somehow ahead. Focused ownership and coordinator regressions prove that an idle
-lane receives no prepare request and that a later save remains stable. This
-removes the all-lane tax from local work, but independent mutation commands are
-still serialized by the single coordinator actor.
-Point and ID-filtered reads now share a coordinator-published direct-lane
-cache. A warm read sends one non-blocking request to every selected lane
-without entering the actor. Every route carries the exact entity UUID and
-region lease; stale or missing routes fall back through the coordinator and
-refresh. A cold point read publishes the route for its next caller. Lanes reject
-selected reads while a phase is pending or committed but not finalized. Each
-owner lane publishes its own monotonic state version. Ordinary point and
-ID-filtered reads capture the versions of only the lanes they touch and accept
-the fanout only when those versions remain unchanged. A writer in another lane
-therefore cannot force an unrelated read back through the coordinator. This
-still prevents one result from combining pre-commit state from one lane with
-post-commit state from another. Versioned reads used by referenced multi-entity
-goal validation carry the same exact lane-version vector instead of a global
-writer counter. Direct fanout is limited to 16
-concurrent batches, leaving at least 48 slots in each 64-message owner queue for
-prepare/commit/finalize traffic. Reconfiguration clears cached lane senders,
-and a region crossing invalidates routes before the mutation reply. This
-removes the actor from repeated point and selected reads. Warm item-stack CAS
-and cached animal-state CAS batches whose exact leases all resolve to one lane
-now enter that owner lane directly. Cross-lane animal batches retain the
-coordinator's atomic multi-owner protocol. A lane-local admission lock orders
-same-lane phases while distinct lanes remain independent; the handle
-uses the shared atomic phase/sequence allocator, records the exact post-state
-through the production journal, rolls back safe journal failures, and
-fail-stops on unknown outcomes before finalize. Save, reconfiguration, journal
-clear, and shutdown take the exclusive side of the mutation gate. Global index
-changes and cross-region commands remain coordinator-owned. Cold coordinator
-reads take shared topology plus their resolved owner admissions, so they cannot
-publish lane state before journal durability or after a safe rollback. Cached
-ordinary reads are lock-free with respect to distinct lane commits and validate
-only their touched lane versions. Referenced goal CAS takes the shared side of
-the topology gate,
-locks only its selected owner lanes in lane-id order, and validates that exact
-version vector before commit. Direct writers in unrelated lanes can continue;
-coordinator-owned index changes, actor fallbacks, and reconfiguration still
-wait for the topology gate.
-The direct helper validates every `(id, UUID, lease)` under the read side of the
-mutation gate before releasing the route cache, rejects duplicate IDs, reserves
-one sequence per mutation, and journals the complete post-state set as one
-decision. Referenced mutations additionally validate every selected entity,
-including non-mutated targets, while holding the corresponding lane admissions.
-This order prevents reconfiguration, migration, or a target mutation from
-making a validated route stale before prepare.
-Coordinator fallbacks for lane-local animal state, goals, item stacks,
-velocities, damage, and effects now follow the same lock order: shared topology
-gate, then successfully resolved touched owner admissions in ascending lane id.
-A malformed ownership-to-lane route retains the exclusive topology fence. A
-valid fallback stalled on one lane therefore no longer holds the exclusive
-topology gate or blocks direct work in unrelated lanes. Spawn, remove,
-position/region changes, full snapshot replacement, save/reconfigure, and other
-global-index operations remain on the exclusive side.
-Cold point and ID-filtered actor reads use the same shared topology and ordered
-touched-lane admissions. Full snapshots still use shared topology plus every
-owner admission. Goal preparation holds only shared topology: each owner-lane
-queue orders its local AI read against local mutations. Snapshot and goal-read
-messages use their lane admission only while they are enqueued, then release it
-before owner computation. Exact goal-input snapshots and leases reject stale
-plans at apply. A slow lane therefore does not hold admissions or stop direct
-work in another lane.
-Goal selection publishes the exact current simulation-active entity IDs through
-`ArcSwap`. Breeding runs after that publication, performs one selected-ID
-regional read, and filters the ECS animal state that actually needs a tick.
-Unobserved regions neither join the owner request nor age their animals. The
-former coordinator and owner-lane all-world breeding snapshot commands were
-deleted; breeding planning still runs without retaining session state or owner
-admission. Age and love counters advance in 20-tick batches. This keeps their
-tick-count semantics while removing the per-tick synchronous owner round trip;
-pairing and adulthood publication may therefore lag by at most one second.
-Ordinary goal-input collection also reads immutable publications for active
-chunks, a 64-shard chunk-to-entity index, terrain-pathing IDs, and per-session
-combat-target poses. It therefore does not enter `SessionRegistry.inner`.
-One revision fence covers active-chunk and entity-index publication so a
-cross-shard move cannot disappear from a concurrent snapshot.
-Ordinary active populations still receive one AI and physics turn every server
-tick. When the active population exceeds the autoscaler's current CPU capacity,
-the network owner selects a deterministic entity-id cohort of
-`256 * cpu_limit` each tick. Cohorts rotate by tick and cover every active
-entity without an operator worker-percentage setting. Goal resolution is
-independently capped at 512 entities inside that cohort. Natural-mob movement
-publication remains every tick through 512 active mobs; larger populations use
-the same deterministic 512-entity rotation. This is bounded overload behavior,
-not a vanilla-cadence claim for artificial overcrowding.
-Sheep grazing keeps exact per-tick timers but now intersects loaded entities
-with a session-owned sheep index before asking regional owners for snapshots.
-Breeding similarly intersects the full active population with a lock-free index
-containing only babies and animals in love. Feed, birth, grazing age changes,
-restore, and removal maintain that index. Idle adults therefore do not cause a
-regional snapshot, while every active animal that needs time advancement
-remains eligible even when physics uses a smaller overload cohort. These
-indexes remove broad reads without becoming mutation authority.
-The publication owns both chunk-to-entity and entity-to-chunk routing. The
-duplicate maps formerly stored in `SessionRegistry.inner` were deleted;
-visibility, projectile collision, sheep grazing, lifecycle radius queries, and
-player-body relocation read the same fenced authority. Chunk, entity, and
-pathing mutations still enter through existing centralized mutation paths, so
-this removes a global index authority rather than completing regional mutation
-ownership.
-Committed physics chunk crossings release `SessionRegistry.inner`, then update
-the routing publication as one expected-old batch. Each move commits only when
-its route still matches the pre-apply snapshot; a newer relocation or removal
-wins instead of being overwritten. The batch clones each touched forward and
-reverse shard once and reacquires the session lock only for the successfully
-committed moves' visibility and tracker publication. Session membership and
-loaded-chunk updates may progress without observing a partial cross-shard move.
-Item lifetime expiry no longer performs a full entity snapshot during every
-physics publication turn. Item creation and restore add the entity id to a
-simulation-tick deadline index; an expiry turn reads and removes only due ids,
-bounded by the existing sweep budget. This removes the steady all-lane
-admission and keeps restored items on their original `spawn_tick` deadline.
-Removal cancels the live deadline, duplicate scheduling is idempotent, and
-stale queue entries do not consume the live-item sweep budget.
-Due removal and visibility publication still use the centralized session
-registry, so this is a removed global read fence rather than a claim that item
-lifecycle is fully regional.
-Prepared-goal apply uses shared topology plus the admissions resolved from its
-active goal inputs, follow-target sources, lease/batch regions, and any requested
-post-apply kinematics IDs. Its multi-lane prepare/commit/finalize is atomic
-across participating lanes in normal operation; an unconfirmed rollback or
-partial finalization is explicitly outcome-unknown and fail-stops instead of
-falling back or retrying. Direct mutations in unrelated lanes continue
-independently.
-Hostile goal planning now compares the computed goal with the goal already in
-the simulation view. Equal wander, follow-position, or idle goals are removed
-before the owner call, and an empty diff sends no command. This reduces the
-high-frequency coordinator path without weakening referenced-target validation
-or multi-entity atomicity for the changed subset.
-Production damage now reuses the snapshot already read by the session and sends
-`DamageIfCurrent` through the same cached single-lane protocol. The helper
-returns the exact post-state captured under lane admission before journal and
-finalize, so a concurrent later hit cannot leak into the earlier
-`EntityDamage`. Lethal damage reports `Despawning`; physical removal and global
-location/UUID index changes remain a separate coordinator-owned command.
-The coordinator now maintains the vehicle topology needed for exact kinematics
-validation: `vehicle -> passenger` and `passenger -> vehicle`. Partial
-kinematics reads only the connected vehicle components containing requested
-entities, grouped by owner lane, instead of cloning every entity in the world.
-A dense batch that already covers the whole world keeps the simpler
-all-snapshot path. Plain batch spawn no longer scans existing stores; only a
-batch that introduces vehicle links pays for full graph validation. Per-lane
-request counters prove west-only kinematics does not read east and a plain west
-spawn batch reads neither existing lane. Vehicle spawn, migration, removal,
-and restore tests cover topology-index maintenance. The bounded debug benchmark
-now reports both dense and active-subset modes. Earlier runs were constrained
-to logical CPUs `0,1`, which are SMT siblings on this host and therefore do not
-constitute multicore evidence. They measured dense p50/p99 `45.6/49.4 ms` with
-one lane and `40.5/45.3 ms` with two. Moving 512 entities in two of eight
-regions measured p50/p99 `11.5/12.3 ms` and `10.3/11.1 ms` respectively.
-Standalone kinematics that stays inside its current region now skips the
-coordinator's duplicate snapshot read and submits one exact-CAS mutation and
-one global sequence per touched region instead of one per entity. The owner
-lane still preflights the whole regional batch before applying it, and the
-existing prepare, durable journal decision, commit, rollback, and finalize
-protocol is unchanged. Vehicle topology, passengers, and region crossings
-continue through the full path. On the same bounded SMT-sibling benchmark,
-the final path measured dense p50/p99 `19.052/20.926 ms` with one lane and
-`16.614/18.067 ms` with two; the 512-active case measured `4.755/5.131 ms`
-and `4.340/4.883 ms`. This is a current-head run-to-run reduction of the common
-batch cost, not multicore evidence. The benchmark now rejects Linux affinity
-that exposes fewer distinct physical cores than owner lanes. On physical cores
-`0,2`, the final path measured dense p50/p99 `19.388/21.276 ms` with one lane
-and `11.996/19.823 ms` with two; the 512-active case measured
-`4.901/5.716 ms` and `3.503/4.769 ms`. This proves lane-level multicore gain for
-one batched kinematics command. The elevated parallel p99 was measured while a
-game was competing for CPU under `nice`; combined chunk/entity throughput,
-oversubscription, and a quiet-host p99 load gate remain required before a
-full-server scaling claim.
-An ignored diagnostic benchmark now separates raw ECS apply, direct coordinator
-transactions, and the production actor path for the same 512-entity batch. On
-physical cores `0,2`, current-head debug p50 measured `1.418 ms` raw ECS,
-`4.017 ms` through a directly called coordinator, and `3.420 ms` through the
-actor. The inversion between direct and actor runs under competing host load
-shows that actor enqueue is not the dominant scaling limit; removing the actor
-would discard sequencing ownership without recovering the transaction cost.
-Single-participant mutations now fuse owner preflight and apply into one
-message. The coordinator still records the durable decision before finalize,
-and journal failure still rolls the committed lane back; unknown append outcome
-still fail-stops. Multi-lane mutations retain separate prepare and commit
-barriers so no lane applies before every participant has validated its input.
-On physical CPU `0`, the fused 512-entity actor path measured p50/p95/p99
-`4.491/4.560/4.885 ms`. This is a bounded current-head debug result, not a
-quiet-host production throughput claim.
-Worker loss after commit but before every lane acknowledges finalization still
-requires the durable decision journal described by this ADR. Local undo can
-roll back surviving lanes after ordinary rejection, but it cannot recover a
-physical store from a dead worker. Therefore a channel close or worker panic
-during commit/finalize is a fatal runtime condition, not a recoverable rejected
-phase, and blocks production cutover until journal replay exists. Expected
-startup and shutdown errors remain recoverable: returned partial state is
-pruned so ownership, location, and UUID indexes name only stores and entities
-that were actually recovered.
-The coordinator now has the exact journal insertion point and a narrow backend
-contract. After every participant reports a successful commit, it captures only
-the touched entities as complete upsert snapshots plus removed IDs and records
-that decision before sending the first finalize. A record failure rolls every
-applied lane back and returns `Journal`; successful finalize asks the backend to
-clear that phase. The default backend is disabled and adds no snapshot traffic.
-Production persistent worlds now use a versioned JSON backend containing the
-complete owner-state delta, including custom attributes, goals, vehicle links,
-and animal state. Each replacement file is flushed, `sync_all`ed, atomically
-renamed, and followed by a directory sync. Startup overlays pending decisions
-on the last entity save, restores the merged owner state, and only then clears
-the recovered phases. Existing age and pickup-delay metadata survive snapshot
-replacement. A bind-restart regression proves exact state replay and durable
-acknowledgement. This closes the process-restart journal gap, but synchronous
-durability cost and the remaining fail-fast adapter path still require p99 and
-fault-injection evidence.
+Every routed operation carries the expected lease. Stale leases reject without
+mutation.
 
-### R3: Migration and boundary interactions
+Multi-owner operations acquire admissions in deterministic lane order and use
+one recorded decision:
 
-Implement entity transfer, projectile crossing, pickup, combat, mounting, and
-breeding across boundaries. Each behavior needs an exact boundary regression
-and deterministic replay before the global `EntityStore` is removed.
+1. prepare validates leases, identities, expected state, and the complete write
+   set without exposing a partial result;
+2. commit records and applies the decision in deterministic order;
+3. finalize makes the result externally publishable;
+4. rollback restores the prepared snapshots when rejection is still known;
+5. an indeterminate commit outcome stops the runtime.
 
-### R4: Regional world mutation
+Transfers preserve entity ID and UUID. Source and destination never expose the
+entity simultaneously. Vehicle/passenger groups move atomically. Save barriers
+capture all lanes at one completed phase and retain sequence watermarks needed
+for replay.
 
-Only after entity ownership is stable, move chunk and block-entity mutation to
-the same region owners. Multi-region structures and transactions use ordered
-region messages; they never acquire two region stores at once.
+Simulation saves freeze the immutable dirty-world plan and world-journal cut
+while owning the shared `WorldStorage` mutex. They release that guard before
+entity/player capture; the simulation owner still excludes subsequent commands.
+World decisions accepted after the frozen cut remain beyond that save's
+checkpoint acknowledgement.
 
-Chunk streaming now receives the already-created `WorldReadView` and
-`WorldMutationView` from `ConnectionWorld`. An already-resident chunk is read,
-lit, conditionally published, and encoded without acquiring the global
-`WorldStorage` mutex. Light publication first compares every neighbourhood
-source token, then installs only while the same resident snapshots remain
-current. There is no constructor `try_lock` fallback: disk misses, generation,
-LRU admission, pressure flush, and other storage work keep the global writer,
-while the resident delivery path has its owner handles before work starts. A
-push-driven regression creates the stream while that writer is already held
-and requires packet delivery before releasing it; its timeout is failure-only.
+### Journal durability
 
-The first production R4 path covers random block ticks whose complete read and
-edit footprint stays inside one 8 by 8 chunk region. Planning uses immutable
-published snapshots. Commit uses exact block-state and mutation-token
-preconditions under the resident region lock, including leaf-neighbour tick
-scheduling and light-change metadata. Persistent worlds reserve a world-journal
-decision, mark the touched resident chunks with that decision, append the full
-post-mutation chunk images, and clear the pending fence before any client or
-entity side effect is published. Journal failure requests controlled shutdown;
-the path never retries an outcome-unknown mutation through `WorldStorage`.
-Tests prove completion while the global world writer is held, exact stale-plan
-rejection, and restart-readable journal state. Cross-region plans still use the
-coordinator fallback. Grouping independent regional plans under one ordered WAL
-append, then dispatching those groups to independent lanes, is the next R4
-step; no full-server multicore claim follows from this first path.
+The owner-approved gameplay contract is write-behind: a successful mutation is
+accepted into the bounded RAM journal queue, not acknowledged as durable storage.
+A crash may lose the unflushed tail. Queue pressure delays admission; it never
+discards accepted work.
 
-The same resident transaction now covers the common sheep-grazing block edit.
-The planner deduplicates competing sheep by food-block position in deterministic
-candidate order. Entity completion and wool regrowth happen only for edits
-present in the accepted resident outcome, after journal durability and block
-publication. A held-global-writer regression covers the action tick. A batch
-whose footprint crosses a region boundary keeps the ordered coordinator path;
-atomic cross-region world/entity transactions remain future R4 work.
+World-chunk and entity decisions use one world-owned `JournalWriter`, queue and
+failure signal. Their existing recovery formats remain distinct. The writer
+groups up to 64 queued requests, persists reserved ID bounds before either log
+can reference them, then syncs the appended batch. Reservations no longer
+serialize and replace the accumulated world journal.
 
-Scheduled fluid processing also uses region ownership for its common path.
-The coordinator no longer drains due ticks before planning. It selects an exact
-per-chunk due prefix from immutable snapshots, and the resident region verifies
-that prefix together with all block state/token preconditions. One mutation
-then consumes the prefix, applies one final flow edit per position, and
-schedules follow-up fluid and leaf ticks. Source-path planning uses one bounded
-visited set instead of recursively revisiting the same graph, and follow-up
-ticks are deduplicated, sorted, and published once per chunk. Stale preflight
-leaves the due queue unchanged. Like ordinary same-region scheduled blocks and
-active furnaces, this deterministic common path marks resident chunks dirty for
-the normal save cadence and does not wait for a world-journal append or `fsync`
-on the tick thread. An unclean process loss may therefore discard unsaved fluid
-progress. A footprint crossing an 8 by 8 boundary keeps the ordered coordinator
-commit, which exact-claims every due prefix before mutation. This removes the
-global dequeue and synchronous journal from one-region fluid work; it does not
-yet run independent regions concurrently in one tick pass.
+Full saves wait for the accepted queue prefix. Every dirty chunk flush plan
+also carries the journal barrier, including background and pressure flushes;
+this prevents a region file from overtaking its WAL. Clean shutdown drains the
+writer, and its lease lasts until all journal owners release it. Any writer
+failure wakes the runtime failure observer and append-order waiters; subsequent
+mutations and save barriers fail closed. A failure affects both logs because
+they belong to the same world's persistence transaction stream.
 
-Scheduled block processing now uses the same exact resident queue-and-block
-transaction when a due batch contains only buttons, leaves, or stale entries.
-The transaction consumes the immutable-snapshot due prefix, applies exact-CAS
-edits, schedules adjacent leaf ticks, and journals the resulting chunks before
-publication. Stale preflight leaves the queue untouched. Hopper tick backfill
-also updates resident chunks without the global writer. Hopper-only
-same-region work now consumes each due tick in the same regional transaction as
-its hopper, chest, furnace, and follow-up tick changes. Persistent worlds stamp
-and fence every changed chunk under one decision before dispatching container
-updates. All hopper commits in one scheduled pass share one decision and one
-append. A rejected resident preflight records a durable empty decision for its
-reserved journal ID before any coordinator fallback, preventing reservation
-holes from poisoning later appends. Comparator-containing batches and hopper
-transfers crossing an 8 by 8 boundary still use the exact coordinator claim and
-ordered block-entity path. Button, leaf, and stale-entry batches that cross an
-8 by 8 boundary use an ordered resident-owner transaction without reacquiring
-the global `WorldStorage` writer. Prepare records immutable expected-present
-snapshots and expected-absent optional neighbour chunks, then builds every
-post-state image in unpublished memory.
+## Invariants
 
-Reservation, push-driven append-turn waiting, source verification, durability,
-and publication run in one synchronous blocking-worker closure. Aborting or
-dropping the async caller cannot cancel that closure after reservation. Before
-the WAL append, the transaction takes exclusive resident mutation admission;
-ordinary region mutations take shared admission. It rechecks every expected
-present snapshot by identity and rejects every absent-to-present neighbour race.
-The transaction owns the exclusive publication admission guard through source
-verification, WAL append, and publication. Readers and ordinary mutators block
-on the shared side of that `RwLock`; OS lock wakeup, not polling, resumes them
-after the writer unlocks. After append success, publication makes the generation
-odd, installs each owner while holding exactly one region lock, updates the read
-and scheduled-tick views, returns the generation to even with release ordering,
-and unlocks. An incomplete publication guard marks the state fail-stopped and
-restores even parity before unlocking; every later reader or mutator rejects
-that state, so an unwind cannot expose a partial publication as reusable state.
-Because durability precedes installation, these chunks need no pending-LSN
-flush fence and there is no installed state to roll back.
+- One region, one lease, one lane, one mutable ECS authority.
+- Reconfiguration occurs only at a completed boundary and increments the
+  relevant epoch/version fence.
+- Same-region AI and physics never round-trip through the coordinator.
+- Goals and physics remain separate because hostile attacks, breeding, and
+  villager population/defence may commit between them.
+- Goal publication uses post-goal state; physics rereads and validates that state
+  rather than trusting a pre-transaction full-population payload.
+- Physics samples the complete swept collision footprint. Missing chunks fail
+  closed. No entity is treated as grounded or stationary to skip physics.
+- Direct pathing still validates finite values, world height, and loaded chunks.
+  Terrain-pathing entities additionally use canonical collision shapes.
+- Publication follows commit and checks the regional version fence.
+- Cross-region ordering is deterministic and replayable.
+- Worker or coordinator loss is fatal when commit outcome cannot be proved.
+- Waits are message-driven; elapsed time is never evidence of completion.
 
-A stale or missing source appends a durable empty decision. Snapshot validation
-or encoding errors are typed known-before-append failures; they return through
-the journal snapshot API without unwinding. A known pre-append or append failure
-must append that empty decision before the reservation is released. After that
-closure is durable, the scheduled-block handler returns a rejected no-op and
-continues. Failure to close is fail-stop. An outcome-unknown append never
-publishes live state, poisons the journal, and requests controlled shutdown.
-Restart repair and replay inspect the WAL bytes and choose exactly the recorded
-outcome; runtime code never guesses whether the attempted decision reached disk.
+## Performance evidence
 
-Active furnace ticks retain their full `(block state, furnace snapshot)` CAS
-under the resident region lock. A successful local mutation marks the owning
-chunk dirty for the normal save cadence and dispatches viewer updates without
-waiting for a WAL append on the tick thread. Stale furnaces are replanned from a
-fresh resident pair on the next pass. This keeps the common cooking path
-responsive; an unclean process loss may discard unsaved furnace progress just
-like other ordinary dirty world state.
+The fixed 100,000-entity workload is the acceptance gate: 50 active players,
+40,000 villagers, 60,000 mixed animals, every entity selected each tick, and
+8,450 retained chunks.
 
-Active campfire cooking now shares that resident journal-wave boundary. The
-campfire session lock protects the in-memory cooking transition while a
-synchronous resident block-state/token CAS installs the matching opaque block
-entity and decision fence. One final append covers every changed campfire chunk
-in the pass before viewer NBT updates and cooked item spawns are published.
-Cold chunks are not loaded for ticking. This makes the world-side cooking state
-recoverable and bounds WAL appends per pass; it does not yet make the later
-cooked item entity spawn exactly-once across process loss.
+The latest optimized release-profile run at
+`.analysis/bench/living-world-100k-compact-goal-capture/baseline.log` completed
+all 1,200 measurement ticks with 100,003 entities at activation and every
+active entity selected. It reported tick p50/p95/p99/max of
+83.673/91.805/95.431/103.005 ms. Dominant p95 phases were goals 33.197 ms,
+physics 32.834 ms, and dispatch 13.581 ms. Owner-local goal apply now emits
+only semantic vectors and changed motion while it mutates ECS; the prior full
+pre-goal motion vector, full post-goal candidate vector, and mismatch reread
+were removed. Matched instrumentation measured owner critical-path p95 at
+26.561 ms versus 27.691 ms and owner CPU-sum p95 at 129.636 ms versus
+139.719 ms. Whole-tick p95/p99 did not improve in the single matched runs.
+The fixed p95 <= 50 ms and p99 <= 60 ms gate still fails, so the architecture
+is functionally current but not performance-ready.
 
-Ordinary scheduled block passes preserve their global due order as contiguous
-regional groups instead of submitting one batch that becomes `CrossRegion` as
-soon as two independent regions are active. An inline single-region group uses
-resident conditional mutation and the normal dirty-chunk save cadence; it does
-not wait for a WAL append on the tick thread. This deliberately allows an
-unclean process loss to discard unsaved ordinary scheduled-tick progress, like
-other unsaved world state, and removes the measured 70-133 ms append stalls
-from the common path. Distinct region groups may fan out across autoscaler CPU
-permits and retain their ordered journal wave. Repeated region order such as
-`A, B, A` stays sequential, and each group is replanned from state published by
-the preceding commit. A plan whose edit footprint crosses a region boundary
-still uses the ordered durable coordinator transaction because partial
-installation would violate block invariants. Autoscaler scale-down to one CPU
-keeps ordinary groups inline.
+No throughput claim may replace this fixed full-population tick-latency gate.
+Short runs, reduced populations, extra cadence, and isolated kernels are only
+profiling evidence.
 
-The scheduled-block phase starts one bounded background job. Pure snapshot
-planning and sequential regional replanning run on an autoscaler-admitted
-blocking worker, while the simulation owner continues servicing pushed
-commands. The tick does not advance into fluid or later phases until the job
-commits, so scheduled-block ordering remains explicit and its wait is attributed
-to the same tick. A shared admission fence covers both ticker and direct owner
-entry points. Commits keep the same resident/coordinator fences, and shutdown
-cannot cross the phase before the admitted job is joined.
+The 2026-09-07 debug natural-despawn probe used unchanged populations of
+128/512/1024 entities, five warmups and forty measured ticks for farm animals,
+hostiles, aquatic mobs, nonpersistent ground animals and mixed populations.
+At 1024 entities, homogeneous-population medians fell by 20.3–27.0%; the exact
+results are retained in
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/despawn-cost/controlled-comparison.json`.
+This isolated stationary-population probe does not establish live tick
+percentiles, the fixed large-world gate, or elimination of session lock stalls.
+The rejected two-pass ground-animal trial is recorded beside them in
+`compact-ground-trial.json`: it doubled reads for nonpersistent ground animals.
 
-Random-tick planning now partitions the common mutation path before commit.
-Contiguous groups retain global sample order and original indexes for
-deterministic seeds. Each later group is planned from the state published by
-the previous commit. A conservative four-block boundary belt separates known
-neighbour scans, while exact edit/precondition ownership preflight remains the
-authority for wider families. Cross-region plans first make the preceding
-resident wave durable, then stamp and append their coordinator snapshots under
-one reserved decision before publishing side effects. Before mutation, the
-coordinator stamps the prospective edit and leaf-tick footprint with exact flush
-fences and never decreases a newer chunk LSN. If pre-stamp observes a newer
-decision, the old empty decision is closed and the global writer is released;
-the retry waits for the journal append cursor through a notification, then
-locks and revalidates from unchanged coordinator state. Checkpoint poison and
-writer closure wake waiters; ordered prefix appends retire earlier reservations
-without polling. Drops are accepted only from the plan whose source edit
-committed. Interior plans for separated regions share one journal decision and
-append. Distinct owner regions now execute concurrently under autoscaler CPU
-admission; scale-down to one CPU keeps the existing inline path. Candidate
-indexes preserve deterministic RNG order, while repeated owner regions and any
-boundary group stay sequential and replan from published state. Every worker
-prospectively stamps and fences its loaded edit and leaf-neighbour footprint
-before mutation. A worker panic is contained per job: all lanes drain, every
-stamped post-state is appended, and only then does the pass fail-stop without
-publishing block deltas or drops. This removes the global writer and sequential
-regional commit from the independent random-tick common case without weakening
-ordered boundary semantics.
+The subsequent grazing probe kept all 128/512/1024 sheep selected through
+idle, active and mixed timer workloads, with five warmups and forty samples
+on the same four CPUs. At 1024 active sheep, removing duplicate coordinator
+validation reduced median/p95 from 52.756/54.448 ms to 42.323/46.913 ms.
+Exact decrements and whole-batch stale rejection remain required. Idle snapshot
+reads are still material and did not improve consistently; these figures do
+not establish whole-server latency. Measurements and a rejected ownership
+cutover are retained under
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/sheep-grazing/`.
 
-Changed entity goals without an entity reference now use the same cached
-same-lane durable commit path as item and animal state mutations. A successful
-full snapshot read publishes exact owner routes while holding exclusive entity
-mutation admission; the later direct batch revalidates ID, UUID, lease, and
-expected snapshot under shared admission before committing and journaling its
-post-state. Duplicate IDs, cache misses, multiple owner lanes, and goals that
-reference another entity still fall back to the coordinator. In particular,
-`FollowTarget` keeps coordinator validation and atomicity across the follower
-and target owners.
+The idle-read follow-on compared filtered and unfiltered query dispatch with
+identical candidate preparation, test instrumentation and nine debug workloads.
+At 1024 idle sheep, median/p95 fell from 15.785/16.453 to 3.708/4.188 ms; mixed
+median fell from 19.439 to 13.691 ms. The all-active median rose from 41.866 to
+43.339 ms (+3.5%), a retained tradeoff rather than an across-the-board win.
+The final owner route still recorded a 51.527 ms grazing warning; warning-only
+samples do not establish throughput or elimination of live contention. Exact
+measurements, unchanged three-seed replay receipts and remaining limitations:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/sheep-grazing-idle/checkpoint.json`.
 
-Dirty high-water handling is deliberately bounded: each pass drains at most 64
-dirty chunks, then relies on producer-pushed tail convergence instead of
-turning pressure handling into an unbounded checkpoint. Full checkpoints remain
-the interval, disconnect, shutdown, and explicit save paths. Focused tests pass;
-the P44 runtime gate has not yet been rerun for this slice.
+The active-cost follow-on rejected projection-then-snapshot composition: its
+1024-sheep idle/active medians were 7.563/51.269 ms against 3.284/43.995 ms for
+the filtered read. Reusing the snapshot vector improved all nine matched cases;
+1024 active median/p95 became 40.985/41.673 ms. The final uninstrumented run
+measured idle/active/mixed medians of 3.243/41.090/12.695 ms.
+Instrumented owner-route attribution localized the live peak to grazing start,
+not grass snapshots. After topology-preserving single CAS, recorded start
+p95/max fell from 25.171/58.016 ms to 1.067/8.395 ms. These are instrumented
+stage samples, not whole-server percentiles. That post-change replay failed
+the unchanged degradation gate on an 11.894 ms chunk-prepare lock wait; it is
+not a graphical acceptance pass. Final gates and preserved failures are in
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/sheep-grazing-read-cost/checkpoint.json`.
 
-Movement fanout uses an adaptive gate rather than unconditional dispatch: it
-selects the fanout path only when `S * M > 2E`, and `M = 0` sends no fanout
-work. Three focused tests pass. This is a bounded work-selection change, not
-runtime throughput evidence; a performance rerun remains pending.
+Save-lock attribution then found recurring `save_barrier` world-lock holds up
+to 21.707 ms; entity capture, not dirty-world planning, dominated that interval.
+After transferring the owned guard into save capture, none of eight matched
+saves reached the 1 ms wait/hold trace threshold. World planning and cut capture
+took 0.314–0.625 ms; entity capture still reached 25.294 ms outside that mutex.
+The deterministic regression also checkpoints and reopens the WAL to prove
+that world decisions accepted during entity capture remain recoverable.
+Final unchanged three-seed graphical routes pass, but scheduled-block warning
+samples still reach 154.404 ms and the inspected owner frame displays 10 FPS.
+This closes the measured save lock scope, not whole-server latency or visual
+acceptance. Temporary clocks were removed; evidence and remaining contention:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/streaming-commit-stalls/checkpoint.json`.
 
-Entity simulation admission now reads a published atomic live-session count.
-Registration, persisted death state, survival death/respawn, and unregister
-publish a generation while changing the authoritative session state. A
-transition to zero live players pushes hostile-goal reconciliation through the
-regional owner after releasing `SessionRegistry.inner`. If another player
-transition happens during that work, the stale generation replans from the
-newly published player set. Positive transitions do not block login on entity
-journal work; the next simulation event performs ordinary target selection.
-Empty/all-dead steady-state ticks therefore take neither the session mutex nor
-an entity-owner snapshot, without leaving disconnected or dead targets behind.
-Active-player selection and visibility mutation still retain their documented
-centralized metadata boundaries, so this is not full world regionalization.
+The background-only admission cutover reduced scheduled-planning CPU-admission
+p99 from 37.654 ms to 0.110 ms in one matched owner-route pair (8,134 and 8,114
+plans). Actual planning p95 stayed at 0.155/0.160 ms. The remaining 95.362 ms
+admission maximum occurred before the first logged background reduction; this
+is not proof of a stable whole-tick deadline. The uninstrumented L2 and three
+unchanged graphical routes pass. Clocks were removed; exact measurements,
+remaining session contention and the limited visual evidence are retained in
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/scheduled-block-phases/checkpoint.json`.
 
-The `wide` SIMD experiment remains non-promoted. Its kernel median gain was
-`7.86%` and its full-path median gain was `0.72%`, both below the 10% promotion
-threshold. The scalar production path and its existing correctness fences stay
-in force.
+The session-lock follow-on measured unload visibility p95/max at
+11.263/42.781 ms before and 0.918/4.043 ms after batching, with 22 unload calls
+in each owner-route run. Despawn projection still costs about 11 ms at p95,
+but no longer holds the session mutex. Apply work remains material; this is
+not a claim of lower total despawn CPU cost. A regression proves that a nearby
+player can join during projection and prevents the formerly eligible despawn.
+Matched samples, final gates and retained limitations:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/session-lock-phases/receipt.json`.
 
-## Acceptance Gates
+The headroom follow-on separated semaphore notification from executor resumption:
+98.516 ms of the worst 98.597 ms admission sample preceded notification.
+Leaving one worker out of the background ceiling reduced matched admission
+p99/max from 2.084/98.597 ms to 0.016/3.020 ms; none of 7,112 candidate
+acquisitions polled pending. The 8,174/7,112 plan samples and finished stream
+windows contain different realized work, so equal throughput is not established.
+Final workspace tests and three unchanged graphical routes pass, as do final
+formatting, strict Clippy and code-health. Earlier failed receipts remain failed.
+The owner route still reaches 155.537 ms whole tick and 118.228 ms unattributed
+time in warning samples; this does not close the 50/60 ms gate or all scheduled
+work. Probe source, exact receipts, test migrations and limitations:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/scheduled-stall-followup/receipt.json`.
 
-- Single-lane replay is bit-identical for entity snapshots, semantic events,
-  persistence, and wire ordering.
-- Two separated busy regions execute concurrently and improve measured dense
-  throughput without increasing p99 tick time or losing entities/events.
-- Negative coordinates and every 8-chunk boundary route deterministically.
-- Migration conserves entity count and identity through restart.
-- Cross-boundary projectile, combat, pickup, vehicle, and breeding tests have
-  no duplicate or lost mutation.
-- Autoscaler scale-up and scale-down wake lanes through notifications and do
-  not move a live region between owners mid-phase. Commands and results from a
-  previous region epoch are rejected.
-- Shutdown drains every lane and produces a zero-dirty final save in the
-  bounded multiplayer gate.
+The narrow-despawn follow-on separated owner projection time from decision work.
+Six-field reads and the earlier persistent-type check reduced matched elapsed
+percentiles and normalized per-candidate cost. Realized populations and route
+durations differ; this is not equal-throughput or process-CPU evidence. Worst-case
+despawn and whole-tick time did not improve in that comparison. Final L2 component
+gates and the unchanged three-seed graphical routes
+pass after import/test cleanup; original failed receipts remain failed.
+Full measurements, the independent review's scope, exact source delta and limits:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/unattributed-tick-followup/receipt.json`.
 
-## Non-Goals
+Periodic planning now lives in `natural_spawn_26_1_2/periodic.rs`. Its collision
+geometry memo is indexed by the immutable input projection slice, local to one
+category call, and initialized only after terrain admission. Individual AABBs
+are computed only when collision short-circuiting reaches them. Candidate order,
+accepted-box checks, counters, identity, cadence and publication fences do not
+change; this is not a persistent cache or a second authority.
+With identical instrumentation and owner-route setup, friendly-due planning p95
+fell from 63.929 to 9.318 ms (18/17 attempts). Realized populations and work differ.
+Whole-tick p95/p99 increased, despite a lower maximum; this is not a whole-server
+latency or equal-work CPU claim. Final L2 component gates and all three graphical
+routes pass. The stale ownership-rule failure remains retained alongside its
+mechanical path repair, independent review scope and visual limitations:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/periodic-planning-followup/receipt.json`.
 
-- One thread per region.
-- Parallel mutation of one hot region.
-- Configurable worker percentages or manual subsystem budgets.
-- A second mutable ECS authority kept in production.
-- Claiming a speedup from routing scaffolding or a single-lane test.
+Owner-local physics now lives in `regional/owner_lane/physics.rs`. Before
+refreshing goal-only publication entries, it excludes IDs already replaced by
+committed physics motion. Wrong-lane rejection remains before that exclusion;
+remaining entries retain their lease, lifecycle and current-kinematics checks.
+The merge, world fence, fallback and downstream publication fence are unchanged.
+Matched pre-extraction tail p95 fell from 1.617 to 0.159 ms and worker p95 from
+9.433 to 8.509 ms (28,548/29,238 nonempty samples). Realized work differs; these
+are elapsed times, not CPU or equal-throughput claims. Worker maximum rose from
+19.944 to 21.033 ms, and the earlier 43.163 ms outlier did not recur in either
+instrumented run. Final canonical correctness and three graphical routes pass
+on the extracted, uninstrumented source. The focused regression preserves
+publication and stale-state behavior without request-count pins:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/regional-commit-followup/receipt.json`.
+
+The shared-classification follow-on compared 3,693,246 identical query/snapshot
+pairs, alternating execution order and checking equal physics results.
+Sampler construction plus integration averaged 12.330 → 7.448 µs (39.6% lower
+elapsed time); both orders improved. An identical-implementation control showed
+0.90% aggregate label bias. Small raw-state/metadata cache experiments and
+duplicate derived flags were discarded in favor of the existing shared table.
+These are paired elapsed measurements, not CPU or whole-server throughput.
+Pathing changed after that comparison; catalog-wide geometry equivalence,
+focused behavior checks, final correctness and three graphical routes passed.
+The final owner warning-only tick maximum remains 148.525 ms, with dispatch,
+preparation and block costs still open. Original shorter water observations and
+broad terrain acceptance are not cleared. Source, review, controls and limits:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/physics-sampling-followup/receipt.json`.
+
+The vehicle-read follow-on keeps graph policy in `entity_vehicle.rs` and reads
+live ECS identity, lifecycle and optional vehicle/passenger components. Pending
+batch snapshots join that compact graph for the same lifecycle, unique-owner
+and cycle checks. No retained graph/cache or new authority exists. Removal uses
+the canonical ECS passenger unlinking without a redundant EntityStore scan.
+Passenger lookup shares the same compact projection; mount/dismount/input and
+transaction/fence semantics are unchanged.
+
+On the same instrumented seeded route, unfenced owner-apply median/p95 fell
+from 10.152/18.321 to 4.373/10.872 ms. All 3,738/2,575 inputs in that cohort
+committed; differing work counts preclude equal-throughput or CPU claims.
+A separate compact fenced batch applied 92/130 inputs and remains recorded,
+not relabeled as universal acceptance. The external smoke covered 45 graph
+cases, 18 removals and 360 paired lookups; the permanent regression preserves
+valid shared chain tails and atomic cycle rejection.
+Final native correctness, build and all three graphical routes pass, alongside
+one independent read-only optimization review. The owner tick still reaches
+119.981 ms and negative-seed dispatch 98.495 ms in warning-only samples.
+The broad tick target and isolated earlier water observation remain open.
+Source, measurements, final receipts and removed probe sources:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/entity-dispatch-followup/receipt.json`.
+
+## Remaining migration
+
+- Meet the fixed 50/60 ms gate without reducing active work, changing gameplay
+  order, or adding a second scheduler/cache/authority.
+- Remove temporary load-benchmark phase instrumentation after the final accepted
+  profile.
+- Continue moving only genuinely cross-region policy out of root orchestration;
+  delete obsolete coordinator APIs as their last callers disappear.
+- Keep world/block ownership outside this ADR until a separate measured and
+  correctness-fenced migration requires it.
+
+## Rejected alternatives
+
+- One thread per region or parallel mutation inside one region.
+- A second mutable ECS, mirrored authoritative snapshot map, or category-based
+  side authority.
+- Cohort, cadence, LOD, natural-despawn cache, grounded-body skip, or zero-
+  velocity skip presented as a performance fix.
+- Reordering or fusing goals and physics across intervening gameplay commits.
+- Speculative asynchronous physics, shared mutable world sampling, or retry on
+  outcome unknown.
+- Operator worker percentages and benchmark-only workload changes.
+- Generic schedulers, queues, caches, journals, and compatibility adapters added
+  beside the existing owner lanes and transaction journal.
 
 ## Consequences
 
-Separated player groups can use multiple cores without contending on one ECS
-mutex. One crowded region remains single-writer and deterministic; later hot
-region splitting is allowed only if profiling shows it is necessary. The main
-cost is an explicit one-phase protocol for cross-region work and a revised save
-barrier. This is larger than further lock trimming, but it removes the global
-serialization ceiling instead of polishing it.
+Separated regions execute concurrently without a global ECS mutex. Ordinary
+local work has a short direct path; coordination cost is paid only for topology,
+transactions, recovery, and exceptional behavior. A crowded lane remains
+single-writer and deterministic. The remaining performance gap must be closed
+inside these correctness fences or explicitly renegotiated; it cannot be hidden
+by doing less simulation.

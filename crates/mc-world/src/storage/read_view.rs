@@ -152,13 +152,20 @@ impl WorldSpawn {
     }
 }
 
+#[derive(Default)]
+struct PublishedChunkUsage {
+    resident_chunks: AtomicUsize,
+    dirty_chunks: AtomicUsize,
+    resident_bytes: AtomicUsize,
+    dirty_bytes: AtomicUsize,
+}
+
 #[derive(Clone)]
 pub struct WorldReadView {
     chunks: Arc<[PublishedChunkShard; READ_VIEW_SHARD_COUNT]>,
     furnaces: Arc<[FurnaceSnapshotShard; READ_VIEW_SHARD_COUNT]>,
     retained_chunks: Arc<RwLock<HashMap<ChunkPos, usize>>>,
-    resident_chunks: Arc<AtomicUsize>,
-    dirty_chunks: Arc<AtomicUsize>,
+    usage: Arc<PublishedChunkUsage>,
     capacity: usize,
     dirty_saturated: Arc<AtomicBool>,
     dirty_high_water_notifier: Arc<RwLock<Option<DirtyHighWaterNotifier>>>,
@@ -206,8 +213,7 @@ impl WorldReadView {
             chunks: Arc::new(std::array::from_fn(|_| RwLock::new(HashMap::new()))),
             furnaces: Arc::new(std::array::from_fn(|_| RwLock::new(HashMap::new()))),
             retained_chunks: Arc::new(RwLock::new(HashMap::new())),
-            resident_chunks: Arc::new(AtomicUsize::new(0)),
-            dirty_chunks: Arc::new(AtomicUsize::new(0)),
+            usage: Arc::default(),
             capacity: capacity.max(1),
             dirty_saturated: Arc::new(AtomicBool::new(false)),
             dirty_high_water_notifier: Arc::new(RwLock::new(None)),
@@ -426,6 +432,7 @@ impl WorldReadView {
             .as_ref()
             .filter(|chunk| chunk.dirty)
             .map(|chunk| chunk.dirty_generation);
+        let previous_bytes = previous.as_deref().map_or(0, Chunk::estimated_heap_bytes);
         drop(previous);
         let result = update(chunk);
         published.insert(position, Arc::clone(chunk));
@@ -433,6 +440,7 @@ impl WorldReadView {
             previous_present,
             previous_dirty,
             previous_dirty_generation,
+            previous_bytes,
             Some(chunk),
         );
         result
@@ -469,12 +477,21 @@ impl WorldReadView {
 
     pub(crate) fn resident_len(&self) -> usize {
         self.publication
-            .read_consistent(|| self.resident_chunks.load(Ordering::Acquire))
+            .read_consistent(|| self.usage.resident_chunks.load(Ordering::Acquire))
     }
 
     pub(crate) fn dirty_len(&self) -> usize {
         self.publication
-            .read_consistent(|| self.dirty_chunks.load(Ordering::Acquire))
+            .read_consistent(|| self.usage.dirty_chunks.load(Ordering::Acquire))
+    }
+
+    pub(super) fn byte_usage(&self) -> (usize, usize) {
+        self.publication.read_consistent(|| {
+            (
+                self.usage.resident_bytes.load(Ordering::Acquire),
+                self.usage.dirty_bytes.load(Ordering::Acquire),
+            )
+        })
     }
 
     fn record_replacement(&self, previous: Option<&Chunk>, current: Option<&Chunk>) {
@@ -484,6 +501,7 @@ impl WorldReadView {
             previous
                 .filter(|chunk| chunk.dirty)
                 .map(|chunk| chunk.dirty_generation),
+            previous.map_or(0, Chunk::estimated_heap_bytes),
             current,
         );
     }
@@ -493,29 +511,46 @@ impl WorldReadView {
         previous_present: bool,
         previous_dirty: bool,
         previous_dirty_generation: Option<u64>,
+        previous_bytes: usize,
         current: Option<&Chunk>,
     ) {
+        let current_bytes = current.map_or(0, Chunk::estimated_heap_bytes);
+        let current_dirty = current.is_some_and(|chunk| chunk.dirty);
+        for (counter, before, after) in [
+            (&self.usage.resident_bytes, previous_bytes, current_bytes),
+            (
+                &self.usage.dirty_bytes,
+                if previous_dirty { previous_bytes } else { 0 },
+                if current_dirty { current_bytes } else { 0 },
+            ),
+        ] {
+            if after > before {
+                counter.fetch_add(after - before, Ordering::AcqRel);
+            } else if before > after {
+                counter.fetch_sub(before - after, Ordering::AcqRel);
+            }
+        }
         match (previous_present, current.is_some()) {
             (false, true) => {
-                self.resident_chunks.fetch_add(1, Ordering::AcqRel);
+                self.usage.resident_chunks.fetch_add(1, Ordering::AcqRel);
             }
             (true, false) => {
-                self.resident_chunks.fetch_sub(1, Ordering::AcqRel);
+                self.usage.resident_chunks.fetch_sub(1, Ordering::AcqRel);
             }
             _ => {}
         }
-        match (previous_dirty, current.is_some_and(|chunk| chunk.dirty)) {
+        match (previous_dirty, current_dirty) {
             (false, true) => {
-                self.dirty_chunks.fetch_add(1, Ordering::AcqRel);
+                self.usage.dirty_chunks.fetch_add(1, Ordering::AcqRel);
             }
             (true, false) => {
-                self.dirty_chunks.fetch_sub(1, Ordering::AcqRel);
+                self.usage.dirty_chunks.fetch_sub(1, Ordering::AcqRel);
             }
             _ => {}
         }
-        let resident = self.resident_chunks.load(Ordering::Acquire);
-        let dirty_saturated =
-            resident >= self.capacity && self.dirty_chunks.load(Ordering::Acquire) == resident;
+        let resident = self.usage.resident_chunks.load(Ordering::Acquire);
+        let dirty_saturated = resident >= self.capacity
+            && self.usage.dirty_chunks.load(Ordering::Acquire) == resident;
         self.dirty_saturated
             .store(dirty_saturated, Ordering::Release);
         let dirty_state_changed = current.is_some_and(|chunk| {
@@ -685,6 +720,11 @@ impl WorldReadSnapshot {
     #[must_use]
     pub fn chunk(&self, position: ChunkPos) -> Option<ChunkSnapshot> {
         self.chunks.get(&position).map(Arc::clone)
+    }
+
+    #[must_use]
+    pub fn chunk_ref(&self, position: ChunkPos) -> Option<&ChunkSnapshot> {
+        self.chunks.get(&position)
     }
 
     #[must_use]

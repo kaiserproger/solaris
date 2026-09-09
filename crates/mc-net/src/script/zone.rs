@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
+
 use mc_script::{
     AdmittedScriptCommand, ScriptAxisAlignedZone, ScriptCommand, ScriptDtoError, ScriptEvent,
     ScriptPlayerContext, ScriptPlayerId, ScriptPluginTarget,
@@ -376,13 +378,25 @@ fn contains(registered: &RegisteredZone, dimension: &str, context: &ScriptPlayer
 pub(crate) struct PluginZoneAdapter {
     scripts: ScriptEventSink,
     registry: Arc<Mutex<ZoneRegistry>>,
+    /// Published protection snapshot. Rebuilt only when zone definitions
+    /// change (upsert/remove); the per-tick readers load it lock-free so
+    /// block-edit bursts never stall the tick on the registry mutex.
+    protection: Arc<ArcSwap<ZoneProtectionSnapshot>>,
 }
 
 impl PluginZoneAdapter {
+    fn publish_protection_snapshot(
+        protection: &ArcSwap<ZoneProtectionSnapshot>,
+        registry: &ZoneRegistry,
+    ) {
+        protection.store(Arc::new(registry.protection_snapshot()));
+    }
+
     pub(crate) fn new(scripts: ScriptEventSink) -> Self {
         Self {
             scripts,
             registry: Arc::new(Mutex::new(ZoneRegistry::new(ZoneLimits::production()))),
+            protection: Arc::new(ArcSwap::from_pointee(ZoneProtectionSnapshot::default())),
         }
     }
 
@@ -391,6 +405,7 @@ impl PluginZoneAdapter {
         Self {
             scripts,
             registry: Arc::new(Mutex::new(ZoneRegistry::new(limits))),
+            protection: Arc::new(ArcSwap::from_pointee(ZoneProtectionSnapshot::default())),
         }
     }
 
@@ -399,10 +414,15 @@ impl PluginZoneAdapter {
         &self,
         admitted: AdmittedScriptCommand,
     ) -> Result<ZoneCommandOutcome, ZoneAdapterError> {
-        self.registry
+        let mut registry = self
+            .registry
             .lock()
-            .map_err(|_| ZoneAdapterError::StateUnavailable)?
-            .route_admitted(admitted)
+            .map_err(|_| ZoneAdapterError::StateUnavailable)?;
+        let outcome = registry.route_admitted(admitted);
+        if outcome.is_ok() {
+            Self::publish_protection_snapshot(&self.protection, &registry);
+        }
+        outcome
     }
 
     pub(crate) async fn route_admitted_with_result(
@@ -419,7 +439,13 @@ impl PluginZoneAdapter {
                     .registry
                     .lock()
                     .map_err(|_| ZoneAdapterError::StateUnavailable)
-                    .and_then(|mut registry| registry.upsert(target.clone(), zone));
+                    .and_then(|mut registry| {
+                        let outcome = registry.upsert(target.clone(), zone);
+                        if outcome.is_ok() {
+                            Self::publish_protection_snapshot(&self.protection, &registry);
+                        }
+                        outcome
+                    });
                 (target, zone_id, outcome)
             }
             ScriptCommand::RemoveZone { .. } => {
@@ -438,7 +464,11 @@ impl PluginZoneAdapter {
                         if registry.closed {
                             Err(ZoneAdapterError::Closed)
                         } else {
-                            Ok(registry.remove(&key))
+                            let outcome = registry.remove(&key);
+                            if outcome == ZoneCommandOutcome::Applied {
+                                Self::publish_protection_snapshot(&self.protection, &registry);
+                            }
+                            Ok(outcome)
                         }
                     });
                 (target, zone_id, outcome)
@@ -503,12 +533,15 @@ impl PluginZoneAdapter {
             .block_mutation_allowed(actor_uuid, operator, dimension, position))
     }
 
+    /// Lock-free read of the last published protection image. Replaces the
+    /// old mutex-guarded rebuild; content is identical (same builder,
+    /// republished on every definition change). Poison semantics changed
+    /// deliberately: a poisoned registry mutex used to fail closed
+    /// (deny-all snapshot), while this serves the last consistent image.
+    /// Poisoning requires a panic while the mutex is held, and the cache
+    /// always holds a complete registry image, never a torn one.
     pub(crate) fn protection_snapshot(&self) -> Result<ZoneProtectionSnapshot, ZoneAdapterError> {
-        Ok(self
-            .registry
-            .lock()
-            .map_err(|_| ZoneAdapterError::StateUnavailable)?
-            .protection_snapshot())
+        Ok(self.protection.load_full().as_ref().clone())
     }
 
     pub(crate) fn close(&self) -> Result<(), ZoneAdapterError> {

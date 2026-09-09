@@ -6,8 +6,7 @@ use crate::natural_spawn_26_1_2::{
     HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK, NaturalSpawnCategory,
     NaturalSpawnCategoryReport, NaturalSpawnReport, NaturalSpawnScheduler,
     build_herd_spawn_candidates, choose_biome_spawn, herd_entry_count, hostile_chunk_spawns,
-    passive_chunk_spawns, safe_land_spawn_offset, sheep_color_for_rolls,
-    spawn_far_enough_from_players,
+    safe_land_spawn_offset, sheep_color_for_rolls, spawn_far_enough_from_players,
 };
 
 #[test]
@@ -16,16 +15,77 @@ fn scheduler_rotates_bounded_chunks_with_independent_category_cursors() {
     let mut scheduler = NaturalSpawnScheduler::default();
 
     assert_eq!(
-        scheduler.select_chunks(NaturalSpawnCategory::Friendly, &active, 4),
+        scheduler.select_chunks(
+            NaturalSpawnCategory::Friendly,
+            &active,
+            &[(0, 0)],
+            8,
+            4,
+            |_| true
+        ),
         vec![(0, 0), (1, 0), (2, 0), (3, 0)]
     );
     assert_eq!(
-        scheduler.select_chunks(NaturalSpawnCategory::Friendly, &active, 4),
+        scheduler.select_chunks(
+            NaturalSpawnCategory::Friendly,
+            &active,
+            &[(0, 0)],
+            8,
+            4,
+            |_| true
+        ),
         vec![(4, 0), (5, 0), (0, 0), (1, 0)]
     );
     assert_eq!(
-        scheduler.select_chunks(NaturalSpawnCategory::Hostile, &active, 4),
+        scheduler.select_chunks(
+            NaturalSpawnCategory::Hostile,
+            &active,
+            &[(0, 0)],
+            8,
+            4,
+            |_| true
+        ),
         vec![(0, 0), (1, 0), (2, 0), (3, 0)]
+    );
+}
+
+#[test]
+fn spawn_budget_is_spent_on_eligible_chunks_before_advancing() {
+    let active = Arc::new((0..32).map(|x| (x, 0)).collect::<HashSet<_>>());
+    let mut scheduler = NaturalSpawnScheduler::default();
+    let eligible = |&(x, _): &(i32, i32)| (20..24).contains(&x);
+    assert_eq!(
+        scheduler.select_chunks(
+            NaturalSpawnCategory::Friendly,
+            &active,
+            &[(22, 0)],
+            2,
+            2,
+            eligible
+        ),
+        vec![(20, 0), (21, 0)]
+    );
+    assert_eq!(
+        scheduler.select_chunks(
+            NaturalSpawnCategory::Friendly,
+            &active,
+            &[(22, 0)],
+            2,
+            2,
+            eligible
+        ),
+        vec![(22, 0), (23, 0)]
+    );
+    assert_eq!(
+        scheduler.select_chunks(
+            NaturalSpawnCategory::Friendly,
+            &active,
+            &[(22, 0)],
+            2,
+            2,
+            eligible
+        ),
+        vec![(20, 0), (21, 0)]
     );
 }
 
@@ -73,9 +133,7 @@ fn scheduler_reports_cumulative_metrics_only_at_the_bounded_log_interval() {
 fn deterministic_spawn_randomness_lives_in_entity_domain() {
     use mc_data::biomes::{BiomeSpawnEntry, SheepColorClimate};
 
-    assert!(passive_chunk_spawns((0, 0)));
     assert!(hostile_chunk_spawns((0, 0)));
-    assert!((0..128).any(|x| !passive_chunk_spawns((x, 7))));
     assert!((0..128).any(|x| !hostile_chunk_spawns((x, 7))));
 
     assert_eq!(

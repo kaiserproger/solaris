@@ -104,7 +104,6 @@ pub(super) struct BlockMutationSnapshot {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum UseKind {
     Food(mc_data::food::FoodEntry),
-    #[allow(dead_code)]
     Bow,
 }
 
@@ -123,7 +122,7 @@ pub(super) fn held_item_id(state: &InteractionState) -> Option<u32> {
 }
 
 pub(super) fn held_item_stack(state: &InteractionState) -> Option<&ItemStack> {
-    let held = state.inventory.held(state.selected_hotbar_slot)?;
+    let held = state.inventory.held(state.selected_hotbar_slot())?;
     (!held.is_empty()).then_some(held)
 }
 
@@ -702,7 +701,6 @@ pub(super) fn held_food_use(
     Some((held.item_id, rule, duration))
 }
 
-#[allow(dead_code)]
 pub(super) fn is_bow_item(state: &InteractionState, held_slot: usize) -> bool {
     let Some(held) = state.inventory.slots.get(held_slot) else {
         return false;
@@ -726,13 +724,12 @@ fn stack_is_arrow(state: &InteractionState, slot: usize) -> bool {
         .is_some_and(|item| item.as_str() == "minecraft:arrow")
 }
 
-#[allow(dead_code)]
 pub(super) fn available_arrow_slot(state: &InteractionState) -> Option<usize> {
     if stack_is_arrow(state, PlayerInventory::OFFHAND_SLOT) {
         return Some(PlayerInventory::OFFHAND_SLOT);
     }
 
-    let main_hand_slot = PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot);
+    let main_hand_slot = PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot());
     if stack_is_arrow(state, main_hand_slot) {
         return Some(main_hand_slot);
     }
@@ -778,10 +775,10 @@ pub(super) fn bow_draw_power(started_tick: u64, current_tick: u64) -> f64 {
 }
 
 pub(super) fn pending_use_matches(state: &InteractionState, pending: &PendingUse) -> bool {
-    let selected_slot = PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot);
+    let hotbar_slot = state.selected_hotbar_slot();
+    let selected_slot = PlayerInventory::HOTBAR_BASE + usize::from(hotbar_slot);
     (pending.held_slot == PlayerInventory::OFFHAND_SLOT
-        || (pending.held_hotbar_slot == state.selected_hotbar_slot
-            && pending.held_slot == selected_slot))
+        || (pending.held_hotbar_slot == hotbar_slot && pending.held_slot == selected_slot))
         && state
             .inventory
             .slots

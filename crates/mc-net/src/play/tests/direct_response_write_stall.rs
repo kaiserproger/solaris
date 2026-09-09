@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use mc_extension::PlayerId;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
@@ -84,8 +83,6 @@ async fn play_loop_closes_session_when_direct_response_write_stalls() {
             0,
             "DirectWriter".to_string(),
             "DirectWriter".to_string(),
-            None,
-            PlayerId::new(0),
             None,
             None,
         ),

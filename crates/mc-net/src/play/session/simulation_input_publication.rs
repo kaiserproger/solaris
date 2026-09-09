@@ -3,6 +3,7 @@ use super::*;
 const ENTITY_INDEX_SHARDS: usize = 64;
 type ChunkEntityIndex = HashMap<(i32, i32), Arc<HashSet<EntityId>>>;
 type EntityChunkIndex = HashMap<EntityId, (i32, i32)>;
+type ActiveChunksMatching = (Arc<HashSet<(i32, i32)>>, HashSet<(i32, i32)>);
 
 pub(super) type ActiveEntityCandidatesMatchingChunks = (
     Arc<HashSet<(i32, i32)>>,
@@ -250,6 +251,21 @@ impl SimulationInputPublication {
             let active_chunks = self.active_chunks();
             let candidates = self.entity_candidates_in_chunks_unfenced(active_chunks.as_ref());
             (active_chunks, candidates)
+        })
+    }
+
+    pub(super) fn active_chunks_matching(
+        &self,
+        mut include_chunk: impl FnMut((i32, i32)) -> bool,
+    ) -> ActiveChunksMatching {
+        self.read_routing(|| {
+            let active_chunks = self.active_chunks();
+            let simulation_chunks = active_chunks
+                .iter()
+                .copied()
+                .filter(|&chunk| include_chunk(chunk))
+                .collect();
+            (active_chunks, simulation_chunks)
         })
     }
 

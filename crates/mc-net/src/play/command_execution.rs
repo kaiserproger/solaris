@@ -374,11 +374,9 @@ where
         debug!(%item, count, "give command rejected: inventory full");
         return Ok(Err("Not enough inventory space"));
     }
-    let expected_inventory = state.inventory.clone();
-    state.inventory = candidate;
     if !commit_player_inventory_candidate(
         state,
-        expected_inventory,
+        candidate,
         state.carried_item.clone(),
         None,
         player_pose,
@@ -649,11 +647,9 @@ where
                 debug!(hotbar_slot, %item, "debug give ignored - invalid hotbar slot");
                 return Ok(());
             }
-            let expected_inventory = state.inventory.clone();
-            state.inventory = inventory;
             if !commit_player_inventory_candidate(
                 state,
-                expected_inventory,
+                inventory,
                 state.carried_item.clone(),
                 None,
                 context.player_pose,

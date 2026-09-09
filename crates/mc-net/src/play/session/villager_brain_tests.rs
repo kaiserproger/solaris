@@ -4,7 +4,7 @@ use std::sync::Arc;
 use mc_data::Identifier;
 use mc_entity::villager_26_1_2::{
     VillagerActivity, VillagerBrainProfile, VillagerBrainState, VillagerPoiSet,
-    VillagerScheduleEntry, VillagerScheduleKind,
+    VillagerScheduleEntry,
 };
 use mc_entity::villager_gossip_26_1_2::{VillagerGossipEvent, VillagerGossipState};
 use mc_entity::villager_merchant_26_1_2::{
@@ -19,11 +19,7 @@ use tokio::sync::mpsc;
 use crate::login::LoggedInProfile;
 use crate::play::{HerdSpawn, PlayerPose};
 
-use super::entity_simulation::{
-    apply_villager_brain_transitions, apply_villager_gossip_transfers,
-    commit_villager_brain_transitions, commit_villager_gossip_transfer_pair,
-    villager_brain_due_for_tick, villager_brain_probe_ids,
-};
+use super::entity_simulation::{commit_villager_gossip_transfer_pair, villager_brain_probe_ids};
 use super::{OutboundCommand, SessionRegistry, dispatch_visibility_commands};
 
 fn install_brain(registry: &SessionRegistry) -> mc_entity::EntityId {
@@ -182,14 +178,42 @@ fn apply_brain(
     lifecycle_tick: u64,
     day_time: i64,
 ) -> usize {
-    let profile = registry.villager_brain_profile();
-    let mut entities = registry.lock_entities("apply villager brain test transition");
-    apply_villager_brain_transitions(
-        &mut entities,
-        &HashSet::from([id]),
+    let ids = HashSet::from([id]);
+    let inputs = mc_entity::RegionalGoalTickInputs {
+        villager: Some(Arc::new(mc_entity::RegionalVillagerGoalTickInputs {
+            day_time,
+            profile: registry.villager_brain_profile(),
+            profession_offers: Arc::new(std::collections::HashMap::new()),
+        })),
+        ..Default::default()
+    };
+    let mut entities = registry.lock_entities("apply owner-lane villager brain test transition");
+    let before = entities
+        .snapshot(id)
+        .expect("villager before owner-lane tick");
+    struct Walkable;
+    impl mc_entity::PathingProbe for Walkable {
+        fn can_stand_at(&self, _position: Vec3) -> mc_entity::PathingProbeResult {
+            mc_entity::PathingProbeResult::Walkable
+        }
+    }
+    let prepared = entities.prepare_goal_tick_with_pathing_for_ids_with_inputs(
         lifecycle_tick,
-        day_time,
-        &profile,
+        Arc::new(ids.clone()),
+        inputs,
+    );
+    let resolved = prepared.resolve(&Walkable, mc_entity::PathingBudget::DEFAULT);
+    let _ =
+        entities.apply_prepared_goal_tick_and_simulation_results(resolved, Arc::new(ids.clone()));
+    let after = entities
+        .snapshot(id)
+        .expect("villager after owner-lane tick");
+    usize::from(
+        before.goal != after.goal
+            || before.retained.villager != after.retained.villager
+            || before.retained.villager_brain != after.retained.villager_brain
+            || before.retained.villager_gossip != after.retained.villager_gossip
+            || before.retained.villager_merchant != after.retained.villager_merchant,
     )
 }
 
@@ -233,70 +257,6 @@ fn brain_cadence_shards_sixteen_thousand_villagers_and_wakes_exact_boundaries() 
     );
     assert!(override_probe.contains(&off_phase));
     assert!(!override_probe.contains(&inactive_override));
-    assert!(!villager_brain_due_for_tick(
-        off_phase,
-        VillagerScheduleKind::Adult,
-        None,
-        2,
-        122,
-        &custom,
-    ));
-    assert!(villager_brain_due_for_tick(
-        off_phase,
-        VillagerScheduleKind::Adult,
-        None,
-        2,
-        123,
-        &custom,
-    ));
-    assert!(villager_brain_due_for_tick(
-        off_phase,
-        VillagerScheduleKind::Adult,
-        Some(2),
-        2,
-        122,
-        &custom,
-    ));
-}
-
-#[test]
-fn stale_villager_transition_does_not_starve_current_neighbor() {
-    let registry = SessionRegistry::new();
-    let first = install_brain(&registry);
-    let second = install_brain(&registry);
-    let mut entities = registry.lock_entities("prepare split villager brain CAS");
-    let first_expected = entities.snapshot(first).unwrap();
-    let second_expected = entities.snapshot(second).unwrap();
-
-    let concurrent_goal = GoalState::Wander {
-        speed: 0.11,
-        period_ticks: 81,
-    };
-    let mut concurrent_first = first_expected.clone();
-    concurrent_first.goal = concurrent_goal.clone();
-    assert!(entities.replace_snapshot_if_current(first_expected.clone(), concurrent_first));
-
-    let mut first_next = first_expected.clone();
-    first_next.goal = GoalState::FollowPosition {
-        target: Vec3::new(20.0, 64.0, 0.0),
-        speed: 0.3,
-    };
-    let second_goal = GoalState::FollowPosition {
-        target: Vec3::new(30.0, 64.0, 0.0),
-        speed: 0.4,
-    };
-    let mut second_next = second_expected.clone();
-    second_next.goal = second_goal.clone();
-
-    assert_eq!(
-        commit_villager_brain_transitions(
-            &mut entities,
-            vec![(first_expected, first_next), (second_expected, second_next)],
-        ),
-        1
-    );
-    assert_eq!(entities.snapshot(first).unwrap().goal, concurrent_goal);
-    assert_eq!(entities.snapshot(second).unwrap().goal, second_goal);
 }
 
 #[test]
@@ -556,107 +516,6 @@ fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
 }
 
 #[test]
-fn nearby_idle_villagers_transfer_gossip_with_mutual_cooldown_and_interaction_target() {
-    let registry = SessionRegistry::new();
-    let player = uuid::Uuid::from_u128(0xCAFE);
-    let receiver = install_gossip_villager(
-        &registry,
-        Vec3::new(0.5, 64.0, 0.5),
-        VillagerActivity::Idle,
-        None,
-    );
-    let mut source_gossip = VillagerGossipState::default();
-    source_gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
-    source_gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
-    let source = install_gossip_villager(
-        &registry,
-        Vec3::new(1.5, 64.0, 0.5),
-        VillagerActivity::Work,
-        Some(source_gossip),
-    );
-    let initiators = HashSet::from([receiver]);
-    let candidates = HashSet::from([receiver, source]);
-    let mut entities = registry.lock_entities("apply villager gossip transfer");
-
-    assert_eq!(
-        apply_villager_gossip_transfers(&mut entities, &initiators, &candidates, 1_200),
-        1
-    );
-    let received = entities.snapshot(receiver).unwrap();
-    let source_after = entities.snapshot(source).unwrap();
-    assert_eq!(
-        received
-            .retained
-            .villager_gossip
-            .as_ref()
-            .unwrap()
-            .minor_negative_value(player),
-        30
-    );
-    let receiver_brain = received.retained.villager_brain.as_ref().unwrap();
-    assert_eq!(receiver_brain.interaction_target, Some(source));
-    assert_eq!(receiver_brain.last_gossip_time, 1_200);
-    assert_eq!(
-        source_after
-            .retained
-            .villager_brain
-            .as_ref()
-            .unwrap()
-            .last_gossip_time,
-        1_200
-    );
-
-    let expected = source_after;
-    let mut next = expected.clone();
-    next.retained
-        .villager_gossip
-        .as_mut()
-        .unwrap()
-        .record_event(VillagerGossipEvent::HurtByPlayer { player });
-    assert!(entities.replace_snapshot_if_current(expected, next));
-    assert_eq!(
-        apply_villager_gossip_transfers(&mut entities, &initiators, &candidates, 2_399),
-        0,
-        "both participants must observe the full mutual 1,200-tick cooldown"
-    );
-    assert_eq!(
-        entities
-            .snapshot(receiver)
-            .unwrap()
-            .retained
-            .villager_gossip
-            .as_ref()
-            .unwrap()
-            .minor_negative_value(player),
-        30
-    );
-    assert_eq!(
-        apply_villager_gossip_transfers(&mut entities, &initiators, &candidates, 2_400),
-        1
-    );
-    let received = entities.snapshot(receiver).unwrap();
-    assert_eq!(
-        received
-            .retained
-            .villager_gossip
-            .as_ref()
-            .unwrap()
-            .minor_negative_value(player),
-        55,
-        "transfer decay is 20 and merge uses max rather than addition"
-    );
-    assert_eq!(
-        received
-            .retained
-            .villager_brain
-            .as_ref()
-            .unwrap()
-            .last_gossip_time,
-        2_400
-    );
-}
-
-#[test]
 fn production_villager_tick_routes_due_idle_gossip_transfer() {
     let registry = SessionRegistry::new();
     let (_session, _outbound) = register_profession_observer(&registry);
@@ -764,12 +623,12 @@ fn production_villager_tick_routes_due_idle_gossip_transfer() {
 }
 
 #[test]
-fn stale_villager_gossip_pair_rejects_both_snapshots_without_partial_cooldown() {
-    let registry = SessionRegistry::new();
+fn stale_cross_lane_villager_gossip_pair_rejects_both_snapshots_without_partial_cooldown() {
+    let registry = SessionRegistry::new_with_entity_owner_lanes(2);
     let player = uuid::Uuid::from_u128(0xD00D);
     let receiver = install_gossip_villager(
         &registry,
-        Vec3::new(0.5, 64.0, 0.5),
+        Vec3::new(127.5, 64.0, 0.5),
         VillagerActivity::Meet,
         None,
     );
@@ -778,7 +637,7 @@ fn stale_villager_gossip_pair_rejects_both_snapshots_without_partial_cooldown() 
     source_gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
     let source = install_gossip_villager(
         &registry,
-        Vec3::new(1.5, 64.0, 0.5),
+        Vec3::new(128.5, 64.0, 0.5),
         VillagerActivity::Idle,
         Some(source_gossip),
     );
@@ -823,118 +682,6 @@ fn stale_villager_gossip_pair_rejects_both_snapshots_without_partial_cooldown() 
             .as_ref()
             .unwrap()
             .last_gossip_time,
-        0
-    );
-}
-
-#[test]
-fn one_source_participates_in_at_most_one_gossip_pair_per_tick() {
-    let registry = SessionRegistry::new();
-    let player = uuid::Uuid::from_u128(0xFACE);
-    let mut source_gossip = VillagerGossipState::default();
-    source_gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
-    source_gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
-    let source = install_gossip_villager(
-        &registry,
-        Vec3::new(1.5, 64.0, 0.5),
-        VillagerActivity::Work,
-        Some(source_gossip),
-    );
-    let first = install_gossip_villager(
-        &registry,
-        Vec3::new(0.5, 64.0, 0.5),
-        VillagerActivity::Idle,
-        None,
-    );
-    let second = install_gossip_villager(
-        &registry,
-        Vec3::new(2.5, 64.0, 0.5),
-        VillagerActivity::Idle,
-        None,
-    );
-    let mut entities = registry.lock_entities("apply disjoint villager gossip pairs");
-    assert_eq!(
-        apply_villager_gossip_transfers(
-            &mut entities,
-            &HashSet::from([first, second]),
-            &HashSet::from([source, first, second]),
-            1_200,
-        ),
-        1
-    );
-    assert_eq!(
-        entities
-            .snapshot(first)
-            .unwrap()
-            .retained
-            .villager_gossip
-            .as_ref()
-            .unwrap()
-            .minor_negative_value(player),
-        30
-    );
-    assert!(
-        entities
-            .snapshot(second)
-            .unwrap()
-            .retained
-            .villager_gossip
-            .is_none()
-    );
-    assert_eq!(
-        entities
-            .snapshot(source)
-            .unwrap()
-            .retained
-            .villager_brain
-            .as_ref()
-            .unwrap()
-            .last_gossip_time,
-        1_200
-    );
-}
-
-#[test]
-fn gossip_transfer_requires_idle_or_meet_and_distance_squared_at_most_five() {
-    let registry = SessionRegistry::new();
-    let player = uuid::Uuid::from_u128(0xABCD);
-    let mut gossip = VillagerGossipState::default();
-    gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
-    let controlled = install_gossip_villager(
-        &registry,
-        Vec3::new(0.5, 64.0, 0.5),
-        VillagerActivity::Controlled,
-        None,
-    );
-    let nearby = install_gossip_villager(
-        &registry,
-        Vec3::new(1.5, 64.0, 0.5),
-        VillagerActivity::Idle,
-        Some(gossip.clone()),
-    );
-    let far = install_gossip_villager(
-        &registry,
-        Vec3::new(10.5, 64.0, 0.5),
-        VillagerActivity::Idle,
-        Some(gossip),
-    );
-    let mut entities = registry.lock_entities("validate villager gossip activity and reach");
-    assert_eq!(
-        apply_villager_gossip_transfers(
-            &mut entities,
-            &HashSet::from([controlled]),
-            &HashSet::from([controlled, nearby]),
-            1_200,
-        ),
-        0
-    );
-    assert_eq!(
-        apply_villager_gossip_transfers(
-            &mut entities,
-            &HashSet::from([nearby]),
-            &HashSet::from([nearby, far]),
-            1_200,
-        ),
         0
     );
 }

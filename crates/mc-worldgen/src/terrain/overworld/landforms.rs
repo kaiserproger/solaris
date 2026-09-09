@@ -155,28 +155,64 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     // the resulting segment network.
     // Keep carving alive through the coast band so channels meet the ocean rather
     // than disappearing at the old inland mask boundary.
+    let low_relief = 1.0 - smootherstep(remap(ridges, 0.025, 0.16));
+    let coast_connection = 1.0 - smootherstep(remap(-continentalness, 0.18, 0.48));
     let drainage = if continentalness > -0.48 && ridges < 0.18 {
-        drainage::sample(router.seed, block_x, block_z, scale)
+        // Quintic falloff has maximum slope 15/8. Reserve one block of the
+        // three-block terrain-step budget for existing relief and use the
+        // remaining two for carving; taller banks therefore become wider.
+        let bank_relief = (height - sea + 3.6).max(0.0) * coast_connection * low_relief;
+        drainage::sample(
+            router.seed,
+            block_x,
+            block_z,
+            scale,
+            bank_relief * 15.0 / 16.0,
+        )
     } else {
         drainage::DrainageSample::default()
     };
-    let low_relief = 1.0 - smootherstep(remap(ridges, 0.025, 0.16));
-    let coast_connection = 1.0 - smootherstep(remap(-continentalness, 0.18, 0.48));
     let river_weight = drainage.channel_weight * coast_connection * low_relief;
     let channel_depth = (2.4 + drainage.accumulation * 0.10).clamp(2.4, 3.6);
     let river_floor = sea - channel_depth + detail.abs() * 0.45;
+    let channel_center_y = lerp(
+        height,
+        river_floor,
+        drainage.channel_strength * coast_connection * low_relief,
+    );
     height = lerp(height, river_floor, river_weight);
 
     let (base_temperature, moisture, climate_domain) = climate(router, x, z, scale);
+    // Wetlands occupy low river shoulders, not every humid lowland. Existing
+    // drainage width, relief and climate vary the band; broad detail creates
+    // shallow pockets and dry hummocks rather than a level shelf or pixel noise.
+    let wetland = if settings.is_none_or(|value| value.water_enabled) {
+        let shoulder = smootherstep(remap(drainage.channel_weight, 0.12, 0.70))
+            * (1.0 - smootherstep(remap(drainage.channel_weight, 0.90, 1.0)));
+        shoulder
+            * coast_connection
+            * low_relief
+            // A weak reach that never reaches water is still ordinary lowland.
+            * smootherstep(remap(sea - channel_center_y, 0.75, 2.0))
+            * smootherstep(remap(moisture, 0.02, 0.30))
+            * smootherstep(remap(base_temperature, -0.25, -0.05))
+            * (1.0 - smootherstep(remap(height - sea, 1.0, 5.0)))
+    } else {
+        0.0
+    };
+    let wetland_floor = sea - 0.6 + detail * 1.8 + hills * 0.65;
+    height = lerp(height, wetland_floor, wetland);
     let temperature = temperature_with_influence(router, base_temperature, height, z);
 
     TerrainSample {
         surface_y: router.clamp_height(height),
         continentalness,
         ridges,
+        erosion,
         // Biome routing sees a river only after the accumulated channel is
         // substantially carved; shallow shoulders remain surrounding land.
         river: drainage.river_distance.max((1.0 - river_weight) * 0.10),
+        wetland,
         temperature,
         moisture,
         climate_domain,

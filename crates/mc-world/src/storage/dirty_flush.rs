@@ -21,6 +21,9 @@ use super::{REGION_AXIS_CHUNKS, WorldError, WorldStorage, ensure_chunk_position,
 const DIRTY_FLUSH_STALE_REGION_RETRIES: usize = 3;
 static REGION_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Waits for the journal prefix accepted before a checkpoint writes world data.
+pub type JournalBarrier = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct DirtyFlushPlan {
     regions: Vec<DirtyFlushRegionPlan>,
@@ -29,8 +32,7 @@ pub struct DirtyFlushPlan {
     registry: Arc<BlockRegistry>,
     item_registry: Option<Arc<ItemRegistry>>,
     unix_time: u32,
-    #[cfg(test)]
-    payload_encode_count: Arc<AtomicU64>,
+    journal_barrier: Option<JournalBarrier>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,29 +148,6 @@ fn chunk_snapshot_token(chunk: &ChunkSnapshot) -> ChunkSnapshotToken {
     Arc::as_ptr(chunk) as ChunkSnapshotToken
 }
 
-#[cfg(test)]
-fn encode_dirty_flush_chunk_payload(
-    chunk: &Chunk,
-    expected_pos: ChunkPos,
-    registry: &BlockRegistry,
-    item_registry: Option<&ItemRegistry>,
-    now: u32,
-    current_tick: u64,
-    payload_encode_count: &AtomicU64,
-) -> Result<ChunkPayload, WorldError> {
-    payload_encode_count.fetch_add(1, Ordering::Relaxed);
-    chunk_to_payload_with_items_at_tick_for_position(
-        chunk,
-        expected_pos,
-        registry,
-        item_registry,
-        now,
-        current_tick,
-    )
-    .map_err(WorldError::from)
-}
-
-#[cfg(not(test))]
 fn encode_dirty_flush_chunk_payload(
     chunk: &Chunk,
     expected_pos: ChunkPos,
@@ -210,13 +189,14 @@ impl DirtyFlushPlan {
     }
 
     pub fn write(self) -> Result<DirtyFlushCommit, WorldError> {
+        if let Some(barrier) = &self.journal_barrier {
+            barrier().map_err(WorldError::JournalBarrier)?;
+        }
         let DirtyFlushPlan {
             regions,
             registry,
             item_registry,
             unix_time,
-            #[cfg(test)]
-            payload_encode_count,
             ..
         } = self;
         let mut commits = Vec::with_capacity(regions.len());
@@ -239,17 +219,6 @@ impl DirtyFlushPlan {
             let mut committed_chunks = Vec::with_capacity(region.dirty_payloads.len());
             for planned in region.dirty_payloads {
                 ensure_chunk_position(planned.pos, planned.snapshot.pos)?;
-                #[cfg(test)]
-                let payload = encode_dirty_flush_chunk_payload(
-                    &planned.snapshot,
-                    planned.pos,
-                    &registry,
-                    item_registry.as_deref(),
-                    unix_time,
-                    planned.current_tick,
-                    &payload_encode_count,
-                )?;
-                #[cfg(not(test))]
                 let payload = encode_dirty_flush_chunk_payload(
                     &planned.snapshot,
                     planned.pos,
@@ -286,11 +255,6 @@ impl DirtyFlushPlan {
         }
 
         Ok(DirtyFlushCommit { regions: commits })
-    }
-
-    #[cfg(test)]
-    fn payload_encode_counter(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.payload_encode_count)
     }
 }
 
@@ -405,16 +369,20 @@ fn sync_parent_dir(path: &Path) -> Result<(), WorldError> {
 }
 
 impl WorldStorage {
+    pub fn set_journal_barrier(&mut self, barrier: JournalBarrier) {
+        self.journal_barrier = Some(barrier);
+    }
+
     /// Build a dirty chunk flush plan. The plan owns dirty chunk snapshots and
     /// the region versions observed while planning so callers can encode and
     /// write region files after releasing any outer world mutex without
     /// replacing a newer region snapshot.
-    pub fn plan_dirty_flush(&self) -> Result<DirtyFlushPlan, WorldError> {
+    pub fn plan_dirty_flush(&mut self) -> Result<DirtyFlushPlan, WorldError> {
         self.plan_dirty_flush_at_tick(0)
     }
 
     pub fn plan_dirty_flush_at_tick(
-        &self,
+        &mut self,
         current_tick: u64,
     ) -> Result<DirtyFlushPlan, WorldError> {
         self.plan_dirty_flush_at_tick_bounded(current_tick, usize::MAX)
@@ -423,19 +391,24 @@ impl WorldStorage {
     /// Build one bounded pressure-flush batch. This fast path caps the retained
     /// plan and encoding/write work; full checkpoints use the unbounded planner.
     pub fn plan_dirty_flush_at_tick_bounded(
-        &self,
+        &mut self,
         current_tick: u64,
         max_chunks: usize,
     ) -> Result<DirtyFlushPlan, WorldError> {
         self.ensure_writable()?;
         let (dirty_chunks_at_capture, mut dirty_snapshots) = self.resident.dirty_flush_snapshot();
-        dirty_snapshots.sort_by_key(|(pos, _)| {
+        let order = |pos: ChunkPos| {
             (
                 pos.x.div_euclid(REGION_AXIS_CHUNKS),
                 pos.z.div_euclid(REGION_AXIS_CHUNKS),
                 pos.z,
                 pos.x,
             )
+        };
+        let cursor = self.dirty_flush_cursor.map(order);
+        dirty_snapshots.sort_by_key(|(pos, _)| {
+            let key = order(*pos);
+            (cursor.is_some_and(|cursor| key <= cursor), key)
         });
         dirty_snapshots.truncate(max_chunks);
         if dirty_snapshots.is_empty() {
@@ -446,10 +419,10 @@ impl WorldStorage {
                 registry: Arc::clone(&self.registry),
                 item_registry: self.item_registry.as_ref().map(Arc::clone),
                 unix_time: 0,
-                #[cfg(test)]
-                payload_encode_count: Arc::new(AtomicU64::new(0)),
+                journal_barrier: self.journal_barrier.clone(),
             });
         }
+        let next_cursor = dirty_snapshots.last().map(|(pos, _)| *pos);
         let mut by_region: HashMap<(i32, i32), Vec<(ChunkPos, ChunkSnapshot)>> = HashMap::new();
         for (pos, chunk) in dirty_snapshots {
             ensure_chunk_position(pos, chunk.pos)?;
@@ -487,6 +460,8 @@ impl WorldStorage {
             });
         }
         regions.sort_by_key(|region| region.region);
+        // Advance on selection, not on cleaning: live mutations may keep a batch dirty.
+        self.dirty_flush_cursor = next_cursor;
 
         Ok(DirtyFlushPlan {
             regions,
@@ -495,8 +470,7 @@ impl WorldStorage {
             registry: Arc::clone(&self.registry),
             item_registry: self.item_registry.as_ref().map(Arc::clone),
             unix_time: now,
-            #[cfg(test)]
-            payload_encode_count: Arc::new(AtomicU64::new(0)),
+            journal_barrier: self.journal_barrier.clone(),
         })
     }
 

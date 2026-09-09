@@ -7,18 +7,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::TAU;
 use std::ops::Range;
-use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
-// W05 stays caller-neutral until regional authority owns transition execution.
-#[allow(dead_code)]
-pub(crate) mod ai_core_26_1_2;
 pub mod attributes_26_1_2;
 pub mod dragon_26_1_2;
 pub mod effects_26_1_2;
+mod entity_projections;
 mod entity_scale_26_1_2;
+mod entity_vehicle;
 pub mod equipment_26_1_2;
 pub mod fire_26_1_2;
 pub mod living_26_1_2;
@@ -47,25 +45,33 @@ mod entity_scale_26_1_2_tests;
 #[path = "natural_spawn_26_1_2_tests.rs"]
 mod natural_spawn_26_1_2_tests;
 
+#[cfg(test)]
+#[path = "entity_vehicle_tests.rs"]
+mod entity_vehicle_tests;
+
+pub use entity_projections::{EntityDespawnProjection, EntitySimulationProjection};
 pub use entity_scale_26_1_2::{EntityScale26_1_2, EntityScaleError};
 pub use lock_policy::{
     LockPoisonMetricsSnapshot, authoritative_lock_poison_from_panic, lock_poison_metrics_snapshot,
 };
 pub use regional::VillagerBindingClaim;
 pub use regional::{
-    CompactEntityKinematicsFence, ItemPickupClaimResolution, REGION_SIZE_CHUNKS,
+    CompactEntityKinematicsFence, ItemPickupClaimResolution, LaneCommitTimings, REGION_SIZE_CHUNKS,
     RegionEntityStoreError, RegionEpoch, RegionKey, RegionLease, RegionOwnerBatch,
     RegionOwnerCompletion, RegionOwnerLaneError, RegionOwnerLaneStartError, RegionOwnerMutation,
     RegionOwnership, RegionOwnershipError, RegionPhase, RegionalCommitDecision,
     RegionalDecisionJournal, RegionalDecisionJournalError, RegionalEntityAuthority,
-    RegionalEntityStore, RegionalKinematicsApply, RegionalOwnerCoordinator,
-    RegionalOwnerCutoverError, RegionalOwnerHandle, RegionalOwnerLane, RegionalOwnerRuntime,
-    RegionalOwnerRuntimeShutdownError, RegionalOwnerSaveSnapshot, RegionalOwnerShutdownError,
-    RegionalOwnerStatus, RegionalPreparedGoalTick, RegionalResolvedGoalTick,
-    SequencedRegionMutation, TransferApply, TransferDecision, TransferId,
-    VersionedEntityKinematics, VersionedEntitySnapshots, VillagerBirthCommit,
+    RegionalEntityPhysicsOutput, RegionalEntityStore, RegionalEntityTickInput,
+    RegionalEntityTickOutput, RegionalGoalTickInputs, RegionalKinematicsApply,
+    RegionalOwnerCoordinator, RegionalOwnerCutoverError, RegionalOwnerHandle, RegionalOwnerLane,
+    RegionalOwnerRuntime, RegionalOwnerRuntimeShutdownError, RegionalOwnerSaveSnapshot,
+    RegionalOwnerShutdownError, RegionalOwnerStatus, RegionalPreparedEntityPhysics,
+    RegionalPreparedGoalTick, RegionalResolvedGoalTick, RegionalTickWorld,
+    RegionalVillagerGoalTickInputs, RegionalVillagerProfessionOffer, SequencedRegionMutation,
+    TransferApply, TransferDecision, TransferId, VersionedEntityKinematics,
+    VersionedEntitySnapshots, VersionedKinematicsCommit, VillagerBirthCommit,
     VillagerCourtshipCommit, VillagerFoodShareCommit, VillagerInventoryPickupCommit,
-    VillagerNoBedCommit,
+    VillagerNoBedCommit, warm_physics_caches,
 };
 
 pub use runtime::{
@@ -956,6 +962,15 @@ impl EntityKinematics {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EntityKinematicsFenceState {
+    pub(crate) uuid: Uuid,
+    pub(crate) lifecycle: EntityLifecycle,
+    pub(crate) motion: EntityMotionState,
+    pub(crate) pickup_claimed: bool,
+    pub(crate) vehicle_attached: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EntityMotionState {
     pub id: EntityId,
     pub position: Vec3,
@@ -976,6 +991,128 @@ pub struct EntityMotionState {
     pub sends_velocity: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityTrackingMotion {
+    pub id: EntityId,
+    pub position: Vec3,
+    pub rotation: Rotation,
+    pub velocity: Vec3,
+    pub on_ground: bool,
+    pub is_item: bool,
+    pub is_experience: bool,
+    pub is_arrow: bool,
+    pub sends_velocity: bool,
+}
+
+impl From<EntityMotionState> for EntityTrackingMotion {
+    fn from(motion: EntityMotionState) -> Self {
+        Self {
+            id: motion.id,
+            position: motion.position,
+            rotation: motion.rotation,
+            velocity: motion.velocity,
+            on_ground: motion.on_ground,
+            is_item: motion.is_item,
+            is_experience: motion.is_experience,
+            is_arrow: motion.is_arrow,
+            sends_velocity: motion.sends_velocity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityPhysicsStep {
+    pub id: EntityId,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub on_ground: bool,
+    pub horizontal_collision: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EntityPhysicsQuery {
+    pub id: EntityId,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub aabb: mc_physics::Aabb,
+    pub on_ground: bool,
+    pub fall_distance: f64,
+    pub goal_fence: EntityGoalFence,
+    pub kind: EntityPhysicsKind,
+}
+
+impl EntityPhysicsQuery {
+    #[must_use]
+    pub fn matches_motion(self, current: EntityMotionState) -> bool {
+        let projectile_state_matches = match self.kind {
+            EntityPhysicsKind::ArrowProjectile {
+                revision,
+                embedded_block,
+            } => {
+                current.is_arrow
+                    && current.arrow_revision == revision
+                    && current.arrow_embedded_block == embedded_block
+            }
+            EntityPhysicsKind::HurtingProjectile { revision, .. }
+            | EntityPhysicsKind::ShulkerBullet { revision } => {
+                current.is_hurting_projectile && current.hurting_projectile_revision == revision
+            }
+            EntityPhysicsKind::ThrowableProjectile { revision, .. } => {
+                current.is_throwable_projectile && current.throwable_projectile_revision == revision
+            }
+            EntityPhysicsKind::Default
+            | EntityPhysicsKind::Immobile
+            | EntityPhysicsKind::ExternalFlight
+            | EntityPhysicsKind::Living
+            | EntityPhysicsKind::PowderSnowWalkableLiving
+            | EntityPhysicsKind::FallingBlock
+            | EntityPhysicsKind::AquaticLiving => true,
+        };
+        current.position == self.position
+            && current.velocity == self.velocity
+            && current.on_ground == self.on_ground
+            && current.fall_distance == self.fall_distance
+            && current.goal_fence == self.goal_fence
+            && projectile_state_matches
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EntitySimulationResult {
+    pub physics: EntityPhysicsQuery,
+    pub hostile: bool,
+    pub rotation: Rotation,
+    pub villager_population_active: bool,
+    pub villager: bool,
+    pub item: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityPhysicsKind {
+    Default,
+    Immobile,
+    ExternalFlight,
+    Living,
+    PowderSnowWalkableLiving,
+    AquaticLiving,
+    FallingBlock,
+    ArrowProjectile {
+        revision: Option<u64>,
+        embedded_block: Option<projectile_26_1_2::BlockPosition>,
+    },
+    ShulkerBullet {
+        revision: Option<u64>,
+    },
+    HurtingProjectile {
+        revision: Option<u64>,
+        acceleration_power_bits: u64,
+    },
+    ThrowableProjectile {
+        revision: Option<u64>,
+        gravity_bits: u64,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityGoalCheckpoint {
     pub(crate) id: EntityId,
@@ -986,52 +1123,6 @@ pub struct EntityGoalCheckpoint {
     pub(crate) lifecycle: EntityLifecycle,
     pub(crate) goal: GoalState,
     pub(crate) path: RetainedPathState,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct EntitySimulationProjection {
-    pub id: EntityId,
-    pub type_name: Arc<str>,
-    pub position: Vec3,
-    pub rotation: Rotation,
-    pub velocity: Vec3,
-    pub on_ground: bool,
-    pub lifecycle: EntityLifecycle,
-    pub follow_range: f64,
-    pub attack_damage: f64,
-    pub goal: GoalState,
-    pub primed_tnt: bool,
-    pub guardian_beam_active: bool,
-    pub has_item_stack: bool,
-    pub has_experience_value: bool,
-    pub has_block_state: bool,
-    pub has_vehicle: bool,
-    pub animal: Option<AnimalBreedingState>,
-    pub fall_distance: f64,
-    pub arrow_revision: Option<u64>,
-    pub arrow_embedded_block: Option<projectile_26_1_2::BlockPosition>,
-    pub hurting_projectile_revision: Option<u64>,
-    pub hurting_projectile_acceleration_power_bits: Option<u64>,
-    pub hurting_projectile_air_inertia_bits: Option<u64>,
-    pub hurting_projectile_water_inertia_bits: Option<u64>,
-    pub throwable_projectile_revision: Option<u64>,
-    pub shulker_bullet_target_entity_id: Option<i32>,
-    pub sheep_grazing_ticks: Option<u8>,
-    pub crossbow_attack: Option<EntityCrossbowAttackState>,
-    pub blaze_attack: Option<EntityBlazeAttackState>,
-    pub ghast_attack: Option<EntityGhastAttackState>,
-    pub breeze_attack: Option<EntityBreezeAttackState>,
-    pub guardian_beam: Option<EntityGuardianBeamState>,
-    pub warden_sonic_boom: Option<EntityWardenSonicBoomState>,
-    pub shulker_attack: Option<EntityShulkerAttackState>,
-    pub evoker_attack: Option<EntityEvokerAttackState>,
-    pub witch_attack: Option<EntityWitchAttackState>,
-    pub villager: Option<VillagerData>,
-    pub villager_schedule: Option<villager_26_1_2::VillagerScheduleKind>,
-    pub villager_last_slept_tick: Option<u64>,
-    pub villager_golem_detected_until_tick: Option<u64>,
-    pub villager_override_expires_tick: Option<u64>,
-    pub villager_override_order_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1466,9 +1557,24 @@ struct GoalPathingRequest {
     speed: f64,
 }
 
+impl GoalPathingRequest {
+    fn into_checkpoint(self) -> EntityGoalCheckpoint {
+        EntityGoalCheckpoint {
+            id: self.id,
+            position: self.expected_position,
+            rotation: self.expected_rotation,
+            velocity: self.expected_velocity,
+            on_ground: self.expected_on_ground,
+            lifecycle: EntityLifecycle::Alive,
+            goal: self.expected_goal,
+            path: self.expected_path,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct GoalPathingResult {
-    request: GoalPathingRequest,
+    request: Option<GoalPathingRequest>,
     decision: PathingDecision,
     next_path: RetainedPathState,
 }
@@ -1483,19 +1589,42 @@ impl GoalPathingResult {
         goal: &GoalState,
         path: &RetainedPathState,
     ) -> bool {
-        self.request.expected_position == position
-            && self.request.expected_rotation == rotation
-            && self.request.expected_velocity == velocity
-            && self.request.expected_on_ground == on_ground
-            && &self.request.expected_goal == goal
-            && &self.request.expected_path == path
+        self.request.as_ref().is_none_or(|request| {
+            request.expected_position == position
+                && request.expected_rotation == rotation
+                && request.expected_velocity == velocity
+                && request.expected_on_ground == on_ground
+                && &request.expected_goal == goal
+                && &request.expected_path == path
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityVillagerGoalUpdate {
+    pub(crate) expected: EntitySnapshot,
+    pub(crate) villager: VillagerData,
+    pub(crate) brain: villager_26_1_2::VillagerBrainState,
+    pub(crate) gossip: Option<villager_gossip_26_1_2::VillagerGossipState>,
+    pub(crate) merchant: Option<villager_merchant_26_1_2::VillagerMerchantState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EntityGoalTickSelection {
+    pub checkpoints: Vec<EntityGoalCheckpoint>,
+    pub goal_tick: PreparedGoalTick,
+    pub goal_overrides: HashMap<EntityId, GoalState>,
+    pub pathing_aabbs: Vec<(EntityId, mc_physics::Aabb)>,
+    pub snapshot_overrides: Vec<(EntitySnapshot, EntitySnapshot)>,
+    pub cross_region_villager_candidates: Vec<EntityId>,
+    pub villager_updates: Vec<EntityVillagerGoalUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedGoalTick {
     tick: u64,
     active_ids: Option<HashSet<EntityId>>,
+    passive_decisions: usize,
     pathing_requests: Vec<GoalPathingRequest>,
 }
 
@@ -1503,13 +1632,17 @@ pub struct PreparedGoalTick {
 pub struct ResolvedGoalTick {
     tick: u64,
     active_ids: Option<HashSet<EntityId>>,
-    pathing_results: BTreeMap<EntityId, GoalPathingResult>,
+    passive_decisions: usize,
+    pathing_results: HashMap<EntityId, GoalPathingResult>,
 }
 
 impl PreparedGoalTick {
     #[must_use]
     pub fn pathing_request_count(&self) -> usize {
         self.pathing_requests.len()
+    }
+    pub(crate) fn pathing_request_ids(&self) -> impl Iterator<Item = EntityId> + '_ {
+        self.pathing_requests.iter().map(|request| request.id)
     }
 
     pub fn visit_pathing_probe_positions(
@@ -1546,28 +1679,67 @@ impl PreparedGoalTick {
 
     #[must_use]
     pub fn resolve(self, probe: &dyn PathingProbe, budget: PathingBudget) -> ResolvedGoalTick {
+        self.resolve_inner(probe, budget, false, false).0
+    }
+
+    fn resolve_for_regional(
+        self,
+        probe: &dyn PathingProbe,
+        budget: PathingBudget,
+    ) -> (ResolvedGoalTick, Vec<EntityGoalCheckpoint>) {
+        self.resolve_inner(probe, budget, true, true)
+    }
+    fn resolve_for_owner(
+        self,
+        probe: &dyn PathingProbe,
+        budget: PathingBudget,
+    ) -> ResolvedGoalTick {
+        self.resolve_inner(probe, budget, true, false).0
+    }
+
+    fn resolve_inner(
+        self,
+        probe: &dyn PathingProbe,
+        budget: PathingBudget,
+        trust_owner_fence: bool,
+        collect_checkpoints: bool,
+    ) -> (ResolvedGoalTick, Vec<EntityGoalCheckpoint>) {
         let tick = self.tick;
-        let pathing_results = self
-            .pathing_requests
-            .into_iter()
-            .map(|request| {
-                let id = request.id;
-                let (decision, next_path) = resolve_retained_pathing(&request, tick, probe, budget);
-                (
-                    id,
-                    GoalPathingResult {
-                        request,
-                        decision,
-                        next_path,
-                    },
-                )
-            })
-            .collect();
-        ResolvedGoalTick {
-            tick: self.tick,
-            active_ids: self.active_ids,
-            pathing_results,
+        let mut pathing_results = HashMap::with_capacity(self.pathing_requests.len());
+        let mut checkpoints = Vec::with_capacity(if collect_checkpoints {
+            self.pathing_requests.len()
+        } else {
+            0
+        });
+        for request in self.pathing_requests {
+            let id = request.id;
+            let (decision, next_path) = resolve_retained_pathing(&request, tick, probe, budget);
+            let request = if trust_owner_fence {
+                if collect_checkpoints {
+                    checkpoints.push(request.into_checkpoint());
+                }
+                None
+            } else {
+                Some(request)
+            };
+            pathing_results.insert(
+                id,
+                GoalPathingResult {
+                    request,
+                    decision,
+                    next_path,
+                },
+            );
         }
+        (
+            ResolvedGoalTick {
+                tick: self.tick,
+                active_ids: self.active_ids,
+                passive_decisions: self.passive_decisions,
+                pathing_results,
+            },
+            checkpoints,
+        )
     }
 }
 
@@ -1797,53 +1969,6 @@ impl EntityStore {
         true
     }
 
-    fn vehicle_graph_accepts(&self, pending: &[EntitySnapshot]) -> bool {
-        let mut entities = self
-            .snapshots()
-            .map(|snapshot| (snapshot.id, snapshot))
-            .collect::<HashMap<_, _>>();
-        entities.extend(
-            pending
-                .iter()
-                .cloned()
-                .map(|snapshot| (snapshot.id, snapshot)),
-        );
-        let mut passenger_owners = HashMap::new();
-        for entity in entities.values() {
-            let Some(vehicle) = entity.vehicle else {
-                continue;
-            };
-            if entity.lifecycle != EntityLifecycle::Alive {
-                return false;
-            }
-            let Some(passenger) = vehicle.passenger else {
-                continue;
-            };
-            if passenger == entity.id
-                || entities
-                    .get(&passenger)
-                    .is_none_or(|passenger| passenger.lifecycle != EntityLifecycle::Alive)
-                || passenger_owners.insert(passenger, entity.id).is_some()
-            {
-                return false;
-            }
-        }
-        for &start in entities.keys() {
-            let mut current = Some(start);
-            let mut visited = HashSet::new();
-            while let Some(id) = current {
-                if !visited.insert(id) {
-                    return false;
-                }
-                current = entities
-                    .get(&id)
-                    .and_then(|entity| entity.vehicle)
-                    .and_then(|vehicle| vehicle.passenger);
-            }
-        }
-        true
-    }
-
     #[must_use]
     pub fn contains(&self, id: EntityId) -> bool {
         self.runtime.contains(id)
@@ -1859,20 +1984,11 @@ impl EntityStore {
         self.runtime.motion_state(id)
     }
 
-    pub(crate) fn goal_checkpoint(&self, id: EntityId) -> Option<EntityGoalCheckpoint> {
-        self.runtime.goal_checkpoint(id)
-    }
-
     pub(crate) fn goal_checkpoints_for_ids(
         &self,
         ids: &HashSet<EntityId>,
     ) -> Vec<EntityGoalCheckpoint> {
-        let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
-        ordered_ids.sort_unstable();
-        ordered_ids
-            .into_iter()
-            .filter_map(|id| self.runtime.goal_checkpoint(id))
-            .collect()
+        self.runtime.goal_checkpoints_for_ids(ids)
     }
 
     pub(crate) fn restore_goal_checkpoints(
@@ -1884,15 +2000,15 @@ impl EntityStore {
             .all(|checkpoint| self.runtime.restore_goal_checkpoint(checkpoint))
     }
 
-    pub fn simulation_projections_for_ids(
+    pub fn simulation_results_for_ids(
         &self,
         ids: &HashSet<EntityId>,
-    ) -> Vec<EntitySimulationProjection> {
+    ) -> Vec<EntitySimulationResult> {
         let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
         ordered_ids.sort_unstable();
         ordered_ids
             .into_iter()
-            .filter_map(|id| self.runtime.simulation_projection(id))
+            .filter_map(|id| self.runtime.simulation_result(id))
             .collect()
     }
 
@@ -1900,14 +2016,78 @@ impl EntityStore {
         self.runtime.alive_kinematics_for_ids(ids)
     }
 
+    pub(crate) fn kinematics_fence_states(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> HashMap<EntityId, EntityKinematicsFenceState> {
+        self.runtime.kinematics_fence_states(ids)
+    }
+
+    pub(crate) fn visit_simulation_fence_results_for_ordered_ids(
+        &self,
+        ids: &[EntityId],
+        visitor: impl FnMut(EntityKinematicsFenceState, Option<EntitySimulationResult>),
+    ) {
+        self.runtime
+            .visit_simulation_fence_results_for_ordered_ids(ids, visitor);
+    }
+
+    pub(crate) fn visit_simulation_fence_results(
+        &mut self,
+        visitor: impl FnMut(EntityKinematicsFenceState, Option<EntitySimulationResult>),
+    ) {
+        self.runtime.visit_simulation_fence_results(visitor);
+    }
+    pub(crate) fn visit_goal_tick_candidates(
+        &mut self,
+        visitor: impl FnMut(EntityKinematics, EntityLifecycle, bool, bool, Option<Vec3>),
+    ) {
+        self.runtime.visit_goal_tick_candidates(visitor);
+    }
+
+    pub(crate) fn kinematics_fence_state(
+        &self,
+        id: EntityId,
+    ) -> Option<EntityKinematicsFenceState> {
+        self.runtime.kinematics_fence_state(id)
+    }
+    pub(crate) fn passenger_ids(&self) -> HashSet<EntityId> {
+        self.runtime.passenger_ids()
+    }
+
     #[must_use]
     pub fn view(&self, id: EntityId) -> Option<EntityView<'_>> {
         self.runtime.view(id)
     }
 
+    pub(crate) fn sheep_grazing_activity(&self, id: EntityId) -> Option<bool> {
+        self.runtime.sheep_grazing_activity(id)
+    }
+
     pub fn snapshots(&self) -> impl Iterator<Item = EntitySnapshot> + '_ {
         let snapshots = self.runtime.normalized_snapshots();
         snapshots.into_iter()
+    }
+
+    pub(crate) fn goal_tick_selection(
+        &self,
+        region: regional::RegionKey,
+        tick: u64,
+        candidate_ids: &HashSet<EntityId>,
+        inputs: &regional::RegionalGoalTickInputs,
+    ) -> EntityGoalTickSelection {
+        self.runtime
+            .goal_tick_selection(region, tick, candidate_ids, inputs)
+    }
+    pub(crate) fn goal_tick_selection_for_ordered_ids(
+        &self,
+        region: regional::RegionKey,
+        tick: u64,
+        candidate_ids: &[EntityId],
+        inputs: &regional::RegionalGoalTickInputs,
+    ) -> EntityGoalTickSelection {
+        self.runtime
+            .goal_tick_selection_for_ordered_ids(region, tick, candidate_ids, inputs)
     }
 
     #[cfg(test)]
@@ -1975,29 +2155,20 @@ impl EntityStore {
         &mut self,
         states: impl IntoIterator<Item = EntityKinematics>,
     ) -> usize {
-        let mut applied = 0;
-        let mut physics_queued = false;
-        for state in states {
-            if !state.is_finite() {
-                continue;
-            }
-            if self.is_runtime_entity(state.id) {
-                if !self.runtime.contains(state.id) {
-                    continue;
-                }
-                self.runtime.queue_physics(EntityPhysicsResult {
-                    id: state.id,
-                    position: state.position,
-                    rotation: state.rotation,
-                    velocity: state.velocity,
-                    on_ground: state.on_ground,
-                });
-                applied += 1;
-                physics_queued = true;
-                continue;
-            }
+        let applied = self.runtime.queue_kinematics(states);
+        if applied > 0 {
+            self.runtime.run_stage(EntityStage::PhysicsApply);
         }
-        if physics_queued {
+        applied
+    }
+
+    /// Applies states already fenced by the owning region transaction.
+    pub(crate) fn apply_kinematics_prevalidated(
+        &mut self,
+        states: impl IntoIterator<Item = EntityKinematics>,
+    ) -> usize {
+        let applied = self.runtime.queue_kinematics_prevalidated(states);
+        if applied > 0 {
             self.runtime.run_stage(EntityStage::PhysicsApply);
         }
         applied
@@ -2023,7 +2194,6 @@ impl EntityStore {
     pub fn remove(&mut self, id: EntityId) -> Option<EntitySnapshot> {
         if self.is_runtime_entity(id) {
             let removed = self.runtime.snapshot(id)?;
-            self.clear_vehicle_passenger_refs(id);
             self.runtime
                 .queue_combat(EntityCombatCommand::Remove { id });
             self.runtime.run_stage(EntityStage::CombatLifecycle);
@@ -2191,194 +2361,6 @@ impl EntityStore {
         None
     }
 
-    pub fn mount_vehicle(
-        &mut self,
-        vehicle: EntityId,
-        passenger: EntityId,
-    ) -> Result<(), VehicleError> {
-        if vehicle == passenger {
-            return Err(VehicleError::SelfMount);
-        }
-        let vehicle_snapshot = self.snapshot(vehicle).ok_or(VehicleError::MissingVehicle)?;
-        let passenger_snapshot = self
-            .snapshot(passenger)
-            .ok_or(VehicleError::MissingPassenger)?;
-        if vehicle_snapshot.lifecycle != EntityLifecycle::Alive
-            || passenger_snapshot.lifecycle != EntityLifecycle::Alive
-        {
-            return Err(VehicleError::InvalidLifecycle);
-        }
-        if self.vehicle_for_passenger(passenger).is_some() {
-            return Err(VehicleError::PassengerAlreadyMounted);
-        }
-        if self.passenger_chain_contains(passenger, vehicle) {
-            return Err(VehicleError::Cycle);
-        }
-        let mut state = vehicle_snapshot.vehicle.ok_or(VehicleError::NotVehicle)?;
-        if state.passenger.is_some() {
-            return Err(VehicleError::AlreadyMounted);
-        }
-        state.passenger = Some(passenger);
-        self.set_vehicle_state(vehicle, Some(state));
-        Ok(())
-    }
-
-    pub fn dismount_vehicle(
-        &mut self,
-        vehicle: EntityId,
-        passenger: EntityId,
-    ) -> Result<(), VehicleError> {
-        let mut state = self
-            .snapshot(vehicle)
-            .ok_or(VehicleError::MissingVehicle)?
-            .vehicle
-            .ok_or(VehicleError::NotVehicle)?;
-        if state.passenger != Some(passenger) {
-            return Err(VehicleError::PassengerMismatch);
-        }
-        state.passenger = None;
-        self.set_vehicle_state(vehicle, Some(state));
-        Ok(())
-    }
-
-    pub fn apply_vehicle_input(
-        &mut self,
-        vehicle: EntityId,
-        passenger: EntityId,
-        input: VehicleInput,
-    ) -> Result<(), VehicleError> {
-        let vehicle_snapshot = self.snapshot(vehicle).ok_or(VehicleError::MissingVehicle)?;
-        let passenger_snapshot = self
-            .snapshot(passenger)
-            .ok_or(VehicleError::MissingPassenger)?;
-        if vehicle_snapshot.lifecycle != EntityLifecycle::Alive
-            || passenger_snapshot.lifecycle != EntityLifecycle::Alive
-        {
-            return Err(VehicleError::InvalidLifecycle);
-        }
-        let state = vehicle_snapshot.vehicle.ok_or(VehicleError::NotVehicle)?;
-        if state.passenger != Some(passenger) {
-            return Err(VehicleError::PassengerMismatch);
-        }
-        let mut rotation = vehicle_snapshot.rotation;
-        let mut velocity = vehicle_snapshot.velocity;
-        match state.kind {
-            VehicleKind::Boat => {
-                let yaw_delta = match (input.left, input.right) {
-                    (true, false) => -4.0,
-                    (false, true) => 4.0,
-                    _ => 0.0,
-                };
-                rotation.yaw += yaw_delta;
-                rotation.head_yaw = rotation.yaw;
-
-                let speed = match (input.forward, input.backward) {
-                    (true, false) => 0.35,
-                    (false, true) => -0.12,
-                    _ => 0.0,
-                };
-                let radians = f64::from(rotation.yaw).to_radians();
-                velocity.x = -radians.sin() * speed;
-                velocity.z = radians.cos() * speed;
-                velocity.y = 0.0;
-            }
-            VehicleKind::Minecart => return Err(VehicleError::UnsupportedSteering),
-        }
-        self.apply_kinematics([EntityKinematics {
-            id: vehicle,
-            position: vehicle_snapshot.position,
-            rotation,
-            velocity,
-            on_ground: vehicle_snapshot.on_ground,
-        }]);
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn vehicle_for_passenger(&self, passenger: EntityId) -> Option<EntityId> {
-        self.snapshots()
-            .find_map(|entity| (entity.vehicle?.passenger == Some(passenger)).then_some(entity.id))
-    }
-
-    fn passenger_chain_contains(&self, start: EntityId, target: EntityId) -> bool {
-        let mut current = Some(start);
-        for _ in 0..self.len() {
-            let Some(id) = current else {
-                return false;
-            };
-            if id == target {
-                return true;
-            }
-            let Some(snapshot) = self.snapshot(id) else {
-                return false;
-            };
-            current = snapshot.vehicle.and_then(|state| state.passenger);
-        }
-        false
-    }
-
-    fn set_vehicle_state(&mut self, id: EntityId, vehicle: Option<VehicleState>) -> bool {
-        if self.is_runtime_entity(id) {
-            self.runtime
-                .queue_input(EntityInputCommand::SetVehicle { id, vehicle });
-            self.runtime.run_stage(EntityStage::InputAi);
-            return true;
-        }
-
-        false
-    }
-
-    fn sanitized_snapshot_vehicle(
-        &self,
-        id: EntityId,
-        lifecycle: EntityLifecycle,
-        vehicle: Option<VehicleState>,
-    ) -> Option<VehicleState> {
-        if lifecycle != EntityLifecycle::Alive {
-            return None;
-        }
-        let state = vehicle?;
-        let Some(passenger) = state.passenger else {
-            return Some(state);
-        };
-        if passenger == id || self.vehicle_for_passenger(passenger).is_some() {
-            return None;
-        }
-
-        let mut current = Some(passenger);
-        for _ in 0..=self.len() {
-            let Some(current_id) = current else {
-                return Some(state);
-            };
-            if current_id == id {
-                return None;
-            }
-            let current_snapshot = self.snapshot(current_id)?;
-            if current_snapshot.lifecycle != EntityLifecycle::Alive {
-                return None;
-            }
-            current = current_snapshot.vehicle.and_then(|state| state.passenger);
-        }
-        None
-    }
-
-    fn clear_vehicle_passenger_refs(&mut self, passenger: EntityId) {
-        let changed = self
-            .snapshots()
-            .filter_map(|entity| {
-                let mut vehicle = entity.vehicle?;
-                if vehicle.passenger != Some(passenger) {
-                    return None;
-                }
-                vehicle.passenger = None;
-                Some((entity.id, vehicle))
-            })
-            .collect::<Vec<_>>();
-        for (id, vehicle) in changed {
-            self.set_vehicle_state(id, Some(vehicle));
-        }
-    }
-
     pub fn attributes_mut(&mut self, id: EntityId) -> Option<&mut AttributeSet> {
         if self.is_runtime_entity(id) {
             return self.runtime.attributes_mut(id);
@@ -2419,23 +2401,26 @@ impl EntityStore {
         tick: u64,
         active_ids: &HashSet<EntityId>,
     ) -> PreparedGoalTick {
-        self.prepare_goal_tick(tick, Some(active_ids))
+        self.prepare_goal_tick(tick, Some(active_ids), &HashMap::new())
     }
 
     fn prepare_goal_tick(
         &mut self,
         tick: u64,
         active_ids: Option<&HashSet<EntityId>>,
+        goal_overrides: &HashMap<EntityId, GoalState>,
     ) -> PreparedGoalTick {
-        let active_ids = active_ids.filter(|active_ids| {
-            active_ids.len() != self.len() || !active_ids.iter().all(|id| self.contains(*id))
-        });
+        let active_ids = active_ids.filter(|active_ids| !self.runtime.ids_cover_world(active_ids));
         let mut pathing_requests = Vec::new();
 
-        pathing_requests.extend(self.runtime.pathing_requests(tick, active_ids));
+        pathing_requests.extend(
+            self.runtime
+                .pathing_requests(tick, active_ids, goal_overrides),
+        );
         PreparedGoalTick {
             tick,
             active_ids: active_ids.cloned(),
+            passive_decisions: 0,
             pathing_requests,
         }
     }
@@ -2444,9 +2429,19 @@ impl EntityStore {
         let ResolvedGoalTick {
             tick,
             active_ids,
+            passive_decisions,
             pathing_results,
         } = resolved;
-        self.apply_goal_tick(tick, true, &pathing_results, active_ids.as_ref(), None)
+        self.apply_goal_tick(
+            tick,
+            true,
+            pathing_results,
+            active_ids.as_ref(),
+            passive_decisions,
+            None,
+            None,
+        )
+        .0
     }
 
     pub(crate) fn apply_prepared_goal_tick_with_follow_targets(
@@ -2454,17 +2449,67 @@ impl EntityStore {
         resolved: ResolvedGoalTick,
         follow_targets: &HashMap<EntityId, Vec3>,
     ) -> GoalTickStats {
+        self.apply_prepared_goal_tick_with_follow_targets_inner(resolved, follow_targets, None)
+            .0
+    }
+
+    pub(crate) fn apply_prepared_goal_tick_with_follow_targets_and_simulation_results(
+        &mut self,
+        resolved: ResolvedGoalTick,
+        follow_targets: &HashMap<EntityId, Vec3>,
+        simulation_capture_ids: Vec<EntityId>,
+    ) -> (GoalTickStats, Vec<runtime::GoalSimulationCandidate>) {
+        self.apply_prepared_goal_tick_with_follow_targets_inner(
+            resolved,
+            follow_targets,
+            Some(simulation_capture_ids),
+        )
+    }
+
+    pub(crate) fn apply_prepared_owner_goal_tick(
+        &mut self,
+        resolved: ResolvedGoalTick,
+        follow_targets: HashMap<EntityId, Vec3>,
+        simulation_capture_ids: Vec<EntityId>,
+    ) -> (GoalTickStats, runtime::OwnerGoalTickOutput) {
         let ResolvedGoalTick {
             tick,
             active_ids,
+            passive_decisions,
+            pathing_results,
+        } = resolved;
+        self.runtime.run_owner_goal_tick(runtime::GoalTickRequest {
+            tick,
+            pathing_enabled: true,
+            pathing: pathing_results,
+            active_ids,
+            passive_decisions,
+            external_follow_targets: follow_targets,
+            external_follow_targets_complete: true,
+            simulation_capture_ids: Some(simulation_capture_ids),
+        })
+    }
+
+    fn apply_prepared_goal_tick_with_follow_targets_inner(
+        &mut self,
+        resolved: ResolvedGoalTick,
+        follow_targets: &HashMap<EntityId, Vec3>,
+        simulation_capture_ids: Option<Vec<EntityId>>,
+    ) -> (GoalTickStats, Vec<runtime::GoalSimulationCandidate>) {
+        let ResolvedGoalTick {
+            tick,
+            active_ids,
+            passive_decisions,
             pathing_results,
         } = resolved;
         self.apply_goal_tick(
             tick,
             true,
-            &pathing_results,
+            pathing_results,
             active_ids.as_ref(),
+            passive_decisions,
             Some(follow_targets),
+            simulation_capture_ids,
         )
     }
 
@@ -2475,39 +2520,34 @@ impl EntityStore {
         active_ids: Option<&HashSet<EntityId>>,
     ) -> GoalTickStats {
         if let Some((probe, budget)) = pathing {
-            let prepared = self.prepare_goal_tick(tick, active_ids);
+            let prepared = self.prepare_goal_tick(tick, active_ids, &HashMap::new());
             return self.apply_prepared_goal_tick(prepared.resolve(probe, budget));
         }
-        self.apply_goal_tick(tick, false, &BTreeMap::new(), active_ids, None)
+        self.apply_goal_tick(tick, false, HashMap::new(), active_ids, 0, None, None)
+            .0
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_goal_tick(
         &mut self,
         tick: u64,
         pathing_enabled: bool,
-        pathing_results: &BTreeMap<EntityId, GoalPathingResult>,
+        pathing_results: HashMap<EntityId, GoalPathingResult>,
         active_ids: Option<&HashSet<EntityId>>,
+        passive_decisions: usize,
         external_follow_targets: Option<&HashMap<EntityId, Vec3>>,
-    ) -> GoalTickStats {
-        let mut stats = GoalTickStats::default();
-
-        self.runtime.queue_goal_tick(
+        simulation_capture_ids: Option<Vec<EntityId>>,
+    ) -> (GoalTickStats, Vec<runtime::GoalSimulationCandidate>) {
+        self.runtime.run_goal_tick(runtime::GoalTickRequest {
             tick,
             pathing_enabled,
-            pathing_results.values().cloned(),
-            active_ids,
-            external_follow_targets,
-        );
-        self.runtime.run_stage(EntityStage::InputAi);
-        let authoritative_stats = self.runtime.take_goal_tick_stats();
-        stats.alive_entities += authoritative_stats.alive_entities;
-        stats.decisions_applied += authoritative_stats.decisions_applied;
-        stats.skipped_non_alive += authoritative_stats.skipped_non_alive;
-        stats.missing_follow_targets += authoritative_stats.missing_follow_targets;
-        stats.pathing_moves += authoritative_stats.pathing_moves;
-        stats.pathing_blocked += authoritative_stats.pathing_blocked;
-        stats.pathing_unloaded += authoritative_stats.pathing_unloaded;
-        stats
+            pathing: pathing_results,
+            active_ids: active_ids.cloned(),
+            passive_decisions,
+            external_follow_targets: external_follow_targets.cloned().unwrap_or_default(),
+            external_follow_targets_complete: external_follow_targets.is_some(),
+            simulation_capture_ids,
+        })
     }
 
     pub fn tick_positions(&mut self, delta_seconds: f64) {
@@ -2733,11 +2773,57 @@ fn bounded_pathing_step(
         };
     }
 
-    let (candidates, limit) = bounded_pathing_candidates(current, direct, speed, budget);
+    let step_height = budget.step_height.max(0.0);
+    let direct_position = Vec3 {
+        x: current.x + direct.x * speed * PathingBudget::TICK_SECONDS,
+        y: current.y,
+        z: current.z + direct.z * speed * PathingBudget::TICK_SECONDS,
+    };
+    let Some(direct_result) = probes.call(entity_id, direct_position) else {
+        return PathingDecision {
+            velocity: Vec3::ZERO,
+            kind: PathingDecisionKind::Blocked,
+            direct: false,
+        };
+    };
     let mut saw_unloaded = false;
+    let direct_velocity = match direct_result {
+        PathingProbeResult::Walkable => Some(direct),
+        PathingProbeResult::Blocked => {
+            let stepped = Vec3 {
+                y: direct_position.y + step_height,
+                ..direct_position
+            };
+            match probes.call(entity_id, stepped) {
+                Some(PathingProbeResult::Walkable) => Some(Vec3 {
+                    y: step_height,
+                    ..direct
+                }),
+                Some(PathingProbeResult::Unloaded) => {
+                    saw_unloaded = true;
+                    None
+                }
+                Some(PathingProbeResult::Blocked) | None => None,
+            }
+        }
+        PathingProbeResult::Unloaded => {
+            saw_unloaded = true;
+            None
+        }
+    };
+    if let Some(velocity) = direct_velocity {
+        probes.direct_path_resolved(entity_id);
+        return PathingDecision {
+            velocity,
+            kind: PathingDecisionKind::Move,
+            direct: true,
+        };
+    }
+
+    let (candidates, limit) = bounded_pathing_candidates(current, direct, speed, budget);
     let mut best: Option<(f64, Vec3)> = None;
     let candidate_limit = if allow_detours { limit } else { limit.min(1) };
-    for (candidate_index, candidate) in candidates.into_iter().take(candidate_limit).enumerate() {
+    for candidate in candidates.into_iter().take(candidate_limit).skip(1) {
         let flat = candidate.position;
         let Some(flat_result) = probes.call(entity_id, flat) else {
             break;
@@ -2750,7 +2836,7 @@ fn bounded_pathing_step(
             }),
             PathingProbeResult::Blocked => {
                 let stepped = Vec3 {
-                    y: flat.y + budget.step_height.max(0.0),
+                    y: flat.y + step_height,
                     ..flat
                 };
                 let Some(stepped_result) = probes.call(entity_id, stepped) else {
@@ -2759,7 +2845,7 @@ fn bounded_pathing_step(
                 match stepped_result {
                     PathingProbeResult::Walkable => Some(Vec3 {
                         x: candidate.direction.x,
-                        y: budget.step_height.max(0.0),
+                        y: step_height,
                         z: candidate.direction.z,
                     }),
                     PathingProbeResult::Unloaded => {
@@ -2777,14 +2863,6 @@ fn bounded_pathing_step(
         let Some(velocity) = accepted else {
             continue;
         };
-        if candidate_index == 0 {
-            probes.direct_path_resolved(entity_id);
-            return PathingDecision {
-                velocity,
-                kind: PathingDecisionKind::Move,
-                direct: true,
-            };
-        }
         let next = Vec3 {
             x: current.x + velocity.x * speed * PathingBudget::TICK_SECONDS,
             y: current.y,
@@ -3258,47 +3336,6 @@ mod tests {
             Vec3::new(0.75, 64.5, 0.5)
         );
         assert_eq!(store.snapshots().count(), 3);
-    }
-
-    #[test]
-    fn simulation_projection_keeps_hot_fields_without_snapshot_payloads() {
-        let mut store = EntityStore::new();
-        let mut entity = cow(Vec3::new(2.5, 64.0, 0.5));
-        entity.goal = GoalState::Wander {
-            speed: 0.2,
-            period_ticks: 1,
-        };
-        entity.animal = Some(AnimalBreedingState::adult());
-        entity.retained.spawn_tick = 77;
-        entity.retained.active_effects = Some(EntityActiveEffectsState {
-            effects: effects_26_1_2::ActiveEffectsSnapshot::default(),
-            action_order: Vec::new(),
-        });
-        let id = store.spawn(entity);
-
-        let projection = store
-            .simulation_projections_for_ids(&HashSet::from([id]))
-            .pop()
-            .expect("simulation projection");
-
-        assert_eq!(projection.id, id);
-        assert_eq!(projection.type_name.as_ref(), "minecraft:cow");
-        assert_eq!(projection.position, Vec3::new(2.5, 64.0, 0.5));
-        assert_eq!(projection.lifecycle, EntityLifecycle::Alive);
-        assert_eq!(projection.follow_range, 16.0);
-        assert_eq!(
-            projection.goal,
-            GoalState::Wander {
-                speed: 0.2,
-                period_ticks: 1,
-            }
-        );
-        assert!(!projection.primed_tnt);
-        assert!(projection.animal.is_some());
-        assert!(!projection.has_item_stack);
-        assert!(!projection.has_experience_value);
-        assert!(!projection.has_block_state);
-        assert!(!projection.has_vehicle);
     }
 
     #[test]
@@ -4215,6 +4252,45 @@ mod tests {
     }
 
     #[test]
+    fn regional_goal_selection_keeps_shulker_bullet_retargeting() {
+        let mut store = EntityStore::new();
+        let position = Vec3::new(0.5, 64.0, 0.5);
+        let projectile_position = projectile_26_1_2::Vec3::new(position.x, position.y, position.z);
+        let bounds = projectile_26_1_2::Aabb::new(0.4, 64.0, 0.4, 0.6, 64.2, 0.6).unwrap();
+        let mut bullet = SpawnEntity::new(113, "minecraft:shulker_bullet", position);
+        bullet.retained.hurting_projectile_state = Some(
+            projectile_26_1_2::HurtingProjectileState::new(
+                None,
+                projectile_position,
+                bounds,
+                projectile_26_1_2::Vec3::new(1.0, 0.0, 0.0),
+                projectile_26_1_2::Rotation::new(0.0, 0.0),
+                0.1,
+            )
+            .unwrap(),
+        );
+        bullet.retained.shulker_bullet = Some(EntityShulkerBulletState::new(42));
+        let bullet = store.spawn(bullet);
+        let inputs = regional::RegionalGoalTickInputs {
+            combat_targets: std::sync::Arc::new(HashMap::from([(42, Vec3::new(10.5, 64.0, 0.5))])),
+            ..regional::RegionalGoalTickInputs::default()
+        };
+
+        let selection = store.goal_tick_selection(
+            regional::RegionKey::from_position(position).unwrap(),
+            1,
+            &HashSet::from([bullet]),
+            &inputs,
+        );
+
+        let [(expected, next)] = selection.snapshot_overrides.as_slice() else {
+            panic!("shulker bullet retarget must remain on the fallback goal route");
+        };
+        assert_eq!(expected.id, bullet);
+        assert_eq!(next.velocity, Vec3::new(0.03, 0.0, 0.0));
+    }
+
+    #[test]
     fn bounded_pathing_moves_over_flat_loaded_terrain() {
         let mut store = EntityStore::new();
         let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
@@ -4377,6 +4453,7 @@ mod tests {
         let prepared = PreparedGoalTick {
             tick: 2,
             active_ids: None,
+            passive_decisions: 0,
             pathing_requests: vec![GoalPathingRequest {
                 id,
                 expected_position: Vec3::new(0.0, 64.0, 0.0),
@@ -4658,6 +4735,7 @@ mod tests {
         let prepared = PreparedGoalTick {
             tick: 2,
             active_ids: None,
+            passive_decisions: 0,
             pathing_requests: vec![GoalPathingRequest {
                 id,
                 expected_position: Vec3::new(0.0, 64.0, 0.0),
@@ -5100,7 +5178,7 @@ mod tests {
 
         let full_started = std::time::Instant::now();
         for tick in 1..=TICKS {
-            let prepared = full_query.prepare_goal_tick(tick, None);
+            let prepared = full_query.prepare_goal_tick(tick, None, &HashMap::new());
             full_query.apply_prepared_goal_tick(prepared.resolve(&probe, PathingBudget::DEFAULT));
         }
         let full_elapsed = full_started.elapsed();

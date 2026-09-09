@@ -40,6 +40,21 @@ fn test_manifest() -> ValidatedScriptPluginManifest {
         .unwrap()
 }
 
+/// Package directory from the independent `solaris-default-plugins` sibling
+/// checkout. Fails loudly instead of skipping: behavior coverage must run
+/// against the real packages, and a missing checkout is a setup error.
+fn sibling_plugin_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../solaris-default-plugins")
+        .join(name);
+    assert!(
+        dir.is_dir(),
+        "sibling plugin checkout missing at {}: clone solaris-default-plugins next to solaris",
+        dir.display()
+    );
+    dir
+}
+
 #[tokio::test]
 async fn lua_plugin_reads_nested_config_as_a_fresh_table() {
     let root = TempPluginDir::new("nested");
@@ -400,8 +415,7 @@ fn disk_config_accepts_each_exact_structural_boundary() {
 
 #[test]
 fn basic_economy_rejects_fail_late_config_shapes_during_plugin_load() {
-    let catalog = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/plugins/basic-economy");
+    let catalog = sibling_plugin_dir("basic-economy");
 
     let mut float_count = read_plugin_source(&catalog).unwrap();
     float_count

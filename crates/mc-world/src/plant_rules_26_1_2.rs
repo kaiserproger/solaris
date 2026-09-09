@@ -5,6 +5,38 @@ use crate::{
     WorldStorage,
 };
 
+/// Distance contributed by a neighbouring block when resolving leaf support.
+#[must_use]
+pub fn leaf_distance_from_state(blocks: &BlockRegistry, state: BlockStateId) -> u8 {
+    let Some(state) = blocks.by_id(state) else {
+        return 7;
+    };
+    let path = state.block.id.path();
+    if path.ends_with("_log")
+        || path.ends_with("_wood")
+        || matches!(
+            path,
+            "crimson_stem"
+                | "stripped_crimson_stem"
+                | "warped_stem"
+                | "stripped_warped_stem"
+                | "crimson_hyphae"
+                | "stripped_crimson_hyphae"
+                | "warped_hyphae"
+                | "stripped_warped_hyphae"
+        )
+    {
+        return 0;
+    }
+    if !path.ends_with("_leaves") {
+        return 7;
+    }
+    block_state_property(state, "distance")
+        .and_then(|distance| distance.parse::<u8>().ok())
+        .unwrap_or(7)
+        .min(7)
+}
+
 pub trait PlantBlockRead {
     fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId>;
 }

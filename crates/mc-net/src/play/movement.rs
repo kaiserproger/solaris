@@ -6,7 +6,7 @@ use mc_data::collision_shapes::{CollisionShapeTable, vanilla_collision_shapes};
 use mc_domain::GameMode;
 use mc_protocol::packets::play::MovePlayerFlags;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, ChunkPos, WorldReadSnapshot, WorldReadView};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::ConnectionError;
 
@@ -701,6 +701,20 @@ pub(super) fn next_player_teleport_id(next_teleport_id: &mut i32) -> i32 {
         teleport_id + 1
     };
     teleport_id
+}
+
+/// Teleport ids are monotonic, so a confirmed id below the pending one is the
+/// client acknowledging an earlier teleport the server already superseded —
+/// the normal vanilla race, not a desync. Anything else stays a warning.
+pub(super) fn note_teleport_confirm_mismatch(expected: i32, received: i32) {
+    if received < expected {
+        debug!(
+            expected,
+            received, "stale teleport confirmation for an earlier teleport accepted"
+        );
+    } else {
+        warn!(expected, received, "teleport confirmation id mismatch");
+    }
 }
 
 fn state_is_water(facts: &BlockFactsTable, state_id: BlockStateId) -> bool {

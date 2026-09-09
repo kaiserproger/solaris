@@ -90,7 +90,8 @@ fn writable_world_lease_is_process_exclusive_and_recovers_after_crash() {
                 && metadata.contains("instance=")
     ));
 
-    let read_only = WorldStorage::open_read_only(first_root.path(), Arc::clone(&registry)).unwrap();
+    let mut read_only =
+        WorldStorage::open_read_only(first_root.path(), Arc::clone(&registry)).unwrap();
     assert!(matches!(
         read_only.plan_dirty_flush(),
         Err(WorldError::ReadOnlyWorld(path)) if path == first_root.path()

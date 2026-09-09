@@ -157,10 +157,10 @@ pub(super) fn acquire_regional_worker_permits(
 ) -> Vec<crate::chunk_pipeline::ChunkPipelinePermit> {
     // The ticker owns the runtime CPU reserved outside this background permit pool.
     // It must never wait for a worker whose result the ticker itself has to accept.
-    if parallel_batch_count < 2 || resources.cpu_limit() < 2 {
+    if parallel_batch_count < 2 || resources.cpu_capacity() < 2 {
         return Vec::new();
     }
-    let target = (parallel_batch_count - 1).min(resources.cpu_limit() - 1);
+    let target = (parallel_batch_count - 1).min(resources.cpu_capacity() - 1);
     let mut permits = Vec::with_capacity(target);
     for _ in 0..target {
         let Some(permit) = resources.try_acquire_cpu() else {

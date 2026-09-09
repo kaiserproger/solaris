@@ -53,6 +53,38 @@ api = "0.6.0"
     fs::write(directory.join("main.lua"), "").unwrap();
 }
 
+/// Package directory from the independent `solaris-default-plugins` sibling
+/// checkout. Fails loudly instead of skipping: behavior coverage must run
+/// against the real packages, and a missing checkout is a setup error.
+fn sibling_plugin_source(name: &str) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../solaris-default-plugins")
+        .join(name);
+    assert!(
+        source.is_dir(),
+        "sibling plugin checkout missing at {}: clone solaris-default-plugins next to solaris",
+        source.display()
+    );
+    source
+}
+
+/// Deploy one real sibling package into a scratch plugin root so worldgen
+/// selection is exercised through normal directory discovery.
+fn deploy_sibling_plugin(name: &str, destination_root: &Path) {
+    let source = sibling_plugin_source(name);
+    let destination = destination_root.join(name);
+    fs::create_dir(&destination).expect("create deployed plugin directory");
+    for file in ["plugin.toml", "main.lua"] {
+        fs::copy(source.join(file), destination.join(file))
+            .unwrap_or_else(|error| panic!("copy sibling {name}/{file}: {error}"));
+    }
+    let config = source.join("config.toml");
+    if config.is_file() {
+        fs::copy(&config, destination.join("config.toml"))
+            .unwrap_or_else(|error| panic!("copy sibling {name}/config.toml: {error}"));
+    }
+}
+
 #[test]
 fn duplicate_plugin_ids_fail_before_runtime_metadata_can_diverge() {
     let plugins = TempPlugins::new();
@@ -77,8 +109,9 @@ api = "0.6.0"
 
 #[test]
 fn shipped_realistic_deposits_plugin_selects_the_startup_ore_profile() {
-    let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
-    let prepared = prepare_lua_plugins(LuaHostConfig::new(plugins)).unwrap();
+    let plugins = TempPlugins::new();
+    deploy_sibling_plugin("geological-mines", plugins.path());
+    let prepared = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
 
     let profile = prepared
         .worldgen_ore_profile()
@@ -89,8 +122,9 @@ fn shipped_realistic_deposits_plugin_selects_the_startup_ore_profile() {
 
 #[test]
 fn shipped_settlement_plugin_selects_the_village_prototype() {
-    let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
-    let prepared = prepare_lua_plugins(LuaHostConfig::new(plugins)).unwrap();
+    let plugins = TempPlugins::new();
+    deploy_sibling_plugin("settlement-prototype", plugins.path());
+    let prepared = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
 
     assert_eq!(
         prepared.worldgen_settlement_profile(),

@@ -42,6 +42,7 @@ mod dragon_authority;
 mod dragon_authority_tests;
 mod entity_physics_class;
 mod entity_simulation;
+pub(crate) use entity_simulation::VillagerPopulationSelection;
 mod entity_spawn_facts;
 mod entity_tracking;
 #[cfg(test)]
@@ -64,6 +65,8 @@ mod interaction_geometry_tests;
 #[cfg(feature = "load-bench")]
 mod load_bench;
 mod movement_publication;
+#[cfg(test)]
+mod natural_mob_despawn_tests;
 mod operator_facts;
 #[cfg(test)]
 #[path = "session/operator_facts_tests.rs"]
@@ -89,22 +92,25 @@ mod projectiles;
 #[cfg(test)]
 #[path = "session/projectiles_tests.rs"]
 mod projectiles_tests;
-mod script_client_screen_endpoint;
+mod script_client_sound_endpoint;
 #[cfg(test)]
-mod script_client_screen_endpoint_tests;
+mod script_client_sound_endpoint_tests;
+mod script_client_ui_endpoint;
+#[cfg(test)]
+mod script_client_ui_endpoint_tests;
 mod script_loader_interaction_endpoint;
 #[cfg(test)]
 mod script_loader_interaction_endpoint_tests;
+#[cfg(test)]
+mod sheep_grazing_tests;
 pub(super) use script_loader_interaction_endpoint::route_client_loader_interaction;
 mod script_commit_events;
-use script_commit_events::{
-    SCRIPT_COMMIT_EVENT_OUTBOX_CAPACITY, ScriptCommitEventMetrics, ScriptCommitEventOutbox,
-};
-pub(crate) use script_commit_events::{
-    ScriptCommitDelivery, ScriptCommitEventOutboxSnapshot, ScriptCommitEventReceiver,
-};
 #[cfg(test)]
-use script_commit_events::{ScriptCommitEnqueueError, ScriptCommitEnqueueOutcome};
+use mc_script::ScriptCommitEnqueueError;
+use mc_script::{
+    ScriptCommitEventMonitor, ScriptCommitEventOutbox, ScriptCommitEventOutboxSnapshot,
+    ScriptCommitEventReceiver,
+};
 mod script_entity_interaction;
 #[cfg(test)]
 mod script_entity_interaction_tests;
@@ -130,6 +136,8 @@ mod script_villager_endpoint;
 mod session_lifecycle;
 mod settlement_authority;
 pub(super) use settlement_authority::toolsmith_merchant_state;
+#[cfg(test)]
+mod goal_cadence_tests;
 mod simulation_input_publication;
 #[cfg(test)]
 mod simulation_input_publication_tests;
@@ -188,7 +196,6 @@ use herd_spawn_authority::{
 #[cfg(test)]
 use herd_spawn_authority::{ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked};
 pub(crate) use herd_spawn_authority::{NaturalSpawnScheduler, NaturalSpawnTickInput};
-use hostile_authority::update_hostile_targets_from_projections;
 #[cfg(test)]
 use hostile_authority::{
     HostileCommitProbe, HostileScanProbe, changed_hostile_goal, hostile_wander_goal,
@@ -225,7 +232,7 @@ pub(super) use passive_mobs::SheepGrazingCandidate;
 pub(super) use passive_mobs::sheep_grazing_starts_on_tick;
 #[cfg(test)]
 use passive_mobs::{
-    BreedingAnimal, GrazingSheep, SHEEP_GRAZING_ACTION_TICK, advance_sheep_grazing, plan_breeding,
+    BreedingAnimal, SHEEP_GRAZING_ACTION_TICK, advance_sheep_grazing, plan_breeding,
 };
 #[cfg(test)]
 use passive_mobs::{sheep_breeding_color, sheep_recipe_mix};
@@ -557,7 +564,7 @@ pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
     simulation_inputs: Arc<SimulationInputPublication>,
     movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
-    active_simulation_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    active_simulation_chunks: arc_swap::ArcSwap<HashSet<(i32, i32)>>,
     active_hostile_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
     evoker_fang_count: Arc<AtomicUsize>,
     entity_update_budget_per_lane: AtomicUsize,
@@ -582,8 +589,7 @@ pub(crate) struct SessionRegistry {
     entities: SessionEntityOwners,
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
     world_chunk_journal_failure: tokio::sync::watch::Sender<bool>,
-    script_commit_event_metrics: Arc<ScriptCommitEventMetrics>,
-    script_commit_event_failure: tokio::sync::watch::Sender<bool>,
+    script_commit_event_monitor: Arc<ScriptCommitEventMonitor>,
     containers: ContainerRegistryShards,
     campfire_cooking: Arc<Mutex<HashMap<mc_world::BlockPos, CampfireCookingState>>>,
     pressure_observation: Arc<SessionPressureObservation>,
@@ -610,10 +616,6 @@ pub(crate) struct SessionRegistry {
     prepared_changed: tokio::sync::Notify,
     last_save_report: Mutex<Option<crate::operator_metrics::RetainedSaveReport>>,
     natural_spawn_report: Mutex<Option<crate::operator_metrics::RetainedNaturalSpawnReport>>,
-    #[cfg(test)]
-    entity_owner_reconfiguration_calls: AtomicU64,
-    #[cfg(test)]
-    prepared_chunk_shed_calls: AtomicU64,
     #[cfg(test)]
     prepared_claim_calls: AtomicU64,
     #[cfg(test)]
@@ -692,8 +694,6 @@ pub(crate) struct SessionRegistry {
     breeding_commits: AtomicU64,
     #[cfg(test)]
     breeding_entity_scan_visits: AtomicU64,
-    #[cfg(test)]
-    sheep_grazing_entity_visits: AtomicU64,
     #[cfg(test)]
     hostile_attack_candidates: AtomicU64,
     #[cfg(test)]
@@ -916,7 +916,7 @@ impl SessionRegistry {
             }),
             simulation_inputs,
             movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
-            active_simulation_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            active_simulation_chunks: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             active_hostile_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             evoker_fang_count,
             entity_update_budget_per_lane: AtomicUsize::new(0),
@@ -947,8 +947,7 @@ impl SessionRegistry {
             entities,
             world_chunk_journal: Mutex::new(None),
             world_chunk_journal_failure: tokio::sync::watch::channel(false).0,
-            script_commit_event_metrics: Arc::new(ScriptCommitEventMetrics::default()),
-            script_commit_event_failure: tokio::sync::watch::channel(false).0,
+            script_commit_event_monitor: Arc::new(ScriptCommitEventMonitor::default()),
             containers: ContainerRegistryShards::default(),
             campfire_cooking: Arc::new(Mutex::new(HashMap::new())),
             pressure_observation,
@@ -975,10 +974,6 @@ impl SessionRegistry {
             prepared_changed: tokio::sync::Notify::new(),
             last_save_report: Mutex::new(None),
             natural_spawn_report: Mutex::new(None),
-            #[cfg(test)]
-            entity_owner_reconfiguration_calls: AtomicU64::new(0),
-            #[cfg(test)]
-            prepared_chunk_shed_calls: AtomicU64::new(0),
             #[cfg(test)]
             prepared_claim_calls: AtomicU64::new(0),
             #[cfg(test)]
@@ -1058,8 +1053,6 @@ impl SessionRegistry {
             #[cfg(test)]
             breeding_entity_scan_visits: AtomicU64::new(0),
             #[cfg(test)]
-            sheep_grazing_entity_visits: AtomicU64::new(0),
-            #[cfg(test)]
             hostile_attack_candidates: AtomicU64::new(0),
             #[cfg(test)]
             hostile_entity_scan_visits: AtomicU64::new(0),
@@ -1068,7 +1061,6 @@ impl SessionRegistry {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn configure_mob_behavior_table(
         &self,
         table: mc_data::mob_behavior_26_1_2::MobBehaviorTable,
@@ -1186,6 +1178,21 @@ impl SessionRegistry {
         &self,
         journal: super::world_journal::WorldChunkJournal,
     ) {
+        {
+            let mut reporter = journal
+                .writer
+                .failure_reporter
+                .lock()
+                .expect("journal failure reporter");
+            if journal
+                .writer
+                .failed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.world_chunk_journal_failure.send_replace(true);
+            }
+            *reporter = Some(self.world_chunk_journal_failure.clone());
+        }
         *lock_authoritative_mutex(
             &self.world_chunk_journal,
             "persistence.world_chunk_journal_handle",
@@ -1286,21 +1293,7 @@ impl SessionRegistry {
     }
 
     pub(crate) fn reconfigure_entity_owner_lanes(&self, lane_count: usize) -> usize {
-        #[cfg(test)]
-        self.entity_owner_reconfiguration_calls
-            .fetch_add(1, Ordering::Relaxed);
         self.entities.reconfigure_lanes(lane_count)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn entity_owner_reconfiguration_calls(&self) -> u64 {
-        self.entity_owner_reconfiguration_calls
-            .load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepared_chunk_shed_calls(&self) -> u64 {
-        self.prepared_chunk_shed_calls.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -1348,7 +1341,7 @@ impl SessionRegistry {
             return false;
         }
         if live == 0 {
-            self.clear_active_simulation_entities();
+            self.clear_active_simulation_selection();
         }
         self.live_session_generation.fetch_add(1, Ordering::Release);
         previous != 0 && live == 0
@@ -1358,18 +1351,18 @@ impl SessionRegistry {
         self.live_session_count.load(Ordering::Acquire) != 0
     }
 
-    fn publish_active_entity_selection(
+    fn publish_active_simulation_selection(
         &self,
         expected_live_session_generation: u64,
-        entities: HashSet<EntityId>,
+        chunks: HashSet<(i32, i32)>,
         hostiles: HashSet<EntityId>,
     ) {
-        self.active_simulation_entities.store(Arc::new(entities));
+        self.active_simulation_chunks.store(Arc::new(chunks));
         self.active_hostile_entities.store(Arc::new(hostiles));
         if self.live_session_generation.load(Ordering::Acquire) != expected_live_session_generation
             || !self.has_live_sessions()
         {
-            self.clear_active_simulation_entities();
+            self.clear_active_simulation_selection();
         }
     }
 
@@ -1392,9 +1385,9 @@ impl SessionRegistry {
         }
     }
 
-    fn clear_active_simulation_entities(&self) {
-        if !self.active_simulation_entities.load().is_empty() {
-            self.active_simulation_entities
+    fn clear_active_simulation_selection(&self) {
+        if !self.active_simulation_chunks.load().is_empty() {
+            self.active_simulation_chunks
                 .store(Arc::new(HashSet::new()));
         }
         if !self.active_hostile_entities.load().is_empty() {
@@ -1410,9 +1403,25 @@ impl SessionRegistry {
         let entities = entities.into_iter().collect::<HashSet<_>>();
         self.refresh_breeding_tick_entities_for_test(entities.iter().copied());
         self.refresh_special_entity_indexes_for_test(entities.iter().copied());
-        self.publish_active_entity_selection(
+        {
+            let mut inner = self.lock_session_entities("publish test active simulation chunks");
+            for entity in &entities {
+                if let Some(position) = inner
+                    .entities
+                    .snapshot(*entity)
+                    .map(|snapshot| snapshot.position)
+                {
+                    entity_lifecycle::track_entity_chunk_locked(&mut inner, *entity, position);
+                }
+            }
+        }
+        let chunks = entities
+            .iter()
+            .filter_map(|entity| self.simulation_inputs.entity_chunk(*entity))
+            .collect::<HashSet<_>>();
+        self.publish_active_simulation_selection(
             self.live_session_generation.load(Ordering::Acquire),
-            entities,
+            chunks,
             HashSet::new(),
         );
     }
@@ -1830,22 +1839,13 @@ impl SessionRegistry {
     }
 
     pub(crate) fn install_script_commit_event_outbox(&self) -> ScriptCommitEventReceiver {
-        let (sender, receiver) = tokio::sync::mpsc::channel(SCRIPT_COMMIT_EVENT_OUTBOX_CAPACITY);
-        let outbox = ScriptCommitEventOutbox::new(
-            sender,
-            Arc::clone(&self.script_commit_event_metrics),
-            self.script_commit_event_failure.clone(),
-        );
+        let (outbox, receiver) = self.script_commit_event_monitor.channel();
         let mut inner = self.lock_inner("install script commit event outbox");
         assert!(
             inner.script_commit_events.replace(outbox).is_none(),
             "script commit event outbox may only be installed once"
         );
-        ScriptCommitEventReceiver::new(
-            receiver,
-            Arc::clone(&self.script_commit_event_metrics),
-            self.script_commit_event_failure.clone(),
-        )
+        receiver
     }
 
     pub(crate) fn close_script_commit_event_outbox(&self) {
@@ -1853,32 +1853,24 @@ impl SessionRegistry {
             .script_commit_events = None;
     }
 
-    pub(crate) fn subscribe_script_commit_event_failure(
-        &self,
-    ) -> tokio::sync::watch::Receiver<bool> {
-        self.script_commit_event_failure.subscribe()
+    pub(crate) fn script_commit_event_monitor(&self) -> Arc<ScriptCommitEventMonitor> {
+        Arc::clone(&self.script_commit_event_monitor)
     }
 
     pub(crate) fn script_commit_event_outbox_snapshot(&self) -> ScriptCommitEventOutboxSnapshot {
-        self.script_commit_event_metrics.snapshot()
+        self.script_commit_event_monitor.snapshot()
     }
 
     #[cfg(test)]
     pub(crate) fn try_enqueue_script_commit_event_for_test(
         &self,
-        delivery: ScriptCommitDelivery,
         event: ScriptEvent,
-    ) -> Result<ScriptCommitEnqueueOutcome, ScriptCommitEnqueueError> {
+    ) -> Result<(), ScriptCommitEnqueueError> {
         let inner = self.lock_inner("enqueue test script commit event");
         let Some(outbox) = inner.script_commit_events.as_ref() else {
-            return match delivery {
-                ScriptCommitDelivery::Required => Err(ScriptCommitEnqueueError::RequiredClosed),
-                ScriptCommitDelivery::BestEffort => {
-                    Ok(ScriptCommitEnqueueOutcome::BestEffortDropped)
-                }
-            };
+            return Err(ScriptCommitEnqueueError::RequiredClosed);
         };
-        outbox.try_enqueue(delivery, event)
+        outbox.try_enqueue(event)
     }
 
     pub(crate) fn subscribe_player_attacks(
@@ -2418,6 +2410,9 @@ fn record_entity_dispatches_locked(
             OutboundCommand::TakeItemEntity { .. } => inner.entity_dispatches.take += 1,
             OutboundCommand::PickupCandidates(_) => {}
             OutboundCommand::DespawnEntity(_) => inner.entity_dispatches.remove += 1,
+            OutboundCommand::DespawnEntities(entities) => {
+                inner.entity_dispatches.remove += entities.len() as u64;
+            }
             _ => {}
         }
     }

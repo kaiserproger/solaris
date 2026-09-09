@@ -121,8 +121,8 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
                 } else {
                     ScriptGameMode::Adventure
                 };
-                let event = deaths.try_recv_required().unwrap_or_else(|error| {
-                    panic!("missing {expected_mode:?} death event for {game_mode:?}: {error:?}")
+                let event = deaths.try_recv_required().unwrap_or_else(|| {
+                    panic!("missing {expected_mode:?} death event for {game_mode:?}")
                 });
                 match event.kind() {
                     ScriptEventKind::PlayerDied {
@@ -133,16 +133,10 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
                 }
             }
             GameMode::Creative | GameMode::Spectator => {
-                assert!(matches!(
-                    deaths.try_recv_required(),
-                    Err(mpsc::error::TryRecvError::Empty)
-                ));
+                assert!(deaths.try_recv_required().is_none());
             }
         }
-        assert!(matches!(
-            deaths.try_recv_required(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(deaths.try_recv_required().is_none());
 
         let mut snapshots_before_duplicate = records
             .into_iter()
@@ -178,10 +172,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
             .collect::<Vec<_>>();
         snapshots_after_duplicate.sort_unstable_by_key(|snapshot| snapshot.id);
         assert_eq!(snapshots_after_duplicate, snapshots_before_duplicate);
-        assert!(matches!(
-            deaths.try_recv_required(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(deaths.try_recv_required().is_none());
     }
 }
 

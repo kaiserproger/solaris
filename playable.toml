@@ -40,9 +40,6 @@ save_interval_ticks = 1200
 # writes an isolated effective config with hostile attempts disabled.
 friendly_spawn_interval_ticks = 400
 hostile_spawn_interval_ticks = 20
-friendly_spawn_cap = 32
-aquatic_spawn_cap = 20
-hostile_spawn_cap = 70
 friendly_spawn_chunk_budget = 48
 hostile_spawn_chunk_budget = 4
 

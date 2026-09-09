@@ -334,7 +334,6 @@ fn spawn_category(value: mc_net::NaturalSpawnCategoryReport) -> SpawnCategoryRep
         rejected_block_or_fluid: value.rejected_block_or_fluid,
         rejected_darkness: value.rejected_darkness,
         rejected_collision: value.rejected_collision,
-        rejected_cap: value.rejected_cap,
         rejected_duplicate: value.rejected_duplicate_or_stale,
     }
 }

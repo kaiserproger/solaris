@@ -14,6 +14,16 @@ pub const TERMINAL_VELOCITY_BLOCKS_PER_SECOND: f64 = -78.4;
 pub const GROUND_FRICTION: f64 = 0.6;
 pub const AIR_DRAG: f64 = 0.98;
 pub const WATER_DRAG: f64 = 0.8;
+/// Downward drift applied to swimming terrestrial bodies while immersed.
+/// Vanilla `LivingEntity` water gravity is `getEffectiveGravity() / 16` per
+/// tick (`0.08 / 16 = 0.005` blocks/tick), i.e. `0.005 * 20 / 0.05 = 2.0`
+/// blocks/s^2. Vanilla living entities therefore sink slowly unless a
+/// `FloatGoal` jump drives them up; there is no passive surface buoyancy.
+pub const WATER_SINK_BLOCKS_PER_SECOND_SQUARED: f64 = 2.0;
+/// Continuous swim drive toward a shallow immersion threshold. Vanilla uses
+/// depth-gated FloatGoal jump impulses; this kernel uses a bounded steady drive
+/// rather than item buoyancy. With drag, submerged rise settles at +0.2 blocks/s.
+pub const TERRESTRIAL_SWIM_LIFT_BLOCKS_PER_SECOND_SQUARED: f64 = 3.0;
 pub const WATER_BUOYANCY_BLOCKS_PER_SECOND_SQUARED: f64 = 7.0;
 pub const STEP_HEIGHT: f64 = 0.6;
 pub const LIVING_JUMP_SPEED_BLOCKS_PER_SECOND: f64 = 0.419_999_986_886_978_15 / TICK_SECONDS;
@@ -600,10 +610,17 @@ impl Default for PhysicsConfig {
 }
 
 impl PhysicsConfig {
+    /// Terrestrial living bodies (sheep, pigs, cows, …) swim with a bounded
+    /// immersion model, not floating-item buoyancy: vanilla
+    /// `LivingEntity.travelInWater` only drags and sinks, while upward drive
+    /// comes from `FloatGoal` jumps gated on fluid depth. The kernel uses a
+    /// shallow swim threshold above the feet (see `step_entity`), so no
+    /// per-type checks are needed here.
     #[must_use]
     pub fn living_entity() -> Self {
         Self {
             jump_speed: LIVING_JUMP_SPEED_BLOCKS_PER_SECOND,
+            water_buoyancy: TERRESTRIAL_SWIM_LIFT_BLOCKS_PER_SECOND_SQUARED,
             ..Self::default()
         }
     }
@@ -711,8 +728,46 @@ pub fn step_entity<S: BlockSampler>(
             horizontal_collision: false,
         };
     }
+    if !in_fluid && body.on_ground && body.velocity == Vec3::ZERO {
+        let settled_velocity_y = (-config.gravity * config.tick_seconds * config.vertical_air_drag)
+            .max(config.terminal_velocity);
+        let settled_displacement_y = settled_velocity_y * config.tick_seconds;
+        if settled_displacement_y < 0.0
+            && bounded_displacement(Vec3::new(0.0, settled_displacement_y, 0.0))
+        {
+            let start_box = WorldAabb::for_body(body);
+            if let Some(collision_boxes) = collision_boxes_for_motion(
+                sampler,
+                start_box,
+                Vec3::new(0.0, settled_displacement_y, 0.0),
+                0.0,
+            ) {
+                let clipped_y = clip_y(start_box, settled_displacement_y, &collision_boxes);
+                if axis_was_clipped(settled_displacement_y, clipped_y) {
+                    // With no horizontal displacement, the general resolver
+                    // can only clip this downward move and restore the same
+                    // grounded zero-velocity body. Avoid its step-height scan.
+                    return StepResult {
+                        body,
+                        in_fluid,
+                        horizontal_collision: false,
+                    };
+                }
+            }
+        }
+    }
     if in_fluid {
-        body.velocity.y += config.water_buoyancy * config.tick_seconds;
+        // Living bodies sink gently and swim upward only below the shallow
+        // immersion threshold. Requiring a submerged head would hold breathing
+        // animals underwater; applying lift at any overlap walks them on water.
+        if config.jump_speed > 0.0 && config.water_buoyancy > 0.0 {
+            body.velocity.y -= WATER_SINK_BLOCKS_PER_SECOND_SQUARED * config.tick_seconds;
+            if fluid_reaches_swim_threshold(body, sampler) {
+                body.velocity.y += config.water_buoyancy * config.tick_seconds;
+            }
+        } else {
+            body.velocity.y += config.water_buoyancy * config.tick_seconds;
+        }
         body.velocity.x *= config.water_drag;
         body.velocity.y *= config.water_drag;
         body.velocity.z *= config.water_drag;
@@ -803,6 +858,27 @@ pub fn step_entity<S: BlockSampler>(
         } else {
             body.on_ground = movement.grounded;
         }
+    }
+    // Vanilla jumpOutOfFluid uses a 0.3-block/tick impulse only when the elevated
+    // destination is free of both collision and liquid, not just a clear ceiling.
+    if in_fluid
+        && horizontal_collision
+        && !movement.stepped
+        && !was_on_ground
+        && !movement.grounded
+        && config.jump_speed > 0.0
+        && config.water_buoyancy > 0.0
+        && {
+            let rise =
+                0.600_000_023_841_857_9 + body.velocity.y * config.tick_seconds - movement.delta.y;
+            let mut exit = body;
+            exit.position.y += rise;
+            clip_y(WorldAabb::for_body(body), rise, &collision_boxes) >= rise
+                && !body_overlaps_fluid(exit, sampler)
+        }
+    {
+        body.velocity.y = 0.300_000_011_920_928_96 / config.tick_seconds;
+        body.on_ground = false;
     }
     if body.on_ground {
         body.velocity.y = 0.0;
@@ -1356,6 +1432,19 @@ fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &S) -> bool {
         zs.iter()
             .any(|&z| (min_y..=max_y).any(|y| sampler.material_at(x, y, z).is_fluid()))
     })
+}
+
+/// Common terrestrial mobs use vanilla's 0.4-block fluid jump threshold.
+/// Keep the probe below the midpoint of smaller bodies so they can breathe.
+fn fluid_reaches_swim_threshold<S: BlockSampler>(body: EntityBody, sampler: &S) -> bool {
+    let probe_y = (body.position.y + 0.4_f64.min(body.aabb.height * 0.5)).floor() as i32;
+    sampler
+        .material_at(
+            body.position.x.floor() as i32,
+            probe_y,
+            body.position.z.floor() as i32,
+        )
+        .is_fluid()
 }
 
 fn try_start_jump(

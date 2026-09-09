@@ -8,8 +8,7 @@ use mc_data::{Identifier, ItemStack};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const LOADER_PROTOCOL_VERSION: u16 = 1;
-pub const MAX_LOADER_SCREEN_ID_BYTES: usize = 128;
+pub const LOADER_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_LOADER_INTERACTION_ID_BYTES: usize = 128;
 pub const MAX_LOADER_INTERACTION_PAYLOAD_BYTES: usize = 4 * 1024;
 pub const MAX_LOADER_MANIFEST_BYTES: usize = 32_767;
@@ -33,9 +32,10 @@ pub enum LoaderPlatform {
 pub enum LoaderContentKind {
     Blocks,
     Items,
-    Screens,
+    Ui,
     Assets,
     Interactions,
+    Sounds,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -43,9 +43,10 @@ pub enum LoaderContentKind {
 pub enum LoaderPermission {
     RegisterBlocks,
     RegisterItems,
-    OpenScreens,
+    PresentUi,
     LoadAssets,
     SendInteractions,
+    PlaySounds,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,8 +114,9 @@ impl LoaderManifest {
                         .map(|content| match content {
                             mc_script::LuaClientContentKind::Blocks => LoaderContentKind::Blocks,
                             mc_script::LuaClientContentKind::Items => LoaderContentKind::Items,
-                            mc_script::LuaClientContentKind::Screens => LoaderContentKind::Screens,
+                            mc_script::LuaClientContentKind::Ui => LoaderContentKind::Ui,
                             mc_script::LuaClientContentKind::Assets => LoaderContentKind::Assets,
+                            mc_script::LuaClientContentKind::Sounds => LoaderContentKind::Sounds,
                             mc_script::LuaClientContentKind::Interactions => {
                                 LoaderContentKind::Interactions
                             }
@@ -131,14 +133,17 @@ impl LoaderManifest {
                             mc_script::LuaClientPermission::RegisterItems => {
                                 LoaderPermission::RegisterItems
                             }
-                            mc_script::LuaClientPermission::OpenScreens => {
-                                LoaderPermission::OpenScreens
+                            mc_script::LuaClientPermission::PresentUi => {
+                                LoaderPermission::PresentUi
                             }
                             mc_script::LuaClientPermission::LoadAssets => {
                                 LoaderPermission::LoadAssets
                             }
                             mc_script::LuaClientPermission::SendInteractions => {
                                 LoaderPermission::SendInteractions
+                            }
+                            mc_script::LuaClientPermission::PlaySounds => {
+                                LoaderPermission::PlaySounds
                             }
                             _ => unreachable!("validated client permission"),
                         })
@@ -606,11 +611,13 @@ impl LoaderSession {
 #[serde(deny_unknown_fields)]
 struct LoaderArtifactIndex {
     schema: u16,
-    screens: Vec<serde_json::Value>,
+    ui: Vec<serde_json::Value>,
     blocks: Vec<LoaderArtifactBlock>,
     items: Vec<serde_json::Value>,
     assets: Vec<serde_json::Value>,
     interactions: Vec<serde_json::Value>,
+    #[serde(default)]
+    sounds: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -701,13 +708,14 @@ fn read_block_from_artifact_bytes(
         .map_err(|error| LoaderHandshakeError::ArtifactIndex(error.to_string()))?;
     let LoaderArtifactIndex {
         schema,
-        screens,
+        ui,
         blocks,
         items,
         assets,
         interactions,
+        sounds,
     } = index;
-    let _ = (screens, items, assets, interactions);
+    let _ = (ui, items, assets, interactions, sounds);
     if schema != 1 {
         return Err(LoaderHandshakeError::ArtifactIndex(format!(
             "unsupported Loader artifact index schema {schema}"
@@ -765,12 +773,13 @@ pub struct LoaderArtifactRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoaderInteractionAction {
     pub(crate) interaction_id: String,
+    pub(crate) phase: mc_script::ScriptLoaderInteractionPhase,
     pub(crate) payload: String,
 }
 
 impl LoaderInteractionAction {
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, LoaderHandshakeError> {
-        if payload.len() < 6 {
+        if payload.len() < 7 {
             return Err(LoaderHandshakeError::Malformed(
                 "interaction payload is truncated".to_owned(),
             ));
@@ -782,13 +791,23 @@ impl LoaderInteractionAction {
                 actual: protocol,
             });
         }
-        let id_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+        let phase = match payload[2] {
+            0 => mc_script::ScriptLoaderInteractionPhase::Trigger,
+            1 => mc_script::ScriptLoaderInteractionPhase::Press,
+            2 => mc_script::ScriptLoaderInteractionPhase::Release,
+            _ => {
+                return Err(LoaderHandshakeError::Malformed(
+                    "invalid interaction phase".to_owned(),
+                ));
+            }
+        };
+        let id_len = usize::from(u16::from_be_bytes([payload[3], payload[4]]));
         if id_len == 0 || id_len > MAX_LOADER_INTERACTION_ID_BYTES {
             return Err(LoaderHandshakeError::Malformed(
                 "interaction id length is outside its limit".to_owned(),
             ));
         }
-        let id_end = 4_usize.checked_add(id_len).ok_or_else(|| {
+        let id_end = 5_usize.checked_add(id_len).ok_or_else(|| {
             LoaderHandshakeError::Malformed("interaction id length overflow".to_owned())
         })?;
         let payload_len_end = id_end.checked_add(2).ok_or_else(|| {
@@ -807,7 +826,7 @@ impl LoaderInteractionAction {
                 "interaction body length does not match its payload".to_owned(),
             ));
         }
-        let interaction_id = std::str::from_utf8(&payload[4..id_end])
+        let interaction_id = std::str::from_utf8(&payload[5..id_end])
             .map_err(|_| LoaderHandshakeError::Malformed("interaction id is not UTF-8".to_owned()))?
             .to_owned();
         let body = std::str::from_utf8(&payload[payload_len_end..])
@@ -817,6 +836,7 @@ impl LoaderInteractionAction {
             .to_owned();
         Ok(Self {
             interaction_id,
+            phase,
             payload: body,
         })
     }
@@ -905,11 +925,10 @@ pub fn loader_manifest_channel() -> &'static Identifier {
     })
 }
 
-pub fn loader_open_screen_channel() -> &'static Identifier {
+pub fn loader_ui_channel() -> &'static Identifier {
     static CHANNEL: OnceLock<Identifier> = OnceLock::new();
     CHANNEL.get_or_init(|| {
-        Identifier::parse("solaris:loader/open_screen")
-            .expect("static Solaris Loader screen channel is valid")
+        Identifier::parse("solaris:loader/ui").expect("static Solaris Loader UI channel is valid")
     })
 }
 
@@ -921,16 +940,33 @@ pub fn loader_interaction_channel() -> &'static Identifier {
     })
 }
 
-pub(crate) fn encode_loader_open_screen(screen_id: &str) -> Option<Vec<u8>> {
-    let len = u16::try_from(screen_id.len()).ok()?;
-    if screen_id.is_empty() || screen_id.len() > MAX_LOADER_SCREEN_ID_BYTES {
-        return None;
+pub(crate) fn encode_loader_ui(presentation: &mc_script::ScriptClientUiPresentation) -> Vec<u8> {
+    let mode = match presentation.mode() {
+        mc_script::ScriptClientUiMode::Screen => 0,
+        mc_script::ScriptClientUiMode::Hud => 1,
+        mc_script::ScriptClientUiMode::Hidden => 2,
+        _ => unreachable!("validated client UI mode"),
+    };
+    let ui_id = presentation.ui_id();
+    let title = presentation.title();
+    let body = presentation.body();
+    let mut payload =
+        Vec::with_capacity(9 + ui_id.len() + title.map_or(0, str::len) + body.map_or(0, str::len));
+    payload.put_u16(LOADER_PROTOCOL_VERSION);
+    payload.put_u8(mode);
+    // The checked DTO bounds every string well below u16::MAX.
+    payload.put_u16(ui_id.len() as u16);
+    payload.extend_from_slice(ui_id.as_bytes());
+    for text in [title, body] {
+        match text {
+            Some(text) => {
+                payload.put_u16(text.len() as u16);
+                payload.extend_from_slice(text.as_bytes());
+            }
+            None => payload.put_u16(u16::MAX),
+        }
     }
-    let mut payload = Vec::with_capacity(4 + screen_id.len());
-    payload.extend_from_slice(&LOADER_PROTOCOL_VERSION.to_be_bytes());
-    payload.extend_from_slice(&len.to_be_bytes());
-    payload.extend_from_slice(screen_id.as_bytes());
-    Some(payload)
+    payload
 }
 
 #[must_use]
@@ -980,14 +1016,14 @@ mod tests {
                 content: vec![
                     LoaderContentKind::Blocks,
                     LoaderContentKind::Items,
-                    LoaderContentKind::Screens,
+                    LoaderContentKind::Ui,
                     LoaderContentKind::Assets,
                     LoaderContentKind::Interactions,
                 ],
                 permissions: vec![
                     LoaderPermission::RegisterBlocks,
                     LoaderPermission::RegisterItems,
-                    LoaderPermission::OpenScreens,
+                    LoaderPermission::PresentUi,
                     LoaderPermission::LoadAssets,
                     LoaderPermission::SendInteractions,
                 ],
@@ -1239,7 +1275,7 @@ mod tests {
             .unwrap();
         archive
             .write_all(
-                br#"{"schema":1,"screens":[],"blocks":[{"id":"example:ruby_block","model":"example:block/ruby_block","name":"Ruby Block"}],"items":[],"assets":[],"interactions":[]}"#,
+                br#"{"schema":1,"ui":[],"blocks":[{"id":"example:ruby_block","model":"example:block/ruby_block","name":"Ruby Block"}],"items":[],"assets":[],"interactions":[]}"#,
             )
             .unwrap();
         archive.finish().unwrap();
@@ -1314,6 +1350,7 @@ mod tests {
         let body = b"accepted";
         let mut payload = Vec::new();
         payload.extend_from_slice(&LOADER_PROTOCOL_VERSION.to_be_bytes());
+        payload.push(0);
         payload.extend_from_slice(&(id.len() as u16).to_be_bytes());
         payload.extend_from_slice(id);
         payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -1323,6 +1360,7 @@ mod tests {
             LoaderInteractionAction::decode(&payload).unwrap(),
             LoaderInteractionAction {
                 interaction_id: "example:continue".to_owned(),
+                phase: mc_script::ScriptLoaderInteractionPhase::Trigger,
                 payload: "accepted".to_owned(),
             }
         );
@@ -1332,6 +1370,7 @@ mod tests {
             LoaderInteractionAction::decode(&[
                 0,
                 LOADER_PROTOCOL_VERSION as u8,
+                0,
                 0,
                 1,
                 b'x',

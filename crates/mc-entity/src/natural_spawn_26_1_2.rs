@@ -4,18 +4,22 @@ use mc_data::entity_types::{
     EntityTypeFacts, EntityTypeRegistry, PhysicalSimulationClass,
     entity_type_contract_26_1_2_by_name,
 };
-use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobMovementPolicy};
+use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobCombatPolicy, MobMovementPolicy};
 use mc_physics::Aabb;
 
-use crate::{AnimalBreedingState, AttributeKind, GoalState, SheepColor, SpawnEntity, Vec3};
+use crate::{
+    AnimalBreedingState, AttributeKind, EntityLifecycle, EntityView, GoalState, SheepColor,
+    SpawnEntity, Vec3,
+};
 
+mod periodic;
 mod planning;
 mod scheduler;
 
+pub use periodic::{MAX_NATURAL_TEMPLATES_PER_CHUNK, plan_periodic_category};
 pub use planning::{
-    ChunkHerdPlanningContext, MAX_NATURAL_TEMPLATES_PER_CHUNK, NaturalSpawnCapacities,
-    build_herd_spawn_candidates, chunk_biome_at, herd_surface_y, plan_chunk_herd_templates,
-    plan_periodic_category, spawn_far_enough_from_players,
+    ChunkHerdPlanningContext, build_herd_spawn_candidates, chunk_biome_at, herd_surface_y,
+    plan_chunk_herd_templates, spawn_far_enough_from_players,
 };
 pub use scheduler::{
     NaturalSpawnCategory, NaturalSpawnCategoryReport, NaturalSpawnReport, NaturalSpawnScheduler,
@@ -58,11 +62,6 @@ pub fn herd_uuid(chunk: (i32, i32), slot: u8) -> uuid::Uuid {
     let hi = herd_hash(chunk, slot, 0x434F_575F_4845_5244);
     let lo = herd_hash(chunk, slot, 0x5041_5353_4956_4500);
     uuid::Uuid::from_u128(((hi as u128) << 64) | lo as u128)
-}
-
-#[must_use]
-pub fn passive_chunk_spawns(chunk: (i32, i32)) -> bool {
-    chunk == (0, 0) || herd_hash(chunk, 0, 0x4845_5244).is_multiple_of(9)
 }
 
 #[must_use]
@@ -179,6 +178,41 @@ pub fn entity_aabb(type_name: &str) -> Aabb {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityGeometry {
+    pub aabb: Aabb,
+    pub eye_height: f64,
+}
+
+#[must_use]
+pub fn entity_geometry(type_name: &str, animal: Option<AnimalBreedingState>) -> EntityGeometry {
+    if animal.is_some_and(AnimalBreedingState::is_baby) {
+        let baby = match type_name {
+            "minecraft:chicken" => Some((0.15, 0.4, 0.28)),
+            "minecraft:cow" => Some((0.225, 0.7, 0.665)),
+            "minecraft:pig" => Some((0.225, 0.45, 0.3825)),
+            "minecraft:sheep" => Some((0.225, 0.65, 0.6175)),
+            _ => None,
+        };
+        if let Some((half_width, height, eye_height)) = baby {
+            return EntityGeometry {
+                aabb: Aabb { half_width, height },
+                eye_height,
+            };
+        }
+    }
+    let dimensions = entity_type_facts(type_name)
+        .expect("entity geometry requires a canonical 26.1.2 entity type")
+        .dimensions;
+    EntityGeometry {
+        aabb: Aabb {
+            half_width: dimensions.half_width(),
+            height: dimensions.height,
+        },
+        eye_height: dimensions.eye_height.unwrap_or(dimensions.height * 0.85),
+    }
+}
+
 #[must_use]
 pub fn entity_type_uses_aquatic_physics(type_name: &str) -> bool {
     entity_type_contract_26_1_2_by_name(type_name).is_some_and(|contract| {
@@ -190,11 +224,117 @@ pub fn entity_type_uses_aquatic_physics(type_name: &str) -> bool {
 }
 
 #[must_use]
+pub fn entity_type_walks_on_powder_snow(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "minecraft:rabbit" | "minecraft:endermite" | "minecraft:silverfish" | "minecraft:fox"
+    )
+}
+
+#[must_use]
 pub fn is_hostile_entity(type_name: &str) -> bool {
     let Some(facts) = entity_type_facts(type_name) else {
         return false;
     };
     facts.category.is_hostile()
+}
+
+#[must_use]
+pub fn hostile_goal_for_entity(
+    entity: &EntityView<'_>,
+    players: &[Vec3],
+    behaviors: &MobBehaviorTable,
+) -> Option<GoalState> {
+    const MELEE_RANGE: f64 = 1.8;
+    const MELEE_VERTICAL_REACH: f64 = 2.25;
+    const CREEPER_TRIGGER_RANGE: f64 = 3.0;
+    const BLAZE_CLOSE_MELEE_RANGE_SQ: f64 = 4.0;
+
+    if entity.lifecycle != EntityLifecycle::Alive || !is_hostile_entity(entity.type_name) {
+        return None;
+    }
+    let profile = behaviors.get_by_name(entity.type_name)?;
+    let follow_range = entity
+        .attributes
+        .base(&AttributeKind::FollowRange)
+        .unwrap_or(16.0);
+    let target = players
+        .iter()
+        .copied()
+        .filter(|position| {
+            distance_squared(*position, entity.position) <= follow_range * follow_range
+        })
+        .min_by(|left, right| {
+            distance_squared(*left, entity.position)
+                .total_cmp(&distance_squared(*right, entity.position))
+        });
+    let uses_ranged_attack = matches!(
+        profile.combat,
+        MobCombatPolicy::Arrow
+            | MobCombatPolicy::Crossbow
+            | MobCombatPolicy::GuardianBeam
+            | MobCombatPolicy::SmallFireball
+            | MobCombatPolicy::SonicBoom
+            | MobCombatPolicy::ShulkerBullet
+            | MobCombatPolicy::EvokerFangs
+            | MobCombatPolicy::LargeFireball
+            | MobCombatPolicy::WindCharge
+            | MobCombatPolicy::ThrownPotion
+            | MobCombatPolicy::WitherSkull
+            | MobCombatPolicy::DragonBoss
+            | MobCombatPolicy::UnsupportedSpecial
+    );
+    let fuse_active = entity.retained.primed_tnt.is_some();
+    let goal = if entity.retained.guardian_beam.is_some()
+        || profile.combat == MobCombatPolicy::DragonBoss
+    {
+        GoalState::Idle
+    } else {
+        match target {
+            None if profile.combat == MobCombatPolicy::CreeperFuse && fuse_active => {
+                GoalState::Idle
+            }
+            None => GoalState::Wander {
+                speed: profile.wander_speed,
+                period_ticks: profile.wander_period_ticks,
+            },
+            Some(target)
+                if profile.combat == MobCombatPolicy::CreeperFuse
+                    && (fuse_active
+                        || distance_squared(target, entity.position)
+                            < CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE) =>
+            {
+                GoalState::Idle
+            }
+            Some(target)
+                if profile.combat == MobCombatPolicy::SmallFireball
+                    && distance_squared(target, entity.position) >= BLAZE_CLOSE_MELEE_RANGE_SQ =>
+            {
+                GoalState::Idle
+            }
+            Some(target)
+                if !uses_ranged_attack
+                    && (target.y - entity.position.y).abs() <= MELEE_VERTICAL_REACH
+                    && (target.x - entity.position.x).powi(2)
+                        + (target.z - entity.position.z).powi(2)
+                        <= MELEE_RANGE * MELEE_RANGE =>
+            {
+                GoalState::FollowPosition { target, speed: 0.0 }
+            }
+            Some(target) => GoalState::FollowPosition {
+                target,
+                speed: profile.pursuit_speed,
+            },
+        }
+    };
+    Some(goal)
+}
+
+fn distance_squared(left: Vec3, right: Vec3) -> f64 {
+    let dx = left.x - right.x;
+    let dy = left.y - right.y;
+    let dz = left.z - right.z;
+    dx * dx + dy * dy + dz * dz
 }
 
 pub fn apply_entity_facts(entity: &mut SpawnEntity) {

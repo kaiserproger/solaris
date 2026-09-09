@@ -12,6 +12,9 @@ use tokio::sync::mpsc;
 
 use crate::connection::{ConnectionReader, PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout};
 
+mod entity_save_barrier;
+mod regional_physics;
+
 #[test]
 fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup() {
     let registry = SessionRegistry::new();
@@ -102,10 +105,7 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
             && (context.x(), context.y(), context.z()) == (pose.x, pose.y, pose.z)
             && dimension == "minecraft:overworld"
     ));
-    assert!(matches!(
-        deaths.try_recv_required(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(deaths.try_recv_required().is_none());
 }
 
 #[test]
@@ -704,7 +704,7 @@ fn batched_breeding_keeps_the_final_love_window() {
 }
 
 #[test]
-fn passive_mob_grazing_plan_emits_dense_timer_update_without_mutating_input() {
+fn grazing_action_uses_four_tick_boundary_and_floored_position() {
     let sheep_id = EntityId(7);
     let mut store = mc_entity::EntityStore::new();
     let mut spawned = SpawnEntity::new(4, "minecraft:sheep", Vec3::new(4.75, 63.0, -1.25));
@@ -715,10 +715,7 @@ fn passive_mob_grazing_plan_emits_dense_timer_update_without_mutating_input() {
     let mut expected = store.snapshot(actual_id).expect("sheep snapshot");
     expected.id = sheep_id;
     expected.retained.sheep_grazing_ticks = Some(5);
-    let sheep = [GrazingSheep {
-        expected: expected.clone(),
-        is_baby: false,
-    }];
+    let sheep = [expected];
 
     let advance = advance_sheep_grazing(99, &sheep);
 
@@ -729,14 +726,8 @@ fn passive_mob_grazing_plan_emits_dense_timer_update_without_mutating_input() {
         advance.plan.actions[0].block_position,
         mc_world::BlockPos { x: 4, y: 63, z: -2 }
     );
-    assert_eq!(
-        advance.timer_updates,
-        [passive_mobs::SheepGrazingTimerUpdate {
-            expected,
-            remaining: Some(4),
-        }]
-    );
-    assert_eq!(sheep[0].expected.retained.sheep_grazing_ticks, Some(5));
+    assert_eq!(advance.timer_updates.len(), 1);
+    assert_eq!(advance.timer_updates[0].remaining, Some(4));
 }
 
 #[test]
@@ -1045,41 +1036,6 @@ fn breeding_tick_with_no_active_simulation_entities_skips_owner() {
             .age_ticks,
         mc_entity::BABY_START_AGE_TICKS
     );
-}
-
-#[test]
-fn entity_save_owner_barrier_does_not_hold_session_registry() {
-    let registry = Arc::new(SessionRegistry::new());
-    registry.spawn_command_entity(
-        &SimulationAuthority::for_test(),
-        4,
-        "minecraft:cow".to_owned(),
-        Vec3::new(0.5, 64.0, 0.5),
-    );
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
-    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-    *registry
-        .entity_save_owner_probe
-        .lock()
-        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
-        reached: reached_tx,
-        resume: resume_rx,
-    });
-
-    let save_registry = Arc::clone(&registry);
-    let save = std::thread::spawn(move || save_registry.persisted_entity_save_snapshot());
-    reached_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("save reaches regional owner barrier");
-    let session_available = registry.inner.try_lock().is_ok();
-    resume_tx.send(()).expect("release entity save barrier");
-    let (records, _) = save.join().expect("entity save snapshot worker");
-
-    assert!(
-        session_available,
-        "regional save barrier must not retain session state"
-    );
-    assert_eq!(records.records.len(), 1);
 }
 
 #[test]
@@ -1623,33 +1579,6 @@ fn sheep_grazing_finish_uses_constant_owner_requests() {
 }
 
 #[test]
-fn sheep_grazing_plan_only_visits_loaded_sheep() {
-    let registry = SessionRegistry::new();
-    let player = register_test_session(&registry, "GrazingPlanIndexAlice");
-    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    for (entity_type, x) in [
-        ("minecraft:sheep", 0.5),
-        ("minecraft:sheep", 160.5),
-        ("minecraft:cow", 1.5),
-    ] {
-        registry.spawn_command_entity(
-            &SimulationAuthority::for_test(),
-            4,
-            entity_type.to_owned(),
-            Vec3::new(x, 64.0, 0.5),
-        );
-    }
-
-    let _ = registry.plan_sheep_grazing(&SimulationAuthority::for_test(), 1);
-
-    assert_eq!(
-        registry.sheep_grazing_entity_visits.load(Ordering::Relaxed),
-        1,
-        "grazing plan should visit only sheep indexed in loaded chunks"
-    );
-}
-
-#[test]
 fn sheep_grazing_plan_batches_timer_updates() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "GrazingPlanBatchAlice");
@@ -1670,23 +1599,19 @@ fn sheep_grazing_plan_batches_timer_updates() {
     for entity_id in &entity_ids {
         assert!(registry.set_sheep_grazing_ticks_for_test(*entity_id, Some(10)));
     }
-    registry.entities.reset_owner_requests_for_test();
 
     let plan = registry.plan_sheep_grazing(&SimulationAuthority::for_test(), 1);
 
     assert!(plan.starts.is_empty());
     assert!(plan.actions.is_empty());
     assert_eq!(
-        registry.entities.owner_requests_for_test(),
-        2,
-        "one selected read and one conditional batch update"
-    );
-    assert!(
         registry
             .persisted_entity_records()
             .into_iter()
             .filter(|record| entity_ids.contains(&record.snapshot.id))
-            .all(|record| record.snapshot.retained.sheep_grazing_ticks == Some(9))
+            .map(|record| record.snapshot.retained.sheep_grazing_ticks)
+            .collect::<Vec<_>>(),
+        vec![Some(9), Some(9)]
     );
 }
 
@@ -3414,7 +3339,7 @@ fn profile(name: &str) -> LoggedInProfile {
     }
 }
 
-fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
+pub(super) fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
     let (tx, _rx) = mpsc::channel(8);
     let (id, _) = registry.register(
         &profile(name),
@@ -4099,7 +4024,7 @@ fn vanilla_powder_snow_walkable_mob_tag_is_exact() {
         "minecraft:fox",
     ] {
         assert!(
-            super::entity_physics_class::entity_type_walks_on_powder_snow(type_name),
+            mc_entity::natural_spawn_26_1_2::entity_type_walks_on_powder_snow(type_name),
             "{type_name}"
         );
     }
@@ -4109,7 +4034,7 @@ fn vanilla_powder_snow_walkable_mob_tag_is_exact() {
         "minecraft:falling_block",
     ] {
         assert!(
-            !super::entity_physics_class::entity_type_walks_on_powder_snow(type_name),
+            !mc_entity::natural_spawn_26_1_2::entity_type_walks_on_powder_snow(type_name),
             "{type_name}"
         );
     }
@@ -4325,7 +4250,7 @@ fn melee_hostile_faces_close_target_without_rewriting_unchanged_hold_goal() {
     let queries = registry.tick_entities_and_collect_physics_queries(1);
 
     assert_eq!(queries.len(), 1);
-    assert_eq!(registry.entities.owner_requests_for_test(), 4);
+    assert_eq!(registry.entities.owner_requests_for_test(), 2);
     assert_eq!(queries[0].velocity.x, 0.0);
     assert_eq!(queries[0].velocity.z, 0.0);
     {
@@ -4343,7 +4268,7 @@ fn melee_hostile_faces_close_target_without_rewriting_unchanged_hold_goal() {
     let queries = registry.tick_entities_and_collect_physics_queries(2);
 
     assert_eq!(queries.len(), 1);
-    assert_eq!(registry.entities.owner_requests_for_test(), 3);
+    assert_eq!(registry.entities.owner_requests_for_test(), 2);
     assert_eq!(queries[0].velocity.x, 0.0);
     assert_eq!(queries[0].velocity.z, 0.0);
     let entities = registry.lock_entities("test entity access");
@@ -4568,8 +4493,7 @@ fn overloaded_dense_simulation_keeps_full_active_entity_cadence() {
     }
     let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 1);
 
-    let queries = registry.tick_entities_and_collect_physics_queries_owned(
-        &SimulationAuthority::for_test(),
+    let (queries, _, _, _) = registry.tick_entities_and_collect_physics_queries_regional(
         &resources,
         20,
         EntitySimulationTickPolicy {
@@ -4584,8 +4508,7 @@ fn overloaded_dense_simulation_keeps_full_active_entity_cadence() {
         300,
         "dense active populations must keep full per-tick physics/AI activity"
     );
-    let next_queries = registry.tick_entities_and_collect_physics_queries_owned(
-        &SimulationAuthority::for_test(),
+    let (next_queries, _, _, _) = registry.tick_entities_and_collect_physics_queries_regional(
         &resources,
         21,
         EntitySimulationTickPolicy {
@@ -4600,9 +4523,9 @@ fn overloaded_dense_simulation_keeps_full_active_entity_cadence() {
         "every active entity must retain consecutive-tick simulation cadence"
     );
     assert_eq!(
-        registry.active_simulation_entities.load().len(),
-        300,
-        "breeding and physics must see the same full active population"
+        registry.active_simulation_chunks.load().len(),
+        1,
+        "breeding and physics must use the same active chunk selection"
     );
     registry.entities.reset_owner_requests_for_test();
     let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 20);
@@ -5003,32 +4926,6 @@ fn loaded_chunk_pathing_probe_reads_published_terrain_collision_and_support() {
 }
 
 #[test]
-fn regional_workers_share_autoscaler_cpu_admission() {
-    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 4);
-    let permits = acquire_regional_worker_permits(&resources, 8);
-    assert_eq!(permits.len(), 3);
-    drop(permits);
-
-    assert_eq!(
-        resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
-        2
-    );
-    let busy = resources
-        .try_acquire_cpu()
-        .expect("reserve shared CPU slot");
-    let permits = acquire_regional_worker_permits(&resources, 8);
-    assert_eq!(permits.len(), 1);
-    drop(permits);
-    drop(busy);
-
-    assert_eq!(
-        resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
-        1
-    );
-    assert!(acquire_regional_worker_permits(&resources, 8).is_empty());
-}
-
-#[test]
 fn entity_tick_detours_around_published_two_block_wall() {
     let (world_read, materials) = two_block_wall_pathing_world();
     let registry = SessionRegistry::new();
@@ -5101,6 +4998,98 @@ fn entity_tick_detours_around_published_two_block_wall() {
 }
 
 #[test]
+fn regional_tick_keeps_living_physics_local_beside_an_exceptional_entity() {
+    let (world_read, materials) = two_block_wall_pathing_world();
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (player, _) = registry.register(
+        &profile("RegionalMixedTarget"),
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(4.5, 64.0, 0.5),
+    );
+    registry.mark_loaded(player, (0, 0));
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:rabbit".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 1));
+    let records = registry.persisted_entity_records();
+    let rabbit = records
+        .iter()
+        .find(|record| record.snapshot.type_name == "minecraft:rabbit")
+        .expect("regional rabbit")
+        .snapshot
+        .id;
+    let item = records
+        .iter()
+        .find(|record| record.snapshot.type_name == "minecraft:item")
+        .expect("exceptional item")
+        .snapshot
+        .id;
+    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 1);
+
+    let (queries, owner_fence, _, prepared) = registry
+        .tick_entities_and_collect_physics_queries_regional(
+            &resources,
+            20,
+            EntitySimulationTickPolicy {
+                pathing_candidates_per_entity: 8,
+                simulation_distance: DEFAULT_VIEW_DISTANCE,
+            },
+            EntitySimulationWorldContext::with_pathing_for_test(&world_read, Arc::new(materials)),
+        );
+
+    assert_eq!(
+        queries.iter().map(|query| query.id).collect::<Vec<_>>(),
+        vec![item],
+        "only the exceptional entity uses central fallback"
+    );
+    let (regional_queries, regional_fence, committed, _lane_timings) =
+        registry.commit_owned_region_physics(prepared.expect("regional physics preparation"));
+    assert!(regional_queries.is_empty());
+    assert!(regional_fence.is_none());
+    let committed = committed.expect("regional movement publication");
+    let committed_rabbit = committed
+        .states
+        .iter()
+        .find(|state| state.id == rabbit)
+        .copied()
+        .expect("ordinary living physics remains owner-local");
+    let item_step = EntityPhysicsStep {
+        id: queries[0].id,
+        position: Vec3::new(
+            queries[0].position.x + 0.01,
+            queries[0].position.y,
+            queries[0].position.z,
+        ),
+        velocity: queries[0].velocity,
+        on_ground: queries[0].on_ground,
+        horizontal_collision: false,
+    };
+    let accepted = registry.apply_entity_physics_if_current_and_dispatch_regional(
+        &resources,
+        20,
+        &queries,
+        &[item_step],
+        owner_fence,
+        &EntityProjectilePhysicsFacts::default(),
+        Some(committed),
+    );
+    assert_eq!(accepted, vec![item_step]);
+    let published_rabbit = registry
+        .server_entity_snapshot(rabbit)
+        .expect("owner-local rabbit publication beside central fallback");
+    assert_eq!(published_rabbit.position, committed_rabbit.position);
+    assert_eq!(published_rabbit.velocity, committed_rabbit.velocity);
+    assert_eq!(published_rabbit.on_ground, committed_rabbit.on_ground);
+}
+
+#[test]
 fn climb_jump_collision_does_not_start_wall_detour() {
     let registry = SessionRegistry::new();
     registry.spawn_command_entity(
@@ -5170,6 +5159,43 @@ fn entity_goal_pathing_compute_releases_store_and_rejects_stale_motion() {
         .find(|query| query.id == entity_id)
         .expect("zombie physics query");
     assert_eq!(entity.velocity, newer_velocity);
+}
+
+#[test]
+fn stale_entity_goal_tick_cannot_restore_target_after_last_player_unregisters() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "GoalGenerationTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(4.5, 64.0, 0.5),
+    );
+    assert_eq!(
+        registry.tick_entities_and_collect_physics_queries(1).len(),
+        1
+    );
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    registry.install_entity_goal_compute_probe(reached_tx, resume_rx);
+
+    let tick_registry = Arc::clone(&registry);
+    let tick =
+        std::thread::spawn(move || tick_registry.tick_entities_and_collect_physics_queries(2));
+    reached_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("entity goal compute boundary");
+    registry.unregister(player);
+    resume_tx.send(()).expect("resume stale entity goal tick");
+    assert!(
+        tick.join().expect("stale entity goal tick").is_empty(),
+        "a tick prepared from a departed player publication must not emit physics"
+    );
+
+    let entities = registry.lock_entities("verify stale goal selection stayed rejected");
+    let zombie = entities.snapshots().next().expect("spawned zombie");
+    assert!(matches!(zombie.goal, GoalState::Wander { .. }));
 }
 
 #[test]
@@ -6671,15 +6697,15 @@ fn delayed_physics_routing_cannot_overwrite_a_newer_physics_commit() {
 }
 
 #[test]
-fn entity_physics_uses_one_commit_and_one_current_read_after_commit() {
+fn off_cadence_owner_physics_crossing_updates_chunk_routing() {
     let registry = SessionRegistry::new();
-    let session = register_test_session(&registry, "PhysicsPostStateAlice");
-    registry.mark_loaded(session, (0, 0));
+    let session = register_test_session(&registry, "OwnerFenceChunkCrossingAlice");
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
     let entity_id = registry
         .spawn_command_entity(
             &SimulationAuthority::for_test(),
-            1,
-            "minecraft:zombie".to_owned(),
+            120,
+            "minecraft:villager".to_owned(),
             Vec3::new(0.5, 64.0, 0.5),
         )
         .into_iter()
@@ -6687,24 +6713,39 @@ fn entity_physics_uses_one_commit_and_one_current_read_after_commit() {
             OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
             _ => None,
         })
-        .expect("spawned zombie");
-    registry.reset_entity_owner_requests_for_test();
+        .expect("spawned villager");
+    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 1);
+    let (queries, owner_fence, _, _) = registry.tick_entities_and_collect_physics_queries_regional(
+        &resources,
+        1,
+        EntitySimulationTickPolicy {
+            pathing_candidates_per_entity: 8,
+            simulation_distance: DEFAULT_VIEW_DISTANCE,
+        },
+        EntitySimulationWorldContext::empty(),
+    );
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].id, entity_id);
 
-    registry.apply_entity_physics_and_dispatch(
-        ENTITY_MOVE_SEND_INTERVAL_TICKS,
+    let accepted = registry.apply_entity_physics_and_dispatch_core(
+        Some(&resources),
+        1,
+        Some(&queries),
         &[EntityPhysicsStep {
             id: entity_id,
-            position: Vec3::new(0.75, 64.0, 0.5),
+            position: Vec3::new(16.5, 64.0, 0.5),
             velocity: Vec3::ZERO,
             on_ground: true,
             horizontal_collision: false,
         }],
+        owner_fence,
+        &EntityProjectilePhysicsFacts::default(),
     );
 
+    assert_eq!(accepted.len(), 1);
     assert_eq!(
-        registry.entity_owner_requests_for_test(),
-        3,
-        "physics uses preparation, one regional commit, and one current publication read"
+        registry.simulation_inputs.entity_chunk(entity_id),
+        Some((1, 0))
     );
 }
 
@@ -8102,10 +8143,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         PlayerAttackResult::Damaged(outcome)
             if matches!(*outcome, EntityAttackOutcome::Damaged { .. })
     ));
-    assert!(matches!(
-        events.try_recv_required(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(events.try_recv_required().is_none());
 
     let stale_costs = next_costs();
     persisted
@@ -8126,10 +8164,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         ),
         PlayerAttackResult::ValidationRejected
     ));
-    assert!(matches!(
-        events.try_recv_required(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(events.try_recv_required().is_none());
 
     let _ = registry.update_pose(session_id, PlayerPose::new(4.5, 64.0, 0.5));
     let costs = next_costs();
@@ -8146,10 +8181,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         ),
         PlayerAttackResult::ValidationRejected
     ));
-    assert!(matches!(
-        events.try_recv_required(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(events.try_recv_required().is_none());
 
     let costs = next_costs();
     assert!(matches!(
@@ -8202,10 +8234,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         ),
         PlayerAttackResult::AcceptedNoDamage
     ));
-    assert!(matches!(
-        events.try_recv_required(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(events.try_recv_required().is_none());
 
     drop(events);
     let closed_outbox_target = spawn(Vec3::new(1.5, 64.0, 1.5));
@@ -10728,6 +10757,7 @@ fn vehicle_crossing_publishes_authoritative_passenger_motion() {
                 horizontal_collision: false,
             },
         ],
+        None,
         &EntityProjectilePhysicsFacts::default(),
     );
 

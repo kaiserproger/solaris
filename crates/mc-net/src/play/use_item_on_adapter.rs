@@ -18,10 +18,7 @@ use crate::connection::write_packet;
 use crate::error::ConnectionError;
 
 #[cfg(test)]
-use super::block_edit_commit::{
-    apply_block_edit_batch_to_storage_conditionally,
-    apply_opaque_block_entity_to_storage_conditionally,
-};
+use super::block_edit_commit::apply_block_edit_batch_to_storage_conditionally;
 use super::block_edit_commit::{
     finalize_visible_block_edit_outcome, send_loaded_block_edit_resyncs,
 };
@@ -153,7 +150,7 @@ where
         direction = ?action.direction,
         hand = ?action.hand,
         held_slot,
-        selected_slot = state.selected_hotbar_slot,
+        selected_slot = state.selected_hotbar_slot(),
         held_item = held.item_id,
         held_count = held.count,
         "UseItemOn received"
@@ -656,7 +653,7 @@ where
             block_facts: Arc::clone(&state.block_facts),
             falling_block_entity_type_id: None,
             held: SurvivalBreakHeldItem {
-                hotbar_slot: state.selected_hotbar_slot,
+                hotbar_slot: state.selected_hotbar_slot(),
                 expected: held,
                 max_damage,
             },
@@ -1660,8 +1657,7 @@ async fn commit_sign_block_entity(
     #[cfg(test)]
     {
         let mut storage = state.world.lock().await;
-        match apply_opaque_block_entity_to_storage_conditionally(
-            &mut storage,
+        match storage.commit_opaque_block_entity_conditionally(
             position,
             expected_state,
             expected_token,

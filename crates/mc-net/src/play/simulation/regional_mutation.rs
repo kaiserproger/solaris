@@ -1,12 +1,16 @@
+use mc_world::{ResidentBlockEdit, ResidentBlockPrecondition};
+
+use super::super::block_edit_commit::{
+    resident_block_edit_result_outcome, resident_block_edits, resident_block_preconditions,
+};
 use super::{
-    Arc, BlockEdit, BlockEditBatchOutcome, BlockLightTable, BlockMutationToken, BlockPos,
-    BlockStateId, BucketUsePlan, BucketUseTransaction, CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
-    CampfireUsePlan, CampfireUseTransaction, ChestBlockEntity, ChestCommitOutcome,
-    ChestTransaction, ChestTransactionRequest, CommittedBucketUse, CommittedCampfireUse,
-    CommittedSurvivalBreak, CommittedSurvivalPlacement, ContainerDropPlan, ContainerPlayerPlan,
-    ContainerXpPlan, FurnaceBlockEntity, FurnaceCommitOutcome, FurnaceTransaction,
-    FurnaceTransactionRequest, HashMap, IncrementalLightSources, Ordering, ResidentBlockEdit,
-    ResidentBlockPrecondition, ScheduledBlockTick, SessionId, SessionRegistry,
+    Arc, BlockEdit, BlockEditBatchOutcome, BlockMutationToken, BlockPos, BlockStateId,
+    BucketUsePlan, BucketUseTransaction, CAMPFIRE_BLOCK_ENTITY_TYPE_ID, CampfireUsePlan,
+    CampfireUseTransaction, ChestBlockEntity, ChestCommitOutcome, ChestTransaction,
+    ChestTransactionRequest, CommittedBucketUse, CommittedCampfireUse, CommittedSurvivalBreak,
+    CommittedSurvivalPlacement, ContainerDropPlan, ContainerPlayerPlan, ContainerXpPlan,
+    FurnaceBlockEntity, FurnaceCommitOutcome, FurnaceTransaction, FurnaceTransactionRequest,
+    HashMap, IncrementalLightSources, Ordering, ScheduledBlockTick, SessionId, SessionRegistry,
     SharedContainerCommit, SimulationCommand, SimulationCommandAttribution,
     SimulationCommandEnvelope, SimulationLaneAttribution, SimulationOwner, SimulationRequestError,
     SimulationResponse, SimulationTickReport, SimulationWorldAccess, SurvivalBreakPlan,
@@ -16,7 +20,6 @@ use super::{
     dispatch_visibility_commands, elapsed_us, falling_block_start_chunks, is_campfire_block,
     is_falling_block_state, plan_falling_block_starts, prepare_survival_block_break_plan,
     publish_regional_light_updates, regional_light_updates, resident_block_edit_outcome,
-    resident_block_edit_result_outcome, resident_block_edits, resident_block_preconditions,
     schedule_resident_fluid_ticks_near_applied, snapshot_region, valid_survival_break_plan, warn,
 };
 use std::collections::BTreeMap;
@@ -211,7 +214,6 @@ impl SimulationOwner {
         &mut self,
         sessions: &SessionRegistry,
         access: SimulationWorldAccess<'_>,
-        block_light: Option<&BlockLightTable>,
         journal: Option<&crate::play::world_journal::WorldChunkJournal>,
         run: Vec<SimulationCommandEnvelope>,
     ) -> SimulationTickReport {
@@ -219,7 +221,7 @@ impl SimulationOwner {
         let mutation = access.mutation.expect("regional block-edit mutation view");
         let resources = access.cpu.expect("regional block-edit CPU admission");
         let block_light_owned = access.light;
-        let lane_count = resources.cpu_limit().max(1);
+        let lane_count = resources.cpu_capacity().max(1);
         let world_tick = sessions.simulation_tick();
         let journal_ids = if let Some(journal) = journal {
             let journal = journal.clone();
@@ -273,7 +275,7 @@ impl SimulationOwner {
                     scheduled_block_ticks,
                 } => RegionalMutationJob::BlockEdits {
                     actor_session: *actor_session,
-                    edits: resident_block_edits(edits, preconditions, block_light),
+                    edits: resident_block_edits(edits),
                     preconditions: resident_block_preconditions(preconditions),
                     scheduled_block_ticks: scheduled_block_ticks.clone(),
                 },

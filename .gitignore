@@ -12,10 +12,8 @@
 *.swp
 *.swo
 
-# Local oracle/scratch dir. Everything inside is local-only by default;
-# only Markdown files (engineering notes, observations) are tracked.
-/.analysis/*
-!/.analysis/*.md
+# Local oracle, benchmark and scratch output at any crate depth.
+.analysis/
 
 # Vanilla Mojang data files (per ADR 0001) are not redistributed via git.
 # They are repopulated locally from .analysis/server.jar by
@@ -28,9 +26,7 @@
 # Side-effect of running vanilla-server-derived helpers and client launchers.
 # Local-only runtime state must never enter source control.
 /logs/
-/client-mod/solaris-client-agent/*/logs/
-/client-mod/solaris-client-agent/*/.analysis/
-/client-mod/solaris-client-agent/*/run*/
+/world/
 
 # Local Claude / session-scratch dirs (per-session prompt drafts,
 # downloaded manifests, harness settings). Not part of the project.
@@ -43,6 +39,9 @@
 # Agent/runtime scratch and generated local launch state.
 /.ai-bridge/
 /.codex/
+/.agent-loom/
+/.pi/
+/.serena/
 /run/
 /run-mcp/
 /run-far-travel*/

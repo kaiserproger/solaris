@@ -1,5 +1,6 @@
 use mc_entity::{EntityId, EntityLifecycle, EntitySnapshot, SpawnEntity, Vec3};
 use mc_world::BlockStateId;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use crate::play::is_hostile_entity;
@@ -50,17 +51,23 @@ impl SessionRegistry {
     }
 
     pub(crate) fn tick_natural_mob_despawn(&self, current_tick: u64) -> NaturalMobDespawnOutcome {
-        let mut inner = self.lock_session_entities("despawn distant natural mobs");
-        let player_positions = inner
-            .sessions
-            .iter()
-            .filter(|(id, _)| {
-                !inner.dead_sessions.contains(id)
-                    && !inner.spectator_sessions.contains(id)
-                    && !inner.client_unloaded_sessions.contains(id)
-            })
-            .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
-            .collect::<Vec<_>>();
+        let inner = self.lock_session_entities("despawn distant natural mobs");
+        let refresh_player_positions = |inner: &SessionRegistryInner, positions: &mut Vec<Vec3>| {
+            positions.clear();
+            positions.extend(
+                inner
+                    .sessions
+                    .iter()
+                    .filter(|(id, _)| {
+                        !inner.dead_sessions.contains(id)
+                            && !inner.spectator_sessions.contains(id)
+                            && !inner.client_unloaded_sessions.contains(id)
+                    })
+                    .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z)),
+            );
+        };
+        let mut player_positions = Vec::new();
+        refresh_player_positions(&inner, &mut player_positions);
         if player_positions.is_empty() {
             return NaturalMobDespawnOutcome {
                 #[cfg(test)]
@@ -68,18 +75,14 @@ impl SessionRegistry {
                 dispatches: Vec::new(),
             };
         }
-        // The three natural category sets are mutually exclusive by
-        // construction: every insertion site (herd spawn commit and checkpoint
-        // restore) routes each entity id through an exclusive if/else chain,
-        // and removal clears all three sets. Direct iteration therefore needs
-        // no sort/dedup; a plain O(N) id buffer keeps the removals below safe
-        // instead of holding iterators into the category sets.
+        // Read every natural entity through the existing compact owner projection.
+        // Full retained snapshots are needed only for conditional removals.
         #[cfg(any(test, debug_assertions))]
         debug_assert!(
             natural_mob_category_sets_disjoint(&inner),
             "natural mob category sets must stay mutually exclusive"
         );
-        let mut candidates = Vec::with_capacity(
+        let mut candidates = HashSet::with_capacity(
             inner.natural_hostile_mobs.len()
                 + inner.natural_ground_mobs.len()
                 + inner.natural_aquatic_mobs.len(),
@@ -87,39 +90,59 @@ impl SessionRegistry {
         candidates.extend(inner.natural_hostile_mobs.iter().copied());
         candidates.extend(inner.natural_ground_mobs.iter().copied());
         candidates.extend(inner.natural_aquatic_mobs.iter().copied());
-        // One batched versioned read per category set refreshes the entity
-        // owner snapshot cache, so every per-candidate snapshot() below is a
-        // local cache hit instead of a cross-lane round trip. EntityView is
-        // not reachable across the regional owner boundary (channel-based),
-        // so this batched cache is the lightest existing read here.
-        inner.entities.prefetch(&inner.natural_hostile_mobs);
-        inner.entities.prefetch(&inner.natural_ground_mobs);
-        inner.entities.prefetch(&inner.natural_aquatic_mobs);
+        let SessionEntityGuards {
+            inner: session,
+            entities,
+            entity_lifecycle_tick,
+        } = inner;
+        drop(session);
+        #[cfg(test)]
+        super::natural_mob_despawn_tests::before_projection();
+        let snapshots = entities.despawn_projections_for_ids(&candidates);
+        let mut inner = SessionEntityGuards {
+            inner: self.lock_inner("apply natural mob despawn"),
+            entities,
+            entity_lifecycle_tick,
+        };
+        refresh_player_positions(&inner, &mut player_positions);
+        if player_positions.is_empty() {
+            return NaturalMobDespawnOutcome {
+                #[cfg(test)]
+                removed: 0,
+                dispatches: Vec::new(),
+            };
+        }
+        #[cfg(test)]
+        super::natural_mob_despawn_tests::after_projection(&mut inner);
         let mut dispatches = Vec::new();
         #[cfg(test)]
         let mut removed = 0usize;
-        for entity_id in candidates {
-            let Some(snapshot) = inner.entities.snapshot(entity_id) else {
-                inner.natural_mob_no_action_since_tick.remove(&entity_id);
-                continue;
-            };
-            if snapshot.lifecycle != EntityLifecycle::Alive {
+        for projection in snapshots {
+            let entity_id = projection.id;
+            candidates.remove(&entity_id);
+            if !inner.natural_hostile_mobs.contains(&entity_id)
+                && !inner.natural_ground_mobs.contains(&entity_id)
+                && !inner.natural_aquatic_mobs.contains(&entity_id)
+            {
                 continue;
             }
-            let Some(contract) =
-                mc_data::entity_types::entity_type_contract_26_1_2_by_name(&snapshot.type_name)
-            else {
+            if projection.lifecycle != EntityLifecycle::Alive {
                 continue;
-            };
-            if !natural_mob_remove_when_far_away(&snapshot.type_name) {
+            }
+            if !natural_mob_remove_when_far_away(&projection.type_name) {
                 inner
                     .natural_mob_no_action_since_tick
                     .insert(entity_id, current_tick);
                 continue;
             }
+            let Some(contract) =
+                mc_data::entity_types::entity_type_contract_26_1_2_by_name(&projection.type_name)
+            else {
+                continue;
+            };
             let nearest_distance_sq = player_positions
                 .iter()
-                .map(|player| distance_sq(snapshot.position, *player))
+                .map(|player| distance_sq(projection.position, *player))
                 .min_by(f64::total_cmp)
                 .expect("non-empty player positions");
             let category = contract.mob_category();
@@ -132,7 +155,7 @@ impl SessionRegistry {
                 .natural_mob_no_action_since_tick
                 .entry(entity_id)
                 .or_insert(current_tick);
-            if let Some(last_damage_tick) = snapshot.retained.last_damage_tick
+            if let Some(last_damage_tick) = projection.last_damage_tick
                 && last_damage_tick > *no_action_since
             {
                 *no_action_since = last_damage_tick;
@@ -143,20 +166,39 @@ impl SessionRegistry {
             let no_action_time = current_tick.saturating_sub(*no_action_since);
             let should_soft_despawn = no_action_time > NATURAL_MOB_SOFT_DESPAWN_IDLE_TICKS
                 && nearest_distance_sq > no_despawn_distance_sq
-                && natural_mob_soft_despawn_roll(snapshot.uuid, current_tick);
+                && natural_mob_soft_despawn_roll(projection.uuid, current_tick);
             if !should_hard_despawn && !should_soft_despawn {
                 continue;
             }
-            let Some((_, mut entity_dispatches)) =
-                remove_server_entity_locked(&mut inner, entity_id)
+            let Some(expected) = inner.entities.snapshot(entity_id) else {
+                inner.natural_mob_no_action_since_tick.remove(&entity_id);
+                continue;
+            };
+            // The owner may have advanced since the projection read. Recheck
+            // despawn inputs before committing against the full current state.
+            if expected.uuid != projection.uuid
+                || expected.type_name != projection.type_name.as_ref()
+                || expected.position != projection.position
+                || expected.lifecycle != projection.lifecycle
+                || expected.retained.last_damage_tick != projection.last_damage_tick
+            {
+                continue;
+            }
+            let Some(removed_snapshot) =
+                remove_server_entity_state_if_current_locked(&mut inner, expected)
             else {
                 continue;
             };
+            let mut entity_dispatches =
+                despawn_entity_visibility_locked(&mut inner, &removed_snapshot);
             #[cfg(test)]
             {
                 removed += 1;
             }
             dispatches.append(&mut entity_dispatches);
+        }
+        for entity_id in candidates {
+            inner.natural_mob_no_action_since_tick.remove(&entity_id);
         }
         drop(inner);
         NaturalMobDespawnOutcome {
@@ -265,10 +307,8 @@ fn natural_mob_remove_when_far_away(type_name: &str) -> bool {
     )
 }
 
-/// Debug/test fence for the despawn scan: the three natural category sets are
-/// mutually exclusive by construction (insertion is an exclusive if/else chain
-/// per spawn/restore site; removal clears all three), which lets despawn
-/// iteration skip sort/dedup entirely.
+/// Debug/test fence for the natural population's mutually exclusive categories.
+/// Spawn/restore routes assign exactly one category; removal clears all three.
 #[cfg(any(test, debug_assertions))]
 pub(super) fn natural_mob_category_sets_disjoint(inner: &SessionRegistryInner) -> bool {
     inner
@@ -579,6 +619,14 @@ pub(super) fn remove_server_entity_state_locked(
     entity_id: EntityId,
 ) -> Option<ServerEntitySnapshot> {
     let expected = inner.entities.snapshot(entity_id)?;
+    remove_server_entity_state_if_current_locked(inner, expected)
+}
+
+fn remove_server_entity_state_if_current_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    expected: EntitySnapshot,
+) -> Option<ServerEntitySnapshot> {
+    let entity_id = expected.id;
     let snapshot = inner
         .entities
         .remove_if_current(expected)

@@ -34,7 +34,6 @@ async fn initial_play_sync_sends_recipe_update_once_before_recipe_book_packets()
         None,
         None,
         None,
-        None,
     )
     .await;
     assert!(matches!(result, Err(ConnectionError::Eof)));

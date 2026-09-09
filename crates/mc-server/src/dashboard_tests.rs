@@ -115,7 +115,6 @@ fn sample_stats() -> StatsPayload {
                 rejected_block_or_fluid: 51,
                 rejected_darkness: 60,
                 rejected_collision: 22,
-                rejected_cap: 140,
                 rejected_duplicate: 2,
             },
             hostile: SpawnCategoryReport {
@@ -129,7 +128,6 @@ fn sample_stats() -> StatsPayload {
                 rejected_block_or_fluid: 2_100,
                 rejected_darkness: 1_800,
                 rejected_collision: 900,
-                rejected_cap: 700,
                 rejected_duplicate: 5,
             },
         },
@@ -309,7 +307,6 @@ fn stats_payload_serializes_every_contract_field() {
             "chunks_sampled",
             "committed",
             "rejected_block_or_fluid",
-            "rejected_cap",
             "rejected_collision",
             "rejected_darkness",
             "rejected_duplicate",

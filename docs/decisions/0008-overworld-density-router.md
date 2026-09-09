@@ -1,7 +1,7 @@
 # ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, worldgen revision 10
+**Status:** Accepted, worldgen revision 18
 
 ## Context
 
@@ -12,6 +12,127 @@ height or decoration fix can remove. Tree placement also accepted any non-fluid
 block as support instead of the surface planned for that column.
 
 ## Decision
+
+Worldgen revision 18 selects ocean temperature variants and snowy beaches from
+the same temperature and transition-domain field as inland and riparian biomes.
+Deep oceans retain their depth thresholds and have no invented deep-warm variant;
+their warmest available vanilla variant is deep lukewarm ocean. The separate
+deep-ocean region-noise picker is removed. Both modes share coastal selection.
+Ocean thresholds are Solaris policy, not vanilla-captured values: -0.25 reuses
+the inland/riparian cold boundary and 0.12 reuses the inland warm boundary.
+The added -0.12 and 0.25 thresholds mirror those magnitudes to separate cold
+from neutral water and warm from lukewarm water without another climate field.
+All four use the existing 0.08 domain-adjusted transition margin. If a named
+variant is absent from supplied biome rules, selection retains the first entry
+of that same ocean/shore bucket; the generic default applies only to an empty
+bucket. These choices do not establish vanilla ocean-temperature parity.
+
+Within the existing two-block shoreline band, the already computed erosion field
+selects exposed rocky shores below 0.35; cold shores retain snowy-beach routing.
+The mountain ridge field cannot select coastal rock because its continental
+mask is zero there. Stony shores now use gravel over stone instead of being
+captured by the general sandy-beach material branch. Raised inland banks remain
+outside this band. No height, drainage, wetland, climate-noise or cache algorithm
+changes; existing terrain fields are reused without extra noise evaluation.
+The persisted revision fence requires fresh generated worlds and leaves the
+frozen field-test archive unchanged. This is climate coherence, not full vanilla
+ocean feature or frozen-water parity.
+
+A follow-up coastal replay found a streaming metadata mismatch, not a reason
+to alter revision 18: Login advertised radius 8 while the owner views loaded
+radius 6. Chunk streaming now publishes the effective client-cache radius
+initially and on changes, keeping distance fog aligned with the delivered view.
+The matched owner footprint and nearby occupancy/fluid samples are unchanged;
+one live dirt/grass material difference is recorded separately. All nine
+retained ground checks and three varied-seed graphical routes pass. The older
+large rectangular patch did not reproduce in the fresh pre-fix replay, so its
+original transient cause is not claimed. This is scoped rendering evidence,
+not global terrain or frozen-water parity. Exact reproduction, wire authority,
+images and gates:
+`.analysis/codex-logs/owner-field-5617830-2026-09-06/coastal-boundaries/receipt.json`.
+
+Worldgen revision 17 replaces the broad humid-lowland swamp classification
+with a shared riparian wetland field. It uses the existing drainage strength
+and variable-width shoulders, coast connection, low relief and warm/moist
+climate. Weak reaches whose full-strength bed would remain above the local
+water table do not create wetlands. Existing broad detail and hill fields
+form shallow pockets and dry hummocks; there is no new noise field,
+fixed-width ring, origin override or second surface-material authority.
+Wetland biomes occupy connected shoulders between two blocks below and one
+block above sea level; dry inland lowlands retain their climate biome.
+
+Both modes share riparian climate selection while retaining their existing
+river-width thresholds: cold rivers select frozen river, warm wetlands select
+mangrove swamp, and temperate wetlands select swamp. Mangroves now have mud,
+native logs and leaves, and variable root arms attached to actual neighbouring
+soil. Submerged roots retain their waterlogged state. Temperate swamps retain
+oak trees, including shallow-water sites, and use blue orchids and grass.
+The existing leaf-support traversal resolves mangrove leaf distances too;
+natural foliage does not receive a permanent-leaf override.
+
+`terrain::trees` owns ordinary and wetland tree placement together rather than
+adding another tree mechanism to chunk orchestration. These are custom
+deterministic habitat shapes, not a claim of exact vanilla feature parity.
+Changed terrain, materials and vegetation retain the persisted revision fence;
+revision-16 generated worlds must not silently mix with revision 17. The frozen
+field-test archive remains unchanged.
+
+Worldgen revision 16 removes raised beach strips by using the existing
+two-block shoreline height in both modes. The Tellus-only six-block band is
+gone; climate fields, river topology and terrain heights do not change.
+Altitude and climate routing now lives in `terrain::biome_routing`, alongside
+its thresholds. Chunk assembly and structure placement consume the same shared
+shoreline bound rather than retaining a second height policy. Surface materials
+still come from the selected biome, and changed surfaces retain the persisted
+worldgen-revision fence.
+
+Worldgen revision 15 replaces the two straight halves of each river reach with
+an eight-segment approximation of a smooth parabolic bend. The same jittered
+endpoints, downstream topology and runoff remain; continental, mountain and
+climate scales do not change. The curve passes through both shared endpoints
+and reaches its existing lateral displacement smoothly at mid-reach.
+Seeded base widths remain, but taller banks widen according to the masked
+carving relief and the quintic falloff's maximum derivative instead of cutting
+steeper cliffs. A first curved-reach attempt failed the existing three-block
+terrain-step check; relief-dependent width fixes that failure without relaxing
+the check. No second generator, persistent cache or compatibility switch is added.
+
+River sampling covers the complete curve and width bounds, including origins
+two cells away at small supported world scales and farther when bank relief
+requires it. Cheap convex-hull and per-reach bounds reject irrelevant candidates
+before detailed distance evaluation. A wide unpruned reference guards
+cell-boundary contributions; the previous 3x3
+search clipped valid river weights at scale 0.25. Changed terrain remains behind
+the existing persisted revision mismatch fence and requires fresh generated worlds.
+
+Both biome routes now restrict beaches to the continental coast band instead
+of assigning every low inland river bank a beach biome. Inland banks retain
+their local climate, ground and vegetation. Surface materials still come from
+the selected biome; no per-column override or second surface authority is added.
+
+Worldgen revision 14 adds a deterministic jungle undergrowth layer: one-block
+jungle-log bushes with oak leaves are mixed with ordinary jungle trunks of
+4–12 blocks. Jungle candidates use roughly 50 columns per chunk before the
+existing moisture, density, exact-surface, stable-5x5 and chunk-margin fences.
+This is not full vanilla jungle feature parity; mega trees and vines are not
+part of this change.
+
+Generated natural leaves start at distance 7 with `persistent=false`. Before
+publishing a decorated chunk, a bounded six-neighbour traversal resolves their
+nearest in-chunk log distances through distance 6. State palettes and support
+classification are cached per generator; the existing `mc-world` plant rules
+own the log/leaf support classification used by both generation and scheduled
+runtime updates. Later block edits retain ordinary leaf-distance propagation
+and decay. There is no permanent-leaf override or separate CPU admission path.
+
+Generated revisions remain behind the persisted world-contract mismatch fence. The
+old packaged alpha archive is unchanged. After correcting chunk-queue CPU
+backpressure, real clients load the full 9x9 destination window within 30 seconds
+on seeds `5617830` and `-17711`; inspected screenshots show trees and undergrowth,
+including the owner's reported site. After removing whole-resident byte-accounting
+rescans, both full graphical harnesses pass without chunk-publication lock-wait
+warnings. Slow scheduled-block ticks remain a separate unresolved performance
+finding; this is not complete terrain, population or performance acceptance.
 
 Worldgen revision 10 removes every production starter fixture and every
 origin-based terrain deformation. Fixed surface stone/iron, the forced tree
@@ -118,17 +239,22 @@ miss retains its delta for retry; shutdown loads that chunk without generation
 before the final save. This preserves vanilla elapsed-tick semantics without
 republishing hundreds of chunks on every tick.
 
-The hot path samples each surface column once and reuses its biome result for
-vertical biome cells. Cave noise exits after its region mask or first tunnel
-field rejects the cell. No revision-8 performance claim exists until a release
-benchmark runs on a clean host.
+The hot path reuses each planned surface column's biome for vertical biome cells
+and biome-restricted ore anchors. Ore admission reads the existing chunk-local
+`OreColumnCache`; it does not rerun height and climate routing for each Y anchor.
+The cache halo covers the same neighbouring anchors as vein placement, so
+chunk-order independence and the ore biome/height fences are unchanged.
+Cave noise exits after its region mask or first tunnel field rejects the cell.
+The 2026-09-05 debug comparison preserves serialized fingerprints across 48
+chunks, three seeds, and both modes; it is not a release throughput claim and
+does not change the generator revision.
 
 ## Staged boundary
 
-Landforms and caves are isolated sibling stages. Surface composition, ores,
-features, and structures still reside in the larger `terrain.rs` assembly and
-should move into focused sibling modules when each stage is changed. This ADR
-does not claim vanilla NoiseRouter parity or complete Tectonic/Tellus feature
+Landforms, caves and biome routing are isolated sibling stages. Surface
+composition, ores, features and structures still reside in the larger `terrain.rs`
+assembly and should move into focused siblings when each stage is changed.
+This ADR does not claim vanilla NoiseRouter parity or complete Tectonic/Tellus feature
 coverage. The bounded client pass verifies representative shapes, not complete
 seed coverage or owner-approved visual parity.
 

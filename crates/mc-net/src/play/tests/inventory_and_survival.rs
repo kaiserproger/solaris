@@ -47,7 +47,11 @@ fn arrow_selection_prefers_held_main_hand_before_other_hotbar_slots() {
         protocol_id: 42,
     }]));
     let mut state = interaction_state_for_items(items);
-    state.selected_hotbar_slot = 4;
+    crate::lock_policy::lock_authoritative_mutex(
+        &state.player_persistence,
+        "play.player_persistence",
+    )
+    .selected_hotbar_slot = 4;
     state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 3);
     state.inventory.slots[PlayerInventory::HOTBAR_BASE + 4] = ItemStack::new(42, 3);
 

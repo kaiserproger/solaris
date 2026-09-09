@@ -98,10 +98,13 @@ pub(in crate::play) fn apply_script_player_inventory_transaction(
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
 ) -> Result<(), ScriptPlayerInventoryFailure> {
-    let plan = plan_script_inventory_deltas(transaction.deltas(), inventory, items, item_facts)
+    persisted
+        .inventory
+        .try_update(|current| {
+            plan_script_inventory_deltas(transaction.deltas(), current, items, item_facts)
+        })
         .map_err(map_plan_failure)?;
-    *inventory = plan.updated.clone();
-    persisted.replace_inventory(plan.updated);
+    *inventory = persisted.inventory.clone();
     Ok(())
 }
 

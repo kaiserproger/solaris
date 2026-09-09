@@ -151,9 +151,8 @@ fn use_max_recipe_is_bounded_when_output_recreates_ingredient() {
         result: RecipeResult { item, count: 1 },
     };
 
-    let outcome = craft_recipe(&mut state, &recipe, true).expect("one bounded craft");
+    let (inventory, outcome) = craft_recipe(&state, &recipe, true).expect("one bounded craft");
 
-    assert!(!outcome.changed_slots.is_empty());
     assert_eq!(
         outcome.crafted,
         CraftedItem {
@@ -162,7 +161,7 @@ fn use_max_recipe_is_bounded_when_output_recreates_ingredient() {
             craft_count: 1,
         }
     );
-    assert_eq!(state.inventory.slots[9], ItemStack::new(1, 1));
+    assert_eq!(inventory.slots[9], ItemStack::new(1, 1));
 }
 
 #[test]
@@ -207,13 +206,13 @@ fn use_max_recipe_reports_large_aggregate_without_partial_mutation_failure() {
         },
     };
 
-    let outcome = craft_recipe(&mut state, &recipe, true).expect("three complete crafts");
+    let (inventory, outcome) = craft_recipe(&state, &recipe, true).expect("three complete crafts");
 
     assert_eq!(outcome.crafted.item_id, 2);
     assert_eq!(outcome.crafted.count, 4_500_000_000);
     assert_eq!(outcome.crafted.craft_count, 3);
     assert_eq!(
-        state.inventory.slots[9..=44]
+        inventory.slots[9..=44]
             .iter()
             .map(|stack| i64::from(stack.count.max(0)))
             .sum::<i64>(),

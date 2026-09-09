@@ -9,9 +9,8 @@ use mc_entity::{
     EntityEvokerAttackState, EntityEvokerFangState, EntityExplosionInteraction,
     EntityGhastAttackState, EntityGuardianBeamPhase, EntityGuardianBeamState, EntityId,
     EntityLifecycle, EntityPendingExplosionState, EntityPrimedTntState, EntityShulkerAttackState,
-    EntitySimulationProjection, EntitySnapshot, EntityWardenSonicBoomPhase,
-    EntityWardenSonicBoomState, EntityWitchAttackState, EntityWitchPotionKind, GoalState, Rotation,
-    SpawnEntity, Vec3,
+    EntitySnapshot, EntityWardenSonicBoomPhase, EntityWardenSonicBoomState, EntityWitchAttackState,
+    EntityWitchPotionKind, GoalState, Rotation, SpawnEntity, Vec3,
 };
 use mc_world::BlockStateId;
 
@@ -1502,8 +1501,8 @@ impl SessionRegistry {
         if self.evoker_fang_count.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
-        let active_ids = self.active_simulation_entities.load_full();
-        if active_ids.is_empty() {
+        let active_chunks = self.active_simulation_chunks.load_full();
+        if active_chunks.is_empty() {
             return Vec::new();
         }
         let mut ids = {
@@ -1512,7 +1511,11 @@ impl SessionRegistry {
                 .evoker_fang_entities
                 .iter()
                 .copied()
-                .filter(|id| active_ids.contains(id))
+                .filter(|id| {
+                    self.simulation_inputs
+                        .entity_chunk(*id)
+                        .is_some_and(|chunk| active_chunks.contains(&chunk))
+                })
                 .collect::<Vec<_>>()
         };
         if ids.is_empty() {
@@ -3478,209 +3481,40 @@ fn hostile_faces_target(position: Vec3, rotation: Rotation, target: Vec3) -> boo
     (facing_x * dx + facing_z * dz) / distance > 0.0
 }
 
-#[derive(Debug, Clone)]
-struct HostileTargetCandidate {
-    id: EntityId,
-    position: Vec3,
-    follow_range: f64,
-    uses_ranged_attack: bool,
-    uses_small_fireball: bool,
-    is_creeper: bool,
-    fuse_active: bool,
-    guardian_beam_active: bool,
-    exclusive_flight: bool,
-    wander_speed: f64,
-    wander_period_ticks: u32,
-    pursuit_speed: f64,
-    current: GoalState,
-}
-
-fn hostile_target_candidate_from_projection(
-    entity: &EntitySimulationProjection,
-    mob_behaviors: &MobBehaviorTable,
-) -> Option<HostileTargetCandidate> {
-    if entity.lifecycle != EntityLifecycle::Alive || !is_hostile_entity(&entity.type_name) {
-        return None;
-    }
-    let profile = mob_behaviors.get_by_name(&entity.type_name)?;
-    Some(HostileTargetCandidate {
-        id: entity.id,
-        position: entity.position,
-        follow_range: entity.follow_range,
-        uses_ranged_attack: matches!(
-            profile.combat,
-            MobCombatPolicy::Arrow
-                | MobCombatPolicy::Crossbow
-                | MobCombatPolicy::GuardianBeam
-                | MobCombatPolicy::SmallFireball
-                | MobCombatPolicy::SonicBoom
-                | MobCombatPolicy::ShulkerBullet
-                | MobCombatPolicy::EvokerFangs
-                | MobCombatPolicy::LargeFireball
-                | MobCombatPolicy::WindCharge
-                | MobCombatPolicy::ThrownPotion
-                | MobCombatPolicy::WitherSkull
-                | MobCombatPolicy::DragonBoss
-                | MobCombatPolicy::UnsupportedSpecial
-        ),
-        uses_small_fireball: profile.combat == MobCombatPolicy::SmallFireball,
-        is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
-        fuse_active: entity.primed_tnt,
-        guardian_beam_active: entity.guardian_beam_active,
-        exclusive_flight: profile.combat == MobCombatPolicy::DragonBoss,
-        wander_speed: profile.wander_speed,
-        wander_period_ticks: profile.wander_period_ticks,
-        pursuit_speed: profile.pursuit_speed,
-        current: entity.goal.clone(),
-    })
-}
-
-fn apply_hostile_target_candidates(
-    entities: &mut EntityOwnerAccess,
-    players: &[Vec3],
-    hostiles: impl IntoIterator<Item = HostileTargetCandidate>,
-) {
-    let changed = hostiles
-        .into_iter()
-        .filter_map(|hostile| {
-            let target = if players.is_empty() {
-                None
-            } else {
-                let max_distance_sq = hostile.follow_range * hostile.follow_range;
-                players
-                    .iter()
-                    .copied()
-                    .filter(|position| distance_sq(*position, hostile.position) <= max_distance_sq)
-                    .min_by(|left, right| {
-                        distance_sq(*left, hostile.position)
-                            .total_cmp(&distance_sq(*right, hostile.position))
-                    })
-            };
-            let goal = if hostile.guardian_beam_active || hostile.exclusive_flight {
-                GoalState::Idle
-            } else {
-                match target {
-                    None if hostile.is_creeper && hostile.fuse_active => GoalState::Idle,
-                    None => {
-                        hostile_wander_goal_for(hostile.wander_speed, hostile.wander_period_ticks)
-                    }
-                    Some(target)
-                        if hostile.is_creeper
-                            && (hostile.fuse_active
-                                || distance_sq(target, hostile.position)
-                                    < CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE) =>
-                    {
-                        GoalState::Idle
-                    }
-                    Some(target)
-                        if hostile.uses_small_fireball
-                            && distance_sq(target, hostile.position)
-                                >= BLAZE_CLOSE_MELEE_RANGE_SQ =>
-                    {
-                        GoalState::Idle
-                    }
-                    Some(target)
-                        if !hostile.uses_ranged_attack
-                            && (target.y - hostile.position.y).abs()
-                                <= HOSTILE_MELEE_VERTICAL_REACH
-                            && (target.x - hostile.position.x).powi(2)
-                                + (target.z - hostile.position.z).powi(2)
-                                <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE =>
-                    {
-                        GoalState::FollowPosition { target, speed: 0.0 }
-                    }
-                    Some(target) => GoalState::FollowPosition {
-                        target,
-                        speed: hostile.pursuit_speed,
-                    },
-                }
-            };
-            changed_hostile_goal(hostile.id, &hostile.current, goal)
-        })
-        .collect::<Vec<_>>();
-    if !changed.is_empty() {
-        let _ = entities.set_goals_deferred_journal(changed);
-    }
-}
-
-pub(super) fn update_hostile_targets_from_projections<'a>(
-    entities: &mut EntityOwnerAccess,
-    players: &[Vec3],
-    projections: impl IntoIterator<Item = &'a EntitySimulationProjection>,
-    mob_behaviors: &MobBehaviorTable,
-) {
-    let hostiles = projections
-        .into_iter()
-        .filter_map(|entity| hostile_target_candidate_from_projection(entity, mob_behaviors))
-        .collect::<Vec<_>>();
-    apply_hostile_target_candidates(entities, players, hostiles);
-}
-
 pub(super) fn update_hostile_targets(
     entities: &mut EntityOwnerAccess,
     players: &[Vec3],
     active_ids: Option<&HashSet<EntityId>>,
     mob_behaviors: &MobBehaviorTable,
 ) {
-    let mut hostiles = Vec::new();
+    let mut changed = Vec::new();
     let mut collect = |entity: mc_entity::EntityView<'_>| {
-        if entity.lifecycle != EntityLifecycle::Alive || !is_hostile_entity(entity.type_name) {
-            return;
-        }
-        let Some(profile) = mob_behaviors.get_by_name(entity.type_name) else {
+        let Some(goal) = mc_entity::natural_spawn_26_1_2::hostile_goal_for_entity(
+            &entity,
+            players,
+            mob_behaviors,
+        ) else {
             return;
         };
-        hostiles.push(HostileTargetCandidate {
-            id: entity.id,
-            position: entity.position,
-            follow_range: entity
-                .attributes
-                .base(&AttributeKind::FollowRange)
-                .unwrap_or(16.0),
-            uses_ranged_attack: matches!(
-                profile.combat,
-                MobCombatPolicy::Arrow
-                    | MobCombatPolicy::Crossbow
-                    | MobCombatPolicy::GuardianBeam
-                    | MobCombatPolicy::SmallFireball
-                    | MobCombatPolicy::SonicBoom
-                    | MobCombatPolicy::ShulkerBullet
-                    | MobCombatPolicy::EvokerFangs
-                    | MobCombatPolicy::LargeFireball
-                    | MobCombatPolicy::WindCharge
-                    | MobCombatPolicy::ThrownPotion
-                    | MobCombatPolicy::WitherSkull
-                    | MobCombatPolicy::DragonBoss
-                    | MobCombatPolicy::UnsupportedSpecial
-            ),
-            uses_small_fireball: profile.combat == MobCombatPolicy::SmallFireball,
-            is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
-            fuse_active: entity.retained.primed_tnt.is_some(),
-            guardian_beam_active: entity.retained.guardian_beam.is_some(),
-            exclusive_flight: profile.combat == MobCombatPolicy::DragonBoss,
-            wander_speed: profile.wander_speed,
-            wander_period_ticks: profile.wander_period_ticks,
-            pursuit_speed: profile.pursuit_speed,
-            current: entity.goal.clone(),
-        });
+        if let Some(change) = changed_hostile_goal(entity.id, entity.goal, goal) {
+            changed.push(change);
+        }
     };
     if let Some(active_ids) = active_ids {
         entities.visit_simulation_entities_for_ids(active_ids, &mut collect);
     } else {
         entities.visit_simulation_entities(&mut collect);
     }
-    apply_hostile_target_candidates(entities, players, hostiles);
+    if !changed.is_empty() {
+        let _ = entities.set_goals_deferred_journal(changed);
+    }
 }
 
 #[cfg(test)]
 pub(super) fn hostile_wander_goal() -> GoalState {
-    hostile_wander_goal_for(HOSTILE_FOLLOW_SPEED, 20)
-}
-
-fn hostile_wander_goal_for(speed: f64, period_ticks: u32) -> GoalState {
     GoalState::Wander {
-        speed,
-        period_ticks,
+        speed: HOSTILE_FOLLOW_SPEED,
+        period_ticks: 20,
     }
 }
 

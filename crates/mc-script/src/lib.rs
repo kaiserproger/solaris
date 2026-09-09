@@ -17,9 +17,29 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
 
+mod loader_interaction;
+pub use loader_interaction::ScriptLoaderInteractionPhase;
+
+mod client_ui;
+pub use client_ui::{
+    MAX_CLIENT_UI_BODY_BYTES, MAX_CLIENT_UI_TITLE_BYTES, ScriptClientUiMode,
+    ScriptClientUiPresentation,
+};
+
+mod client_sound;
+pub use client_sound::{ScriptClientSound, ScriptClientSoundPlayback};
+
+mod commit_events;
+pub use commit_events::{
+    ScriptCommitEnqueueError, ScriptCommitEventMonitor, ScriptCommitEventOutbox,
+    ScriptCommitEventOutboxSnapshot, ScriptCommitEventReceiver,
+};
+
 #[cfg(feature = "lua-runtime")]
 mod lua;
 
+#[cfg(test)]
+mod custom_payload_tests;
 #[cfg(test)]
 mod entity_interaction_tests;
 #[cfg(test)]
@@ -39,14 +59,14 @@ mod tick_delivery_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{
-    BundledLuauPlugin, LuaClientBundle, LuaClientBundleDiscovery, LuaClientContentKind,
-    LuaClientLoader, LuaClientPermission, LuaHost, LuaHostConfig, LuaHostError, LuaHostExitReason,
+    LuaClientBundle, LuaClientBundleDiscovery, LuaClientContentKind, LuaClientLoader,
+    LuaClientPermission, LuaHost, LuaHostConfig, LuaHostError, LuaHostExitReason,
     LuaHostExitReport, LuaPluginDeployment, LuaPluginDisableDiagnostic, LuaPluginDisableStage,
     LuaPluginDiscovery, LuaReloadError, LuaReloadReport, LuaSettlementBuilding,
     LuaSettlementBuildingRole, LuaSettlementBuildingTemplate, LuaSettlementExtension,
     LuaSettlementInhabitant, LuaSettlementInhabitantKind, LuaSettlementJob, LuaSettlementPlan,
-    LuaWorldgenOreProfile, LuaWorldgenSettlementProfile, PreparedLuaPlugins,
-    prepare_bundled_luau_plugins, prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
+    LuaWorldgenOreProfile, LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_lua_plugins,
+    start_lua_host, start_prepared_lua_host,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.
@@ -73,6 +93,8 @@ pub const MAX_SCRIPT_PLAYER_UUID_BYTES: usize = 64;
 pub const MAX_SCRIPT_PLAYER_NAME_BYTES: usize = 16;
 pub const MAX_SCRIPT_CHAT_MESSAGE_BYTES: usize = 4_096;
 pub const MAX_SCRIPT_DISCONNECT_REASON_BYTES: usize = 1_024;
+/// Maximum raw custom-payload body accepted through the script boundary.
+pub const MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES: usize = 32_768;
 pub const MAX_SCRIPT_COMMAND_BATCH: usize = 32;
 pub const MAX_SCRIPT_EVENT_QUEUE_CAPACITY: usize = 1_024;
 pub const MAX_SCRIPT_COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -122,7 +144,8 @@ pub const MAX_PLAYER_COMMAND_ROOT_BYTES: usize = 64;
 
 /// Maximum number of active plugin player-command roots across the server.
 pub const MAX_PLAYER_COMMAND_ROOTS: usize = 128;
-
+/// Maximum number of exclusive custom-payload channels owned across the server.
+pub const MAX_PLUGIN_PAYLOAD_CHANNELS: usize = 128;
 /// Maximum command-tree nodes added by active plugin roots.
 pub const MAX_PLAYER_COMMAND_TREE_NODES: usize = MAX_PLAYER_COMMAND_ROOTS * 2;
 
@@ -1671,6 +1694,49 @@ impl ScriptVillagerGoalFailure {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptVillagerReleaseRequest {
+    request_id: String,
+    binding_token: String,
+}
+
+impl ScriptVillagerReleaseRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        binding_token: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            binding_token: validate_script_id(binding_token.as_ref())?,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn binding_token(&self) -> &str {
+        &self.binding_token
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptVillagerReleaseFailure {
+    BindingUnavailable,
+    Busy,
+}
+
+impl ScriptVillagerReleaseFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BindingUnavailable => "binding_unavailable",
+            Self::Busy => "busy",
+        }
+    }
+}
+
 /// Server-normalized inventory click kind. Plugins never receive slot stacks or packet state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1762,6 +1828,24 @@ impl ScriptGameMode {
             Self::Survival => "survival",
             Self::Creative => "creative",
             Self::Adventure => "adventure",
+        }
+    }
+}
+
+/// Protocol phase that produced a client-originated custom payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptProtocolPhase {
+    Configuration,
+    Play,
+}
+
+impl ScriptProtocolPhase {
+    /// Return the stable Lua-visible phase name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::Play => "play",
         }
     }
 }
@@ -2475,11 +2559,27 @@ impl ScriptEvent {
         })
     }
 
+    /// Build a targeted result for one admitted bound-villager release.
+    pub(crate) fn villager_release_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptVillagerReleaseRequest,
+        failure: Option<ScriptVillagerReleaseFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::VillagerReleaseResult {
+                request_id: request.request_id().to_owned(),
+                failure,
+            },
+        })
+    }
+
     /// Build one client-originated Loader interaction targeted to its bundle owner.
     pub fn loader_interaction(
         target_plugin_id: impl AsRef<str>,
         player_id: ScriptPlayerId,
         interaction_id: impl AsRef<str>,
+        phase: ScriptLoaderInteractionPhase,
         payload: impl AsRef<str>,
     ) -> Result<Self, ScriptDtoError> {
         let target_plugin_id = validate_target_plugin_id(target_plugin_id.as_ref())?;
@@ -2504,7 +2604,53 @@ impl ScriptEvent {
             kind: ScriptEventKind::LoaderInteraction {
                 player_id,
                 interaction_id: interaction_id.to_owned(),
+                phase,
                 payload: payload.to_owned(),
+            },
+        })
+    }
+
+    /// Build a client-brand event snapshot. Empty brands are preserved.
+    pub fn client_brand(
+        player_id: ScriptPlayerId,
+        brand: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        let brand = brand.as_ref();
+        validate_bounded_value("client brand", brand, MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES)?;
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::ClientBrand {
+                player_id,
+                brand: brand.to_owned(),
+            },
+        })
+    }
+
+    /// Build a custom-payload event snapshot targeted to the channel owner.
+    /// The owned payload moves into the event without copying.
+    pub fn custom_payload(
+        target_plugin_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        phase: ScriptProtocolPhase,
+        channel: impl AsRef<str>,
+        payload: Vec<u8>,
+    ) -> Result<Self, ScriptDtoError> {
+        let target_plugin_id = validate_target_plugin_id(target_plugin_id.as_ref())?;
+        let channel = validate_contract_resource_id(channel.as_ref())?;
+        if payload.len() > MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
+            return Err(ScriptDtoError::ValueTooLong {
+                field: "custom payload",
+                max_bytes: MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES,
+                actual_bytes: payload.len(),
+            });
+        }
+        Ok(Self {
+            target_plugin_id: Some(target_plugin_id),
+            kind: ScriptEventKind::CustomPayload {
+                player_id,
+                phase,
+                channel,
+                payload,
             },
         })
     }
@@ -2559,7 +2705,10 @@ impl ScriptEvent {
             ScriptEventKind::OnlinePlayersResult { .. } => "player.online_result",
             ScriptEventKind::VillagerBindingResult { .. } => "villager.binding_result",
             ScriptEventKind::VillagerGoalResult { .. } => "villager.goal_result",
+            ScriptEventKind::VillagerReleaseResult { .. } => "villager.release_result",
             ScriptEventKind::LoaderInteraction { .. } => "loader.interaction",
+            ScriptEventKind::ClientBrand { .. } => "player.client_brand",
+            ScriptEventKind::CustomPayload { .. } => "player.custom_payload",
         }
     }
 
@@ -2884,6 +3033,9 @@ impl ScriptEvent {
                 validate_script_id(request_id)?;
                 goal.validate()
             }
+            ScriptEventKind::VillagerReleaseResult { request_id, .. } => {
+                validate_script_id(request_id).map(drop)
+            }
             ScriptEventKind::LoaderInteraction {
                 interaction_id,
                 payload,
@@ -2895,6 +3047,22 @@ impl ScriptEvent {
                     payload,
                     MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES,
                 )
+            }
+            ScriptEventKind::ClientBrand { brand, .. } => {
+                validate_bounded_value("client brand", brand, MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES)
+            }
+            ScriptEventKind::CustomPayload {
+                channel, payload, ..
+            } => {
+                validate_contract_resource_id(channel)?;
+                if payload.len() > MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
+                    return Err(ScriptDtoError::ValueTooLong {
+                        field: "custom payload",
+                        max_bytes: MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES,
+                        actual_bytes: payload.len(),
+                    });
+                }
+                Ok(())
             }
         }
     }
@@ -3113,10 +3281,25 @@ pub enum ScriptEventKind {
         goal: ScriptVillagerGoal,
         failure: Option<ScriptVillagerGoalFailure>,
     },
+    VillagerReleaseResult {
+        request_id: String,
+        failure: Option<ScriptVillagerReleaseFailure>,
+    },
     LoaderInteraction {
         player_id: ScriptPlayerId,
         interaction_id: String,
+        phase: ScriptLoaderInteractionPhase,
         payload: String,
+    },
+    ClientBrand {
+        player_id: ScriptPlayerId,
+        brand: String,
+    },
+    CustomPayload {
+        player_id: ScriptPlayerId,
+        phase: ScriptProtocolPhase,
+        channel: String,
+        payload: Vec<u8>,
     },
 }
 
@@ -3163,9 +3346,13 @@ pub enum ScriptCommand {
         player_id: ScriptPlayerId,
         menu: ScriptInventoryMenu,
     },
-    OpenClientScreen {
+    PresentClientUi {
         player_id: ScriptPlayerId,
-        screen_id: String,
+        presentation: ScriptClientUiPresentation,
+    },
+    ClientSound {
+        player_id: ScriptPlayerId,
+        sound: ScriptClientSound,
     },
     PlaceLoaderBlock {
         request: ScriptLoaderBlockPlacementRequest,
@@ -3195,6 +3382,9 @@ pub enum ScriptCommand {
     SetVillagerGoal {
         request: ScriptVillagerGoalRequest,
     },
+    ReleaseVillagerBinding {
+        request: ScriptVillagerReleaseRequest,
+    },
     TeleportPlayer {
         request: ScriptPlayerTeleportRequest,
     },
@@ -3206,6 +3396,11 @@ pub enum ScriptCommand {
     },
     ListOnlinePlayers {
         request: ScriptOnlinePlayersRequest,
+    },
+    SendCustomPayload {
+        player_id: ScriptPlayerId,
+        channel: String,
+        payload: Vec<u8>,
     },
 }
 
@@ -3436,24 +3631,33 @@ impl AdmittedScriptCommand {
         ))
     }
 
-    pub fn into_open_client_screen(
+    pub fn into_present_client_ui(
         self,
-    ) -> Result<(ScriptPluginTarget, ScriptPlayerId, String), ScriptDtoError> {
-        let ScriptCommand::OpenClientScreen {
+    ) -> Result<
+        (
+            ScriptPluginTarget,
+            ScriptPlayerId,
+            ScriptClientUiPresentation,
+        ),
+        ScriptDtoError,
+    > {
+        let request =
+            Arc::try_unwrap(self.request).unwrap_or_else(|request| request.as_ref().clone());
+        let ScriptCommand::PresentClientUi {
             player_id,
-            screen_id,
-        } = self.request.as_ref()
+            presentation,
+        } = request
         else {
             return Err(ScriptDtoError::InconsistentResult {
-                field: "client screen admission",
+                field: "client UI admission",
             });
         };
         Ok((
             ScriptPluginTarget {
                 plugin_id: self.plugin_id,
             },
-            *player_id,
-            screen_id.clone(),
+            player_id,
+            presentation,
         ))
     }
 
@@ -3630,6 +3834,18 @@ impl AdmittedScriptCommand {
         ScriptEvent::villager_goal_result(&self.plugin_id, request, failure)
     }
 
+    pub fn villager_release_result(
+        self,
+        failure: Option<ScriptVillagerReleaseFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::ReleaseVillagerBinding { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "villager release admission",
+            });
+        };
+        ScriptEvent::villager_release_result(&self.plugin_id, request, failure)
+    }
+
     pub fn player_teleport_result(
         self,
         failure: Option<ScriptPlayerTeleportFailure>,
@@ -3742,6 +3958,36 @@ impl AdmittedScriptCommand {
         };
         ScriptEvent::online_players_result(&self.plugin_id, request, players, truncated)
     }
+
+    /// Consume an admitted outbound custom-payload command, moving the payload
+    /// out of the shared request without copying when uniquely owned.
+    pub fn into_send_custom_payload(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptPlayerId, String, Vec<u8>), ScriptDtoError> {
+        let target = ScriptPluginTarget {
+            plugin_id: Arc::clone(&self.plugin_id),
+        };
+        match Arc::try_unwrap(self.request) {
+            Ok(ScriptCommand::SendCustomPayload {
+                player_id,
+                channel,
+                payload,
+            }) => Ok((target, player_id, channel, payload)),
+            Ok(_) => Err(ScriptDtoError::InconsistentResult {
+                field: "custom payload admission",
+            }),
+            Err(request) => match request.as_ref() {
+                ScriptCommand::SendCustomPayload {
+                    player_id,
+                    channel,
+                    payload,
+                } => Ok((target, *player_id, channel.clone(), payload.clone())),
+                _ => Err(ScriptDtoError::InconsistentResult {
+                    field: "custom payload admission",
+                }),
+            },
+        }
+    }
 }
 
 /// Opaque plugin target retained by a production adapter after accepting an
@@ -3816,7 +4062,8 @@ impl ScriptCommand {
             Self::SendChatMessage { .. }
             | Self::BroadcastChatMessage { .. }
             | Self::DisconnectPlayer { .. }
-            | Self::OpenClientScreen { .. }
+            | Self::PresentClientUi { .. }
+            | Self::ClientSound { .. }
             | Self::PlaceLoaderBlock { .. }
             | Self::GrantLoaderBlockItem { .. } => None,
             Self::SpawnEntity { entity_type, .. } => {
@@ -3838,13 +4085,16 @@ impl ScriptCommand {
             Self::UpsertZone { .. } | Self::RemoveZone { .. } => {
                 Some(RequiredCommandCapability::Zones)
             }
-            Self::RequestVillagerBinding { .. } | Self::SetVillagerGoal { .. } => {
-                Some(RequiredCommandCapability::Villagers)
-            }
+            Self::RequestVillagerBinding { .. }
+            | Self::SetVillagerGoal { .. }
+            | Self::ReleaseVillagerBinding { .. } => Some(RequiredCommandCapability::Villagers),
             Self::TeleportPlayer { .. } => Some(RequiredCommandCapability::PlayerTeleport),
             Self::SetWorldTime { .. } => Some(RequiredCommandCapability::WorldTime),
             Self::SetWorldBlock { .. } => Some(RequiredCommandCapability::WorldBlocks),
             Self::ListOnlinePlayers { .. } => Some(RequiredCommandCapability::PlayerQueries),
+            Self::SendCustomPayload { channel, .. } => {
+                Some(RequiredCommandCapability::CustomPayloadChannel { channel })
+            }
         }
     }
 
@@ -3883,9 +4133,8 @@ impl ScriptCommand {
                 ScriptInventoryMenu::try_new(menu.id(), menu.title(), menu.slots().to_vec())
                     .map(drop)
             }
-            Self::OpenClientScreen { screen_id, .. } => {
-                validate_contract_resource_id(screen_id).map(drop)
-            }
+            // The presentation has private fields and a checked constructor.
+            Self::PresentClientUi { .. } | Self::ClientSound { .. } => Ok(()),
             Self::PlaceLoaderBlock { request } => ScriptLoaderBlockPlacementRequest::try_new(
                 request.request_id(),
                 request.block_id(),
@@ -3960,6 +4209,10 @@ impl ScriptCommand {
             )
             .and_then(|request| request.goal().validate())
             .map(drop),
+            Self::ReleaseVillagerBinding { request } => {
+                ScriptVillagerReleaseRequest::try_new(request.request_id(), request.binding_token())
+                    .map(drop)
+            }
             Self::TeleportPlayer { request } => ScriptPlayerTeleportRequest::try_new(
                 request.request_id(),
                 request.player_id(),
@@ -3981,6 +4234,24 @@ impl ScriptCommand {
             .map(drop),
             Self::ListOnlinePlayers { request } => {
                 ScriptOnlinePlayersRequest::try_new(request.request_id(), request.limit()).map(drop)
+            }
+            Self::SendCustomPayload {
+                channel, payload, ..
+            } => {
+                validate_custom_payload_channel(channel).map_err(|_| {
+                    ScriptDtoError::InvalidResourceId {
+                        field: "custom payload channel",
+                        actual_bytes: channel.len(),
+                    }
+                })?;
+                if payload.len() > MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
+                    return Err(ScriptDtoError::ValueTooLong {
+                        field: "custom payload",
+                        max_bytes: MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES,
+                        actual_bytes: payload.len(),
+                    });
+                }
+                Ok(())
             }
         }
     }
@@ -4042,12 +4313,8 @@ pub(crate) enum ScriptBatchSubmissionError {
 pub(crate) enum ScriptReloadCommitError {
     QueueFull,
     QueueClosed,
-    Rejected {
-        error: CommandBatchError,
-    },
-    Ownership {
-        error: PlayerCommandRegistrationError,
-    },
+    Rejected { error: CommandBatchError },
+    Ownership { error: ScriptRouteRegistrationError },
 }
 
 pub(crate) enum ScriptHostInput {
@@ -4061,7 +4328,7 @@ pub(crate) enum ScriptHostInput {
 pub struct ScriptBoundary {
     event_admission: Arc<ScriptEventAdmission>,
     command_rx: Arc<Mutex<mpsc::Receiver<ScriptCommand>>>,
-    player_command_owners: PlayerCommandOwners,
+    plugin_routes: PluginRouteAuthority,
     host_admissions: Arc<HostAdmissionLedger>,
 }
 
@@ -4173,17 +4440,17 @@ impl ScriptBoundary {
     /// Stop accepting new host events while allowing already admitted events to drain.
     pub fn close_event_admission(&self) {
         self.event_admission.close();
-        self.player_command_owners.clear();
+        self.plugin_routes.clear();
     }
 
     /// Return a sorted snapshot of currently active plugin command roots.
     pub fn player_command_roots(&self) -> Vec<String> {
-        self.player_command_owners.roots(false)
+        self.plugin_routes.roots(false)
     }
 
     /// Return a sorted snapshot of active operator-only plugin command roots.
     pub fn operator_command_roots(&self) -> Vec<String> {
-        self.player_command_owners.roots(true)
+        self.plugin_routes.roots(true)
     }
 
     /// Route a raw player command with the immutable context observed by the server.
@@ -4199,7 +4466,7 @@ impl ScriptBoundary {
         let Some((root, arguments)) = split_player_command(raw) else {
             return Ok(PlayerCommandAdmission::NotOwned);
         };
-        let Some(owner) = self.player_command_owners.owner(root) else {
+        let Some(owner) = self.plugin_routes.owner(root) else {
             return Ok(PlayerCommandAdmission::NotOwned);
         };
         if owner.operator_only && !context.operator() {
@@ -4219,7 +4486,43 @@ impl ScriptBoundary {
             Ok(()) => Ok(PlayerCommandAdmission::Enqueued),
             Err(error @ ScriptQueueError::Full) => Err(error),
             Err(error @ ScriptQueueError::Closed) => {
-                self.player_command_owners.clear();
+                self.plugin_routes.clear();
+                Err(error)
+            }
+        }
+    }
+
+    /// Return whether one custom-payload channel is currently owned.
+    /// This consults the active route owner without allocating.
+    pub fn allows_custom_payload(&self, channel: &str) -> bool {
+        self.plugin_routes.has_channel(channel)
+    }
+
+    /// Route one owned custom-payload body to the registered channel owner.
+    /// Unknown channels and bodies above the fixed host bound report `false`
+    /// before event retention. The owned payload moves into the event on success.
+    pub fn try_enqueue_custom_payload(
+        &self,
+        player_id: ScriptPlayerId,
+        phase: ScriptProtocolPhase,
+        channel: &str,
+        payload: Vec<u8>,
+    ) -> Result<bool, ScriptQueueError> {
+        if payload.len() > MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
+            return Ok(false);
+        }
+        let Some(owner) = self.plugin_routes.channel_owner(channel) else {
+            return Ok(false);
+        };
+        let event = match ScriptEvent::custom_payload(owner, player_id, phase, channel, payload) {
+            Ok(event) => event,
+            Err(_) => return Ok(false),
+        };
+        match self.try_enqueue_event(event) {
+            Ok(()) => Ok(true),
+            Err(error @ ScriptQueueError::Full) => Err(error),
+            Err(error @ ScriptQueueError::Closed) => {
+                self.plugin_routes.clear();
                 Err(error)
             }
         }
@@ -4254,7 +4557,7 @@ pub struct ScriptHostEndpoint {
     coalesced_tick_due: bool,
     highest_delivered_tick: Option<u64>,
     command_tx: mpsc::Sender<ScriptCommand>,
-    player_command_owners: PlayerCommandOwners,
+    plugin_routes: PluginRouteAuthority,
     #[cfg(any(test, feature = "lua-runtime"))]
     host_admissions: Arc<HostAdmissionLedger>,
 }
@@ -4488,21 +4791,18 @@ impl ScriptHostEndpoint {
         Ok(())
     }
 
-    /// Register the player command roots from one validated plugin manifest.
-    pub fn register_player_commands(
+    /// Register the plugin routes (command roots and payload channels) from one
+    /// validated plugin manifest.
+    pub fn register_plugin_routes(
         &self,
         manifest: &ValidatedScriptPluginManifest,
-    ) -> Result<(), PlayerCommandRegistrationError> {
-        self.player_command_owners.register(
-            manifest.plugin_id(),
-            manifest.player_command_roots(),
-            manifest.operator_command_roots(),
-        )
+    ) -> Result<(), ScriptRouteRegistrationError> {
+        self.plugin_routes.register(manifest)
     }
 
-    /// Remove every active player command root owned by one plugin.
-    pub fn unregister_player_commands(&self, plugin_id: &str) {
-        self.player_command_owners.unregister(plugin_id);
+    /// Remove every active plugin route owned by one plugin.
+    pub fn unregister_plugin_routes(&self, plugin_id: &str) {
+        self.plugin_routes.unregister(plugin_id);
     }
 
     #[cfg(feature = "lua-runtime")]
@@ -4547,7 +4847,7 @@ impl ScriptHostEndpoint {
             .map(|(_, batch)| batch.commands().len())
             .sum::<usize>();
         if command_count == 0 {
-            self.player_command_owners
+            self.plugin_routes
                 .replace_all(manifests)
                 .map_err(|error| ScriptReloadCommitError::Ownership { error })?;
             swap();
@@ -4571,7 +4871,7 @@ impl ScriptHostEndpoint {
                 })?;
             attached.extend(issued);
         }
-        self.player_command_owners
+        self.plugin_routes
             .replace_all(manifests)
             .map_err(|error| ScriptReloadCommitError::Ownership { error })?;
         swap();
@@ -4582,15 +4882,23 @@ impl ScriptHostEndpoint {
     }
 }
 
-/// Error returned when active player-command roots cannot be registered.
+/// Error returned when active plugin routes cannot be registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum PlayerCommandRegistrationError {
+pub enum ScriptRouteRegistrationError {
     RootConflict {
         root: String,
         owner_plugin_id: String,
     },
+    ChannelConflict {
+        channel: String,
+        owner_plugin_id: String,
+    },
     RootLimitExceeded {
+        limit: usize,
+        requested: usize,
+    },
+    ChannelLimitExceeded {
         limit: usize,
         requested: usize,
     },
@@ -4598,24 +4906,38 @@ pub enum PlayerCommandRegistrationError {
 }
 
 #[derive(Debug, Clone, Default)]
-struct PlayerCommandOwners {
-    owners: Arc<RwLock<BTreeMap<String, PlayerCommandOwner>>>,
+struct PluginRouteAuthority {
+    routes: Arc<RwLock<PluginRouteTable>>,
     disabled: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PluginRouteTable {
+    commands: BTreeMap<String, PluginCommandOwner>,
+    payload_channels: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
-struct PlayerCommandOwner {
+struct PluginCommandOwner {
     plugin_id: String,
     operator_only: bool,
 }
 
-impl PlayerCommandOwners {
+impl PluginRouteTable {
+    fn clear(&mut self) {
+        self.commands.clear();
+        self.payload_channels.clear();
+    }
+}
+
+impl PluginRouteAuthority {
     fn roots(&self, operator_only: bool) -> Vec<String> {
         if self.disabled.load(Ordering::Acquire) {
             return Vec::new();
         }
-        match self.owners.read() {
-            Ok(owners) => owners
+        match self.routes.read() {
+            Ok(routes) => routes
+                .commands
                 .iter()
                 .filter(|(_, owner)| owner.operator_only == operator_only)
                 .map(|(root, _)| root.clone())
@@ -4628,12 +4950,40 @@ impl PlayerCommandOwners {
         }
     }
 
-    fn owner(&self, root: &str) -> Option<PlayerCommandOwner> {
+    fn has_channel(&self, channel: &str) -> bool {
+        if self.disabled.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.routes.read() {
+            Ok(routes) => routes.payload_channels.contains_key(channel),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.disable();
+                false
+            }
+        }
+    }
+
+    fn owner(&self, root: &str) -> Option<PluginCommandOwner> {
         if self.disabled.load(Ordering::Acquire) {
             return None;
         }
-        match self.owners.read() {
-            Ok(owners) => owners.get(root).cloned(),
+        match self.routes.read() {
+            Ok(routes) => routes.commands.get(root).cloned(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.disable();
+                None
+            }
+        }
+    }
+
+    fn channel_owner(&self, channel: &str) -> Option<String> {
+        if self.disabled.load(Ordering::Acquire) {
+            return None;
+        }
+        match self.routes.read() {
+            Ok(routes) => routes.payload_channels.get(channel).cloned(),
             Err(poisoned) => {
                 drop(poisoned);
                 self.disable();
@@ -4644,58 +4994,88 @@ impl PlayerCommandOwners {
 
     fn register(
         &self,
-        plugin_id: &str,
-        player_roots: &[String],
-        operator_roots: &[String],
-    ) -> Result<(), PlayerCommandRegistrationError> {
+        manifest: &ValidatedScriptPluginManifest,
+    ) -> Result<(), ScriptRouteRegistrationError> {
         if self.disabled.load(Ordering::Acquire) {
-            return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+            return Err(ScriptRouteRegistrationError::AuthorityPoisoned);
         }
-        let mut owners = match self.owners.write() {
-            Ok(owners) => owners,
+        let mut routes = match self.routes.write() {
+            Ok(routes) => routes,
             Err(poisoned) => {
                 poisoned.into_inner().clear();
                 self.disabled.store(true, Ordering::Release);
-                return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+                return Err(ScriptRouteRegistrationError::AuthorityPoisoned);
             }
         };
-        let requested_roots = player_roots
+        let channels = manifest.custom_payload_channels();
+        let requested_roots = manifest
+            .player_command_roots()
             .iter()
-            .chain(operator_roots)
+            .chain(manifest.operator_command_roots())
             .collect::<Vec<_>>();
-        let requested = owners.len().saturating_add(requested_roots.len());
-        if requested > MAX_PLAYER_COMMAND_ROOTS {
-            return Err(PlayerCommandRegistrationError::RootLimitExceeded {
+        let requested_roots = routes.commands.len().saturating_add(requested_roots.len());
+        if requested_roots > MAX_PLAYER_COMMAND_ROOTS {
+            return Err(ScriptRouteRegistrationError::RootLimitExceeded {
                 limit: MAX_PLAYER_COMMAND_ROOTS,
-                requested,
+                requested: requested_roots,
             });
         }
-        if let Some((root, owner_plugin_id)) = requested_roots
+        let requested_channels = routes.payload_channels.len().saturating_add(channels.len());
+        if requested_channels > MAX_PLUGIN_PAYLOAD_CHANNELS {
+            return Err(ScriptRouteRegistrationError::ChannelLimitExceeded {
+                limit: MAX_PLUGIN_PAYLOAD_CHANNELS,
+                requested: requested_channels,
+            });
+        }
+        if let Some((root, owner_plugin_id)) = manifest
+            .player_command_roots()
             .iter()
-            .find_map(|root| owners.get(*root).map(|owner| (root, &owner.plugin_id)))
+            .chain(manifest.operator_command_roots())
+            .find_map(|root| {
+                routes
+                    .commands
+                    .get(root)
+                    .map(|owner| (root, owner.plugin_id.clone()))
+            })
         {
-            return Err(PlayerCommandRegistrationError::RootConflict {
-                root: (*root).clone(),
-                owner_plugin_id: owner_plugin_id.clone(),
+            return Err(ScriptRouteRegistrationError::RootConflict {
+                root: root.clone(),
+                owner_plugin_id,
             });
         }
-        for root in player_roots {
-            owners.insert(
+        if let Some((channel, owner_plugin_id)) = channels.iter().find_map(|channel| {
+            routes
+                .payload_channels
+                .get(*channel)
+                .map(|owner| (channel, owner.clone()))
+        }) {
+            return Err(ScriptRouteRegistrationError::ChannelConflict {
+                channel: (*channel).to_owned(),
+                owner_plugin_id,
+            });
+        }
+        for root in manifest.player_command_roots() {
+            routes.commands.insert(
                 root.clone(),
-                PlayerCommandOwner {
-                    plugin_id: plugin_id.to_owned(),
+                PluginCommandOwner {
+                    plugin_id: manifest.plugin_id().to_owned(),
                     operator_only: false,
                 },
             );
         }
-        for root in operator_roots {
-            owners.insert(
+        for root in manifest.operator_command_roots() {
+            routes.commands.insert(
                 root.clone(),
-                PlayerCommandOwner {
-                    plugin_id: plugin_id.to_owned(),
+                PluginCommandOwner {
+                    plugin_id: manifest.plugin_id().to_owned(),
                     operator_only: true,
                 },
             );
+        }
+        for channel in channels {
+            routes
+                .payload_channels
+                .insert(channel.to_owned(), manifest.plugin_id().to_owned());
         }
         Ok(())
     }
@@ -4705,8 +5085,15 @@ impl PlayerCommandOwners {
             self.clear_poisoned();
             return;
         }
-        match self.owners.write() {
-            Ok(mut owners) => owners.retain(|_, owner| owner.plugin_id != plugin_id),
+        match self.routes.write() {
+            Ok(mut routes) => {
+                routes
+                    .commands
+                    .retain(|_, owner| owner.plugin_id != plugin_id);
+                routes
+                    .payload_channels
+                    .retain(|_, owner| owner.as_str() != plugin_id);
+            }
             Err(poisoned) => {
                 poisoned.into_inner().clear();
                 self.disabled.store(true, Ordering::Release);
@@ -4718,20 +5105,29 @@ impl PlayerCommandOwners {
     fn replace_all(
         &self,
         manifests: &[ValidatedScriptPluginManifest],
-    ) -> Result<(), PlayerCommandRegistrationError> {
+    ) -> Result<(), ScriptRouteRegistrationError> {
         if self.disabled.load(Ordering::Acquire) {
-            return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+            return Err(ScriptRouteRegistrationError::AuthorityPoisoned);
         }
-        let mut replacement = BTreeMap::new();
-        let requested = manifests.iter().fold(0_usize, |count, manifest| {
+        let mut replacement = PluginRouteTable::default();
+        let requested_roots = manifests.iter().fold(0_usize, |count, manifest| {
             count
                 .saturating_add(manifest.player_command_roots().len())
                 .saturating_add(manifest.operator_command_roots().len())
         });
-        if requested > MAX_PLAYER_COMMAND_ROOTS {
-            return Err(PlayerCommandRegistrationError::RootLimitExceeded {
+        if requested_roots > MAX_PLAYER_COMMAND_ROOTS {
+            return Err(ScriptRouteRegistrationError::RootLimitExceeded {
                 limit: MAX_PLAYER_COMMAND_ROOTS,
-                requested,
+                requested: requested_roots,
+            });
+        }
+        let requested_channels = manifests.iter().fold(0_usize, |count, manifest| {
+            count.saturating_add(manifest.custom_payload_channels().len())
+        });
+        if requested_channels > MAX_PLUGIN_PAYLOAD_CHANNELS {
+            return Err(ScriptRouteRegistrationError::ChannelLimitExceeded {
+                limit: MAX_PLUGIN_PAYLOAD_CHANNELS,
+                requested: requested_channels,
             });
         }
         for manifest in manifests {
@@ -4746,29 +5142,40 @@ impl PlayerCommandOwners {
                         .map(|root| (root, true)),
                 )
             {
-                if let Some(owner) = replacement.insert(
+                if let Some(owner) = replacement.commands.insert(
                     root.clone(),
-                    PlayerCommandOwner {
+                    PluginCommandOwner {
                         plugin_id: manifest.plugin_id().to_owned(),
                         operator_only,
                     },
                 ) {
-                    return Err(PlayerCommandRegistrationError::RootConflict {
+                    return Err(ScriptRouteRegistrationError::RootConflict {
                         root: root.clone(),
                         owner_plugin_id: owner.plugin_id,
                     });
                 }
             }
+            for channel in manifest.custom_payload_channels() {
+                if let Some(owner) = replacement
+                    .payload_channels
+                    .insert(channel.to_owned(), manifest.plugin_id().to_owned())
+                {
+                    return Err(ScriptRouteRegistrationError::ChannelConflict {
+                        channel: channel.to_owned(),
+                        owner_plugin_id: owner,
+                    });
+                }
+            }
         }
-        let mut owners = match self.owners.write() {
-            Ok(owners) => owners,
+        let mut routes = match self.routes.write() {
+            Ok(routes) => routes,
             Err(poisoned) => {
                 poisoned.into_inner().clear();
                 self.disabled.store(true, Ordering::Release);
-                return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+                return Err(ScriptRouteRegistrationError::AuthorityPoisoned);
             }
         };
-        *owners = replacement;
+        *routes = replacement;
         Ok(())
     }
 
@@ -4783,8 +5190,8 @@ impl PlayerCommandOwners {
     }
 
     fn clear_poisoned(&self) {
-        match self.owners.write() {
-            Ok(mut owners) => owners.clear(),
+        match self.routes.write() {
+            Ok(mut routes) => routes.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
     }
@@ -4801,7 +5208,7 @@ pub fn script_boundary_pair(
         .min(MAX_SCRIPT_COMMAND_QUEUE_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(event_capacity);
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
-    let player_command_owners = PlayerCommandOwners::default();
+    let plugin_routes = PluginRouteAuthority::default();
     let host_admissions = Arc::new(HostAdmissionLedger::default());
     let coalesced_server_tick = Arc::new(StdMutex::new(CoalescedServerTick::default()));
     let weak_event_tx = event_tx.downgrade();
@@ -4814,7 +5221,7 @@ pub fn script_boundary_pair(
                 coalesced_server_tick: Arc::clone(&coalesced_server_tick),
             }),
             command_rx: Arc::new(Mutex::new(command_rx)),
-            player_command_owners: player_command_owners.clone(),
+            plugin_routes: plugin_routes.clone(),
             host_admissions: Arc::clone(&host_admissions),
         },
         ScriptHostEndpoint {
@@ -4823,7 +5230,7 @@ pub fn script_boundary_pair(
             coalesced_tick_due: false,
             highest_delivered_tick: None,
             command_tx,
-            player_command_owners,
+            plugin_routes,
             #[cfg(any(test, feature = "lua-runtime"))]
             host_admissions,
         },
@@ -4861,6 +5268,7 @@ pub enum ScriptCommandCapability {
     PlayerQueries,
     WorldTime,
     WorldBlocks,
+    CustomPayloadChannel { channel: String },
 }
 
 /// Stable non-owning category used in public command-admission errors.
@@ -4879,6 +5287,7 @@ pub enum ScriptCommandCapabilityKind {
     PlayerQueries,
     WorldTime,
     WorldBlocks,
+    CustomPayloadChannel,
 }
 
 impl ScriptCommandCapabilityKind {
@@ -4896,6 +5305,7 @@ impl ScriptCommandCapabilityKind {
             Self::PlayerQueries => "player_queries",
             Self::WorldTime => "world_time",
             Self::WorldBlocks => "world_blocks",
+            Self::CustomPayloadChannel => "custom_payload",
         }
     }
 
@@ -4913,6 +5323,7 @@ impl ScriptCommandCapabilityKind {
             Self::PlayerQueries => "player query",
             Self::WorldTime => "world time",
             Self::WorldBlocks => "world block mutation",
+            Self::CustomPayloadChannel => "custom payload channel",
         }
     }
 }
@@ -4931,6 +5342,7 @@ enum RequiredCommandCapability<'a> {
     PlayerQueries,
     WorldTime,
     WorldBlocks,
+    CustomPayloadChannel { channel: &'a str },
 }
 
 impl RequiredCommandCapability<'_> {
@@ -4950,6 +5362,7 @@ impl RequiredCommandCapability<'_> {
             Self::PlayerQueries => ScriptCommandCapabilityKind::PlayerQueries,
             Self::WorldTime => ScriptCommandCapabilityKind::WorldTime,
             Self::WorldBlocks => ScriptCommandCapabilityKind::WorldBlocks,
+            Self::CustomPayloadChannel { .. } => ScriptCommandCapabilityKind::CustomPayloadChannel,
         }
     }
 }
@@ -5215,6 +5628,20 @@ impl ScriptPluginManifest {
         self
     }
 
+    /// Declare exclusive ownership of one namespaced custom-payload channel.
+    pub fn declare_custom_payload_channel(mut self, channel: impl AsRef<str>) -> Self {
+        let channel = bounded_manifest_owned(
+            "custom payload channel",
+            channel.as_ref(),
+            MAX_SCRIPT_RESOURCE_ID_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            self.push_capability(ScriptCommandCapability::CustomPayloadChannel { channel });
+        }
+        self
+    }
+
     /// Declare a literal command root that players may invoke for this plugin.
     pub fn declare_player_command_root(mut self, root: impl AsRef<str>) -> Self {
         let root = bounded_manifest_owned(
@@ -5396,13 +5823,24 @@ impl ScriptPluginManifest {
             )?;
         }
         for capability in &self.declared_command_capabilities {
-            if let ScriptCommandCapability::SpawnEntityType { entity_type } = capability {
-                validate_manifest_field(
-                    "spawn entity type",
-                    entity_type,
-                    MAX_SCRIPT_RESOURCE_ID_BYTES,
-                    false,
-                )?;
+            match capability {
+                ScriptCommandCapability::SpawnEntityType { entity_type } => {
+                    validate_manifest_field(
+                        "spawn entity type",
+                        entity_type,
+                        MAX_SCRIPT_RESOURCE_ID_BYTES,
+                        false,
+                    )?;
+                }
+                ScriptCommandCapability::CustomPayloadChannel { channel } => {
+                    validate_manifest_field(
+                        "custom payload channel",
+                        channel,
+                        MAX_SCRIPT_RESOURCE_ID_BYTES,
+                        false,
+                    )?;
+                }
+                _ => {}
             }
         }
         for permission in &self.declared_permissions {
@@ -5511,6 +5949,16 @@ impl ScriptPluginManifest {
                     }
                     normalized_capabilities
                         .push(ScriptCommandCapability::SpawnEntityType { entity_type });
+                }
+                ScriptCommandCapability::CustomPayloadChannel { channel } => {
+                    let channel = validate_custom_payload_channel(channel)?.to_owned();
+                    let capability = ScriptCommandCapability::CustomPayloadChannel { channel };
+                    if normalized_capabilities.contains(&capability) {
+                        return Err(ScriptPluginManifestError::DuplicateCapability {
+                            capability: capability.clone(),
+                        });
+                    }
+                    normalized_capabilities.push(capability);
                 }
                 ScriptCommandCapability::EntityDamage
                 | ScriptCommandCapability::PluginStorage
@@ -5637,8 +6085,15 @@ impl ValidatedScriptPluginManifest {
         &self.operator_command_roots
     }
 
-    pub fn declared_permissions(&self) -> &[String] {
-        &self.declared_permissions
+    /// Return every custom-payload channel this manifest exclusively owns.
+    pub fn custom_payload_channels(&self) -> Vec<&str> {
+        self.declared_command_capabilities
+            .iter()
+            .filter_map(|capability| match capability {
+                ScriptCommandCapability::CustomPayloadChannel { channel } => Some(channel.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Trusted host-side conversion from validated manifest declarations to
@@ -5683,6 +6138,9 @@ impl ValidatedScriptPluginManifest {
                 }
                 ScriptCommandCapability::WorldBlocks => {
                     capabilities = capabilities.allow_world_blocks();
+                }
+                ScriptCommandCapability::CustomPayloadChannel { channel } => {
+                    capabilities = capabilities.allow_custom_payload_channel(channel);
                 }
             }
         }
@@ -5743,6 +6201,9 @@ pub enum ScriptPluginManifestError {
     },
     TooManySpawnEntityTypes {
         max: usize,
+    },
+    InvalidCustomPayloadChannel {
+        channel: String,
     },
     InvalidPlayerCommandRoot {
         root: String,
@@ -5828,6 +6289,7 @@ pub struct CommandCapabilities {
     player_queries: bool,
     world_time: bool,
     world_blocks: bool,
+    custom_payload_channels: Vec<String>,
 }
 
 impl CommandCapabilities {
@@ -5915,6 +6377,25 @@ impl CommandCapabilities {
         self
     }
 
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_custom_payload_channel(mut self, channel: impl AsRef<str>) -> Self {
+        let channel = channel.as_ref().to_owned();
+        if !self
+            .custom_payload_channels
+            .iter()
+            .any(|allowed| allowed == &channel)
+        {
+            self.custom_payload_channels.push(channel);
+        }
+        self
+    }
+    /// Return whether this plugin may exchange one custom-payload channel.
+    pub(crate) fn allows_custom_payload_channel(&self, channel: &str) -> bool {
+        self.custom_payload_channels
+            .iter()
+            .any(|allowed| allowed == channel)
+    }
+
     fn allows(&self, capability: RequiredCommandCapability<'_>) -> bool {
         match capability {
             RequiredCommandCapability::SpawnEntityType { entity_type } => self
@@ -5934,6 +6415,9 @@ impl CommandCapabilities {
             RequiredCommandCapability::PlayerQueries => self.player_queries,
             RequiredCommandCapability::WorldTime => self.world_time,
             RequiredCommandCapability::WorldBlocks => self.world_blocks,
+            RequiredCommandCapability::CustomPayloadChannel { channel } => {
+                self.allows_custom_payload_channel(channel)
+            }
         }
     }
 }
@@ -6065,6 +6549,8 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.teleport_result"
             | "villager.binding_result"
             | "villager.goal_result"
+            | "player.custom_payload"
+            | "player.client_brand"
     )
 }
 
@@ -6112,6 +6598,37 @@ fn validate_script_resource_id(value: &str) -> Result<String, ScriptPluginManife
         });
     }
     Ok(value.to_owned())
+}
+
+fn validate_custom_payload_channel(channel: &str) -> Result<&str, ScriptPluginManifestError> {
+    // Loader control traffic must use permission-checked typed commands.
+    if channel.len() > MAX_SCRIPT_RESOURCE_ID_BYTES || channel.starts_with("solaris:loader/") {
+        return Err(ScriptPluginManifestError::InvalidCustomPayloadChannel {
+            channel: channel.to_owned(),
+        });
+    }
+    let Some((namespace, path)) = channel.split_once(':') else {
+        return Err(ScriptPluginManifestError::InvalidCustomPayloadChannel {
+            channel: channel.to_owned(),
+        });
+    };
+    if namespace.is_empty()
+        || path.is_empty()
+        || path.contains(':')
+        || !namespace.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+        || !path.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/')
+        })
+    {
+        return Err(ScriptPluginManifestError::InvalidCustomPayloadChannel {
+            channel: channel.to_owned(),
+        });
+    }
+    Ok(channel)
 }
 
 fn validate_script_id(value: &str) -> Result<String, ScriptDtoError> {
@@ -7138,7 +7655,7 @@ mod tests {
                 .declare_player_command_root("hello")
                 .validate()
                 .unwrap();
-        endpoint.register_player_commands(&manifest).unwrap();
+        endpoint.register_plugin_routes(&manifest).unwrap();
 
         assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
         let context = || ScriptPlayerContext::new("player-7", "Alex", false, 0.0, 64.0, 0.0);
@@ -7199,7 +7716,7 @@ mod tests {
             .declare_player_command_root("owned")
             .validate()
             .unwrap();
-        endpoint.register_player_commands(&manifest).unwrap();
+        endpoint.register_plugin_routes(&manifest).unwrap();
         let context =
             ScriptPlayerContext::try_new("player-7", "Alex", false, 0.0, 64.0, 0.0).unwrap();
 
@@ -7279,7 +7796,7 @@ mod tests {
         assert!(manifest.player_command_roots().is_empty());
         assert_eq!(manifest.operator_command_roots(), ["adminday"]);
         let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        endpoint.register_player_commands(&manifest).unwrap();
+        endpoint.register_plugin_routes(&manifest).unwrap();
         boundary
             .try_enqueue_event(ScriptEvent::server_started())
             .unwrap();
@@ -7323,16 +7840,14 @@ mod tests {
                 .unwrap();
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
 
-        endpoint
-            .register_player_commands(&boundary_manifest)
-            .unwrap();
+        endpoint.register_plugin_routes(&boundary_manifest).unwrap();
         assert_eq!(
             boundary.player_command_roots().len(),
             MAX_PLAYER_COMMAND_ROOTS
         );
         assert_eq!(
-            endpoint.register_player_commands(&over_limit_manifest),
-            Err(PlayerCommandRegistrationError::RootLimitExceeded {
+            endpoint.register_plugin_routes(&over_limit_manifest),
+            Err(ScriptRouteRegistrationError::RootLimitExceeded {
                 limit: MAX_PLAYER_COMMAND_ROOTS,
                 requested: MAX_PLAYER_COMMAND_ROOTS + 1,
             })
@@ -8410,27 +8925,27 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_player_command_authority_is_cleared_and_permanently_disabled() {
+    fn poisoned_plugin_route_authority_is_cleared_and_permanently_disabled() {
         let (_boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
         let manifest = ScriptPluginManifest::new("owner", "Owner", "0.1.0", SCRIPT_API_VERSION)
             .declare_player_command_root("owned")
             .validate()
             .unwrap();
-        endpoint.register_player_commands(&manifest).unwrap();
-        let owners = endpoint.player_command_owners.clone();
+        endpoint.register_plugin_routes(&manifest).unwrap();
+        let routes = endpoint.plugin_routes.clone();
         std::thread::spawn(move || {
-            let _guard = owners.owners.write().unwrap();
-            panic!("poison player-command authority");
+            let _guard = routes.routes.write().unwrap();
+            panic!("poison plugin-route authority");
         })
         .join()
         .unwrap_err();
 
-        assert!(endpoint.player_command_owners.roots(false).is_empty());
+        assert!(endpoint.plugin_routes.roots(false).is_empty());
         assert_eq!(
-            endpoint.register_player_commands(&manifest),
-            Err(PlayerCommandRegistrationError::AuthorityPoisoned)
+            endpoint.register_plugin_routes(&manifest),
+            Err(ScriptRouteRegistrationError::AuthorityPoisoned)
         );
-        assert!(endpoint.player_command_owners.owner("owned").is_none());
+        assert!(endpoint.plugin_routes.owner("owned").is_none());
     }
 
     #[test]

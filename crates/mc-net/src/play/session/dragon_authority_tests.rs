@@ -182,6 +182,68 @@ fn dragon_player_part_damage_enters_dying_and_pays_fightless_xp_schedule() {
             OutboundCommand::DespawnEntity(entity) if entity.id == dragon_id
         )
     }));
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            &dispatch.command,
+            OutboundCommand::MoveEntityRelative(movement)
+                if movement.id == dragon_id && movement.position.y > dying.position.y
+                    && movement.wire_move.is_some()
+        )
+    }));
+}
+
+#[test]
+fn dragon_chunk_crossing_spawns_and_despawns_before_tracking_existing_observers() {
+    let registry = SessionRegistry::new();
+    let departing = register_test_session(&registry, "DragonDeparting");
+    let arriving = register_test_session(&registry, "DragonArriving");
+    let remaining = register_test_session(&registry, "DragonRemaining");
+    registry.mark_loaded(departing, (0, 0));
+    registry.mark_loaded(arriving, (1, 0));
+    registry.mark_loaded(remaining, (0, 0));
+    registry.mark_loaded(remaining, (1, 0));
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        43,
+        "minecraft:ender_dragon".to_owned(),
+        Vec3::new(15.9, 64.0, 0.5),
+    );
+    let dragon_id = registry.persisted_entity_records()[0].snapshot.id;
+    let _ = registry.tick_entities_and_collect_physics_queries(1);
+    {
+        let mut inner = registry.lock_session_entities("seed dragon boundary flight");
+        let expected = inner.entities.snapshot(dragon_id).expect("dragon");
+        let mut next = expected.clone();
+        next.velocity = Vec3::new(2.0, 0.0, 0.0);
+        assert!(inner.entities.replace_snapshot_if_current(expected, next));
+    }
+    let dispatches = registry.tick_dragon_air_combat(&SimulationAuthority::for_test(), 2);
+    let published = registry
+        .server_entity_snapshot(dragon_id)
+        .expect("flying dragon");
+    assert!(published.position.x >= 16.0);
+    assert!(dispatches.iter().any(|dispatch| {
+        dispatch.recipient.id == departing
+            && matches!(&dispatch.command, OutboundCommand::DespawnEntity(entity)
+                if entity.id == dragon_id)
+    }));
+    assert!(dispatches.iter().any(|dispatch| {
+        dispatch.recipient.id == arriving
+            && matches!(&dispatch.command, OutboundCommand::SpawnEntity(entity)
+                if entity.id == dragon_id && entity.position == published.position)
+    }));
+    let movement_recipients = dispatches
+        .iter()
+        .filter_map(|dispatch| match &dispatch.command {
+            OutboundCommand::MoveEntityRelative(movement)
+                if movement.id == dragon_id && movement.wire_move.is_some() =>
+            {
+                Some(dispatch.recipient.id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(movement_recipients, [remaining]);
 }
 
 #[test]
@@ -228,6 +290,14 @@ fn dragon_air_owner_moves_and_fires_owned_fireball_without_generic_goal_motion()
         .snapshot;
     assert_eq!(dragon.goal, mc_entity::GoalState::Idle);
     assert_ne!(dragon.position, initial.position);
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            &dispatch.command,
+            OutboundCommand::MoveEntityRelative(movement)
+                if movement.id == dragon_id && movement.position != initial.position
+                    && movement.wire_move.is_some()
+        )
+    }));
     assert!(dragon.retained.dragon_air.is_some());
     let fireball = registry
         .persisted_entity_records()

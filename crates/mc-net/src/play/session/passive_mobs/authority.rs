@@ -10,7 +10,7 @@ use super::super::{
     visibility_dispatches, visible_entity_observers_locked,
 };
 use super::{
-    BreedingAnimal, GrazingSheep, SHEEP_GRAZING_ACTION_TICK, SHEEP_GRAZING_ANIMATION_TICKS,
+    BreedingAnimal, SHEEP_GRAZING_ACTION_TICK, SHEEP_GRAZING_ANIMATION_TICKS,
     SheepGrazingCandidate, SheepGrazingPlan, advance_sheep_grazing, plan_breeding,
 };
 use crate::play::inventory::PlayerInventory;
@@ -239,24 +239,21 @@ impl SessionRegistry {
             return (0, Vec::new());
         }
         let breeding_tick = self.simulation_tick();
-        let active_entity_ids = self.active_simulation_entities.load_full();
-        if active_entity_ids.is_empty() {
+        let active_chunks = self.active_simulation_chunks.load_full();
+        if active_chunks.is_empty() {
             return (0, Vec::new());
         }
-        let breeding_tick_entities = self.simulation_inputs.breeding_tick_entities();
-        let active_entity_ids: HashSet<EntityId> = {
-            if breeding_tick_entities.len() < active_entity_ids.len() {
-                breeding_tick_entities
-                    .intersection(&active_entity_ids)
-                    .copied()
-                    .collect()
-            } else {
-                active_entity_ids
-                    .intersection(&breeding_tick_entities)
-                    .copied()
-                    .collect()
-            }
-        };
+        let active_entity_ids = self
+            .simulation_inputs
+            .breeding_tick_entities()
+            .iter()
+            .copied()
+            .filter(|entity| {
+                self.simulation_inputs
+                    .entity_chunk(*entity)
+                    .is_some_and(|chunk| active_chunks.contains(&chunk))
+            })
+            .collect::<HashSet<_>>();
         if active_entity_ids.is_empty() {
             return (0, Vec::new());
         }
@@ -478,7 +475,7 @@ impl SessionRegistry {
         tick: u64,
     ) -> SheepGrazingPlan {
         let (_, loaded_entity_ids) = self.simulation_inputs.active_entity_candidates();
-        let loaded_sheep_ids = {
+        let loaded_sheep_ids: std::collections::HashSet<_> = {
             let inner = self.lock_inner("snapshot loaded sheep index");
             if inner.sheep_entities.len() < loaded_entity_ids.len() {
                 inner
@@ -493,19 +490,15 @@ impl SessionRegistry {
                     .collect()
             }
         };
+        // The 50-tick baby phase includes every 1,000-tick adult start.
+        // Owners still inspect every selected ID for an active grazing timer.
+        let include_idle = loaded_sheep_ids
+            .iter()
+            .copied()
+            .filter(|&id| super::sheep_grazing_starts_on_tick(id, tick, true))
+            .collect();
         let mut entities = self.lock_entities("snapshot sheep grazing candidates");
-        let mut sheep_ids = Vec::new();
-        entities.visit_sheep_entities_for_ids(&loaded_sheep_ids, |entity| {
-            #[cfg(test)]
-            self.sheep_grazing_entity_visits
-                .fetch_add(1, Ordering::Relaxed);
-            if let Some(animal) = entity.animal {
-                sheep_ids.push(GrazingSheep {
-                    expected: entity.clone(),
-                    is_baby: animal.is_baby(),
-                });
-            }
-        });
+        let sheep_ids = entities.sheep_grazing_candidates(&loaded_sheep_ids, include_idle);
         #[cfg(test)]
         self.pause_during_sheep_grazing_plan_for_test();
         let mut advance = advance_sheep_grazing(tick, &sheep_ids);
@@ -518,17 +511,9 @@ impl SessionRegistry {
                 (update.expected, next)
             })
             .collect::<Vec<_>>();
-        let applied_updates = updates
-            .iter()
-            .map(|(_, next)| next.id)
-            .collect::<HashSet<_>>();
+        // Every action was derived from a timer update in this atomic batch.
         if !updates.is_empty() && !entities.replace_snapshots_if_current(updates) {
             advance.plan.actions.clear();
-        } else {
-            advance
-                .plan
-                .actions
-                .retain(|candidate| applied_updates.contains(&candidate.entity_id));
         }
         advance.plan
     }

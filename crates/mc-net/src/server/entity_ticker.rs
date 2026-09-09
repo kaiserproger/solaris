@@ -82,6 +82,87 @@ fn apply_runtime_tick_metrics_observation(
     }
 }
 
+fn log_runtime_tick_percentiles(
+    tick: u64,
+    world_time: u64,
+    tick_window_capacity: usize,
+    metrics: &RuntimeTickMetricsHandle,
+) {
+    let Some(percentiles) = metrics.snapshot() else {
+        return;
+    };
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    debug!(
+        tick,
+        world_time,
+        tick_window_source_tick = percentiles.source_tick,
+        tick_window_submit_us = percentiles.observer_submit_us,
+        tick_window_compute_us = percentiles.observer_compute_us,
+        tick_window_skipped = percentiles.observer_skipped_windows,
+        tick_window_samples = percentiles.tick.samples,
+        tick_window_capacity,
+        tick_p50_us = percentiles.tick.p50_us,
+        tick_p95_us = percentiles.tick.p95_us,
+        tick_p99_us = percentiles.tick.p99_us,
+        tick_max_us = percentiles.tick.max_us,
+        world_time_p50_us = percentiles.world_time.p50_us,
+        world_time_p95_us = percentiles.world_time.p95_us,
+        world_time_p99_us = percentiles.world_time.p99_us,
+        world_time_max_us = percentiles.world_time.max_us,
+        sheep_grazing_p50_us = percentiles.sheep_grazing.p50_us,
+        sheep_grazing_p95_us = percentiles.sheep_grazing.p95_us,
+        sheep_grazing_p99_us = percentiles.sheep_grazing.p99_us,
+        sheep_grazing_max_us = percentiles.sheep_grazing.max_us,
+        animal_breeding_p50_us = percentiles.animal_breeding.p50_us,
+        animal_breeding_p95_us = percentiles.animal_breeding.p95_us,
+        animal_breeding_p99_us = percentiles.animal_breeding.p99_us,
+        animal_breeding_max_us = percentiles.animal_breeding.max_us,
+        hostile_attacks_p50_us = percentiles.hostile_attacks.p50_us,
+        hostile_attacks_p95_us = percentiles.hostile_attacks.p95_us,
+        hostile_attacks_p99_us = percentiles.hostile_attacks.p99_us,
+        hostile_attacks_max_us = percentiles.hostile_attacks.max_us,
+        entity_goals_p50_us = percentiles.entity_goals.p50_us,
+        entity_goals_p95_us = percentiles.entity_goals.p95_us,
+        entity_goals_p99_us = percentiles.entity_goals.p99_us,
+        entity_goals_max_us = percentiles.entity_goals.max_us,
+        entity_physics_p50_us = percentiles.entity_physics.p50_us,
+        entity_physics_p95_us = percentiles.entity_physics.p95_us,
+        entity_physics_p99_us = percentiles.entity_physics.p99_us,
+        entity_physics_max_us = percentiles.entity_physics.max_us,
+        entity_dispatch_p50_us = percentiles.entity_dispatch.p50_us,
+        entity_dispatch_p95_us = percentiles.entity_dispatch.p95_us,
+        entity_dispatch_p99_us = percentiles.entity_dispatch.p99_us,
+        entity_dispatch_max_us = percentiles.entity_dispatch.max_us,
+        campfire_tick_p50_us = percentiles.campfire_tick.p50_us,
+        campfire_tick_p95_us = percentiles.campfire_tick.p95_us,
+        campfire_tick_p99_us = percentiles.campfire_tick.p99_us,
+        campfire_tick_max_us = percentiles.campfire_tick.max_us,
+        inhabited_time_p50_us = percentiles.inhabited_time.p50_us,
+        inhabited_time_p95_us = percentiles.inhabited_time.p95_us,
+        inhabited_time_p99_us = percentiles.inhabited_time.p99_us,
+        inhabited_time_max_us = percentiles.inhabited_time.max_us,
+        entity_save_p50_us = percentiles.entity_save.p50_us,
+        entity_save_p95_us = percentiles.entity_save.p95_us,
+        entity_save_p99_us = percentiles.entity_save.p99_us,
+        entity_save_max_us = percentiles.entity_save.max_us,
+        random_tick_p50_us = percentiles.random_tick.p50_us,
+        random_tick_p95_us = percentiles.random_tick.p95_us,
+        random_tick_p99_us = percentiles.random_tick.p99_us,
+        random_tick_max_us = percentiles.random_tick.max_us,
+        block_tick_p50_us = percentiles.block_tick.p50_us,
+        block_tick_p95_us = percentiles.block_tick.p95_us,
+        block_tick_p99_us = percentiles.block_tick.p99_us,
+        block_tick_max_us = percentiles.block_tick.max_us,
+        fluid_tick_p50_us = percentiles.fluid_tick.p50_us,
+        fluid_tick_p95_us = percentiles.fluid_tick.p95_us,
+        fluid_tick_p99_us = percentiles.fluid_tick.p99_us,
+        fluid_tick_max_us = percentiles.fluid_tick.max_us,
+        "runtime tick percentile window"
+    );
+}
+
 pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
     let EntityTickerContext {
         prewarmed_entity_pathing_states,
@@ -365,39 +446,13 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
         entity_sessions.synchronize_entity_lifecycle_epoch(tick);
         simulation_owner.tick_dying_entities(&entity_sessions, entity_sessions.simulation_tick());
         let world_time_us = elapsed_us(started);
-        natural_spawn_ticker.tick(
-            &entity_sessions,
-            tick,
-            entity_world_read.as_ref(),
-            entity_pathing_materials.as_deref(),
-        );
-        let started = Instant::now();
-        simulation_owner
-            .run_sheep_grazing(
-                &entity_config,
-                &entity_sessions,
-                entity_world_read.as_ref(),
-                entity_world_mutation.as_ref(),
-                tick,
-            )
-            .await;
-        let sheep_grazing_us = elapsed_us(started);
-        let mut animal_breeding_us = 0;
-        simulation_owner.tick_dragon_authority(&entity_sessions, tick);
-        // A previous tick's async entity physics job may still be in flight.
-        // Wait for it here and apply its result with the off-tick completion
-        // semantics (including the primed-TNT completion behavior) instead of
-        // skipping this tick's entity batch: every tick must run the normal
-        // entity goal and physics work; overload must never hide as skipped
-        // simulation ticks.
+        // Finish the previous tick's physics before current-tick autonomous
+        // entity mutations. The post-goal compact kinematics fence belongs to
+        // that previous physics result; grazing/AI mutations must not
+        // invalidate it and force the whole active population through the
+        // full-snapshot fallback.
         if let Some(job) = entity_physics_job.take() {
-            #[cfg(feature = "load-bench")]
-            let prev_job_wait_started = Instant::now();
             let prev_job_result = job.await;
-            #[cfg(feature = "load-bench")]
-            let prev_job_wait_us = elapsed_us(prev_job_wait_started);
-            #[cfg(feature = "load-bench")]
-            let prev_job_apply_started = Instant::now();
             apply_entity_physics_job_result(
                 prev_job_result,
                 &simulation_owner,
@@ -407,13 +462,6 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 entity_world_read.as_ref(),
             )
             .await;
-            #[cfg(feature = "load-bench")]
-            eprintln!(
-                "PHYSICS_PREV_JOB tick={} wait_us={} apply_us={}",
-                tick,
-                prev_job_wait_us,
-                elapsed_us(prev_job_apply_started)
-            );
             simulation_owner
                 .tick_primed_tnt(
                     &entity_sessions,
@@ -436,22 +484,41 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 )
                 .await;
         }
-        let started = Instant::now();
-        let queries = simulation_owner.collect_entity_physics_queries(
+        natural_spawn_ticker.tick(
             &entity_sessions,
-            &entity_chunk_pipeline_resources,
             tick,
-            play::EntitySimulationTickPolicy {
-                pathing_candidates_per_entity: work_budgets.entity_pathing_candidates,
-                simulation_distance: simulation_policy.simulation_distance,
-            },
-            simulation_owner.entity_world_context(
-                entity_world_read.as_ref(),
-                entity_pathing_materials.as_deref(),
-                entity_config.blocks.as_ref(),
-                entity_config.items.as_ref(),
-            ),
+            entity_world_read.as_ref(),
+            entity_pathing_materials.as_deref(),
         );
+        let started = Instant::now();
+        simulation_owner
+            .run_sheep_grazing(
+                &entity_config,
+                &entity_sessions,
+                entity_world_read.as_ref(),
+                entity_world_mutation.as_ref(),
+                tick,
+            )
+            .await;
+        let sheep_grazing_us = elapsed_us(started);
+        let mut animal_breeding_us = 0;
+        simulation_owner.tick_dragon_authority(&entity_sessions, tick);
+        let started = Instant::now();
+        let (mut queries, mut owner_fence, villager_population, regional_prepared) =
+            entity_sessions.tick_entities_and_collect_physics_queries_regional(
+                &entity_chunk_pipeline_resources,
+                tick,
+                play::EntitySimulationTickPolicy {
+                    pathing_candidates_per_entity: work_budgets.entity_pathing_candidates,
+                    simulation_distance: simulation_policy.simulation_distance,
+                },
+                play::EntitySimulationWorldContext::new(
+                    entity_world_read.as_ref(),
+                    entity_pathing_materials.as_ref(),
+                    entity_config.blocks.as_ref(),
+                    entity_config.items.as_ref(),
+                ),
+            );
         let entity_goals_us = elapsed_us(started);
         let started = Instant::now();
         simulation_owner.tick_hostile_attacks(
@@ -469,6 +536,7 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
         if let Some((food_items, villager_type_id, item_type_id)) = villager_population_ids {
             simulation_owner.tick_villager_population(
                 &entity_sessions,
+                &villager_population,
                 tick,
                 food_items,
                 villager_type_id,
@@ -485,24 +553,58 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 entity_pathing_materials.as_deref(),
             );
         }
+        let entity_physics_started = Instant::now();
+        let mut regional_commit = None;
+        let mut regional_commit_us = 0;
+        let mut lane_timings = mc_entity::LaneCommitTimings::default();
+        if let Some(prepared) = regional_prepared {
+            let regional_commit_started = Instant::now();
+            let had_queries = !queries.is_empty();
+            let (mut regional_queries, regional_fence, committed, lane_commit_timings) =
+                entity_sessions.commit_owned_region_physics(prepared);
+            lane_timings = lane_commit_timings;
+            if !regional_queries.is_empty() {
+                owner_fence = if had_queries { None } else { regional_fence };
+                queries.append(&mut regional_queries);
+            }
+            regional_commit = committed;
+            regional_commit_us = elapsed_us(regional_commit_started);
+        }
         let entity_query_count = queries.len();
+        let physics_prepare_us: u64;
+        let physics_step_us: u64;
         let (steps, entity_physics_us, entity_dispatch_us) = {
-            let started = Instant::now();
+            let started = entity_physics_started;
+            let physics_prepare_started = Instant::now();
             let inputs =
                 prepare_entity_physics_inputs(&entity_config, entity_world_read.as_ref(), &queries);
+            physics_prepare_us = elapsed_us(physics_prepare_started);
             if inputs.len() > ENTITY_PHYSICS_INLINE_LIMIT {
+                let _ = entity_sessions.apply_entity_physics_if_current_and_dispatch_regional(
+                    &entity_chunk_pipeline_resources,
+                    tick,
+                    &[],
+                    &[],
+                    None,
+                    &play::EntityProjectilePhysicsFacts::default(),
+                    regional_commit,
+                );
                 entity_physics_job = Some(spawn_entity_physics_job(
                     tick,
                     queries,
+                    owner_fence,
                     entity_chunk_pipeline_resources.clone(),
                     inputs,
                 ));
+                physics_step_us = 0;
                 (Vec::new(), elapsed_us(started), 0)
             } else {
                 let physics_snapshot = inputs.first().map(|input| Arc::clone(&input.snapshot));
-                let steps =
+                let physics_step_started = Instant::now();
+                let mut steps =
                     step_entity_physics_inputs(entity_chunk_pipeline_resources.clone(), inputs)
                         .await;
+                physics_step_us = elapsed_us(physics_step_started);
                 let entity_physics_us = elapsed_us(started);
                 let world_is_current = physics_snapshot.as_ref().is_none_or(|snapshot| {
                     entity_world_read.as_ref().is_some_and(|world_read| {
@@ -514,34 +616,37 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                         tick,
                         "discarded inline entity physics after world snapshot changed"
                     );
-                    (Vec::new(), entity_physics_us, 0)
-                } else {
-                    let projectile_physics_facts =
-                        inline_projectile_facts(tick, &queries, physics_snapshot, &steps);
-                    let started = Instant::now();
-                    let accepted_steps = simulation_owner.apply_entity_physics_if_current(
-                        &entity_sessions,
+                    queries.clear();
+                    steps.clear();
+                    owner_fence = None;
+                }
+                let projectile_physics_facts =
+                    inline_projectile_facts(tick, &queries, physics_snapshot, &steps);
+                let started = Instant::now();
+                let accepted_steps = entity_sessions
+                    .apply_entity_physics_if_current_and_dispatch_regional(
                         &entity_chunk_pipeline_resources,
                         tick,
                         &queries,
                         &steps,
+                        owner_fence,
                         &projectile_physics_facts,
+                        regional_commit,
                     );
-                    let entity_dispatch_us = elapsed_us(started);
-                    let landed_falling_blocks =
-                        entity_sessions.landed_falling_blocks(&queries, &accepted_steps);
-                    if !landed_falling_blocks.is_empty() {
-                        simulation_owner
-                            .land_falling_blocks(
-                                &entity_config,
-                                &entity_sessions,
-                                entity_world_read.as_ref(),
-                                &landed_falling_blocks,
-                            )
-                            .await;
-                    }
-                    (steps, entity_physics_us, entity_dispatch_us)
+                let entity_dispatch_us = elapsed_us(started);
+                let landed_falling_blocks =
+                    entity_sessions.landed_falling_blocks(&queries, &accepted_steps);
+                if !landed_falling_blocks.is_empty() {
+                    simulation_owner
+                        .land_falling_blocks(
+                            &entity_config,
+                            &entity_sessions,
+                            entity_world_read.as_ref(),
+                            &landed_falling_blocks,
+                        )
+                        .await;
                 }
+                (steps, entity_physics_us, entity_dispatch_us)
             }
         };
         let entity_step_count = steps.len();
@@ -785,7 +890,7 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
         };
         let entity_update_budget_total = selected_entity_updates;
         let entity_update_budget_per_lane =
-            selected_entity_updates.div_ceil(entity_chunk_pipeline_resources.cpu_limit().max(1));
+            selected_entity_updates.div_ceil(entity_chunk_pipeline_resources.cpu_capacity().max(1));
         let entity_update_rotation_ticks =
             active_entity_population.div_ceil(selected_entity_updates.max(1));
         let movement_budget =
@@ -836,77 +941,12 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
             ) {
                 scheduled_budget_exhausted_since_publish = false;
             }
-            if let Some(percentiles) = entity_tick_metrics.snapshot()
-                && tracing::enabled!(tracing::Level::DEBUG)
-            {
-                debug!(
-                    tick,
-                    world_time,
-                    tick_window_source_tick = percentiles.source_tick,
-                    tick_window_submit_us = percentiles.observer_submit_us,
-                    tick_window_compute_us = percentiles.observer_compute_us,
-                    tick_window_skipped = percentiles.observer_skipped_windows,
-                    tick_window_samples = percentiles.tick.samples,
-                    tick_window_capacity = tick_metrics.capacity(),
-                    tick_p50_us = percentiles.tick.p50_us,
-                    tick_p95_us = percentiles.tick.p95_us,
-                    tick_p99_us = percentiles.tick.p99_us,
-                    tick_max_us = percentiles.tick.max_us,
-                    world_time_p50_us = percentiles.world_time.p50_us,
-                    world_time_p95_us = percentiles.world_time.p95_us,
-                    world_time_p99_us = percentiles.world_time.p99_us,
-                    world_time_max_us = percentiles.world_time.max_us,
-                    sheep_grazing_p50_us = percentiles.sheep_grazing.p50_us,
-                    sheep_grazing_p95_us = percentiles.sheep_grazing.p95_us,
-                    sheep_grazing_p99_us = percentiles.sheep_grazing.p99_us,
-                    sheep_grazing_max_us = percentiles.sheep_grazing.max_us,
-                    animal_breeding_p50_us = percentiles.animal_breeding.p50_us,
-                    animal_breeding_p95_us = percentiles.animal_breeding.p95_us,
-                    animal_breeding_p99_us = percentiles.animal_breeding.p99_us,
-                    animal_breeding_max_us = percentiles.animal_breeding.max_us,
-                    hostile_attacks_p50_us = percentiles.hostile_attacks.p50_us,
-                    hostile_attacks_p95_us = percentiles.hostile_attacks.p95_us,
-                    hostile_attacks_p99_us = percentiles.hostile_attacks.p99_us,
-                    hostile_attacks_max_us = percentiles.hostile_attacks.max_us,
-                    entity_goals_p50_us = percentiles.entity_goals.p50_us,
-                    entity_goals_p95_us = percentiles.entity_goals.p95_us,
-                    entity_goals_p99_us = percentiles.entity_goals.p99_us,
-                    entity_goals_max_us = percentiles.entity_goals.max_us,
-                    entity_physics_p50_us = percentiles.entity_physics.p50_us,
-                    entity_physics_p95_us = percentiles.entity_physics.p95_us,
-                    entity_physics_p99_us = percentiles.entity_physics.p99_us,
-                    entity_physics_max_us = percentiles.entity_physics.max_us,
-                    entity_dispatch_p50_us = percentiles.entity_dispatch.p50_us,
-                    entity_dispatch_p95_us = percentiles.entity_dispatch.p95_us,
-                    entity_dispatch_p99_us = percentiles.entity_dispatch.p99_us,
-                    entity_dispatch_max_us = percentiles.entity_dispatch.max_us,
-                    campfire_tick_p50_us = percentiles.campfire_tick.p50_us,
-                    campfire_tick_p95_us = percentiles.campfire_tick.p95_us,
-                    campfire_tick_p99_us = percentiles.campfire_tick.p99_us,
-                    campfire_tick_max_us = percentiles.campfire_tick.max_us,
-                    inhabited_time_p50_us = percentiles.inhabited_time.p50_us,
-                    inhabited_time_p95_us = percentiles.inhabited_time.p95_us,
-                    inhabited_time_p99_us = percentiles.inhabited_time.p99_us,
-                    inhabited_time_max_us = percentiles.inhabited_time.max_us,
-                    entity_save_p50_us = percentiles.entity_save.p50_us,
-                    entity_save_p95_us = percentiles.entity_save.p95_us,
-                    entity_save_p99_us = percentiles.entity_save.p99_us,
-                    entity_save_max_us = percentiles.entity_save.max_us,
-                    random_tick_p50_us = percentiles.random_tick.p50_us,
-                    random_tick_p95_us = percentiles.random_tick.p95_us,
-                    random_tick_p99_us = percentiles.random_tick.p99_us,
-                    random_tick_max_us = percentiles.random_tick.max_us,
-                    block_tick_p50_us = percentiles.block_tick.p50_us,
-                    block_tick_p95_us = percentiles.block_tick.p95_us,
-                    block_tick_p99_us = percentiles.block_tick.p99_us,
-                    block_tick_max_us = percentiles.block_tick.max_us,
-                    fluid_tick_p50_us = percentiles.fluid_tick.p50_us,
-                    fluid_tick_p95_us = percentiles.fluid_tick.p95_us,
-                    fluid_tick_p99_us = percentiles.fluid_tick.p99_us,
-                    fluid_tick_max_us = percentiles.fluid_tick.max_us,
-                    "runtime tick percentile window"
-                );
-            }
+            log_runtime_tick_percentiles(
+                tick,
+                world_time,
+                tick_metrics.capacity(),
+                &entity_tick_metrics,
+            );
         }
         if metrics_log_gate.should_log(tick, tick_us, metrics_policy) {
             let pressure = entity_sessions.pressure_snapshot();
@@ -920,8 +960,13 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                     sheep_grazing_us,
                     animal_breeding_us,
                     hostile_attacks_us,
-                    entity_goals_us,
-                    entity_physics_us,
+                    lane_commit_exec_us = lane_timings.exec_us,
+                    lane_admission_wait_us = lane_timings.admission_wait_us,
+                    lane_worker_wait_us = lane_timings.worker_wait_us,
+                    lane_worker_exec_us = lane_timings.worker_exec_us,
+                    regional_commit_us,
+                    physics_prepare_us,
+                    physics_step_us,
                     entity_dispatch_us,
                     campfire_tick_us,
                     furnace_tick_us,
@@ -1041,8 +1086,12 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                     sheep_grazing_us,
                     animal_breeding_us,
                     hostile_attacks_us,
-                    entity_goals_us,
-                    entity_physics_us,
+                    lane_commit_exec_us = lane_timings.exec_us,
+                    lane_admission_wait_us = lane_timings.admission_wait_us,
+                    lane_worker_wait_us = lane_timings.worker_wait_us,
+                    lane_worker_exec_us = lane_timings.worker_exec_us,
+                    physics_prepare_us,
+                    physics_step_us,
                     entity_dispatch_us,
                     campfire_tick_us,
                     furnace_tick_us,

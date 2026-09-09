@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "mc-data"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "mc-domain",
  "mc-nbt",
@@ -1781,11 +1781,11 @@ dependencies = [
 
 [[package]]
 name = "mc-domain"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 
 [[package]]
 name = "mc-entity"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "bevy_ecs",
  "mc-data",
@@ -1797,16 +1797,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "mc-extension"
-version = "0.0.2-alpha.1"
-dependencies = [
- "bytes",
- "tokio",
-]
-
-[[package]]
 name = "mc-nbt"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "bytes",
  "proptest",
@@ -1815,19 +1807,17 @@ dependencies = [
 
 [[package]]
 name = "mc-net"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "aes",
  "arc-swap",
  "bytes",
  "cfb8",
  "crc32fast",
- "fd-lock",
  "flate2",
  "mc-data",
  "mc-domain",
  "mc-entity",
- "mc-extension",
  "mc-nbt",
  "mc-physics",
  "mc-protocol",
@@ -1851,14 +1841,14 @@ dependencies = [
 
 [[package]]
 name = "mc-physics"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "smallvec",
 ]
 
 [[package]]
 name = "mc-protocol"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "bytes",
  "flate2",
@@ -1872,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "mc-script"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "luaur",
  "mlua",
@@ -1886,14 +1876,13 @@ dependencies = [
 
 [[package]]
 name = "mc-server"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "bytes",
  "clap",
  "mc-data",
- "mc-extension",
  "mc-nbt",
  "mc-net",
  "mc-protocol",
@@ -1916,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "mc-test-harness"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1935,14 +1924,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
  "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "mc-world"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -1958,9 +1946,8 @@ dependencies = [
 
 [[package]]
 name = "mc-worldgen"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 dependencies = [
- "bytes",
  "flate2",
  "mc-data",
  "mc-nbt",
@@ -3991,7 +3978,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.0.2-alpha.1"
+version = "0.0.3-alpha.1"
 
 [[package]]
 name = "yoke"

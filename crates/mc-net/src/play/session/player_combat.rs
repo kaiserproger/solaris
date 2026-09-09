@@ -1611,10 +1611,7 @@ mod tests {
                 ..
             } if player_id.value() == target && context.username() == "PvpDeathTarget"
         ));
-        assert!(matches!(
-            deaths.try_recv_required(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(deaths.try_recv_required().is_none());
     }
 
     #[test]
@@ -1660,10 +1657,7 @@ mod tests {
                 ..
             } if player_id.value() == target && context.username() == "ArrowDeath"
         ));
-        assert!(matches!(
-            deaths.try_recv_required(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(deaths.try_recv_required().is_none());
     }
 
     #[test]

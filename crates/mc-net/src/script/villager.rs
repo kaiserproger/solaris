@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use mc_script::{
     AdmittedScriptCommand, ScriptCommand, ScriptDtoError, ScriptVillagerBinding,
     ScriptVillagerBindingFailure, ScriptVillagerGoal, ScriptVillagerGoalFailure,
+    ScriptVillagerReleaseFailure,
 };
 use rsa::rand_core::{OsRng, RngCore};
 
@@ -160,6 +161,57 @@ impl PluginVillagerAdapter {
         let accepted = failure.is_none();
         let event = admitted
             .villager_goal_result(failure)
+            .map_err(VillagerAdapterError::InvalidResult)?;
+        self.deliver(event).await?;
+        Ok(VillagerCommandOutcome { accepted })
+    }
+    pub(crate) async fn route_release_admitted(
+        &self,
+        admitted: AdmittedScriptCommand,
+        sessions: &SessionRegistry,
+    ) -> Result<VillagerCommandOutcome, VillagerAdapterError> {
+        let ScriptCommand::ReleaseVillagerBinding { request } = admitted.request() else {
+            return Err(VillagerAdapterError::WrongCommand);
+        };
+        let request = request.clone();
+        let current_tick = sessions.simulation_tick();
+        self.purge_expired_bindings(current_tick);
+        let owns_binding = self
+            .lock_bindings()
+            .get(request.binding_token())
+            .is_some_and(|binding| binding.plugin_id == admitted.plugin_id());
+
+        let failure = if !owns_binding {
+            Some(ScriptVillagerReleaseFailure::BindingUnavailable)
+        } else {
+            match sessions
+                .release_script_villager_binding(request.binding_token().to_owned())
+                .await
+            {
+                Ok(released) => {
+                    self.remove_binding(request.binding_token());
+                    if released {
+                        None
+                    } else {
+                        Some(ScriptVillagerReleaseFailure::BindingUnavailable)
+                    }
+                }
+                Err(
+                    mc_entity::RegionOwnerLaneError::InvalidQuery
+                    | mc_entity::RegionOwnerLaneError::InvalidMutation,
+                ) => {
+                    self.remove_binding(request.binding_token());
+                    Some(ScriptVillagerReleaseFailure::BindingUnavailable)
+                }
+                Err(mc_entity::RegionOwnerLaneError::Busy) => {
+                    Some(ScriptVillagerReleaseFailure::Busy)
+                }
+                Err(error) => return Err(VillagerAdapterError::BindingOwner(error)),
+            }
+        };
+        let accepted = failure.is_none();
+        let event = admitted
+            .villager_release_result(failure)
             .map_err(VillagerAdapterError::InvalidResult)?;
         self.deliver(event).await?;
         Ok(VillagerCommandOutcome { accepted })

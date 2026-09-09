@@ -32,6 +32,15 @@ the plugin. Results return as exact targeted events. A future coroutine/await
 helper may wrap those events but cannot introduce polling or elapsed-time
 success.
 
+Source ownership (2026-09-06): first-party Luau packages live in the independent
+sibling `solaris-default-plugins` repository. Production core discovers deployed
+packages through the existing `plugins.directory` boundary; it no longer embeds
+first-party source or exposes `plugins.bundled`. Strict/expected deployment
+validation still covers the complete discovered set. Core builds without the
+plugin checkout; integration tests explicitly read that checkout to exercise
+actual first-party behavior. This relocation does not change Lua API 0.6.0 or
+grant first-party packages access beyond the ordinary plugin boundary.
+
 ## Event and mutation classes
 
 Ordinary observations such as chat, death, zone entry, and completed world

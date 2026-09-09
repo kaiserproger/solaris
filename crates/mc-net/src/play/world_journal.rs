@@ -1,7 +1,8 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mc_data::items::ItemRegistry;
@@ -28,7 +29,7 @@ const MAX_PENDING_DECISIONS: usize = 65_536;
 const MAX_IMAGE_NBT_BYTES: usize = mc_nbt::MAX_NBT_LENGTH;
 const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
-const WRITER_QUEUE_CAPACITY: usize = 16;
+const WRITER_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorldChunkImage {
@@ -53,9 +54,6 @@ pub(crate) struct WorldChunkDecision {
     current_tick: u64,
     images: Vec<WorldChunkImage>,
 }
-
-type JournalRecovery = (u64, u64, Vec<WorldChunkDecision>);
-type JournalInitialization = Result<JournalRecovery, WorldChunkJournalError>;
 
 impl WorldChunkDecision {
     #[must_use]
@@ -154,14 +152,6 @@ pub(crate) enum WorldChunkJournalError {
     },
     #[error("world chunk journal writer closed during {operation}")]
     WriterClosed { operation: &'static str },
-    #[error("world chunk journal append outcome is unknown at {path}: {source}")]
-    AppendOutcomeUnknown {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("world chunk journal append completion was lost; its outcome is unknown")]
-    AppendCompletionLost,
     #[error("world chunk journal checkpoint outcome is unknown at {path}: {source}")]
     CheckpointOutcomeUnknown {
         path: PathBuf,
@@ -170,53 +160,105 @@ pub(crate) enum WorldChunkJournalError {
     },
     #[error("world chunk journal checkpoint completion was lost; its outcome is unknown")]
     CheckpointCompletionLost,
-    #[error("world chunk journal reservation outcome is unknown at {path}: {source}")]
-    ReservationOutcomeUnknown {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("world chunk journal reservation completion was lost; its outcome is unknown")]
-    ReservationCompletionLost,
     #[error("world chunk journal is poisoned by an earlier append with unknown outcome")]
     PoisonedOutcomeUnknown,
 }
 
 impl WorldChunkJournalError {
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "journal callers must distinguish unknown append outcomes"
-    )]
     pub(crate) fn outcome_unknown(&self) -> bool {
         matches!(
             self,
-            Self::AppendOutcomeUnknown { .. }
-                | Self::AppendCompletionLost
-                | Self::CheckpointOutcomeUnknown { .. }
+            Self::CheckpointOutcomeUnknown { .. }
                 | Self::CheckpointCompletionLost
-                | Self::ReservationOutcomeUnknown { .. }
-                | Self::ReservationCompletionLost
                 | Self::PoisonedOutcomeUnknown
         )
+    }
+}
+
+pub(crate) struct JournalWriter {
+    pub(super) requests: std::sync::mpsc::SyncSender<WriterRequest>,
+    pub(super) failed: Arc<AtomicBool>,
+    pub(super) failure_reporter: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    advanced: Arc<tokio::sync::Notify>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    lease: Mutex<Option<File>>,
+}
+
+impl JournalWriter {
+    pub(crate) fn open(world_root: &Path) -> std::io::Result<Arc<Self>> {
+        let (requests, receiver) = std::sync::mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let failed = Arc::new(AtomicBool::new(false));
+        let failure_reporter = Arc::new(Mutex::new(None::<tokio::sync::watch::Sender<bool>>));
+        let advanced = Arc::new(tokio::sync::Notify::new());
+        let directory = world_root.join(SOLARIS_DIRECTORY);
+        let worker_failed = Arc::clone(&failed);
+        let worker_reporter = Arc::clone(&failure_reporter);
+        let worker_advanced = Arc::clone(&advanced);
+        let worker = std::thread::Builder::new()
+            .name("solaris-journal".to_owned())
+            .spawn(move || {
+                if let Err(error) = run_writer(&directory, receiver) {
+                    tracing::error!(?error, "journal writer failed");
+                    worker_failed.store(true, Ordering::Release);
+                    if let Some(reporter) =
+                        &*worker_reporter.lock().expect("journal failure reporter")
+                    {
+                        reporter.send_replace(true);
+                    }
+                    worker_advanced.notify_waiters();
+                }
+            })?;
+        Ok(Arc::new(Self {
+            requests,
+            failed,
+            failure_reporter,
+            advanced,
+            worker: Some(worker),
+            lease: Mutex::new(None),
+        }))
+    }
+
+    pub(crate) fn flush(&self) -> Result<(), WorldChunkJournalError> {
+        let (reply, completion) = std::sync::mpsc::sync_channel(0);
+        self.requests
+            .send(WriterRequest::Flush { reply })
+            .map_err(|_| WorldChunkJournalError::WriterClosed { operation: "flush" })?;
+        completion
+            .recv()
+            .map_err(|_| WorldChunkJournalError::CheckpointCompletionLost)
+    }
+}
+
+impl Drop for JournalWriter {
+    fn drop(&mut self) {
+        let (reply, completion) = std::sync::mpsc::channel();
+        let _ = self.requests.send(WriterRequest::Shutdown { reply });
+        let _ = completion.recv();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct WorldChunkJournal {
     shared: Arc<JournalShared>,
+    pub(crate) writer: Arc<JournalWriter>,
 }
 
 struct JournalShared {
     blocks: Arc<BlockRegistry>,
     items: Arc<ItemRegistry>,
     state: Mutex<JournalState>,
-    append_advanced: tokio::sync::Notify,
+    append_advanced: Arc<tokio::sync::Notify>,
 }
 
 impl JournalShared {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, JournalState> {
-        lock_authoritative_mutex(&self.state, "persistence.world_chunk_journal")
+        let mut state = lock_authoritative_mutex(&self.state, "persistence.world_chunk_journal");
+        state.poisoned |= state.writer.failed.load(Ordering::Acquire);
+        state
     }
 }
 
@@ -228,7 +270,7 @@ struct JournalState {
     next_append_id: u64,
     poisoned: bool,
     requests: std::sync::mpsc::SyncSender<WriterRequest>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    writer: Arc<JournalWriter>,
 }
 
 impl fmt::Debug for WorldChunkJournal {
@@ -249,60 +291,46 @@ impl fmt::Debug for WorldChunkJournal {
     }
 }
 
-impl Drop for JournalState {
-    fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            shutdown_writer(&self.requests, worker);
-        }
-    }
-}
-
-fn shutdown_writer(
-    requests: &std::sync::mpsc::SyncSender<WriterRequest>,
-    worker: std::thread::JoinHandle<()>,
-) {
-    let (reply, completion) = std::sync::mpsc::channel();
-    let _ = requests.send(WriterRequest::Shutdown { reply });
-    let _ = completion.recv();
-    let _ = worker.join();
-}
-
 impl WorldChunkJournal {
+    #[cfg(test)]
+    pub(crate) fn open_for_test(
+        root: &Path,
+        blocks: Arc<BlockRegistry>,
+        items: Arc<ItemRegistry>,
+    ) -> Result<(Self, Vec<WorldChunkDecision>), WorldChunkJournalError> {
+        Self::open(root, blocks, items, JournalWriter::open(root).unwrap())
+    }
+
     pub(crate) fn open(
         world_root: &Path,
         blocks: Arc<BlockRegistry>,
         items: Arc<ItemRegistry>,
+        writer: Arc<JournalWriter>,
     ) -> Result<(Self, Vec<WorldChunkDecision>), WorldChunkJournalError> {
         let path = world_root.join(SOLARIS_DIRECTORY).join(JOURNAL_FILE);
-        let (requests, receiver) = std::sync::mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
-        let (initialized, initialization) = std::sync::mpsc::sync_channel(1);
-        let writer_path = path.clone();
-        let worker = std::thread::Builder::new()
-            .name("solaris-world-chunk-journal".to_owned())
-            .spawn(move || run_writer(writer_path, receiver, initialized))
+        let directory = path.parent().expect("journal directory");
+        ensure_journal_directory(directory).map_err(|source| WorldChunkJournalError::Io {
+            operation: "create journal directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let lease_path = directory.join(JOURNAL_LOCK_FILE);
+        let lease = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .and_then(|file| {
+                file.try_lock().map_err(std::io::Error::from)?;
+                Ok(file)
+            })
             .map_err(|source| WorldChunkJournalError::Io {
-                operation: "spawn writer",
-                path: path.clone(),
+                operation: "acquire journal lease",
+                path: lease_path,
                 source,
             })?;
-        let (base_id, allocated_high, pending) = match initialization.recv() {
-            Ok(Ok(recovered)) => recovered,
-            Ok(Err(error)) => {
-                let _ = worker.join();
-                return Err(error);
-            }
-            Err(_) => {
-                let _ = worker.join();
-                return Err(WorldChunkJournalError::Io {
-                    operation: "initialize writer",
-                    path: path.clone(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "world chunk journal writer exited before initialization",
-                    ),
-                });
-            }
-        };
+        let (base_id, allocated_high, pending) = read_and_repair_journal(&path)?;
         let next_id = pending
             .iter()
             .map(WorldChunkDecision::id)
@@ -313,15 +341,16 @@ impl WorldChunkJournal {
         let next_append_id = match next_id.checked_add(1).filter(|_| next_id <= MAX_JOURNAL_ID) {
             Some(next) => next,
             None => {
-                shutdown_writer(&requests, worker);
+                drop(lease);
                 return Err(WorldChunkJournalError::RecordIdExhausted);
             }
         };
+        *writer.lease.lock().expect("journal lease") = Some(lease);
         let journal = Self {
             shared: Arc::new(JournalShared {
                 blocks,
                 items,
-                append_advanced: tokio::sync::Notify::new(),
+                append_advanced: Arc::clone(&writer.advanced),
                 state: Mutex::new(JournalState {
                     path,
                     checkpoint_base: base_id,
@@ -329,10 +358,11 @@ impl WorldChunkJournal {
                     next_id,
                     next_append_id,
                     poisoned: false,
-                    requests,
-                    worker: Some(worker),
+                    requests: writer.requests.clone(),
+                    writer: Arc::clone(&writer),
                 }),
             }),
+            writer,
         };
         Ok((journal, pending))
     }
@@ -602,11 +632,19 @@ impl WorldChunkJournal {
         requests: std::sync::mpsc::SyncSender<WriterRequest>,
         worker: std::thread::JoinHandle<()>,
     ) -> Self {
+        let writer = Arc::new(JournalWriter {
+            requests: requests.clone(),
+            failed: Arc::new(AtomicBool::new(false)),
+            failure_reporter: Arc::new(Mutex::new(None)),
+            advanced: Arc::new(tokio::sync::Notify::new()),
+            worker: Some(worker),
+            lease: Mutex::new(None),
+        });
         Self {
             shared: Arc::new(JournalShared {
                 blocks,
                 items,
-                append_advanced: tokio::sync::Notify::new(),
+                append_advanced: Arc::new(tokio::sync::Notify::new()),
                 state: Mutex::new(JournalState {
                     path,
                     checkpoint_base: 0,
@@ -614,10 +652,11 @@ impl WorldChunkJournal {
                     next_id: 0,
                     next_append_id: 1,
                     poisoned: false,
-                    requests,
-                    worker: Some(worker),
+                    requests: requests.clone(),
+                    writer: Arc::clone(&writer),
                 }),
             }),
+            writer,
         }
     }
 }
@@ -641,34 +680,17 @@ fn reserve_ids_locked(
     if last > MAX_JOURNAL_ID {
         return Err(WorldChunkJournalError::RecordIdExhausted);
     }
-    let replacement = encode_journal(state.checkpoint_base, last, &state.pending)?;
-    let (reply, completion) = std::sync::mpsc::channel();
     if state
         .requests
-        .send(WriterRequest::Replace { replacement, reply })
+        .send(WriterRequest::Reserve {
+            allocated_high: last,
+        })
         .is_err()
     {
         state.poisoned = true;
         return Err(WorldChunkJournalError::WriterClosed {
             operation: "reserve decision ids",
         });
-    }
-    match completion.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(WriterFailure::JournalTooLarge(bytes))) => {
-            return Err(WorldChunkJournalError::JournalTooLarge(bytes));
-        }
-        Ok(Err(WriterFailure::Io(source))) => {
-            state.poisoned = true;
-            return Err(WorldChunkJournalError::ReservationOutcomeUnknown {
-                path: state.path.clone(),
-                source,
-            });
-        }
-        Err(_) => {
-            state.poisoned = true;
-            return Err(WorldChunkJournalError::ReservationCompletionLost);
-        }
     }
     state.next_id = last;
     Ok((first..=last).collect())
@@ -696,10 +718,9 @@ fn append_decisions(
             return Err(error);
         }
     };
-    let (reply, completion) = std::sync::mpsc::channel();
     if state
         .requests
-        .send(WriterRequest::Append { bytes, reply })
+        .send(WriterRequest::Append { bytes })
         .is_err()
     {
         state.poisoned = true;
@@ -707,33 +728,26 @@ fn append_decisions(
             operation: "append",
         });
     }
-    match completion.recv() {
-        Ok(Ok(())) => {
-            state.pending.extend(decisions);
-            Ok(())
-        }
-        Ok(Err(WriterFailure::JournalTooLarge(bytes))) => {
-            state.poisoned = true;
-            Err(WorldChunkJournalError::JournalTooLarge(bytes))
-        }
-        Ok(Err(WriterFailure::Io(source))) => {
-            state.poisoned = true;
-            Err(WorldChunkJournalError::AppendOutcomeUnknown {
-                path: state.path.clone(),
-                source,
-            })
-        }
-        Err(_) => {
-            state.poisoned = true;
-            Err(WorldChunkJournalError::AppendCompletionLost)
-        }
-    }
+    state.pending.extend(decisions);
+    Ok(())
 }
 
 pub(super) enum WriterRequest {
+    Reserve {
+        allocated_high: u64,
+    },
     Append {
         bytes: Vec<u8>,
-        reply: std::sync::mpsc::Sender<Result<(), WriterFailure>>,
+    },
+    EntityAppend {
+        decisions: Vec<mc_entity::RegionalCommitDecision>,
+    },
+    EntityReplace {
+        pending: Vec<mc_entity::RegionalCommitDecision>,
+        reply: std::sync::mpsc::Sender<Result<(), mc_entity::RegionalDecisionJournalError>>,
+    },
+    Flush {
+        reply: std::sync::mpsc::SyncSender<()>,
     },
     Replace {
         replacement: Vec<u8>,
@@ -757,81 +771,132 @@ impl From<std::io::Error> for WriterFailure {
 }
 
 fn run_writer(
-    path: PathBuf,
+    directory: &Path,
     receiver: std::sync::mpsc::Receiver<WriterRequest>,
-    initialized: std::sync::mpsc::SyncSender<JournalInitialization>,
-) {
-    let directory = path.parent().expect("journal path has a parent");
-    if let Err(source) = ensure_journal_directory(directory) {
-        let _ = initialized.send(Err(WorldChunkJournalError::Io {
-            operation: "create journal directory",
-            path: directory.to_path_buf(),
-            source,
-        }));
-        return;
+) -> Result<(), WriterFailure> {
+    let paths = [
+        directory.join(JOURNAL_FILE),
+        directory.join(super::persistence::REGIONAL_DECISION_JOURNAL_FILE),
+    ];
+    let mut batch = std::collections::VecDeque::with_capacity(WRITER_QUEUE_CAPACITY);
+    let mut dirty = [false; 2];
+    while let Ok(first) = receiver.recv() {
+        batch.push_back(first);
+        batch.extend(receiver.try_iter().take(WRITER_QUEUE_CAPACITY - 1));
+        while !batch.is_empty() {
+            let count = batch
+                .iter()
+                .position(|request| {
+                    matches!(
+                        request,
+                        WriterRequest::Replace { .. }
+                            | WriterRequest::EntityReplace { .. }
+                            | WriterRequest::Flush { .. }
+                            | WriterRequest::Shutdown { .. }
+                    )
+                })
+                .unwrap_or(batch.len());
+            let allocated_high = batch
+                .iter()
+                .take(count)
+                .filter_map(|request| {
+                    if let WriterRequest::Reserve { allocated_high } = request {
+                        Some(*allocated_high)
+                    } else {
+                        None
+                    }
+                })
+                .max();
+            if let Some(allocated_high) = allocated_high {
+                ensure_journal_directory(directory)?;
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&paths[0])?;
+                if file.metadata()?.len() == 0 {
+                    write_header(&mut file, 0, allocated_high)?;
+                } else {
+                    file.seek(SeekFrom::Start(
+                        (JOURNAL_HEADER_BYTES - size_of::<u64>()) as u64,
+                    ))?;
+                    file.write_all(&allocated_high.to_le_bytes())?;
+                }
+                // Persist the allocation prefix before either WAL can reference its IDs.
+                file.sync_all()?;
+                sync_directory(directory)?;
+            }
+            for request in batch.drain(..count) {
+                match request {
+                    WriterRequest::Reserve { .. } => {}
+                    WriterRequest::Append { bytes } => {
+                        append_frames(&paths[0], &bytes)?;
+                        dirty[0] = true;
+                    }
+                    WriterRequest::EntityAppend { decisions } => {
+                        super::persistence::append_regional_decisions(&paths[1], &decisions)
+                            .map_err(|error| WriterFailure::Io(std::io::Error::other(error)))?;
+                        dirty[1] |= !decisions.is_empty();
+                    }
+                    _ => unreachable!("checkpoint bounds the append batch"),
+                }
+            }
+            sync_journal_batch(directory, &paths, &mut dirty)?;
+            match batch.pop_front() {
+                Some(WriterRequest::Replace { replacement, reply }) => {
+                    if let Err(error) = replace_journal(&paths[0], &replacement) {
+                        let _ = reply.send(Err(error));
+                        return Err(std::io::Error::other("world journal checkpoint failed").into());
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                Some(WriterRequest::EntityReplace { pending, reply }) => {
+                    if let Err(error) =
+                        super::persistence::persist_regional_decisions(&paths[1], &pending)
+                    {
+                        let _ = reply.send(Err(
+                            mc_entity::RegionalDecisionJournalError::OUTCOME_UNKNOWN,
+                        ));
+                        return Err(std::io::Error::other(error).into());
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                Some(WriterRequest::Flush { reply }) => {
+                    let _ = reply.send(());
+                }
+                Some(WriterRequest::Shutdown { reply }) => {
+                    let _ = reply.send(());
+                    return Ok(());
+                }
+                None => {}
+                _ => unreachable!("append batch ends at a checkpoint"),
+            }
+        }
     }
-    let lock_path = directory.join(JOURNAL_LOCK_FILE);
-    let lock_file = match OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(file) => file,
-        Err(source) => {
-            let _ = initialized.send(Err(WorldChunkJournalError::Io {
-                operation: "open journal lease",
-                path: lock_path,
-                source,
-            }));
-            return;
-        }
-    };
-    let mut lease = fd_lock::RwLock::new(lock_file);
-    let guard = match lease.try_write() {
-        Ok(guard) => guard,
-        Err(source) => {
-            let _ = initialized.send(Err(WorldChunkJournalError::Io {
-                operation: "acquire journal lease",
-                path: lock_path,
-                source,
-            }));
-            return;
-        }
-    };
-    let recovered = match read_and_repair_journal(&path) {
-        Ok(recovered) => recovered,
-        Err(error) => {
-            let _ = initialized.send(Err(error));
-            return;
-        }
-    };
-    if initialized.send(Ok(recovered)).is_err() {
-        return;
-    }
+    Ok(())
+}
 
-    while let Ok(request) = receiver.recv() {
-        match request {
-            WriterRequest::Append { bytes, reply } => {
-                let _ = reply.send(append_frames(&path, &bytes));
-            }
-            WriterRequest::Replace { replacement, reply } => {
-                let _ = reply.send(replace_journal(&path, &replacement));
-            }
-            WriterRequest::Shutdown { reply } => {
-                let _ = reply.send(());
-                break;
+fn sync_journal_batch(
+    directory: &Path,
+    paths: &[PathBuf; 2],
+    dirty: &mut [bool; 2],
+) -> Result<(), WriterFailure> {
+    if dirty.iter().any(|&dirty| dirty) {
+        for (path, dirty) in paths.iter().zip(dirty.iter_mut()) {
+            if *dirty {
+                File::open(path)?.sync_all()?;
+                *dirty = false;
             }
         }
+        sync_directory(directory)?;
     }
-    drop(guard);
+    Ok(())
 }
 
 fn append_frames(path: &Path, bytes: &[u8]) -> Result<(), WriterFailure> {
     let directory = path.parent().expect("journal path has a parent");
     ensure_journal_directory(directory)?;
-    let existed = path.is_file();
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let current_len = file.metadata()?.len();
     let header_len = if current_len == 0 {
@@ -851,11 +916,6 @@ fn append_frames(path: &Path, bytes: &[u8]) -> Result<(), WriterFailure> {
         write_header(&mut file, 0, 0)?;
     }
     file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    if !existed {
-        sync_directory(directory)?;
-    }
     Ok(())
 }
 
@@ -1391,859 +1451,5 @@ fn corrupt(offset: usize, reason: impl Into<String>) -> WorldChunkJournalError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs::{File, OpenOptions};
-    use std::io::{Seek, SeekFrom, Write};
-    use std::sync::Arc;
-
-    use mc_data::Identifier;
-    use mc_data::blocks::solaris_required_blocks_report;
-    use mc_data::items::{ItemRegistry, solaris_required_items};
-    use mc_world::{
-        BlockPos, BlockRegistry, Chunk, ChunkPos, ChunkSnapshot, ScheduledBlockTick, SectionLight,
-    };
-
-    use super::*;
-
-    fn registries() -> (Arc<BlockRegistry>, Arc<ItemRegistry>) {
-        (
-            Arc::new(
-                BlockRegistry::from_report(&solaris_required_blocks_report())
-                    .expect("embedded block registry"),
-            ),
-            Arc::new(solaris_required_items()),
-        )
-    }
-
-    fn snapshot(blocks: &BlockRegistry, position: ChunkPos, current_tick: u64) -> ChunkSnapshot {
-        let air = blocks
-            .block(&Identifier::parse("minecraft:air").unwrap())
-            .expect("air")
-            .default;
-        let stone = blocks
-            .block(&Identifier::parse("minecraft:stone").unwrap())
-            .expect("stone")
-            .default;
-        let mut chunk = Chunk::empty(
-            position,
-            air,
-            Identifier::parse("minecraft:plains").unwrap(),
-        );
-        chunk
-            .set_block(1, 64, 2, stone)
-            .expect("test position is in the chunk");
-        chunk.section_lights[8] = SectionLight {
-            block: Some(vec![0x21; mc_world::LIGHT_LAYER_BYTES]),
-            sky: Some(vec![0x54; mc_world::LIGHT_LAYER_BYTES]),
-        };
-        chunk
-            .extras
-            .push(("SolarisJournalTest".to_owned(), mc_nbt::Tag::Long(91)));
-        assert!(chunk.schedule_block_tick(ScheduledBlockTick::new(
-            BlockPos {
-                x: position.x * 16 + 1,
-                y: 64,
-                z: position.z * 16 + 2,
-            },
-            Identifier::parse("minecraft:stone").unwrap(),
-            current_tick + 17,
-            2,
-        )));
-        Arc::new(chunk)
-    }
-
-    fn snapshot_with_lsn(
-        blocks: &BlockRegistry,
-        position: ChunkPos,
-        current_tick: u64,
-        lsn: u64,
-    ) -> ChunkSnapshot {
-        let mut snapshot = snapshot(blocks, position, current_tick);
-        Arc::get_mut(&mut snapshot).unwrap().extras.push((
-            "SolarisJournalLsn".to_owned(),
-            mc_nbt::Tag::Long(i64::try_from(lsn).unwrap()),
-        ));
-        snapshot
-    }
-
-    #[test]
-    fn round_trips_full_chunk_snapshot_and_restart_relative_tick() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let position = ChunkPos { x: -3, z: 9 };
-        let (journal, pending) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        assert!(pending.is_empty());
-
-        let id = journal
-            .record_snapshots(120, vec![snapshot(&blocks, position, 120)])
-            .unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(journal.watermark(), Some(1));
-        drop(journal);
-
-        let (journal, pending) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id(), 1);
-        assert_eq!(pending[0].current_tick(), 120);
-        assert_eq!(pending[0].images().len(), 1);
-        assert_eq!(pending[0].images()[0].position(), position);
-        assert!(!pending[0].images()[0].nbt().is_empty());
-
-        let chunks = journal.decode_pending(&pending).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].pos, position);
-        assert_eq!(chunks[0].get_block(1, 64, 2).unwrap().0, 1);
-        assert_eq!(
-            chunks[0].section_lights[8].block.as_deref(),
-            Some(&vec![0x21; mc_world::LIGHT_LAYER_BYTES][..])
-        );
-        assert_eq!(chunks[0].scheduled_block_ticks()[0].trigger_tick, 17);
-        assert!(chunks[0].extras.iter().any(|(name, value)| {
-            name == "SolarisJournalTest" && value == &mc_nbt::Tag::Long(91)
-        }));
-    }
-
-    #[test]
-    fn appends_decision_prefixes_and_keeps_each_snapshot_group_together() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-
-        assert_eq!(
-            journal
-                .record_snapshots(10, vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 10)])
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            journal
-                .record_snapshots(
-                    20,
-                    vec![
-                        snapshot(&blocks, ChunkPos { x: 1, z: 0 }, 20),
-                        snapshot(&blocks, ChunkPos { x: 2, z: 0 }, 20),
-                    ],
-                )
-                .unwrap(),
-            2
-        );
-        drop(journal);
-
-        let (_, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
-        assert_eq!(
-            pending
-                .iter()
-                .map(WorldChunkDecision::id)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(pending[0].images().len(), 1);
-        assert_eq!(pending[1].images().len(), 2);
-    }
-
-    #[test]
-    fn truncates_an_incomplete_final_frame_and_preserves_the_prefix() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let path = temp.path().join("solaris/world-chunk-journal.bin");
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        journal
-            .record_snapshots(10, vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 10)])
-            .unwrap();
-        drop(journal);
-        let prefix_len = std::fs::metadata(&path).unwrap().len();
-
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        journal
-            .record_snapshots(20, vec![snapshot(&blocks, ChunkPos { x: 1, z: 0 }, 20)])
-            .unwrap();
-        drop(journal);
-        let damaged_len = std::fs::metadata(&path).unwrap().len() - 3;
-        let file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_len(damaged_len).unwrap();
-        file.sync_all().unwrap();
-
-        let (_, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
-        assert_eq!(
-            pending
-                .iter()
-                .map(WorldChunkDecision::id)
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
-        assert_eq!(std::fs::metadata(path).unwrap().len(), prefix_len);
-    }
-
-    #[test]
-    fn rejects_a_corrupt_final_frame_without_truncating_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let path = temp.path().join("solaris/world-chunk-journal.bin");
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        journal
-            .record_snapshots(10, vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 10)])
-            .unwrap();
-        drop(journal);
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        journal
-            .record_snapshots(20, vec![snapshot(&blocks, ChunkPos { x: 1, z: 0 }, 20)])
-            .unwrap();
-        drop(journal);
-
-        let damaged_len = std::fs::metadata(&path).unwrap().len();
-        flip_byte(&path, std::fs::metadata(&path).unwrap().len() - 1);
-        let error = WorldChunkJournal::open(temp.path(), blocks, items).unwrap_err();
-        assert!(matches!(error, WorldChunkJournalError::Corrupt { .. }));
-        assert_eq!(std::fs::metadata(path).unwrap().len(), damaged_len);
-    }
-
-    #[test]
-    fn rejects_corruption_before_a_valid_later_frame() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let path = temp.path().join("solaris/world-chunk-journal.bin");
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        journal
-            .record_snapshots(10, vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 10)])
-            .unwrap();
-        journal
-            .record_snapshots(20, vec![snapshot(&blocks, ChunkPos { x: 1, z: 0 }, 20)])
-            .unwrap();
-        drop(journal);
-
-        let first_payload_byte = (JOURNAL_HEADER_BYTES + FRAME_PREFIX_BYTES) as u64;
-        flip_byte(&path, first_payload_byte);
-        let error = WorldChunkJournal::open(temp.path(), blocks, items).unwrap_err();
-        assert!(matches!(error, WorldChunkJournalError::Corrupt { .. }));
-    }
-
-    #[test]
-    fn rejects_impossible_image_count_before_allocation() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u64.to_le_bytes());
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&u32::MAX.to_le_bytes());
-
-        let error = decode_decision_payload(&payload).unwrap_err();
-        assert!(error.contains("image count"), "{error}");
-        assert!(error.contains("exceeds limit"), "{error}");
-    }
-
-    #[test]
-    fn rejects_infeasible_image_count_before_allocation() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u64.to_le_bytes());
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&1_u32.to_le_bytes());
-
-        let error = decode_decision_payload(&payload).unwrap_err();
-        assert!(error.contains("payload feasibility"), "{error}");
-    }
-
-    #[test]
-    fn rejects_oversized_image_nbt_before_copy() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u64.to_le_bytes());
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&1_u32.to_le_bytes());
-        payload.extend_from_slice(&0_i32.to_le_bytes());
-        payload.extend_from_slice(&0_i32.to_le_bytes());
-        payload.extend_from_slice(
-            &u32::try_from(MAX_IMAGE_NBT_BYTES + 1)
-                .expect("test NBT limit fits u32")
-                .to_le_bytes(),
-        );
-
-        let error = decode_decision_payload(&payload).unwrap_err();
-        assert!(error.contains("NBT length"), "{error}");
-        assert!(error.contains("exceeds limit"), "{error}");
-    }
-
-    #[test]
-    fn encoder_rejects_too_many_images_before_building_payload() {
-        let image = WorldChunkImage {
-            position: ChunkPos { x: 0, z: 0 },
-            nbt: Vec::new(),
-        };
-        let decision = WorldChunkDecision {
-            id: 1,
-            current_tick: 0,
-            images: vec![image; MAX_IMAGES_PER_DECISION + 1],
-        };
-
-        assert!(matches!(
-            encode_decision_payload(&decision),
-            Err(WorldChunkJournalError::TooManyImages(count))
-                if count == MAX_IMAGES_PER_DECISION + 1
-        ));
-    }
-
-    #[test]
-    fn aggregate_preflight_rejects_file_budget_without_allocation() {
-        let maximum = usize::try_from(MAX_JOURNAL_FILE_BYTES).unwrap();
-        assert_eq!(checked_journal_len(0, maximum).unwrap(), maximum);
-        assert!(matches!(
-            checked_journal_len(maximum, 1),
-            Err(WorldChunkJournalError::JournalTooLarge(bytes))
-                if bytes == MAX_JOURNAL_FILE_BYTES + 1
-        ));
-    }
-
-    #[test]
-    fn open_rejects_oversized_sparse_journal_before_reading() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let directory = temp.path().join(SOLARIS_DIRECTORY);
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(JOURNAL_FILE);
-        let file = File::create(&path).unwrap();
-        file.set_len(MAX_JOURNAL_FILE_BYTES + 1).unwrap();
-
-        let error = WorldChunkJournal::open(temp.path(), blocks, items).unwrap_err();
-        assert!(matches!(
-            error,
-            WorldChunkJournalError::JournalTooLarge(bytes)
-                if bytes == MAX_JOURNAL_FILE_BYTES + 1
-        ));
-    }
-
-    #[test]
-    fn append_rejects_growth_beyond_file_budget_without_writing() {
-        let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join(SOLARIS_DIRECTORY);
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(JOURNAL_FILE);
-        let file = File::create(&path).unwrap();
-        file.set_len(MAX_JOURNAL_FILE_BYTES).unwrap();
-
-        assert!(matches!(
-            append_frames(&path, b"x"),
-            Err(WriterFailure::JournalTooLarge(bytes))
-                if bytes == MAX_JOURNAL_FILE_BYTES + 1
-        ));
-        assert_eq!(
-            std::fs::metadata(path).unwrap().len(),
-            MAX_JOURNAL_FILE_BYTES
-        );
-    }
-
-    #[test]
-    fn writer_lease_rejects_a_second_journal_instance() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (first, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-
-        let error = WorldChunkJournal::open(temp.path(), blocks, items).unwrap_err();
-        assert!(matches!(
-            error,
-            WorldChunkJournalError::Io {
-                operation: "acquire journal lease",
-                ..
-            }
-        ));
-        drop(first);
-    }
-
-    #[tokio::test]
-    async fn append_budget_failure_poisons_and_wakes_later_reserved_waiter() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected reservation request");
-            };
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Append { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected append request");
-            };
-            reply
-                .send(Err(WriterFailure::JournalTooLarge(
-                    MAX_JOURNAL_FILE_BYTES + 1,
-                )))
-                .unwrap();
-            let WriterRequest::Shutdown { reply } = receiver.recv().unwrap() else {
-                panic!("expected shutdown request");
-            };
-            reply.send(()).unwrap();
-        });
-        let journal = WorldChunkJournal::from_parts_for_test(
-            temp.path().join("solaris/world-chunk-journal.bin"),
-            blocks,
-            items,
-            requests,
-            worker,
-        );
-        assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
-
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn({
-            let journal = journal.clone();
-            async move {
-                started_tx.send(()).unwrap();
-                journal.wait_for_append_turn(2).await
-            }
-        });
-        started_rx.await.unwrap();
-
-        let append = tokio::task::spawn_blocking({
-            let journal = journal.clone();
-            move || journal.record_reserved_snapshot_groups(10, vec![(1, Vec::new())])
-        })
-        .await
-        .unwrap();
-        assert!(matches!(
-            append,
-            Err(WorldChunkJournalError::JournalTooLarge(bytes))
-                if bytes == MAX_JOURNAL_FILE_BYTES + 1
-        ));
-        assert!(matches!(
-            waiter.await.unwrap(),
-            Err(WorldChunkJournalError::PoisonedOutcomeUnknown)
-        ));
-    }
-
-    #[test]
-    fn checkpoint_through_watermark_atomically_retains_newer_decisions() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let path = temp.path().join("solaris/world-chunk-journal.bin");
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        for id in 1..=3 {
-            assert_eq!(
-                journal
-                    .record_snapshots(
-                        id * 10,
-                        vec![snapshot(&blocks, ChunkPos { x: id as i32, z: 0 }, id * 10)],
-                    )
-                    .unwrap(),
-                id
-            );
-        }
-
-        journal.checkpoint_through(2).unwrap();
-        assert_eq!(journal.watermark(), Some(3));
-        drop(journal);
-        let (journal, pending) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        assert_eq!(
-            pending
-                .iter()
-                .map(WorldChunkDecision::id)
-                .collect::<Vec<_>>(),
-            vec![3]
-        );
-
-        journal.checkpoint_through(3).unwrap();
-        assert_eq!(journal.watermark(), None);
-        assert!(path.exists());
-        drop(journal);
-
-        let (journal, pending) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        assert!(pending.is_empty());
-        assert_eq!(
-            journal
-                .record_snapshots(40, vec![snapshot(&blocks, ChunkPos { x: 4, z: 0 }, 40)])
-                .unwrap(),
-            4
-        );
-    }
-
-    #[test]
-    fn checkpoint_base_is_the_last_removed_decision_not_the_requested_upper_bound() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        assert_eq!(
-            journal
-                .record_snapshots(10, vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 10)])
-                .unwrap(),
-            1
-        );
-
-        journal.checkpoint_through(100).unwrap();
-        assert_eq!(
-            journal
-                .record_snapshots(20, vec![snapshot(&blocks, ChunkPos { x: 1, z: 0 }, 20)])
-                .unwrap(),
-            2
-        );
-        drop(journal);
-
-        let (_, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
-        assert_eq!(
-            pending
-                .iter()
-                .map(WorldChunkDecision::id)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
-    }
-
-    #[test]
-    fn reserved_snapshot_groups_use_one_ordered_append() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected reservation request");
-            };
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Append { bytes, reply } = receiver.recv().unwrap() else {
-                panic!("expected append request");
-            };
-            let (first, offset) = decode_frame_at(&bytes, 0).unwrap();
-            let (second, end) = decode_frame_at(&bytes, offset).unwrap();
-            assert_eq!((first.id(), second.id()), (1, 2));
-            assert_eq!(end, bytes.len());
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Shutdown { reply } = receiver.recv().unwrap() else {
-                panic!("expected shutdown request");
-            };
-            reply.send(()).unwrap();
-        });
-        let journal = WorldChunkJournal::from_parts_for_test(
-            temp.path().join("solaris/world-chunk-journal.bin"),
-            Arc::clone(&blocks),
-            items,
-            requests,
-            worker,
-        );
-
-        assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
-        journal
-            .record_reserved_snapshot_groups(
-                10,
-                vec![
-                    (
-                        1,
-                        vec![snapshot_with_lsn(&blocks, ChunkPos { x: 0, z: 0 }, 10, 1)],
-                    ),
-                    (
-                        2,
-                        vec![snapshot_with_lsn(&blocks, ChunkPos { x: 1, z: 0 }, 10, 2)],
-                    ),
-                ],
-            )
-            .unwrap();
-        assert_eq!(journal.watermark(), Some(2));
-    }
-
-    #[test]
-    fn reserved_ids_are_not_reused_after_restart_without_an_append() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (journal, _) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
-        assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
-        drop(journal);
-
-        let (journal, pending) =
-            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), items).unwrap();
-        assert!(pending.is_empty());
-        assert_eq!(journal.reserve_decision_ids(1).unwrap(), vec![3]);
-    }
-
-    #[test]
-    fn reserved_decisions_can_append_in_ordered_prefixes() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (journal, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
-        assert!(pending.is_empty());
-        assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
-
-        journal
-            .record_reserved_snapshot_groups(10, vec![(1, Vec::new())])
-            .unwrap();
-        assert_eq!(journal.watermark(), Some(1));
-        journal
-            .record_reserved_snapshot_groups(10, vec![(2, Vec::new())])
-            .unwrap();
-        assert_eq!(journal.watermark(), Some(2));
-    }
-
-    #[test]
-    fn known_reserved_append_failure_can_close_with_an_empty_decision() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (journal, pending) =
-            WorldChunkJournal::open(temp.path(), blocks.clone(), items.clone()).unwrap();
-        assert!(pending.is_empty());
-        let decision_id = journal.reserve_decision_ids(1).unwrap()[0];
-        let error = journal
-            .record_reserved_snapshot_groups(
-                20,
-                vec![(
-                    decision_id,
-                    vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 20)],
-                )],
-            )
-            .expect_err("unstamped snapshot is a known pre-append failure");
-        assert!(!error.outcome_unknown());
-
-        journal
-            .record_reserved_snapshot_groups(20, vec![(decision_id, Vec::new())])
-            .unwrap();
-        drop(journal);
-
-        let (_reopened, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id(), decision_id);
-        assert!(pending[0].images().is_empty());
-    }
-
-    #[tokio::test]
-    async fn later_reserved_decision_waits_for_append_turn() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (journal, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
-        assert!(pending.is_empty());
-        assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
-
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn({
-            let journal = journal.clone();
-            async move {
-                started_tx.send(()).unwrap();
-                journal.wait_for_append_turn(2).await
-            }
-        });
-        started_rx.await.unwrap();
-
-        tokio::task::spawn_blocking({
-            let journal = journal.clone();
-            move || journal.record_reserved_snapshot_groups(10, vec![(1, Vec::new())])
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        waiter.await.unwrap().unwrap();
-        journal
-            .record_reserved_snapshot_groups(10, vec![(2, Vec::new())])
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn checkpoint_poison_wakes_append_turn_waiter() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected reservation request");
-            };
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Append { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected append request");
-            };
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected checkpoint request");
-            };
-            reply
-                .send(Err(WriterFailure::Io(std::io::Error::other("injected"))))
-                .unwrap();
-            let WriterRequest::Shutdown { reply } = receiver.recv().unwrap() else {
-                panic!("expected shutdown request");
-            };
-            reply.send(()).unwrap();
-        });
-        let journal = WorldChunkJournal::from_parts_for_test(
-            temp.path().join("solaris/world-chunk-journal.bin"),
-            blocks,
-            items,
-            requests,
-            worker,
-        );
-        assert_eq!(journal.reserve_decision_ids(3).unwrap(), vec![1, 2, 3]);
-        journal
-            .record_reserved_snapshot_groups(10, vec![(1, Vec::new())])
-            .unwrap();
-
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn({
-            let journal = journal.clone();
-            async move {
-                started_tx.send(()).unwrap();
-                journal.wait_for_append_turn(3).await
-            }
-        });
-        started_rx.await.unwrap();
-        let checkpoint = tokio::task::spawn_blocking({
-            let journal = journal.clone();
-            move || journal.checkpoint_through(1)
-        })
-        .await
-        .unwrap();
-        assert!(matches!(
-            checkpoint,
-            Err(WorldChunkJournalError::CheckpointOutcomeUnknown { .. })
-        ));
-        assert!(matches!(
-            waiter.await.unwrap(),
-            Err(WorldChunkJournalError::PoisonedOutcomeUnknown)
-        ));
-    }
-
-    #[tokio::test]
-    async fn closed_writer_wakes_append_turn_waiter() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected reservation request");
-            };
-            reply.send(Ok(())).unwrap();
-        });
-        let journal = WorldChunkJournal::from_parts_for_test(
-            temp.path().join("solaris/world-chunk-journal.bin"),
-            blocks,
-            items,
-            requests,
-            worker,
-        );
-        assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
-
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn({
-            let journal = journal.clone();
-            async move {
-                started_tx.send(()).unwrap();
-                journal.wait_for_append_turn(2).await
-            }
-        });
-        started_rx.await.unwrap();
-        let append = tokio::task::spawn_blocking({
-            let journal = journal.clone();
-            move || journal.record_reserved_snapshot_groups(10, vec![(1, Vec::new())])
-        })
-        .await
-        .unwrap();
-        assert!(matches!(
-            append,
-            Err(WorldChunkJournalError::WriterClosed {
-                operation: "append"
-            })
-        ));
-        assert!(matches!(
-            waiter.await.unwrap(),
-            Err(WorldChunkJournalError::PoisonedOutcomeUnknown)
-        ));
-    }
-
-    #[test]
-    fn checkpoint_failure_poisons_follow_up_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected reservation request");
-            };
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Append { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected append request");
-            };
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
-                panic!("expected checkpoint request");
-            };
-            reply
-                .send(Err(WriterFailure::Io(std::io::Error::other("injected"))))
-                .unwrap();
-        });
-        let journal = WorldChunkJournal::from_parts_for_test(
-            temp.path().join("solaris/world-chunk-journal.bin"),
-            Arc::clone(&blocks),
-            items,
-            requests,
-            worker,
-        );
-        journal
-            .record_snapshots(10, vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 10)])
-            .unwrap();
-
-        let error = journal.checkpoint_through(1).unwrap_err();
-        assert!(error.outcome_unknown());
-        let error = journal
-            .record_snapshots(20, vec![snapshot(&blocks, ChunkPos { x: 1, z: 0 }, 20)])
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            WorldChunkJournalError::PoisonedOutcomeUnknown
-        ));
-    }
-
-    #[test]
-    fn append_outcome_unknown_recovery_uses_the_persisted_frame() {
-        let temp = tempfile::tempdir().unwrap();
-        let (blocks, items) = registries();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let path = temp.path().join("solaris/world-chunk-journal.bin");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let writer_path = path.clone();
-        let worker = std::thread::spawn(move || {
-            let WriterRequest::Replace { replacement, reply } = receiver.recv().unwrap() else {
-                panic!("expected reservation request");
-            };
-            std::fs::write(&writer_path, replacement).unwrap();
-            reply.send(Ok(())).unwrap();
-            let WriterRequest::Append { bytes, reply } = receiver.recv().unwrap() else {
-                panic!("expected append request");
-            };
-            let mut file = OpenOptions::new().append(true).open(&writer_path).unwrap();
-            file.write_all(&bytes).unwrap();
-            file.sync_all().unwrap();
-            reply
-                .send(Err(WriterFailure::Io(std::io::Error::other("injected"))))
-                .unwrap();
-        });
-        let journal = WorldChunkJournal::from_parts_for_test(
-            path,
-            blocks.clone(),
-            items.clone(),
-            requests,
-            worker,
-        );
-
-        let error = journal
-            .record_snapshots(10, vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 10)])
-            .expect_err("injected append failure");
-        assert!(error.outcome_unknown());
-        assert_eq!(journal.watermark(), None);
-        drop(journal);
-
-        let (_reopened, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id(), 1);
-    }
-
-    fn flip_byte(path: &Path, offset: u64) {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        let mut byte = [0_u8; 1];
-        file.read_exact(&mut byte).unwrap();
-        byte[0] ^= 0xff;
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&byte).unwrap();
-        file.sync_all().unwrap();
-    }
-}
+#[path = "world_journal_tests.rs"]
+mod tests;

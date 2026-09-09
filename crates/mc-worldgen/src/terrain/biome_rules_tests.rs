@@ -2,11 +2,59 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mc_data::Identifier;
 use mc_data::biomes::BiomeWorldgenData;
+use mc_world::ChunkGenerator;
 
 use crate::terrain::tests::tiny_registry;
 use crate::terrain::{SEA_LEVEL, TerrainGenerator};
 
 use super::BiomeRules;
+
+#[test]
+fn inland_river_bank_retains_a_grass_surface() {
+    let g = TerrainGenerator::with_worldgen_mode(
+        712_816,
+        tiny_registry(),
+        super::super::WorldgenMode::TellusLike(Default::default()),
+    );
+    let (x, z) = (-252_i32, 59_i32);
+    let chunk = g.generate(mc_world::ChunkPos {
+        x: x.div_euclid(16),
+        z: z.div_euclid(16),
+    });
+    assert_eq!(
+        chunk.get_block(
+            x.rem_euclid(16) as u8,
+            g.surface_height(x, z),
+            z.rem_euclid(16) as u8,
+        ),
+        Some(g.grass_block),
+        "an exposed inland river bank became a beach",
+    );
+}
+
+#[test]
+fn raised_coastal_land_stays_grass_while_rocky_shore_keeps_gravel() {
+    let g = TerrainGenerator::with_worldgen_mode(
+        -17_711,
+        tiny_registry(),
+        super::super::WorldgenMode::TellusLike(Default::default()),
+    );
+    for (x, z, expected) in [(-195_i32, 781_i32, g.grass_block), (-187, 811, g.gravel)] {
+        let chunk = g.generate(mc_world::ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        });
+        assert_eq!(
+            chunk.get_block(
+                x.rem_euclid(16) as u8,
+                g.surface_height(x, z),
+                z.rem_euclid(16) as u8,
+            ),
+            Some(expected),
+            "coastal surface at ({x}, {z})",
+        );
+    }
+}
 
 #[test]
 fn every_overworld_biome_is_reachable_by_selector() {
@@ -37,7 +85,7 @@ fn every_overworld_biome_is_reachable_by_selector() {
 }
 
 #[test]
-fn subtype_and_region_pickers_include_world_seed_identity() {
+fn subtype_picker_includes_world_seed_identity() {
     let rules = BiomeRules::vanilla_overworld();
     let subtype_fingerprint = |seed| {
         (-4_096..=4_096)
@@ -49,18 +97,7 @@ fn subtype_and_region_pickers_include_world_seed_identity() {
             })
             .collect::<Vec<_>>()
     };
-    let region_fingerprint = |seed| {
-        (-4_096..=4_096)
-            .step_by(128)
-            .map(|z| {
-                rules
-                    .pick_region_band(&rules.deep_ocean, z / 2, z, seed)
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-    };
     assert_ne!(subtype_fingerprint(0), subtype_fingerprint(712_816));
-    assert_ne!(region_fingerprint(0), region_fingerprint(712_816));
 }
 
 #[test]

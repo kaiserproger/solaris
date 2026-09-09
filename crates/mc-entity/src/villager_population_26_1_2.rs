@@ -66,6 +66,13 @@ pub struct VillagerInventory {
     slots: [Option<EntityItemStack>; VILLAGER_INVENTORY_SLOTS],
 }
 
+impl VillagerInventory {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+}
+
 impl Default for VillagerInventory {
     fn default() -> Self {
         Self {

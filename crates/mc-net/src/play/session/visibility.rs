@@ -51,7 +51,6 @@ pub(super) enum EntityPositionUpdate {
     Absolute,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct EntityTrackerUpdate {
     pub(super) wire_move: Option<ServerEntityWireMove>,
@@ -171,7 +170,6 @@ pub(super) fn entity_wire_move_for_kind(
     }
 }
 
-#[cfg(test)]
 pub(super) fn advance_entity_tracker_update(
     last_sent: &mut LastSentEntityState,
     position: Vec3,
@@ -535,10 +533,10 @@ pub(super) fn refresh_loaded_chunk_for_session_locked(
     dispatches
 }
 
-pub(super) fn refresh_unloaded_chunk_for_session_locked(
+pub(super) fn refresh_unloaded_chunks_for_session_locked(
     inner: &mut SessionRegistryInner,
     observer_id: SessionId,
-    chunk: (i32, i32),
+    chunks: &HashSet<(i32, i32)>,
 ) -> Vec<VisibilityDispatch> {
     let Some(observer) = inner.sessions.get(&observer_id) else {
         return Vec::new();
@@ -550,17 +548,22 @@ pub(super) fn refresh_unloaded_chunk_for_session_locked(
         .into_iter()
         .filter_map(|target_id| {
             let target = inner.sessions.get(&target_id)?;
-            (target.pose.chunk_pos() == chunk)
+            chunks
+                .contains(&target.pose.chunk_pos())
                 .then(|| (target_id, session_snapshot(target_id, target)))
         })
         .collect::<Vec<_>>();
-    let entities = visible_entities
+    let mut removed_entities = visible_entities
         .iter()
         .copied()
-        .filter_map(|entity_id| {
-            (inner.simulation_inputs.entity_chunk(entity_id) == Some(chunk))
-                .then(|| inner.published_entity_snapshots.get(&entity_id).cloned())?
+        .filter(|&entity_id| {
+            inner
+                .simulation_inputs
+                .entity_chunk(entity_id)
+                .is_some_and(|chunk| chunks.contains(&chunk))
+                && inner.published_entity_snapshots.contains_key(&entity_id)
         })
+        .map(|entity_id| entity_id.0)
         .collect::<Vec<_>>();
 
     let Some(observer) = inner.sessions.get_mut(&observer_id) else {
@@ -575,13 +578,19 @@ pub(super) fn refresh_unloaded_chunk_for_session_locked(
             });
         }
     }
-    for snapshot in entities {
-        if observer.visible_entities.remove(&snapshot.id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: ordered_session_recipient(observer_id, observer),
-                command: OutboundCommand::DespawnEntity(snapshot),
-            });
-        }
+    removed_entities.retain(|&entity_id| observer.visible_entities.remove(&EntityId(entity_id)));
+    match removed_entities.len() {
+        0 => {}
+        1 => dispatches.push(VisibilityDispatch {
+            recipient: ordered_session_recipient(observer_id, observer),
+            command: OutboundCommand::DespawnEntity(
+                inner.published_entity_snapshots[&EntityId(removed_entities[0])].clone(),
+            ),
+        }),
+        _ => dispatches.push(VisibilityDispatch {
+            recipient: ordered_session_recipient(observer_id, observer),
+            command: OutboundCommand::DespawnEntities(removed_entities),
+        }),
     }
     observer.visible_entities.publish();
     record_entity_dispatches_locked(inner, &dispatches);

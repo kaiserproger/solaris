@@ -224,8 +224,10 @@ pub(super) fn next_leaf_distance_state(
             continue;
         }
         let neighbour_state = storage.get_cached_block(neighbour)?;
-        distance =
-            distance.min(leaf_distance_from_state(blocks, neighbour_state).saturating_add(1));
+        distance = distance.min(
+            mc_world::plant_rules_26_1_2::leaf_distance_from_state(blocks, neighbour_state)
+                .saturating_add(1),
+        );
         if distance == 1 {
             break;
         }
@@ -235,36 +237,6 @@ pub(super) fn next_leaf_distance_state(
         return None;
     }
     sibling_state_with_property(blocks, current, "distance", &distance.to_string())
-}
-
-pub(super) fn leaf_distance_from_state(blocks: &BlockRegistry, state: BlockStateId) -> u8 {
-    let Some(state) = blocks.by_id(state) else {
-        return 7;
-    };
-    let path = state.block.id.path();
-    if path.ends_with("_log")
-        || path.ends_with("_wood")
-        || matches!(
-            path,
-            "crimson_stem"
-                | "stripped_crimson_stem"
-                | "warped_stem"
-                | "stripped_warped_stem"
-                | "crimson_hyphae"
-                | "stripped_crimson_hyphae"
-                | "warped_hyphae"
-                | "stripped_warped_hyphae"
-        )
-    {
-        return 0;
-    }
-    if !path.ends_with("_leaves") {
-        return 7;
-    }
-    block_state_property(state, "distance")
-        .and_then(|distance| distance.parse::<u8>().ok())
-        .unwrap_or(7)
-        .min(7)
 }
 
 pub(super) fn next_fire_state(blocks: &BlockRegistry, state: BlockStateId) -> Option<BlockStateId> {

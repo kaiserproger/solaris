@@ -139,7 +139,7 @@ Initial candidates:
    intentionally omitted components (giant command catalogs, multiworld
    teleport, auctions, nations/war, bulk editing, WorldGuard-style regions,
    unbounded logs, guessed rollback) and rationale live in
-   `examples/plugins/standard-pack/README.md`.
+   `../solaris-default-plugins/standard-pack/README.md`.
    Evidence: `docs/evidence/alpha3-plugin-pack-005-2026-08-30.md`
    (integration coverage: `crates/mc-test-harness/tests/plugin_standard_pack.rs`).
 

@@ -13,6 +13,9 @@ use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::control_plane::RuntimeControlConfig;
 
+#[cfg(test)]
+mod resource_admission_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPipelinePolicy {
     pub chunk_send_rate: u32,
@@ -59,8 +62,7 @@ pub(crate) struct ChunkPipelineResources {
     cpu_permits: Arc<Semaphore>,
     prepare_request_permits: Arc<Semaphore>,
     cpu_capacity: usize,
-    cpu_limit: Arc<AtomicUsize>,
-    cpu_admission_changed: Arc<Notify>,
+    prepare_limit: Arc<AtomicUsize>,
     prepare_admission_changed: Arc<Notify>,
     active_prepare_tasks: Arc<AtomicUsize>,
     active_prepare_requests: Arc<AtomicUsize>,
@@ -340,8 +342,7 @@ impl ChunkPipelineResources {
             cpu_permits: Arc::new(Semaphore::new(cpu_capacity)),
             prepare_request_permits: Arc::new(Semaphore::new(cpu_capacity)),
             cpu_capacity,
-            cpu_limit: Arc::new(AtomicUsize::new(cpu_capacity)),
-            cpu_admission_changed: Arc::new(Notify::new()),
+            prepare_limit: Arc::new(AtomicUsize::new(cpu_capacity.saturating_sub(1).max(1))),
             prepare_admission_changed: Arc::new(Notify::new()),
             active_prepare_tasks: Arc::new(AtomicUsize::new(0)),
             active_prepare_requests: Arc::new(AtomicUsize::new(0)),
@@ -350,8 +351,13 @@ impl ChunkPipelineResources {
     }
 
     #[must_use]
-    pub(crate) fn cpu_limit(&self) -> usize {
-        self.cpu_limit.load(Ordering::Acquire)
+    pub(crate) fn cpu_capacity(&self) -> usize {
+        self.cpu_capacity
+    }
+
+    #[must_use]
+    pub(crate) fn prepare_limit(&self) -> usize {
+        self.prepare_limit.load(Ordering::Acquire)
     }
 
     pub(crate) fn apply_runtime_control_action(
@@ -359,18 +365,19 @@ impl ChunkPipelineResources {
         action: crate::AutoscaleAction,
         draining: bool,
     ) -> usize {
-        let current = self.cpu_limit();
+        let current = self.prepare_limit();
         let next = if draining {
             1
         } else {
             match action {
                 crate::AutoscaleAction::Hold => current,
                 crate::AutoscaleAction::ScaleDown => current.div_ceil(2).max(1),
-                crate::AutoscaleAction::ScaleUp => current.saturating_mul(2).min(self.cpu_capacity),
+                crate::AutoscaleAction::ScaleUp => current
+                    .saturating_mul(2)
+                    .min(self.cpu_capacity.saturating_sub(1).max(1)),
             }
         };
-        if self.cpu_limit.swap(next, Ordering::AcqRel) != next {
-            self.cpu_admission_changed.notify_waiters();
+        if self.prepare_limit.swap(next, Ordering::AcqRel) != next {
             self.prepare_admission_changed.notify_waiters();
         }
         next
@@ -429,15 +436,7 @@ impl ChunkPipelineResources {
 
     pub(crate) async fn acquire_cpu(&self) -> Result<ChunkPipelinePermit, AcquireError> {
         let permit = Arc::clone(&self.cpu_permits).acquire_owned().await?;
-        loop {
-            let changed = self.cpu_admission_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.try_reserve_cpu_slot() {
-                return Ok(self.track_reserved_cpu_permit(permit));
-            }
-            changed.await;
-        }
+        Ok(self.track_cpu_permit(permit))
     }
 
     pub(crate) async fn acquire_prepare_request(
@@ -450,10 +449,7 @@ impl ChunkPipelineResources {
             let changed = self.prepare_admission_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self
-                .try_reserve_limited_slot(&self.active_prepare_requests)
-                .is_some()
-            {
+            if self.try_reserve_prepare_request() {
                 return Ok(ChunkPipelinePermit {
                     _permit: permit,
                     active: Arc::clone(&self.active_prepare_requests),
@@ -467,10 +463,7 @@ impl ChunkPipelineResources {
 
     pub(crate) fn try_acquire_cpu(&self) -> Option<ChunkPipelinePermit> {
         let permit = Arc::clone(&self.cpu_permits).try_acquire_owned().ok()?;
-        if !self.try_reserve_cpu_slot() {
-            return None;
-        }
-        Some(self.track_reserved_cpu_permit(permit))
+        Some(self.track_cpu_permit(permit))
     }
 
     #[cfg(test)]
@@ -478,7 +471,9 @@ impl ChunkPipelineResources {
         let permit = Arc::clone(&self.prepare_request_permits)
             .try_acquire_owned()
             .ok()?;
-        self.try_reserve_limited_slot(&self.active_prepare_requests)?;
+        if !self.try_reserve_prepare_request() {
+            return None;
+        }
         Some(ChunkPipelinePermit {
             _permit: permit,
             active: Arc::clone(&self.active_prepare_requests),
@@ -499,21 +494,12 @@ impl ChunkPipelineResources {
         }
     }
 
-    fn try_reserve_cpu_slot(&self) -> bool {
-        let Some(active) = self.try_reserve_limited_slot(&self.metrics.active_cpu) else {
-            return false;
-        };
-        self.metrics
-            .max_cpu_active
-            .fetch_max(active, Ordering::AcqRel);
-        true
-    }
-
-    fn try_reserve_limited_slot(&self, active_slots: &AtomicUsize) -> Option<usize> {
+    fn try_reserve_prepare_request(&self) -> bool {
+        let active_slots = &self.active_prepare_requests;
         let mut active = active_slots.load(Ordering::Acquire);
         loop {
-            if active >= self.cpu_limit() {
-                return None;
+            if active >= self.prepare_limit() {
+                return false;
             }
             match active_slots.compare_exchange_weak(
                 active,
@@ -521,18 +507,21 @@ impl ChunkPipelineResources {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(active + 1),
+                Ok(_) => return true,
                 Err(observed) => active = observed,
             }
         }
     }
 
-    fn track_reserved_cpu_permit(&self, permit: OwnedSemaphorePermit) -> ChunkPipelinePermit {
+    fn track_cpu_permit(&self, permit: OwnedSemaphorePermit) -> ChunkPipelinePermit {
+        let active = &self.metrics.active_cpu;
+        let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.metrics.max_cpu_active.fetch_max(now, Ordering::AcqRel);
         ChunkPipelinePermit {
             _permit: permit,
-            active: Arc::clone(&self.metrics.active_cpu),
+            active: Arc::clone(active),
             idle_changed: Arc::clone(&self.metrics.idle_changed),
-            admission_changed: Some(Arc::clone(&self.cpu_admission_changed)),
+            admission_changed: None,
         }
     }
 }
@@ -920,97 +909,6 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), idle)
             .await
             .expect("prepare task completion must wake idle waiter");
-    }
-
-    #[tokio::test]
-    async fn adaptive_cpu_limit_wakes_waiter_on_scale_up() {
-        let resources = ChunkPipelineResources::with_limits(1, 4);
-        let first = resources.acquire_cpu().await.unwrap();
-        let second = resources.acquire_cpu().await.unwrap();
-
-        assert_eq!(
-            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
-            2
-        );
-        assert_eq!(resources.cpu_limit(), 2);
-        assert!(resources.try_acquire_cpu().is_none());
-
-        let mut third = std::pin::pin!(resources.acquire_cpu());
-        std::future::poll_fn(|cx| {
-            assert!(
-                std::future::Future::poll(third.as_mut(), cx).is_pending(),
-                "reduced CPU admission must hold new background work"
-            );
-            std::task::Poll::Ready(())
-        })
-        .await;
-
-        assert_eq!(
-            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleUp, false),
-            4
-        );
-        let third = third.await.unwrap();
-        assert_eq!(resources.metrics().snapshot().active_cpu, 3);
-
-        drop((first, second, third));
-    }
-
-    #[tokio::test]
-    async fn adaptive_cpu_limit_wakes_waiter_after_active_work_releases() {
-        let resources = ChunkPipelineResources::with_limits(1, 2);
-        let first = resources.acquire_cpu().await.unwrap();
-        let second = resources.acquire_cpu().await.unwrap();
-        assert_eq!(
-            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
-            1
-        );
-
-        let mut waiting = std::pin::pin!(resources.acquire_cpu());
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-
-        drop(first);
-        std::future::poll_fn(|cx| {
-            assert!(
-                std::future::Future::poll(waiting.as_mut(), cx).is_pending(),
-                "active work must fall below the new limit before admission"
-            );
-            std::task::Poll::Ready(())
-        })
-        .await;
-
-        drop(second);
-        let waiting = waiting.await.unwrap();
-        assert_eq!(resources.metrics().snapshot().active_cpu, 1);
-        drop(waiting);
-    }
-
-    #[tokio::test]
-    async fn prepare_request_admission_shares_the_runtime_cpu_limit() {
-        let resources = ChunkPipelineResources::with_limits(1, 2);
-        assert_eq!(
-            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
-            1
-        );
-        let first = resources.acquire_prepare_request().await.unwrap();
-        assert!(resources.try_acquire_prepare_request().is_none());
-
-        let mut waiting = std::pin::pin!(resources.acquire_prepare_request());
-        std::future::poll_fn(|cx| {
-            assert!(
-                std::future::Future::poll(waiting.as_mut(), cx).is_pending(),
-                "a second batch must not bypass global request admission"
-            );
-            std::task::Poll::Ready(())
-        })
-        .await;
-
-        drop(first);
-        let second = waiting.await.unwrap();
-        drop(second);
     }
 
     #[test]

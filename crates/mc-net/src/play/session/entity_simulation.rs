@@ -1,14 +1,13 @@
+use crate::play::simulation::RegionallyCommittedEntityMovement;
+use mc_entity::{EntitySimulationResult, EntityTrackingMotion};
+
 use super::entity_lifecycle::{
     remove_server_entity_locked, schedule_entity_death_locked, track_entity_chunk_locked,
     update_breeding_tick_tracking_locked,
 };
-use super::entity_physics_class::{
-    entity_type_uses_aquatic_physics, entity_type_walks_on_powder_snow,
-};
+use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::explosion_authority::schedule_primed_tnt_deadline_locked;
-use super::interaction_geometry::{
-    distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
-};
+use super::interaction_geometry::{distance_sq, entity_aabb, entity_is_near_player_chunk};
 use super::pickups::merge_item_entities_locked;
 use super::simulation_input_publication::ExpectedEntityRoutingMove;
 use super::visibility::{
@@ -22,37 +21,12 @@ mod persistence_projection;
 
 use persistence_projection::{EntityPersistenceMetadata, project_owner_save};
 
-fn entity_physics_query_matches(current: EntityMotionState, expected: &EntityPhysicsQuery) -> bool {
-    let arrow_state_matches = match expected.kind {
-        EntityPhysicsKind::ArrowProjectile {
-            revision,
-            embedded_block,
-        } => {
-            current.is_arrow
-                && current.arrow_revision == revision
-                && current.arrow_embedded_block == embedded_block
-        }
-        EntityPhysicsKind::HurtingProjectile { revision, .. }
-        | EntityPhysicsKind::ShulkerBullet { revision } => {
-            current.is_hurting_projectile && current.hurting_projectile_revision == revision
-        }
-        EntityPhysicsKind::ThrowableProjectile { revision, .. } => {
-            current.is_throwable_projectile && current.throwable_projectile_revision == revision
-        }
-        EntityPhysicsKind::Default
-        | EntityPhysicsKind::Immobile
-        | EntityPhysicsKind::ExternalFlight
-        | EntityPhysicsKind::Living
-        | EntityPhysicsKind::PowderSnowWalkableLiving
-        | EntityPhysicsKind::FallingBlock
-        | EntityPhysicsKind::AquaticLiving => true,
-    };
-    current.position == expected.position
-        && current.velocity == expected.velocity
-        && current.on_ground == expected.on_ground
-        && current.fall_distance == expected.fall_distance
-        && current.goal_fence == expected.goal_fence
-        && arrow_state_matches
+#[derive(Debug, Default)]
+pub(crate) struct VillagerPopulationSelection {
+    pub(super) candidates: HashSet<EntityId>,
+    /// Exact active-simulation villager set returned by the owner lanes.
+    pub(super) covered: HashSet<EntityId>,
+    pub(super) proximity_seeds: Vec<Vec3>,
 }
 
 #[cfg(test)]
@@ -133,93 +107,7 @@ fn record_movement_exhaustive_membership_check() {
 }
 
 const VILLAGER_BRAIN_TICK_INTERVAL: u64 = 20;
-const VILLAGER_BRAIN_COMMIT_BATCH: usize = 64;
-const SHULKER_BULLET_TARGET_SPEED: f64 = 0.15;
-const SHULKER_BULLET_STEERING: f64 = 0.2;
 
-fn shulker_bullet_homing_velocity(current: Vec3, position: Vec3, target: Vec3) -> Option<Vec3> {
-    let delta = Vec3::new(
-        target.x - position.x,
-        target.y - position.y,
-        target.z - position.z,
-    );
-    let length_sq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-    if !length_sq.is_finite() || length_sq <= 1.0e-14 {
-        return None;
-    }
-    let scale = SHULKER_BULLET_TARGET_SPEED / length_sq.sqrt();
-    let desired = Vec3::new(delta.x * scale, delta.y * scale, delta.z * scale);
-    Some(Vec3::new(
-        current.x + (desired.x - current.x) * SHULKER_BULLET_STEERING,
-        current.y + (desired.y - current.y) * SHULKER_BULLET_STEERING,
-        current.z + (desired.z - current.z) * SHULKER_BULLET_STEERING,
-    ))
-}
-
-fn retarget_active_shulker_bullets(
-    entities: &mut super::entity_owner::EntityOwnerAccess,
-    bullet_ids: &HashSet<EntityId>,
-    targets: &HashMap<i32, Vec3>,
-    kinematics: &mut [EntityKinematics],
-) -> Vec<(EntityId, u64)> {
-    if bullet_ids.is_empty() || targets.is_empty() {
-        return Vec::new();
-    }
-    let projections = entities.simulation_projections_for_ids(bullet_ids);
-    let mut revisions = Vec::with_capacity(projections.len());
-    for projection in projections {
-        let Some(target_entity_id) = projection.shulker_bullet_target_entity_id else {
-            continue;
-        };
-        let Some(target) = targets.get(&target_entity_id).copied() else {
-            continue;
-        };
-        let Some(expected) = entities.snapshot(projection.id) else {
-            continue;
-        };
-        if expected.retained.shulker_bullet
-            != Some(mc_entity::EntityShulkerBulletState::new(target_entity_id))
-        {
-            continue;
-        }
-        let Some(state) = expected.retained.hurting_projectile_state else {
-            continue;
-        };
-        let Some(velocity) =
-            shulker_bullet_homing_velocity(expected.velocity, expected.position, target)
-        else {
-            continue;
-        };
-        let projectile_velocity =
-            mc_entity::projectile_26_1_2::Vec3::new(velocity.x, velocity.y, velocity.z);
-        let Ok(next_state) = state.retarget_velocity(projectile_velocity) else {
-            continue;
-        };
-        let rotation = mc_entity::Rotation {
-            yaw: next_state.projectile.rotation.yaw,
-            pitch: next_state.projectile.rotation.pitch,
-            head_yaw: next_state.projectile.rotation.yaw,
-        };
-        let mut next = expected.clone();
-        next.velocity = velocity;
-        next.rotation = rotation;
-        next.retained.hurting_projectile_state = Some(next_state);
-        if !entities.replace_snapshot_if_current(expected, next) {
-            continue;
-        }
-        if let Some(kinematics) = kinematics
-            .iter_mut()
-            .find(|state| state.id == projection.id)
-        {
-            kinematics.velocity = velocity;
-            kinematics.rotation = rotation;
-        }
-        revisions.push((projection.id, next_state.projectile.revision));
-    }
-    revisions
-}
-
-const VILLAGER_RESTOCK_REACH_SQUARED: f64 = 4.0;
 const VILLAGER_GOSSIP_REACH_SQUARED: f64 = 5.0;
 const VILLAGER_GOSSIP_COOLDOWN_TICKS: u64 = 1_200;
 const VILLAGER_GOSSIP_CELL_SIZE: f64 = 3.0;
@@ -231,26 +119,13 @@ struct VillagerProfessionContext<'a> {
     items: &'a mc_data::items::ItemRegistry,
 }
 
-#[derive(Default)]
-struct VillagerBrainTransitionReport {
-    #[cfg(test)]
-    applied: usize,
-    metadata_updates: Vec<EntitySnapshot>,
-}
-
 fn current_villager_brain(
     entity: &EntitySnapshot,
 ) -> Option<mc_entity::villager_26_1_2::VillagerBrainState> {
     let villager = entity.retained.villager?;
     Some(entity.retained.villager_brain.clone().unwrap_or_else(|| {
-        let job_site =
-            (villager.profession != mc_entity::VillagerProfession::None).then_some(entity.position);
         mc_entity::villager_26_1_2::VillagerBrainState::adult(
-            mc_entity::villager_26_1_2::VillagerPoiSet {
-                home: Some(entity.position),
-                job_site,
-                meeting_point: Some(entity.position),
-            },
+            mc_entity::villager_26_1_2::default_villager_pois(entity.position, villager.profession),
         )
     }))
 }
@@ -263,35 +138,50 @@ fn villager_job_site_block_pos(position: Vec3) -> mc_world::BlockPos {
     }
 }
 
-fn supported_profession_assignment(
-    entity: &EntitySnapshot,
-    brain: &mc_entity::villager_26_1_2::VillagerBrainState,
+fn supported_profession_offer(
+    entity: &mc_entity::EntitySimulationProjection,
     context: VillagerProfessionContext<'_>,
-) -> Option<(
-    mc_entity::VillagerData,
-    mc_entity::villager_merchant_26_1_2::VillagerMerchantState,
-)> {
-    let villager = entity.retained.villager?;
-    if villager.profession != mc_entity::VillagerProfession::None
-        || villager.level != 1
-        || entity.retained.villager_merchant.is_some()
-        || brain.schedule != mc_entity::villager_26_1_2::VillagerScheduleKind::Adult
-    {
-        return None;
-    }
-    let job_site = brain.pois.job_site?;
+    cached_merchant: Option<&mc_entity::villager_merchant_26_1_2::VillagerMerchantState>,
+) -> Option<mc_entity::RegionalVillagerProfessionOffer> {
+    let job_site = entity.villager_job_site?;
     let state = context
         .world_read
         .get_cached_block(villager_job_site_block_pos(job_site))?;
     let block = &context.blocks.by_id(state)?.block.id;
     match mc_data::villager_trades_26_1_2::supported_profession_for_job_site_26_1_2(block)? {
-        "toolsmith" => {
-            let mut assigned = villager;
-            assigned.profession = mc_entity::VillagerProfession::Toolsmith;
-            Some((assigned, toolsmith_merchant_state(context.items)?))
-        }
+        "toolsmith" => Some(mc_entity::RegionalVillagerProfessionOffer {
+            profession: mc_entity::VillagerProfession::Toolsmith,
+            merchant: cached_merchant?.clone(),
+        }),
         _ => None,
     }
+}
+
+fn regional_profession_offers_by_block_state(
+    context: VillagerProfessionContext<'_>,
+    cached_merchant: Option<&mc_entity::villager_merchant_26_1_2::VillagerMerchantState>,
+) -> HashMap<u32, mc_entity::RegionalVillagerProfessionOffer> {
+    let smithing_table =
+        mc_data::Identifier::parse("minecraft:smithing_table").expect("static identifier");
+    let Some(block) = context.blocks.block(&smithing_table) else {
+        return HashMap::new();
+    };
+    let Some(merchant) = cached_merchant else {
+        return HashMap::new();
+    };
+    block
+        .states
+        .iter()
+        .map(|state| {
+            (
+                state.0,
+                mc_entity::RegionalVillagerProfessionOffer {
+                    profession: mc_entity::VillagerProfession::Toolsmith,
+                    merchant: merchant.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 fn villager_schedule_boundary(
@@ -328,6 +218,48 @@ fn villager_brain_phase_due(entity: EntityId, lifecycle_tick: u64) -> bool {
         .is_multiple_of(VILLAGER_BRAIN_TICK_INTERVAL)
 }
 
+/// Re-plan cadence for far-periphery goals: entities farther than
+/// [`NEAR_GOAL_CHUNK_RADIUS`] (Chebyshev chunks) from every player chunk
+/// re-plan once every [`FAR_GOAL_CADENCE_TICKS`], phase-rotated by entity id
+/// so roughly one quarter is due each tick. Near entities and entities with
+/// unknown chunks plan every tick (fail open), as does the whole population
+/// when no player positions are published yet. Deferred entities keep moving
+/// every tick via current-simulation-results continuation at the apply site.
+const FAR_GOAL_CADENCE_TICKS: u64 = 4;
+const NEAR_GOAL_CHUNK_RADIUS: i32 = 1;
+
+fn far_goal_tick_due(entity: EntityId, tick: u64) -> bool {
+    tick.wrapping_add(u64::from(entity.0.unsigned_abs()))
+        .is_multiple_of(FAR_GOAL_CADENCE_TICKS)
+}
+
+pub(super) fn split_goal_population_by_distance(
+    population: &HashSet<EntityId>,
+    entity_chunk: impl Fn(EntityId) -> Option<(i32, i32)>,
+    player_chunks: &[(i32, i32)],
+    tick: u64,
+) -> (HashSet<EntityId>, HashSet<EntityId>) {
+    if player_chunks.is_empty() {
+        return (population.clone(), HashSet::new());
+    }
+    let mut planned = HashSet::new();
+    let mut deferred = HashSet::new();
+    for entity in population.iter().copied() {
+        let near = entity_chunk(entity).is_none_or(|(cx, cz)| {
+            player_chunks.iter().any(|&(px, pz)| {
+                cx.abs_diff(px) <= NEAR_GOAL_CHUNK_RADIUS as u32
+                    && cz.abs_diff(pz) <= NEAR_GOAL_CHUNK_RADIUS as u32
+            })
+        });
+        if near || far_goal_tick_due(entity, tick) {
+            planned.insert(entity);
+        } else {
+            deferred.insert(entity);
+        }
+    }
+    (planned, deferred)
+}
+
 pub(super) fn villager_brain_probe_ids(
     active_population: &HashSet<EntityId>,
     overridden_villagers: &HashSet<EntityId>,
@@ -351,189 +283,6 @@ pub(super) fn villager_brain_probe_ids(
             .filter(|entity| active_population.contains(entity)),
     );
     due
-}
-
-pub(super) fn villager_brain_due_for_tick(
-    entity: EntityId,
-    schedule: mc_entity::villager_26_1_2::VillagerScheduleKind,
-    override_expires_tick: Option<u64>,
-    lifecycle_tick: u64,
-    day_time: i64,
-    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
-) -> bool {
-    override_expires_tick.is_some_and(|expires| lifecycle_tick >= expires)
-        || villager_schedule_boundary(profile, schedule, day_time)
-        || villager_brain_phase_due(entity, lifecycle_tick)
-}
-
-fn villager_can_restock_at_job_site(
-    position: Vec3,
-    brain: &mc_entity::villager_26_1_2::VillagerBrainState,
-) -> bool {
-    if brain.activity != mc_entity::villager_26_1_2::VillagerActivity::Work {
-        return false;
-    }
-    let Some(job_site) = brain.pois.job_site else {
-        return false;
-    };
-    let dx = position.x - job_site.x;
-    let dy = position.y - job_site.y;
-    let dz = position.z - job_site.z;
-    dx * dx + dy * dy + dz * dz <= VILLAGER_RESTOCK_REACH_SQUARED
-}
-
-#[cfg(test)]
-pub(super) fn apply_villager_brain_transitions(
-    entities: &mut EntityStoreGuard<'_>,
-    ids: &HashSet<EntityId>,
-    lifecycle_tick: u64,
-    day_time: i64,
-    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
-) -> usize {
-    apply_villager_brain_transitions_with_professions(
-        entities,
-        ids,
-        lifecycle_tick,
-        day_time,
-        profile,
-        None,
-    )
-    .applied
-}
-
-fn apply_villager_brain_transitions_with_professions(
-    entities: &mut EntityStoreGuard<'_>,
-    ids: &HashSet<EntityId>,
-    lifecycle_tick: u64,
-    day_time: i64,
-    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
-    profession_context: Option<VillagerProfessionContext<'_>>,
-) -> VillagerBrainTransitionReport {
-    if ids.is_empty() {
-        return VillagerBrainTransitionReport::default();
-    }
-    let Ok(validated_profile) = profile.validated() else {
-        return VillagerBrainTransitionReport::default();
-    };
-    let mut ordered = ids.iter().copied().collect::<Vec<_>>();
-    ordered.sort_unstable();
-    let mut transitions = Vec::new();
-    let mut expected_metadata = Vec::new();
-    for id in ordered {
-        let Some(expected) = entities.snapshot(id) else {
-            continue;
-        };
-        if expected.lifecycle != EntityLifecycle::Alive
-            || expected.type_name != "minecraft:villager"
-        {
-            continue;
-        }
-        let Some(current) = current_villager_brain(&expected) else {
-            continue;
-        };
-        let Ok(plan) = validated_profile.plan(&current, lifecycle_tick, day_time) else {
-            continue;
-        };
-        let goal = if expected
-            .retained
-            .villager_population
-            .as_ref()
-            .is_some_and(|population| population.pending_birth.is_some())
-        {
-            expected.goal.clone()
-        } else {
-            plan.goal
-        };
-        let profession_assignment = profession_context
-            .and_then(|context| supported_profession_assignment(&expected, &plan.state, context));
-        let updated_gossip = expected
-            .retained
-            .villager_gossip
-            .clone()
-            .and_then(|mut gossip| (gossip.decay(day_time).ok() == Some(true)).then_some(gossip));
-        let updated_merchant =
-            expected
-                .retained
-                .villager_merchant
-                .clone()
-                .and_then(|mut merchant| {
-                    (villager_can_restock_at_job_site(expected.position, &plan.state)
-                        && merchant.restock(day_time).ok() == Some(true))
-                    .then_some(merchant)
-                });
-        if expected.goal == goal
-            && expected.retained.villager_brain.as_ref() == Some(&plan.state)
-            && updated_gossip.is_none()
-            && updated_merchant.is_none()
-            && profession_assignment.is_none()
-        {
-            continue;
-        }
-        let mut next = expected.clone();
-        next.goal = goal;
-        next.retained.villager_brain = Some(plan.state);
-        if let Some(gossip) = updated_gossip {
-            next.retained.villager_gossip = Some(gossip);
-        }
-        if let Some(merchant) = updated_merchant {
-            next.retained.villager_merchant = Some(merchant);
-        }
-        if let Some((assigned, merchant)) = profession_assignment {
-            next.retained.villager = Some(assigned);
-            next.retained.villager_merchant = Some(merchant.clone());
-            expected_metadata.push((next.id, assigned, merchant));
-        }
-        transitions.push((expected, next));
-    }
-    let _applied = commit_villager_brain_transitions(entities, transitions);
-    let metadata_updates = expected_metadata
-        .into_iter()
-        .filter_map(|(id, expected_villager, expected_merchant)| {
-            let current = entities.snapshot(id)?;
-            (current.retained.villager == Some(expected_villager)
-                && current.retained.villager_merchant.as_ref() == Some(&expected_merchant))
-            .then_some(current)
-        })
-        .collect();
-    VillagerBrainTransitionReport {
-        #[cfg(test)]
-        applied: _applied,
-        metadata_updates,
-    }
-}
-
-pub(super) fn commit_villager_brain_transitions(
-    entities: &mut EntityStoreGuard<'_>,
-    transitions: Vec<(EntitySnapshot, EntitySnapshot)>,
-) -> usize {
-    let mut transitions = transitions.into_iter();
-    let mut applied = 0;
-    loop {
-        let batch = transitions
-            .by_ref()
-            .take(VILLAGER_BRAIN_COMMIT_BATCH)
-            .collect::<Vec<_>>();
-        if batch.is_empty() {
-            return applied;
-        }
-        applied += commit_villager_brain_transition_batch(entities, batch);
-    }
-}
-
-fn commit_villager_brain_transition_batch(
-    entities: &mut EntityStoreGuard<'_>,
-    mut batch: Vec<(EntitySnapshot, EntitySnapshot)>,
-) -> usize {
-    let count = batch.len();
-    if entities.replace_snapshots_if_current(batch.iter().cloned()) {
-        return count;
-    }
-    if count <= 1 {
-        return 0;
-    }
-    let right = batch.split_off(count / 2);
-    commit_villager_brain_transition_batch(entities, batch)
-        + commit_villager_brain_transition_batch(entities, right)
 }
 
 fn villager_gossip_activity_allows_transfer(
@@ -581,12 +330,19 @@ fn select_villager_gossip_target(
     cells: &HashMap<(i32, i32, i32), Vec<EntityId>>,
     reserved: &HashSet<EntityId>,
     timestamp: u64,
+    cross_region_only: bool,
 ) -> Option<EntityId> {
     let eligible = |target: EntityId| {
         if target == receiver.id || reserved.contains(&target) {
             return None;
         }
         let snapshot = candidates.get(&target)?;
+        if cross_region_only
+            && mc_entity::RegionKey::from_position(snapshot.position)
+                == mc_entity::RegionKey::from_position(receiver.position)
+        {
+            return None;
+        }
         let brain = current_villager_brain(snapshot)?;
         if !villager_gossip_cooldown_ready(timestamp, brain.last_gossip_time) {
             return None;
@@ -681,23 +437,29 @@ pub(super) fn commit_villager_gossip_transfer_pair(
     entities.replace_snapshots_if_current([(receiver, receiver_next), (source, source_next)])
 }
 
-pub(super) fn apply_villager_gossip_transfers(
+fn apply_cross_region_villager_gossip_transfers(
     entities: &mut EntityStoreGuard<'_>,
     initiator_ids: &HashSet<EntityId>,
     candidate_ids: &HashSet<EntityId>,
     timestamp: u64,
+) -> usize {
+    apply_villager_gossip_transfers_inner(entities, initiator_ids, candidate_ids, timestamp, true)
+}
+
+fn apply_villager_gossip_transfers_inner(
+    entities: &mut EntityStoreGuard<'_>,
+    initiator_ids: &HashSet<EntityId>,
+    candidate_ids: &HashSet<EntityId>,
+    timestamp: u64,
+    cross_region_only: bool,
 ) -> usize {
     if initiator_ids.is_empty() || candidate_ids.len() < 2 {
         return 0;
     }
     let mut candidates = HashMap::<EntityId, EntitySnapshot>::new();
     let mut cells = HashMap::<(i32, i32, i32), Vec<EntityId>>::new();
-    let mut ordered_candidates = candidate_ids.iter().copied().collect::<Vec<_>>();
-    ordered_candidates.sort_unstable();
-    for id in ordered_candidates {
-        let Some(snapshot) = entities.snapshot(id) else {
-            continue;
-        };
+    for snapshot in entities.snapshots_for_ids_uncached(candidate_ids) {
+        let id = snapshot.id;
         if snapshot.lifecycle != EntityLifecycle::Alive
             || snapshot.type_name != "minecraft:villager"
             || snapshot.retained.villager.is_none()
@@ -737,6 +499,7 @@ pub(super) fn apply_villager_gossip_transfers(
             &cells,
             &reserved,
             timestamp,
+            cross_region_only,
         ) else {
             continue;
         };
@@ -768,11 +531,20 @@ struct PhysicsApplyProfile {
     total_started: std::time::Instant,
     phase_started: std::time::Instant,
     publication_refresh_started: Option<std::time::Instant>,
+    movement_plan_started: bool,
+    preflight_lock_us: u64,
+    preflight_prefetch_us: u64,
+    prefetch_missing: usize,
+    fenced_apply: bool,
+    motion_lookup_calls: usize,
+    motion_lookup_samples: usize,
+    motion_lookup_sample_us: u64,
+    preflight_capture_us: u64,
+    preflight_finalize_us: u64,
     preflight_us: u64,
     owner_apply_us: u64,
     publication_refresh_us: u64,
     locked_publish_us: u64,
-    movement_plan_started: bool,
     input_steps: usize,
     filtered_steps: usize,
     effective_steps: usize,
@@ -792,12 +564,21 @@ impl PhysicsApplyProfile {
             tick,
             total_started: now,
             phase_started: now,
+            movement_plan_started: false,
             publication_refresh_started: None,
+            preflight_lock_us: 0,
+            preflight_prefetch_us: 0,
+            preflight_capture_us: 0,
+            preflight_finalize_us: 0,
+            prefetch_missing: 0,
+            motion_lookup_calls: 0,
+            motion_lookup_samples: 0,
+            motion_lookup_sample_us: 0,
+            fenced_apply: false,
             preflight_us: 0,
             owner_apply_us: 0,
             publication_refresh_us: 0,
             locked_publish_us: 0,
-            movement_plan_started: false,
             input_steps,
             filtered_steps: input_steps,
             effective_steps: input_steps,
@@ -819,9 +600,10 @@ impl PhysicsApplyProfile {
         self.phase_started = std::time::Instant::now();
     }
 
-    fn finish_owner_apply(&mut self, applied_kinematics: usize) {
+    fn finish_owner_apply(&mut self, applied_kinematics: usize, fenced_apply: bool) {
         self.owner_apply_us = Self::elapsed_us(self.phase_started);
         self.applied_kinematics = applied_kinematics;
+        self.fenced_apply = fenced_apply;
     }
 
     fn begin_publication_refresh(&mut self) {
@@ -887,10 +669,27 @@ impl Drop for PhysicsApplyProfile {
             0
         };
         let total_us = Self::elapsed_us(self.total_started);
-        eprintln!(
-            "PHYSICS_APPLY_PROFILE tick={} total_us={total_us} preflight_us={} owner_apply_us={} publication_refresh_us={} locked_publish_us={} movement_plan_us={} input_steps={} filtered={} effective={} applied_kinematics={} applied_steps={} tracker_inputs={} movements={} chunk_crossings={} publication_retries={}",
+        let motion_lookup_est_us = if self.motion_lookup_samples == 0 {
+            0
+        } else {
+            self.motion_lookup_sample_us
+                .saturating_mul(self.motion_lookup_calls as u64)
+                / self.motion_lookup_samples as u64
+        };
+        tracing::trace!(
+            "PHYSICS_APPLY_PROFILE tick={} total_us={total_us} preflight_us={} preflight_lock_us={} preflight_prefetch_us={} prefetch_missing={} fenced_apply={} preflight_capture_us={} motion_lookup_calls={} motion_lookup_samples={} motion_lookup_sample_us={} motion_lookup_est_us={} preflight_finalize_us={} owner_apply_us={} publication_refresh_us={} locked_publish_us={} movement_plan_us={} input_steps={} filtered={} effective={} applied_kinematics={} applied_steps={} tracker_inputs={} movements={} chunk_crossings={} publication_retries={}",
             self.tick,
             self.preflight_us,
+            self.preflight_lock_us,
+            self.preflight_prefetch_us,
+            self.prefetch_missing,
+            self.fenced_apply,
+            self.preflight_capture_us,
+            self.motion_lookup_calls,
+            self.motion_lookup_samples,
+            self.motion_lookup_sample_us,
+            motion_lookup_est_us,
+            self.preflight_finalize_us,
             self.owner_apply_us,
             self.publication_refresh_us,
             self.locked_publish_us,
@@ -964,20 +763,25 @@ impl SessionRegistry {
             .max(1)
     }
 
-    pub(in crate::play) fn tick_entities_and_collect_physics_queries_owned(
+    pub(crate) fn tick_entities_and_collect_physics_queries_regional(
         &self,
-        _authority: &SimulationAuthority,
         cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
         tick: u64,
         policy: EntitySimulationTickPolicy,
         world: EntitySimulationWorldContext<'_>,
-    ) -> Vec<EntityPhysicsQuery> {
+    ) -> (
+        Vec<EntityPhysicsQuery>,
+        Option<mc_entity::VersionedEntityKinematics>,
+        VillagerPopulationSelection,
+        Option<mc_entity::RegionalPreparedEntityPhysics>,
+    ) {
         self.tick_entities_and_collect_physics_queries_core(
             Some(cpu_resources),
             tick,
             policy,
             world.pathing(),
             world.profession_context(),
+            world.regional_pathing_materials(),
         )
     }
 
@@ -995,7 +799,9 @@ impl SessionRegistry {
             },
             None,
             None,
+            None,
         )
+        .0
     }
 
     #[cfg(test)]
@@ -1013,7 +819,9 @@ impl SessionRegistry {
             },
             None,
             None,
+            None,
         )
+        .0
     }
 
     #[cfg(test)]
@@ -1031,7 +839,9 @@ impl SessionRegistry {
             },
             None,
             None,
+            None,
         )
+        .0
     }
 
     #[cfg(test)]
@@ -1050,7 +860,9 @@ impl SessionRegistry {
             },
             Some((world_read, pathing_materials)),
             None,
+            None,
         )
+        .0
     }
 
     #[cfg(test)]
@@ -1070,7 +882,9 @@ impl SessionRegistry {
             },
             None,
             Some((world_read, blocks, items)),
+            None,
         )
+        .0
     }
 
     fn tick_entities_and_collect_physics_queries_core(
@@ -1084,7 +898,13 @@ impl SessionRegistry {
             &mc_world::BlockRegistry,
             &mc_data::items::ItemRegistry,
         )>,
-    ) -> Vec<EntityPhysicsQuery> {
+        regional_pathing_materials: Option<Arc<mc_physics::BlockMaterialIds>>,
+    ) -> (
+        Vec<EntityPhysicsQuery>,
+        Option<mc_entity::VersionedEntityKinematics>,
+        VillagerPopulationSelection,
+        Option<mc_entity::RegionalPreparedEntityPhysics>,
+    ) {
         let EntitySimulationTickPolicy {
             pathing_candidates_per_entity,
             simulation_distance,
@@ -1092,8 +912,13 @@ impl SessionRegistry {
         #[cfg(feature = "load-bench")]
         let goal_profile_started = std::time::Instant::now();
         if !self.has_live_sessions() {
-            self.clear_active_simulation_entities();
-            return Vec::new();
+            self.clear_active_simulation_selection();
+            return (
+                Vec::new(),
+                None,
+                VillagerPopulationSelection::default(),
+                None,
+            );
         }
         let live_session_generation = self.live_session_generation.load(Ordering::Acquire);
         let (world_read, pathing_materials) = pathing.unzip();
@@ -1121,252 +946,238 @@ impl SessionRegistry {
                 );
             }
         }
-        let (active_chunks, simulation_chunks, active_population_ids) = self
-            .simulation_inputs
-            .active_entity_candidates_matching_chunks(|chunk| {
-                entity_is_near_player_chunk(chunk, &player_positions, simulation_distance)
-            });
         let terrain_pathing_entities = self.simulation_inputs.terrain_pathing_entities();
         let villager_day_time = i64::try_from(self.world_time()).unwrap_or(i64::MAX);
         let villager_profile = self.villager_brain_profile();
         let overridden_villagers = self.overridden_villager_entities();
+        let hostile_target_positions = Arc::<[Vec3]>::from(hostile_target_positions);
+        let combat_targets_by_entity_id = Arc::new(combat_targets_by_entity_id);
+        // Merchant offers are rebuilt from the item registry; do it once per
+        // tick outside the entity-store lock instead of once per villager
+        // while holding it.
+        let cached_toolsmith_merchant =
+            profession_context.and_then(|context| toolsmith_merchant_state(context.items));
+        if self.live_session_generation.load(Ordering::Acquire) != live_session_generation {
+            self.clear_active_simulation_selection();
+            return (
+                Vec::new(),
+                None,
+                VillagerPopulationSelection::default(),
+                None,
+            );
+        }
+        let mut regional_tick =
+            world_read
+                .zip(regional_pathing_materials)
+                .map(|(world_read, materials)| {
+                    let (active_chunks, simulation_chunks) =
+                        self.simulation_inputs.active_chunks_matching(|chunk| {
+                            entity_is_near_player_chunk(
+                                chunk,
+                                &player_positions,
+                                simulation_distance,
+                            )
+                        });
+                    let snapshot_chunks = active_chunks
+                        .iter()
+                        .map(|&(x, z)| mc_world::ChunkPos { x, z })
+                        .collect::<Vec<_>>();
+                    let pathing_snapshot = Arc::new(world_read.snapshot_chunks(&snapshot_chunks));
+                    let profession_offers_by_block_state = Arc::new(
+                        profession_context
+                            .map(|context| {
+                                regional_profession_offers_by_block_state(
+                                    context,
+                                    cached_toolsmith_merchant.as_ref(),
+                                )
+                            })
+                            .unwrap_or_default(),
+                    );
+                    let world = Arc::new(mc_entity::RegionalTickWorld::new(
+                        Arc::clone(&active_chunks),
+                        Arc::clone(&terrain_pathing_entities),
+                        pathing_snapshot,
+                        world_read.clone(),
+                        materials,
+                    ));
+                    let output =
+                        self.entities
+                            .tick_owned_regions(mc_entity::RegionalEntityTickInput {
+                                tick,
+                                simulation_chunks: Arc::new(simulation_chunks.clone()),
+                                goals: mc_entity::RegionalGoalTickInputs {
+                                    active_chunks: Some(Arc::clone(&active_chunks)),
+                                    terrain_pathing_entities: Arc::clone(&terrain_pathing_entities),
+                                    hostile_target_positions: Some(Arc::clone(
+                                        &hostile_target_positions,
+                                    )),
+                                    combat_targets: Arc::clone(&combat_targets_by_entity_id),
+                                    villager: Some(Arc::new(
+                                        mc_entity::RegionalVillagerGoalTickInputs {
+                                            day_time: villager_day_time,
+                                            profile: Arc::clone(&villager_profile),
+                                            profession_offers: Arc::new(HashMap::new()),
+                                        },
+                                    )),
+                                    mob_behaviors: self.mob_behavior_table(),
+                                },
+                                world,
+                                pathing_budget: PathingBudget {
+                                    max_candidates_per_entity: pathing_candidates_per_entity.max(1),
+                                    ..PathingBudget::DEFAULT
+                                },
+                                profession_offers_by_block_state,
+                            });
+                    debug_assert!(
+                        output
+                            .active_hostile_ids
+                            .iter()
+                            .chain(&output.villager_population_candidates)
+                            .chain(&output.villager_ids)
+                            .chain(&output.villager_proximity_seeds)
+                            .all(|(entity, _)| !output.fallback_entity_ids.contains(entity))
+                    );
+                    (active_chunks, simulation_chunks, output)
+                });
+        let (active_chunks, simulation_chunks, active_population_count, goal_population_ids) =
+            if let Some((active_chunks, simulation_chunks, output)) = regional_tick.as_ref() {
+                (
+                    Arc::clone(active_chunks),
+                    simulation_chunks.clone(),
+                    output.active_entity_count,
+                    output.fallback_entity_ids.clone(),
+                )
+            } else {
+                let (active_chunks, simulation_chunks, active_population_ids) = self
+                    .simulation_inputs
+                    .active_entity_candidates_matching_chunks(|chunk| {
+                        entity_is_near_player_chunk(chunk, &player_positions, simulation_distance)
+                    });
+                (
+                    active_chunks,
+                    simulation_chunks,
+                    active_population_ids.len(),
+                    active_population_ids,
+                )
+            };
+        let goal_population_ids = Arc::new(goal_population_ids);
         let villager_brain_probe_ids = villager_brain_probe_ids(
-            &active_population_ids,
+            &goal_population_ids,
             &overridden_villagers,
             tick,
             villager_day_time,
             &villager_profile,
         );
-        // Performance work must never reduce entity/AI activity: every entity
-        // in the active population is simulated every tick, so selection is
-        // the full population and this path never rotates simulation cohorts.
-        let active_entity_candidates = &active_population_ids;
-        let lane_count = cpu_resources.map_or(1, |resources| resources.cpu_limit().max(1));
+        // Goal re-plan cadence is tiered, physics is not: near entities
+        // re-plan every tick, far-periphery entities re-plan once every
+        // FAR_GOAL_CADENCE_TICKS (phase-rotated by entity id, see
+        // split_goal_population_by_distance). Every entity still moves every
+        // tick: off-phase far entities reuse current simulation results at
+        // the apply site below, so selection stays the full population and
+        // only decision refresh rate drops with distance.
+        let lane_count = cpu_resources.map_or(1, |resources| resources.cpu_capacity().max(1));
         self.entity_update_budget_per_lane.store(
-            active_population_ids.len().div_ceil(lane_count),
+            active_population_count.div_ceil(lane_count),
             Ordering::Relaxed,
         );
         self.entity_update_budget_total
-            .store(active_population_ids.len(), Ordering::Relaxed);
+            .store(active_population_count, Ordering::Relaxed);
         self.entity_update_selected
-            .store(active_population_ids.len(), Ordering::Relaxed);
+            .store(active_population_count, Ordering::Relaxed);
         self.entity_update_active_population
-            .store(active_population_ids.len(), Ordering::Relaxed);
+            .store(active_population_count, Ordering::Relaxed);
         #[cfg(feature = "load-bench")]
         let selection_us =
             u64::try_from(goal_profile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         #[cfg(feature = "load-bench")]
         let projection_started = std::time::Instant::now();
-        let mut entities = self.lock_entities("prepare entity goals");
         if active_chunks.is_empty() {
-            self.clear_active_simulation_entities();
-            return Vec::new();
+            self.clear_active_simulation_selection();
+            return (
+                Vec::new(),
+                None,
+                VillagerPopulationSelection::default(),
+                None,
+            );
         }
-        let mut active_entity_ids = HashSet::new();
-        let mut active_shulker_bullet_ids = HashSet::new();
-        let mut active_exclusive_flight_ids = HashSet::new();
-        let mut active_hostile_ids = HashSet::new();
-        let mut active_villager_ids = HashSet::new();
-        let mut active_villager_population_ids = HashSet::new();
-        let mut sheep_grazing_entities = HashSet::new();
-        let mut active_entity_aabbs = HashMap::new();
-        let mut active_entity_kinds = HashMap::new();
-        let projection_ids = active_entity_candidates
-            .union(&villager_brain_probe_ids)
-            .copied()
-            .collect::<HashSet<_>>();
-        let simulation_projections = entities
-            .simulation_projections_for_ids(&projection_ids)
-            .into_iter()
-            .map(|projection| (projection.id, projection))
-            .collect::<HashMap<_, _>>();
-        for entity in simulation_projections.values() {
-            if active_entity_candidates.contains(&entity.id) {
-                #[cfg(test)]
-                self.active_entity_selection_visits
-                    .fetch_add(1, Ordering::Relaxed);
-                if entity.lifecycle == EntityLifecycle::Alive {
-                    let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
-                    if active_chunks.contains(&chunk) {
-                        let type_name = &*entity.type_name;
-                        active_entity_ids.insert(entity.id);
-                        if type_name == "minecraft:shulker_bullet" {
-                            active_shulker_bullet_ids.insert(entity.id);
-                        }
-                        if type_name == "minecraft:ender_dragon" {
-                            active_exclusive_flight_ids.insert(entity.id);
-                        }
-                        if is_hostile_entity(type_name) {
-                            active_hostile_ids.insert(entity.id);
-                        }
-                        if type_name == "minecraft:villager" && entity.villager.is_some() {
-                            active_villager_population_ids.insert(entity.id);
-                        }
-                        if entity.sheep_grazing_ticks.is_some() {
-                            sheep_grazing_entities.insert(entity.id);
-                        }
-                        active_entity_aabbs
-                            .insert(entity.id, entity_geometry(type_name, entity.animal).aabb);
-                        active_entity_kinds.insert(
-                            entity.id,
-                            (
-                                if type_name == "minecraft:arrow" {
-                                    EntityPhysicsKind::ArrowProjectile {
-                                        revision: entity.arrow_revision,
-                                        embedded_block: entity.arrow_embedded_block,
-                                    }
-                                } else if type_name == "minecraft:ender_dragon" {
-                                    EntityPhysicsKind::ExternalFlight
-                                } else if matches!(
-                                    type_name,
-                                    "minecraft:evoker_fangs" | "minecraft:area_effect_cloud"
-                                ) {
-                                    EntityPhysicsKind::Immobile
-                                } else if type_name == "minecraft:shulker_bullet" {
-                                    EntityPhysicsKind::ShulkerBullet {
-                                        revision: entity.hurting_projectile_revision,
-                                    }
-                                } else if let Some(acceleration_power_bits) =
-                                    entity.hurting_projectile_acceleration_power_bits
-                                {
-                                    EntityPhysicsKind::HurtingProjectile {
-                                        revision: entity.hurting_projectile_revision,
-                                        acceleration_power_bits,
-                                    }
-                                } else if let Some(revision) = entity.throwable_projectile_revision
-                                {
-                                    EntityPhysicsKind::ThrowableProjectile {
-                                        revision: Some(revision),
-                                        gravity_bits: 0.05_f64.to_bits(),
-                                    }
-                                } else if entity_type_uses_aquatic_physics(type_name) {
-                                    EntityPhysicsKind::AquaticLiving
-                                } else if type_name == "minecraft:falling_block" {
-                                    EntityPhysicsKind::FallingBlock
-                                } else if !entity.has_item_stack
-                                    && !entity.has_experience_value
-                                    && !entity.has_block_state
-                                    && !entity.has_vehicle
-                                {
-                                    if entity_type_walks_on_powder_snow(type_name) {
-                                        EntityPhysicsKind::PowderSnowWalkableLiving
-                                    } else {
-                                        EntityPhysicsKind::Living
-                                    }
-                                } else {
-                                    EntityPhysicsKind::Default
-                                },
-                                entity.fall_distance,
-                                mc_entity::EntityGoalFence::from_goal(&entity.goal),
-                            ),
-                        );
-                    }
-                }
-            }
-            if villager_brain_probe_ids.contains(&entity.id)
-                && entity.lifecycle == EntityLifecycle::Alive
-                && &*entity.type_name == "minecraft:villager"
-                && entity.villager.is_some()
-                && villager_brain_due_for_tick(
-                    entity.id,
-                    entity
-                        .villager_schedule
-                        .unwrap_or(mc_entity::villager_26_1_2::VillagerScheduleKind::Adult),
-                    entity.villager_override_expires_tick,
-                    tick,
-                    villager_day_time,
-                    &villager_profile,
-                )
-            {
-                active_villager_ids.insert(entity.id);
-            }
+        if goal_population_ids.is_empty() && regional_tick.is_some() {
+            let (_, _, output) = regional_tick
+                .take()
+                .expect("empty fallback population requires a regional tick");
+            return self.finish_entity_tick_selection(
+                live_session_generation,
+                simulation_chunks,
+                output.active_entity_count,
+                Vec::new(),
+                None,
+                false,
+                HashSet::new(),
+                Vec::new(),
+                Some(output),
+            );
         }
-        let VillagerBrainTransitionReport {
-            metadata_updates: villager_metadata_updates,
-            ..
-        } = apply_villager_brain_transitions_with_professions(
-            &mut entities,
-            &active_villager_ids,
-            tick,
-            villager_day_time,
-            &villager_profile,
-            profession_context,
-        );
-        let _gossip_transfers = apply_villager_gossip_transfers(
-            &mut entities,
-            &active_villager_ids,
-            &active_villager_population_ids,
-            tick,
-        );
-        let cleared_overrides = overridden_villagers
+        let player_chunks = player_positions
             .iter()
-            .copied()
-            .filter(|entity| {
-                simulation_projections.get(entity).is_none_or(|projection| {
-                    projection.lifecycle != EntityLifecycle::Alive
-                        || !projection.villager_override_order_present
-                })
-            })
+            .map(|position| chunk_pos_from_coords(position.x, position.z))
             .collect::<Vec<_>>();
-        self.clear_villager_overrides(&cleared_overrides);
+        let (planned_goal_ids, deferred_goal_ids) = split_goal_population_by_distance(
+            &goal_population_ids,
+            |entity| self.simulation_inputs.entity_chunk(entity),
+            &player_chunks,
+            tick,
+        );
+        let planned_goal_ids = Arc::new(planned_goal_ids);
+        let mut entities = self.lock_entities("prepare entity goals");
+        let active_villager_ids = villager_brain_probe_ids;
+        let villager_profession_offers = profession_context.map_or_else(HashMap::new, |context| {
+            entities
+                .simulation_projections_for_ids(&active_villager_ids)
+                .into_iter()
+                .filter_map(|projection| {
+                    supported_profession_offer(
+                        &projection,
+                        context,
+                        cached_toolsmith_merchant.as_ref(),
+                    )
+                    .map(|offer| (projection.id, offer))
+                })
+                .collect::<HashMap<_, _>>()
+        });
+        let villager_profession_metadata = villager_profession_offers
+            .iter()
+            .map(|(entity, offer)| (*entity, offer.profession))
+            .collect::<HashMap<_, _>>();
         #[cfg(feature = "load-bench")]
         let projection_us =
             u64::try_from(projection_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        if active_entity_ids.is_empty() {
-            self.publish_active_entity_selection(
-                live_session_generation,
-                active_population_ids,
-                active_hostile_ids,
-            );
-            drop(entities);
-            self.publish_villager_metadata_updates(villager_metadata_updates);
-            return Vec::new();
-        }
         #[cfg(feature = "load-bench")]
-        let targets_started = std::time::Instant::now();
-        let mob_behaviors = self.mob_behavior_table();
-        update_hostile_targets_from_projections(
-            &mut entities,
-            &hostile_target_positions,
-            active_hostile_ids
-                .iter()
-                .filter_map(|entity_id| simulation_projections.get(entity_id)),
-            &mob_behaviors,
-        );
-        self.publish_active_entity_selection(
-            live_session_generation,
-            active_population_ids,
-            active_hostile_ids,
-        );
-        #[cfg(feature = "load-bench")]
-        let targets_us = u64::try_from(targets_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let targets_us = 0_u64;
         #[cfg(feature = "load-bench")]
         let prepare_started = std::time::Instant::now();
-        // Every eligible goal entity (sheep grazing and exclusive-flight
-        // exclusions preserved) is goal-selected every tick; the legacy
-        // ENTITY_GOAL_UPDATES_PER_TICK cohort cap never applies here.
-        let goal_entity_ids = active_entity_ids
-            .difference(&sheep_grazing_entities)
-            .copied()
-            .filter(|entity_id| !active_exclusive_flight_ids.contains(entity_id))
-            .collect::<HashSet<_>>();
-        let unprojected_entity_ids = active_entity_ids
-            .difference(&goal_entity_ids)
-            .copied()
-            .collect::<HashSet<_>>();
-        let prepared_goal_tick =
-            entities.prepare_goal_tick_with_pathing_for_ids(tick, &goal_entity_ids);
-        for entity_id in &goal_entity_ids {
-            if let Some(goal_fence) = prepared_goal_tick.goal_fence(*entity_id)
-                && let Some(state) = active_entity_kinds.get_mut(entity_id)
-            {
-                state.2 = goal_fence;
-            }
-        }
+        let prepared_goal_tick = entities.prepare_goal_tick_with_pathing_for_ids_with_inputs(
+            tick,
+            Arc::clone(&planned_goal_ids),
+            mc_entity::RegionalGoalTickInputs {
+                active_chunks: Some(Arc::clone(&active_chunks)),
+                terrain_pathing_entities: Arc::clone(&terrain_pathing_entities),
+                hostile_target_positions: Some(Arc::clone(&hostile_target_positions)),
+                combat_targets: Arc::clone(&combat_targets_by_entity_id),
+                villager: Some(Arc::new(mc_entity::RegionalVillagerGoalTickInputs {
+                    day_time: villager_day_time,
+                    profile: Arc::clone(&villager_profile),
+                    profession_offers: Arc::new(villager_profession_offers),
+                })),
+                mob_behaviors: self.mob_behavior_table(),
+            },
+        );
+        let cross_region_villager_candidates = prepared_goal_tick
+            .cross_region_villager_candidates()
+            .clone();
+        #[cfg(feature = "load-bench")]
+        let goal_entity_count = prepared_goal_tick.goal_entity_count();
         #[cfg(feature = "load-bench")]
         let prepare_us = u64::try_from(prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         drop(entities);
-        self.publish_villager_metadata_updates(villager_metadata_updates);
         #[cfg(test)]
         self.pause_before_entity_goal_compute_for_test();
         #[cfg(feature = "load-bench")]
@@ -1375,25 +1186,35 @@ impl SessionRegistry {
             max_candidates_per_entity: pathing_candidates_per_entity.max(1),
             ..PathingBudget::DEFAULT
         };
+        let pathing_request_count = prepared_goal_tick.pathing_request_count();
+        let pathing_aabbs = prepared_goal_tick.pathing_aabbs().clone();
         let terrain_snapshot = if terrain_pathing_entities.is_empty() {
             None
         } else {
             world_read.zip(pathing_materials).map(|(world_read, _)| {
-                let mut chunks = HashSet::new();
-                prepared_goal_tick.visit_pathing_probe_positions(
-                    goal_budget,
-                    |entity, position| {
-                        insert_terrain_snapshot_chunks_for_probe_position(
-                            &mut chunks,
-                            entity,
-                            position,
-                            &terrain_pathing_entities,
-                            &active_entity_aabbs,
-                            &active_chunks,
-                        );
-                    },
-                );
-                let chunks = sorted_chunk_positions(chunks);
+                let chunks = if pathing_request_count >= active_chunks.len() {
+                    let chunks = active_chunks
+                        .iter()
+                        .map(|&(x, z)| mc_world::ChunkPos { x, z })
+                        .collect::<HashSet<_>>();
+                    sorted_chunk_positions(chunks)
+                } else {
+                    let mut chunks = HashSet::new();
+                    prepared_goal_tick.visit_pathing_probe_positions(
+                        goal_budget,
+                        |entity, position| {
+                            insert_terrain_snapshot_chunks_for_probe_position(
+                                &mut chunks,
+                                entity,
+                                position,
+                                &terrain_pathing_entities,
+                                &pathing_aabbs,
+                                &active_chunks,
+                            );
+                        },
+                    );
+                    sorted_chunk_positions(chunks)
+                };
                 world_read.snapshot_chunks(&chunks)
             })
         };
@@ -1404,7 +1225,7 @@ impl SessionRegistry {
         let pathing_probe = LoadedChunkPathingProbe::new(
             &active_chunks,
             &terrain_pathing_entities,
-            &active_entity_aabbs,
+            &pathing_aabbs,
             terrain_snapshot
                 .as_ref()
                 .zip(pathing_materials)
@@ -1433,154 +1254,243 @@ impl SessionRegistry {
         #[cfg(feature = "load-bench")]
         let apply_started = std::time::Instant::now();
         let mut entities = self.lock_entities("apply entity goals");
-        let applied = entities
-            .apply_prepared_goal_tick_and_alive_kinematics(resolved_goal_tick, &goal_entity_ids);
+        if self.live_session_generation.load(Ordering::Acquire) != live_session_generation {
+            drop(goal_cpu_permits);
+            drop(entities);
+            self.clear_active_simulation_selection();
+            return (
+                Vec::new(),
+                None,
+                VillagerPopulationSelection::default(),
+                None,
+            );
+        }
+        let (results, goal_applied, owner_fence) = match entities
+            .apply_prepared_goal_tick_and_simulation_results(
+                resolved_goal_tick,
+                Arc::clone(&planned_goal_ids),
+            ) {
+            Some((_, mut results, owner_fence)) => {
+                if !deferred_goal_ids.is_empty() {
+                    let (continued, _) =
+                        entities.current_simulation_results_for_ids(&deferred_goal_ids);
+                    results.extend(continued);
+                }
+                (results, true, owner_fence)
+            }
+            None => {
+                let (results, owner_fence) =
+                    entities.current_simulation_results_for_ids(&goal_population_ids);
+                (results, false, owner_fence)
+            }
+        };
+        if goal_applied {
+            let _cross_region_gossip_transfers = apply_cross_region_villager_gossip_transfers(
+                &mut entities,
+                &active_villager_ids,
+                &cross_region_villager_candidates,
+                tick,
+            );
+        }
+        let villager_metadata_updates = villager_profession_metadata
+            .iter()
+            .filter_map(|(entity, profession)| {
+                let snapshot = entities.snapshot(*entity)?;
+                snapshot
+                    .retained
+                    .villager
+                    .is_some_and(|villager| villager.profession == *profession)
+                    .then_some(snapshot)
+            })
+            .collect::<Vec<_>>();
+        let cleared_overrides = overridden_villagers
+            .iter()
+            .copied()
+            .filter(|entity| {
+                entities.snapshot(*entity).is_none_or(|snapshot| {
+                    snapshot.lifecycle != EntityLifecycle::Alive
+                        || current_villager_brain(&snapshot)
+                            .is_none_or(|brain| brain.override_order.is_none())
+                })
+            })
+            .collect::<Vec<_>>();
+        self.clear_villager_overrides(&cleared_overrides);
         #[cfg(feature = "load-bench")]
         let apply_us = u64::try_from(apply_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         #[cfg(feature = "load-bench")]
         let post_started = std::time::Instant::now();
-        let current_ids = if applied.is_some() {
-            for id in &unprojected_entity_ids {
-                active_entity_aabbs.remove(id);
-                active_entity_kinds.remove(id);
-            }
-            &unprojected_entity_ids
-        } else {
-            active_entity_aabbs.clear();
-            active_entity_kinds.clear();
-            &active_entity_ids
-        };
-        let mut kinematics = applied
-            .map(|(_, kinematics)| kinematics)
-            .unwrap_or_default();
-        for (entity_id, revision) in retarget_active_shulker_bullets(
-            &mut entities,
-            &active_shulker_bullet_ids,
-            &combat_targets_by_entity_id,
-            &mut kinematics,
-        ) {
-            if let Some((kind, _, _)) = active_entity_kinds.get_mut(&entity_id) {
-                *kind = EntityPhysicsKind::ShulkerBullet {
-                    revision: Some(revision),
-                };
-            }
-        }
-        let current_projections = if current_ids.is_empty() {
-            HashMap::new()
-        } else {
-            entities
-                .simulation_projections_for_ids(current_ids)
-                .into_iter()
-                .map(|projection| (projection.id, projection))
-                .collect::<HashMap<_, _>>()
-        };
-        for id in current_ids {
-            let Some(projected) = current_projections.get(id) else {
-                continue;
-            };
-            let entity = projected;
-            if entity.lifecycle != EntityLifecycle::Alive {
-                continue;
-            }
-            let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
-            if !simulation_chunks.contains(&chunk) {
-                continue;
-            }
-            let type_name = &*entity.type_name;
-            active_entity_aabbs.insert(entity.id, entity_geometry(type_name, entity.animal).aabb);
-            active_entity_kinds.insert(
-                entity.id,
-                (
-                    if type_name == "minecraft:arrow" {
-                        EntityPhysicsKind::ArrowProjectile {
-                            revision: entity.arrow_revision,
-                            embedded_block: entity.arrow_embedded_block,
-                        }
-                    } else if type_name == "minecraft:ender_dragon" {
-                        EntityPhysicsKind::ExternalFlight
-                    } else if matches!(
-                        type_name,
-                        "minecraft:evoker_fangs" | "minecraft:area_effect_cloud"
-                    ) {
-                        EntityPhysicsKind::Immobile
-                    } else if type_name == "minecraft:shulker_bullet" {
-                        EntityPhysicsKind::ShulkerBullet {
-                            revision: entity.hurting_projectile_revision,
-                        }
-                    } else if let Some(acceleration_power_bits) =
-                        entity.hurting_projectile_acceleration_power_bits
-                    {
-                        EntityPhysicsKind::HurtingProjectile {
-                            revision: entity.hurting_projectile_revision,
-                            acceleration_power_bits,
-                        }
-                    } else if let Some(revision) = entity.throwable_projectile_revision {
-                        EntityPhysicsKind::ThrowableProjectile {
-                            revision: Some(revision),
-                            gravity_bits: 0.05_f64.to_bits(),
-                        }
-                    } else if entity_type_uses_aquatic_physics(type_name) {
-                        EntityPhysicsKind::AquaticLiving
-                    } else if type_name == "minecraft:falling_block" {
-                        EntityPhysicsKind::FallingBlock
-                    } else if !entity.has_item_stack
-                        && !entity.has_experience_value
-                        && !entity.has_block_state
-                        && !entity.has_vehicle
-                    {
-                        if entity_type_walks_on_powder_snow(type_name) {
-                            EntityPhysicsKind::PowderSnowWalkableLiving
-                        } else {
-                            EntityPhysicsKind::Living
-                        }
-                    } else {
-                        EntityPhysicsKind::Default
-                    },
-                    entity.fall_distance,
-                    mc_entity::EntityGoalFence::from_goal(&entity.goal),
-                ),
-            );
-            kinematics.push(EntityKinematics {
-                id: entity.id,
-                position: entity.position,
-                rotation: entity.rotation,
-                velocity: entity.velocity,
-                on_ground: entity.on_ground,
-            });
-        }
-        kinematics.sort_unstable_by_key(|state| state.id);
         drop(goal_cpu_permits);
-        let queries = kinematics
-            .into_iter()
-            .map(|state| EntityPhysicsQuery {
-                id: state.id,
-                position: state.position,
-                velocity: state.velocity,
-                aabb: active_entity_aabbs[&state.id],
-                on_ground: state.on_ground,
-                fall_distance: active_entity_kinds[&state.id].1,
-                goal_fence: active_entity_kinds[&state.id].2,
-                kind: active_entity_kinds[&state.id].0,
-            })
-            .collect();
+        drop(entities);
+        let finished = self.finish_entity_tick_selection(
+            live_session_generation,
+            simulation_chunks,
+            active_population_count,
+            results,
+            owner_fence,
+            goal_applied,
+            resolved_direct_paths,
+            villager_metadata_updates,
+            regional_tick.take().map(|(_, _, output)| output),
+        );
         #[cfg(feature = "load-bench")]
         {
             let post_us = u64::try_from(post_started.elapsed().as_micros()).unwrap_or(u64::MAX);
             if tick.is_multiple_of(10) {
-                eprintln!(
+                tracing::trace!(
                     "ENTITY_GOAL_PHASE tick={tick} active={} selected={} goal_ids={} selection_us={selection_us} projection_us={projection_us} targets_us={targets_us} prepare_us={prepare_us} terrain_us={terrain_us} resolve_us={resolve_us} apply_us={apply_us} post_us={post_us}",
                     self.entity_update_active_population.load(Ordering::Relaxed),
                     self.entity_update_selected.load(Ordering::Relaxed),
-                    goal_entity_ids.len(),
+                    goal_entity_count,
                 );
             }
         }
-        drop(entities);
-        if !resolved_direct_paths.is_empty() {
+        finished
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_entity_tick_selection(
+        &self,
+        live_session_generation: u64,
+        simulation_chunks: HashSet<(i32, i32)>,
+        _active_population_count: usize,
+        results: Vec<EntitySimulationResult>,
+        owner_fence: Option<mc_entity::VersionedEntityKinematics>,
+        mut goal_applied: bool,
+        mut resolved_direct_paths: HashSet<EntityId>,
+        mut villager_metadata_updates: Vec<EntitySnapshot>,
+        regional_output: Option<mc_entity::RegionalEntityTickOutput>,
+    ) -> (
+        Vec<EntityPhysicsQuery>,
+        Option<mc_entity::VersionedEntityKinematics>,
+        VillagerPopulationSelection,
+        Option<mc_entity::RegionalPreparedEntityPhysics>,
+    ) {
+        let (
+            regional_active_hostiles,
+            regional_villager_candidates,
+            regional_villagers,
+            regional_proximity_seeds,
+            regional_prepared,
+        ) = if let Some(output) = regional_output {
+            goal_applied |= output.active_entity_count > output.fallback_entity_ids.len();
+            resolved_direct_paths.extend(output.resolved_direct_paths);
+            villager_metadata_updates.extend(output.villager_profession_updates);
+            (
+                output.active_hostile_ids,
+                output.villager_population_candidates,
+                output.villager_ids,
+                output.villager_proximity_seeds,
+                Some(output.prepared_physics),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)
+        };
+        let mut active_hostile_ids = HashSet::new();
+        let mut villager_population = VillagerPopulationSelection::default();
+        let mut queries = Vec::with_capacity(results.len());
+        {
+            let mut classify = |result: EntitySimulationResult, include_query: bool| {
+                let position = result.physics.position;
+                if !simulation_chunks.contains(&chunk_pos_from_coords(position.x, position.z)) {
+                    return;
+                }
+                if result.hostile {
+                    active_hostile_ids.insert(result.physics.id);
+                }
+                if result.villager_population_active {
+                    villager_population.candidates.insert(result.physics.id);
+                }
+                if result.villager {
+                    villager_population.covered.insert(result.physics.id);
+                }
+                if result.villager_population_active || result.item {
+                    villager_population.proximity_seeds.push(position);
+                }
+                if include_query {
+                    queries.push(result.physics);
+                }
+            };
+            for result in results {
+                classify(result, true);
+            }
+            active_hostile_ids.extend(regional_active_hostiles.into_iter().filter_map(
+                |(entity, position)| {
+                    simulation_chunks
+                        .contains(&chunk_pos_from_coords(position.x, position.z))
+                        .then_some(entity)
+                },
+            ));
+            villager_population.candidates.extend(
+                regional_villager_candidates
+                    .into_iter()
+                    .filter_map(|(entity, position)| {
+                        simulation_chunks
+                            .contains(&chunk_pos_from_coords(position.x, position.z))
+                            .then_some(entity)
+                    }),
+            );
+            villager_population
+                .covered
+                .extend(
+                    regional_villagers
+                        .into_iter()
+                        .filter_map(|(entity, position)| {
+                            simulation_chunks
+                                .contains(&chunk_pos_from_coords(position.x, position.z))
+                                .then_some(entity)
+                        }),
+                );
+            villager_population.proximity_seeds.extend(
+                regional_proximity_seeds
+                    .into_iter()
+                    .filter_map(|(_, position)| {
+                        simulation_chunks
+                            .contains(&chunk_pos_from_coords(position.x, position.z))
+                            .then_some(position)
+                    }),
+            );
+        }
+        #[cfg(test)]
+        self.active_entity_selection_visits.fetch_add(
+            u64::try_from(_active_population_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.publish_active_simulation_selection(
+            live_session_generation,
+            simulation_chunks,
+            active_hostile_ids,
+        );
+        self.publish_villager_metadata_updates(villager_metadata_updates);
+        if goal_applied && !resolved_direct_paths.is_empty() {
             self.simulation_inputs
                 .remove_terrain_pathing(resolved_direct_paths);
         }
-        queries
+        (queries, owner_fence, villager_population, regional_prepared)
+    }
+
+    pub(crate) fn commit_owned_region_physics(
+        &self,
+        prepared: mc_entity::RegionalPreparedEntityPhysics,
+    ) -> (
+        Vec<EntityPhysicsQuery>,
+        Option<mc_entity::VersionedEntityKinematics>,
+        Option<RegionallyCommittedEntityMovement>,
+        mc_entity::LaneCommitTimings,
+    ) {
+        let output = self.entities.commit_owned_region_physics(prepared);
+        self.simulation_inputs
+            .insert_terrain_pathing(output.terrain_pathing_additions);
+        let queries = output
+            .fallback_results
+            .into_iter()
+            .map(|result| result.physics)
+            .collect();
+        let commit =
+            (!output.committed_motion.is_empty()).then_some(RegionallyCommittedEntityMovement {
+                states: output.committed_motion,
+                fence: output.publication_fence,
+            });
+        (queries, output.fallback_fence, commit, output.lane_timings)
     }
 
     pub(in crate::play) fn restore_persisted_entities_owned(
@@ -1719,39 +1629,44 @@ impl SessionRegistry {
         (checkpoint, phases)
     }
 
-    #[cfg(test)]
-    pub(in crate::play) fn apply_entity_physics_and_dispatch_owned(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_entity_physics_if_current_and_dispatch_regional(
         &self,
-        _authority: &SimulationAuthority,
-        tick: u64,
-        steps: &[EntityPhysicsStep],
-    ) {
-        let projectile_physics_facts = test_entity_projectile_physics_facts(steps);
-        let _ = self.apply_entity_physics_and_dispatch_core(
-            None,
-            tick,
-            None,
-            steps,
-            &projectile_physics_facts,
-        );
-    }
-
-    pub(in crate::play) fn apply_entity_physics_if_current_and_dispatch_owned(
-        &self,
-        _authority: &SimulationAuthority,
         cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
         tick: u64,
         expected: &[EntityPhysicsQuery],
         steps: &[EntityPhysicsStep],
+        owner_fence: Option<mc_entity::VersionedEntityKinematics>,
         projectile_physics_facts: &EntityProjectilePhysicsFacts,
+        mut regional_commit: Option<RegionallyCommittedEntityMovement>,
     ) -> Vec<EntityPhysicsStep> {
-        self.apply_entity_physics_and_dispatch_core(
+        let no_due_item_despawn = {
+            let inner = self.lock_inner("check entity item despawn deadline");
+            inner
+                .item_despawn_deadlines
+                .first_key_value()
+                .is_none_or(|(&deadline, _)| deadline > tick)
+        };
+        let publish_before_central = no_due_item_despawn
+            && projectile_physics_facts.arrows.is_empty()
+            && projectile_physics_facts.hurting.is_empty()
+            && projectile_physics_facts.throwable.is_empty();
+        if publish_before_central && let Some(commit) = regional_commit.take() {
+            self.entity_lifecycle_tick.fetch_max(tick, Ordering::AcqRel);
+            self.publish_regionally_committed_entity_movement(tick, commit);
+        }
+        let accepted = self.apply_entity_physics_and_dispatch_core(
             Some(cpu_resources),
             tick,
             Some(expected),
             steps,
+            owner_fence,
             projectile_physics_facts,
-        )
+        );
+        if let Some(commit) = regional_commit {
+            self.publish_regionally_committed_entity_movement(tick, commit);
+        }
+        accepted
     }
 
     #[cfg(test)]
@@ -1762,6 +1677,7 @@ impl SessionRegistry {
             tick,
             None,
             steps,
+            None,
             &projectile_physics_facts,
         );
     }
@@ -1783,6 +1699,7 @@ impl SessionRegistry {
             tick,
             None,
             steps,
+            None,
             &projectile_physics_facts,
         );
     }
@@ -1804,6 +1721,7 @@ impl SessionRegistry {
             tick,
             None,
             steps,
+            None,
             &projectile_physics_facts,
         );
     }
@@ -1825,6 +1743,7 @@ impl SessionRegistry {
             tick,
             None,
             steps,
+            None,
             &projectile_physics_facts,
         );
     }
@@ -1842,46 +1761,144 @@ impl SessionRegistry {
             tick,
             Some(expected),
             steps,
+            None,
             &projectile_physics_facts,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_entity_physics_and_dispatch_core(
         &self,
         cpu_resources: Option<&crate::chunk_pipeline::ChunkPipelineResources>,
         tick: u64,
         expected: Option<&[EntityPhysicsQuery]>,
         steps: &[EntityPhysicsStep],
+        owner_fence: Option<mc_entity::VersionedEntityKinematics>,
         projectile_physics_facts: &EntityProjectilePhysicsFacts,
     ) -> Vec<EntityPhysicsStep> {
+        self.entity_lifecycle_tick.fetch_max(tick, Ordering::AcqRel);
         #[cfg(feature = "load-bench")]
         let mut profile = PhysicsApplyProfile::new(tick, steps.len());
-        let mut scheduled_tracker_ids = steps.iter().map(|step| step.id).collect::<Vec<_>>();
-        scheduled_tracker_ids.sort_unstable();
-        scheduled_tracker_ids.dedup();
-        let step_ids = scheduled_tracker_ids
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
+        #[cfg(feature = "load-bench")]
+        let preflight_lock_started = std::time::Instant::now();
         let mut entities = self.lock_entities("prepare entity physics");
-        entities.prefetch(&step_ids);
-        self.entity_lifecycle_tick.fetch_max(tick, Ordering::AcqRel);
-        let expected_by_id = expected.map(|queries| {
-            queries
-                .iter()
-                .map(|query| (query.id, *query))
-                .collect::<HashMap<_, _>>()
+        #[cfg(feature = "load-bench")]
+        {
+            profile.preflight_lock_us = PhysicsApplyProfile::elapsed_us(preflight_lock_started);
+        }
+        #[cfg(feature = "load-bench")]
+        let preflight_prefetch_started = std::time::Instant::now();
+        let mut owner_fence = owner_fence;
+        let direct_queries = expected.filter(|queries| {
+            queries.len() == steps.len()
+                && queries
+                    .iter()
+                    .zip(steps)
+                    .all(|(query, step)| query.id == step.id)
         });
-        // Single validation/state-capture pass: reject non-finite steps and
-        // steps that fail expected-snapshot validation while capturing the
-        // old chunk, old motion (at most one motion_state lookup per step,
-        // reused for validation and capture), and accepted kinematics.
-        let mut accepted_steps = Vec::with_capacity(steps.len());
-        let mut old_chunks: HashMap<_, _> = HashMap::with_capacity(steps.len());
-        let mut old_motion: HashMap<_, _> = HashMap::with_capacity(steps.len());
-        let mut kinematics = Vec::new();
+        let direct_fence = direct_queries.and_then(|_| owner_fence.take());
+        let direct_attempted = direct_fence.is_some();
+        let publish_ids = if direct_attempted {
+            let mut publish_ids = {
+                let inner = self.lock_inner("select smooth natural entity movement");
+                inner
+                    .natural_hostile_mobs
+                    .iter()
+                    .chain(&inner.natural_ground_mobs)
+                    .chain(&inner.natural_aquatic_mobs)
+                    .copied()
+                    .collect::<HashSet<_>>()
+            };
+            if let Some(queries) = direct_queries {
+                publish_ids.extend(queries.iter().zip(steps).filter_map(|(query, step)| {
+                    (chunk_pos_from_coords(query.position.x, query.position.z)
+                        != chunk_pos_from_coords(step.position.x, step.position.z))
+                    .then_some(step.id)
+                }));
+            }
+            if tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
+                let ordinary_count = steps.len();
+                let budget = self.entity_movement_publication_budget();
+                publish_ids.extend(steps.iter().enumerate().filter_map(|(ordinal, step)| {
+                    ordinary_entity_is_due_for_movement_tracking(
+                        ordinal,
+                        tick,
+                        ordinary_count,
+                        budget,
+                    )
+                    .then_some(step.id)
+                }));
+            }
+            publish_ids
+        } else {
+            HashSet::new()
+        };
+        let direct_result = if let (Some(fence), Some(queries)) = (direct_fence, direct_queries) {
+            #[cfg(test)]
+            self.pause_before_physics_owner_apply_for_test();
+            entities.apply_entity_physics_from_fence(fence, queries, steps, publish_ids)
+        } else {
+            None
+        };
+        let (direct_routed, direct_rejected, direct_motion, mut applied_kinematics) =
+            match direct_result {
+                Some((rejected, motion, kinematics)) => (true, rejected, motion, kinematics),
+                None => (false, Vec::new(), Vec::new(), Vec::new()),
+            };
+        let direct_complete = direct_routed && direct_rejected.is_empty();
+        let direct_rejected = direct_rejected.into_iter().collect::<HashSet<_>>();
+        let mut old_motion = direct_motion
+            .into_iter()
+            .map(|motion| (motion.id, motion))
+            .collect::<HashMap<_, _>>();
+        let fallback_ids = if direct_complete {
+            HashSet::new()
+        } else if direct_routed {
+            direct_rejected.clone()
+        } else {
+            steps.iter().map(|step| step.id).collect::<HashSet<_>>()
+        };
+        let fallback_preferred = (!direct_attempted).then_some(owner_fence).flatten();
+        let (kinematics_fence, prefetch_missing) =
+            entities.prefetch_kinematics(&fallback_ids, fallback_preferred);
+        #[cfg(feature = "load-bench")]
+        {
+            profile.prefetch_missing = prefetch_missing;
+            profile.preflight_prefetch_us =
+                PhysicsApplyProfile::elapsed_us(preflight_prefetch_started);
+        }
+        #[cfg(not(feature = "load-bench"))]
+        let _ = prefetch_missing;
+        #[cfg(feature = "load-bench")]
+        let preflight_capture_started = std::time::Instant::now();
+        let expected_by_id = (!fallback_ids.is_empty())
+            .then(|| {
+                expected.map(|queries| {
+                    queries
+                        .iter()
+                        .filter(|query| fallback_ids.contains(&query.id))
+                        .map(|query| (query.id, *query))
+                        .collect::<HashMap<_, _>>()
+                })
+            })
+            .flatten();
+        let mut handled_steps = Vec::with_capacity(steps.len());
+        let mut publication_steps = Vec::new();
+        let mut old_chunks: HashMap<_, _> = HashMap::new();
+        let mut kinematics = Vec::with_capacity(fallback_ids.len());
+        let mut selected_motion_cursor = None;
         for step in steps {
             if !step.position.is_finite() || !step.velocity.is_finite() {
+                continue;
+            }
+            if direct_complete || (direct_routed && !direct_rejected.contains(&step.id)) {
+                handled_steps.push(*step);
+                if old_motion.contains_key(&step.id) {
+                    publication_steps.push(*step);
+                    if let Some(chunk) = self.simulation_inputs.entity_chunk(step.id) {
+                        old_chunks.insert(step.id, chunk);
+                    }
+                }
                 continue;
             }
             let expected = expected_by_id
@@ -1890,57 +1907,94 @@ impl SessionRegistry {
             if expected_by_id.is_some() && expected.is_none() {
                 continue;
             }
-            let current_motion = entities.motion_state(step.id);
-            if let Some(expected) = expected {
-                let Some(current) = current_motion else {
-                    continue;
-                };
-                if !entity_physics_query_matches(current, expected) {
-                    continue;
+            #[cfg(feature = "load-bench")]
+            let sample_motion_lookup = profile.motion_lookup_calls.is_multiple_of(1024);
+            #[cfg(feature = "load-bench")]
+            let motion_lookup_started = sample_motion_lookup.then(std::time::Instant::now);
+            let current_motion = entities.motion_state_with_fence_cursor(
+                kinematics_fence.as_ref(),
+                step.id,
+                &mut selected_motion_cursor,
+            );
+            #[cfg(feature = "load-bench")]
+            {
+                profile.motion_lookup_calls = profile.motion_lookup_calls.saturating_add(1);
+                if let Some(started) = motion_lookup_started {
+                    profile.motion_lookup_samples = profile.motion_lookup_samples.saturating_add(1);
+                    profile.motion_lookup_sample_us = profile
+                        .motion_lookup_sample_us
+                        .saturating_add(PhysicsApplyProfile::elapsed_us(started));
                 }
             }
-            accepted_steps.push(*step);
+            let Some(current_motion) = current_motion else {
+                continue;
+            };
+            if let Some(expected) = expected
+                && !expected.matches_motion(current_motion)
+            {
+                continue;
+            }
+            handled_steps.push(*step);
+            publication_steps.push(*step);
             if let Some(chunk) = self.simulation_inputs.entity_chunk(step.id) {
                 old_chunks.insert(step.id, chunk);
             }
-            if let Some(motion) = current_motion {
-                old_motion.insert(step.id, motion);
-                if !motion.is_arrow
-                    && !motion.is_hurting_projectile
-                    && !motion.is_throwable_projectile
-                {
-                    kinematics.push(EntityKinematics {
-                        id: step.id,
-                        position: step.position,
-                        rotation: motion.rotation,
-                        velocity: step.velocity,
-                        on_ground: step.on_ground,
-                    });
-                }
+            old_motion.insert(step.id, current_motion);
+            if !current_motion.is_arrow
+                && !current_motion.is_hurting_projectile
+                && !current_motion.is_throwable_projectile
+            {
+                kinematics.push(EntityKinematics {
+                    id: step.id,
+                    position: step.position,
+                    rotation: current_motion.rotation,
+                    velocity: step.velocity,
+                    on_ground: step.on_ground,
+                });
             }
         }
-        let steps = accepted_steps.as_slice();
         #[cfg(feature = "load-bench")]
-        profile.record_filtered(steps.len());
+        {
+            profile.preflight_capture_us =
+                PhysicsApplyProfile::elapsed_us(preflight_capture_started);
+        }
+        #[cfg(feature = "load-bench")]
+        let preflight_finalize_started = std::time::Instant::now();
+        let publication_ids = publication_steps
+            .iter()
+            .map(|step| step.id)
+            .collect::<HashSet<_>>();
+        #[cfg(feature = "load-bench")]
+        profile.record_filtered(publication_steps.len());
         let regional_batch_count = entities.parallel_kinematics_batch_count(&kinematics);
         let regional_worker_permits = cpu_resources
             .map(|resources| acquire_regional_worker_permits(resources, regional_batch_count))
             .unwrap_or_default();
         #[cfg(feature = "load-bench")]
+        {
+            profile.preflight_finalize_us =
+                PhysicsApplyProfile::elapsed_us(preflight_finalize_started);
+        }
+        #[cfg(feature = "load-bench")]
         profile.finish_preflight();
         #[cfg(test)]
-        self.pause_before_physics_owner_apply_for_test();
-        let applied_kinematics = if regional_worker_permits.is_empty() {
-            entities.apply_kinematics_authoritative(kinematics)
+        if !direct_attempted {
+            self.pause_before_physics_owner_apply_for_test();
+        }
+        let fallback_applied = if regional_worker_permits.is_empty() {
+            entities.apply_kinematics_authoritative_with_fence(kinematics, kinematics_fence)
         } else {
-            entities.apply_kinematics_parallel_authoritative(
+            entities.apply_kinematics_parallel_authoritative_with_fence(
                 kinematics,
+                kinematics_fence,
                 regional_worker_permits.len() + 1,
             )
         };
+        applied_kinematics.extend(fallback_applied);
+        applied_kinematics.sort_unstable_by_key(|state| state.id);
         drop(regional_worker_permits);
         #[cfg(feature = "load-bench")]
-        profile.finish_owner_apply(applied_kinematics.len());
+        profile.finish_owner_apply(applied_kinematics.len(), entities.take_fenced_apply());
         // Re-read the owner state before taking the publication lock:
         // regional owner mutation does not require this lock, so snapshots
         // fetched before it is acquired are only a valid publication view
@@ -1950,7 +2004,11 @@ impl SessionRegistry {
         // mutex.
         #[cfg(feature = "load-bench")]
         profile.begin_publication_refresh();
-        let mut publication_snapshots = entities.refresh_publication_snapshots(&step_ids);
+        let mut publication_snapshots =
+            entities.take_current_publication_snapshots(&publication_ids);
+        if publication_snapshots.is_none() {
+            publication_snapshots = entities.refresh_publication_snapshots(&publication_ids);
+        }
         #[cfg(feature = "load-bench")]
         profile.finish_publication_refresh();
         #[cfg(feature = "load-bench")]
@@ -1968,10 +2026,11 @@ impl SessionRegistry {
             profile.record_publication_retry();
             #[cfg(feature = "load-bench")]
             profile.begin_publication_refresh();
-            publication_snapshots = entities.refresh_publication_snapshots(&step_ids);
+            publication_snapshots = entities.refresh_publication_snapshots(&publication_ids);
             #[cfg(feature = "load-bench")]
             profile.finish_publication_refresh();
         };
+        let steps = publication_steps.as_slice();
         let mut inner = SessionEntityGuards {
             inner: session_inner,
             entities,
@@ -1985,14 +2044,18 @@ impl SessionRegistry {
         let applied_motion = applied_kinematics
             .into_iter()
             .filter_map(|state| {
-                let current = inner.entities.motion_state(state.id)?;
-                (current.position == state.position
-                    && current.rotation == state.rotation
-                    && current.velocity == state.velocity
-                    && current.on_ground == state.on_ground)
-                    .then_some((state, current))
+                let mut current = *old_motion.get(&state.id)?;
+                current.position = state.position;
+                current.rotation = state.rotation;
+                current.velocity = state.velocity;
+                current.on_ground = state.on_ground;
+                Some((state, current))
             })
             .collect::<Vec<_>>();
+        let applied_motion_by_id = applied_motion
+            .iter()
+            .map(|(_, motion)| (motion.id, *motion))
+            .collect::<HashMap<_, _>>();
         let mut applied_steps = applied_motion
             .iter()
             .filter_map(|(state, _)| {
@@ -2006,8 +2069,8 @@ impl SessionRegistry {
                 })
             })
             .collect::<Vec<_>>();
-        for (_, motion) in applied_motion {
-            publish_server_entity_motion_locked(&mut inner, motion);
+        for (_, motion) in &applied_motion {
+            publish_server_entity_motion_locked(&mut inner, *motion);
         }
         inner = resolve_arrow_entity_hits_locked(
             self,
@@ -2055,7 +2118,10 @@ impl SessionRegistry {
             .iter()
             .filter(|step| !rejected_arrows.contains(&step.id))
             .filter_map(|step| {
-                let motion = inner.entities.motion_state(step.id)?;
+                let motion = applied_motion_by_id
+                    .get(&step.id)
+                    .copied()
+                    .or_else(|| inner.entities.motion_state(step.id))?;
                 Some(EntityPhysicsStep {
                     id: step.id,
                     position: motion.position,
@@ -2071,6 +2137,20 @@ impl SessionRegistry {
         inner.arrow_tick_scratch.processed = processed_arrows;
         #[cfg(feature = "load-bench")]
         profile.record_effective(effective_steps.len());
+        let effective_by_id = effective_steps
+            .iter()
+            .map(|step| (step.id, *step))
+            .collect::<HashMap<_, _>>();
+        handled_steps.retain_mut(|step| {
+            if !publication_ids.contains(&step.id) {
+                return true;
+            }
+            let Some(effective) = effective_by_id.get(&step.id).copied() else {
+                return false;
+            };
+            *step = effective;
+            true
+        });
         let steps = effective_steps.as_slice();
         let terrain_pathing_additions = steps
             .iter()
@@ -2179,7 +2259,11 @@ impl SessionRegistry {
         let movement_publication_budget = self.entity_movement_publication_budget();
         let mut tracker_inputs = Vec::with_capacity(steps.len());
         for step in steps {
-            let Some(motion) = inner.entities.motion_state(step.id) else {
+            let Some(motion) = applied_motion_by_id
+                .get(&step.id)
+                .copied()
+                .or_else(|| inner.entities.motion_state(step.id))
+            else {
                 continue;
             };
             let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
@@ -2200,7 +2284,7 @@ impl SessionRegistry {
                     teleport_delay: 0,
                 },
             );
-            tracker_inputs.push((motion, last_sent, smooth_natural_mob));
+            tracker_inputs.push((motion.into(), last_sent, smooth_natural_mob));
         }
         #[cfg(feature = "load-bench")]
         profile.record_tracker_inputs(tracker_inputs.len());
@@ -2268,10 +2352,199 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         pickup_sessions.extend(spawned_xp_observer_ids(&dispatches));
+        self.dispatch_entity_movement_tracking(
+            tick,
+            handled_steps,
+            dispatches,
+            tracker_inputs,
+            movement_publication_budget,
+            entity_movement_trackers,
+            pickup_sessions,
+            old_observers_by_entity,
+            #[cfg(feature = "load-bench")]
+            &mut profile,
+        )
+    }
+
+    fn publish_regionally_committed_entity_movement(
+        &self,
+        tick: u64,
+        commit: RegionallyCommittedEntityMovement,
+    ) {
+        let RegionallyCommittedEntityMovement { mut states, fence } = commit;
+        #[cfg(feature = "load-bench")]
+        let mut profile = PhysicsApplyProfile::new(tick, states.len());
+        #[cfg(feature = "load-bench")]
+        {
+            profile.finish_preflight();
+            profile.finish_owner_apply(states.len(), false);
+            profile.begin_publication_refresh();
+        }
+        let mut session_inner = self.lock_inner("publish regional entity movement");
+        if !self.entities.versioned_snapshots_are_current(&fence) {
+            drop(session_inner);
+            states.sort_unstable_by_key(|state| state.id);
+            let regional_ids = states.iter().map(|state| state.id).collect::<HashSet<_>>();
+            let (mut current_states, current_fence) = self
+                .entities
+                .alive_kinematics_for_ids_versioned(&regional_ids);
+            current_states.sort_unstable_by_key(|state| state.id);
+            if current_states.len() != states.len()
+                || current_states.iter().zip(&states).any(|(current, motion)| {
+                    current.id != motion.id
+                        || current.position != motion.position
+                        || current.rotation != motion.rotation
+                        || current.velocity != motion.velocity
+                        || current.on_ground != motion.on_ground
+                })
+            {
+                return;
+            }
+            let Some(current_fence) = current_fence else {
+                return;
+            };
+            session_inner = self.lock_inner("publish refreshed regional entity movement");
+            if !self
+                .entities
+                .versioned_kinematics_are_current(&current_fence)
+            {
+                return;
+            }
+        }
+        #[cfg(feature = "load-bench")]
+        {
+            profile.finish_publication_refresh();
+            profile.begin_locked_publish();
+        }
+        let state_count = states.len();
+        let ordinary_tracking_turn = tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS);
+        let movement_publication_budget = self.entity_movement_publication_budget();
+        let exceptional_tracking = states
+            .iter()
+            .any(|motion| motion.is_arrow || motion.is_item || motion.is_experience);
+        let priority_tracking = if !exceptional_tracking
+            && session_inner.natural_hostile_mobs.is_empty()
+            && session_inner.natural_ground_mobs.is_empty()
+            && session_inner.natural_aquatic_mobs.is_empty()
+        {
+            None
+        } else {
+            Some(
+                states
+                    .iter()
+                    .map(|motion| {
+                        motion.is_arrow
+                            || motion.is_item
+                            || motion.is_experience
+                            || session_inner.natural_hostile_mobs.contains(&motion.id)
+                            || session_inner.natural_ground_mobs.contains(&motion.id)
+                            || session_inner.natural_aquatic_mobs.contains(&motion.id)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let priority_count = priority_tracking.as_ref().map_or(0, |priorities| {
+            priorities.iter().filter(|&&priority| priority).count()
+        });
+        let ordinary_count = state_count.saturating_sub(priority_count);
+        let mut tracker_candidates = Vec::with_capacity(
+            priority_count
+                + usize::from(ordinary_tracking_turn)
+                    * ordinary_count.min(movement_publication_budget),
+        );
+        let mut ordinary_ordinal = 0usize;
+        for (index, motion) in states.into_iter().enumerate() {
+            let priority = priority_tracking
+                .as_ref()
+                .is_some_and(|priorities| priorities[index]);
+            debug_assert!(
+                !motion.is_arrow && !motion.is_item && !motion.is_experience,
+                "exceptional entity movement must stay on the central fallback path"
+            );
+            if let Some(snapshot) = session_inner.published_entity_snapshots.get_mut(&motion.id) {
+                snapshot.position = motion.position;
+                snapshot.rotation = motion.rotation;
+                snapshot.velocity = motion.velocity;
+                snapshot.on_ground = motion.on_ground;
+            }
+            let selected = priority
+                || (ordinary_tracking_turn
+                    && ordinary_entity_is_due_for_movement_tracking(
+                        ordinary_ordinal,
+                        tick,
+                        ordinary_count,
+                        movement_publication_budget,
+                    ));
+            ordinary_ordinal += usize::from(!priority);
+            if selected {
+                // Ordinary candidates are already budgeted here; the shared
+                // planner must not rotate this compact selection a second time.
+                tracker_candidates.push((motion, true));
+            }
+        }
+        let entity_movement_trackers = Arc::clone(&session_inner.entity_movement_trackers);
+        let last_sent = entity_movement_trackers.get_or_insert_many(tracker_candidates.iter().map(
+            |(motion, _)| {
+                (
+                    motion.id,
+                    LastSentEntityState {
+                        position: motion.position,
+                        velocity: motion.velocity,
+                        rotation: motion.rotation,
+                        on_ground: motion.on_ground,
+                        tracking_update_count: 0,
+                        teleport_delay: 0,
+                    },
+                )
+            },
+        ));
+        let tracker_inputs = tracker_candidates
+            .into_iter()
+            .zip(last_sent)
+            .map(|((motion, already_scheduled), last_sent)| (motion, last_sent, already_scheduled))
+            .collect::<Vec<_>>();
+        #[cfg(feature = "load-bench")]
+        {
+            profile.record_filtered(state_count);
+            profile.record_effective(state_count);
+            profile.record_applied_steps(state_count);
+            profile.record_tracker_inputs(tracker_inputs.len());
+            profile.record_chunk_crossings(0);
+        }
+        drop(session_inner);
+        #[cfg(feature = "load-bench")]
+        profile.finish_locked_publish();
+        let _ = self.dispatch_entity_movement_tracking(
+            tick,
+            Vec::new(),
+            Vec::new(),
+            tracker_inputs,
+            movement_publication_budget,
+            entity_movement_trackers,
+            Vec::new(),
+            HashMap::new(),
+            #[cfg(feature = "load-bench")]
+            &mut profile,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_entity_movement_tracking(
+        &self,
+        tick: u64,
+        handled_steps: Vec<EntityPhysicsStep>,
+        mut dispatches: Vec<VisibilityDispatch>,
+        tracker_inputs: Vec<(EntityTrackingMotion, LastSentEntityState, bool)>,
+        movement_publication_budget: usize,
+        entity_movement_trackers: Arc<EntityMovementTrackers>,
+        pickup_sessions: Vec<u64>,
+        old_observers_by_entity: HashMap<EntityId, HashSet<u64>>,
+        #[cfg(feature = "load-bench")] profile: &mut PhysicsApplyProfile,
+    ) -> Vec<EntityPhysicsStep> {
         if tracker_inputs.is_empty() {
             dispatches.extend(self.pickup_candidate_dispatches(pickup_sessions));
             dispatch_visibility_commands(dispatches);
-            return steps.to_vec();
+            return handled_steps;
         }
         let ordinary_tracker_count = tracker_inputs
             .iter()
@@ -2350,7 +2623,7 @@ impl SessionRegistry {
         if movements.is_empty() {
             entity_movement_trackers.compare_exchange_many(tracker_commits);
             dispatch_visibility_commands(dispatches);
-            return steps.to_vec();
+            return handled_steps;
         }
 
         let recipient_index = self.movement_recipients.load_full();
@@ -2374,7 +2647,7 @@ impl SessionRegistry {
                 edge_count.checked_add(visible_entities.len())
             });
         let estimated_exhaustive_cost = session_count.saturating_mul(movements.len());
-        // Charge one extra unit per edge for reverse-map allocation and insertion.
+        // Building one flat sorted edge vector avoids one allocation per entity.
         let use_reverse_index = visibility_edge_count
             .is_some_and(|edge_count| estimated_exhaustive_cost > edge_count.saturating_mul(2));
         let mut movement_recipients = Vec::with_capacity(session_count);
@@ -2382,7 +2655,7 @@ impl SessionRegistry {
         if use_reverse_index {
             #[cfg(test)]
             record_movement_visibility_index_build();
-            let mut reverse_index = HashMap::<EntityId, Vec<usize>>::new();
+            let mut reverse_index = Vec::with_capacity(visibility_edge_count.unwrap_or_default());
             for (publication, recipient, visible_entities) in recipient_snapshots {
                 let recipient_index = movement_recipients.len();
                 movement_recipients.push((
@@ -2393,18 +2666,11 @@ impl SessionRegistry {
                 for &entity_id in visible_entities.iter() {
                     #[cfg(test)]
                     record_movement_visibility_index_edge_visit();
-                    reverse_index
-                        .entry(entity_id)
-                        .or_default()
-                        .push(recipient_index);
+                    reverse_index.push((entity_id, recipient_index));
                 }
             }
-            let indexed_visibility_edges = reverse_index
-                .values()
-                .try_fold(0usize, |edge_count, observer_indexes| {
-                    edge_count.checked_add(observer_indexes.len())
-                });
-            if indexed_visibility_edges == visibility_edge_count {
+            if Some(reverse_index.len()) == visibility_edge_count {
+                reverse_index.sort_unstable();
                 current_observers_by_entity = Some(reverse_index);
                 for (_, _, visible_entities) in &mut movement_recipients {
                     *visible_entities = None;
@@ -2428,10 +2694,12 @@ impl SessionRegistry {
             .collect::<Vec<_>>();
         if let Some(current_observers_by_entity) = current_observers_by_entity.as_ref() {
             for (entity_id, movement) in &movements {
-                let Some(candidate_indexes) = current_observers_by_entity.get(entity_id) else {
-                    continue;
-                };
-                for &recipient_index in candidate_indexes {
+                let first = current_observers_by_entity
+                    .partition_point(|(candidate, _)| candidate < entity_id);
+                let after = current_observers_by_entity[first..]
+                    .partition_point(|(candidate, _)| candidate == entity_id)
+                    + first;
+                for &(_, recipient_index) in &current_observers_by_entity[first..after] {
                     let (publication, _, _, recipient_movements) =
                         &mut movements_by_recipient[recipient_index];
                     if old_observers_by_entity
@@ -2502,7 +2770,7 @@ impl SessionRegistry {
             };
             dispatch_visibility_command(&recipient, command);
         }
-        steps.to_vec()
+        handled_steps
     }
 
     pub(crate) fn landed_falling_blocks(

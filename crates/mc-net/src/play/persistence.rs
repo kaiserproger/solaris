@@ -39,7 +39,7 @@ const ENTITY_VERTICAL_POSITION_LIMIT_26_1_2: f64 = 2.0E7;
 const ENTITY_VELOCITY_LIMIT_26_1_2: f64 = 10.0;
 const ENTITY_TICKS_PER_SECOND: f64 = 20.0;
 const WORLD_FILE: &str = "world.dat";
-const REGIONAL_DECISION_JOURNAL_FILE: &str = "entity-owner-journal.json";
+pub(super) const REGIONAL_DECISION_JOURNAL_FILE: &str = "entity-owner-journal.json";
 const REGIONAL_DECISION_JOURNAL_HEADER: &[u8] = b"SOLARIS_ENTITY_OWNER_JOURNAL 3\n";
 const REGIONAL_DECISION_JOURNAL_FRAME_HEADER_BYTES: usize = 8;
 // One recovery set supports the documented 30k-entity workload. The byte caps leave room for
@@ -136,27 +136,23 @@ pub(crate) struct FileRegionalDecisionJournal {
     path: PathBuf,
     pending: Vec<RegionalCommitDecision>,
     needs_compaction: bool,
-    requests: std::sync::mpsc::SyncSender<RegionalJournalWriteRequest>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-enum RegionalJournalWriteRequest {
-    Append {
-        decisions: Vec<RegionalCommitDecision>,
-        reply: std::sync::mpsc::Sender<Result<(), RegionalDecisionJournalError>>,
-    },
-    Replace {
-        pending: Vec<RegionalCommitDecision>,
-        reply: std::sync::mpsc::Sender<Result<(), RegionalDecisionJournalError>>,
-    },
-    Shutdown {
-        reply: std::sync::mpsc::Sender<()>,
-    },
+    writer: std::sync::Arc<super::world_journal::JournalWriter>,
 }
 
 impl FileRegionalDecisionJournal {
+    #[cfg(test)]
+    pub(crate) fn open_for_test(
+        root: &Path,
+    ) -> Result<(Self, Vec<RegionalCommitDecision>), RegionalDecisionJournalOpenError> {
+        Self::open(
+            root,
+            super::world_journal::JournalWriter::open(root).unwrap(),
+        )
+    }
+
     pub(crate) fn open(
         world_root: &Path,
+        writer: std::sync::Arc<super::world_journal::JournalWriter>,
     ) -> Result<(Self, Vec<RegionalCommitDecision>), RegionalDecisionJournalOpenError> {
         let path = world_root
             .join(SOLARIS_DIR)
@@ -183,29 +179,20 @@ impl FileRegionalDecisionJournal {
         } else {
             Vec::new()
         };
-        let (requests, receiver) = std::sync::mpsc::sync_channel(64);
-        let worker_path = path.clone();
-        let worker = std::thread::Builder::new()
-            .name("solaris-entity-journal".to_owned())
-            .spawn(move || run_regional_journal_writer(&worker_path, receiver))
-            .map_err(|source| RegionalDecisionJournalOpenError::Io {
-                path: path.clone(),
-                source,
-            })?;
         let journal = Self {
             path,
             pending: pending.clone(),
             needs_compaction: false,
-            requests,
-            worker: Some(worker),
+            writer,
         };
         Ok((journal, pending))
     }
 
     fn persist(&self) -> Result<(), RegionalDecisionJournalOpenError> {
         let (reply, completion) = std::sync::mpsc::channel();
-        self.requests
-            .send(RegionalJournalWriteRequest::Replace {
+        self.writer
+            .requests
+            .send(super::world_journal::WriterRequest::EntityReplace {
                 pending: self.pending.clone(),
                 reply,
             })
@@ -215,70 +202,19 @@ impl FileRegionalDecisionJournal {
             .map_err(|_| journal_writer_closed(&self.path))?
             .map_err(|_| journal_writer_closed(&self.path))
     }
-
-    fn append_commits(
-        &self,
-        decisions: &[RegionalCommitDecision],
-    ) -> Result<(), RegionalDecisionJournalError> {
-        validate_regional_decision_group(decisions)
-            .map_err(|_| RegionalDecisionJournalError::SAFE)?;
-        let (reply, completion) = std::sync::mpsc::channel();
-        self.requests
-            .send(RegionalJournalWriteRequest::Append {
-                decisions: decisions.to_vec(),
-                reply,
-            })
-            .map_err(|_| RegionalDecisionJournalError::SAFE)?;
-        completion
-            .recv()
-            .map_err(|_| RegionalDecisionJournalError::OUTCOME_UNKNOWN)?
-    }
 }
 
 impl Drop for FileRegionalDecisionJournal {
     fn drop(&mut self) {
-        // The world checkpoint watermark makes acknowledged records replay-safe.
-        // Compact only at this exact shutdown event so gameplay appends never queue
-        // behind a checkpoint rewrite and its fsync.
         if self.needs_compaction {
             let _ = self.persist();
-        }
-        let (reply, completion) = std::sync::mpsc::channel();
-        let _ = self
-            .requests
-            .send(RegionalJournalWriteRequest::Shutdown { reply });
-        let _ = completion.recv();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        } else {
+            let _ = self.writer.flush();
         }
     }
 }
 
-fn run_regional_journal_writer(
-    path: &Path,
-    receiver: std::sync::mpsc::Receiver<RegionalJournalWriteRequest>,
-) {
-    while let Ok(request) = receiver.recv() {
-        match request {
-            RegionalJournalWriteRequest::Append { decisions, reply } => {
-                let result = append_regional_decisions(path, &decisions)
-                    .map_err(|_| RegionalDecisionJournalError::OUTCOME_UNKNOWN);
-                let _ = reply.send(result);
-            }
-            RegionalJournalWriteRequest::Replace { pending, reply } => {
-                let result = persist_regional_decisions(path, &pending)
-                    .map_err(|_| RegionalDecisionJournalError::SAFE);
-                let _ = reply.send(result);
-            }
-            RegionalJournalWriteRequest::Shutdown { reply } => {
-                let _ = reply.send(());
-                break;
-            }
-        }
-    }
-}
-
-fn append_regional_decisions(
+pub(super) fn append_regional_decisions(
     path: &Path,
     decisions: &[RegionalCommitDecision],
 ) -> Result<(), RegionalDecisionJournalOpenError> {
@@ -291,7 +227,6 @@ fn append_regional_decisions(
         .map_err(|source| regional_decision_validation_error(path, source))?;
     let parent = path.parent().expect("journal path has parent");
     create_regional_journal_directory(parent)?;
-    let existed = path.is_file();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -316,19 +251,10 @@ fn append_regional_decisions(
             })?;
     }
     write_regional_decision_group(&mut file, path, decisions)?;
-    file.flush()
-        .and_then(|()| file.sync_all())
-        .map_err(|source| RegionalDecisionJournalOpenError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if !existed {
-        sync_regional_journal_directory(parent)?;
-    }
     Ok(())
 }
 
-fn persist_regional_decisions(
+pub(super) fn persist_regional_decisions(
     path: &Path,
     pending: &[RegionalCommitDecision],
 ) -> Result<(), RegionalDecisionJournalOpenError> {
@@ -792,24 +718,26 @@ impl RegionalDecisionJournal for FileRegionalDecisionJournal {
     ) -> Result<(), RegionalDecisionJournalError> {
         validate_regional_decision_group(decisions)
             .map_err(|_| RegionalDecisionJournalError::SAFE)?;
-        let mut pending = self.pending.clone();
-        pending.extend_from_slice(decisions);
-        if validate_regional_commit_decisions(&pending).is_err()
-            || validate_regional_decision_group(&pending).is_err()
+        let previous_len = self.pending.len();
+        self.pending.extend_from_slice(decisions);
+        if validate_regional_commit_decisions(&self.pending).is_err()
+            || validate_regional_decision_group(&self.pending).is_err()
         {
+            self.pending.truncate(previous_len);
             return Err(RegionalDecisionJournalError::SAFE);
         }
-        match self.append_commits(decisions) {
-            Ok(()) => {
-                self.pending.extend_from_slice(decisions);
-                Ok(())
-            }
-            Err(error) if error.outcome_unknown() => {
-                self.pending.extend_from_slice(decisions);
-                Err(error)
-            }
-            Err(error) => Err(error),
+        if self
+            .writer
+            .requests
+            .send(super::world_journal::WriterRequest::EntityAppend {
+                decisions: decisions.to_vec(),
+            })
+            .is_err()
+        {
+            self.pending.truncate(previous_len);
+            return Err(RegionalDecisionJournalError::OUTCOME_UNKNOWN);
         }
+        Ok(())
     }
 
     fn clear_commit(&mut self, phase: RegionPhase) -> Result<(), RegionalDecisionJournalError> {
@@ -841,14 +769,10 @@ impl RegionalDecisionJournal for FileRegionalDecisionJournal {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        let retained = self
-            .pending
-            .iter()
-            .filter(|decision| !identities.contains(&decision.identity()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if retained.len() != self.pending.len() {
-            self.pending = retained;
+        let previous_len = self.pending.len();
+        self.pending
+            .retain(|decision| !identities.contains(&decision.identity()));
+        if self.pending.len() != previous_len {
             self.needs_compaction = true;
         }
         Ok(())
@@ -3581,14 +3505,14 @@ mod tests {
         .expect("valid decision");
 
         let (mut journal, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("open empty journal");
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("open empty journal");
         assert!(pending.is_empty());
         serde_json::to_string(&decision).expect("decision is JSON serializable");
         journal.record_commit(&decision).expect("record decision");
         drop(journal);
 
         let (mut reopened, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("reopen journal");
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("reopen journal");
         assert_eq!(pending, vec![decision.clone()]);
         let mut stale = decision.upserts()[0].clone();
         stale.position = Vec3::ZERO;
@@ -3623,7 +3547,7 @@ mod tests {
             .expect("clear decision");
         drop(reopened);
         let (_, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("reopen cleared journal");
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("reopen cleared journal");
         assert!(pending.is_empty());
     }
 
@@ -3706,7 +3630,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, br#"{"version":1,"pending":[]}"#).unwrap();
 
-        let Err(error) = FileRegionalDecisionJournal::open(tmp.path()) else {
+        let Err(error) = FileRegionalDecisionJournal::open_for_test(tmp.path()) else {
             panic!("unreleased JSON journal files must fail closed");
         };
 
@@ -3724,7 +3648,7 @@ mod tests {
         let later = RegionalCommitDecision::from_parts(RegionPhase(12), 12, Vec::new(), Vec::new())
             .expect("later decision");
         let (mut journal, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("open journal");
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("open journal");
         assert!(pending.is_empty());
         journal
             .record_commit(&first)
@@ -3738,7 +3662,8 @@ mod tests {
             .expect("compact acknowledged checkpoint decision");
         drop(journal);
 
-        let (_, pending) = FileRegionalDecisionJournal::open(tmp.path()).expect("reopen journal");
+        let (_, pending) =
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("reopen journal");
         assert_eq!(pending, vec![later]);
     }
 
@@ -3757,7 +3682,7 @@ mod tests {
         )
         .expect("different durable identity")
         .identity();
-        let (mut journal, _) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+        let (mut journal, _) = FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         journal.record_commit(&decision).unwrap();
 
         journal
@@ -3771,71 +3696,29 @@ mod tests {
     }
 
     #[test]
-    fn regional_decision_checkpoint_cleanup_does_not_queue_a_rewrite_before_next_append() {
-        let checkpointed =
-            RegionalCommitDecision::from_parts(RegionPhase(11), 41, Vec::new(), Vec::new())
-                .expect("checkpointed decision");
-        let later = RegionalCommitDecision::from_parts(RegionPhase(12), 42, Vec::new(), Vec::new())
-            .expect("later decision");
-        let expected_later = later.clone();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(2);
-        let writer = std::thread::spawn(move || {
-            match receiver.recv().expect("first writer request after cleanup") {
-                RegionalJournalWriteRequest::Append { decisions, reply } => {
-                    assert_eq!(decisions, vec![expected_later]);
-                    reply.send(Ok(())).expect("append completion");
-                }
-                RegionalJournalWriteRequest::Replace { reply, .. } => {
-                    reply.send(Ok(())).expect("rewrite completion");
-                    panic!("checkpoint cleanup queued a WAL rewrite before the next append");
-                }
-                RegionalJournalWriteRequest::Shutdown { reply } => {
-                    reply.send(()).expect("shutdown completion");
-                    panic!("checkpoint cleanup shut down the writer");
-                }
-            }
-        });
-        let mut journal = FileRegionalDecisionJournal {
-            path: PathBuf::from("memory-only-checkpoint-cleanup"),
-            pending: vec![checkpointed.clone()],
-            needs_compaction: false,
-            requests,
-            worker: None,
-        };
-
-        journal
-            .clear_commit_identities(&[checkpointed.identity()])
-            .expect("acknowledge durable checkpoint");
-        journal
-            .record_commit(&later)
-            .expect("append later decision");
-        writer.join().expect("writer assertion");
-    }
-
-    #[test]
     fn crash_before_shutdown_compaction_replays_old_wal_through_checkpoint_watermark() {
         let tmp = tempfile::tempdir().unwrap();
         let decision =
             RegionalCommitDecision::from_parts(RegionPhase(11), 41, Vec::new(), Vec::new())
                 .expect("checkpointed decision");
-        let (mut journal, _) = FileRegionalDecisionJournal::open(tmp.path()).expect("open journal");
+        let (mut journal, _) =
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("open journal");
         journal.record_commit(&decision).expect("append decision");
         journal
             .clear_commit_identities(&[decision.identity()])
             .expect("acknowledge durable checkpoint");
 
-        let worker = journal.worker.take().expect("journal writer");
         let (reply, completion) = std::sync::mpsc::channel();
         journal
+            .writer
             .requests
-            .send(RegionalJournalWriteRequest::Shutdown { reply })
+            .send(super::world_journal::WriterRequest::Shutdown { reply })
             .expect("stop writer without compaction");
         completion.recv().expect("writer stopped");
-        worker.join().expect("join writer");
         drop(journal);
 
-        let (reopened, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("reopen uncompacted journal");
+        let (reopened, pending) = FileRegionalDecisionJournal::open_for_test(tmp.path())
+            .expect("reopen uncompacted journal");
         assert_eq!(pending, vec![decision]);
         let checkpoint = PersistedEntityCheckpoint::new_at_owner_sequence(
             41,
@@ -3859,7 +3742,7 @@ mod tests {
                 .expect("second grouped decision"),
         ];
         let (mut journal, _) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("open grouped journal");
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("open grouped journal");
 
         journal
             .record_commits(&decisions)
@@ -3867,40 +3750,26 @@ mod tests {
         drop(journal);
 
         let (_, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("reopen grouped journal");
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("reopen grouped journal");
         assert_eq!(pending, decisions);
     }
 
     #[test]
-    fn regional_decision_journal_preserves_unknown_append_outcome() {
+    fn regional_decision_journal_retains_accepted_tail_after_writer_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("journal-test");
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let RegionalJournalWriteRequest::Append { reply, .. } =
-                receiver.recv().expect("append request")
-            else {
-                panic!("expected append request");
-            };
-            reply
-                .send(Err(RegionalDecisionJournalError::OUTCOME_UNKNOWN))
-                .expect("append completion");
-        });
-        let mut journal = FileRegionalDecisionJournal {
-            path,
-            pending: Vec::new(),
-            needs_compaction: false,
-            requests,
-            worker: Some(worker),
-        };
+        let (mut journal, _) = FileRegionalDecisionJournal::open(
+            tmp.path(),
+            super::world_journal::JournalWriter::open(tmp.path()).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&journal.path).unwrap();
         let decision =
-            RegionalCommitDecision::from_parts(RegionPhase(1), 1, Vec::new(), Vec::new())
-                .expect("decision");
-
-        let error = journal
-            .record_commit(&decision)
-            .expect_err("unknown durability outcome");
-        assert!(error.outcome_unknown());
+            RegionalCommitDecision::from_parts(RegionPhase(1), 1, Vec::new(), Vec::new()).unwrap();
+        journal.record_commit(&decision).unwrap();
+        assert!(journal.writer.flush().is_err());
+        let later =
+            RegionalCommitDecision::from_parts(RegionPhase(2), 2, Vec::new(), Vec::new()).unwrap();
+        assert!(journal.record_commit(&later).unwrap_err().outcome_unknown());
         assert_eq!(journal.pending, vec![decision]);
     }
 
@@ -3915,7 +3784,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("journal benchmark directory");
         let (mut journal, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("open benchmark journal");
+            FileRegionalDecisionJournal::open_for_test(tmp.path()).expect("open benchmark journal");
         assert!(pending.is_empty());
         let snapshot = EntitySnapshot {
             id: EntityId(1),

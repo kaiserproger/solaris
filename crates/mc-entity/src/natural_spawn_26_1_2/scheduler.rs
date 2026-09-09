@@ -21,7 +21,6 @@ pub struct NaturalSpawnCategoryReport {
     pub rejected_block_or_fluid: u64,
     pub rejected_darkness: u64,
     pub rejected_collision: u64,
-    pub rejected_cap: u64,
     pub rejected_duplicate_or_stale: u64,
 }
 
@@ -49,7 +48,6 @@ impl NaturalSpawnCategoryReport {
         self.rejected_collision = self
             .rejected_collision
             .saturating_add(other.rejected_collision);
-        self.rejected_cap = self.rejected_cap.saturating_add(other.rejected_cap);
         self.rejected_duplicate_or_stale = self
             .rejected_duplicate_or_stale
             .saturating_add(other.rejected_duplicate_or_stale);
@@ -73,6 +71,8 @@ impl NaturalSpawnReport {
 pub struct NaturalSpawnScheduler {
     active_snapshot: Option<Arc<HashSet<(i32, i32)>>>,
     active_ring: Vec<(i32, i32)>,
+    player_chunks: Vec<(i32, i32)>,
+    radius: u32,
     friendly_cursor: usize,
     hostile_cursor: usize,
     cumulative: NaturalSpawnReport,
@@ -84,16 +84,34 @@ impl NaturalSpawnScheduler {
         &mut self,
         category: NaturalSpawnCategory,
         active_chunks: &Arc<HashSet<(i32, i32)>>,
+        player_chunks: &[(i32, i32)],
+        radius: u32,
         chunk_budget: usize,
+        eligible: impl Fn(&(i32, i32)) -> bool,
     ) -> Vec<(i32, i32)> {
         let unchanged = self
             .active_snapshot
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, active_chunks));
+            .is_some_and(|current| Arc::ptr_eq(current, active_chunks))
+            && self.player_chunks == player_chunks
+            && self.radius == radius;
         if !unchanged {
             self.active_ring.clear();
-            self.active_ring.extend(active_chunks.iter().copied());
+            let radius = radius.min(8) as i32;
+            for &(cx, cz) in player_chunks {
+                for z in cz - radius..=cz + radius {
+                    for x in cx - radius..=cx + radius {
+                        if active_chunks.contains(&(x, z)) {
+                            self.active_ring.push((x, z));
+                        }
+                    }
+                }
+            }
             self.active_ring.sort_unstable_by_key(|&(cx, cz)| (cz, cx));
+            self.active_ring.dedup();
+            self.player_chunks.clear();
+            self.player_chunks.extend_from_slice(player_chunks);
+            self.radius = radius as u32;
             self.active_snapshot = Some(Arc::clone(active_chunks));
             if self.active_ring.is_empty() {
                 self.friendly_cursor = 0;
@@ -111,10 +129,17 @@ impl NaturalSpawnScheduler {
             NaturalSpawnCategory::Hostile => &mut self.hostile_cursor,
         };
         let count = self.active_ring.len().min(chunk_budget);
-        let selected = (0..count)
-            .map(|offset| self.active_ring[(*cursor + offset) % self.active_ring.len()])
-            .collect::<Vec<_>>();
-        *cursor = (*cursor + count) % self.active_ring.len();
+        let mut selected = Vec::with_capacity(count);
+        for _ in 0..self.active_ring.len().min(chunk_budget.saturating_mul(4)) {
+            if selected.len() == count {
+                break;
+            }
+            let chunk = self.active_ring[*cursor];
+            *cursor = (*cursor + 1) % self.active_ring.len();
+            if eligible(&chunk) {
+                selected.push(chunk);
+            }
+        }
         selected
     }
 

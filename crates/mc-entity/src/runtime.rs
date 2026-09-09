@@ -8,7 +8,7 @@ use bevy_ecs::entity::Entity as EcsEntity;
 use bevy_ecs::query::Without;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::schedule::{ExecutorKind, IntoScheduleConfigs, Schedule};
-use bevy_ecs::world::World;
+use bevy_ecs::world::{EntityRef, World};
 use uuid::Uuid;
 
 use crate::effects_26_1_2::{
@@ -22,11 +22,15 @@ use crate::runtime_26_1_2::{
 };
 use crate::{
     AnimalBreedingState, AttributeSet, EntityActiveEffectsState, EntityDamageRequest,
-    EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics, EntityLifecycle,
-    EntityLivingRetainedState, EntityMotionState, EntityRetainedState, EntitySimulationProjection,
-    EntitySnapshot, EntityView, GoalPathingRequest, GoalPathingResult, GoalState, GoalTickStats,
-    PathingDecisionKind, RetainedPathState, Rotation, Vec3, VehicleKind, VehicleState,
+    EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics, EntityKinematicsFenceState,
+    EntityLifecycle, EntityLivingRetainedState, EntityMotionState, EntityPhysicsKind,
+    EntityPhysicsQuery, EntityRetainedState, EntitySimulationResult, EntitySnapshot,
+    EntityTrackingMotion, EntityView, GoalPathingRequest, GoalPathingResult, GoalState,
+    GoalTickStats, PathingDecisionKind, RetainedPathState, Rotation, Vec3, VehicleKind,
+    VehicleState,
 };
+
+mod entity_projections;
 
 #[derive(Component)]
 struct StableIdentity {
@@ -38,6 +42,26 @@ struct StableIdentity {
 struct EntityTypeState {
     protocol_id: i32,
     name: Arc<str>,
+    geometry: crate::natural_spawn_26_1_2::EntityGeometry,
+    hostile: bool,
+    aquatic_physics: bool,
+    powder_snow_walkable: bool,
+    villager: bool,
+    item: bool,
+}
+
+fn entity_type_state(protocol_id: i32, name: impl Into<Arc<str>>) -> EntityTypeState {
+    let name = name.into();
+    EntityTypeState {
+        protocol_id,
+        geometry: crate::natural_spawn_26_1_2::entity_geometry(&name, None),
+        hostile: crate::natural_spawn_26_1_2::is_hostile_entity(&name),
+        aquatic_physics: crate::natural_spawn_26_1_2::entity_type_uses_aquatic_physics(&name),
+        powder_snow_walkable: crate::natural_spawn_26_1_2::entity_type_walks_on_powder_snow(&name),
+        villager: name.as_ref() == "minecraft:villager",
+        item: name.as_ref() == "minecraft:item",
+        name,
+    }
 }
 
 #[derive(Component)]
@@ -280,19 +304,36 @@ struct PendingInputCommands(Vec<EntityInputCommand>);
 #[derive(Resource, Default)]
 struct PendingPhysicsResults(Vec<EntityPhysicsResult>);
 
-#[derive(Resource, Default)]
-struct PendingGoalTick(Option<GoalTickRequest>);
-
-struct GoalTickRequest {
-    tick: u64,
-    pathing_enabled: bool,
-    pathing: BTreeMap<EntityId, GoalPathingResult>,
-    active_ids: Option<HashSet<EntityId>>,
-    external_follow_targets: HashMap<EntityId, Vec3>,
+pub(crate) struct GoalTickRequest {
+    pub(crate) tick: u64,
+    pub(crate) pathing_enabled: bool,
+    pub(crate) pathing: HashMap<EntityId, GoalPathingResult>,
+    pub(crate) active_ids: Option<HashSet<EntityId>>,
+    pub(crate) passive_decisions: usize,
+    pub(crate) external_follow_targets: HashMap<EntityId, Vec3>,
+    pub(crate) external_follow_targets_complete: bool,
+    pub(crate) simulation_capture_ids: Option<Vec<EntityId>>,
 }
 
-#[derive(Resource, Default)]
-struct GoalTickOutput(Option<GoalTickStats>);
+pub(crate) struct GoalSimulationCandidate {
+    pub id: EntityId,
+    pub uuid: uuid::Uuid,
+    pub lifecycle: EntityLifecycle,
+    pub pickup_claimed: bool,
+    pub vehicle_attached: bool,
+    pub result: Option<EntitySimulationResult>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OwnerGoalTickOutput {
+    pub(crate) captured_count: usize,
+    pub(crate) invalid_count: usize,
+    pub(crate) active_hostile_ids: Vec<(EntityId, Vec3)>,
+    pub(crate) villager_population_candidates: Vec<(EntityId, Vec3)>,
+    pub(crate) villager_ids: Vec<(EntityId, Vec3)>,
+    pub(crate) villager_proximity_seeds: Vec<(EntityId, Vec3)>,
+    pub(crate) goal_committed_motion: Vec<EntityTrackingMotion>,
+}
 
 #[derive(Resource, Default)]
 struct PendingPositionTick(Option<(f64, Option<HashSet<EntityId>>)>);
@@ -358,8 +399,6 @@ impl EntityRuntime {
         world.init_resource::<SheepEntities>();
         world.init_resource::<PendingInputCommands>();
         world.init_resource::<PendingPhysicsResults>();
-        world.init_resource::<PendingGoalTick>();
-        world.init_resource::<GoalTickOutput>();
         world.init_resource::<PendingPositionTick>();
         world.init_resource::<PendingCombatCommands>();
         world.init_resource::<SnapshotRequest>();
@@ -680,11 +719,20 @@ impl EntityRuntime {
         self.world.get_entity(entity).is_ok()
     }
 
+    pub(crate) fn ids_cover_world(&self, ids: &HashSet<EntityId>) -> bool {
+        active_set_covers_world(&self.world, ids)
+    }
     pub(crate) fn contains_uuid(&self, uuid: Uuid) -> bool {
         self.world
             .resource::<RuntimeEntityUuids>()
             .0
             .contains(&uuid)
+    }
+
+    pub(crate) fn sheep_grazing_activity(&self, id: EntityId) -> Option<bool> {
+        let entity = *self.world.resource::<RuntimeEntityIndex>().0.get(&id)?;
+        let gameplay = self.world.get::<GameplayDecisionState>(entity)?;
+        Some(gameplay.sheep_grazing_ticks.is_some())
     }
 
     pub(crate) fn motion_state(&self, id: EntityId) -> Option<EntityMotionState> {
@@ -696,39 +744,45 @@ impl EntityRuntime {
         let motion = entity.get::<MotionState>()?;
         let goal = entity.get::<AiGoalState>()?;
         let gameplay = entity.get::<GameplayDecisionState>()?;
-        let arrow_state = gameplay.arrow_state;
-        let hurting_projectile_state = gameplay.hurting_projectile_state;
-        let throwable_projectile_state = gameplay.throwable_projectile_state;
-        Some(EntityMotionState {
-            id: identity.id,
-            position: transform.position,
-            rotation: transform.rotation,
-            velocity: motion.velocity,
-            on_ground: motion.on_ground,
-            fall_distance: motion.fall_distance,
-            goal_fence: crate::EntityGoalFence::from_goal(&goal.0),
-            is_item: &*entity_type.name == "minecraft:item",
-            is_experience: &*entity_type.name == "minecraft:experience_orb",
-            is_arrow: &*entity_type.name == "minecraft:arrow",
-            arrow_revision: arrow_state.map(|state| state.projectile.revision),
-            arrow_embedded_block: arrow_state
-                .filter(|state| state.in_ground)
-                .and_then(|state| state.last_block_position),
-            is_hurting_projectile: hurting_projectile_state.is_some(),
-            hurting_projectile_revision: hurting_projectile_state
-                .map(|state| state.projectile.revision),
-            is_throwable_projectile: throwable_projectile_state.is_some(),
-            throwable_projectile_revision: throwable_projectile_state
-                .map(|state| state.projectile.revision),
-            sends_velocity: !matches!(
-                &*entity_type.name,
-                "minecraft:item" | "minecraft:experience_orb"
-            ),
-        })
+        Some(motion_state_from_components(
+            identity,
+            entity_type,
+            transform,
+            motion,
+            goal,
+            gameplay,
+        ))
     }
 
     pub(crate) fn goal_checkpoint(&self, id: EntityId) -> Option<EntityGoalCheckpoint> {
         entity_goal_checkpoint_from_world(&self.world, id)
+    }
+
+    pub(crate) fn goal_checkpoints_for_ids(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> Vec<EntityGoalCheckpoint> {
+        if ids.len() < 64 {
+            let mut checkpoints = ids
+                .iter()
+                .filter_map(|&id| self.goal_checkpoint(id))
+                .collect::<Vec<_>>();
+            checkpoints.sort_unstable_by_key(|checkpoint| checkpoint.id);
+            return checkpoints;
+        }
+
+        let index = self.world.resource::<RuntimeEntityIndex>();
+        index
+            .0
+            .values()
+            .filter_map(|&ecs_entity| {
+                let entity = self.world.get_entity(ecs_entity).ok()?;
+                let identity = entity.get::<StableIdentity>()?;
+                ids.contains(&identity.id)
+                    .then(|| entity_goal_checkpoint_from_entity(&entity))
+                    .flatten()
+            })
+            .collect()
     }
 
     pub(crate) fn restore_goal_checkpoint(&mut self, checkpoint: EntityGoalCheckpoint) -> bool {
@@ -777,12 +831,303 @@ impl EntityRuntime {
         true
     }
 
-    pub(crate) fn simulation_projection(&self, id: EntityId) -> Option<EntitySimulationProjection> {
-        entity_simulation_projection_from_world(&self.world, id)
+    pub(crate) fn simulation_result(&self, id: EntityId) -> Option<EntitySimulationResult> {
+        entity_simulation_result_from_world(&self.world, id)
     }
 
     pub(crate) fn view(&self, id: EntityId) -> Option<EntityView<'_>> {
         entity_view_from_world(&self.world, id)
+    }
+
+    pub(crate) fn kinematics_fence_state(
+        &self,
+        id: EntityId,
+    ) -> Option<EntityKinematicsFenceState> {
+        let ecs_entity = *self.world.resource::<RuntimeEntityIndex>().0.get(&id)?;
+        let entity = self.world.get_entity(ecs_entity).ok()?;
+        let (identity, entity_type, transform, motion, lifecycle, _, goal, _, gameplay) = entity
+            .get_components::<(
+                &StableIdentity,
+                &EntityTypeState,
+                &TransformState,
+                &MotionState,
+                &LifecycleState,
+                &LivingState,
+                &AiGoalState,
+                &AiPathState,
+                &GameplayDecisionState,
+            )>()
+            .ok()?;
+        let vehicle_attached = entity.get::<VehicleKindState>().is_some();
+        Some(kinematics_fence_state_from_components(
+            identity,
+            entity_type,
+            transform,
+            motion,
+            lifecycle,
+            goal,
+            gameplay,
+            vehicle_attached,
+        ))
+    }
+
+    pub(crate) fn kinematics_fence_states(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> HashMap<EntityId, EntityKinematicsFenceState> {
+        if ids.len() < 64 {
+            return ids
+                .iter()
+                .filter_map(|&id| self.kinematics_fence_state(id).map(|state| (id, state)))
+                .collect();
+        }
+        let index = self.world.resource::<RuntimeEntityIndex>();
+        index
+            .0
+            .values()
+            .filter_map(|&ecs_entity| {
+                let entity = self.world.get_entity(ecs_entity).ok()?;
+                let (identity, entity_type, transform, motion, lifecycle, _, goal, _, gameplay) =
+                    entity
+                        .get_components::<(
+                            &StableIdentity,
+                            &EntityTypeState,
+                            &TransformState,
+                            &MotionState,
+                            &LifecycleState,
+                            &LivingState,
+                            &AiGoalState,
+                            &AiPathState,
+                            &GameplayDecisionState,
+                        )>()
+                        .ok()?;
+                if !ids.contains(&identity.id) {
+                    return None;
+                }
+                let vehicle_attached = entity.get::<VehicleKindState>().is_some();
+                Some((
+                    identity.id,
+                    kinematics_fence_state_from_components(
+                        identity,
+                        entity_type,
+                        transform,
+                        motion,
+                        lifecycle,
+                        goal,
+                        gameplay,
+                        vehicle_attached,
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn visit_simulation_fence_results_for_ordered_ids(
+        &self,
+        ids: &[EntityId],
+        mut visitor: impl FnMut(EntityKinematicsFenceState, Option<EntitySimulationResult>),
+    ) {
+        if ids.len() < 64 {
+            for &id in ids {
+                let Some(state) = self.kinematics_fence_state(id) else {
+                    continue;
+                };
+                let result = (!state.vehicle_attached)
+                    .then(|| self.simulation_result(id))
+                    .flatten();
+                visitor(state, result);
+            }
+            return;
+        }
+
+        let index = self.world.resource::<RuntimeEntityIndex>();
+        let mut cursor = 0;
+        for (&id, &ecs_entity) in &index.0 {
+            while cursor < ids.len() && ids[cursor] < id {
+                cursor += 1;
+            }
+            if cursor == ids.len() {
+                break;
+            }
+            if ids[cursor] != id {
+                continue;
+            }
+            cursor += 1;
+            let Ok(entity) = self.world.get_entity(ecs_entity) else {
+                continue;
+            };
+            let Some((state, result)) = simulation_fence_result_from_entity(&entity) else {
+                continue;
+            };
+            visitor(state, result);
+        }
+    }
+
+    pub(crate) fn visit_simulation_fence_results(
+        &mut self,
+        mut visitor: impl FnMut(EntityKinematicsFenceState, Option<EntitySimulationResult>),
+    ) {
+        let mut query = self.world.query::<(
+            &StableIdentity,
+            &EntityTypeState,
+            &TransformState,
+            &MotionState,
+            &LifecycleState,
+            &LivingState,
+            &AiGoalState,
+            &AiPathState,
+            &GameplayDecisionState,
+            Option<&VehicleKindState>,
+            Option<&ItemStackState>,
+            Option<&ExperienceState>,
+            Option<&FallingBlockState>,
+            Option<&AnimalState>,
+        )>();
+        let index = self.world.resource::<RuntimeEntityIndex>();
+        for (
+            identity,
+            entity_type,
+            transform,
+            motion,
+            lifecycle,
+            _,
+            goal,
+            _,
+            gameplay,
+            vehicle,
+            item,
+            experience,
+            falling_block,
+            animal,
+        ) in query.iter_many(&self.world, index.0.values().copied())
+        {
+            let vehicle_attached = vehicle.is_some();
+            let state = kinematics_fence_state_from_components(
+                identity,
+                entity_type,
+                transform,
+                motion,
+                lifecycle,
+                goal,
+                gameplay,
+                vehicle_attached,
+            );
+            let ordinary_living = item.is_none()
+                && experience.is_none()
+                && falling_block.is_none()
+                && !vehicle_attached;
+            let result = (state.lifecycle == EntityLifecycle::Alive && !state.vehicle_attached)
+                .then(|| {
+                    entity_simulation_result_from_motion(
+                        entity_type,
+                        gameplay,
+                        animal.map(|animal| animal.0),
+                        ordinary_living,
+                        state.motion,
+                    )
+                });
+            visitor(state, result);
+        }
+    }
+
+    pub(crate) fn visit_goal_tick_candidates(
+        &mut self,
+        mut visitor: impl FnMut(EntityKinematics, EntityLifecycle, bool, bool, Option<Vec3>),
+    ) {
+        let mut query = self.world.query::<(
+            &StableIdentity,
+            &EntityTypeState,
+            &TransformState,
+            &MotionState,
+            &LifecycleState,
+            &LivingState,
+            &AiGoalState,
+            &AiPathState,
+            &GameplayDecisionState,
+            Option<&VehicleKindState>,
+            Option<&ItemStackState>,
+            Option<&ExperienceState>,
+            Option<&FallingBlockState>,
+        )>();
+        let index = self.world.resource::<RuntimeEntityIndex>();
+        for (
+            identity,
+            entity_type,
+            transform,
+            motion,
+            lifecycle,
+            _,
+            _,
+            _,
+            gameplay,
+            vehicle,
+            item,
+            experience,
+            falling_block,
+        ) in query.iter_many(&self.world, index.0.values().copied())
+        {
+            let vehicle_attached = vehicle.is_some();
+            let ordinary_living = item.is_none()
+                && experience.is_none()
+                && falling_block.is_none()
+                && !vehicle_attached;
+            let local_living = lifecycle.0 == EntityLifecycle::Alive
+                && gameplay.item_pickup_claim.is_none()
+                && !vehicle_attached
+                && matches!(
+                    entity_physics_kind(entity_type, gameplay, ordinary_living),
+                    EntityPhysicsKind::Living
+                        | EntityPhysicsKind::PowderSnowWalkableLiving
+                        | EntityPhysicsKind::AquaticLiving
+                );
+            visitor(
+                EntityKinematics {
+                    id: identity.id,
+                    position: transform.position,
+                    rotation: transform.rotation,
+                    velocity: motion.velocity,
+                    on_ground: motion.on_ground,
+                },
+                lifecycle.0,
+                local_living,
+                entity_type.villager,
+                villager_job_site(gameplay, transform.position),
+            );
+        }
+    }
+
+    pub(crate) fn vehicle_states(
+        &self,
+    ) -> impl Iterator<Item = (EntityId, EntityLifecycle, Option<VehicleState>)> + '_ {
+        self.world
+            .resource::<RuntimeEntityIndex>()
+            .0
+            .values()
+            .filter_map(|&entity| {
+                let entity = self.world.get_entity(entity).ok()?;
+                let (identity, lifecycle, kind, passenger) = entity
+                    .get_components::<(
+                        &StableIdentity,
+                        &LifecycleState,
+                        Option<&VehicleKindState>,
+                        Option<&PassengerState>,
+                    )>()
+                    .ok()?;
+                Some((
+                    identity.id,
+                    lifecycle.0,
+                    kind.map(|kind| VehicleState {
+                        kind: kind.0,
+                        passenger: passenger.map(|passenger| passenger.0),
+                    }),
+                ))
+            })
+    }
+
+    pub(crate) fn passenger_ids(&self) -> HashSet<EntityId> {
+        self.vehicle_states()
+            .filter_map(|(_, _, vehicle)| vehicle?.passenger)
+            .collect()
     }
 
     pub(crate) fn views(&self) -> impl Iterator<Item = EntityView<'_>> + '_ {
@@ -917,10 +1262,205 @@ impl EntityRuntime {
         }
     }
 
+    pub(crate) fn goal_tick_selection(
+        &self,
+        region: crate::RegionKey,
+        tick: u64,
+        candidate_ids: &HashSet<EntityId>,
+        inputs: &crate::regional::RegionalGoalTickInputs,
+    ) -> crate::EntityGoalTickSelection {
+        let index = self.world.resource::<RuntimeEntityIndex>();
+        let world_entity_count = index.0.len();
+        let ordered_entities = index
+            .0
+            .iter()
+            .filter(|(id, _)| candidate_ids.contains(id))
+            .map(|(&id, &entity)| (id, entity))
+            .collect::<Vec<_>>();
+        self.goal_tick_selection_from_ordered_entities(
+            region,
+            tick,
+            ordered_entities,
+            world_entity_count,
+            inputs,
+        )
+    }
+
+    pub(crate) fn goal_tick_selection_for_ordered_ids(
+        &self,
+        region: crate::RegionKey,
+        tick: u64,
+        candidate_ids: &[EntityId],
+        inputs: &crate::regional::RegionalGoalTickInputs,
+    ) -> crate::EntityGoalTickSelection {
+        debug_assert!(
+            candidate_ids.windows(2).all(|ids| ids[0] < ids[1]),
+            "ordered goal candidates must be unique"
+        );
+        let index = self.world.resource::<RuntimeEntityIndex>();
+        let world_entity_count = index.0.len();
+        let mut candidates = candidate_ids.iter().copied().peekable();
+        let mut ordered_entities = Vec::with_capacity(candidate_ids.len());
+        for (&id, &entity) in &index.0 {
+            while candidates.peek().is_some_and(|candidate| *candidate < id) {
+                candidates.next();
+            }
+            if candidates.peek().is_some_and(|candidate| *candidate == id) {
+                candidates.next();
+                ordered_entities.push((id, entity));
+            }
+        }
+        self.goal_tick_selection_from_ordered_entities(
+            region,
+            tick,
+            ordered_entities,
+            world_entity_count,
+            inputs,
+        )
+    }
+
+    fn goal_tick_selection_from_ordered_entities(
+        &self,
+        region: crate::RegionKey,
+        tick: u64,
+        ordered_entities: Vec<(EntityId, EcsEntity)>,
+        world_entity_count: usize,
+        inputs: &crate::regional::RegionalGoalTickInputs,
+    ) -> crate::EntityGoalTickSelection {
+        let mut goal_ids = Vec::with_capacity(ordered_entities.len());
+        let mut passive_decisions = 0;
+        let (mut goal_overrides, villager_updates, cross_region_villager_candidates) =
+            plan_region_villager_updates(
+                &self.world,
+                region,
+                &ordered_entities,
+                inputs.active_chunks.as_deref(),
+                tick,
+                inputs.villager.as_deref(),
+            );
+        let mut pathing_aabbs = Vec::new();
+        let mut snapshot_overrides = Vec::new();
+        let mut checkpoints = Vec::with_capacity(ordered_entities.len());
+        let mut pathing_requests = Vec::with_capacity(ordered_entities.len());
+        for (id, ecs_entity) in ordered_entities {
+            let Ok(entity) = self.world.get_entity(ecs_entity) else {
+                continue;
+            };
+            let Some(lifecycle) = entity.get::<LifecycleState>() else {
+                continue;
+            };
+            let Some(entity_type) = entity.get::<EntityTypeState>() else {
+                continue;
+            };
+            let Some(transform) = entity.get::<TransformState>() else {
+                continue;
+            };
+            let Ok((identity, motion, goal, path)) =
+                entity
+                    .get_components::<(&StableIdentity, &MotionState, &AiGoalState, &AiPathState)>(
+                    )
+            else {
+                continue;
+            };
+            let chunk = (
+                (transform.position.x.floor() as i32).div_euclid(16),
+                (transform.position.z.floor() as i32).div_euclid(16),
+            );
+            if lifecycle.0 != EntityLifecycle::Alive
+                || inputs
+                    .active_chunks
+                    .as_ref()
+                    .is_some_and(|active_chunks| !active_chunks.contains(&chunk))
+            {
+                continue;
+            }
+
+            let gameplay = entity.get::<GameplayDecisionState>();
+            if inputs.terrain_pathing_entities.contains(&id) {
+                pathing_aabbs.push((
+                    id,
+                    crate::natural_spawn_26_1_2::entity_geometry(
+                        &entity_type.name,
+                        entity.get::<AnimalState>().map(|state| state.0),
+                    )
+                    .aabb,
+                ));
+            }
+            if let Some(hostile_target_positions) = inputs.hostile_target_positions.as_deref()
+                && entity_type.hostile
+                && let Some(view) = entity_view_from_world(&self.world, id)
+                && let Some(goal) = crate::natural_spawn_26_1_2::hostile_goal_for_entity(
+                    &view,
+                    hostile_target_positions,
+                    &inputs.mob_behaviors,
+                )
+                && goal != *view.goal
+            {
+                goal_overrides.insert(id, goal);
+            }
+            let snapshot_overridden = if entity_type.name.as_ref() == "minecraft:shulker_bullet"
+                && let Some(expected) = snapshot_from_world(&self.world, id)
+                && let Some(next) =
+                    retarget_shulker_bullet_snapshot(&expected, &inputs.combat_targets)
+            {
+                snapshot_overrides.push((expected, next));
+                true
+            } else {
+                false
+            };
+            let goal_eligible = entity_type.name.as_ref() != "minecraft:ender_dragon"
+                && gameplay.is_none_or(|state| state.sheep_grazing_ticks.is_none());
+            let overridden_goal = goal_overrides.get(&id);
+            let selected_goal = overridden_goal.unwrap_or(&goal.0);
+            let goal_overridden = overridden_goal.is_some();
+            let passive = goal_eligible
+                && !goal_overridden
+                && !snapshot_overridden
+                && matches!(selected_goal, GoalState::Idle)
+                && motion.velocity.x == 0.0
+                && motion.velocity.z == 0.0;
+            let goal_active = goal_eligible && !passive;
+            if goal_active {
+                goal_ids.push(id);
+            } else if passive {
+                passive_decisions += 1;
+            }
+            let pathing_requested = goal_active
+                && goal_pathing_request(identity, transform, motion, selected_goal, path, tick)
+                    .is_some_and(|request| {
+                        pathing_requests.push(request);
+                        true
+                    });
+            if !pathing_requested
+                && (goal_active || goal_overridden)
+                && let Some(checkpoint) = entity_goal_checkpoint_from_entity(&entity)
+            {
+                checkpoints.push(checkpoint);
+            }
+        }
+        let active_ids =
+            (goal_ids.len() != world_entity_count).then(|| goal_ids.into_iter().collect());
+        crate::EntityGoalTickSelection {
+            checkpoints,
+            goal_tick: crate::PreparedGoalTick {
+                tick,
+                active_ids,
+                passive_decisions,
+                pathing_requests,
+            },
+            goal_overrides,
+            pathing_aabbs,
+            snapshot_overrides,
+            villager_updates,
+            cross_region_villager_candidates,
+        }
+    }
+
     pub(crate) fn pathing_requests(
         &mut self,
         tick: u64,
         active_ids: Option<&HashSet<EntityId>>,
+        goal_overrides: &HashMap<EntityId, GoalState>,
     ) -> Vec<GoalPathingRequest> {
         if let Some(active_ids) = active_ids
             && active_set_is_sparse(&self.world, active_ids)
@@ -929,7 +1469,7 @@ impl EntityRuntime {
             ids.sort_unstable();
             return ids
                 .into_iter()
-                .filter_map(|id| self.pathing_request(id, tick))
+                .filter_map(|id| self.pathing_request(id, tick, goal_overrides.get(&id)))
                 .collect();
         }
         let active_filter =
@@ -955,6 +1495,7 @@ impl EntityRuntime {
                 active_filter.is_none_or(|active_ids| active_ids.contains(&identity.id))
             })
             .filter_map(|(identity, transform, motion, _, goal, path)| {
+                let goal = goal_overrides.get(&identity.id).unwrap_or(&goal.0);
                 goal_pathing_request(identity, transform, motion, goal, path, tick)
             })
             .collect::<Vec<_>>();
@@ -962,7 +1503,12 @@ impl EntityRuntime {
         requests
     }
 
-    fn pathing_request(&self, id: EntityId, tick: u64) -> Option<GoalPathingRequest> {
+    fn pathing_request(
+        &self,
+        id: EntityId,
+        tick: u64,
+        goal_override: Option<&GoalState>,
+    ) -> Option<GoalPathingRequest> {
         let entity = *self.world.resource::<RuntimeEntityIndex>().0.get(&id)?;
         let entity = self.world.get_entity(entity).ok()?;
         if entity.contains::<ItemStackState>()
@@ -979,7 +1525,14 @@ impl EntityRuntime {
         let motion = entity.get::<MotionState>()?;
         let goal = entity.get::<AiGoalState>()?;
         let path = entity.get::<AiPathState>()?;
-        goal_pathing_request(identity, transform, motion, goal, path, tick)
+        goal_pathing_request(
+            identity,
+            transform,
+            motion,
+            goal_override.unwrap_or(&goal.0),
+            path,
+            tick,
+        )
     }
 
     pub fn remove(&mut self, id: EntityId) -> Option<EntitySnapshot> {
@@ -1000,38 +1553,114 @@ impl EntityRuntime {
             .push(result);
     }
 
-    pub(crate) fn queue_goal_tick(
+    pub(crate) fn queue_kinematics(
         &mut self,
-        tick: u64,
-        pathing_enabled: bool,
-        pathing: impl IntoIterator<Item = GoalPathingResult>,
-        active_ids: Option<&HashSet<EntityId>>,
-        external_follow_targets: Option<&HashMap<EntityId, Vec3>>,
-    ) {
-        let request = GoalTickRequest {
-            tick,
-            pathing_enabled,
-            pathing: pathing
-                .into_iter()
-                .map(|result| (result.request.id, result))
-                .collect(),
-            active_ids: active_ids.cloned(),
-            external_follow_targets: external_follow_targets.cloned().unwrap_or_default(),
+        states: impl IntoIterator<Item = EntityKinematics>,
+    ) -> usize {
+        let mut pending = std::mem::take(&mut self.world.resource_mut::<PendingPhysicsResults>().0);
+        let applied = {
+            let entity_index = self.world.resource::<RuntimeEntityIndex>();
+            let mut applied = 0;
+            for state in states {
+                if !state.is_finite() || !entity_index.0.contains_key(&state.id) {
+                    continue;
+                }
+                pending.push(EntityPhysicsResult {
+                    id: state.id,
+                    position: state.position,
+                    rotation: state.rotation,
+                    velocity: state.velocity,
+                    on_ground: state.on_ground,
+                });
+                applied += 1;
+            }
+            applied
         };
-        let previous = self
-            .world
-            .resource_mut::<PendingGoalTick>()
-            .0
-            .replace(request);
-        assert!(previous.is_none(), "goal tick already queued");
+        self.world.resource_mut::<PendingPhysicsResults>().0 = pending;
+        applied
     }
 
-    pub(crate) fn take_goal_tick_stats(&mut self) -> GoalTickStats {
-        self.world
-            .resource_mut::<GoalTickOutput>()
-            .0
-            .take()
-            .expect("queued goal tick must publish stats")
+    pub(crate) fn queue_kinematics_prevalidated(
+        &mut self,
+        states: impl IntoIterator<Item = EntityKinematics>,
+    ) -> usize {
+        let mut pending = std::mem::take(&mut self.world.resource_mut::<PendingPhysicsResults>().0);
+        let mut applied = 0;
+        for state in states {
+            if !state.is_finite() {
+                continue;
+            }
+            pending.push(EntityPhysicsResult {
+                id: state.id,
+                position: state.position,
+                rotation: state.rotation,
+                velocity: state.velocity,
+                on_ground: state.on_ground,
+            });
+            applied += 1;
+        }
+        self.world.resource_mut::<PendingPhysicsResults>().0 = pending;
+        applied
+    }
+
+    pub(crate) fn run_goal_tick(
+        &mut self,
+        request: GoalTickRequest,
+    ) -> (GoalTickStats, Vec<GoalSimulationCandidate>) {
+        self.run_goal_tick_inner(request, None)
+    }
+
+    pub(crate) fn run_owner_goal_tick(
+        &mut self,
+        request: GoalTickRequest,
+    ) -> (GoalTickStats, OwnerGoalTickOutput) {
+        let mut output = OwnerGoalTickOutput::default();
+        let (stats, captured) = self.run_goal_tick_inner(request, Some(&mut output));
+        debug_assert!(captured.is_empty());
+        (stats, output)
+    }
+
+    fn run_goal_tick_inner(
+        &mut self,
+        mut request: GoalTickRequest,
+        owner_output: Option<&mut OwnerGoalTickOutput>,
+    ) -> (GoalTickStats, Vec<GoalSimulationCandidate>) {
+        #[cfg(feature = "load-bench")]
+        let apply_split_tick = request.tick;
+        #[cfg(feature = "load-bench")]
+        let apply_split_started = std::time::Instant::now();
+        if request
+            .simulation_capture_ids
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            request.simulation_capture_ids = None;
+        } else if let Some(ids) = &mut request.simulation_capture_ids {
+            ids.sort_unstable();
+        }
+        #[cfg(feature = "load-bench")]
+        let apply_sort_us =
+            u64::try_from(apply_split_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        #[cfg(feature = "load-bench")]
+        let apply_stage_started = std::time::Instant::now();
+        self.run_stage(EntityStage::InputAi);
+        #[cfg(feature = "load-bench")]
+        let apply_stage_us =
+            u64::try_from(apply_stage_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        #[cfg(feature = "load-bench")]
+        let apply_commit_started = std::time::Instant::now();
+        let output = apply_goal_tick(&mut self.world, request, owner_output);
+        #[cfg(feature = "load-bench")]
+        if apply_split_tick.is_multiple_of(10) {
+            eprintln!(
+                "APPLY_SPLIT tick={} sort_us={} stage_us={} commit_us={}",
+                apply_split_tick,
+                apply_sort_us,
+                apply_stage_us,
+                u64::try_from(apply_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+        }
+        output
     }
 
     pub(crate) fn queue_position_tick(&mut self, delta_seconds: f64) {
@@ -1157,18 +1786,18 @@ fn active_set_is_sparse(world: &World, active_ids: &HashSet<EntityId>) -> bool {
 
 fn active_set_covers_world(world: &World, active_ids: &HashSet<EntityId>) -> bool {
     let index = world.resource::<RuntimeEntityIndex>();
-    active_ids.len() == index.0.len() && active_ids.iter().all(|id| index.0.contains_key(id))
+    active_ids.len() == index.0.len() && index.0.keys().all(|id| active_ids.contains(id))
 }
 
 fn goal_pathing_request(
     identity: &StableIdentity,
     transform: &TransformState,
     motion: &MotionState,
-    goal: &AiGoalState,
+    goal: &GoalState,
     path: &AiPathState,
     tick: u64,
 ) -> Option<GoalPathingRequest> {
-    let (target, target_epoch, speed) = match &goal.0 {
+    let (target, target_epoch, speed) = match goal {
         GoalState::FollowPosition { target, speed } if *speed != 0.0 => (*target, None, *speed),
         GoalState::Wander {
             speed,
@@ -1191,7 +1820,7 @@ fn goal_pathing_request(
         expected_rotation: transform.rotation,
         expected_velocity: motion.velocity,
         expected_on_ground: motion.on_ground,
-        expected_goal: goal.0.clone(),
+        expected_goal: goal.clone(),
         expected_path: path.0,
         target,
         target_epoch,
@@ -1203,10 +1832,9 @@ impl EntitySchedules {
     fn new() -> Self {
         let mut input_ai = Schedule::default();
         input_ai.set_executor_kind(ExecutorKind::SingleThreaded);
-        input_ai.add_systems((apply_input_commands, apply_goal_tick).chain());
+        input_ai.add_systems(apply_input_commands);
 
         let mut snapshot_request = Schedule::default();
-        snapshot_request.set_executor_kind(ExecutorKind::SingleThreaded);
         snapshot_request.add_systems(capture_snapshot_request);
 
         let mut physics_apply = Schedule::default();
@@ -1404,10 +2032,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         && animal.is_some_and(|animal| animal.sheep_wool.is_some());
     let mut entity = world.spawn((
         StableIdentity { id, uuid },
-        EntityTypeState {
-            protocol_id: type_id,
-            name: type_name.into(),
-        },
+        entity_type_state(type_id, type_name),
         TransformState { position, rotation },
         MotionState {
             velocity,
@@ -1609,10 +2234,7 @@ fn restore_snapshot_in_world(
             return false;
         };
         entity.insert((
-            EntityTypeState {
-                protocol_id: type_id,
-                name: type_name.into(),
-            },
+            entity_type_state(type_id, type_name),
             TransformState { position, rotation },
             MotionState {
                 velocity,
@@ -1710,6 +2332,10 @@ fn replace_optional_component<T: Component>(
 fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
     let ecs_entity = *world.resource::<RuntimeEntityIndex>().0.get(&id)?;
     let entity = world.get_entity(ecs_entity).ok()?;
+    snapshot_from_entity(&entity)
+}
+
+fn snapshot_from_entity(entity: &EntityRef<'_>) -> Option<EntitySnapshot> {
     let identity = entity.get::<StableIdentity>()?;
     let entity_type = entity.get::<EntityTypeState>()?;
     let transform = entity.get::<TransformState>()?;
@@ -1770,6 +2396,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             primed_tnt: gameplay.primed_tnt,
             pending_explosion: gameplay.pending_explosion,
             crossbow_attack: gameplay.crossbow_attack,
+
             blaze_attack: gameplay.blaze_attack,
             ghast_attack: gameplay.ghast_attack,
             breeze_attack: gameplay.breeze_attack,
@@ -1796,6 +2423,10 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
 fn entity_goal_checkpoint_from_world(world: &World, id: EntityId) -> Option<EntityGoalCheckpoint> {
     let ecs_entity = *world.resource::<RuntimeEntityIndex>().0.get(&id)?;
     let entity = world.get_entity(ecs_entity).ok()?;
+    entity_goal_checkpoint_from_entity(&entity)
+}
+
+fn entity_goal_checkpoint_from_entity(entity: &EntityRef<'_>) -> Option<EntityGoalCheckpoint> {
     let identity = entity.get::<StableIdentity>()?;
     let transform = entity.get::<TransformState>()?;
     let motion = entity.get::<MotionState>()?;
@@ -1814,87 +2445,785 @@ fn entity_goal_checkpoint_from_world(world: &World, id: EntityId) -> Option<Enti
     })
 }
 
-fn entity_simulation_projection_from_world(
+fn villager_job_site(gameplay: &GameplayDecisionState, position: Vec3) -> Option<Vec3> {
+    match (gameplay.villager_brain.as_ref(), gameplay.villager) {
+        (Some(brain), _) => brain.pois.job_site,
+        (None, Some(villager)) => {
+            crate::villager_26_1_2::default_villager_pois(position, villager.profession).job_site
+        }
+        (None, None) => None,
+    }
+}
+
+fn entity_simulation_result_from_world(
     world: &World,
     id: EntityId,
-) -> Option<EntitySimulationProjection> {
+) -> Option<EntitySimulationResult> {
     let ecs_entity = *world.resource::<RuntimeEntityIndex>().0.get(&id)?;
     let entity = world.get_entity(ecs_entity).ok()?;
+    entity_simulation_result_from_entity(&entity)
+}
+
+fn villager_population_active(
+    entity_type: &EntityTypeState,
+    gameplay: &GameplayDecisionState,
+) -> bool {
+    entity_type.villager
+        && gameplay
+            .villager_population
+            .as_ref()
+            .is_some_and(|population| {
+                population.age_ticks != 0
+                    || population.food_level != 0
+                    || !population.inventory.is_empty()
+                    || population.pending_birth.is_some()
+            })
+}
+
+fn entity_simulation_result_from_entity(entity: &EntityRef<'_>) -> Option<EntitySimulationResult> {
     let identity = entity.get::<StableIdentity>()?;
     let entity_type = entity.get::<EntityTypeState>()?;
     let transform = entity.get::<TransformState>()?;
     let motion = entity.get::<MotionState>()?;
     let lifecycle = entity.get::<LifecycleState>()?;
-    let living = entity.get::<LivingState>()?;
     let goal = entity.get::<AiGoalState>()?;
     let gameplay = entity.get::<GameplayDecisionState>()?;
+    entity_simulation_result_from_components(
+        identity,
+        entity_type,
+        transform,
+        motion,
+        lifecycle,
+        goal,
+        gameplay,
+        entity.get::<AnimalState>().map(|state| state.0),
+        entity.get::<ItemStackState>().is_none()
+            && entity.get::<ExperienceState>().is_none()
+            && entity.get::<FallingBlockState>().is_none()
+            && entity.get::<VehicleKindState>().is_none(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn entity_simulation_result_from_components(
+    identity: &StableIdentity,
+    entity_type: &EntityTypeState,
+    transform: &TransformState,
+    motion: &MotionState,
+    lifecycle: &LifecycleState,
+    goal: &AiGoalState,
+    gameplay: &GameplayDecisionState,
+    animal: Option<AnimalBreedingState>,
+    ordinary_living: bool,
+) -> Option<EntitySimulationResult> {
+    if lifecycle.0 != EntityLifecycle::Alive {
+        return None;
+    }
+    let motion =
+        motion_state_from_components(identity, entity_type, transform, motion, goal, gameplay);
+    Some(entity_simulation_result_from_motion(
+        entity_type,
+        gameplay,
+        animal,
+        ordinary_living,
+        motion,
+    ))
+}
+
+fn entity_physics_kind(
+    entity_type: &EntityTypeState,
+    gameplay: &GameplayDecisionState,
+    ordinary_living: bool,
+) -> EntityPhysicsKind {
+    let type_name = &*entity_type.name;
     let arrow_state = gameplay.arrow_state;
     let hurting_projectile_state = gameplay.hurting_projectile_state;
     let throwable_projectile_state = gameplay.throwable_projectile_state;
-    let villager_brain = gameplay.villager_brain.as_ref();
+    if type_name == "minecraft:arrow" {
+        EntityPhysicsKind::ArrowProjectile {
+            revision: arrow_state.map(|state| state.projectile.revision),
+            embedded_block: arrow_state
+                .filter(|state| state.in_ground)
+                .and_then(|state| state.last_block_position),
+        }
+    } else if type_name == "minecraft:ender_dragon" {
+        EntityPhysicsKind::ExternalFlight
+    } else if matches!(
+        type_name,
+        "minecraft:evoker_fangs" | "minecraft:area_effect_cloud"
+    ) {
+        EntityPhysicsKind::Immobile
+    } else if type_name == "minecraft:shulker_bullet" {
+        EntityPhysicsKind::ShulkerBullet {
+            revision: hurting_projectile_state.map(|state| state.projectile.revision),
+        }
+    } else if let Some(state) = hurting_projectile_state {
+        EntityPhysicsKind::HurtingProjectile {
+            revision: Some(state.projectile.revision),
+            acceleration_power_bits: state.acceleration_power.to_bits(),
+        }
+    } else if let Some(state) = throwable_projectile_state {
+        EntityPhysicsKind::ThrowableProjectile {
+            revision: Some(state.projectile.revision),
+            gravity_bits: 0.05_f64.to_bits(),
+        }
+    } else if entity_type.aquatic_physics {
+        EntityPhysicsKind::AquaticLiving
+    } else if type_name == "minecraft:falling_block" {
+        EntityPhysicsKind::FallingBlock
+    } else if ordinary_living {
+        if entity_type.powder_snow_walkable {
+            EntityPhysicsKind::PowderSnowWalkableLiving
+        } else {
+            EntityPhysicsKind::Living
+        }
+    } else {
+        EntityPhysicsKind::Default
+    }
+}
 
-    Some(EntitySimulationProjection {
+fn entity_simulation_result_from_motion(
+    entity_type: &EntityTypeState,
+    gameplay: &GameplayDecisionState,
+    animal: Option<AnimalBreedingState>,
+    ordinary_living: bool,
+    motion: EntityMotionState,
+) -> EntitySimulationResult {
+    let type_name = &*entity_type.name;
+    let kind = entity_physics_kind(entity_type, gameplay, ordinary_living);
+
+    EntitySimulationResult {
+        hostile: entity_type.hostile,
+        rotation: motion.rotation,
+        villager_population_active: villager_population_active(entity_type, gameplay),
+        villager: entity_type.villager,
+        item: entity_type.item,
+        physics: EntityPhysicsQuery {
+            id: motion.id,
+            position: motion.position,
+            velocity: motion.velocity,
+            aabb: if animal.is_some_and(AnimalBreedingState::is_baby) {
+                crate::natural_spawn_26_1_2::entity_geometry(type_name, animal).aabb
+            } else {
+                entity_type.geometry.aabb
+            },
+            on_ground: motion.on_ground,
+            fall_distance: motion.fall_distance,
+            goal_fence: motion.goal_fence,
+            kind,
+        },
+    }
+}
+
+fn retarget_shulker_bullet_snapshot(
+    expected: &EntitySnapshot,
+    targets: &HashMap<i32, Vec3>,
+) -> Option<EntitySnapshot> {
+    const TARGET_SPEED: f64 = 0.15;
+    const STEERING: f64 = 0.2;
+
+    let target_entity_id = expected.retained.shulker_bullet?.target_entity_id;
+    let target = targets.get(&target_entity_id).copied()?;
+    let state = expected.retained.hurting_projectile_state?;
+    let delta = Vec3::new(
+        target.x - expected.position.x,
+        target.y - expected.position.y,
+        target.z - expected.position.z,
+    );
+    let length_squared = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+    if !length_squared.is_finite() || length_squared <= 1.0e-14 {
+        return None;
+    }
+    let scale = TARGET_SPEED / length_squared.sqrt();
+    let desired = Vec3::new(delta.x * scale, delta.y * scale, delta.z * scale);
+    let velocity = Vec3::new(
+        expected.velocity.x + (desired.x - expected.velocity.x) * STEERING,
+        expected.velocity.y + (desired.y - expected.velocity.y) * STEERING,
+        expected.velocity.z + (desired.z - expected.velocity.z) * STEERING,
+    );
+    let projectile_velocity =
+        crate::projectile_26_1_2::Vec3::new(velocity.x, velocity.y, velocity.z);
+    let next_state = state.retarget_velocity(projectile_velocity).ok()?;
+    let mut next = expected.clone();
+    next.velocity = velocity;
+    next.rotation = Rotation {
+        yaw: next_state.projectile.rotation.yaw,
+        pitch: next_state.projectile.rotation.pitch,
+        head_yaw: next_state.projectile.rotation.yaw,
+    };
+    next.retained.hurting_projectile_state = Some(next_state);
+    Some(next)
+}
+
+const VILLAGER_BRAIN_TICK_INTERVAL: u64 = 20;
+const VILLAGER_RESTOCK_REACH_SQUARED: f64 = 4.0;
+const VILLAGER_GOSSIP_REACH_SQUARED: f64 = 5.0;
+const VILLAGER_GOSSIP_COOLDOWN_TICKS: u64 = 1_200;
+const VILLAGER_GOSSIP_CELL_SIZE: f64 = 3.0;
+
+#[derive(Clone)]
+struct PlannedVillager {
+    ecs_entity: EcsEntity,
+    id: EntityId,
+    uuid: Uuid,
+    position: Vec3,
+    activity: crate::villager_26_1_2::VillagerActivity,
+    interaction_target: Option<EntityId>,
+    last_gossip_time: u64,
+    update: Option<PlannedVillagerUpdate>,
+}
+
+#[derive(Clone)]
+struct PlannedVillagerUpdate {
+    goal: GoalState,
+    population_pending_birth: bool,
+    villager: crate::VillagerData,
+    brain: crate::villager_26_1_2::VillagerBrainState,
+    gossip: Option<crate::villager_gossip_26_1_2::VillagerGossipState>,
+    merchant: Option<crate::villager_merchant_26_1_2::VillagerMerchantState>,
+}
+
+fn plan_region_villager_updates(
+    world: &World,
+    region: crate::RegionKey,
+    ordered_entities: &[(EntityId, EcsEntity)],
+    active_chunks: Option<&HashSet<(i32, i32)>>,
+    tick: u64,
+    inputs: Option<&crate::regional::RegionalVillagerGoalTickInputs>,
+) -> (
+    HashMap<EntityId, GoalState>,
+    Vec<crate::EntityVillagerGoalUpdate>,
+    Vec<EntityId>,
+) {
+    let Some(inputs) = inputs else {
+        return (HashMap::new(), Vec::new(), Vec::new());
+    };
+    let Some(profile) = inputs.profile.validated().ok() else {
+        return (HashMap::new(), Vec::new(), Vec::new());
+    };
+    let mut planned = HashMap::<EntityId, PlannedVillager>::new();
+    let mut cells = HashMap::<(i32, i32, i32), Vec<EntityId>>::new();
+    let mut due_ids = Vec::new();
+    let mut goal_overrides = HashMap::new();
+    let mut cross_region_villager_candidates = Vec::new();
+    for &(id, ecs_entity) in ordered_entities {
+        let Ok(entity) = world.get_entity(ecs_entity) else {
+            continue;
+        };
+        if entity
+            .get::<EntityTypeState>()
+            .is_none_or(|entity_type| entity_type.name.as_ref() != "minecraft:villager")
+            || entity
+                .get::<LifecycleState>()
+                .is_none_or(|lifecycle| lifecycle.0 != EntityLifecycle::Alive)
+        {
+            continue;
+        }
+        let Some(transform) = entity.get::<TransformState>() else {
+            continue;
+        };
+        let position = transform.position;
+        let chunk = (
+            (position.x.floor() as i32).div_euclid(16),
+            (position.z.floor() as i32).div_euclid(16),
+        );
+        if active_chunks.is_some_and(|chunks| !chunks.contains(&chunk)) {
+            continue;
+        }
+        let Ok((identity, goal, gameplay)) =
+            entity.get_components::<(&StableIdentity, &AiGoalState, &GameplayDecisionState)>()
+        else {
+            continue;
+        };
+        let Some(villager) = gameplay.villager else {
+            continue;
+        };
+        let brain = current_villager_brain(position, villager, gameplay.villager_brain.as_ref());
+        let base_brain_state = (
+            brain.activity,
+            brain.interaction_target,
+            brain.last_gossip_time,
+        );
+        let due = villager_brain_due_for_tick(
+            id,
+            brain.schedule,
+            brain.override_expires_tick,
+            tick,
+            inputs.day_time,
+            &inputs.profile,
+        );
+        let update = if due {
+            due_ids.push(id);
+            let mut update = PlannedVillagerUpdate {
+                goal: goal.0.clone(),
+                population_pending_birth: gameplay
+                    .villager_population
+                    .as_ref()
+                    .is_some_and(|population| population.pending_birth.is_some()),
+                brain,
+                gossip: gameplay.villager_gossip.clone(),
+                merchant: gameplay.villager_merchant.clone(),
+                villager,
+            };
+            if let Ok(plan) = profile.plan(&update.brain, tick, inputs.day_time) {
+                if !update.population_pending_birth && update.goal != plan.goal {
+                    goal_overrides.insert(id, plan.goal.clone());
+                }
+                update.brain = plan.state;
+                if let Some(mut gossip) = update.gossip.clone()
+                    && gossip.decay(inputs.day_time).ok() == Some(true)
+                {
+                    update.gossip = Some(gossip);
+                }
+                if villager_can_restock_at_job_site(position, &update.brain)
+                    && let Some(mut merchant) = update.merchant.clone()
+                    && merchant.restock(inputs.day_time).ok() == Some(true)
+                {
+                    update.merchant = Some(merchant);
+                }
+                if let Some(offer) = inputs.profession_offers.get(&id)
+                    && update.villager.profession == crate::VillagerProfession::None
+                    && update.villager.level == 1
+                    && update.merchant.is_none()
+                    && update.brain.schedule == crate::villager_26_1_2::VillagerScheduleKind::Adult
+                {
+                    update.villager.profession = offer.profession;
+                    update.merchant = Some(offer.merchant.clone());
+                }
+            }
+            Some(update)
+        } else {
+            None
+        };
+        let (activity, interaction_target, last_gossip_time) =
+            update.as_ref().map_or(base_brain_state, |planned_update| {
+                (
+                    planned_update.brain.activity,
+                    planned_update.brain.interaction_target,
+                    planned_update.brain.last_gossip_time,
+                )
+            });
+        planned.insert(
+            id,
+            PlannedVillager {
+                ecs_entity,
+                id,
+                uuid: identity.uuid,
+                position,
+                activity,
+                interaction_target,
+                last_gossip_time,
+                update,
+            },
+        );
+        cells
+            .entry(villager_gossip_cell(position))
+            .or_default()
+            .push(id);
+        if villager_is_near_region_boundary(region, position) {
+            cross_region_villager_candidates.push(id);
+        }
+    }
+
+    let mut reserved = HashSet::new();
+    for receiver_id in due_ids {
+        if reserved.contains(&receiver_id) {
+            continue;
+        }
+        let Some(receiver) = planned.get(&receiver_id) else {
+            continue;
+        };
+        if !villager_gossip_activity_allows_transfer(receiver.activity)
+            || !villager_gossip_cooldown_ready(tick, receiver.last_gossip_time)
+        {
+            continue;
+        }
+        let Some(source_id) =
+            select_local_villager_gossip_target(receiver, &planned, &cells, &reserved, tick)
+        else {
+            continue;
+        };
+        let receiver_uuid = receiver.uuid;
+        if planned
+            .get(&source_id)
+            .is_none_or(|source| source.update.is_none())
+        {
+            let Some(source) = planned.get(&source_id) else {
+                continue;
+            };
+            let Ok(entity) = world.get_entity(source.ecs_entity) else {
+                continue;
+            };
+            let Ok((goal, gameplay)) =
+                entity.get_components::<(&AiGoalState, &GameplayDecisionState)>()
+            else {
+                continue;
+            };
+            let Some(villager) = gameplay.villager else {
+                continue;
+            };
+            let source_update = PlannedVillagerUpdate {
+                goal: goal.0.clone(),
+                population_pending_birth: gameplay
+                    .villager_population
+                    .as_ref()
+                    .is_some_and(|population| population.pending_birth.is_some()),
+                brain: current_villager_brain(
+                    source.position,
+                    villager,
+                    gameplay.villager_brain.as_ref(),
+                ),
+                gossip: gameplay.villager_gossip.clone(),
+                merchant: gameplay.villager_merchant.clone(),
+                villager,
+            };
+            planned
+                .get_mut(&source_id)
+                .expect("selected gossip source remains planned")
+                .update = Some(source_update);
+        }
+        let Some(source) = planned.get(&source_id) else {
+            continue;
+        };
+        let Some(source_update) = source.update.as_ref() else {
+            continue;
+        };
+        let source_uuid = source.uuid;
+        let source_gossip = source_update.gossip.clone().unwrap_or_default();
+        let Some(receiver_update) = planned
+            .get(&receiver_id)
+            .and_then(|receiver| receiver.update.as_ref())
+        else {
+            continue;
+        };
+        let mut receiver_gossip = receiver_update.gossip.clone().unwrap_or_default();
+        if receiver_gossip
+            .transfer_from_seeded(
+                &source_gossip,
+                villager_gossip_seed(receiver_uuid, source_uuid, tick),
+                crate::villager_gossip_26_1_2::MAX_TRANSFER_COUNT,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        let Some(receiver_update) = planned
+            .get_mut(&receiver_id)
+            .and_then(|receiver| receiver.update.as_mut())
+        else {
+            continue;
+        };
+        receiver_update.brain.interaction_target = Some(source_id);
+        receiver_update.brain.last_gossip_time = tick;
+        receiver_update.gossip = Some(receiver_gossip);
+        let Some(source_update) = planned
+            .get_mut(&source_id)
+            .and_then(|source| source.update.as_mut())
+        else {
+            continue;
+        };
+        source_update.brain.last_gossip_time = tick;
+        reserved.insert(receiver_id);
+        reserved.insert(source_id);
+    }
+
+    let mut updates = planned
+        .into_values()
+        .filter_map(|planned| {
+            let update = planned.update?;
+            let entity = world.get_entity(planned.ecs_entity).ok()?;
+            let gameplay = entity.get::<GameplayDecisionState>()?;
+            (gameplay.villager != Some(update.villager)
+                || gameplay.villager_brain.as_ref() != Some(&update.brain)
+                || gameplay.villager_gossip != update.gossip
+                || gameplay.villager_merchant != update.merchant)
+                .then(|| {
+                    snapshot_from_entity(&entity).map(|expected| crate::EntityVillagerGoalUpdate {
+                        expected,
+                        villager: update.villager,
+                        brain: update.brain,
+                        gossip: update.gossip,
+                        merchant: update.merchant,
+                    })
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    updates.sort_unstable_by_key(|update| update.expected.id);
+    (goal_overrides, updates, cross_region_villager_candidates)
+}
+
+fn villager_is_near_region_boundary(region: crate::RegionKey, position: Vec3) -> bool {
+    const GOSSIP_REACH: f64 = 2.236_067_977_499_79;
+    const REGION_SIZE_BLOCKS: f64 = crate::REGION_SIZE_CHUNKS as f64 * 16.0;
+    let min_x = f64::from(region.x) * REGION_SIZE_BLOCKS;
+    let min_z = f64::from(region.z) * REGION_SIZE_BLOCKS;
+    let max_x = min_x + REGION_SIZE_BLOCKS;
+    let max_z = min_z + REGION_SIZE_BLOCKS;
+    position.x - min_x <= GOSSIP_REACH
+        || max_x - position.x <= GOSSIP_REACH
+        || position.z - min_z <= GOSSIP_REACH
+        || max_z - position.z <= GOSSIP_REACH
+}
+
+fn current_villager_brain(
+    position: Vec3,
+    villager: crate::VillagerData,
+    brain: Option<&crate::villager_26_1_2::VillagerBrainState>,
+) -> crate::villager_26_1_2::VillagerBrainState {
+    brain.cloned().unwrap_or_else(|| {
+        crate::villager_26_1_2::VillagerBrainState::adult(
+            crate::villager_26_1_2::default_villager_pois(position, villager.profession),
+        )
+    })
+}
+
+fn villager_schedule_boundary(
+    profile: &crate::villager_26_1_2::VillagerBrainProfile,
+    schedule: crate::villager_26_1_2::VillagerScheduleKind,
+    day_time: i64,
+) -> bool {
+    let entries = match schedule {
+        crate::villager_26_1_2::VillagerScheduleKind::Adult => &profile.adult_schedule,
+        crate::villager_26_1_2::VillagerScheduleKind::Baby => &profile.baby_schedule,
+    };
+    let normalized = day_time.rem_euclid(24_000);
+    entries.iter().any(|entry| entry.day_time == normalized)
+}
+
+fn villager_brain_due_for_tick(
+    entity: EntityId,
+    schedule: crate::villager_26_1_2::VillagerScheduleKind,
+    override_expires_tick: Option<u64>,
+    lifecycle_tick: u64,
+    day_time: i64,
+    profile: &crate::villager_26_1_2::VillagerBrainProfile,
+) -> bool {
+    override_expires_tick.is_some_and(|expires| lifecycle_tick >= expires)
+        || villager_schedule_boundary(profile, schedule, day_time)
+        || lifecycle_tick
+            .wrapping_add(u64::from(entity.0.unsigned_abs()))
+            .is_multiple_of(VILLAGER_BRAIN_TICK_INTERVAL)
+}
+
+fn villager_can_restock_at_job_site(
+    position: Vec3,
+    brain: &crate::villager_26_1_2::VillagerBrainState,
+) -> bool {
+    if brain.activity != crate::villager_26_1_2::VillagerActivity::Work {
+        return false;
+    }
+    let Some(job_site) = brain.pois.job_site else {
+        return false;
+    };
+    let dx = position.x - job_site.x;
+    let dy = position.y - job_site.y;
+    let dz = position.z - job_site.z;
+    dx * dx + dy * dy + dz * dz <= VILLAGER_RESTOCK_REACH_SQUARED
+}
+
+fn villager_gossip_activity_allows_transfer(
+    activity: crate::villager_26_1_2::VillagerActivity,
+) -> bool {
+    matches!(
+        activity,
+        crate::villager_26_1_2::VillagerActivity::Idle
+            | crate::villager_26_1_2::VillagerActivity::Meet
+    )
+}
+
+fn villager_gossip_cooldown_ready(timestamp: u64, last_gossip_time: u64) -> bool {
+    timestamp < last_gossip_time
+        || timestamp >= last_gossip_time.saturating_add(VILLAGER_GOSSIP_COOLDOWN_TICKS)
+}
+
+fn villager_gossip_cell(position: Vec3) -> (i32, i32, i32) {
+    (
+        (position.x / VILLAGER_GOSSIP_CELL_SIZE).floor() as i32,
+        (position.y / VILLAGER_GOSSIP_CELL_SIZE).floor() as i32,
+        (position.z / VILLAGER_GOSSIP_CELL_SIZE).floor() as i32,
+    )
+}
+
+fn select_local_villager_gossip_target(
+    receiver: &PlannedVillager,
+    candidates: &HashMap<EntityId, PlannedVillager>,
+    cells: &HashMap<(i32, i32, i32), Vec<EntityId>>,
+    reserved: &HashSet<EntityId>,
+    timestamp: u64,
+) -> Option<EntityId> {
+    let eligible = |target: EntityId| {
+        if target == receiver.id || reserved.contains(&target) {
+            return None;
+        }
+        let candidate = candidates.get(&target)?;
+        if !villager_gossip_cooldown_ready(timestamp, candidate.last_gossip_time) {
+            return None;
+        }
+        let delta = Vec3::new(
+            receiver.position.x - candidate.position.x,
+            receiver.position.y - candidate.position.y,
+            receiver.position.z - candidate.position.z,
+        );
+        let distance = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+        (distance <= VILLAGER_GOSSIP_REACH_SQUARED).then_some((target, distance))
+    };
+    if let Some(target) = receiver.interaction_target
+        && eligible(target).is_some()
+    {
+        return Some(target);
+    }
+    let (cell_x, cell_y, cell_z) = villager_gossip_cell(receiver.position);
+    let mut best = None::<(EntityId, f64)>;
+    for x in (cell_x - 1)..=(cell_x + 1) {
+        for y in (cell_y - 1)..=(cell_y + 1) {
+            for z in (cell_z - 1)..=(cell_z + 1) {
+                let Some(ids) = cells.get(&(x, y, z)) else {
+                    continue;
+                };
+                for &target in ids {
+                    let Some((target, distance)) = eligible(target) else {
+                        continue;
+                    };
+                    if best.is_none_or(|(best_id, best_distance)| {
+                        distance < best_distance || distance == best_distance && target < best_id
+                    }) {
+                        best = Some((target, distance));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(target, _)| target)
+}
+
+fn villager_gossip_seed(receiver: Uuid, source: Uuid, timestamp: u64) -> u64 {
+    let receiver = receiver.as_u128();
+    let source = source.as_u128();
+    splitmix64_villager(
+        (receiver as u64)
+            ^ ((receiver >> 64) as u64).rotate_left(11)
+            ^ (source as u64).rotate_left(23)
+            ^ ((source >> 64) as u64).rotate_left(37)
+            ^ timestamp.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    )
+}
+
+fn splitmix64_villager(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut mixed = value;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
+}
+fn simulation_fence_result_from_entity(
+    entity: &EntityRef<'_>,
+) -> Option<(EntityKinematicsFenceState, Option<EntitySimulationResult>)> {
+    let (identity, entity_type, transform, motion, lifecycle, _, goal, _, gameplay) = entity
+        .get_components::<(
+            &StableIdentity,
+            &EntityTypeState,
+            &TransformState,
+            &MotionState,
+            &LifecycleState,
+            &LivingState,
+            &AiGoalState,
+            &AiPathState,
+            &GameplayDecisionState,
+        )>()
+        .ok()?;
+    let vehicle_attached = entity.get::<VehicleKindState>().is_some();
+    let state = kinematics_fence_state_from_components(
+        identity,
+        entity_type,
+        transform,
+        motion,
+        lifecycle,
+        goal,
+        gameplay,
+        vehicle_attached,
+    );
+    let ordinary_living = entity.get::<ItemStackState>().is_none()
+        && entity.get::<ExperienceState>().is_none()
+        && entity.get::<FallingBlockState>().is_none()
+        && !state.vehicle_attached;
+    let result =
+        (state.lifecycle == EntityLifecycle::Alive && !state.vehicle_attached).then(|| {
+            entity_simulation_result_from_motion(
+                entity_type,
+                gameplay,
+                entity.get::<AnimalState>().map(|animal| animal.0),
+                ordinary_living,
+                state.motion,
+            )
+        });
+    Some((state, result))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kinematics_fence_state_from_components(
+    identity: &StableIdentity,
+    entity_type: &EntityTypeState,
+    transform: &TransformState,
+    motion: &MotionState,
+    lifecycle: &LifecycleState,
+    goal: &AiGoalState,
+    gameplay: &GameplayDecisionState,
+    vehicle_attached: bool,
+) -> EntityKinematicsFenceState {
+    EntityKinematicsFenceState {
+        uuid: identity.uuid,
+        lifecycle: lifecycle.0,
+        motion: motion_state_from_components(
+            identity,
+            entity_type,
+            transform,
+            motion,
+            goal,
+            gameplay,
+        ),
+        pickup_claimed: gameplay.item_pickup_claim.is_some(),
+        vehicle_attached,
+    }
+}
+
+fn motion_state_from_components(
+    identity: &StableIdentity,
+    entity_type: &EntityTypeState,
+    transform: &TransformState,
+    motion: &MotionState,
+    goal: &AiGoalState,
+    gameplay: &GameplayDecisionState,
+) -> EntityMotionState {
+    let arrow_state = gameplay.arrow_state;
+    let hurting_projectile_state = gameplay.hurting_projectile_state;
+    let throwable_projectile_state = gameplay.throwable_projectile_state;
+    EntityMotionState {
         id: identity.id,
-        type_name: entity_type.name.clone(),
         position: transform.position,
         rotation: transform.rotation,
         velocity: motion.velocity,
         on_ground: motion.on_ground,
-        lifecycle: lifecycle.0,
-        follow_range: living
-            .attributes
-            .base(&crate::AttributeKind::FollowRange)
-            .unwrap_or(16.0),
-        attack_damage: living
-            .attributes
-            .base(&crate::AttributeKind::AttackDamage)
-            .unwrap_or(0.0),
-        goal: goal.0.clone(),
-        primed_tnt: gameplay.primed_tnt.is_some(),
-        guardian_beam_active: gameplay.guardian_beam.is_some(),
-        has_item_stack: entity.get::<ItemStackState>().is_some(),
-        has_experience_value: entity.get::<ExperienceState>().is_some(),
-        has_block_state: entity.get::<FallingBlockState>().is_some(),
-        has_vehicle: entity.get::<VehicleKindState>().is_some(),
-        animal: entity.get::<AnimalState>().map(|state| state.0),
         fall_distance: motion.fall_distance,
+        goal_fence: crate::EntityGoalFence::from_goal(&goal.0),
+        is_item: &*entity_type.name == "minecraft:item",
+        is_experience: &*entity_type.name == "minecraft:experience_orb",
+        is_arrow: &*entity_type.name == "minecraft:arrow",
         arrow_revision: arrow_state.map(|state| state.projectile.revision),
         arrow_embedded_block: arrow_state
             .filter(|state| state.in_ground)
             .and_then(|state| state.last_block_position),
+        is_hurting_projectile: hurting_projectile_state.is_some(),
         hurting_projectile_revision: hurting_projectile_state
             .map(|state| state.projectile.revision),
-        hurting_projectile_acceleration_power_bits: hurting_projectile_state
-            .map(|state| state.acceleration_power.to_bits()),
-        hurting_projectile_air_inertia_bits: hurting_projectile_state
-            .map(|state| state.air_inertia.to_bits()),
-        hurting_projectile_water_inertia_bits: hurting_projectile_state
-            .map(|state| state.water_inertia.to_bits()),
+        is_throwable_projectile: throwable_projectile_state.is_some(),
         throwable_projectile_revision: throwable_projectile_state
             .map(|state| state.projectile.revision),
-        shulker_bullet_target_entity_id: gameplay
-            .shulker_bullet
-            .map(|state| state.target_entity_id),
-        sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
-        crossbow_attack: gameplay.crossbow_attack,
-        blaze_attack: gameplay.blaze_attack,
-        ghast_attack: gameplay.ghast_attack,
-        breeze_attack: gameplay.breeze_attack,
-        guardian_beam: gameplay.guardian_beam,
-        warden_sonic_boom: gameplay.warden_sonic_boom,
-        shulker_attack: gameplay.shulker_attack,
-        evoker_attack: gameplay.evoker_attack,
-        witch_attack: gameplay.witch_attack,
-        villager: gameplay.villager,
-        villager_schedule: villager_brain.map(|brain| brain.schedule),
-        villager_last_slept_tick: villager_brain.and_then(|brain| brain.last_slept_tick),
-        villager_golem_detected_until_tick: villager_brain
-            .and_then(|brain| brain.golem_detected_until_tick),
-        villager_override_expires_tick: villager_brain
-            .and_then(|brain| brain.override_expires_tick),
-        villager_override_order_present: villager_brain
-            .is_some_and(|brain| brain.override_order.is_some()),
-    })
+        sends_velocity: !matches!(
+            &*entity_type.name,
+            "minecraft:item" | "minecraft:experience_orb"
+        ),
+    }
 }
 
 fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>> {
@@ -2150,55 +3479,99 @@ fn apply_input_commands(world: &mut World) {
     }
 }
 
-fn apply_goal_tick(world: &mut World) {
-    let Some(request) = world.resource_mut::<PendingGoalTick>().0.take() else {
-        return;
-    };
+fn apply_goal_tick(
+    world: &mut World,
+    request: GoalTickRequest,
+    mut owner_output: Option<&mut OwnerGoalTickOutput>,
+) -> (GoalTickStats, Vec<GoalSimulationCandidate>) {
+    #[cfg(feature = "load-bench")]
+    let commit_split_tick = request.tick;
+    #[cfg(feature = "load-bench")]
+    let commit_split_started = std::time::Instant::now();
     let active_filter = request
         .active_ids
         .as_ref()
         .filter(|active_ids| !active_set_covers_world(world, active_ids));
-    let active_entities = active_filter
-        .filter(|active_ids| active_set_is_sparse(world, active_ids))
-        .map(|active_ids| indexed_entities_for_ids(world, active_ids));
-    let mut target_ids = Vec::new();
-    if let Some(active_entities) = active_entities.as_ref() {
-        for &entity in active_entities {
-            let Ok(entity) = world.get_entity(entity) else {
-                continue;
-            };
-            if let Some(AiGoalState(GoalState::FollowTarget { target, .. })) =
-                entity.get::<AiGoalState>()
-            {
-                target_ids.push(*target);
+    let active_entities = request
+        .simulation_capture_ids
+        .is_none()
+        .then(|| {
+            active_filter
+                .filter(|active_ids| active_set_is_sparse(world, active_ids))
+                .map(|active_ids| indexed_entities_for_ids(world, active_ids))
+        })
+        .flatten();
+    let captures_world = request.simulation_capture_ids.as_ref().is_some_and(|ids| {
+        let index = world.resource::<RuntimeEntityIndex>();
+        ids.len() == index.0.len() && ids.iter().eq(index.0.keys())
+    });
+    #[cfg(feature = "load-bench")]
+    let commit_pre_us =
+        u64::try_from(commit_split_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    #[cfg(feature = "load-bench")]
+    let commit_follow_started = std::time::Instant::now();
+    let mut positions = BTreeMap::new();
+    if !request.external_follow_targets_complete {
+        let mut target_ids = Vec::new();
+        if let Some(active_entities) = active_entities.as_ref() {
+            for &entity in active_entities {
+                let Ok(entity) = world.get_entity(entity) else {
+                    continue;
+                };
+                if let Some(AiGoalState(GoalState::FollowTarget { target, .. })) =
+                    entity.get::<AiGoalState>()
+                {
+                    target_ids.push(*target);
+                }
             }
+        } else {
+            let mut identity_query = world.query::<(&StableIdentity, &AiGoalState)>();
+            target_ids.extend(identity_query.iter(world).filter_map(|(identity, goal)| {
+                if active_filter.is_some_and(|active_ids| !active_ids.contains(&identity.id)) {
+                    return None;
+                }
+                match goal.0 {
+                    GoalState::FollowTarget { target, .. } => Some(target),
+                    _ => None,
+                }
+            }));
         }
+        target_ids.sort_unstable();
+        target_ids.dedup();
+        positions = indexed_positions(world, &target_ids);
+    }
+    positions.extend(
+        request
+            .external_follow_targets
+            .iter()
+            .map(|(&id, &position)| (id, position)),
+    );
+    #[cfg(feature = "load-bench")]
+    let commit_follow_us =
+        u64::try_from(commit_follow_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    #[cfg(feature = "load-bench")]
+    let commit_loop_started = std::time::Instant::now();
+    let mut stats = GoalTickStats {
+        alive_entities: request.passive_decisions,
+        decisions_applied: request.passive_decisions,
+        ..GoalTickStats::default()
+    };
+    let mut simulation_results = if owner_output.is_some() {
+        Vec::new()
     } else {
-        let mut identity_query = world.query::<(&StableIdentity, &AiGoalState)>();
-        target_ids.extend(identity_query.iter(world).filter_map(|(identity, goal)| {
-            if active_filter.is_some_and(|active_ids| !active_ids.contains(&identity.id)) {
-                return None;
-            }
-            match goal.0 {
-                GoalState::FollowTarget { target, .. } => Some(target),
-                _ => None,
-            }
-        }));
-    }
-    target_ids.sort_unstable();
-    target_ids.dedup();
-    let mut positions = indexed_positions(world, &target_ids);
-    for (&id, &position) in &request.external_follow_targets {
-        positions.entry(id).or_insert(position);
-    }
-    let mut stats = GoalTickStats::default();
+        Vec::with_capacity(request.simulation_capture_ids.as_ref().map_or(0, Vec::len))
+    };
     let mut query = world.query_filtered::<(
         &StableIdentity,
+        &EntityTypeState,
         &mut TransformState,
         &mut MotionState,
         &LifecycleState,
+        Option<&LivingState>,
         &AiGoalState,
         &mut AiPathState,
+        &GameplayDecisionState,
+        Option<&AnimalState>,
     ), (
         Without<ItemStackState>,
         Without<ExperienceState>,
@@ -2208,7 +3581,7 @@ fn apply_goal_tick(world: &mut World) {
     )>();
     if let Some(active_entities) = active_entities {
         for entity in active_entities {
-            let Ok((identity, mut transform, mut motion, lifecycle, goal, mut path)) =
+            let Ok((identity, _, mut transform, mut motion, lifecycle, _, goal, mut path, _, _)) =
                 query.get_mut(world, entity)
             else {
                 continue;
@@ -2226,26 +3599,175 @@ fn apply_goal_tick(world: &mut World) {
             );
         }
     } else {
-        for (identity, mut transform, mut motion, lifecycle, goal, mut path) in
-            query.iter_mut(world)
+        for (
+            identity,
+            entity_type,
+            mut transform,
+            mut motion,
+            lifecycle,
+            living,
+            goal,
+            mut path,
+            gameplay,
+            animal,
+        ) in query.iter_mut(world)
         {
-            if active_filter.is_some_and(|active_ids| !active_ids.contains(&identity.id)) {
-                continue;
+            let captures_entity = captures_world
+                || request
+                    .simulation_capture_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.binary_search(&identity.id).is_ok());
+            let previous_motion =
+                (captures_entity && owner_output.is_some()).then_some(EntityTrackingMotion {
+                    id: identity.id,
+                    position: transform.position,
+                    rotation: transform.rotation,
+                    velocity: motion.velocity,
+                    on_ground: motion.on_ground,
+                    is_item: false,
+                    is_experience: false,
+                    is_arrow: false,
+                    sends_velocity: true,
+                });
+            let applies_goal =
+                active_filter.is_none_or(|active_ids| active_ids.contains(&identity.id));
+            if applies_goal {
+                apply_goal_to_entity(
+                    &request,
+                    &positions,
+                    identity,
+                    &mut transform,
+                    &mut motion,
+                    lifecycle,
+                    goal,
+                    &mut path,
+                    &mut stats,
+                );
             }
-            apply_goal_to_entity(
-                &request,
-                &positions,
-                identity,
-                &mut transform,
-                &mut motion,
-                lifecycle,
-                goal,
-                &mut path,
-                &mut stats,
-            );
+            if captures_entity {
+                let candidate = goal_simulation_candidate(
+                    identity,
+                    entity_type,
+                    &transform,
+                    &motion,
+                    lifecycle,
+                    living,
+                    goal,
+                    gameplay,
+                    animal,
+                );
+                if let Some(output) = owner_output.as_deref_mut() {
+                    capture_owner_goal_simulation_result(
+                        output,
+                        previous_motion.expect("owner goal capture records previous motion"),
+                        candidate,
+                    );
+                } else if let Some(candidate) = candidate {
+                    simulation_results.push(candidate);
+                }
+            }
         }
     }
-    world.resource_mut::<GoalTickOutput>().0 = Some(stats);
+    #[cfg(feature = "load-bench")]
+    let commit_loop_us =
+        u64::try_from(commit_loop_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    #[cfg(feature = "load-bench")]
+    let commit_sort_started = std::time::Instant::now();
+    simulation_results.sort_unstable_by_key(|candidate| candidate.id);
+    #[cfg(feature = "load-bench")]
+    if commit_split_tick.is_multiple_of(10) {
+        eprintln!(
+            "COMMIT_SPLIT tick={} pre_us={} follow_us={} loop_us={} sort_us={}",
+            commit_split_tick,
+            commit_pre_us,
+            commit_follow_us,
+            commit_loop_us,
+            u64::try_from(commit_sort_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+    }
+    (stats, simulation_results)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn goal_simulation_candidate(
+    identity: &StableIdentity,
+    entity_type: &EntityTypeState,
+    transform: &TransformState,
+    motion: &MotionState,
+    lifecycle: &LifecycleState,
+    living: Option<&LivingState>,
+    goal: &AiGoalState,
+    gameplay: &GameplayDecisionState,
+    animal: Option<&AnimalState>,
+) -> Option<GoalSimulationCandidate> {
+    if living.is_none() || lifecycle.0 != EntityLifecycle::Alive {
+        return None;
+    }
+    let state =
+        motion_state_from_components(identity, entity_type, transform, motion, goal, gameplay);
+    let result = entity_simulation_result_from_motion(
+        entity_type,
+        gameplay,
+        animal.map(|state| state.0),
+        true,
+        state,
+    );
+    Some(GoalSimulationCandidate {
+        id: identity.id,
+        uuid: identity.uuid,
+        lifecycle: lifecycle.0,
+        pickup_claimed: gameplay.item_pickup_claim.is_some(),
+        vehicle_attached: false,
+        result: Some(result),
+    })
+}
+
+fn capture_owner_goal_simulation_result(
+    output: &mut OwnerGoalTickOutput,
+    previous: EntityTrackingMotion,
+    candidate: Option<GoalSimulationCandidate>,
+) {
+    output.captured_count = output.captured_count.saturating_add(1);
+    let Some(candidate) = candidate else {
+        output.invalid_count = output.invalid_count.saturating_add(1);
+        return;
+    };
+    let Some(result) = candidate.result else {
+        output.invalid_count = output.invalid_count.saturating_add(1);
+        return;
+    };
+    if candidate.id != previous.id
+        || candidate.lifecycle != EntityLifecycle::Alive
+        || candidate.pickup_claimed
+        || candidate.vehicle_attached
+        || result.physics.id != candidate.id
+    {
+        output.invalid_count = output.invalid_count.saturating_add(1);
+        return;
+    }
+    let entity = candidate.id;
+    let position = result.physics.position;
+    if result.hostile {
+        output.active_hostile_ids.push((entity, position));
+    }
+    if result.villager_population_active {
+        output
+            .villager_population_candidates
+            .push((entity, position));
+    }
+    if result.villager {
+        output.villager_ids.push((entity, position));
+    }
+    if result.villager_population_active || result.item {
+        output.villager_proximity_seeds.push((entity, position));
+    }
+    if previous.position != result.physics.position
+        || previous.rotation != result.rotation
+        || previous.velocity != result.physics.velocity
+        || previous.on_ground != result.physics.on_ground
+    {
+        output.goal_committed_motion.push(previous);
+    }
 }
 
 fn indexed_entities_for_ids(world: &World, ids: &HashSet<EntityId>) -> Vec<EcsEntity> {
@@ -2475,6 +3997,17 @@ fn capture_snapshot_request(world: &mut World) {
 
 fn apply_physics_results(world: &mut World) {
     let results = std::mem::take(&mut world.resource_mut::<PendingPhysicsResults>().0);
+    if results.len() >= 257 {
+        let mut result_indices = HashMap::with_capacity(results.len());
+        if results
+            .iter()
+            .enumerate()
+            .all(|(index, result)| result_indices.insert(result.id, index).is_none())
+        {
+            apply_unique_physics_results(world, &results, &result_indices);
+            return;
+        }
+    }
     for result in results {
         let Some(entity) = ecs_entity_for(world, result.id) else {
             continue;
@@ -2508,6 +4041,29 @@ fn apply_physics_results(world: &mut World) {
     }
 }
 
+fn apply_unique_physics_results(
+    world: &mut World,
+    results: &[EntityPhysicsResult],
+    result_indices: &HashMap<EntityId, usize>,
+) {
+    let mut query = world.query::<(&StableIdentity, &mut TransformState, &mut MotionState)>();
+    for (identity, mut transform, mut motion) in query.iter_mut(world) {
+        let Some(index) = result_indices.get(&identity.id) else {
+            continue;
+        };
+        let result = &results[*index];
+        let old_y = transform.position.y;
+        transform.position = result.position;
+        transform.rotation = result.rotation;
+        motion.fall_distance = if result.on_ground {
+            0.0
+        } else {
+            motion.fall_distance + (old_y - result.position.y).max(0.0)
+        };
+        motion.velocity = result.velocity;
+        motion.on_ground = result.on_ground;
+    }
+}
 fn apply_combat_commands(world: &mut World) {
     let commands = std::mem::take(&mut world.resource_mut::<PendingCombatCommands>().0);
     for command in commands {
@@ -2727,6 +4283,60 @@ mod tests {
         assert!(runtime.has_visibility_state(EntityId(7)));
         assert_eq!(runtime.remove(EntityId(6)), Some(expected[5].clone()));
         assert_eq!(runtime.snapshot(EntityId(6)), None);
+    }
+
+    #[test]
+    fn full_population_visitors_follow_entity_id_order() {
+        let mut runtime = EntityRuntime::new();
+        for id in [3, 2, 1] {
+            assert!(runtime.insert_snapshot(snapshot(id, id, "minecraft:cow")));
+        }
+
+        let mut goal_ids = Vec::new();
+        runtime.visit_goal_tick_candidates(|motion, _, _, _, _| goal_ids.push(motion.id));
+        let mut physics_ids = Vec::new();
+        runtime.visit_simulation_fence_results(|state, _| physics_ids.push(state.motion.id));
+
+        let expected = vec![EntityId(1), EntityId(2), EntityId(3)];
+        assert_eq!(goal_ids, expected);
+        assert_eq!(physics_ids, expected);
+    }
+
+    #[test]
+    fn profession_projection_does_not_invent_missing_explicit_job_site() {
+        let mut explicit_brain = snapshot(10, 10, "minecraft:villager");
+        explicit_brain.retained.villager = Some(crate::VillagerData::new(
+            crate::VillagerKind::Plains,
+            crate::VillagerProfession::Toolsmith,
+            1,
+        ));
+        explicit_brain.retained.villager_brain =
+            Some(crate::villager_26_1_2::VillagerBrainState::adult(
+                crate::villager_26_1_2::VillagerPoiSet::default(),
+            ));
+        let mut implicit_brain = explicit_brain.clone();
+        implicit_brain.id = EntityId(11);
+        implicit_brain.uuid = Uuid::from_u128(11);
+        implicit_brain.retained.villager_brain = None;
+
+        let mut runtime = EntityRuntime::new();
+        assert!(runtime.insert_snapshot(explicit_brain));
+        assert!(runtime.insert_snapshot(implicit_brain.clone()));
+
+        assert_eq!(
+            runtime
+                .simulation_projection(EntityId(10))
+                .expect("explicit-brain villager projection")
+                .villager_job_site,
+            None
+        );
+        assert_eq!(
+            runtime
+                .simulation_projection(EntityId(11))
+                .expect("implicit-brain villager projection")
+                .villager_job_site,
+            Some(implicit_brain.position)
+        );
     }
 
     #[test]

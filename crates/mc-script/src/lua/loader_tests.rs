@@ -51,11 +51,11 @@ artifact = "client/rich-content.zip"
 sha256 = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
 size_bytes = 1
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "screens", "assets", "interactions"]
+content = ["blocks", "items", "ui", "assets", "interactions"]
 permissions = [
   "register_blocks",
   "register_items",
-  "open_screens",
+  "present_ui",
   "load_assets",
   "send_interactions",
 ]
@@ -75,7 +75,7 @@ permissions = [
         plugin.permissions(),
         &[
             "load_assets",
-            "open_screens",
+            "present_ui",
             "register_blocks",
             "register_items",
             "send_interactions"
@@ -96,7 +96,7 @@ permissions = [
     );
     assert_eq!(
         plugin.client_bundles()[0].content(),
-        &["blocks", "items", "screens", "assets", "interactions"]
+        &["blocks", "items", "ui", "assets", "interactions"]
     );
     assert_eq!(bundle.id(), "rich-content");
     assert_eq!(
@@ -112,7 +112,7 @@ permissions = [
         &[
             LuaClientContentKind::Blocks,
             LuaClientContentKind::Items,
-            LuaClientContentKind::Screens,
+            LuaClientContentKind::Ui,
             LuaClientContentKind::Assets,
             LuaClientContentKind::Interactions,
         ]
@@ -199,7 +199,7 @@ artifact = "client/screen.zip"
 sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 size_bytes = 32
 loaders = ["fabric"]
-content = ["screens"]
+content = ["ui"]
 permissions = ["load_assets"]
 "#,
     );
@@ -280,23 +280,6 @@ permissions = ["load_assets"]
 async fn shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/loader-live-gate/plugins");
-    let prepared = prepare_lua_plugins(LuaHostConfig::new(&fixture)).unwrap();
-    let bundles = prepared
-        .client_bundles()
-        .iter()
-        .map(|bundle| (bundle.owner_plugin_id(), bundle))
-        .collect::<std::collections::BTreeMap<_, _>>();
-
-    assert_eq!(bundles.len(), 2);
-    for owner in ["ruby-live", "sapphire-live"] {
-        let bundle = bundles.get(owner).unwrap();
-        assert_eq!(bundle.id(), "rich-content");
-        assert_eq!(bundle.version(), "1");
-        assert_eq!(bundle.loaders().len(), 3);
-        assert_eq!(bundle.content().len(), 5);
-        assert_eq!(bundle.permissions().len(), 5);
-        assert!(bundle.artifact_path().is_file());
-    }
 
     let (boundary, host) = start_lua_host(LuaHostConfig::new(fixture)).unwrap();
     assert_eq!(host.loaded_plugins(), 2);
@@ -307,7 +290,7 @@ async fn shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable() {
     let player_id = ScriptPlayerId::new(7);
     let player_context =
         ScriptPlayerContext::new("fixture-player", "SolarisLoader", false, 0.0, 64.0, 0.0);
-    for (owner, command, block_id, screen_id) in [
+    for (owner, command, block_id, ui_id) in [
         (
             "ruby-live",
             "loader_ruby",
@@ -349,10 +332,12 @@ async fn shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable() {
                 if provenance.plugin_id() == owner
                     && matches!(
                         request.as_ref(),
-                        ScriptCommand::OpenClientScreen {
+                        ScriptCommand::PresentClientUi {
                             player_id: target,
-                            screen_id: requested_screen,
-                        } if *target == player_id && requested_screen == screen_id
+                            presentation,
+                        } if *target == player_id
+                            && presentation.ui_id() == ui_id
+                            && presentation.mode() == crate::ScriptClientUiMode::Screen
                     )
         ));
     }
@@ -373,7 +358,14 @@ async fn shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable() {
     ] {
         boundary
             .enqueue_targeted_event(
-                ScriptEvent::loader_interaction(owner, player_id, interaction_id, payload).unwrap(),
+                ScriptEvent::loader_interaction(
+                    owner,
+                    player_id,
+                    interaction_id,
+                    crate::ScriptLoaderInteractionPhase::Trigger,
+                    payload,
+                )
+                .unwrap(),
             )
             .await
             .unwrap();

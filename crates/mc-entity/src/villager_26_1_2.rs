@@ -95,6 +95,18 @@ impl VillagerPoiSet {
     }
 }
 
+#[must_use]
+pub fn default_villager_pois(
+    position: Vec3,
+    profession: crate::VillagerProfession,
+) -> VillagerPoiSet {
+    VillagerPoiSet {
+        home: Some(position),
+        job_site: (profession != crate::VillagerProfession::None).then_some(position),
+        meeting_point: Some(position),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VillagerPoiKind {
     Home,

@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -6,29 +7,257 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, channel, sync_channel}
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use super::tick::RegionalPhysicsWorld;
 use super::{
-    CompactEntityKinematicsFence, RegionKey, RegionLease, RegionPhase, add_goal_tick_stats,
+    CompactEntityKinematicsFence, CompactEntityPhysicsFence, RegionKey, RegionLease, RegionPhase,
+    RegionalEntityTickInput, RegionalGoalTickInputs, RegionalTickWorld, add_goal_tick_stats,
     goal_reference, order_vehicle_group_for_removal, snapshot_vehicle_reference,
 };
 
 use crate::lock_policy::lock_authoritative_mutex;
 use crate::{
     AnimalBreedingState, EntityDamageRequest, EntityEffectRequest, EntityEffectResult,
-    EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics, EntitySimulationProjection,
-    EntitySnapshot, EntityStore, GoalState, GoalTickStats, PreparedGoalTick, ResolvedGoalTick,
-    Vec3,
+    EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics, EntityMotionState,
+    EntityPhysicsQuery, EntityPhysicsStep, EntitySimulationProjection, EntitySimulationResult,
+    EntitySnapshot, EntityStore, EntityTrackingMotion, EntityVillagerGoalUpdate, GoalState,
+    GoalTickStats, PreparedGoalTick, ResolvedGoalTick, Vec3,
 };
+
+mod entity_projections;
+mod physics;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FencedKinematicsCandidate {
-    pub expected: CompactEntityKinematicsFence,
+    pub lease: RegionLease,
+    pub id: EntityId,
+    pub uuid: uuid::Uuid,
+    pub lifecycle: crate::EntityLifecycle,
+    pub pickup_claimed: bool,
+    pub vehicle_attached: bool,
+    pub result: Option<EntitySimulationResult>,
+}
+
+impl FencedKinematicsCandidate {
+    pub(super) fn eligible(self) -> bool {
+        self.lifecycle == crate::EntityLifecycle::Alive
+            && !self.pickup_claimed
+            && !self.vehicle_attached
+            && self
+                .result
+                .is_some_and(|result| result.physics.id == self.id)
+    }
+
+    pub(super) fn expected(self) -> Option<CompactEntityKinematicsFence> {
+        let result = self.result?;
+        Some(CompactEntityKinematicsFence {
+            id: self.id,
+            uuid: self.uuid,
+            lifecycle: self.lifecycle,
+            expected: EntityKinematics {
+                id: self.id,
+                position: result.physics.position,
+                rotation: result.rotation,
+                velocity: result.physics.velocity,
+                on_ground: result.physics.on_ground,
+            },
+            pickup_claimed: self.pickup_claimed,
+            vehicle_attached: self.vehicle_attached,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct FencedKinematicsRead {
     pub lane: usize,
     pub candidates: Vec<FencedKinematicsCandidate>,
+    pub motion_states: Vec<EntityMotionState>,
     pub state_version: u64,
+}
+
+fn fenced_kinematics_candidates(
+    store: &EntityStore,
+    lease: RegionLease,
+    entities: &[EntityId],
+    include_motion_states: bool,
+) -> (Vec<FencedKinematicsCandidate>, Vec<EntityMotionState>) {
+    let mut candidates = Vec::with_capacity(entities.len());
+    let mut motion_states = Vec::with_capacity(if include_motion_states {
+        entities.len()
+    } else {
+        0
+    });
+    store.visit_simulation_fence_results_for_ordered_ids(entities, |state, result| {
+        if state.lifecycle != crate::EntityLifecycle::Alive {
+            return;
+        }
+        let motion = state.motion;
+        candidates.push(FencedKinematicsCandidate {
+            lease,
+            id: motion.id,
+            uuid: state.uuid,
+            lifecycle: state.lifecycle,
+            pickup_claimed: state.pickup_claimed,
+            vehicle_attached: state.vehicle_attached,
+            result,
+        });
+        if include_motion_states {
+            motion_states.push(motion);
+        }
+    });
+    (candidates, motion_states)
+}
+
+fn fenced_kinematics_candidates_from_capture(
+    lease: RegionLease,
+    ids: &[EntityId],
+    captured: Vec<crate::runtime::GoalSimulationCandidate>,
+) -> Option<Vec<FencedKinematicsCandidate>> {
+    if ids.len() != captured.len()
+        || ids
+            .iter()
+            .zip(&captured)
+            .any(|(&id, candidate)| id != candidate.id)
+    {
+        return None;
+    }
+    Some(
+        captured
+            .into_iter()
+            .map(|candidate| FencedKinematicsCandidate {
+                lease,
+                id: candidate.id,
+                uuid: candidate.uuid,
+                lifecycle: candidate.lifecycle,
+                pickup_claimed: candidate.pickup_claimed,
+                vehicle_attached: candidate.vehicle_attached,
+                result: candidate.result,
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn merge_fenced_kinematics_candidate_runs(
+    runs: Vec<Vec<FencedKinematicsCandidate>>,
+) -> Vec<FencedKinematicsCandidate> {
+    let total = runs.iter().map(Vec::len).sum();
+    let mut runs = runs
+        .into_iter()
+        .filter(|run| !run.is_empty())
+        .collect::<Vec<_>>();
+    runs.sort_unstable_by_key(|run| run[0].id);
+    if runs
+        .windows(2)
+        .all(|pair| pair[0].last().expect("nonempty run").id < pair[1][0].id)
+    {
+        let mut merged = Vec::with_capacity(total);
+        for run in runs {
+            merged.extend(run);
+        }
+        return merged;
+    }
+    let mut runs = runs.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+    let mut heads = runs.iter_mut().map(Iterator::next).collect::<Vec<_>>();
+    let mut ready = BinaryHeap::new();
+    for (run, candidate) in heads.iter().enumerate() {
+        if let Some(candidate) = candidate {
+            ready.push(Reverse((candidate.id, run)));
+        }
+    }
+
+    let mut merged = Vec::with_capacity(total);
+    while let Some(Reverse((_, run))) = ready.pop() {
+        merged.push(heads[run].take().expect("queued candidate run head"));
+        heads[run] = runs[run].next();
+        if let Some(candidate) = &heads[run] {
+            ready.push(Reverse((candidate.id, run)));
+        }
+    }
+    merged
+}
+
+#[derive(Debug)]
+pub(super) struct LocalKinematicsRegionBatch {
+    pub lease: RegionLease,
+    pub previous: Vec<CompactEntityKinematicsFence>,
+    pub states: Vec<EntityKinematics>,
+}
+
+#[derive(Debug)]
+pub(super) struct LocalKinematicsCommit {
+    pub states: Vec<EntityKinematics>,
+    pub state_version: u64,
+}
+
+pub(super) struct LocalPhysicsRegionBatch {
+    pub lease: RegionLease,
+    pub inputs: Vec<LocalPhysicsInput>,
+    pub world_fence: Option<RegionalPhysicsWorld>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LocalPhysicsInput {
+    pub previous: CompactEntityPhysicsFence,
+    pub expected: EntityPhysicsQuery,
+    pub step: EntityPhysicsStep,
+    pub publish: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct LocalPhysicsCommit {
+    pub rejected: Vec<EntityId>,
+    pub accepted: Vec<(RegionLease, EntityMotionState)>,
+    pub states: Vec<EntityKinematics>,
+    pub state_version: u64,
+}
+type LocalPhysicsApply = (
+    Vec<EntityId>,
+    Vec<(RegionLease, EntityMotionState)>,
+    Vec<EntityKinematics>,
+);
+
+pub(super) struct OwnerLanePhysicsTickInput {
+    pub regions: Vec<RegionLease>,
+    pub goal_motion: Vec<(RegionLease, EntityTrackingMotion)>,
+    pub simulation_chunks: Arc<HashSet<(i32, i32)>>,
+    pub world: Arc<RegionalTickWorld>,
+}
+
+pub(super) struct OwnerLaneTickOutput {
+    pub goal_stats: GoalTickStats,
+    pub active_entity_count: usize,
+    pub active_hostile_ids: Vec<(EntityId, Vec3)>,
+    pub villager_population_candidates: Vec<(EntityId, Vec3)>,
+    pub villager_ids: Vec<(EntityId, Vec3)>,
+    pub villager_proximity_seeds: Vec<(EntityId, Vec3)>,
+    pub fallback_entity_ids: HashSet<EntityId>,
+    pub goal_committed_motion: Vec<(RegionLease, EntityTrackingMotion)>,
+    pub physics_regions: Vec<RegionLease>,
+    pub resolved_direct_paths: HashSet<EntityId>,
+    pub villager_profession_updates: Vec<EntitySnapshot>,
+    pub mutated: bool,
+}
+
+pub(super) struct OwnerLanePhysicsOutput {
+    pub fallback_candidates: Vec<FencedKinematicsCandidate>,
+    pub committed_motion: Vec<(RegionLease, EntityTrackingMotion)>,
+    pub terrain_pathing_additions: HashSet<EntityId>,
+    pub physics_mutated: bool,
+    pub state_version: u64,
+    /// Worker-thread execution of this physics message (dispatch receipt to
+    /// output assembly). The coordinator compares it against its nested
+    /// completion wait to isolate worker message-queue delay.
+    pub worker_exec_us: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedRegionGoalTick {
+    pub goal_tick: PreparedGoalTick,
+    pub checkpoints: Vec<EntityGoalCheckpoint>,
+    pub goal_overrides: Vec<(EntityId, GoalState)>,
+    pub pathing_aabbs: Vec<(EntityId, mc_physics::Aabb)>,
+    pub snapshot_overrides: Vec<(EntitySnapshot, EntitySnapshot)>,
+    pub villager_updates: Vec<EntityVillagerGoalUpdate>,
+    pub cross_region_villager_candidates: Vec<EntityId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,9 +315,13 @@ pub enum RegionOwnerMutation {
     },
     ApplyGoalBatch {
         expected: Vec<EntityGoalCheckpoint>,
+        candidate_ids: Vec<EntityId>,
         expected_state_version: u64,
         resolved: Box<ResolvedGoalTick>,
         follow_targets: HashMap<EntityId, Vec3>,
+        goal_overrides: Vec<(EntityId, GoalState)>,
+        snapshot_overrides: Vec<(EntitySnapshot, EntitySnapshot)>,
+        villager_updates: Vec<EntityVillagerGoalUpdate>,
     },
     InsertSnapshot(Box<EntitySnapshot>),
     InsertSnapshots(Vec<EntitySnapshot>),
@@ -111,9 +344,10 @@ pub struct RegionOwnerBatch {
     pub mutations: Vec<SequencedRegionMutation>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct RegionOwnerCompletion {
     pub phase: RegionPhase,
+    pub(super) goal_candidate_runs: Vec<Vec<FencedKinematicsCandidate>>,
     pub applied_sequences: Vec<u64>,
     pub goal_stats: GoalTickStats,
     pub effect_results: Vec<(u64, EntityEffectResult)>,
@@ -242,6 +476,7 @@ enum RegionOwnerLaneMessage {
     },
     SnapshotsForIds {
         entities: Vec<(RegionLease, EntityId)>,
+        selection: super::SnapshotSelection,
         reply: std::sync::mpsc::Sender<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>,
     },
     ExistingSnapshotsForIds {
@@ -253,6 +488,12 @@ enum RegionOwnerLaneMessage {
         reply:
             std::sync::mpsc::Sender<Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError>>,
     },
+    DespawnProjectionsForIds {
+        entities: Vec<(RegionLease, EntityId)>,
+        reply: std::sync::mpsc::Sender<
+            Result<Vec<crate::EntityDespawnProjection>, RegionOwnerLaneError>,
+        >,
+    },
     GoalCheckpointsForIds {
         entities: Vec<(RegionLease, EntityId)>,
         reply: std::sync::mpsc::Sender<Result<Vec<EntityGoalCheckpoint>, RegionOwnerLaneError>>,
@@ -260,6 +501,23 @@ enum RegionOwnerLaneMessage {
     AliveKinematicsForIds {
         entities: Vec<(RegionLease, EntityId)>,
         reply: std::sync::mpsc::Sender<Result<FencedKinematicsRead, RegionOwnerLaneError>>,
+    },
+    ApplyLocalKinematicsIfVersion {
+        batches: Vec<LocalKinematicsRegionBatch>,
+        reply: std::sync::mpsc::Sender<Result<Option<LocalKinematicsCommit>, RegionOwnerLaneError>>,
+    },
+    ApplyLocalPhysicsIfCurrent {
+        expected_state_version: u64,
+        batches: Vec<LocalPhysicsRegionBatch>,
+        reply: std::sync::mpsc::Sender<Result<LocalPhysicsCommit, RegionOwnerLaneError>>,
+    },
+    TickOwnedRegions {
+        input: RegionalEntityTickInput,
+        reply: std::sync::mpsc::Sender<Result<OwnerLaneTickOutput, RegionOwnerLaneError>>,
+    },
+    TickOwnedRegionPhysics {
+        input: OwnerLanePhysicsTickInput,
+        reply: std::sync::mpsc::Sender<Result<OwnerLanePhysicsOutput, RegionOwnerLaneError>>,
     },
     NearestVillager {
         leases: Vec<RegionLease>,
@@ -277,7 +535,8 @@ enum RegionOwnerLaneMessage {
         lease: RegionLease,
         tick: u64,
         active_ids: HashSet<EntityId>,
-        reply: std::sync::mpsc::Sender<Result<PreparedGoalTick, RegionOwnerLaneError>>,
+        inputs: RegionalGoalTickInputs,
+        reply: std::sync::mpsc::Sender<Result<PreparedRegionGoalTick, RegionOwnerLaneError>>,
     },
     #[cfg(test)]
     HoldForTest {
@@ -380,7 +639,7 @@ pub struct RegionalOwnerLane {
     goal_checkpoint_batch_requests: std::sync::Arc<AtomicU64>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(super) struct RegionalOwnerLaneReader {
     sender: SyncSender<RegionOwnerLaneMessage>,
     health: Arc<RegionOwnerLaneHealth>,
@@ -389,7 +648,7 @@ pub(super) struct RegionalOwnerLaneReader {
 }
 
 impl RegionalOwnerLaneReader {
-    fn unavailable_error(&self) -> RegionOwnerLaneError {
+    pub(super) fn unavailable_error(&self) -> RegionOwnerLaneError {
         self.health.error_after_disconnect()
     }
 
@@ -410,6 +669,46 @@ impl RegionalOwnerLaneReader {
         self.sender
             .send(RegionOwnerLaneMessage::HoldForTest { entered, release })
             .map_err(|_| self.unavailable_error())
+    }
+    pub(super) fn apply_local_physics_if_current(
+        &self,
+        expected_state_version: u64,
+        batches: Vec<LocalPhysicsRegionBatch>,
+    ) -> Result<Receiver<Result<LocalPhysicsCommit, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    {
+        let (reply, committed) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::ApplyLocalPhysicsIfCurrent {
+                expected_state_version,
+                batches,
+                reply,
+            })
+            .map_err(|_| self.unavailable_error())?;
+        Ok(committed)
+    }
+
+    pub(super) fn tick_owned_regions(
+        &self,
+        input: RegionalEntityTickInput,
+    ) -> Result<Receiver<Result<OwnerLaneTickOutput, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    {
+        let (reply, completed) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::TickOwnedRegions { input, reply })
+            .map_err(|_| self.unavailable_error())?;
+        Ok(completed)
+    }
+
+    pub(super) fn tick_owned_region_physics(
+        &self,
+        input: OwnerLanePhysicsTickInput,
+    ) -> Result<Receiver<Result<OwnerLanePhysicsOutput, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    {
+        let (reply, completed) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::TickOwnedRegionPhysics { input, reply })
+            .map_err(|_| self.unavailable_error())?;
+        Ok(completed)
     }
 
     pub(super) fn prepare_and_commit(
@@ -434,20 +733,6 @@ impl RegionalOwnerLaneReader {
             .send(RegionOwnerLaneMessage::ExistingSnapshotsForIds { entities, reply })
             .map_err(|_| self.unavailable_error())?;
         Ok(snapshots)
-    }
-
-    pub(super) fn request_simulation_projections_for_ids(
-        &self,
-        entities: Vec<(RegionLease, EntityId)>,
-    ) -> Result<
-        Receiver<Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError>>,
-        RegionOwnerLaneError,
-    > {
-        let (reply, projections) = channel();
-        self.sender
-            .send(RegionOwnerLaneMessage::SimulationProjectionsForIds { entities, reply })
-            .map_err(|_| self.unavailable_error())?;
-        Ok(projections)
     }
 
     pub(super) fn request_goal_checkpoints_for_ids(
@@ -540,8 +825,11 @@ impl RegionalOwnerLaneReader {
         let (reply, snapshots) = channel();
         match self
             .sender
-            .try_send(RegionOwnerLaneMessage::SnapshotsForIds { entities, reply })
-        {
+            .try_send(RegionOwnerLaneMessage::SnapshotsForIds {
+                entities,
+                selection: super::SnapshotSelection::All,
+                reply,
+            }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Err(RegionOwnerLaneError::Busy),
             Err(TrySendError::Disconnected(_)) => return Err(self.unavailable_error()),
@@ -690,6 +978,20 @@ impl RegionalOwnerLane {
         let (reply, committed) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::PrepareAndCommit { batch, reply })
+            .map_err(|_| self.unavailable_error())?;
+        Ok(committed)
+    }
+
+    pub(super) fn apply_local_kinematics_if_version(
+        &self,
+        batches: Vec<LocalKinematicsRegionBatch>,
+    ) -> Result<
+        Receiver<Result<Option<LocalKinematicsCommit>, RegionOwnerLaneError>>,
+        RegionOwnerLaneError,
+    > {
+        let (reply, committed) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::ApplyLocalKinematicsIfVersion { batches, reply })
             .map_err(|_| self.unavailable_error())?;
         Ok(committed)
     }
@@ -859,13 +1161,18 @@ impl RegionalOwnerLane {
     pub(super) fn request_snapshots_for_ids(
         &self,
         entities: Vec<(RegionLease, EntityId)>,
+        selection: super::SnapshotSelection,
     ) -> Result<Receiver<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>, RegionOwnerLaneError>
     {
         #[cfg(test)]
         self.snapshot_batch_requests.fetch_add(1, Ordering::Relaxed);
         let (reply, snapshots) = channel();
         self.sender
-            .send(RegionOwnerLaneMessage::SnapshotsForIds { entities, reply })
+            .send(RegionOwnerLaneMessage::SnapshotsForIds {
+                entities,
+                selection,
+                reply,
+            })
             .map_err(|_| self.unavailable_error())?;
         Ok(snapshots)
     }
@@ -952,7 +1259,8 @@ impl RegionalOwnerLane {
         lease: RegionLease,
         tick: u64,
         active_ids: HashSet<EntityId>,
-    ) -> Result<Receiver<Result<PreparedGoalTick, RegionOwnerLaneError>>, RegionOwnerLaneError>
+        inputs: RegionalGoalTickInputs,
+    ) -> Result<Receiver<Result<PreparedRegionGoalTick, RegionOwnerLaneError>>, RegionOwnerLaneError>
     {
         let (reply, prepared) = channel();
         self.sender
@@ -960,6 +1268,7 @@ impl RegionalOwnerLane {
                 lease,
                 tick,
                 active_ids,
+                inputs,
                 reply,
             })
             .map_err(|_| self.unavailable_error())?;
@@ -971,10 +1280,18 @@ impl RegionalOwnerLane {
         lease: RegionLease,
         tick: u64,
         active_ids: HashSet<EntityId>,
-    ) -> Result<Receiver<Result<PreparedGoalTick, RegionOwnerLaneError>>, RegionOwnerLaneError>
-    {
+        inputs: RegionalGoalTickInputs,
+    ) -> Result<
+        (
+            u64,
+            Receiver<Result<PreparedRegionGoalTick, RegionOwnerLaneError>>,
+        ),
+        RegionOwnerLaneError,
+    > {
         let _admission = lock_authoritative_mutex(&self.admission, "regional.owner_lane_admission");
-        self.request_goal_tick(lease, tick, active_ids)
+        let state_version = self.state_version.load(Ordering::Acquire);
+        let completion = self.request_goal_tick(lease, tick, active_ids, inputs)?;
+        Ok((state_version, completion))
     }
 
     pub fn shutdown(mut self) -> Result<BTreeMap<RegionKey, EntityStore>, RegionOwnerLaneError> {
@@ -1223,7 +1540,11 @@ fn run_region_owner_lane(
                 snapshots.sort_unstable_by_key(|snapshot| snapshot.id);
                 let _ = reply.send(snapshots);
             }
-            RegionOwnerLaneMessage::SnapshotsForIds { entities, reply } => {
+            RegionOwnerLaneMessage::SnapshotsForIds {
+                entities,
+                selection,
+                reply,
+            } => {
                 let mut snapshots = Vec::with_capacity(entities.len());
                 let mut error = (pending.is_some() || committed.is_some())
                     .then_some(RegionOwnerLaneError::Busy);
@@ -1240,6 +1561,17 @@ fn run_region_owner_lane(
                         if *current != lease {
                             error = Some(RegionOwnerLaneError::StaleLease);
                             break;
+                        }
+                        if let super::SnapshotSelection::SheepGrazing { include_idle } = &selection
+                            && !include_idle.contains(&entity)
+                        {
+                            let Some(active) = store.sheep_grazing_activity(entity) else {
+                                error = Some(RegionOwnerLaneError::UnknownEntity);
+                                break;
+                            };
+                            if !active {
+                                continue;
+                            }
                         }
                         let Some(snapshot) = store.snapshot(entity) else {
                             error = Some(RegionOwnerLaneError::UnknownEntity);
@@ -1281,38 +1613,10 @@ fn run_region_owner_lane(
                 });
             }
             RegionOwnerLaneMessage::SimulationProjectionsForIds { entities, reply } => {
-                let mut projections = Vec::with_capacity(entities.len());
-                let mut error = None;
-                let mut ids_by_region = BTreeMap::<RegionKey, HashSet<EntityId>>::new();
-                for (lease, entity) in entities {
-                    if lease.lane != lane {
-                        error = Some(RegionOwnerLaneError::WrongLane);
-                        break;
-                    }
-                    let Some((current, _)) = regions.get(&lease.key) else {
-                        error = Some(RegionOwnerLaneError::UnknownRegion);
-                        break;
-                    };
-                    if *current != lease {
-                        error = Some(RegionOwnerLaneError::StaleLease);
-                        break;
-                    }
-                    ids_by_region.entry(lease.key).or_default().insert(entity);
-                }
-                if error.is_none() {
-                    for (key, ids) in ids_by_region {
-                        let Some((_, store)) = regions.get(&key) else {
-                            error = Some(RegionOwnerLaneError::UnknownRegion);
-                            break;
-                        };
-                        projections.extend(store.simulation_projections_for_ids(&ids));
-                    }
-                }
-                projections.sort_unstable_by_key(|projection| projection.id);
-                let _ = reply.send(match error {
-                    Some(error) => Err(error),
-                    None => Ok(projections),
-                });
+                let _ = reply.send(entity_projections::read(lane, &regions, entities));
+            }
+            RegionOwnerLaneMessage::DespawnProjectionsForIds { entities, reply } => {
+                let _ = reply.send(entity_projections::read(lane, &regions, entities));
             }
             RegionOwnerLaneMessage::GoalCheckpointsForIds { entities, reply } => {
                 let mut checkpoints = Vec::with_capacity(entities.len());
@@ -1369,42 +1673,101 @@ fn run_region_owner_lane(
                         ids_by_region.entry(lease.key).or_default().insert(entity);
                     }
                 }
-                let mut states = Vec::new();
+                let mut candidates = Vec::new();
+                let mut motion_states = Vec::new();
                 if error.is_none() {
                     for (key, ids) in ids_by_region {
-                        let store = &mut regions
-                            .get_mut(&key)
-                            .expect("validated regional kinematics route")
-                            .1;
-                        states.extend(store.alive_kinematics_for_ids(&ids).into_iter().filter_map(
-                            |state| {
-                                let view = store.view(state.id)?;
-                                Some(FencedKinematicsCandidate {
-                                    expected: CompactEntityKinematicsFence {
-                                        id: state.id,
-                                        uuid: view.uuid,
-                                        lifecycle: view.lifecycle,
-                                        expected: state,
-                                        pickup_claimed: view.retained.item_pickup_claim.is_some(),
-                                        // Reverse passenger membership is checked from the coordinator's
-                                        // O(1) topology index before the token is issued and again from a
-                                        // per-region passenger set during atomic lane preparation.
-                                        vehicle_attached: view.vehicle.is_some(),
-                                    },
-                                })
-                            },
-                        ));
+                        let mut ids = ids.into_iter().collect::<Vec<_>>();
+                        ids.sort_unstable();
+                        let (lease, store) = regions
+                            .get(&key)
+                            .expect("validated regional kinematics route");
+                        let (mut region_candidates, mut region_motion_states) =
+                            fenced_kinematics_candidates(store, *lease, &ids, true);
+                        candidates.append(&mut region_candidates);
+                        motion_states.append(&mut region_motion_states);
                     }
-                    states.sort_unstable_by_key(|candidate| candidate.expected.id);
+                    candidates.sort_unstable_by_key(|candidate| candidate.id);
+                    motion_states.sort_unstable_by_key(|motion| motion.id);
                 }
                 let _ = reply.send(match error {
                     Some(error) => Err(error),
                     None => Ok(FencedKinematicsRead {
                         lane,
-                        candidates: states,
+                        candidates,
+                        motion_states,
                         state_version: state_version.load(Ordering::Acquire),
                     }),
                 });
+            }
+            RegionOwnerLaneMessage::ApplyLocalKinematicsIfVersion { batches, reply } => {
+                let result = if pending.is_some() || committed.is_some() {
+                    Err(RegionOwnerLaneError::Busy)
+                } else {
+                    apply_local_kinematics_if_version(lane, &mut regions, batches).map(|states| {
+                        states.map(|states| LocalKinematicsCommit {
+                            states,
+                            state_version: state_version.fetch_add(1, Ordering::AcqRel) + 1,
+                        })
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            RegionOwnerLaneMessage::ApplyLocalPhysicsIfCurrent {
+                expected_state_version,
+                batches,
+                reply,
+            } => {
+                let result = if pending.is_some() || committed.is_some() {
+                    Err(RegionOwnerLaneError::Busy)
+                } else {
+                    let version_current =
+                        state_version.load(Ordering::Acquire) == expected_state_version;
+                    apply_local_physics_if_current(lane, &mut regions, batches, version_current)
+                        .map(|(rejected, accepted, states)| {
+                            let state_version = if states.is_empty() {
+                                state_version.load(Ordering::Acquire)
+                            } else {
+                                state_version.fetch_add(1, Ordering::AcqRel) + 1
+                            };
+                            LocalPhysicsCommit {
+                                rejected,
+                                accepted,
+                                states,
+                                state_version,
+                            }
+                        })
+                };
+                let _ = reply.send(result);
+            }
+            RegionOwnerLaneMessage::TickOwnedRegions { input, reply } => {
+                let result = if pending.is_some() || committed.is_some() {
+                    Err(RegionOwnerLaneError::Busy)
+                } else {
+                    tick_owned_regions(lane, &mut regions, input).inspect(|output| {
+                        if output.mutated {
+                            state_version.fetch_add(1, Ordering::AcqRel);
+                        }
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            RegionOwnerLaneMessage::TickOwnedRegionPhysics { input, reply } => {
+                let result = if pending.is_some() || committed.is_some() {
+                    Err(RegionOwnerLaneError::Busy)
+                } else {
+                    physics::tick_owned_region_physics(lane, &mut regions, input).map(
+                        |mut output| {
+                            output.state_version = if output.physics_mutated {
+                                state_version.fetch_add(1, Ordering::AcqRel) + 1
+                            } else {
+                                state_version.load(Ordering::Acquire)
+                            };
+                            output
+                        },
+                    )
+                };
+                let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::NearestVillager {
                 leases,
@@ -1509,6 +1872,7 @@ fn run_region_owner_lane(
                 lease,
                 tick,
                 active_ids,
+                inputs,
                 reply,
             } => {
                 let result = if pending.is_some() || committed.is_some() {
@@ -1519,7 +1883,23 @@ fn run_region_owner_lane(
                     if *current != lease {
                         Err(RegionOwnerLaneError::StaleLease)
                     } else {
-                        Ok(store.prepare_goal_tick_with_pathing_for_ids(tick, &active_ids))
+                        let selection =
+                            store.goal_tick_selection(lease.key, tick, &active_ids, &inputs);
+                        let checkpoints = selection.checkpoints;
+                        let goal_tick = selection.goal_tick;
+                        let mut goal_overrides =
+                            selection.goal_overrides.into_iter().collect::<Vec<_>>();
+                        goal_overrides.sort_unstable_by_key(|(entity, _)| *entity);
+                        Ok(PreparedRegionGoalTick {
+                            checkpoints,
+                            goal_tick,
+                            goal_overrides,
+                            pathing_aabbs: selection.pathing_aabbs,
+                            snapshot_overrides: selection.snapshot_overrides,
+                            villager_updates: selection.villager_updates,
+                            cross_region_villager_candidates: selection
+                                .cross_region_villager_candidates,
+                        })
                     }
                 } else {
                     Err(RegionOwnerLaneError::UnknownRegion)
@@ -1560,6 +1940,521 @@ fn effect_expected_snapshot_matches(current: &EntitySnapshot, expected: &EntityS
     } else {
         current == expected
     }
+}
+
+fn apply_local_kinematics_if_version(
+    lane: usize,
+    regions: &mut BTreeMap<RegionKey, (RegionLease, EntityStore)>,
+    batches: Vec<LocalKinematicsRegionBatch>,
+) -> Result<Option<Vec<EntityKinematics>>, RegionOwnerLaneError> {
+    if batches.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut all_ids = HashSet::new();
+    for batch in &batches {
+        if batch.lease.lane != lane {
+            return Err(RegionOwnerLaneError::WrongLane);
+        }
+        let Some((current_lease, store)) = regions.get(&batch.lease.key) else {
+            return Err(RegionOwnerLaneError::UnknownRegion);
+        };
+        if *current_lease != batch.lease {
+            return Err(RegionOwnerLaneError::StaleLease);
+        }
+        if batch.previous.is_empty() || batch.previous.len() != batch.states.len() {
+            return Ok(None);
+        }
+        let passengers = store.passenger_ids();
+        let ids = batch
+            .previous
+            .iter()
+            .map(|previous| previous.id)
+            .collect::<HashSet<_>>();
+        if ids.len() != batch.previous.len() || ids.iter().any(|id| !all_ids.insert(*id)) {
+            return Ok(None);
+        }
+        let fences = store.kinematics_fence_states(&ids);
+        if batch
+            .previous
+            .iter()
+            .zip(&batch.states)
+            .any(|(previous, state)| {
+                let Some(current) = fences.get(&previous.id) else {
+                    return true;
+                };
+                !previous.eligible()
+                    || previous.id != state.id
+                    || !state.is_finite()
+                    || RegionKey::from_position(previous.expected.position) != Some(batch.lease.key)
+                    || RegionKey::from_position(state.position) != Some(batch.lease.key)
+                    || current.uuid != previous.uuid
+                    || current.lifecycle != previous.lifecycle
+                    || current.motion.position != previous.expected.position
+                    || current.motion.rotation != previous.expected.rotation
+                    || current.motion.velocity != previous.expected.velocity
+                    || current.motion.on_ground != previous.expected.on_ground
+                    || current.pickup_claimed
+                    || current.vehicle_attached
+                    || passengers.contains(&previous.id)
+            })
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut committed = Vec::with_capacity(all_ids.len());
+    for batch in batches {
+        let expected_count = batch.states.len();
+        let store = &mut regions
+            .get_mut(&batch.lease.key)
+            .expect("validated local kinematics region")
+            .1;
+        committed.extend(batch.states.iter().copied());
+        if store.apply_kinematics_prevalidated(batch.states) != expected_count {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+    }
+    committed.sort_unstable_by_key(|state| state.id);
+    Ok(Some(committed))
+}
+
+fn tick_owned_regions(
+    lane: usize,
+    regions: &mut BTreeMap<RegionKey, (RegionLease, EntityStore)>,
+    input: RegionalEntityTickInput,
+) -> Result<OwnerLaneTickOutput, RegionOwnerLaneError> {
+    let mut goal_stats = GoalTickStats::default();
+    let mut active_entity_count = 0usize;
+    let mut active_hostile_ids = Vec::new();
+    let mut villager_population_candidates = Vec::new();
+    let mut villager_ids = Vec::new();
+    let mut villager_proximity_seeds = Vec::new();
+    let mut fallback_entity_ids = HashSet::new();
+    let mut goal_committed_motion = Vec::new();
+    let mut physics_regions = Vec::new();
+    let mut resolved_direct_paths = HashSet::new();
+    let mut villager_profession_updates = Vec::new();
+    let mut mutated = false;
+    #[cfg(feature = "load-bench")]
+    let profile_started = std::time::Instant::now();
+    #[cfg(feature = "load-bench")]
+    let elapsed_us = |started: std::time::Instant| {
+        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+    };
+    #[cfg(feature = "load-bench")]
+    let mut scan_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut selection_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut resolve_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut resolve_scan_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut resolve_pathing_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut resolve_overrides_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut resolve_map_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut apply_us = 0_u64;
+    #[cfg(feature = "load-bench")]
+    let mut post_us = 0_u64;
+
+    for (&key, (lease, store)) in regions.iter_mut() {
+        #[cfg(feature = "load-bench")]
+        let phase_started = std::time::Instant::now();
+        if lease.lane != lane {
+            return Err(RegionOwnerLaneError::WrongLane);
+        }
+        let store_capacity = store.len();
+        let mut ordered_ids = Vec::with_capacity(store_capacity);
+        let mut villager_job_sites = Vec::new();
+        let mut selected_in_region = 0usize;
+        store.visit_goal_tick_candidates(|state, lifecycle, local_living, villager, job_site| {
+            let chunk = (
+                (state.position.x.floor() as i32).div_euclid(16),
+                (state.position.z.floor() as i32).div_euclid(16),
+            );
+            if lifecycle != crate::EntityLifecycle::Alive
+                || !input.simulation_chunks.contains(&chunk)
+            {
+                return;
+            }
+            selected_in_region = selected_in_region.saturating_add(1);
+            if local_living {
+                if villager {
+                    villager_job_sites.push((state.id, job_site));
+                }
+                ordered_ids.push(state.id);
+            } else {
+                fallback_entity_ids.insert(state.id);
+            }
+        });
+        active_entity_count = active_entity_count.saturating_add(selected_in_region);
+        if ordered_ids.is_empty() {
+            continue;
+        }
+
+        let mut goals = input.goals.clone();
+        if let Some(villager) = goals.villager.as_ref() {
+            let missing_job_site_snapshot = villager_job_sites
+                .iter()
+                .filter_map(|(_, job_site)| *job_site)
+                .any(|job_site| input.world.block_state_at(job_site).is_none());
+            if missing_job_site_snapshot {
+                fallback_entity_ids.extend(ordered_ids.iter().copied());
+                continue;
+            }
+            let profession_offers = villager_job_sites
+                .into_iter()
+                .filter_map(|(id, job_site)| {
+                    let state = input.world.block_state_at(job_site?)?;
+                    input
+                        .profession_offers_by_block_state
+                        .get(&state)
+                        .cloned()
+                        .map(|offer| (id, offer))
+                })
+                .collect::<HashMap<_, _>>();
+            goals.villager = Some(Arc::new(super::RegionalVillagerGoalTickInputs {
+                day_time: villager.day_time,
+                profile: Arc::clone(&villager.profile),
+                profession_offers: Arc::new(profession_offers),
+            }));
+        }
+
+        #[cfg(feature = "load-bench")]
+        {
+            scan_us = scan_us.saturating_add(elapsed_us(phase_started));
+        }
+        #[cfg(feature = "load-bench")]
+        let phase_started = std::time::Instant::now();
+        let selection =
+            store.goal_tick_selection_for_ordered_ids(key, input.tick, &ordered_ids, &goals);
+        #[cfg(feature = "load-bench")]
+        {
+            selection_us = selection_us.saturating_add(elapsed_us(phase_started));
+        }
+        #[cfg(feature = "load-bench")]
+        let phase_started = std::time::Instant::now();
+        #[cfg(feature = "load-bench")]
+        let resolve_scan_started = std::time::Instant::now();
+        let mut follow_targets = HashMap::new();
+        let has_nonlocal_goal_reference = selection.checkpoints.iter().any(|checkpoint| {
+            let Some(target) = goal_reference(&checkpoint.goal) else {
+                return false;
+            };
+            let Some(target_view) = store.view(target) else {
+                return true;
+            };
+            follow_targets.insert(target, target_view.position);
+            false
+        });
+        if has_nonlocal_goal_reference
+            || !selection.snapshot_overrides.is_empty()
+            || !selection.cross_region_villager_candidates.is_empty()
+        {
+            fallback_entity_ids.extend(ordered_ids.iter().copied());
+            continue;
+        }
+
+        #[cfg(feature = "load-bench")]
+        {
+            resolve_scan_us = resolve_scan_us.saturating_add(elapsed_us(resolve_scan_started));
+        }
+        #[cfg(feature = "load-bench")]
+        let resolve_pathing_started = std::time::Instant::now();
+        #[cfg(feature = "load-bench")]
+        let resolve_map_started = std::time::Instant::now();
+        let pathing_aabbs = selection
+            .pathing_aabbs
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let pathing_probe = input.world.pathing_probe(&pathing_aabbs);
+        #[cfg(feature = "load-bench")]
+        {
+            resolve_map_us = resolve_map_us.saturating_add(elapsed_us(resolve_map_started));
+        }
+        let resolved = selection
+            .goal_tick
+            .resolve_for_owner(&pathing_probe, input.pathing_budget);
+        resolved_direct_paths.extend(pathing_probe.take_resolved_direct_paths());
+        #[cfg(feature = "load-bench")]
+        {
+            resolve_pathing_us =
+                resolve_pathing_us.saturating_add(elapsed_us(resolve_pathing_started));
+        }
+        #[cfg(feature = "load-bench")]
+        let resolve_overrides_started = std::time::Instant::now();
+
+        let mut goal_overrides = selection.goal_overrides.into_iter().collect::<Vec<_>>();
+        goal_overrides.sort_unstable_by_key(|(entity, _)| *entity);
+        let applied_goal_overrides = store.set_goals(goal_overrides.iter().cloned());
+        assert_eq!(
+            applied_goal_overrides,
+            goal_overrides.len(),
+            "owner-local goal overrides were selected from the same ECS store"
+        );
+        #[cfg(feature = "load-bench")]
+        {
+            resolve_us = resolve_us.saturating_add(elapsed_us(phase_started));
+            resolve_overrides_us =
+                resolve_overrides_us.saturating_add(elapsed_us(resolve_overrides_started));
+        }
+        #[cfg(feature = "load-bench")]
+        let phase_started = std::time::Instant::now();
+        let expected_capture_count = ordered_ids.len();
+        let (stats, output) =
+            store.apply_prepared_owner_goal_tick(resolved, follow_targets, ordered_ids);
+        #[cfg(feature = "load-bench")]
+        {
+            apply_us = apply_us.saturating_add(elapsed_us(phase_started));
+        }
+        #[cfg(feature = "load-bench")]
+        let phase_started = std::time::Instant::now();
+        add_goal_tick_stats(&mut goal_stats, stats);
+        if output.captured_count != expected_capture_count || output.invalid_count != 0 {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        active_hostile_ids.extend(output.active_hostile_ids);
+        villager_population_candidates.extend(output.villager_population_candidates);
+        villager_ids.extend(output.villager_ids);
+        villager_proximity_seeds.extend(output.villager_proximity_seeds);
+        goal_committed_motion.extend(
+            output
+                .goal_committed_motion
+                .into_iter()
+                .map(|motion| (*lease, motion)),
+        );
+        for update in selection.villager_updates {
+            let profession_changed = update
+                .expected
+                .retained
+                .villager
+                .is_some_and(|previous| previous.profession != update.villager.profession);
+            let mut current = store
+                .snapshot(update.expected.id)
+                .expect("owner-local villager update retains its selected entity");
+            current.retained.villager = Some(update.villager);
+            current.retained.villager_brain = Some(update.brain);
+            current.retained.villager_gossip = update.gossip;
+            current.retained.villager_merchant = update.merchant;
+            let publication = profession_changed.then(|| current.clone());
+            assert!(
+                store.restore_snapshot_in_place(current),
+                "owner-local villager update applies to the same ECS store"
+            );
+            villager_profession_updates.extend(publication);
+        }
+
+        physics_regions.push(*lease);
+        mutated = true;
+        #[cfg(feature = "load-bench")]
+        {
+            post_us = post_us.saturating_add(elapsed_us(phase_started));
+        }
+    }
+    active_hostile_ids.sort_unstable_by_key(|(entity, _)| *entity);
+    villager_population_candidates.sort_unstable_by_key(|(entity, _)| *entity);
+    villager_ids.sort_unstable_by_key(|(entity, _)| *entity);
+    villager_proximity_seeds.sort_unstable_by_key(|(entity, _)| *entity);
+    goal_committed_motion.sort_unstable_by_key(|(_, motion)| motion.id);
+    physics_regions.sort_unstable_by_key(|lease| lease.key);
+    #[cfg(feature = "load-bench")]
+    if input.tick.is_multiple_of(10) {
+        eprintln!(
+            "OWNER_GOAL_PHASE tick={} regions={} selected={} total_us={} scan_us={} selection_us={} resolve_us={} apply_us={} post_us={} resolve_scan_us={} resolve_pathing_us={} resolve_overrides_us={} resolve_map_us={}",
+            input.tick,
+            regions.len(),
+            active_entity_count,
+            elapsed_us(profile_started),
+            scan_us,
+            selection_us,
+            resolve_us,
+            apply_us,
+            post_us,
+            resolve_scan_us,
+            resolve_pathing_us,
+            resolve_overrides_us,
+            resolve_map_us,
+        );
+    }
+    Ok(OwnerLaneTickOutput {
+        goal_stats,
+        active_entity_count,
+        active_hostile_ids,
+        villager_population_candidates,
+        villager_ids,
+        villager_proximity_seeds,
+        fallback_entity_ids,
+        goal_committed_motion,
+        physics_regions,
+        resolved_direct_paths,
+        villager_profession_updates,
+        mutated,
+    })
+}
+
+fn apply_local_physics_if_current(
+    lane: usize,
+    regions: &mut BTreeMap<RegionKey, (RegionLease, EntityStore)>,
+    batches: Vec<LocalPhysicsRegionBatch>,
+    version_current: bool,
+) -> Result<LocalPhysicsApply, RegionOwnerLaneError> {
+    for batch in &batches {
+        if batch.lease.lane != lane {
+            return Err(RegionOwnerLaneError::WrongLane);
+        }
+        let Some((current_lease, _)) = regions.get(&batch.lease.key) else {
+            return Err(RegionOwnerLaneError::UnknownRegion);
+        };
+        if *current_lease != batch.lease {
+            return Err(RegionOwnerLaneError::StaleLease);
+        }
+    }
+    let input_count = batches.iter().map(|batch| batch.inputs.len()).sum();
+    let mut rejected = Vec::new();
+    let mut accepted = Vec::with_capacity(input_count);
+    let mut committed = Vec::with_capacity(input_count);
+    for batch in batches {
+        if batch
+            .world_fence
+            .as_ref()
+            .is_some_and(|world| !world.is_current())
+        {
+            rejected.extend(batch.inputs.iter().map(|input| input.previous.id));
+            continue;
+        }
+        let store = &mut regions
+            .get_mut(&batch.lease.key)
+            .expect("validated local physics region")
+            .1;
+        // The coordinator's inverse vehicle index is authoritative, but keep
+        // the owner-local passenger relation as the final mutation fence.
+        let mut passengers = None;
+        let mut states = Vec::with_capacity(batch.inputs.len());
+        for LocalPhysicsInput {
+            previous,
+            expected,
+            step,
+            publish,
+        } in batch.inputs
+        {
+            if previous.lifecycle != crate::EntityLifecycle::Alive
+                || previous.pickup_claimed
+                || previous.vehicle_attached
+                || previous.id != expected.id
+                || expected.id != step.id
+                || !step.position.is_finite()
+                || !step.velocity.is_finite()
+                || RegionKey::from_position(expected.position) != Some(batch.lease.key)
+                || RegionKey::from_position(step.position) != Some(batch.lease.key)
+            {
+                rejected.push(previous.id);
+                continue;
+            }
+
+            let unchanged = expected.position == step.position
+                && expected.velocity == step.velocity
+                && expected.on_ground == step.on_ground;
+            let ordinary_living = matches!(
+                expected.kind,
+                crate::EntityPhysicsKind::Living
+                    | crate::EntityPhysicsKind::PowderSnowWalkableLiving
+                    | crate::EntityPhysicsKind::AquaticLiving
+            );
+            if version_current && ordinary_living && !step.horizontal_collision {
+                let motion = EntityMotionState {
+                    id: expected.id,
+                    position: expected.position,
+                    rotation: previous.rotation,
+                    velocity: expected.velocity,
+                    on_ground: expected.on_ground,
+                    fall_distance: expected.fall_distance,
+                    goal_fence: expected.goal_fence,
+                    is_item: false,
+                    is_experience: false,
+                    is_arrow: false,
+                    arrow_revision: None,
+                    arrow_embedded_block: None,
+                    is_hurting_projectile: false,
+                    hurting_projectile_revision: None,
+                    is_throwable_projectile: false,
+                    throwable_projectile_revision: None,
+                    sends_velocity: true,
+                };
+                if publish {
+                    accepted.push((batch.lease, motion));
+                }
+                if !unchanged {
+                    let state = EntityKinematics {
+                        id: step.id,
+                        position: step.position,
+                        rotation: motion.rotation,
+                        velocity: step.velocity,
+                        on_ground: step.on_ground,
+                    };
+                    if publish {
+                        committed.push(state);
+                    }
+                    states.push(state);
+                }
+                continue;
+            }
+
+            let passengers = passengers.get_or_insert_with(|| store.passenger_ids());
+            let Some(current) = store.kinematics_fence_state(previous.id) else {
+                rejected.push(previous.id);
+                continue;
+            };
+            let motion = current.motion;
+            if current.uuid != previous.uuid
+                || current.lifecycle != previous.lifecycle
+                || current.pickup_claimed
+                || passengers.contains(&previous.id)
+                || current.vehicle_attached
+                || !expected.matches_motion(motion)
+            {
+                rejected.push(previous.id);
+                continue;
+            }
+            let changed = motion.position != step.position
+                || motion.velocity != step.velocity
+                || motion.on_ground != step.on_ground;
+            let projectile =
+                motion.is_arrow || motion.is_hurting_projectile || motion.is_throwable_projectile;
+            let should_publish = publish
+                || projectile
+                || motion.is_item
+                || motion.is_experience
+                || step.horizontal_collision
+                || matches!(expected.kind, crate::EntityPhysicsKind::FallingBlock);
+            if should_publish {
+                accepted.push((batch.lease, motion));
+            }
+            if changed && !projectile {
+                let state = EntityKinematics {
+                    id: step.id,
+                    position: step.position,
+                    rotation: motion.rotation,
+                    velocity: step.velocity,
+                    on_ground: step.on_ground,
+                };
+                if should_publish {
+                    committed.push(state);
+                }
+                states.push(state);
+            }
+        }
+        let expected_count = states.len();
+        if store.apply_kinematics_prevalidated(states) != expected_count {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+    }
+    rejected.sort_unstable();
+    accepted.sort_unstable_by_key(|(_, motion)| motion.id);
+    committed.sort_unstable_by_key(|state| state.id);
+    Ok((rejected, accepted, committed))
 }
 
 fn prepare_region_owner_batch(
@@ -1694,38 +2589,60 @@ fn prepare_region_owner_batch(
             } => {
                 let passengers = passengers_by_region
                     .entry(mutation.lease.key)
-                    .or_insert_with(|| {
-                        store
-                            .views()
-                            .filter_map(|view| view.vehicle.and_then(|vehicle| vehicle.passenger))
-                            .collect()
-                    });
-                let mut ids = HashSet::with_capacity(previous.len());
-                if *expected_state_version != current_state_version
-                    || previous.is_empty()
-                    || previous.len() != states.len()
-                    || previous.iter().zip(states).any(|(previous, state)| {
-                        let Some(current) = store.view(previous.id) else {
-                            return true;
-                        };
-                        !previous.eligible()
-                            || previous.id != state.id
-                            || !ids.insert(previous.id)
-                            || !state.is_finite()
-                            || RegionKey::from_position(previous.expected.position)
-                                != Some(mutation.lease.key)
-                            || RegionKey::from_position(state.position) != Some(mutation.lease.key)
-                            || current.uuid != previous.uuid
-                            || current.lifecycle != previous.lifecycle
-                            || current.position != previous.expected.position
-                            || current.rotation != previous.expected.rotation
-                            || current.velocity != previous.expected.velocity
-                            || current.on_ground != previous.expected.on_ground
-                            || current.retained.item_pickup_claim.is_some()
-                            || current.vehicle.is_some()
-                            || passengers.contains(&previous.id)
-                    })
-                {
+                    .or_insert_with(|| store.passenger_ids());
+                #[cfg(feature = "load-bench")]
+                let lane_version_stale = *expected_state_version != current_state_version;
+                #[cfg(not(feature = "load-bench"))]
+                let _ = expected_state_version;
+                // A lane version also advances for unrelated entities (for
+                // example, player movement sharing this lane). The compact
+                // target fence below is the authoritative stale check: it
+                // still rejects changed identity, motion, ownership, pickup,
+                // and passenger state without turning disjoint lane traffic
+                // into a full-snapshot fallback.
+                let invalid = if previous.is_empty() || previous.len() != states.len() {
+                    true
+                } else {
+                    let mut ids = HashSet::with_capacity(previous.len());
+                    let duplicate = previous.iter().any(|previous| !ids.insert(previous.id));
+                    let fences = store.kinematics_fence_states(&ids);
+                    duplicate
+                        || previous.iter().zip(states).any(|(previous, state)| {
+                            let Some(current) = fences.get(&previous.id) else {
+                                return true;
+                            };
+                            !previous.eligible()
+                                || previous.id != state.id
+                                || !state.is_finite()
+                                || RegionKey::from_position(previous.expected.position)
+                                    != Some(mutation.lease.key)
+                                || RegionKey::from_position(state.position)
+                                    != Some(mutation.lease.key)
+                                || current.uuid != previous.uuid
+                                || current.lifecycle != previous.lifecycle
+                                || current.motion.position != previous.expected.position
+                                || current.motion.rotation != previous.expected.rotation
+                                || current.motion.velocity != previous.expected.velocity
+                                || current.motion.on_ground != previous.expected.on_ground
+                                || current.pickup_claimed
+                                || current.vehicle_attached
+                                || passengers.contains(&previous.id)
+                        })
+                };
+                #[cfg(feature = "load-bench")]
+                if invalid {
+                    eprintln!(
+                        "PHYSICS_VERSIONED_LANE_REJECT lane={} region={:?} lane_stale={} expected_version={} current_version={} previous={} states={}",
+                        lane,
+                        mutation.lease.key,
+                        lane_version_stale,
+                        expected_state_version,
+                        current_state_version,
+                        previous.len(),
+                        states.len()
+                    );
+                }
+                if invalid {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
             }
@@ -1756,25 +2673,90 @@ fn prepare_region_owner_batch(
             }
             RegionOwnerMutation::ApplyGoalBatch {
                 expected,
+                candidate_ids,
                 expected_state_version,
                 resolved,
+                goal_overrides,
+                snapshot_overrides,
+                villager_updates,
                 ..
             } => {
-                let expected_ids = expected
+                let expected_ids_are_unique =
+                    expected.windows(2).all(|pair| pair[0].id < pair[1].id);
+                let candidate_ids_are_unique =
+                    candidate_ids.windows(2).all(|pair| pair[0] < pair[1]);
+                let contains_expected = |id: &EntityId| {
+                    expected
+                        .binary_search_by_key(id, |checkpoint| checkpoint.id)
+                        .is_ok()
+                };
+                let override_ids = goal_overrides
                     .iter()
-                    .map(|checkpoint| checkpoint.id)
+                    .map(|(entity, _)| *entity)
                     .collect::<HashSet<_>>();
+                let snapshot_override_ids = snapshot_overrides
+                    .iter()
+                    .map(|(expected, _)| expected.id)
+                    .collect::<HashSet<_>>();
+                let villager_update_ids = villager_updates
+                    .iter()
+                    .map(|update| update.expected.id)
+                    .collect::<HashSet<_>>();
+                let resolved_ids_match = resolved.active_ids.as_ref().is_some_and(|active| {
+                    active.union(&override_ids).count() == expected.len()
+                        && expected.iter().all(|checkpoint| {
+                            active.contains(&checkpoint.id) || override_ids.contains(&checkpoint.id)
+                        })
+                });
+                // Goal preparation captures this lane version with the rollback
+                // checkpoints, and the coordinator rechecks it immediately before
+                // this single-threaded lane admits the batch. Every successful
+                // owner mutation advances the version before replying, so equality
+                // here is the exact stale-state fence; the full checkpoints remain
+                // only for rollback.
                 if *expected_state_version != current_state_version
-                    || expected_ids.len() != expected.len()
+                    || !expected_ids_are_unique
+                    || !candidate_ids_are_unique
+                    || candidate_ids.iter().any(|id| !store.contains(*id))
+                    || override_ids.len() != goal_overrides.len()
+                    || snapshot_override_ids.len() != snapshot_overrides.len()
+                    || villager_update_ids.len() != villager_updates.len()
+                    || !override_ids.iter().all(&contains_expected)
+                    || !snapshot_override_ids.iter().all(&contains_expected)
+                    || !villager_update_ids.iter().all(&contains_expected)
                     || expected.iter().any(|checkpoint| {
                         RegionKey::from_position(checkpoint.position) != Some(mutation.lease.key)
-                            || store.goal_checkpoint(checkpoint.id).as_ref() != Some(checkpoint)
                     })
-                    || resolved
-                        .active_ids
-                        .as_ref()
-                        .is_some_and(|active| *active != expected_ids)
-                    || (resolved.active_ids.is_none() && expected_ids.len() != store.len())
+                    || snapshot_overrides.iter().any(|(expected, next)| {
+                        let mut allowed = expected.clone();
+                        allowed.velocity = next.velocity;
+                        allowed.rotation = next.rotation;
+                        allowed.retained.hurting_projectile_state =
+                            next.retained.hurting_projectile_state;
+                        expected.id != next.id
+                            || expected.uuid != next.uuid
+                            || expected.type_name != "minecraft:shulker_bullet"
+                            || expected.retained.shulker_bullet.is_none()
+                            || !next.rotation.is_finite()
+                            || !next.velocity.is_finite()
+                            || RegionKey::from_position(next.position) != Some(mutation.lease.key)
+                            || store.snapshot(expected.id).as_ref() != Some(expected)
+                            || &allowed != next
+                    })
+                    || villager_updates.iter().any(|update| {
+                        let pois = update.brain.pois;
+                        update.expected.type_name != "minecraft:villager"
+                            || update.expected.retained.villager.is_none()
+                            || RegionKey::from_position(update.expected.position)
+                                != Some(mutation.lease.key)
+                            || store.snapshot(update.expected.id).as_ref() != Some(&update.expected)
+                            || [pois.home, pois.job_site, pois.meeting_point]
+                                .into_iter()
+                                .flatten()
+                                .any(|position| !position.is_finite())
+                    })
+                    || (resolved.active_ids.is_some() && !resolved_ids_match)
+                    || (resolved.active_ids.is_none() && expected.len() != store.len())
                 {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
@@ -1872,6 +2854,9 @@ fn apply_prepared_region_owner_batch(
     let mut undo = Vec::with_capacity(batch.mutations.len());
     let mut goal_stats = GoalTickStats::default();
     let mut effect_results = Vec::new();
+    let mut goal_candidate_ids = BTreeMap::<RegionKey, Vec<EntityId>>::new();
+    let mut captured_goal_candidates =
+        BTreeMap::<RegionKey, Vec<crate::runtime::GoalSimulationCandidate>>::new();
     for mutation in batch.mutations {
         let store = &mut regions
             .get_mut(&mutation.lease.key)
@@ -1994,7 +2979,7 @@ fn apply_prepared_region_owner_batch(
                     })
                     .collect::<Vec<_>>();
                 let expected_count = states.len();
-                let applied = store.apply_kinematics(states) == expected_count;
+                let applied = store.apply_kinematics_prevalidated(states) == expected_count;
                 if applied {
                     undo.push(RegionOwnerUndo::KinematicsBatch {
                         lease: mutation.lease,
@@ -2009,7 +2994,7 @@ fn apply_prepared_region_owner_batch(
                 states,
             } => {
                 let expected_count = states.len();
-                let applied = store.apply_kinematics(states) == expected_count;
+                let applied = store.apply_kinematics_prevalidated(states) == expected_count;
                 if applied {
                     undo.push(RegionOwnerUndo::KinematicsBatch {
                         lease: mutation.lease,
@@ -2048,19 +3033,81 @@ fn apply_prepared_region_owner_batch(
             }
             RegionOwnerMutation::ApplyGoalBatch {
                 expected,
+                candidate_ids,
                 expected_state_version: _,
                 resolved,
                 follow_targets,
+                goal_overrides,
+                snapshot_overrides,
+                villager_updates,
             } => {
+                if goal_candidate_ids.contains_key(&mutation.lease.key) {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
                 let checkpoints = expected;
-                let stats =
-                    store.apply_prepared_goal_tick_with_follow_targets(*resolved, &follow_targets);
+                if store.set_goals(goal_overrides.iter().cloned()) != goal_overrides.len() {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+                let capture_is_current = snapshot_overrides.is_empty();
+                let (stats, captured) = store
+                    .apply_prepared_goal_tick_with_follow_targets_and_simulation_results(
+                        *resolved,
+                        &follow_targets,
+                        candidate_ids.clone(),
+                    );
                 add_goal_tick_stats(&mut goal_stats, stats);
+                goal_candidate_ids.insert(mutation.lease.key, candidate_ids);
+                if capture_is_current {
+                    captured_goal_candidates.insert(mutation.lease.key, captured);
+                }
                 undo.push(RegionOwnerUndo::GoalBatch {
                     lease: mutation.lease,
                     checkpoints,
                 });
-                true
+                let mut applied = true;
+                for (expected, retargeted) in snapshot_overrides {
+                    let Some(current) = store.snapshot(expected.id) else {
+                        applied = false;
+                        break;
+                    };
+                    let mut next = current.clone();
+                    next.velocity = retargeted.velocity;
+                    next.rotation = retargeted.rotation;
+                    next.retained.hurting_projectile_state =
+                        retargeted.retained.hurting_projectile_state;
+                    if !store.restore_snapshot_in_place(next) {
+                        applied = false;
+                        break;
+                    }
+                    undo.push(RegionOwnerUndo::Snapshot {
+                        lease: mutation.lease,
+                        snapshot: Box::new(current),
+                        allow_type_change: false,
+                    });
+                }
+                if applied {
+                    for update in villager_updates {
+                        let Some(current) = store.snapshot(update.expected.id) else {
+                            applied = false;
+                            break;
+                        };
+                        let mut next = current.clone();
+                        next.retained.villager = Some(update.villager);
+                        next.retained.villager_brain = Some(update.brain);
+                        next.retained.villager_gossip = update.gossip;
+                        next.retained.villager_merchant = update.merchant;
+                        if !store.restore_snapshot_in_place(next) {
+                            applied = false;
+                            break;
+                        }
+                        undo.push(RegionOwnerUndo::Snapshot {
+                            lease: mutation.lease,
+                            snapshot: Box::new(current),
+                            allow_type_change: false,
+                        });
+                    }
+                }
+                applied
             }
             RegionOwnerMutation::InsertSnapshot(snapshot) => {
                 let entity = snapshot.id;
@@ -2140,8 +3187,20 @@ fn apply_prepared_region_owner_batch(
         }
         applied_sequences.push(mutation.sequence);
     }
+    let mut goal_candidate_runs = Vec::with_capacity(goal_candidate_ids.len());
+    for (key, ids) in goal_candidate_ids {
+        let (lease, store) = regions
+            .get(&key)
+            .expect("applied goal batch retains its regional store");
+        let candidates = captured_goal_candidates
+            .remove(&key)
+            .and_then(|captured| fenced_kinematics_candidates_from_capture(*lease, &ids, captured))
+            .unwrap_or_else(|| fenced_kinematics_candidates(store, *lease, &ids, false).0);
+        goal_candidate_runs.push(candidates);
+    }
     let completion = RegionOwnerCompletion {
         phase: batch.phase,
+        goal_candidate_runs,
         applied_sequences,
         goal_stats,
         effect_results,

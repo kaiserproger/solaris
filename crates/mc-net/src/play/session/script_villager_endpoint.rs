@@ -38,6 +38,16 @@ impl SessionRegistry {
             Ok(false)
         }
     }
+    pub(crate) async fn release_script_villager_binding(
+        &self,
+        token: String,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let owner = self.entities.handle.clone();
+        let result = tokio::task::spawn_blocking(move || owner.release_villager_binding(token))
+            .await
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        self.entities.try_resolve(result)
+    }
 
     #[cfg(test)]
     pub(crate) fn spawn_script_villager_for_test(&self, position: Vec3) -> mc_entity::EntityId {

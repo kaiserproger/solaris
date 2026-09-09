@@ -1,6 +1,6 @@
 //! `mc-server` binary entry point.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -14,14 +14,19 @@ use mc_server::{OperatorFileOperation, ServerConfig};
 
 mod startup_validation;
 
+use mc_server::startup_data::{
+    StartupData, load_effective_loot, load_effective_protocol_data, load_effective_recipes,
+    load_effective_tags,
+};
+
 #[cfg(test)]
 use startup_validation::ensure_world_contract;
 #[cfg(test)]
 use startup_validation::{PersistedWorldContract, WORLD_CONTRACT_SCHEMA, world_contract_path};
 use startup_validation::{
     WorldSource, ensure_world_contract_with_spawn, has_non_directory_ancestor, is_public_bind_ip,
-    required_world_dir, validate_runtime_config, validate_vanilla_sidecar_version,
-    world_region_root_is_blocked, world_requires_solaris_spawn,
+    required_world_dir, validate_runtime_config, world_region_root_is_blocked,
+    world_requires_solaris_spawn,
 };
 
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
@@ -73,47 +78,6 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
 }
 
-fn bundled_luau_plugin(plugin: mc_server::BundledPlugin) -> mc_script::BundledLuauPlugin {
-    match plugin {
-        mc_server::BundledPlugin::BasicEconomy => mc_script::BundledLuauPlugin::new(
-            "basic-economy",
-            include_str!("../../../examples/plugins/basic-economy/plugin.toml"),
-            include_str!("../../../examples/plugins/basic-economy/main.lua"),
-        )
-        .with_config(include_str!(
-            "../../../examples/plugins/basic-economy/config.toml"
-        )),
-        mc_server::BundledPlugin::ColonyVillagerScaffold => mc_script::BundledLuauPlugin::new(
-            "colony-villager-scaffold",
-            include_str!("../../../examples/plugins/colony-villager-scaffold/plugin.toml"),
-            include_str!("../../../examples/plugins/colony-villager-scaffold/main.lua"),
-        ),
-        mc_server::BundledPlugin::GeologicalMines => mc_script::BundledLuauPlugin::new(
-            "geological-mines",
-            include_str!("../../../examples/plugins/geological-mines/plugin.toml"),
-            include_str!("../../../examples/plugins/geological-mines/main.lua"),
-        ),
-        mc_server::BundledPlugin::LandClaims => mc_script::BundledLuauPlugin::new(
-            "land-claims",
-            include_str!("../../../examples/plugins/land-claims/plugin.toml"),
-            include_str!("../../../examples/plugins/land-claims/main.lua"),
-        )
-        .with_config(include_str!(
-            "../../../examples/plugins/land-claims/config.toml"
-        )),
-        mc_server::BundledPlugin::OnlineRoster => mc_script::BundledLuauPlugin::new(
-            "online-roster",
-            include_str!("../../../examples/plugins/online-roster/plugin.toml"),
-            include_str!("../../../examples/plugins/online-roster/main.lua"),
-        ),
-        mc_server::BundledPlugin::SettlementPrototype => mc_script::BundledLuauPlugin::new(
-            "settlement-prototype",
-            include_str!("../../../examples/plugins/settlement-prototype/plugin.toml"),
-            include_str!("../../../examples/plugins/settlement-prototype/main.lua"),
-        ),
-    }
-}
-
 fn prepare_configured_luau_plugins(
     config: &ServerConfig,
 ) -> Result<Option<mc_script::PreparedLuaPlugins>> {
@@ -136,24 +100,6 @@ fn prepare_configured_luau_plugins(
             })
         })
         .transpose()?;
-
-    if !config.plugins.bundled.is_empty() {
-        let packages = config
-            .plugins
-            .bundled
-            .iter()
-            .copied()
-            .map(bundled_luau_plugin)
-            .collect::<Vec<_>>();
-        let bundled = mc_script::prepare_bundled_luau_plugins(&packages)
-            .context("preparing server-bundled Luau plugins")?;
-        prepared = Some(match prepared {
-            Some(external) => external
-                .merge(bundled)
-                .context("merging external and server-bundled Luau plugins")?,
-            None => bundled,
-        });
-    }
 
     prepared = prepared.map(|prepared| prepared.strict_startup(config.plugins.strict));
     validate_expected_plugin_set(config, prepared.as_ref())?;
@@ -508,7 +454,7 @@ fn vanilla_tags_are_usable(vanilla_data_dir: &Path) -> bool {
     };
     let items = mc_data::items::solaris_required_items();
     let blocks = mc_data::blocks::solaris_required_blocks_report();
-    load_effective_tags(Some(vanilla_data_dir), &protocol_data.data, &items, &blocks).is_ok()
+    load_effective_tags(Some(vanilla_data_dir), &protocol_data, &items, &blocks).is_ok()
 }
 
 fn vanilla_recipes_are_usable(vanilla_data_dir: &Path) -> bool {
@@ -675,14 +621,6 @@ async fn serve(
         .as_ref()
         .map(mc_script::LuaSettlementPlan::contract_name)
         .unwrap_or_else(|| "vanilla".to_owned());
-    let protocol_data = load_effective_protocol_data(cfg.data.vanilla_data_dir.as_deref())?;
-    let data = protocol_data.data;
-    tracing::info!(
-        registries = data.registry_count(),
-        entries = data.entry_count(),
-        source = protocol_data.source,
-        "registry index loaded",
-    );
 
     let loader_manifest = prepared_plugins
         .as_ref()
@@ -697,61 +635,22 @@ async fn serve(
             Ok::<_, anyhow::Error>(Arc::new(manifest))
         })
         .transpose()?;
-    let mut blocks_report = mc_data::blocks::solaris_required_blocks_report();
-    let block_light_source =
-        load_effective_block_light(cfg.data.vanilla_data_dir.as_deref(), &blocks_report)?;
-    let mut block_light = block_light_source.table;
-    tracing::info!(
-        version = %block_light.version,
-        states = block_light.len(),
-        source = block_light_source.source,
-        "block-light table loaded",
-    );
-    let block_mining_source =
-        load_effective_block_mining(cfg.data.vanilla_data_dir.as_deref(), &blocks_report)?;
-    tracing::info!(
-        states = block_mining_source
-            .table
-            .as_ref()
-            .map_or(0, |table| table.len()),
-        source = block_mining_source.source,
-        "block-mining table loaded",
-    );
-    if let Some(manifest) = loader_manifest.as_deref() {
-        for state_id in manifest
-            .append_world_block_report(&mut blocks_report)
-            .context("registering Solaris Loader world blocks")?
-        {
-            anyhow::ensure!(
-                usize::try_from(state_id).ok() == Some(block_light.len()),
-                "Solaris Loader block state must follow the validated light table"
-            );
-            block_light.append_opaque_state();
-        }
-    }
-    let block_light = Arc::new(block_light);
-    let block_states: usize = blocks_report.iter().map(|b| b.states.len()).sum();
-    let blocks = Arc::new(
-        mc_world::BlockRegistry::from_report(&blocks_report)
-            .context("building block-state registry from embedded JSON")?,
-    );
-    tracing::info!(
-        blocks = blocks_report.len(),
-        states = block_states,
-        "server block registry loaded",
-    );
-    let block_explosion_source =
-        load_effective_block_explosion(cfg.data.vanilla_data_dir.as_deref())?;
-    tracing::info!(
-        states = block_explosion_source
-            .table
-            .as_ref()
-            .map_or(0, |table| table.len()),
-        source = block_explosion_source.source,
-        "block-explosion table loaded",
-    );
-    let items = Arc::new(mc_data::items::solaris_required_items());
-    tracing::info!(entries = items.len(), "embedded item registry loaded");
+    let StartupData {
+        data,
+        blocks,
+        block_light,
+        items,
+        item_facts,
+        tags,
+        recipes,
+        loot,
+        block_facts,
+        entity_types,
+        biome_spawns,
+    } = StartupData::load(
+        cfg.data.vanilla_data_dir.as_deref(),
+        loader_manifest.as_deref(),
+    )?;
     let structure_rules = structure_rules_for_startup(
         cfg.data.seed,
         cfg.data.worldgen_mode,
@@ -797,13 +696,6 @@ async fn serve(
         chunk_z = world_spawn.chunk().z,
         source = ?world_source,
         "world spawn centre resolved",
-    );
-    let item_facts_source = load_effective_item_facts(cfg.data.vanilla_data_dir.as_deref())?;
-    let item_facts = Arc::new(item_facts_source.table);
-    tracing::info!(
-        entries = item_facts.len(),
-        source = item_facts_source.source,
-        "item component facts loaded"
     );
 
     let startup_view_distance = startup_spawn_view_distance(&cfg);
@@ -862,7 +754,7 @@ async fn serve(
                         chunks = generated,
                         dirty = storage.dirty_count(),
                         region_files = region_count,
-                        "empty world pre-generated around spawn; disk flush queued for startup dirty checkpoint",
+                        "empty world pre-generated around spawn; disk flush deferred to startup checkpoint",
                     );
                 } else {
                     let prepared = prepare_existing_spawn_window(
@@ -902,61 +794,6 @@ async fn serve(
         bail!("data.world_dir is required to start a playable persistent server");
     };
 
-    let data = Arc::new(data);
-    let tag_source = load_effective_tags(
-        cfg.data.vanilla_data_dir.as_deref(),
-        &data,
-        &items,
-        &blocks_report,
-    )?;
-    let tags = Arc::new(tag_source.tags);
-    tracing::info!(
-        tags = tags.total_tags(),
-        entries = tags.total_entries(),
-        source = tag_source.source,
-        "tags loaded"
-    );
-    let recipe_source = load_effective_recipes(cfg.data.vanilla_data_dir.as_deref())?;
-    validate_recipe_result_stacks(&recipe_source.recipes, &item_facts)?;
-    let recipes = Arc::new(recipe_source.recipes);
-    tracing::info!(
-        entries = recipes.len(),
-        source = recipe_source.source,
-        "recipe registry loaded"
-    );
-    let loot_source = load_effective_loot(cfg.data.vanilla_data_dir.as_deref())?;
-    let loot = Arc::new(loot_source.tables);
-    tracing::info!(
-        drops = loot.total_drops(),
-        source = loot_source.source,
-        "survival loot tables loaded"
-    );
-
-    let mut block_facts = mc_data::block_facts::BlockFactsTable::from_blocks_report_with_mining(
-        &blocks_report,
-        block_mining_source.table.as_ref(),
-    );
-    if let Some(table) = block_explosion_source.table {
-        block_facts = block_facts.with_explosion_table(table);
-    }
-    let block_facts = Arc::new(block_facts);
-    tracing::info!(
-        states = block_facts.len(),
-        random_tick_states = block_facts.eligible_states(),
-        "block simulation facts built from blocks report",
-    );
-
-    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
-    tracing::info!(
-        entries = entity_types.len(),
-        "embedded entity type registry loaded"
-    );
-    let biome_spawns = Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules());
-    tracing::info!(
-        biomes = biome_spawns.len(),
-        "embedded biome spawn rules loaded"
-    );
-
     let mut net = cfg
         .to_network(
             data,
@@ -993,8 +830,7 @@ async fn serve(
         let (boundary, host) = mc_script::start_prepared_lua_host(prepared)
             .context("starting configured Luau plugins")?;
         tracing::info!(
-            external_directory = ?cfg.plugins.directory.as_deref(),
-            bundled = cfg.plugins.bundled.len(),
+            plugin_directory = ?cfg.plugins.directory.as_deref(),
             loaded = host.loaded_plugins(),
             "Luau plugin host started"
         );
@@ -1786,345 +1622,6 @@ fn count_region_files(world_dir: &Path) -> usize {
     total
 }
 
-struct EffectiveLootTables {
-    tables: mc_data::loot::LootTables,
-    source: &'static str,
-}
-
-struct EffectiveProtocolData {
-    data: mc_data::VanillaData,
-    source: &'static str,
-}
-
-fn load_effective_protocol_data(vanilla_data_dir: Option<&Path>) -> Result<EffectiveProtocolData> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        validate_vanilla_sidecar_version(vanilla_data_dir)?;
-        let data = mc_data::load(vanilla_data_dir).with_context(|| {
-            format!(
-                "loading vanilla registry data from {}",
-                vanilla_data_dir.display()
-            )
-        })?;
-        return Ok(EffectiveProtocolData {
-            data,
-            source: "vanilla_sidecar",
-        });
-    }
-
-    Ok(EffectiveProtocolData {
-        data: mc_data::solaris_required_data(),
-        source: "embedded_solaris_fallback",
-    })
-}
-
-struct EffectiveTags {
-    tags: mc_data::tags::TagsData,
-    source: &'static str,
-}
-
-fn load_effective_tags(
-    vanilla_data_dir: Option<&Path>,
-    data: &mc_data::VanillaData,
-    items: &mc_data::items::ItemRegistry,
-    blocks: &[mc_data::blocks::BlockReport],
-) -> Result<EffectiveTags> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let tags = mc_data::tags::load(vanilla_data_dir, data)
-            .with_context(|| format!("loading vanilla tags from {}", vanilla_data_dir.display()))?
-            .with_vanilla_fuel_values(items);
-        if tags.total_tags() == 0 {
-            bail!(
-                "vanilla tags from {} were empty; run tools/extract-vanilla-data.sh with tag data",
-                vanilla_data_dir.display()
-            );
-        }
-        for registry in ["minecraft:block", "minecraft:item", "minecraft:entity_type"] {
-            let registry_id = mc_data::Identifier::parse(registry).expect("static registry id");
-            let missing = match tags.registries.get(&registry_id) {
-                Some(entries) => !entries.values().any(|ids| !ids.is_empty()),
-                None => true,
-            };
-            if missing {
-                bail!(
-                    "vanilla tags from {} missing required resolved entries for tag registry {registry}",
-                    vanilla_data_dir.display()
-                );
-            }
-        }
-        if !tags.fuel_values().matches_default_vanilla_26_1_2(items) {
-            bail!(
-                "vanilla tags from {} resolved {} furnace fuels instead of the canonical 26.1.2 default set; regenerate the sidecar",
-                vanilla_data_dir.display(),
-                tags.fuel_values().fuel_count(),
-            );
-        }
-        return Ok(EffectiveTags {
-            tags,
-            source: "vanilla_sidecar",
-        });
-    }
-
-    Ok(EffectiveTags {
-        tags: mc_data::tags::solaris_required_client_tags(items, blocks),
-        source: "embedded_solaris_fallback",
-    })
-}
-
-fn load_effective_loot(vanilla_data_dir: Option<&Path>) -> Result<EffectiveLootTables> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let root = vanilla_data_dir
-            .join("data")
-            .join("minecraft")
-            .join("loot_table");
-        let mut tables = mc_data::loot::load_vanilla_subset(&root)
-            .with_context(|| format!("loading vanilla loot tables from {}", root.display()))?;
-        if tables.total_drops() > 0 {
-            tables.fill_missing_from(mc_data::loot::builtin());
-            tables.fill_missing_entity_items_from(mc_data::loot::builtin());
-            return Ok(EffectiveLootTables {
-                tables,
-                source: "vanilla_sidecar_simple_subset+embedded_fallback",
-            });
-        }
-        bail!(
-            "vanilla loot tables from {} had no supported simple drops; run tools/extract-vanilla-data.sh with loot_table data",
-            root.display()
-        );
-    }
-
-    Ok(EffectiveLootTables {
-        tables: mc_data::loot::builtin().clone(),
-        source: "embedded_solaris_fallback",
-    })
-}
-
-struct EffectiveRecipes {
-    recipes: Vec<mc_data::recipes::Recipe>,
-    source: &'static str,
-}
-
-fn validate_recipe_result_stacks(
-    recipes: &[mc_data::recipes::Recipe],
-    item_facts: &mc_data::item_components::ItemFactsTable,
-) -> Result<()> {
-    for recipe in recipes {
-        let Some(max_stack_size) = item_facts
-            .get(&recipe.result.item)
-            .and_then(|facts| facts.max_stack_size)
-        else {
-            continue;
-        };
-        if recipe.result.count > max_stack_size {
-            bail!(
-                "recipe {} produces {} x {}, exceeding the item's max stack size {}",
-                recipe.id,
-                recipe.result.count,
-                recipe.result.item,
-                max_stack_size
-            );
-        }
-    }
-    Ok(())
-}
-
-fn load_effective_recipes(vanilla_data_dir: Option<&Path>) -> Result<EffectiveRecipes> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let root = vanilla_data_dir
-            .join("data")
-            .join("minecraft")
-            .join("recipe");
-        let sidecar_recipes = mc_data::recipes::load_recipes(&root)
-            .with_context(|| format!("loading vanilla recipes from {}", root.display()))?;
-        if !sidecar_recipes.is_empty() {
-            let mut sidecar_by_id: BTreeMap<_, _> = sidecar_recipes
-                .into_iter()
-                .map(|recipe| (recipe.id.clone(), recipe))
-                .collect();
-            let embedded = mc_data::recipes::solaris_required_recipes();
-            let mut recipes = Vec::with_capacity(embedded.len() + sidecar_by_id.len());
-            for fallback in embedded {
-                let recipe = sidecar_by_id.remove(&fallback.id).unwrap_or(fallback);
-                recipes.push(recipe);
-            }
-            recipes.extend(sidecar_by_id.into_values());
-            return Ok(EffectiveRecipes {
-                recipes,
-                source: "vanilla_sidecar+stable_embedded_prefix",
-            });
-        }
-        bail!(
-            "vanilla recipes from {} had no supported recipes; run tools/extract-vanilla-data.sh with recipe data",
-            root.display()
-        );
-    }
-
-    Ok(EffectiveRecipes {
-        recipes: mc_data::recipes::solaris_required_recipes(),
-        source: "embedded_solaris_fallback",
-    })
-}
-
-struct EffectiveBlockLight {
-    table: mc_data::block_light::BlockLightTable,
-    source: &'static str,
-}
-
-struct EffectiveItemFacts {
-    table: mc_data::item_components::ItemFactsTable,
-    source: &'static str,
-}
-
-struct EffectiveBlockMining {
-    table: Option<mc_data::block_mining::BlockMiningTable>,
-    source: &'static str,
-}
-
-struct EffectiveBlockExplosion {
-    table: Option<mc_data::block_explosion::BlockExplosionTable>,
-    source: &'static str,
-}
-
-fn load_effective_block_explosion(
-    vanilla_data_dir: Option<&Path>,
-) -> Result<EffectiveBlockExplosion> {
-    let Some(vanilla_data_dir) = vanilla_data_dir else {
-        return Ok(EffectiveBlockExplosion {
-            table: None,
-            source: "embedded_solaris_fallback",
-        });
-    };
-
-    let path = vanilla_data_dir
-        .join("reports")
-        .join("block_explosion.json");
-    let table =
-        mc_data::block_explosion::load_block_explosion_report(&path).with_context(|| {
-            format!(
-                "loading vanilla block-explosion table from {}",
-                path.display()
-            )
-        })?;
-    Ok(EffectiveBlockExplosion {
-        table: Some(table),
-        source: "vanilla_sidecar",
-    })
-}
-
-fn load_effective_block_mining(
-    vanilla_data_dir: Option<&Path>,
-    blocks_report: &[mc_data::blocks::BlockReport],
-) -> Result<EffectiveBlockMining> {
-    let Some(vanilla_data_dir) = vanilla_data_dir else {
-        return Ok(EffectiveBlockMining {
-            table: None,
-            source: "embedded_solaris_fallback",
-        });
-    };
-
-    let path = vanilla_data_dir.join("reports").join("block_mining.json");
-    let table = mc_data::block_mining::load(&path)
-        .with_context(|| format!("loading vanilla block-mining table from {}", path.display()))?;
-    if let Some(max_state_id) = blocks_report
-        .iter()
-        .flat_map(|block| block.states.iter().map(|state| state.id as usize))
-        .max()
-        && table.len() <= max_state_id
-    {
-        bail!(
-            "vanilla block-mining table from {} has {} states but blocks report requires state id {max_state_id}",
-            path.display(),
-            table.len()
-        );
-    }
-    if table.version != mc_protocol::TARGET_RELEASE {
-        bail!(
-            "vanilla block-mining table from {} targets {} but Solaris targets {}",
-            path.display(),
-            table.version,
-            mc_protocol::TARGET_RELEASE
-        );
-    }
-
-    Ok(EffectiveBlockMining {
-        table: Some(table),
-        source: "vanilla_sidecar",
-    })
-}
-
-fn load_effective_item_facts(vanilla_data_dir: Option<&Path>) -> Result<EffectiveItemFacts> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let path = vanilla_data_dir
-            .join("reports")
-            .join("minecraft")
-            .join("components")
-            .join("item");
-        let table = mc_data::item_components::load_item_facts(&path).with_context(|| {
-            format!(
-                "loading vanilla item component facts from {}",
-                path.display()
-            )
-        })?;
-        if table.is_empty() {
-            bail!(
-                "vanilla item component facts from {} were empty; rerun tools/extract-vanilla-data.sh",
-                path.display()
-            );
-        }
-        return Ok(EffectiveItemFacts {
-            table,
-            source: "vanilla_sidecar",
-        });
-    }
-
-    Ok(EffectiveItemFacts {
-        table: mc_data::item_components::solaris_required_item_facts(),
-        source: "embedded_solaris_fallback",
-    })
-}
-
-fn load_effective_block_light(
-    vanilla_data_dir: Option<&Path>,
-    blocks_report: &[mc_data::blocks::BlockReport],
-) -> Result<EffectiveBlockLight> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let path = vanilla_data_dir.join("reports").join("block_light.json");
-        let table = mc_data::block_light::load(&path).with_context(|| {
-            format!("loading vanilla block-light table from {}", path.display())
-        })?;
-        if let Some(max_state_id) = blocks_report
-            .iter()
-            .flat_map(|block| block.states.iter().map(|state| state.id as usize))
-            .max()
-            && table.len() <= max_state_id
-        {
-            bail!(
-                "vanilla block-light table from {} has {} states but blocks report requires state id {max_state_id}",
-                path.display(),
-                table.len()
-            );
-        }
-        if table.version != mc_protocol::TARGET_RELEASE {
-            bail!(
-                "vanilla block-light table from {} targets {} but Solaris targets {}",
-                path.display(),
-                table.version,
-                mc_protocol::TARGET_RELEASE
-            );
-        }
-        return Ok(EffectiveBlockLight {
-            table,
-            source: "vanilla_sidecar",
-        });
-    }
-
-    Ok(EffectiveBlockLight {
-        table: mc_data::block_light::BlockLightTable::conservative_from_blocks_report(
-            blocks_report,
-        ),
-        source: "embedded_solaris_fallback",
-    })
-}
-
 fn ensure_world_region_root(world_dir: &Path) -> Result<()> {
     let modern = world_dir
         .join("dimensions")
@@ -2273,27 +1770,72 @@ mod tests {
         Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap())
     }
 
-    #[test]
-    fn bundled_luau_plugins_prepare_runtime_and_worldgen_profiles() {
-        let config: ServerConfig = toml::from_str(
+    /// Root of the independent `solaris-default-plugins` sibling checkout.
+    ///
+    /// Tests fail loudly here instead of skipping: behavior coverage must run
+    /// against the real packages, and a missing checkout is a setup error.
+    fn sibling_plugin_root() -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../solaris-default-plugins");
+        assert!(
+            root.is_dir(),
+            "sibling plugin checkout missing at {}: clone solaris-default-plugins next to solaris",
+            root.display()
+        );
+        root
+    }
+
+    fn deploy_sibling_plugin(name: &str, destination_root: &Path) {
+        let source = sibling_plugin_root().join(name);
+        assert!(
+            source.is_dir(),
+            "sibling plugin package `{name}` missing at {}",
+            source.display()
+        );
+        let destination = destination_root.join(name);
+        std::fs::create_dir(&destination).expect("create deployed plugin directory");
+        for file in ["plugin.toml", "main.lua"] {
+            std::fs::copy(source.join(file), destination.join(file))
+                .unwrap_or_else(|error| panic!("copy sibling {name}/{file}: {error}"));
+        }
+        let config = source.join("config.toml");
+        if config.is_file() {
+            std::fs::copy(&config, destination.join("config.toml"))
+                .unwrap_or_else(|error| panic!("copy sibling {name}/config.toml: {error}"));
+        }
+    }
+
+    fn config_with_deployed_plugins(names: &[&str]) -> (tempfile::TempDir, ServerConfig) {
+        let root = tempfile::tempdir().expect("deployed plugin root");
+        for name in names {
+            deploy_sibling_plugin(name, root.path());
+        }
+        let mut config: ServerConfig = toml::from_str(
             r#"
                 [server]
-                name = "Bundled"
-                motd = "Bundled plugins"
+                name = "Deployed"
+                motd = "Deployed plugins"
 
                 [network]
                 bind_address = "127.0.0.1"
                 port = 25565
-
-                [plugins]
-                bundled = ["online-roster", "geological-mines", "settlement-prototype"]
             "#,
         )
         .unwrap();
+        config.plugins.directory = Some(root.path().to_path_buf());
+        (root, config)
+    }
+
+    #[test]
+    fn deployed_sibling_plugins_prepare_runtime_and_worldgen_profiles() {
+        let (_root, config) = config_with_deployed_plugins(&[
+            "online-roster",
+            "geological-mines",
+            "settlement-prototype",
+        ]);
 
         let prepared = prepare_configured_luau_plugins(&config)
             .unwrap()
-            .expect("bundled plugins should prepare a host");
+            .expect("deployed plugins should prepare a host");
         assert_eq!(
             prepared.worldgen_ore_profile(),
             Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits)
@@ -2309,7 +1851,20 @@ mod tests {
     }
 
     #[test]
-    fn strict_plugin_set_matches_merged_external_and_bundled_deployment() {
+    fn deployed_colony_scaffold_starts_with_its_config() {
+        let (_root, config) = config_with_deployed_plugins(&["colony-villager-scaffold"]);
+
+        let prepared = prepare_configured_luau_plugins(&config)
+            .unwrap()
+            .expect("deployed colony plugin should prepare a host");
+        let (boundary, host) = mc_script::start_prepared_lua_host(prepared).unwrap();
+        assert_eq!(host.loaded_plugins(), 1);
+        drop(boundary);
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn strict_plugin_set_matches_deployed_directory() {
         let plugins = tempfile::tempdir().unwrap();
         let external = plugins.path().join("external");
         std::fs::create_dir(&external).unwrap();
@@ -2319,6 +1874,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(external.join("main.lua"), "return nil").unwrap();
+        deploy_sibling_plugin("online-roster", plugins.path());
         let mut config: ServerConfig = toml::from_str(
             r#"
                 [server]
@@ -2332,13 +1888,12 @@ mod tests {
         )
         .unwrap();
         config.plugins.directory = Some(plugins.path().to_path_buf());
-        config.plugins.bundled = vec![mc_server::BundledPlugin::OnlineRoster];
         config.plugins.strict = true;
         config.plugins.expected = vec!["online-roster".to_owned(), "external".to_owned()];
 
         let prepared = prepare_configured_luau_plugins(&config)
             .unwrap()
-            .expect("strict merged plugin set prepares");
+            .expect("strict deployed plugin set prepares");
         assert_eq!(
             prepared
                 .discovered_plugins()
@@ -2621,15 +2176,6 @@ mod tests {
         );
         config.simulation.random_tick_speed = 3;
 
-        config.simulation.friendly_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP + 1;
-        let error = validate_runtime_config(&config).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("simulation.friendly_spawn_cap=257")
-        );
-        config.simulation.friendly_spawn_cap = 32;
-
         config.simulation.friendly_spawn_chunk_budget = 0;
         let error = validate_runtime_config(&config).unwrap_err();
         assert!(
@@ -2663,9 +2209,6 @@ mod tests {
         config.simulation.save_interval_ticks = 1_728_000;
         config.simulation.friendly_spawn_interval_ticks = 1_728_000;
         config.simulation.hostile_spawn_interval_ticks = 1_728_000;
-        config.simulation.friendly_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP;
-        config.simulation.aquatic_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP;
-        config.simulation.hostile_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP;
         config.simulation.friendly_spawn_chunk_budget = mc_net::MAX_NATURAL_SPAWN_CHUNK_BUDGET;
         config.simulation.hostile_spawn_chunk_budget = mc_net::MAX_NATURAL_SPAWN_CHUNK_BUDGET;
 
@@ -3297,696 +2840,6 @@ mod tests {
         assert!(changed > 200, "prototype changed only {changed} blocks");
     }
 
-    #[test]
-    fn effective_protocol_data_rejects_missing_sidecar_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("missing-vanilla");
-
-        let err = match load_effective_protocol_data(Some(&missing)) {
-            Ok(_) => panic!("missing sidecar root must fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("reading vanilla sidecar directory metadata")
-        );
-    }
-
-    #[test]
-    fn effective_protocol_data_rejects_mismatched_sidecar_version() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("version.json"),
-            format!(
-                r#"{{"id":"{}","world_version":{},"protocol_version":999999}}"#,
-                mc_protocol::TARGET_RELEASE,
-                mc_protocol::WORLD_VERSION,
-            ),
-        )
-        .unwrap();
-
-        let err = match load_effective_protocol_data(Some(tmp.path())) {
-            Ok(_) => panic!("mismatched sidecar version must fail before registry loading"),
-            Err(err) => err,
-        };
-
-        assert!(
-            format!("{err:#}").contains("protocol_version 999999 does not match"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn effective_tags_reject_empty_vanilla_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reports = tmp.path().join("reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(reports.join("registries.json"), "{}").unwrap();
-        let data = mc_data::VanillaData::from_registries("", vec![]);
-        let items = mc_data::items::ItemRegistry::default();
-
-        let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
-            Ok(_) => panic!("empty vanilla tag sidecar must fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("vanilla tags"));
-        assert!(err.to_string().contains("were empty"));
-    }
-
-    #[test]
-    fn effective_tags_attach_fuel_values_to_embedded_startup_data() {
-        let items = mc_data::items::solaris_required_items();
-        let blocks = mc_data::blocks::solaris_required_blocks_report();
-
-        let effective =
-            load_effective_tags(None, &mc_data::solaris_required_data(), &items, &blocks).unwrap();
-        let oak_stairs = items
-            .id_of(&Identifier::parse("minecraft:oak_stairs").unwrap())
-            .unwrap();
-        let warped_stairs = items
-            .id_of(&Identifier::parse("minecraft:warped_stairs").unwrap())
-            .unwrap();
-
-        assert_eq!(
-            effective.tags.fuel_values().burn_duration(oak_stairs),
-            Some(300)
-        );
-        assert!(!effective.tags.fuel_values().is_fuel(warped_stairs));
-    }
-
-    #[test]
-    fn effective_tags_reject_partial_fuel_membership_with_all_required_keys() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reports = tmp.path().join("reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(
-            reports.join("registries.json"),
-            r#"{
-                "minecraft:block":{"entries":{"minecraft:stone":{"protocol_id":0}}},
-                "minecraft:item":{"entries":{"minecraft:coal":{"protocol_id":10}}},
-                "minecraft:entity_type":{"entries":{"minecraft:pig":{"protocol_id":1}}}
-            }"#,
-        )
-        .unwrap();
-        for (registry, entry) in [
-            ("block", "minecraft:stone"),
-            ("entity_type", "minecraft:pig"),
-        ] {
-            let root = tmp.path().join("data/minecraft/tags").join(registry);
-            std::fs::create_dir_all(&root).unwrap();
-            std::fs::write(
-                root.join("sample.json"),
-                format!(r#"{{"values":["{entry}"]}}"#),
-            )
-            .unwrap();
-        }
-        let item_tags = tmp.path().join("data/minecraft/tags/item");
-        std::fs::create_dir_all(&item_tags).unwrap();
-        for tag in [
-            "logs",
-            "bamboo_blocks",
-            "planks",
-            "wooden_stairs",
-            "wooden_slabs",
-            "wooden_trapdoors",
-            "wooden_pressure_plates",
-            "wooden_shelves",
-            "wooden_fences",
-            "fence_gates",
-            "banners",
-            "signs",
-            "hanging_signs",
-            "wooden_doors",
-            "boats",
-            "wool",
-            "wooden_buttons",
-            "saplings",
-            "wool_carpets",
-            "non_flammable_wood",
-        ] {
-            let values = if tag == "logs" {
-                r#"["minecraft:coal"]"#
-            } else {
-                "[]"
-            };
-            std::fs::write(
-                item_tags.join(format!("{tag}.json")),
-                format!(r#"{{"values":{values}}}"#),
-            )
-            .unwrap();
-        }
-        let items = mc_data::items::ItemRegistry::from_report(&[mc_data::items::ItemReport {
-            id: Identifier::parse("minecraft:coal").unwrap(),
-            protocol_id: 10,
-        }]);
-
-        let err = match load_effective_tags(
-            Some(tmp.path()),
-            &mc_data::VanillaData::from_registries("", vec![]),
-            &items,
-            &[],
-        ) {
-            Ok(_) => panic!("partial canonical fuel membership must fail startup"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("canonical 26.1.2 default set"));
-    }
-
-    #[test]
-    fn effective_tags_reject_missing_required_vanilla_tag_registry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reports = tmp.path().join("reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(
-            reports.join("registries.json"),
-            r#"{
-                "minecraft:item": {
-                    "entries": {
-                        "minecraft:apple": { "protocol_id": 5 }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        let tags_item = tmp
-            .path()
-            .join("data")
-            .join("minecraft")
-            .join("tags")
-            .join("item");
-        std::fs::create_dir_all(&tags_item).unwrap();
-        std::fs::write(
-            tags_item.join("food.json"),
-            r#"{ "values": [ "minecraft:apple" ] }"#,
-        )
-        .unwrap();
-        let data = mc_data::VanillaData::from_registries("", vec![]);
-        let items = mc_data::items::ItemRegistry::default();
-
-        let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
-            Ok(_) => panic!("partial vanilla tag sidecar must fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("missing required resolved entries")
-        );
-        assert!(err.to_string().contains("minecraft:block"));
-    }
-
-    #[test]
-    fn effective_tags_reject_required_tag_registries_without_protocol_ids() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reports = tmp.path().join("reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(reports.join("registries.json"), "{}").unwrap();
-        for (root, entry) in [
-            ("block", "minecraft:stone"),
-            ("item", "minecraft:apple"),
-            ("entity_type", "minecraft:pig"),
-        ] {
-            let tags_root = tmp
-                .path()
-                .join("data")
-                .join("minecraft")
-                .join("tags")
-                .join(root);
-            std::fs::create_dir_all(&tags_root).unwrap();
-            std::fs::write(
-                tags_root.join("sample.json"),
-                format!(r#"{{ "values": [ "{entry}" ] }}"#),
-            )
-            .unwrap();
-        }
-        let data = mc_data::VanillaData::from_registries("", vec![]);
-        let items = mc_data::items::ItemRegistry::default();
-
-        let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
-            Ok(_) => panic!("unresolved required tag registries must fail"),
-            Err(err) => err,
-        };
-
-        let message = format!("{err:#}");
-        assert!(message.contains("required registry entry"));
-        assert!(
-            message.contains("minecraft:stone")
-                || message.contains("minecraft:apple")
-                || message.contains("minecraft:pig")
-        );
-    }
-
-    #[test]
-    fn effective_block_light_requires_sidecar_file_when_vanilla_dir_is_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let report = [mc_data::blocks::BlockReport {
-            id: Identifier::parse("minecraft:air").unwrap(),
-            properties: std::collections::BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id: 0,
-                default: true,
-                properties: std::collections::BTreeMap::new(),
-            }],
-        }];
-
-        let err = match load_effective_block_light(Some(tmp.path()), &report) {
-            Ok(_) => panic!("missing block_light.json must fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("loading vanilla block-light table")
-        );
-        assert!(err.to_string().contains("block_light.json"));
-    }
-
-    #[test]
-    fn effective_item_facts_reject_missing_sidecar_report() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let error = match load_effective_item_facts(Some(tmp.path())) {
-            Ok(_) => panic!("missing item component report must fail"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("were empty"));
-        assert!(error.to_string().contains("components/item"));
-    }
-
-    #[test]
-    fn effective_block_mining_requires_sidecar_file_when_configured() {
-        let tmp = tempfile::tempdir().unwrap();
-        let report = [mc_data::blocks::BlockReport {
-            id: Identifier::parse("minecraft:air").unwrap(),
-            properties: BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id: 0,
-                default: true,
-                properties: BTreeMap::new(),
-            }],
-        }];
-
-        let error = match load_effective_block_mining(Some(tmp.path()), &report) {
-            Ok(_) => panic!("missing block_mining.json must fail"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("block-mining table"));
-        assert!(error.to_string().contains("block_mining.json"));
-    }
-
-    #[test]
-    fn effective_block_mining_loads_matching_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reports = tmp.path().join("reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(
-            reports.join("block_mining.json"),
-            format!(
-                r#"{{"version":"{}","max_state_id":1,"entries":[[0.0,0],[1.5,1]]}}"#,
-                mc_protocol::TARGET_RELEASE
-            ),
-        )
-        .unwrap();
-        let report = [mc_data::blocks::BlockReport {
-            id: Identifier::parse("minecraft:stone").unwrap(),
-            properties: BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id: 1,
-                default: true,
-                properties: BTreeMap::new(),
-            }],
-        }];
-
-        let effective = load_effective_block_mining(Some(tmp.path()), &report).unwrap();
-
-        assert_eq!(effective.source, "vanilla_sidecar");
-        assert_eq!(
-            effective.table.as_ref().and_then(|table| table.facts(1)),
-            Some(mc_data::block_mining::BlockMiningFacts {
-                destroy_speed: 1.5,
-                requires_correct_tool_for_drops: true,
-            })
-        );
-    }
-
-    #[test]
-    fn effective_item_facts_load_sidecar_tool_rules() {
-        let tmp = tempfile::tempdir().unwrap();
-        let items = tmp
-            .path()
-            .join("reports")
-            .join("minecraft")
-            .join("components")
-            .join("item");
-        std::fs::create_dir_all(&items).unwrap();
-        std::fs::write(
-            items.join("wooden_pickaxe.json"),
-            r##"{
-                "components": {
-                    "minecraft:tool": {
-                        "rules": [{
-                            "blocks": "#minecraft:mineable/pickaxe",
-                            "speed": 2.0,
-                            "correct_for_drops": true
-                        }]
-                    }
-                }
-            }"##,
-        )
-        .unwrap();
-
-        let effective = load_effective_item_facts(Some(tmp.path())).unwrap();
-
-        assert_eq!(effective.source, "vanilla_sidecar");
-        let tool = effective
-            .table
-            .get(&Identifier::parse("minecraft:wooden_pickaxe").unwrap())
-            .and_then(|facts| facts.tool.as_ref())
-            .expect("tool facts");
-        assert_eq!(tool.rules.len(), 1);
-        assert_eq!(tool.rules[0].speed, Some(2.0));
-    }
-
-    #[test]
-    fn effective_item_facts_use_embedded_fallback_without_sidecar() {
-        let effective = load_effective_item_facts(None).unwrap();
-
-        assert_eq!(effective.source, "embedded_solaris_fallback");
-        assert!(!effective.table.is_empty());
-    }
-
-    #[test]
-    fn effective_block_light_rejects_sidecar_that_does_not_cover_blocks_report() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reports = tmp.path().join("reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(
-            reports.join("block_light.json"),
-            r#"{"version":"26.1.2-test","max_state_id":0,"entries":[[0,0,1,0]]}"#,
-        )
-        .unwrap();
-        let report = [mc_data::blocks::BlockReport {
-            id: Identifier::parse("minecraft:stone").unwrap(),
-            properties: std::collections::BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id: 1,
-                default: true,
-                properties: std::collections::BTreeMap::new(),
-            }],
-        }];
-
-        let err = match load_effective_block_light(Some(tmp.path()), &report) {
-            Ok(_) => panic!("stale block-light sidecar must fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("requires state id 1"));
-    }
-
-    #[test]
-    fn effective_block_light_rejects_wrong_target_version() {
-        let tmp = tempfile::tempdir().unwrap();
-        let reports = tmp.path().join("reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(
-            reports.join("block_light.json"),
-            r#"{"version":"not-the-target","max_state_id":0,"entries":[[0,0,1,0]]}"#,
-        )
-        .unwrap();
-        let report = [mc_data::blocks::BlockReport {
-            id: Identifier::parse("minecraft:air").unwrap(),
-            properties: std::collections::BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id: 0,
-                default: true,
-                properties: std::collections::BTreeMap::new(),
-            }],
-        }];
-
-        let err = match load_effective_block_light(Some(tmp.path()), &report) {
-            Ok(_) => panic!("wrong block-light target version must fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("not-the-target"));
-        assert!(err.to_string().contains(mc_protocol::TARGET_RELEASE));
-    }
-
-    #[test]
-    fn effective_block_light_uses_embedded_fallback_without_sidecar() {
-        let report = [mc_data::blocks::BlockReport {
-            id: Identifier::parse("minecraft:air").unwrap(),
-            properties: std::collections::BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id: 0,
-                default: true,
-                properties: std::collections::BTreeMap::new(),
-            }],
-        }];
-
-        let light = load_effective_block_light(None, &report).unwrap();
-
-        assert_eq!(light.source, "embedded_solaris_fallback");
-        assert_eq!(light.table.version, "blocks-report-conservative");
-        assert_eq!(light.table.len(), 1);
-    }
-
-    #[test]
-    fn effective_loot_uses_embedded_fallback_without_sidecar() {
-        let loot = load_effective_loot(None).unwrap();
-
-        assert_eq!(loot.source, "embedded_solaris_fallback");
-        assert_eq!(
-            loot.tables
-                .block_drop(&Identifier::parse("minecraft:stone").unwrap()),
-            Some(&Identifier::parse("minecraft:cobblestone").unwrap())
-        );
-    }
-
-    #[test]
-    fn effective_loot_uses_simple_vanilla_sidecar_when_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let blocks = tmp
-            .path()
-            .join("data")
-            .join("minecraft")
-            .join("loot_table")
-            .join("blocks");
-        std::fs::create_dir_all(&blocks).unwrap();
-        std::fs::write(
-            blocks.join("stone.json"),
-            r#"{
-              "pools": [{
-                "entries": [{
-                  "type": "minecraft:item",
-                  "name": "minecraft:diamond"
-                }]
-              }]
-            }"#,
-        )
-        .unwrap();
-
-        let loot = load_effective_loot(Some(tmp.path())).unwrap();
-
-        assert_eq!(
-            loot.tables.total_drops(),
-            mc_data::loot::builtin().total_drops()
-        );
-        assert_eq!(
-            loot.tables
-                .block_drop(&Identifier::parse("minecraft:stone").unwrap()),
-            Some(&Identifier::parse("minecraft:diamond").unwrap())
-        );
-        assert_eq!(
-            loot.tables
-                .entity_drop_stacks(&Identifier::parse("minecraft:cow").unwrap())
-                .map(|drops| drops.iter().map(|drop| &drop.item).collect::<Vec<_>>()),
-            Some(vec![
-                &Identifier::parse("minecraft:leather").unwrap(),
-                &Identifier::parse("minecraft:beef").unwrap(),
-            ])
-        );
-        assert_eq!(
-            loot.source,
-            "vanilla_sidecar_simple_subset+embedded_fallback"
-        );
-    }
-
-    #[test]
-    fn effective_loot_completes_partial_entity_table_from_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let entities = tmp
-            .path()
-            .join("data")
-            .join("minecraft")
-            .join("loot_table")
-            .join("entities");
-        std::fs::create_dir_all(&entities).unwrap();
-        std::fs::write(
-            entities.join("sheep.json"),
-            r#"{
-              "pools": [
-                {
-                  "entries": [{
-                    "type": "minecraft:item",
-                    "functions": [{
-                      "function": "minecraft:set_count",
-                      "count": {
-                        "type": "minecraft:uniform",
-                        "min": 1.0,
-                        "max": 2.0
-                      }
-                    }],
-                    "name": "minecraft:mutton"
-                  }]
-                },
-                {
-                  "entries": [{
-                    "type": "minecraft:loot_table",
-                    "value": "minecraft:entities/sheep/white"
-                  }]
-                }
-              ]
-            }"#,
-        )
-        .unwrap();
-
-        let loot = load_effective_loot(Some(tmp.path())).unwrap();
-
-        assert_eq!(
-            loot.tables
-                .entity_drop_stacks(&Identifier::parse("minecraft:sheep").unwrap())
-                .map(|drops| drops.iter().map(|drop| &drop.item).collect::<Vec<_>>()),
-            Some(vec![
-                &Identifier::parse("minecraft:mutton").unwrap(),
-                &Identifier::parse("minecraft:white_wool").unwrap(),
-            ])
-        );
-    }
-
-    #[test]
-    fn effective_loot_rejects_sidecar_with_no_simple_loot() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let err = match load_effective_loot(Some(tmp.path())) {
-            Ok(_) => panic!("configured vanilla loot sidecar without usable drops must fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("vanilla loot tables"));
-        assert!(err.to_string().contains("no supported simple drops"));
-    }
-
-    #[test]
-    fn effective_recipes_keep_embedded_display_ids_when_sidecar_is_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let recipes = tmp.path().join("data").join("minecraft").join("recipe");
-        std::fs::create_dir_all(&recipes).unwrap();
-        std::fs::write(
-            recipes.join("oak_planks.json"),
-            r#"{
-              "type": "minecraft:crafting_shapeless",
-              "category": "building",
-              "ingredients": [{ "tag": "minecraft:oak_logs" }],
-              "result": {
-                "id": "minecraft:oak_planks",
-                "count": 5
-              }
-            }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            recipes.join("zz_sidecar_only.json"),
-            r#"{
-              "type": "minecraft:crafting_shapeless",
-              "category": "misc",
-              "ingredients": [{ "item": "minecraft:stick" }],
-              "result": {
-                "id": "minecraft:stick",
-                "count": 1
-              }
-            }"#,
-        )
-        .unwrap();
-
-        let recipes = load_effective_recipes(Some(tmp.path())).unwrap();
-        let embedded = mc_data::recipes::solaris_required_recipes();
-        let oak_planks_index = embedded
-            .iter()
-            .position(|recipe| recipe.id.as_str() == "minecraft:oak_planks")
-            .unwrap();
-
-        assert_eq!(recipes.source, "vanilla_sidecar+stable_embedded_prefix");
-        assert_eq!(recipes.recipes.len(), embedded.len() + 1);
-        assert_eq!(
-            recipes.recipes[..embedded.len()]
-                .iter()
-                .map(|recipe| &recipe.id)
-                .collect::<Vec<_>>(),
-            embedded.iter().map(|recipe| &recipe.id).collect::<Vec<_>>()
-        );
-        assert_eq!(recipes.recipes[oak_planks_index].result.count, 5);
-        assert_eq!(
-            recipes.recipes.last().unwrap().id.as_str(),
-            "minecraft:zz_sidecar_only"
-        );
-    }
-
-    #[test]
-    fn recipe_result_stack_validation_rejects_known_item_overflow() {
-        let item = Identifier::parse("minecraft:test_item").unwrap();
-        let facts = mc_data::item_components::ItemFactsTable::from_entries([(
-            item.clone(),
-            mc_data::item_components::ItemFacts {
-                max_stack_size: Some(16),
-                ..Default::default()
-            },
-        )]);
-        let recipe = mc_data::recipes::Recipe {
-            id: Identifier::parse("minecraft:test_recipe").unwrap(),
-            kind: mc_data::recipes::RecipeKind::Shapeless(mc_data::recipes::ShapelessRecipe {
-                ingredients: vec![mc_data::recipes::Ingredient {
-                    alternatives: vec![mc_data::recipes::IngredientAlternative::Item(item.clone())],
-                }],
-            }),
-            result: mc_data::recipes::RecipeResult { item, count: 17 },
-        };
-
-        let error = validate_recipe_result_stacks(&[recipe], &facts).unwrap_err();
-        assert!(error.to_string().contains("max stack size 16"));
-    }
-
-    #[test]
-    fn effective_recipes_reject_configured_sidecar_without_supported_recipes() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let err = match load_effective_recipes(Some(tmp.path())) {
-            Ok(_) => panic!("configured vanilla recipe sidecar without recipes must fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("vanilla recipes"));
-        assert!(err.to_string().contains("no supported recipes"));
-    }
-
-    #[test]
-    fn effective_recipes_use_embedded_fallback_without_sidecar() {
-        let recipes = load_effective_recipes(None).unwrap();
-
-        assert_eq!(recipes.source, "embedded_solaris_fallback");
-        assert!(
-            recipes
-                .recipes
-                .iter()
-                .any(|recipe| recipe.id.as_str() == "minecraft:oak_planks")
-        );
-    }
-
     #[tokio::test]
     async fn production_bound_server_performs_final_save_after_internal_shutdown() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4513,9 +3366,6 @@ mod tests {
         let policy = &autoscale["policy"];
         let simulation = &rendered["simulation"];
 
-        assert_eq!(simulation["friendly_spawn_cap"], 32);
-        assert_eq!(simulation["aquatic_spawn_cap"], 20);
-        assert_eq!(simulation["hostile_spawn_cap"], 70);
         assert_eq!(simulation["friendly_spawn_chunk_budget"], 48);
         assert_eq!(simulation["hostile_spawn_chunk_budget"], 4);
         assert_eq!(autoscale["enabled"], Value::Bool(true));

@@ -302,6 +302,40 @@ fn owner_inventory_transaction_maps_failures_without_partial_mutation() {
 }
 
 #[test]
+fn owner_inventory_transaction_preserves_newer_authoritative_items() {
+    let items = mc_data::items::solaris_required_items();
+    let facts = mc_data::item_components::solaris_required_item_facts();
+    let apple = items
+        .id_of(&Identifier::parse("minecraft:apple").unwrap())
+        .unwrap();
+    let mut owner_inventory = PlayerInventory::empty();
+    owner_inventory.slots[9] = ItemStack::new(apple, 2);
+    let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5));
+    persisted.inventory = owner_inventory.clone();
+    persisted.inventory.slots[PlayerInventory::OFFHAND_SLOT] = ItemStack::new(apple, 5);
+
+    apply_script_player_inventory_transaction(
+        &transaction(
+            1,
+            "preserve-authoritative-offhand",
+            vec![ScriptInventoryResourceDelta::try_new("minecraft:apple", -1).unwrap()],
+        ),
+        &mut owner_inventory,
+        &mut persisted,
+        &items,
+        &facts,
+    )
+    .unwrap();
+
+    assert_eq!(persisted.inventory.slots[9], ItemStack::new(apple, 1));
+    assert_eq!(
+        persisted.inventory.slots[PlayerInventory::OFFHAND_SLOT],
+        ItemStack::new(apple, 5)
+    );
+    assert_eq!(owner_inventory.slots, persisted.inventory.slots);
+}
+
+#[test]
 fn owner_inventory_transaction_rejects_full_inventory_without_mutation() {
     let items = mc_data::items::solaris_required_items();
     let facts = mc_data::item_components::solaris_required_item_facts();

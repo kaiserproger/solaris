@@ -29,6 +29,7 @@ pub mod dashboard_stats;
 #[cfg(test)]
 #[path = "dashboard_tests.rs"]
 mod dashboard_tests;
+pub mod startup_data;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -245,51 +246,17 @@ pub struct SimulationSection {
     pub friendly_spawn_interval_ticks: u64,
     #[serde(default = "default_hostile_spawn_interval_ticks")]
     pub hostile_spawn_interval_ticks: u64,
-    #[serde(default = "default_friendly_spawn_cap")]
-    pub friendly_spawn_cap: usize,
-    #[serde(default = "default_aquatic_spawn_cap")]
-    pub aquatic_spawn_cap: usize,
-    #[serde(default = "default_hostile_spawn_cap")]
-    pub hostile_spawn_cap: usize,
     #[serde(default = "default_friendly_spawn_chunk_budget")]
     pub friendly_spawn_chunk_budget: usize,
     #[serde(default = "default_hostile_spawn_chunk_budget")]
     pub hostile_spawn_chunk_budget: usize,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BundledPlugin {
-    BasicEconomy,
-    ColonyVillagerScaffold,
-    GeologicalMines,
-    LandClaims,
-    OnlineRoster,
-    SettlementPrototype,
-}
-
-impl BundledPlugin {
-    #[must_use]
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::BasicEconomy => "basic-economy",
-            Self::ColonyVillagerScaffold => "colony-villager-scaffold",
-            Self::GeologicalMines => "geological-mines",
-            Self::LandClaims => "land-claims",
-            Self::OnlineRoster => "online-roster",
-            Self::SettlementPrototype => "settlement-prototype",
-        }
-    }
-}
-
-/// Optional external and server-bundled Luau plugins.
+/// Optional external Luau plugins, loaded from a deployed plugin directory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginSection {
     #[serde(default)]
     pub directory: Option<PathBuf>,
-    #[serde(default)]
-    pub bundled: Vec<BundledPlugin>,
     #[serde(default)]
     pub strict: bool,
     #[serde(default)]
@@ -851,9 +818,6 @@ impl Default for SimulationSection {
             save_interval_ticks: policy.save_interval_ticks,
             friendly_spawn_interval_ticks: policy.friendly_spawn_interval_ticks,
             hostile_spawn_interval_ticks: policy.hostile_spawn_interval_ticks,
-            friendly_spawn_cap: policy.friendly_spawn_cap,
-            aquatic_spawn_cap: policy.aquatic_spawn_cap,
-            hostile_spawn_cap: policy.hostile_spawn_cap,
             friendly_spawn_chunk_budget: policy.friendly_spawn_chunk_budget,
             hostile_spawn_chunk_budget: policy.hostile_spawn_chunk_budget,
         }
@@ -873,9 +837,6 @@ impl SimulationSection {
             save_interval_ticks: self.save_interval_ticks.max(1),
             friendly_spawn_interval_ticks: self.friendly_spawn_interval_ticks,
             hostile_spawn_interval_ticks: self.hostile_spawn_interval_ticks,
-            friendly_spawn_cap: self.friendly_spawn_cap,
-            aquatic_spawn_cap: self.aquatic_spawn_cap,
-            hostile_spawn_cap: self.hostile_spawn_cap,
             friendly_spawn_chunk_budget: self.friendly_spawn_chunk_budget,
             hostile_spawn_chunk_budget: self.hostile_spawn_chunk_budget,
             seed: seed as u64,
@@ -980,18 +941,6 @@ fn default_friendly_spawn_interval_ticks() -> u64 {
 
 fn default_hostile_spawn_interval_ticks() -> u64 {
     mc_net::RandomTickPolicy::default().hostile_spawn_interval_ticks
-}
-
-fn default_friendly_spawn_cap() -> usize {
-    mc_net::RandomTickPolicy::default().friendly_spawn_cap
-}
-
-fn default_aquatic_spawn_cap() -> usize {
-    mc_net::RandomTickPolicy::default().aquatic_spawn_cap
-}
-
-fn default_hostile_spawn_cap() -> usize {
-    mc_net::RandomTickPolicy::default().hostile_spawn_cap
 }
 
 fn default_friendly_spawn_chunk_budget() -> usize {
@@ -1233,9 +1182,6 @@ mod tests {
         assert_eq!(cfg.simulation.save_interval_ticks, 1200);
         assert_eq!(cfg.simulation.friendly_spawn_interval_ticks, 400);
         assert_eq!(cfg.simulation.hostile_spawn_interval_ticks, 20);
-        assert_eq!(cfg.simulation.friendly_spawn_cap, 32);
-        assert_eq!(cfg.simulation.aquatic_spawn_cap, 20);
-        assert_eq!(cfg.simulation.hostile_spawn_cap, 70);
         assert_eq!(cfg.simulation.friendly_spawn_chunk_budget, 48);
         assert_eq!(cfg.simulation.hostile_spawn_chunk_budget, 4);
         assert_eq!(cfg.chunk_pipeline.chunk_send_rate, 8);
@@ -1351,17 +1297,12 @@ mod tests {
 
             [plugins]
             directory = "plugins"
-            bundled = ["basic-economy", "online-roster"]
             strict = true
             expected = ["basic-economy", "online-roster"]
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
 
         assert_eq!(cfg.plugins.directory, Some(PathBuf::from("plugins")));
-        assert_eq!(
-            cfg.plugins.bundled,
-            [BundledPlugin::BasicEconomy, BundledPlugin::OnlineRoster]
-        );
         assert!(cfg.plugins.strict);
         assert_eq!(
             cfg.plugins.expected,
@@ -1670,9 +1611,6 @@ mod tests {
             save_interval_ticks = 40
             friendly_spawn_interval_ticks = 800
             hostile_spawn_interval_ticks = 0
-            friendly_spawn_cap = 48
-            aquatic_spawn_cap = 24
-            hostile_spawn_cap = 64
             friendly_spawn_chunk_budget = 20
             hostile_spawn_chunk_budget = 6
         "#;
@@ -1682,9 +1620,6 @@ mod tests {
         assert_eq!(cfg.simulation.save_interval_ticks, 40);
         assert_eq!(cfg.simulation.friendly_spawn_interval_ticks, 800);
         assert_eq!(cfg.simulation.hostile_spawn_interval_ticks, 0);
-        assert_eq!(cfg.simulation.friendly_spawn_cap, 48);
-        assert_eq!(cfg.simulation.aquatic_spawn_cap, 24);
-        assert_eq!(cfg.simulation.hostile_spawn_cap, 64);
         assert_eq!(cfg.simulation.friendly_spawn_chunk_budget, 20);
         assert_eq!(cfg.simulation.hostile_spawn_chunk_budget, 6);
     }
@@ -1786,9 +1721,6 @@ mod tests {
             save_interval_ticks: 0,
             friendly_spawn_interval_ticks: 0,
             hostile_spawn_interval_ticks: 0,
-            friendly_spawn_cap: usize::MAX,
-            aquatic_spawn_cap: usize::MAX,
-            hostile_spawn_cap: usize::MAX,
             friendly_spawn_chunk_budget: 0,
             hostile_spawn_chunk_budget: usize::MAX,
         };
@@ -1801,9 +1733,6 @@ mod tests {
         assert_eq!(policy.save_interval_ticks, 1);
         assert_eq!(policy.friendly_spawn_interval_ticks, 0);
         assert_eq!(policy.hostile_spawn_interval_ticks, 0);
-        assert_eq!(policy.friendly_spawn_cap, mc_net::MAX_NATURAL_SPAWN_CAP);
-        assert_eq!(policy.aquatic_spawn_cap, mc_net::MAX_NATURAL_SPAWN_CAP);
-        assert_eq!(policy.hostile_spawn_cap, mc_net::MAX_NATURAL_SPAWN_CAP);
         assert_eq!(policy.friendly_spawn_chunk_budget, 1);
         assert_eq!(
             policy.hostile_spawn_chunk_budget,

@@ -6,8 +6,8 @@ use mc_entity::runtime_26_1_2::{PublicationFact, TargetKind};
 use mc_entity::{
     AttributeKind, AttributeSet, EntityDamageRequest, EntityEffectOperation, EntityEffectRejection,
     EntityEffectRequest, EntityEffectResult, EntityId, EntityInputCommand, EntityItemStack,
-    EntityLifecycle, EntityPhysicsResult, EntityRuntime, EntitySnapshot, EntityStage, EntityStore,
-    GoalState, Rotation, SpawnEntity, Vec3,
+    EntityKinematics, EntityLifecycle, EntityPhysicsResult, EntityRuntime, EntitySnapshot,
+    EntityStage, EntityStore, GoalState, Rotation, SpawnEntity, Vec3,
 };
 use uuid::Uuid;
 
@@ -179,6 +179,65 @@ fn staged_ecs_runtime_mutations_preserve_state() {
     }
 
     assert_eq!(runtime.snapshot(id), Some(expected));
+}
+
+#[test]
+fn large_unique_physics_batch_uses_ecs_query_and_preserves_positions() {
+    let mut store = EntityStore::new();
+    let ids = (0..257)
+        .map(|index| {
+            store.spawn(SpawnEntity::new(
+                4,
+                "minecraft:cow",
+                Vec3::new(index as f64 + 0.5, 64.0, 0.5),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let states = ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| EntityKinematics {
+            id,
+            position: Vec3::new(index as f64 + 1.5, 64.0, 0.5),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::new(0.25, 0.0, 0.0),
+            on_ground: true,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(store.apply_kinematics(states), ids.len());
+    assert_eq!(
+        store.snapshot(ids[0]).unwrap().position,
+        Vec3::new(1.5, 64.0, 0.5)
+    );
+    assert_eq!(
+        store.snapshot(ids[256]).unwrap().position,
+        Vec3::new(257.5, 64.0, 0.5)
+    );
+}
+
+#[test]
+fn duplicate_large_physics_batch_keeps_ordered_fall_distance_updates() {
+    let mut store = EntityStore::new();
+    let id = store.spawn(SpawnEntity::new(
+        4,
+        "minecraft:cow",
+        Vec3::new(0.5, 64.0, 0.5),
+    ));
+    let states = (1..=257)
+        .map(|step| EntityKinematics {
+            id,
+            position: Vec3::new(0.5, 64.0 - step as f64, 0.5),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::new(0.0, -1.0, 0.0),
+            on_ground: false,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(store.apply_kinematics(states), 257);
+    let snapshot = store.snapshot(id).unwrap();
+    assert_eq!(snapshot.position, Vec3::new(0.5, -193.0, 0.5));
+    assert_eq!(snapshot.retained.fall_distance, 257.0);
 }
 
 #[test]

@@ -86,10 +86,22 @@ pub struct ResidentScheduledBlockTickPlan<'a> {
     pub leaf_trigger_tick: Option<u64>,
 }
 
-/// A staged scheduled-block-tick change spanning more than one resident
-/// region. The transaction owns immutable source snapshots and mutable staged
-/// snapshots; no read or tick view is published until durability succeeds in
-/// [`Self::commit_durably`].
+/// New block-tick schedule accompanying a cross-region storage commit.
+///
+/// Unlike [`ResidentScheduledBlockTickPlan`], no ticks are consumed; entries
+/// in [`Self::scheduled_block_ticks`] are admitted only for positions whose
+/// block actually changed in the same batch.
+pub(crate) struct ResidentCrossRegionBlockEditPlan<'a> {
+    pub edits: &'a [ResidentBlockEdit],
+    pub preconditions: &'a [ResidentBlockPrecondition],
+    pub scheduled_block_ticks: &'a [ScheduledBlockTick],
+    pub light_table: Option<&'a BlockLightTable>,
+    pub leaf_trigger_tick: Option<u64>,
+}
+
+/// Staged block changes with source-fenced, all-or-nothing publication.
+/// The transaction retains source snapshots until commit; [`Self::commit_durably`]
+/// additionally requires persistence to succeed before publication.
 pub struct ResidentCrossRegionScheduledBlockTickTransaction {
     resident: ResidentChunkStore,
     chunks: Vec<ResidentCrossRegionStagedChunk>,
@@ -1671,24 +1683,63 @@ impl WorldMutationView {
         decision_id: Option<u64>,
         plan: &ResidentScheduledBlockTickPlan<'_>,
     ) -> ResidentCrossRegionScheduledBlockTickPrepareResult {
+        self.prepare_cross_region_block_edit_inner(
+            decision_id,
+            plan.consumed_ticks,
+            &ResidentCrossRegionBlockEditPlan {
+                edits: plan.edits,
+                preconditions: plan.preconditions,
+                scheduled_block_ticks: &[],
+                light_table: plan.light_table,
+                leaf_trigger_tick: plan.leaf_trigger_tick,
+            },
+        )
+    }
+
+    /// Prepare a cross-region block-edit storage commit without mutating the
+    /// resident store or publishing a world snapshot. The returned transaction
+    /// commits through
+    /// [`ResidentCrossRegionScheduledBlockTickTransaction::commit_nondurably`],
+    /// which shares source fencing and publication with the durable path but
+    /// performs no persistence.
+    pub(crate) fn prepare_cross_region_block_edit_transaction(
+        &self,
+        plan: &ResidentCrossRegionBlockEditPlan<'_>,
+    ) -> ResidentCrossRegionScheduledBlockTickPrepareResult {
+        self.prepare_cross_region_block_edit_inner(None, &[], plan)
+    }
+
+    fn prepare_cross_region_block_edit_inner(
+        &self,
+        decision_id: Option<u64>,
+        consumed_ticks: &[ScheduledBlockTick],
+        plan: &ResidentCrossRegionBlockEditPlan<'_>,
+    ) -> ResidentCrossRegionScheduledBlockTickPrepareResult {
+        let &ResidentCrossRegionBlockEditPlan {
+            edits,
+            preconditions,
+            scheduled_block_ticks,
+            light_table,
+            leaf_trigger_tick,
+        } = plan;
         let publication = self.resident.read_view.publication_state();
         let _mutation = publication.mutation();
         let mut required = HashSet::new();
-        required.extend(plan.edits.iter().map(|edit| chunk_pos_of(edit.pos)));
+        required.extend(edits.iter().map(|edit| chunk_pos_of(edit.pos)));
         required.extend(
-            plan.preconditions
+            preconditions
                 .iter()
                 .map(|precondition| chunk_pos_of(precondition.pos)),
         );
+        required.extend(consumed_ticks.iter().map(|tick| chunk_pos_of(tick.pos)));
         required.extend(
-            plan.consumed_ticks
+            scheduled_block_ticks
                 .iter()
                 .map(|tick| chunk_pos_of(tick.pos)),
         );
-
         let mut positions = required.iter().copied().collect::<Vec<_>>();
-        if plan.leaf_trigger_tick.is_some() {
-            for edit in plan.edits {
+        if leaf_trigger_tick.is_some() {
+            for edit in edits {
                 let Some(neighbours) = block_neighbours(edit.pos) else {
                     return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
                 };
@@ -1748,8 +1799,10 @@ impl WorldMutationView {
                 }
                 chunks.push(ResidentCrossRegionStagedChunk {
                     position,
+                    // Share the source snapshot until `Arc::make_mut` copies on
+                    // the first staged mutation instead of deep-cloning eagerly.
                     expected: Some(Arc::clone(chunk)),
-                    staged: Some(Arc::new((**chunk).clone())),
+                    staged: Some(Arc::clone(chunk)),
                 });
             }
         }
@@ -1761,7 +1814,7 @@ impl WorldMutationView {
             )
         });
 
-        for precondition in plan.preconditions {
+        for precondition in preconditions {
             let Some(chunk) = cross_region_staged_chunk(&chunks, chunk_pos_of(precondition.pos))
             else {
                 return ResidentCrossRegionScheduledBlockTickPrepareResult::Missing;
@@ -1781,7 +1834,7 @@ impl WorldMutationView {
         }
 
         let mut consumed_by_chunk = HashMap::<ChunkPos, Vec<ScheduledBlockTick>>::new();
-        for tick in plan.consumed_ticks {
+        for tick in consumed_ticks {
             consumed_by_chunk
                 .entry(chunk_pos_of(tick.pos))
                 .or_default()
@@ -1816,8 +1869,8 @@ impl WorldMutationView {
             touched.insert(position);
         }
 
-        let mut applied = Vec::with_capacity(plan.edits.len());
-        for edit in plan.edits {
+        let mut applied = Vec::with_capacity(edits.len());
+        for edit in edits {
             let position = chunk_pos_of(edit.pos);
             let chunk = cross_region_staged_chunk_mut(&mut chunks, position)
                 .expect("preflighted resident chunk");
@@ -1830,8 +1883,7 @@ impl WorldMutationView {
                 .get_block(local_x, edit.pos.y, local_z)
                 .expect("preflighted block position");
             let preserve_light = edit.preserve_light
-                || plan
-                    .light_table
+                || light_table
                     .is_some_and(|table| same_light_behaviour(table, previous, edit.new_state));
             let previous_light = if previous != edit.new_state && !preserve_light {
                 ChunkLight::from_chunk(chunk.staged.as_ref().expect("required staged chunk"))
@@ -1854,7 +1906,7 @@ impl WorldMutationView {
             .expect("preflighted block position");
             if previous != edit.new_state {
                 prune_incompatible_block_entities(chunk, edit.pos, &registry, edit.new_state);
-                if !preserve_light && let Some(light_table) = plan.light_table {
+                if !preserve_light && let Some(light_table) = light_table {
                     chunk.update_highest_opaque_column(local_x, local_z, light_table);
                 }
                 if let Some(decision_id) = decision_id {
@@ -1875,7 +1927,23 @@ impl WorldMutationView {
             }
         }
 
-        if let Some(trigger_tick) = plan.leaf_trigger_tick {
+        for tick in scheduled_block_ticks {
+            if !applied.iter().any(|edit| edit.pos == tick.pos) {
+                continue;
+            }
+            let chunk_position = chunk_pos_of(tick.pos);
+            let chunk = cross_region_staged_chunk_mut(&mut chunks, chunk_position)
+                .expect("preflighted scheduled-tick chunk");
+            let chunk = Arc::make_mut(chunk.staged.as_mut().expect("required staged chunk"));
+            if chunk.schedule_block_tick(tick.clone()) {
+                if let Some(decision_id) = decision_id {
+                    chunk.set_world_journal_lsn(decision_id);
+                }
+                touched.insert(chunk_position);
+            }
+        }
+
+        if let Some(trigger_tick) = leaf_trigger_tick {
             let mut leaves = Vec::new();
             for edit in &applied {
                 for position in block_neighbours(edit.pos).expect("preflighted neighbours") {
@@ -2430,6 +2498,19 @@ impl ResidentCrossRegionScheduledBlockTickTransaction {
         }
         let applied = self.publish(&publication, transaction);
         ResidentCrossRegionScheduledBlockTickCommitResult::Applied(applied)
+    }
+
+    /// Verify staged sources and publish without any persistence step. Shares
+    /// source fencing and publication with [`Self::commit_durably`]; for
+    /// headless storage commits that own no journal.
+    pub(crate) fn commit_nondurably(self) -> ResidentBlockEditBatchResult {
+        let publication = self.resident.read_view.publication_state();
+        let transaction = publication.transaction();
+        if let Some(result) = self.verify_sources() {
+            return result;
+        }
+        let applied = self.publish(&publication, transaction);
+        ResidentBlockEditBatchResult::Applied(applied)
     }
 
     fn verify_sources(&self) -> Option<ResidentBlockEditBatchResult> {

@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use mc_data::block_light::BlockLightTable;
 use mc_protocol::packets::play::BlockChangedAck;
-use mc_world::light::ChunkLight;
-use mc_world::{ChunkPos, ScheduledBlockTick};
+use mc_world::{
+    ResidentBlockEdit, ResidentBlockEditBatchResult, ResidentBlockPrecondition, ScheduledBlockTick,
+};
 use tokio::io::AsyncWriteExt;
 #[cfg(not(test))]
 use tracing::debug;
@@ -21,7 +22,7 @@ use super::campfire::{CampfireCookingState, is_campfire_block};
 use super::lighting::collect_incremental_light_updates_for_applied_edits;
 use super::{
     AppliedBlockEdit, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition, InteractionState,
-    block_edit_changes_light, dispatch_campfire_block_entity_update,
+    dispatch_campfire_block_entity_update,
 };
 
 #[cfg(test)]
@@ -51,21 +52,7 @@ pub(super) fn apply_block_edit_batch_with_scheduled_ticks_to_storage_conditional
     preconditions: &[BlockEditPrecondition],
     scheduled_block_ticks: &[ScheduledBlockTick],
 ) -> Option<BlockEditBatchOutcome> {
-    let outcome =
-        apply_block_edit_batch_to_storage_conditionally(storage, table, edits, preconditions)?;
-    let applied_positions = outcome
-        .applied
-        .iter()
-        .map(|edit| edit.pos)
-        .collect::<HashSet<_>>();
-    for tick in scheduled_block_ticks {
-        if applied_positions.contains(&tick.pos)
-            && let Err(error) = storage.schedule_block_tick(tick.clone())
-        {
-            warn!(%error, pos = ?tick.pos, "simulation block tick scheduling failed");
-        }
-    }
-    Some(outcome)
+    apply_storage_block_edits(storage, table, edits, preconditions, scheduled_block_ticks)
 }
 
 pub(super) fn apply_block_edit_batch_to_storage_conditionally(
@@ -74,46 +61,45 @@ pub(super) fn apply_block_edit_batch_to_storage_conditionally(
     edits: &[BlockEdit],
     preconditions: &[BlockEditPrecondition],
 ) -> Option<BlockEditBatchOutcome> {
-    let mut outcome = BlockEditBatchOutcome::default();
-    for precondition in preconditions {
-        let current = match storage.get_block(precondition.pos) {
-            Ok(current) => current,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    x = precondition.pos.x,
-                    y = precondition.pos.y,
-                    z = precondition.pos.z,
-                    "conditional block edit precondition read failed"
-                );
-                return None;
-            }
-        };
-        if current != Some(precondition.expected_state)
-            || storage.block_mutation_token(precondition.pos) != Some(precondition.expected_token)
-        {
-            return None;
-        }
-    }
-    for edit in edits {
-        apply_block_edit_to_storage(storage, table, edit, &mut outcome);
-    }
-    Some(outcome)
+    apply_storage_block_edits(storage, table, edits, preconditions, &[])
 }
 
-pub(super) fn apply_opaque_block_entity_to_storage_conditionally(
+fn apply_storage_block_edits(
     storage: &mut mc_world::WorldStorage,
-    position: mc_world::BlockPos,
-    expected_state: mc_world::BlockStateId,
-    expected_token: mc_world::BlockMutationToken,
-    bytes: Vec<u8>,
-) -> Result<bool, mc_world::WorldError> {
-    if storage.get_block(position)? != Some(expected_state)
-        || storage.block_mutation_token(position) != Some(expected_token)
-    {
-        return Ok(false);
+    table: Option<&BlockLightTable>,
+    edits: &[BlockEdit],
+    preconditions: &[BlockEditPrecondition],
+    scheduled_block_ticks: &[ScheduledBlockTick],
+) -> Option<BlockEditBatchOutcome> {
+    let resident_edits = resident_block_edits(edits);
+    let resident_preconditions = resident_block_preconditions(preconditions);
+    // Leaf ticks stay with their existing owners (the simulation coordinator
+    // schedules them near applied edits), so the storage commit must not
+    // duplicate them.
+    match storage.apply_block_edits_conditionally(
+        &resident_edits,
+        &resident_preconditions,
+        scheduled_block_ticks,
+        table,
+        None,
+    ) {
+        Ok(ResidentBlockEditBatchResult::Applied(applied)) => {
+            resident_block_edit_result_outcome(ResidentBlockEditBatchResult::Applied(applied))
+        }
+        Ok(ResidentBlockEditBatchResult::Stale) => None,
+        Ok(ResidentBlockEditBatchResult::Missing) => {
+            warn!("conditional block edit rejected: position is not loaded");
+            None
+        }
+        Ok(ResidentBlockEditBatchResult::CrossRegion) => {
+            warn!("conditional block edit rejected: cross-region batch");
+            None
+        }
+        Err(error) => {
+            warn!(%error, "conditional block edit storage commit failed");
+            None
+        }
     }
-    storage.set_opaque_block_entity(position, bytes)
 }
 
 fn replaced_campfire_with_non_campfire(state: &InteractionState, edit: &AppliedBlockEdit) -> bool {
@@ -127,78 +113,114 @@ pub(super) fn apply_block_edit_to_storage(
     edit: &BlockEdit,
     outcome: &mut BlockEditBatchOutcome,
 ) {
-    let pos = edit.pos;
-    let chunk_pos = ChunkPos {
-        x: pos.x.div_euclid(16),
-        z: pos.z.div_euclid(16),
-    };
-    let preserves_baked_light = table.is_some_and(|table| {
-        storage
-            .get_cached_block(pos)
-            .is_some_and(|previous| !block_edit_changes_light(table, previous, edit.new_state))
-    });
-    let previous_light = if table.is_some() && !preserves_baked_light {
-        match storage.get_chunk(chunk_pos) {
-            Ok(Some(chunk)) => ChunkLight::from_chunk(chunk),
-            Ok(None) => None,
-            Err(err) => {
-                warn!(error = %err, cx = chunk_pos.x, cz = chunk_pos.z, "pre-edit baked light read failed");
-                None
-            }
+    let resident_edit = [ResidentBlockEdit {
+        pos: edit.pos,
+        new_state: edit.new_state,
+        // The resident kernel derives light preservation from the actual
+        // previous state plus the light table; no precondition scan needed.
+        preserve_light: false,
+    }];
+    let applied = match storage.apply_block_edits_conditionally(
+        &resident_edit,
+        &[],
+        &[],
+        table,
+        None,
+    ) {
+        Ok(ResidentBlockEditBatchResult::Applied(applied)) => applied,
+        Ok(
+            ResidentBlockEditBatchResult::Stale
+            | ResidentBlockEditBatchResult::Missing
+            | ResidentBlockEditBatchResult::CrossRegion,
+        ) => return,
+        Err(error) => {
+            warn!(error = %error, x = edit.pos.x, y = edit.pos.y, z = edit.pos.z, "set_block_at failed; skipping edit");
+            return;
         }
-    } else {
-        None
     };
-    let edit_result = if preserves_baked_light {
-        storage.set_block_at_preserving_light(pos, edit.new_state)
-    } else {
-        storage.set_block_at(pos, edit.new_state)
+    let Some(additional) =
+        resident_block_edit_result_outcome(ResidentBlockEditBatchResult::Applied(applied))
+    else {
+        return;
     };
-    match edit_result {
-        Ok(Some(previous)) if previous != edit.new_state => {
-            let changes_light = table
-                .is_some_and(|table| block_edit_changes_light(table, previous, edit.new_state));
-            if changes_light
-                && let Some(table) = table
-                && let Err(err) = storage.update_highest_opaque_at(pos, table)
-            {
-                warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "highest-opaque heightmap update failed");
-            }
-            outcome.applied.push(AppliedBlockEdit {
-                pos,
-                previous,
-                new_state: edit.new_state,
-            });
-            if let Some(token) = storage.block_mutation_token(pos) {
-                outcome.resulting_tokens.insert(pos, token);
-            }
-            outcome.deltas.push(BlockDelta {
-                x: pos.x,
-                y: pos.y,
-                z: pos.z,
-                state_id: edit.new_state,
-            });
-            let chunk = (pos.x.div_euclid(16), pos.z.div_euclid(16));
-            outcome.edit_chunks.insert(chunk);
-            if changes_light {
-                outcome.light_edit_chunks.insert(chunk);
-                if let Some(light) = previous_light {
-                    outcome.previous_light_chunks.entry(chunk).or_insert(light);
-                }
-            } else if let Some(light) = previous_light {
-                match storage.set_baked_light(chunk_pos, &light) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        warn!(error = %err, cx = chunk_pos.x, cz = chunk_pos.z, "light-inert edit baked light restore failed");
-                    }
-                }
-            }
+    outcome.applied.extend(additional.applied);
+    outcome.resulting_tokens.extend(additional.resulting_tokens);
+    outcome.deltas.extend(additional.deltas);
+    outcome.edit_chunks.extend(additional.edit_chunks);
+    outcome
+        .light_edit_chunks
+        .extend(additional.light_edit_chunks);
+    for (chunk, light) in additional.previous_light_chunks {
+        outcome.previous_light_chunks.entry(chunk).or_insert(light);
+    }
+    debug_assert!(additional.cleared_campfires.is_empty());
+    debug_assert!(additional.precomputed_light_updates.is_none());
+    debug_assert!(additional.pending_light_sources.is_none());
+}
+
+pub(super) fn resident_block_edits(edits: &[BlockEdit]) -> Vec<ResidentBlockEdit> {
+    edits
+        .iter()
+        .map(|edit| ResidentBlockEdit {
+            pos: edit.pos,
+            new_state: edit.new_state,
+            // The resident kernel derives light preservation from the actual
+            // previous state plus the light table; precondition scans here
+            // would only duplicate that work with potentially stale state.
+            preserve_light: false,
+        })
+        .collect()
+}
+
+pub(super) fn resident_block_preconditions(
+    preconditions: &[BlockEditPrecondition],
+) -> Vec<ResidentBlockPrecondition> {
+    preconditions
+        .iter()
+        .map(|precondition| ResidentBlockPrecondition {
+            pos: precondition.pos,
+            expected_state: precondition.expected_state,
+            expected_token: precondition.expected_token,
+        })
+        .collect()
+}
+
+pub(super) fn resident_block_edit_result_outcome(
+    result: ResidentBlockEditBatchResult,
+) -> Option<BlockEditBatchOutcome> {
+    let ResidentBlockEditBatchResult::Applied(applied) = result else {
+        return None;
+    };
+    let mut outcome = BlockEditBatchOutcome::default();
+    for edit in applied {
+        let chunk = (edit.pos.x.div_euclid(16), edit.pos.z.div_euclid(16));
+        let changes_light = edit.changes_light;
+        if let Some(previous_light) = edit.previous_light {
+            outcome
+                .previous_light_chunks
+                .entry(chunk)
+                .or_insert(previous_light);
         }
-        Ok(Some(_)) | Ok(None) => {}
-        Err(err) => {
-            warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "set_block_at failed; skipping edit");
+        outcome.applied.push(AppliedBlockEdit {
+            pos: edit.pos,
+            previous: edit.previous,
+            new_state: edit.new_state,
+        });
+        outcome
+            .resulting_tokens
+            .insert(edit.pos, edit.resulting_token);
+        outcome.deltas.push(BlockDelta {
+            x: edit.pos.x,
+            y: edit.pos.y,
+            z: edit.pos.z,
+            state_id: edit.new_state,
+        });
+        outcome.edit_chunks.insert(chunk);
+        if changes_light {
+            outcome.light_edit_chunks.insert(chunk);
         }
     }
+    Some(outcome)
 }
 
 pub(super) async fn send_loaded_block_edit_resyncs<W>(

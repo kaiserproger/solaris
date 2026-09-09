@@ -78,12 +78,6 @@ impl SessionRegistry {
         actor_session: SessionId,
         plan: &CampfireUsePlan,
     ) -> Result<Option<CommittedCampfireUse>, SimulationRequestError> {
-        if storage.get_cached_block(plan.position) != Some(plan.expected_state)
-            || storage.block_mutation_token(plan.position) != Some(plan.expected_token)
-        {
-            return Ok(None);
-        }
-
         let inner = self.lock_inner("commit campfire use");
         if !inner.sessions.contains_key(&actor_session) {
             return Ok(None);
@@ -117,9 +111,14 @@ impl SessionRegistry {
         if authoritative != plan.expected_cooking {
             return Ok(None);
         }
-        match storage.set_opaque_block_entity(plan.position, plan.persistent_bytes.clone()) {
+        match storage.commit_opaque_block_entity_conditionally(
+            plan.position,
+            plan.expected_state,
+            plan.expected_token,
+            plan.persistent_bytes.clone(),
+        ) {
             Ok(true) => {}
-            Ok(false) => return Err(SimulationRequestError::WorldMutationFailed),
+            Ok(false) => return Ok(None),
             Err(error) => {
                 warn!(%error, position = ?plan.position, "campfire use persistence failed");
                 return Err(SimulationRequestError::WorldMutationFailed);

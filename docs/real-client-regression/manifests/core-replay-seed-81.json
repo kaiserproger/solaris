@@ -25,9 +25,9 @@
     "automation-driver.txt"
   ],
   "automation_runner": {
-    "script": "tools/run-core-replay-client-gate.sh",
-    "delegates_to": "tools/run-real-client-regression.sh",
-    "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "script": "python3 -m tools.harness run replay",
+    "delegates_to": "tools/harness/backends/regression.sh",
+    "client_adapter": "../solaris-loader/gradlew -p ../solaris-loader --no-configuration-cache :fabric-agent:runClientAgent",
     "client_adapter_source": "auto-gradle-runclient",
     "default_agent_scenario": "core-actions-seed-81",
     "passing_gate": "agent-run real-client"

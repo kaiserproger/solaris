@@ -73,29 +73,49 @@ impl SessionRegistry {
         world_read: Option<&WorldReadView>,
         materials: Option<&BlockMaterialIds>,
     ) -> (VillageDefenseReport, Vec<VisibilityDispatch>) {
-        let active_ids = self.active_simulation_entities.load_full();
-        if active_ids.is_empty() {
+        let active_chunks = self.active_simulation_chunks.load_full();
+        if active_chunks.is_empty() {
             return (VillageDefenseReport::default(), Vec::new());
         }
-        {
-            let inner = self.lock_inner("check active village defence actors");
-            if !inner
-                .villager_entities
+        let periodic_village_work = tick.is_multiple_of(VILLAGE_DEFENSE_TICK_INTERVAL);
+        let projection_ids = {
+            let inner = self.lock_inner("select active village defence actors");
+            let is_active = |entity_id: EntityId| {
+                self.simulation_inputs
+                    .entity_chunk(entity_id)
+                    .is_some_and(|chunk| active_chunks.contains(&chunk))
+            };
+            let active_golems = inner
+                .iron_golem_entities
                 .iter()
-                .any(|entity_id| active_ids.contains(entity_id))
-                && !inner
-                    .iron_golem_entities
-                    .iter()
-                    .any(|entity_id| active_ids.contains(entity_id))
-            {
+                .copied()
+                .filter(|&entity| is_active(entity))
+                .collect::<Vec<_>>();
+            let active_hostiles = inner
+                .hostile_entities
+                .iter()
+                .copied()
+                .filter(|&entity| is_active(entity))
+                .collect::<Vec<_>>();
+            if active_golems.is_empty() && active_hostiles.is_empty() {
                 return (VillageDefenseReport::default(), Vec::new());
             }
-        }
-
+            let mut ids = active_golems.into_iter().collect::<HashSet<_>>();
+            ids.extend(active_hostiles);
+            if periodic_village_work {
+                ids.extend(
+                    inner
+                        .villager_entities
+                        .iter()
+                        .copied()
+                        .filter(|&entity| is_active(entity)),
+                );
+            }
+            ids
+        };
         let projections = self
             .lock_entities("project village defence candidates")
-            .simulation_projections_for_ids(&active_ids);
-
+            .simulation_projections_for_ids(&projection_ids);
         let mut report = VillageDefenseReport::default();
         let mut dispatches = Vec::new();
         if tick.is_multiple_of(GOLEM_SENSOR_INTERVAL) {
@@ -106,13 +126,28 @@ impl SessionRegistry {
             );
         }
         if tick.is_multiple_of(VILLAGE_DEFENSE_TICK_INTERVAL) {
-            let spawns = plan_golem_spawns(
+            let mut spawns = plan_golem_spawns(
                 &projections,
                 tick,
                 world_read,
                 materials,
                 MAX_GOLEM_SPAWNS_PER_TICK,
             );
+            if !spawns.is_empty() {
+                let collision_projection_ids = self
+                    .simulation_inputs
+                    .entity_candidates_in_chunks(&active_chunks);
+                let collision_projections = self
+                    .lock_entities("project village golem spawn collisions")
+                    .simulation_projections_for_ids(&collision_projection_ids);
+                spawns = plan_golem_spawns(
+                    &collision_projections,
+                    tick,
+                    world_read,
+                    materials,
+                    MAX_GOLEM_SPAWNS_PER_TICK,
+                );
+            }
             for plan in spawns {
                 if let Some(spawn_dispatches) =
                     commit_golem_spawn(self, plan, tick, iron_golem_type_id)
@@ -799,9 +834,16 @@ mod tests {
                 .attributes
                 .set_base(AttributeKind::MaxHealth, max_health);
         }
-        registry
+        let id = registry
             .lock_entities("spawn village defence mob")
-            .spawn(entity)
+            .spawn(entity);
+        if is_hostile_entity(type_name) {
+            registry
+                .lock_inner("index village defence hostile fixture")
+                .hostile_entities
+                .insert(id);
+        }
+        id
     }
 
     #[test]

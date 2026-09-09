@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "screens": [{
+  "ui": [{
     "id": "ruby-live:showcase",
     "title": "Ruby Loader Fixture",
     "body": "Owner ruby-live: custom item, block carrier, asset pack, and interaction.",
@@ -27,11 +27,42 @@
     "path": "assets/ruby-live/models/block/ruby_block.json",
     "sha256": "@BLOCK_SHA256@",
     "size_bytes": @BLOCK_SIZE@
+  }, {
+    "id": "ruby-live:tone_audio",
+    "path": "assets/ruby-live/sounds/tone.ogg",
+    "sha256": "@SOUND_SHA256@",
+    "size_bytes": @SOUND_SIZE@
   }],
+  "sounds": [{"id": "ruby-live:tone"}],
   "interactions": [{
     "id": "ruby-live:confirm",
-    "screen_id": "ruby-live:showcase",
+    "ui_id": "ruby-live:showcase",
     "label": "Confirm Ruby",
     "payload": "ruby-confirmed"
+  }, {
+    "id": "ruby-live:key",
+    "key": "key.keyboard.g",
+    "label": "Ruby action",
+    "payload": "ruby-key"
+  }, {
+    "id": "ruby-live:jump",
+    "key": "key.keyboard.space",
+    "label": "Observe jump",
+    "payload": "ruby-jump"
+  }, {
+    "id": "ruby-live:escape",
+    "key": "key.keyboard.escape",
+    "label": "Observe menu boundary",
+    "payload": "ruby-escape"
+  }, {
+    "id": "ruby-live:f2",
+    "key": "key.keyboard.f2",
+    "label": "Observe screenshot",
+    "payload": "ruby-f2"
+  }, {
+    "id": "ruby-live:f11",
+    "key": "key.keyboard.f11",
+    "label": "Observe fullscreen",
+    "payload": "ruby-f11"
   }]
 }

@@ -207,7 +207,7 @@ where
         return Ok(false);
     }
     if let Some(expected_target) = expected_target {
-        let Some(held) = state.inventory.held(state.selected_hotbar_slot).cloned() else {
+        let Some(held) = state.inventory.held(state.selected_hotbar_slot()).cloned() else {
             return Ok(false);
         };
         let max_damage = if held.is_empty() {
@@ -239,7 +239,7 @@ where
                 falling_block_entity_type_id: falling_block_entity_type_id(&state.entity_types),
                 loader_block_drop,
                 held: SurvivalBreakHeldItem {
-                    hotbar_slot: state.selected_hotbar_slot,
+                    hotbar_slot: state.selected_hotbar_slot(),
                     expected: held,
                     max_damage,
                 },
@@ -733,7 +733,7 @@ where
                 // Vanilla starts timing when START is handled. Capture before the
                 // owner snapshot await so owner-queue latency counts as progress.
                 let started_tick = state.sessions.simulation_tick();
-                let held_hotbar_slot = state.selected_hotbar_slot;
+                let held_hotbar_slot = state.selected_hotbar_slot();
                 let held_item = held_item_stack(state).cloned();
                 let (expected_target, progress_per_tick) =
                     mining_target_for(state, action.position, player_pose).await;
@@ -881,7 +881,7 @@ where
                             current_progress_per_tick,
                             action_position = action.position,
                             action_direction = ?action.direction,
-                            action_held_slot = state.selected_hotbar_slot,
+                            action_held_slot = state.selected_hotbar_slot(),
                             action_held_item = ?held_item_id(state),
                             pending_position,
                             pending_direction = ?pending_direction,
@@ -979,9 +979,10 @@ where
     )
     .await?;
     let held_after_break = held_item_stack(state).cloned();
+    let selected_hotbar_slot = state.selected_hotbar_slot();
     if changed
         && let Some(active) = state.pending_break.as_mut()
-        && active.held_hotbar_slot == state.selected_hotbar_slot
+        && active.held_hotbar_slot == selected_hotbar_slot
     {
         active.held_item = held_after_break;
     }

@@ -14,7 +14,7 @@ use super::prepared_chunks::{
 };
 use super::visibility::{
     ordered_session_recipient, refresh_loaded_chunk_for_session_locked,
-    refresh_unloaded_chunk_for_session_locked, refresh_visibility_locked, visibility_dispatches,
+    refresh_unloaded_chunks_for_session_locked, refresh_visibility_locked, visibility_dispatches,
 };
 use super::{
     SessionId, SessionRegistry, add_loaded_chunk_reference_locked,
@@ -219,19 +219,17 @@ impl SessionRegistry {
         let mut inner = self.lock_inner("mark chunks unloaded");
         let mut dispatches = Vec::new();
         if let Some(session) = inner.sessions.get_mut(&id) {
-            let mut removed = Vec::new();
+            let mut removed = HashSet::new();
             for chunk in chunks {
                 if session.loaded.remove(chunk) {
-                    removed.push(*chunk);
+                    removed.insert(*chunk);
                 }
             }
             for &chunk in &removed {
                 remove_loaded_chunk_reference_locked(&mut inner, chunk);
-                dispatches.extend(refresh_unloaded_chunk_for_session_locked(
-                    &mut inner, id, chunk,
-                ));
             }
             if !removed.is_empty() {
+                dispatches = refresh_unloaded_chunks_for_session_locked(&mut inner, id, &removed);
                 let mut cache = self.lock_prepared_cache("mark prepared chunks unloaded");
                 let desired = inner
                     .sessions

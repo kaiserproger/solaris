@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use mc_server::ServerConfig;
+use mc_server::startup_data::validate_vanilla_sidecar_version;
 
 pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 3;
 const WORLD_CONTRACT_FILE: &str = "world.json";
@@ -207,27 +207,6 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
     }
     for (field, value) in [
         (
-            "simulation.friendly_spawn_cap",
-            config.simulation.friendly_spawn_cap,
-        ),
-        (
-            "simulation.aquatic_spawn_cap",
-            config.simulation.aquatic_spawn_cap,
-        ),
-        (
-            "simulation.hostile_spawn_cap",
-            config.simulation.hostile_spawn_cap,
-        ),
-    ] {
-        if value > mc_net::MAX_NATURAL_SPAWN_CAP {
-            bail!(
-                "{field}={value} exceeds safe maximum {}",
-                mc_net::MAX_NATURAL_SPAWN_CAP
-            );
-        }
-    }
-    for (field, value) in [
-        (
             "simulation.friendly_spawn_chunk_budget",
             config.simulation.friendly_spawn_chunk_budget,
         ),
@@ -258,15 +237,6 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
             derived_outbound_queue,
             MAX_DERIVED_OUTBOUND_QUEUE
         );
-    }
-    let mut bundled_plugins = BTreeSet::new();
-    for plugin in &config.plugins.bundled {
-        if !bundled_plugins.insert(plugin.id()) {
-            bail!(
-                "plugins.bundled contains duplicate plugin {:?}",
-                plugin.id()
-            );
-        }
     }
     if let Some(vanilla_data_dir) = config.data.vanilla_data_dir.as_deref() {
         validate_vanilla_sidecar_version(vanilla_data_dir)?;
@@ -514,58 +484,6 @@ fn sync_metadata_directory(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn sync_metadata_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[derive(serde::Deserialize)]
-struct VanillaVersionMetadata {
-    id: String,
-    world_version: u32,
-    protocol_version: i32,
-}
-
-pub(crate) fn validate_vanilla_sidecar_version(vanilla_data_dir: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(vanilla_data_dir).with_context(|| {
-        format!(
-            "reading vanilla sidecar directory metadata for {}",
-            vanilla_data_dir.display()
-        )
-    })?;
-    if !metadata.is_dir() {
-        bail!(
-            "data.vanilla_data_dir is not a directory: {}",
-            vanilla_data_dir.display()
-        );
-    }
-
-    let path = vanilla_data_dir.join("version.json");
-    let raw = std::fs::read(&path)
-        .with_context(|| format!("reading vanilla sidecar version from {}", path.display()))?;
-    let version = serde_json::from_slice::<VanillaVersionMetadata>(&raw)
-        .with_context(|| format!("parsing vanilla sidecar version from {}", path.display()))?;
-
-    if version.id != mc_protocol::TARGET_RELEASE {
-        bail!(
-            "vanilla sidecar release id {:?} does not match Solaris target {:?}",
-            version.id,
-            mc_protocol::TARGET_RELEASE
-        );
-    }
-    if version.world_version != mc_protocol::WORLD_VERSION {
-        bail!(
-            "vanilla sidecar world_version {} does not match Solaris world version {}",
-            version.world_version,
-            mc_protocol::WORLD_VERSION
-        );
-    }
-    if version.protocol_version != mc_protocol::PROTOCOL_VERSION {
-        bail!(
-            "vanilla sidecar protocol_version {} does not match Solaris protocol version {}",
-            version.protocol_version,
-            mc_protocol::PROTOCOL_VERSION
-        );
-    }
-
     Ok(())
 }
 

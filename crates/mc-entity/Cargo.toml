@@ -11,6 +11,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+load-bench = []
+
 [dependencies]
 bevy_ecs = { workspace = true }
 mc-data = { path = "../mc-data" }

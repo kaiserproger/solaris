@@ -600,7 +600,7 @@ fn hostile_tick_uses_current_loaded_selection_and_clears_without_players() {
         1
     );
     registry.unregister(player);
-    assert!(registry.active_simulation_entities.load().is_empty());
+    assert!(registry.active_simulation_chunks.load().is_empty());
     assert!(registry.active_hostile_entities.load().is_empty());
 }
 

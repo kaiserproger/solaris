@@ -237,3 +237,97 @@ async fn wrong_admitted_command_is_rejected_without_result() {
     drop(adapter);
     assert!(events.recv_event().await.is_none());
 }
+
+#[tokio::test]
+async fn owner_release_frees_lease_for_rebind_and_foreign_release_is_rejected() {
+    let owner_binding = admitted_villager_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("bind", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let (adapter, mut events) = adapter();
+    let sessions = crate::play::SessionRegistry::new();
+    sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
+
+    assert!(
+        adapter
+            .route_binding_admitted(owner_binding, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    let lease_id = match events.recv_event().await.unwrap().kind() {
+        ScriptEventKind::VillagerBindingResult {
+            binding: Some(binding),
+            failure: None,
+            ..
+        } => binding.token().to_owned(),
+        other => panic!("unexpected binding result: {other:?}"),
+    };
+
+    let foreign = admitted_villager_command(
+        "foreign",
+        &format!("solaris.release_villager_binding('foreign-release', '{lease_id}')"),
+    )
+    .await;
+    assert!(
+        !adapter
+            .route_release_admitted(foreign, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::VillagerReleaseResult {
+            request_id,
+            failure: Some(mc_script::ScriptVillagerReleaseFailure::BindingUnavailable),
+        } if request_id == "foreign-release"
+    ));
+
+    let release = admitted_villager_command(
+        "owner",
+        &format!("solaris.release_villager_binding('release', '{lease_id}')"),
+    )
+    .await;
+    assert!(
+        adapter
+            .route_release_admitted(release, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::VillagerReleaseResult {
+            request_id,
+            failure: None,
+        } if request_id == "release"
+    ));
+    assert_eq!(adapter.binding_owner_for_test(&lease_id), None);
+
+    let rebind = admitted_villager_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("rebind", 0, 64, 0, 16)"#,
+    )
+    .await;
+    assert!(
+        adapter
+            .route_binding_admitted(rebind, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    let rebound_id = match events.recv_event().await.unwrap().kind() {
+        ScriptEventKind::VillagerBindingResult {
+            binding: Some(binding),
+            failure: None,
+            ..
+        } => binding.token().to_owned(),
+        other => panic!("unexpected rebind result: {other:?}"),
+    };
+    assert_eq!(
+        adapter.binding_owner_for_test(&rebound_id).as_deref(),
+        Some("owner")
+    );
+}

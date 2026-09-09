@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use mc_entity::natural_spawn_26_1_2::{
-    MAX_NATURAL_TEMPLATES_PER_CHUNK, NaturalSpawnCapacities, NaturalSpawnCategory,
-    NaturalSpawnReport, NaturalSpawnScheduler, plan_periodic_category,
+    MAX_NATURAL_TEMPLATES_PER_CHUNK, NaturalSpawnCategory, NaturalSpawnReport,
+    NaturalSpawnScheduler, plan_periodic_category,
 };
 use mc_entity::{SpawnEntity, Vec3};
 use mc_physics::{Aabb, BlockMaterialIds};
@@ -91,32 +91,45 @@ impl SessionRegistry {
             .iter()
             .map(|position| chunk_pos_from_coords(position.x, position.z))
             .collect::<Vec<_>>();
-        let mut friendly_chunks = if friendly_due {
+        // Vanilla ChunkMap admits natural spawning within 128 horizontal blocks
+        // of a player. Filter before spending the attempt budget: a large view
+        // must not spend minutes spawning only at the far edge of its chunk ring.
+        let eligible = |chunk: &(i32, i32)| {
+            player_positions
+                .iter()
+                .zip(&player_chunks)
+                .any(|(position, player)| {
+                    let dx = f64::from(chunk.0) * 16.0 + 8.0 - position.x;
+                    let dz = f64::from(chunk.1) * 16.0 + 8.0 - position.z;
+                    chunk.0.abs_diff(player.0) <= simulation_distance
+                        && chunk.1.abs_diff(player.1) <= simulation_distance
+                        && dx * dx + dz * dz < 128.0 * 128.0
+                })
+        };
+        let friendly_chunks = if friendly_due {
             scheduler.select_chunks(
                 NaturalSpawnCategory::Friendly,
                 &active_chunks,
+                &player_chunks,
+                simulation_distance.min(8),
                 policy.friendly_spawn_chunk_budget,
+                eligible,
             )
         } else {
             Vec::new()
         };
-        let mut hostile_chunks = if hostile_due {
+        let hostile_chunks = if hostile_due {
             scheduler.select_chunks(
                 NaturalSpawnCategory::Hostile,
                 &active_chunks,
+                &player_chunks,
+                simulation_distance.min(8),
                 policy.hostile_spawn_chunk_budget,
+                eligible,
             )
         } else {
             Vec::new()
         };
-        let within_simulation_distance = |chunk: &(i32, i32)| {
-            player_chunks.iter().any(|player| {
-                chunk.0.abs_diff(player.0) <= simulation_distance
-                    && chunk.1.abs_diff(player.1) <= simulation_distance
-            })
-        };
-        friendly_chunks.retain(&within_simulation_distance);
-        hostile_chunks.retain(within_simulation_distance);
         let selected_chunks = friendly_chunks
             .iter()
             .chain(&hostile_chunks)
@@ -127,9 +140,9 @@ impl SessionRegistry {
             return (report, Vec::new());
         }
 
-        let (templates, natural_hostiles, natural_ground, natural_aquatic) = {
+        let templates = {
             let inner = self.lock_inner("snapshot selected periodic natural spawning");
-            let templates = selected_chunks
+            selected_chunks
                 .iter()
                 .filter_map(|chunk| {
                     inner
@@ -137,13 +150,7 @@ impl SessionRegistry {
                         .get(chunk)
                         .map(|templates| (*chunk, templates.clone()))
                 })
-                .collect::<HashMap<_, _>>();
-            (
-                templates,
-                inner.natural_hostile_mobs.len(),
-                inner.natural_ground_mobs.len(),
-                inner.natural_aquatic_mobs.len(),
-            )
+                .collect::<HashMap<_, _>>()
         };
         let collision_chunks = selected_chunks
             .iter()
@@ -157,14 +164,6 @@ impl SessionRegistry {
         let projections = self
             .lock_entities("project periodic natural spawn collisions")
             .simulation_projections_for_ids(&active_entity_ids);
-        let mut capacities = NaturalSpawnCapacities::from_counts_and_caps(
-            natural_hostiles,
-            natural_ground,
-            natural_aquatic,
-            policy.hostile_spawn_cap,
-            policy.friendly_spawn_cap,
-            policy.aquatic_spawn_cap,
-        );
 
         let chunk_positions = selected_chunks
             .iter()
@@ -187,7 +186,6 @@ impl SessionRegistry {
                 &player_positions,
                 &projections,
                 &mut accepted_boxes,
-                &mut capacities,
                 tick,
                 world_time,
                 thundering,
@@ -206,7 +204,6 @@ impl SessionRegistry {
                 &player_positions,
                 &projections,
                 &mut accepted_boxes,
-                &mut capacities,
                 tick,
                 world_time,
                 thundering,
@@ -320,7 +317,6 @@ fn record_natural_spawn_report(
         friendly_rejected_player_distance = cumulative.friendly.rejected_player_distance,
         friendly_rejected_block_or_fluid = cumulative.friendly.rejected_block_or_fluid,
         friendly_rejected_collision = cumulative.friendly.rejected_collision,
-        friendly_rejected_cap = cumulative.friendly.rejected_cap,
         hostile_attempts = cumulative.hostile.attempts,
         hostile_chunks = cumulative.hostile.chunks_sampled,
         hostile_committed = cumulative.hostile.committed,
@@ -329,7 +325,6 @@ fn record_natural_spawn_report(
         hostile_rejected_player_distance = cumulative.hostile.rejected_player_distance,
         hostile_rejected_block_or_fluid = cumulative.hostile.rejected_block_or_fluid,
         hostile_rejected_collision = cumulative.hostile.rejected_collision,
-        hostile_rejected_cap = cumulative.hostile.rejected_cap,
         "periodic natural spawn metrics"
     );
 }

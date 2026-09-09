@@ -231,6 +231,48 @@ fn binding_goal_releases_claim_when_bound_entity_was_removed() {
 }
 
 #[test]
+fn release_villager_binding_frees_claim_for_rebind_and_reports_unknown_tokens() {
+    let runtime = RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+    handle
+        .spawn(entity("minecraft:villager", Vec3::new(0.0, 64.0, 0.0)))
+        .expect("spawn villager");
+    handle
+        .claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "dismissed")
+        .expect("binding query")
+        .expect("binding claim");
+    assert_eq!(
+        handle.claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "blocked"),
+        Ok(None)
+    );
+
+    assert_eq!(
+        handle.release_villager_binding("dismissed".to_owned()),
+        Ok(true)
+    );
+    assert_eq!(
+        handle.release_villager_binding("dismissed".to_owned()),
+        Ok(false)
+    );
+    assert_eq!(
+        handle.release_villager_binding("never-issued".to_owned()),
+        Ok(false)
+    );
+    assert_eq!(
+        handle.release_villager_binding(String::new()),
+        Err(RegionOwnerLaneError::InvalidQuery)
+    );
+    let rebound = handle
+        .claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "rebound")
+        .expect("rebind query")
+        .expect("released villager is available");
+    assert_eq!(rebound.token(), "rebound");
+
+    runtime.shutdown().expect("regional owner shutdown");
+}
+
+#[test]
 fn concurrent_claims_cannot_bind_the_same_villager() {
     let runtime = RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
         .expect("regional owner runtime");

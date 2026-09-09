@@ -18,8 +18,11 @@ pub(in crate::terrain) struct TerrainSample {
     pub(in crate::terrain) surface_y: i32,
     pub(in crate::terrain) continentalness: f64,
     pub(in crate::terrain) ridges: f64,
+    pub(in crate::terrain) erosion: f64,
     /// Distance from the nearest river centre line.
     pub(in crate::terrain) river: f64,
+    /// Hydrologically connected, warm wet river shoulders; zero on dry inland land.
+    pub(in crate::terrain) wetland: f64,
     pub(in crate::terrain) temperature: f64,
     pub(in crate::terrain) moisture: f64,
     /// Broad, warped climate-domain identity used only inside transition margins.

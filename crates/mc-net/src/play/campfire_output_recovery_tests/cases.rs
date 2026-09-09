@@ -81,7 +81,8 @@ async fn campfire_completion_persists_intent_before_entity_materialization() {
         live_sessions.as_ref(),
         mc_world::BlockPos { x: 1, y: 64, z: 1 },
     );
-    let (_, entity_pending) = persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (_, entity_pending) =
+        persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert!(entity_pending.is_empty());
     assert_eq!(output.stack.count, 1);
 
@@ -128,7 +129,8 @@ async fn restart_after_entity_commit_before_world_ack_deduplicates() {
     abort_runtime_at_gate(runtime, reached_rx).await;
     let expected =
         pending_output_from_world_journal(tmp.path(), mc_world::BlockPos { x: 1, y: 64, z: 1 });
-    let (_, entity_pending) = persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (_, entity_pending) =
+        persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     let replayed = persistence::replay_regional_commit_decisions(
         PersistedEntityCheckpoint::new(0, Vec::<PersistedEntityRecord>::new()),
         &entity_pending,
@@ -173,7 +175,8 @@ async fn successful_d2_checkpoint_does_not_resurrect_campfire_output() {
     assert_eq!(world_pending.len(), 2, "D1 and D2 must precede checkpoint");
     drop(world_pending);
     drop(journal);
-    let (_, entity_pending) = persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (_, entity_pending) =
+        persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert_eq!(entity_pending.len(), 1, "E must precede checkpoint");
 
     checkpoint_campfire_runtime(&mut runtime).await;
@@ -183,7 +186,8 @@ async fn successful_d2_checkpoint_does_not_resurrect_campfire_output() {
     assert!(world_pending.is_empty());
     drop(world_pending);
     drop(journal);
-    let (_, entity_pending) = persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (_, entity_pending) =
+        persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert_eq!(
         entity_pending.len(),
         1,
@@ -201,7 +205,8 @@ async fn successful_d2_checkpoint_does_not_resurrect_campfire_output() {
     assert_eq!(replayed.records[0].snapshot.uuid, expected.uuid);
     drop(runtime);
 
-    let (_, entity_pending) = persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+    let (_, entity_pending) =
+        persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert!(
         entity_pending.is_empty(),
         "normal shutdown compacts checkpointed entity WAL"

@@ -212,7 +212,9 @@ impl SessionRegistry {
             max_desired_loaded_chunks,
             visible_entity_links,
             owner_entities,
-            active_simulation_entities: self.active_simulation_entities.load().len(),
+            active_simulation_entities: self
+                .entity_update_active_population
+                .load(Ordering::Relaxed),
             active_hostile_entities: self.active_hostile_entities.load().len(),
             prepared_chunks,
             prepared_in_flight,
@@ -243,7 +245,7 @@ impl SessionRegistry {
         let entity_update_active_population =
             self.entity_update_active_population.load(Ordering::Relaxed);
         LoadBenchActivityStats {
-            active_simulation_entities: self.active_simulation_entities.load().len(),
+            active_simulation_entities: entity_update_active_population,
             active_hostile_entities: self.active_hostile_entities.load().len(),
             entity_update_budget_per_lane: self
                 .entity_update_budget_per_lane

@@ -3,8 +3,8 @@ use super::{
     FURNACE_CONTAINER_ID_MIN, FurnaceSlot, GameMode, HOPPER_TICK_DELAY_TICKS,
     HOPPER_TRANSFER_DELAY_TICKS, HOPPER_TRANSFER_MAX_STACK, HopperTransferContext, Identifier,
     InteractionState, ItemFactsTable, ItemRegistry, ItemReport, ItemStack, ItemToBlockTable,
-    LightCache, LightWorkspace, ListTag, LoggedInProfile, OutboundCommand, PlayerInventory,
-    PlayerPersistedState, PlayerPose, QuickCraftState, RESIDENT_HOPPER_TRANSFER_COMMIT_COUNT,
+    LightCache, ListTag, LoggedInProfile, OutboundCommand, PlayerInventory, PlayerPersistedState,
+    PlayerPose, QuickCraftState, RESIDENT_HOPPER_TRANSFER_COMMIT_COUNT,
     SIMULATION_COMMAND_BATCH_LIMIT, ScheduledBlockTickReport, ServerConfig, SessionRegistry,
     SimulationWorldAccess, Tag, TagsData, container_redstone_signal_at,
     dispatch_and_clear_setup_packets, handle_block_item_placement,
@@ -156,7 +156,7 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
     );
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),
@@ -603,10 +603,8 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         sessions: Arc::new(SessionRegistry::new()),
         simulation: simulation_channel().0,
         session_id: 1,
-        workspace: LightWorkspace::new(),
         light_cache: LightCache::new(),
         compression: Compression::Disabled,
-        selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(
@@ -946,7 +944,7 @@ async fn scheduled_hopper_cooldown_tick_uses_resident_commit() {
     register_loaded_button_session(&sessions, "ResidentHopperCooldown");
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),
@@ -1073,7 +1071,7 @@ async fn scheduled_hopper_cooldowns_share_one_wal_decision() {
     register_loaded_button_session(&sessions, "GroupedHopperCooldowns");
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&config.blocks),
         Arc::clone(&config.items),

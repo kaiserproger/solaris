@@ -14,11 +14,12 @@ artifact = "client/rich-content.zip"
 sha256 = "@ARTIFACT_SHA256@"
 size_bytes = @ARTIFACT_SIZE@
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "screens", "assets", "interactions"]
+content = ["blocks", "items", "ui", "assets", "interactions", "sounds"]
 permissions = [
   "register_blocks",
   "register_items",
-  "open_screens",
+  "present_ui",
   "load_assets",
   "send_interactions",
+  "play_sounds",
 ]

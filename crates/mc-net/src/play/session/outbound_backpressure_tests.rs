@@ -70,6 +70,61 @@ fn loaded_chunk_batches_entity_spawns_before_bounded_outbound_queue() {
 }
 
 #[tokio::test]
+async fn unloading_dense_chunk_does_not_disconnect_reliable_session() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("ChunkUnloadBurst"),
+        name: "ChunkUnloadBurst".to_owned(),
+    };
+    let (session, _) = registry.register(
+        &profile,
+        (0, 0),
+        2,
+        HashSet::new(),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    for index in 0..400 {
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            4,
+            "minecraft:cow".to_owned(),
+            Vec3::new(f64::from(index % 2) * 16.0 + 0.5, 64.0, 0.5),
+        );
+    }
+    dispatch_visibility_commands(registry.mark_loaded(session, (0, 0)));
+    dispatch_visibility_commands(registry.mark_loaded(session, (1, 0)));
+    // The receiver has not consumed the initial population when its view moves.
+    dispatch_visibility_commands(registry.mark_unloaded(session, &[(0, 0), (1, 0)]));
+    let pressure = registry.pressure_snapshot();
+    assert_eq!(pressure.slow_client_pressure_sheds, 0);
+    assert_eq!(pressure.reliable_command_drops, 0);
+    let mut visible = HashSet::new();
+    for _ in 0..2 {
+        let Some(OutboundCommand::SpawnEntities(entities)) = rx.recv().await else {
+            panic!("initial visible population was lost");
+        };
+        visible.extend(entities.iter().map(|entity| entity.id.0));
+    }
+    while !visible.is_empty() {
+        let removed = match rx.recv().await.expect("removal delivery") {
+            OutboundCommand::DespawnEntity(entity) => vec![entity.id.0],
+            OutboundCommand::DespawnEntities(entity_ids) => entity_ids,
+            other => panic!("unexpected command before removals complete: {other:?}"),
+        };
+        for entity_id in removed {
+            assert!(visible.remove(&entity_id), "unknown or duplicated removal");
+        }
+    }
+    assert_eq!(
+        registry.persisted_entity_records().len(),
+        400,
+        "leaving a view must not delete authoritative entities"
+    );
+}
+
+#[tokio::test]
 async fn dense_entity_movement_backlog_coalesces_without_disconnect() {
     const ENTITY_COUNT: usize = 5_132;
 
@@ -149,6 +204,90 @@ async fn dense_entity_movement_backlog_coalesces_without_disconnect() {
         assert_eq!(movement.rotation.head_yaw, 64.0);
     }
     assert!(rx.try_recv().is_err(), "stale movement batches were queued");
+    retry_completed.await;
+    let snapshot = registry.pressure_snapshot();
+    assert_eq!(snapshot.reliable_command_drops, 0);
+    assert_eq!(snapshot.slow_client_pressure_sheds, 0);
+    assert_eq!(snapshot.reliable_command_retries_in_flight, 0);
+}
+
+#[tokio::test]
+async fn interleaved_player_and_entity_movements_coalesce_without_disconnect() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(16);
+    for entity_id in 1..=16 {
+        tx.try_send(OutboundCommand::AnimatePlayer { entity_id })
+            .expect("fill recipient queue");
+    }
+    let recipient = test_recipient(&registry, 72, tx);
+    let pressure = test_pressure(&registry);
+    let retry_completed = pressure.reliable_retry_completed.notified();
+    let first_dequeued = pressure.reliable_retry_dequeued.notified();
+    tokio::pin!(first_dequeued);
+    first_dequeued.as_mut().enable();
+    let entity_movement = |tick: i32| ServerEntityMove {
+        id: EntityId(42),
+        position: Vec3::new(f64::from(tick), 64.0, 0.5),
+        wire_move: Some(ServerEntityWireMove::Position {
+            delta: Vec3::new(0.25, 0.0, 0.0),
+        }),
+        velocity: Vec3::new(f64::from(tick), 0.0, 0.0),
+        rotation: Rotation::ZERO,
+        on_ground: true,
+        send_velocity: false,
+        send_head_rotation: false,
+    };
+    let player_movement = |tick: i32| {
+        OutboundCommand::MovePlayer(PlayerEntitySnapshot {
+            session_id: 100,
+            entity_id: 100,
+            uuid: uuid::Uuid::nil(),
+            name: "moving-player".to_owned(),
+            properties: Vec::new(),
+            pose: PlayerPose::new(f64::from(tick), 64.0, 0.5),
+        })
+    };
+
+    dispatch_visibility_command(
+        &recipient,
+        OutboundCommand::MoveEntityRelative(entity_movement(1)),
+    );
+    first_dequeued.await;
+    for tick in 2..=64 {
+        dispatch_visibility_command(&recipient, player_movement(tick));
+        dispatch_visibility_command(
+            &recipient,
+            OutboundCommand::MoveEntityRelative(entity_movement(tick)),
+        );
+    }
+
+    for expected in 1..=16 {
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutboundCommand::AnimatePlayer { entity_id }) if entity_id == expected
+        ));
+    }
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::MoveEntityRelative(ServerEntityMove { position, .. }))
+            if position == Vec3::new(1.0, 64.0, 0.5)
+    ));
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::MovePlayer(PlayerEntitySnapshot { pose, .. }))
+            if pose.x == 64.0
+    ));
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::MoveEntitiesRelative(movements))
+            if movements.len() == 1
+                && movements[0].position == Vec3::new(64.0, 64.0, 0.5)
+                && matches!(
+                    movements[0].wire_move,
+                    Some(ServerEntityWireMove::Absolute { .. })
+                )
+    ));
+    assert!(rx.try_recv().is_err(), "stale movement turns were queued");
     retry_completed.await;
     let snapshot = registry.pressure_snapshot();
     assert_eq!(snapshot.reliable_command_drops, 0);

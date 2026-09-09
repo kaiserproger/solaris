@@ -117,20 +117,31 @@ impl SessionRegistry {
             wait_started,
             guard,
         );
-        if player_state.inventory.slots != player.expected_inventory.slots
-            || player_state.carried_item != player.expected_carried_item
-            || player
-                .crafting_table_input
-                .as_ref()
-                .is_some_and(|plan| player_state.crafting_table_input != plan.expected)
-            || player
-                .enchanting_table_input
-                .as_ref()
-                .is_some_and(|plan| player_state.enchanting_table_input != plan.expected)
-            || player
-                .merchant_input
-                .as_ref()
-                .is_some_and(|plan| player_state.merchant_input != plan.expected)
+        let player_state = &mut *player_state;
+        if player_state
+            .inventory
+            .try_update(|inventory| {
+                if inventory.slots != player.expected_inventory.slots
+                    || player_state.carried_item != player.expected_carried_item
+                    || player
+                        .crafting_table_input
+                        .as_ref()
+                        .is_some_and(|plan| player_state.crafting_table_input != plan.expected)
+                    || player
+                        .enchanting_table_input
+                        .as_ref()
+                        .is_some_and(|plan| player_state.enchanting_table_input != plan.expected)
+                    || player
+                        .merchant_input
+                        .as_ref()
+                        .is_some_and(|plan| player_state.merchant_input != plan.expected)
+                {
+                    Err(())
+                } else {
+                    Ok(player.updated_inventory.clone())
+                }
+            })
+            .is_err()
         {
             return Ok(PlayerInventoryCommitOutcome::Rejected {
                 inventory: player_state.inventory.clone(),
@@ -141,10 +152,7 @@ impl SessionRegistry {
             });
         }
 
-        player_state.replace_container(
-            player.updated_inventory.clone(),
-            player.updated_carried_item.clone(),
-        );
+        player_state.carried_item = player.updated_carried_item.clone();
         if let Some(plan) = &player.crafting_table_input {
             player_state.crafting_table_input = plan.updated.clone();
         }

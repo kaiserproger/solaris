@@ -11,8 +11,6 @@ use crate::connection::write_packet;
 use crate::error::ConnectionError;
 use crate::server::ServerConfig;
 
-#[cfg(test)]
-use super::block_edit_commit::apply_opaque_block_entity_to_storage_conditionally;
 use super::block_edit_commit::send_loaded_block_edit_resyncs;
 #[cfg(test)]
 use super::campfire::campfire_cooking_states_from_chunk;
@@ -228,8 +226,7 @@ async fn commit_campfire_use(
                 plan.position,
                 &plan.expected_cooking,
                 plan.updated_cooking,
-                || match apply_opaque_block_entity_to_storage_conditionally(
-                    &mut storage,
+                || match storage.commit_opaque_block_entity_conditionally(
                     plan.position,
                     plan.expected_state,
                     plan.expected_token,

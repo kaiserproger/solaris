@@ -30,12 +30,6 @@ pub(crate) enum ScriptStoragePrepareOutcome<T> {
     Rejected,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ScriptInventoryPlan {
-    pub(crate) expected: PlayerInventory,
-    pub(crate) updated: PlayerInventory,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScriptInventoryPlanError {
     UnknownResource(String),
@@ -52,7 +46,7 @@ pub(crate) fn plan_script_inventory_transaction(
     inventory: &PlayerInventory,
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
-) -> Result<ScriptInventoryPlan, ScriptInventoryPlanError> {
+) -> Result<PlayerInventory, ScriptInventoryPlanError> {
     plan_script_inventory_deltas(transaction.inventory(), inventory, items, item_facts)
 }
 
@@ -61,7 +55,7 @@ pub(crate) fn plan_script_inventory_deltas(
     inventory: &PlayerInventory,
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
-) -> Result<ScriptInventoryPlan, ScriptInventoryPlanError> {
+) -> Result<PlayerInventory, ScriptInventoryPlanError> {
     let mut updated = inventory.clone();
 
     for delta in deltas.iter().filter(|delta| delta.delta() < 0) {
@@ -101,10 +95,7 @@ pub(crate) fn plan_script_inventory_deltas(
         }
     }
 
-    Ok(ScriptInventoryPlan {
-        expected: inventory.clone(),
-        updated,
-    })
+    Ok(updated)
 }
 
 fn resolve_item_id(items: &ItemRegistry, resource: &str) -> Result<u32, ScriptInventoryPlanError> {

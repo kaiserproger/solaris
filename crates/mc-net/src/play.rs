@@ -38,7 +38,7 @@ use mc_entity::{
     EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, GoalState, PathingBudget,
     PathingProbe, PathingProbeResult, RegionKey, Rotation, SpawnEntity, Vec3,
 };
-use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, PlayerId, ProtocolPhase};
+pub(crate) use mc_entity::{EntityPhysicsKind, EntityPhysicsQuery};
 #[cfg(test)]
 use mc_nbt::ListTag;
 use mc_nbt::Tag;
@@ -77,8 +77,8 @@ use mc_protocol::packets::play::{
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{
-    ScriptCraftingSource, ScriptEvent, ScriptInteractionHand, ScriptItemPickupSource,
-    ScriptPlayerContext, ScriptPlayerId,
+    MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, ScriptCraftingSource, ScriptEvent, ScriptInteractionHand,
+    ScriptItemPickupSource, ScriptPlayerContext, ScriptPlayerId, ScriptProtocolPhase,
 };
 #[cfg(test)]
 use mc_world::FurnaceSlot;
@@ -99,8 +99,9 @@ use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::loader::loader_interaction_channel;
 use crate::login::LoggedInProfile;
+use crate::play::scheduled_blocks::ScheduledBlockRegionPlan;
 use crate::script::PluginZoneAdapter;
-use crate::server::{ExtensionEventSink, ScriptEventSink, ServerConfig, WorldHandle};
+use crate::server::{ScriptEventSink, ServerConfig, WorldHandle};
 use crate::{
     ChunkPipelinePolicy, ChunkPipelineStopReason, ChunkPriority, ChunkRequest, ChunkScheduler,
     RuntimeControlHandle,
@@ -163,9 +164,6 @@ pub(super) use mc_entity::natural_spawn_26_1_2::{
 };
 use merchant_adapter::{handle_select_trade, open_merchant_container};
 use player_breathing::{PlayerBreathingState, player_can_drown};
-// Router and storage-owner wiring land separately; keep the bounded adapter
-// contract available without creating a second ingress path here.
-#[allow(dead_code)]
 mod script_inventory_transaction;
 pub(crate) use script_inventory_transaction::{
     ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
@@ -232,10 +230,7 @@ use falling_blocks::{
 pub(crate) use inhabited_time::InhabitedTimeAccumulator;
 #[cfg(test)]
 pub(in crate::play) use session::{ENTITY_PICKUP_RADIUS, ITEM_PICKUP_DELAY_TICKS};
-pub(crate) use session::{
-    ScriptCommitDelivery, ScriptCommitEventReceiver, SessionRegistry, WeatherKind,
-    entity_owner_fatal_from_panic,
-};
+pub(crate) use session::{SessionRegistry, WeatherKind, entity_owner_fatal_from_panic};
 
 pub(crate) fn prewarm_entity_pathing_tables() -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(session::prewarm_canonical_pathing_state_facts())
@@ -266,9 +261,9 @@ pub struct PlayerAttackObservation {
     pub authority_sequence: u64,
 }
 pub(crate) use simulation::{
-    EntitySimulationTickPolicy, ExplosionRegistries, SIMULATION_COMMAND_BATCH_LIMIT,
-    SimulationHandle, SimulationOwner, SimulationRequestError, SimulationSaveSnapshot,
-    SimulationTickReport, simulation_channel_with_explosion_seed,
+    EntitySimulationTickPolicy, EntitySimulationWorldContext, ExplosionRegistries,
+    SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner, SimulationRequestError,
+    SimulationSaveSnapshot, SimulationTickReport, simulation_channel_with_explosion_seed,
 };
 pub(crate) use spawn::prepare_spawn_chunk;
 
@@ -400,8 +395,9 @@ use movement::{
     AcceptedAbsoluteMovement, PendingTeleport, PlayerCollisionContext, TeleportConfirmResult,
     clamp_player_pose, confirm_pending_teleport, farmland_trample_pos,
     guard_pending_teleport_movement, movement_exhaustion, next_player_teleport_id,
-    normalize_absolute_player_movement, player_pose_collides_with_solid_in_snapshot_with_context,
-    player_water_overlap_in_snapshot, refresh_player_fall_state, validate_player_rotation,
+    normalize_absolute_player_movement, note_teleport_confirm_mismatch,
+    player_pose_collides_with_solid_in_snapshot_with_context, player_water_overlap_in_snapshot,
+    refresh_player_fall_state, validate_player_rotation,
 };
 #[cfg(test)]
 use persistence::PersistedEntityRecord;
@@ -476,7 +472,7 @@ use use_item_on_adapter::{
 };
 use use_item_on_adapter::{ack_use_item_noop, handle_sign_update, handle_use_item_on};
 use wire_entities::{
-    send_entity_data, send_entity_despawn, send_entity_health, send_entity_relative_move,
+    send_entities_despawn, send_entity_data, send_entity_health, send_entity_relative_move,
     send_entity_spawn, send_player_animation, send_player_despawn, send_player_move,
     send_player_spawn, send_take_item_entity,
 };
@@ -791,8 +787,6 @@ const WORLD_TIME_SYNC_PERIOD: Duration = Duration::from_secs(1);
 struct RegisteredSessionCleanup {
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
-    extension: Option<ExtensionEventSink>,
-    extension_player_id: PlayerId,
     scripts: Option<ScriptEventSink>,
     script_zones: Option<PluginZoneAdapter>,
     active: bool,
@@ -802,15 +796,12 @@ impl RegisteredSessionCleanup {
     fn new(
         sessions: Arc<SessionRegistry>,
         session_id: SessionId,
-        extension: Option<ExtensionEventSink>,
         scripts: Option<ScriptEventSink>,
         script_zones: Option<PluginZoneAdapter>,
     ) -> Self {
         Self {
             sessions,
             session_id,
-            extension,
-            extension_player_id: PlayerId::new(session_id),
             scripts,
             script_zones,
             active: true,
@@ -830,12 +821,6 @@ impl RegisteredSessionCleanup {
             self.sessions
                 .unregister_preserving_player_state(self.session_id),
         );
-        if let Some(extension) = self.extension.as_ref() {
-            extension.enqueue_event(InboundEvent::PlayerLeft {
-                player_id: self.extension_player_id,
-                reason: "disconnected".to_owned(),
-            });
-        }
         if let Some(scripts) = self.scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::player_left(
                 ScriptPlayerId::new(self.session_id),
@@ -922,8 +907,6 @@ fn survival_damage_after_equipment(
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
-/// Upper bound for each natural-mob population cap.
-pub const MAX_NATURAL_SPAWN_CAP: usize = 256;
 /// Upper bound for chunks sampled by one natural-spawn category attempt.
 pub const MAX_NATURAL_SPAWN_CHUNK_BUDGET: usize = 64;
 
@@ -936,9 +919,6 @@ pub struct RandomTickPolicy {
     pub save_interval_ticks: u64,
     pub friendly_spawn_interval_ticks: u64,
     pub hostile_spawn_interval_ticks: u64,
-    pub friendly_spawn_cap: usize,
-    pub aquatic_spawn_cap: usize,
-    pub hostile_spawn_cap: usize,
     pub friendly_spawn_chunk_budget: usize,
     pub hostile_spawn_chunk_budget: usize,
     pub seed: u64,
@@ -954,9 +934,6 @@ impl Default for RandomTickPolicy {
             save_interval_ticks: 20,
             friendly_spawn_interval_ticks: 400,
             hostile_spawn_interval_ticks: 20,
-            friendly_spawn_cap: 32,
-            aquatic_spawn_cap: 20,
-            hostile_spawn_cap: 70,
             friendly_spawn_chunk_budget: 48,
             hostile_spawn_chunk_budget: 4,
             seed: 0,
@@ -977,9 +954,6 @@ impl RandomTickPolicy {
             save_interval_ticks: self.save_interval_ticks.max(1),
             friendly_spawn_interval_ticks: self.friendly_spawn_interval_ticks,
             hostile_spawn_interval_ticks: self.hostile_spawn_interval_ticks,
-            friendly_spawn_cap: self.friendly_spawn_cap.min(MAX_NATURAL_SPAWN_CAP),
-            aquatic_spawn_cap: self.aquatic_spawn_cap.min(MAX_NATURAL_SPAWN_CAP),
-            hostile_spawn_cap: self.hostile_spawn_cap.min(MAX_NATURAL_SPAWN_CAP),
             friendly_spawn_chunk_budget: self
                 .friendly_spawn_chunk_budget
                 .clamp(1, MAX_NATURAL_SPAWN_CHUNK_BUDGET),
@@ -1036,52 +1010,7 @@ pub(super) struct SettlementInhabitantSpawn {
     villager_merchant: Option<mc_entity::villager_merchant_26_1_2::VillagerMerchantState>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EntityPhysicsQuery {
-    pub id: EntityId,
-    pub position: Vec3,
-    pub velocity: Vec3,
-    pub aabb: mc_physics::Aabb,
-    pub on_ground: bool,
-    pub fall_distance: f64,
-    pub goal_fence: mc_entity::EntityGoalFence,
-    pub kind: EntityPhysicsKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EntityPhysicsKind {
-    Default,
-    Immobile,
-    ExternalFlight,
-    Living,
-    PowderSnowWalkableLiving,
-    AquaticLiving,
-    FallingBlock,
-    ArrowProjectile {
-        revision: Option<u64>,
-        embedded_block: Option<mc_entity::projectile_26_1_2::BlockPosition>,
-    },
-    ShulkerBullet {
-        revision: Option<u64>,
-    },
-    HurtingProjectile {
-        revision: Option<u64>,
-        acceleration_power_bits: u64,
-    },
-    ThrowableProjectile {
-        revision: Option<u64>,
-        gravity_bits: u64,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EntityPhysicsStep {
-    pub id: EntityId,
-    pub position: Vec3,
-    pub velocity: Vec3,
-    pub on_ground: bool,
-    pub horizontal_collision: bool,
-}
+pub(crate) use mc_entity::EntityPhysicsStep;
 
 /// World-snapshot collision endpoint for one arrow physics query.
 ///
@@ -1446,12 +1375,6 @@ struct ScheduledFluidTickPlan {
     scheduled_fluid_ticks: Vec<ScheduledFluidTick>,
 }
 
-struct ScheduledBlockRegionPlan {
-    region: RegionKey,
-    due: Vec<ScheduledBlockTick>,
-    plan: ScheduledBlockTickPlan,
-}
-
 struct ScheduledBlockRegionJob {
     index: usize,
     #[cfg(test)]
@@ -1725,7 +1648,6 @@ pub(crate) async fn handle<R, W>(
     simulation: SimulationHandle,
     configuration_custom_payloads: Vec<ConfigurationCustomPayload>,
     loader_session: Option<crate::LoaderSession>,
-    extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
     script_zones: Option<PluginZoneAdapter>,
 ) -> Result<(), ConnectionError>
@@ -1831,33 +1753,25 @@ where
             return Ok(());
         }
     };
-    let extension_player_id = PlayerId::new(session_id);
     let session_cleanup = RegisteredSessionCleanup::new(
         Arc::clone(&sessions),
         session_id,
-        extension.clone(),
         scripts.clone(),
         script_zones.clone(),
     );
-    if let Some(extension) = extension.as_ref() {
-        extension.enqueue_event(InboundEvent::PlayerJoined {
-            player_id: extension_player_id,
-            username: profile.name.clone(),
-        });
-        for payload in &configuration_custom_payloads {
-            extension.enqueue_custom_payload(
-                extension_player_id,
-                ProtocolPhase::Configuration,
-                &payload.channel,
-                payload.payload.as_ref(),
-            );
-        }
-    }
     if let Some(scripts) = scripts.as_ref() {
         scripts.enqueue_event(ScriptEvent::player_joined_with_context(
             ScriptPlayerId::new(session_id),
             script_player_context(profile, permissions, initial_pose),
         ));
+        for payload in configuration_custom_payloads {
+            scripts.enqueue_custom_payload(
+                ScriptPlayerId::new(session_id),
+                ScriptProtocolPhase::Configuration,
+                &payload.channel,
+                payload.payload,
+            );
+        }
     }
 
     // 1. Login (Play).
@@ -2150,10 +2064,8 @@ where
             sessions: Arc::clone(&sessions),
             simulation: player_simulation.clone(),
             session_id,
-            workspace: LightWorkspace::new(),
             light_cache: std::mem::take(&mut light_cache),
             compression,
-            selected_hotbar_slot: player_state.selected_hotbar_slot,
             inventory: initial_inventory,
             carried_item: player_state.carried_item.clone(),
             player_persistence: Arc::clone(&player_save_state),
@@ -2229,8 +2141,6 @@ where
             config.view_distance,
             profile.uuid.to_string(),
             profile.name.clone(),
-            extension,
-            extension_player_id,
             scripts,
             script_zones,
         ))
@@ -2269,22 +2179,16 @@ struct InteractionState {
     sessions: Arc<SessionRegistry>,
     simulation: SimulationHandle,
     session_id: SessionId,
-    #[allow(dead_code)] // Retained for existing direct test fixtures.
-    workspace: LightWorkspace,
     /// Per-session chunk light cache, populated during the spawn burst.
     light_cache: LightCache,
     compression: Compression,
-    /// M6.d: which item the player is currently holding. Bumped by
-    /// `ServerboundSetCarriedItem` (0..=8) and consulted by
-    /// `handle_use_item_on` to resolve the placed block.
-    selected_hotbar_slot: u8,
     /// M6.e: a 46-slot window-0 inventory. Indices follow vanilla's
     /// numbering: 0..4 crafting (output + 2×2 input), 5..8 armor,
     /// 9..35 main rows, 36..44 hotbar, 45 offhand.
     inventory: PlayerInventory,
     /// Server-authoritative cursor stack for vanilla container clicks.
     carried_item: ItemStack,
-    /// Durable mirror committed only by this exact session owner.
+    /// Authoritative player state shared with this exact session owner.
     player_persistence: Arc<Mutex<PlayerPersistedState>>,
     /// M6.e: per-vanilla, the server bumps this counter on every
     /// inventory mutation it ships to the client; the client uses
@@ -2310,6 +2214,16 @@ struct InteractionState {
     pending_sign_edit: Option<PendingSignEdit>,
     shield_use: Option<ShieldUseState>,
     last_entity_attack_tick: Option<u64>,
+}
+
+impl InteractionState {
+    fn selected_hotbar_slot(&self) -> u8 {
+        crate::lock_policy::lock_authoritative_mutex(
+            &self.player_persistence,
+            "play.player_persistence",
+        )
+        .selected_hotbar_slot
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2371,7 +2285,7 @@ enum PlayCustomPayloadAction {
 fn classify_play_custom_payload(
     mut body: Bytes,
 ) -> Result<PlayCustomPayloadAction, ConnectionError> {
-    if body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+    if body.len() > MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES {
         return Ok(PlayCustomPayloadAction::Oversized { len: body.len() });
     }
 
@@ -3881,13 +3795,11 @@ where
         return Ok(());
     }
 
-    let expected_inventory = state.inventory.clone();
-    let expected_carried_item = state.carried_item.clone();
-    if let Some(outcome) = craft_recipe(state, &recipe, packet.use_max_items) {
+    if let Some((inventory, outcome)) = craft_recipe(state, &recipe, packet.use_max_items) {
         if commit_player_inventory_candidate(
             state,
-            expected_inventory,
-            expected_carried_item,
+            inventory,
+            state.carried_item.clone(),
             None,
             player_pose,
         )
@@ -4477,15 +4389,13 @@ async fn commit_enchanting_table_candidate(
 
 async fn commit_player_inventory_candidate(
     state: &mut InteractionState,
-    expected_inventory: PlayerInventory,
-    expected_carried_item: ItemStack,
+    updated_inventory: PlayerInventory,
+    updated_carried_item: ItemStack,
     dropped: Option<ItemStack>,
     player_pose: PlayerPose,
 ) -> Result<bool, ConnectionError> {
     let drops = if let Some(stack) = dropped {
         let Some(entity_type_id) = item_entity_type_id(&state.entity_types) else {
-            state.inventory = expected_inventory;
-            state.carried_item = expected_carried_item;
             return Ok(false);
         };
         vec![ContainerDropPlan {
@@ -4497,10 +4407,10 @@ async fn commit_player_inventory_candidate(
         Vec::new()
     };
     let plan = ContainerPlayerPlan {
-        expected_inventory: expected_inventory.clone(),
-        expected_carried_item: expected_carried_item.clone(),
-        updated_inventory: state.inventory.clone(),
-        updated_carried_item: state.carried_item.clone(),
+        expected_inventory: state.inventory.clone(),
+        expected_carried_item: state.carried_item.clone(),
+        updated_inventory,
+        updated_carried_item,
         crafting_table_input: None,
         enchanting_table_input: None,
         merchant_input: None,
@@ -4510,8 +4420,6 @@ async fn commit_player_inventory_candidate(
     let outcome = match state.simulation.commit_player_inventory(plan).await {
         Ok(outcome) => outcome,
         Err(error) => {
-            state.inventory = expected_inventory;
-            state.carried_item = expected_carried_item;
             debug!(?error, "simulation player inventory request rejected");
             return Err(ConnectionError::RuntimeUnavailable {
                 operation: "committing player inventory",
@@ -4793,7 +4701,7 @@ async fn settle_recovered_player_inventory(
 fn hand_inventory_slot(state: &InteractionState, hand: InteractionHand) -> usize {
     match hand {
         InteractionHand::MainHand => {
-            PlayerInventory::HOTBAR_BASE + state.selected_hotbar_slot as usize
+            PlayerInventory::HOTBAR_BASE + state.selected_hotbar_slot() as usize
         }
         InteractionHand::OffHand => 45,
     }
@@ -6063,8 +5971,8 @@ where
         );
     }
 
-    let before_inventory = state.inventory.clone();
-    let before_carried_item = state.carried_item.clone();
+    let mut inventory = state.inventory.clone();
+    let mut carried_item = state.carried_item.clone();
     let mut dropped = None;
     let mut discarded_remainders = Vec::new();
     let action = classify_container_click(&packet);
@@ -6073,18 +5981,18 @@ where
     }
     let crafted_result = match &action {
         ContainerClickAction::Pickup { slot: 0, .. }
-        | ContainerClickAction::QuickMove { slot: 0 } => Some(before_inventory.slots[0].clone()),
+        | ContainerClickAction::QuickMove { slot: 0 } => Some(state.inventory.slots[0].clone()),
         _ => None,
     };
     let quick_moved_result = matches!(&action, ContainerClickAction::QuickMove { slot: 0 });
     let changed = match action {
         ContainerClickAction::Pickup { slot, button } => {
-            let (changed, discarded) = state.inventory.apply_crafting_pickup_click(
+            let (changed, discarded) = inventory.apply_crafting_pickup_click(
                 &state.items,
                 &state.item_facts,
                 &state.tags,
                 &state.recipes,
-                &mut state.carried_item,
+                &mut carried_item,
                 slot,
                 button,
             );
@@ -6092,11 +6000,11 @@ where
             changed
         }
         ContainerClickAction::OutsidePickup { button } => {
-            dropped = apply_outside_pickup_click_with_carried(&mut state.carried_item, button);
+            dropped = apply_outside_pickup_click_with_carried(&mut carried_item, button);
             dropped.is_some()
         }
         ContainerClickAction::QuickMove { slot } => {
-            let (changed, discarded) = state.inventory.apply_crafting_quick_move_click(
+            let (changed, discarded) = inventory.apply_crafting_quick_move_click(
                 &state.items,
                 &state.item_facts,
                 &state.tags,
@@ -6106,7 +6014,7 @@ where
             discarded_remainders = discarded;
             changed
         }
-        ContainerClickAction::Swap { slot, button } => state.inventory.apply_crafting_swap_click(
+        ContainerClickAction::Swap { slot, button } => inventory.apply_crafting_swap_click(
             &state.items,
             &state.item_facts,
             &state.tags,
@@ -6116,7 +6024,7 @@ where
         ),
         ContainerClickAction::Throw { slot, button } => {
             if item_entity_type_id(&state.entity_types).is_some() {
-                dropped = state.inventory.apply_crafting_throw_click(
+                dropped = inventory.apply_crafting_throw_click(
                     &state.items,
                     &state.item_facts,
                     &state.tags,
@@ -6130,17 +6038,17 @@ where
             }
         }
         ContainerClickAction::QuickCraft(click) => {
-            match state.inventory.apply_crafting_quickcraft_click(
+            match inventory.apply_crafting_quickcraft_click(
                 &state.items,
                 &state.item_facts,
-                &mut state.carried_item,
+                &mut carried_item,
                 &mut state.inventory_quickcraft,
                 click,
                 &state.tags,
                 &state.recipes,
             ) {
                 QuickCraftOutcome::Pending => {
-                    if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+                    if !client_carried_item_matches(&packet.carried_item, &carried_item) {
                         state.inventory_quickcraft.reset();
                         write_inventory_content_resync(state, writer).await?;
                     }
@@ -6159,10 +6067,8 @@ where
             "dropping inventory crafting remainder because inventory is full"
         );
     }
-    if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+    if !client_carried_item_matches(&packet.carried_item, &carried_item) {
         debug!("container click resynced mismatched carried item");
-        state.inventory = before_inventory;
-        state.carried_item = before_carried_item;
         write_inventory_content_resync(state, writer).await?;
         return Ok(());
     }
@@ -6179,19 +6085,13 @@ where
     }
     let crafted = crafted_result.as_ref().and_then(|result| {
         if quick_moved_result {
-            crafted_item_from_inventory_delta(result, &before_inventory, &state.inventory)
+            crafted_item_from_inventory_delta(result, &state.inventory, &inventory)
         } else {
             CraftedItem::from_single_result(result)
         }
     });
-    if commit_player_inventory_candidate(
-        state,
-        before_inventory,
-        before_carried_item,
-        dropped,
-        player_pose,
-    )
-    .await?
+    if commit_player_inventory_candidate(state, inventory, carried_item, dropped, player_pose)
+        .await?
     {
         if let (Some(script_events), Some(crafted)) = (script_events, crafted) {
             script_events
@@ -6868,7 +6768,7 @@ async fn damage_held_weapon_after_attack<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let slot = PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot);
+    let slot = PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot());
     if let Some(stack) = damage_held_weapon_stack(
         &state.items,
         &state.item_facts,
@@ -6929,9 +6829,9 @@ async fn handle_attack<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let Some(held) = state.inventory.held(state.selected_hotbar_slot).cloned() else {
+    let Some(held) = state.inventory.held(state.selected_hotbar_slot()).cloned() else {
         debug!(
-            slot = state.selected_hotbar_slot,
+            slot = state.selected_hotbar_slot(),
             "entity attack ignored for invalid selected hotbar slot"
         );
         return Ok(());
@@ -7146,7 +7046,7 @@ fn player_attack_cost_plan(
     let mut updated_survival = survival;
     let mut updated_inventory = state.inventory.clone();
     if game_mode == GameMode::Survival {
-        let held = updated_inventory.held_mut(state.selected_hotbar_slot)?;
+        let held = updated_inventory.held_mut(state.selected_hotbar_slot())?;
         updated_survival
             .add_exhaustion(mc_entity::player_survival_26_1_2::ENTITY_ATTACK_EXHAUSTION);
         damage_held_weapon_stack(&state.items, &state.item_facts, held);
@@ -7320,7 +7220,7 @@ where
             return write_block_ack(writer, state.compression, action.sequence).await;
         }
 
-        let slot = PlayerInventory::HOTBAR_BASE + state.selected_hotbar_slot as usize;
+        let slot = PlayerInventory::HOTBAR_BASE + state.selected_hotbar_slot() as usize;
         let expected_held = state.inventory.slots[slot].clone();
         if !expected_held.is_empty()
             && let Some(entity_type_id) = item_entity_type_id(&state.entity_types)
@@ -7334,7 +7234,7 @@ where
             match state
                 .simulation
                 .commit_selected_item_drop(SelectedItemDropPlan {
-                    held_hotbar_slot: state.selected_hotbar_slot,
+                    held_hotbar_slot: state.selected_hotbar_slot(),
                     expected_held,
                     drop_count,
                     entity_type_id,
@@ -7368,15 +7268,14 @@ where
         state.pending_use = None;
         clear_shield_use(state);
 
-        let main_hand_slot = PlayerInventory::HOTBAR_BASE + state.selected_hotbar_slot as usize;
-        let expected_inventory = state.inventory.clone();
-        state
-            .inventory
+        let main_hand_slot = PlayerInventory::HOTBAR_BASE + state.selected_hotbar_slot() as usize;
+        let mut inventory = state.inventory.clone();
+        inventory
             .slots
             .swap(main_hand_slot, PlayerInventory::OFFHAND_SLOT);
         if commit_player_inventory_candidate(
             state,
-            expected_inventory,
+            inventory,
             state.carried_item.clone(),
             None,
             player_pose,
@@ -7469,7 +7368,7 @@ fn start_shield_use(
     }
     let slot = shield_hand_slot(
         hand,
-        PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot),
+        PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot()),
         PlayerInventory::OFFHAND_SLOT,
     );
     let stack = state.inventory.slots[slot].clone();
@@ -7510,7 +7409,7 @@ fn refresh_shield_use_state(state: &mut InteractionState) {
     };
     let current_hand_slot = shield_hand_slot(
         shield_use.hand,
-        PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot),
+        PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot()),
         PlayerInventory::OFFHAND_SLOT,
     );
     if !shield_use_matches(
@@ -7531,7 +7430,8 @@ fn restore_authoritative_shield_state(
     state.inventory = authoritative.inventory;
     state.carried_item = authoritative.carried_item;
     state.shield_use = authoritative.active_shield.and_then(|shield| {
-        let main_hand_slot = PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot);
+        let main_hand_slot =
+            PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot());
         let hand = if shield.slot == main_hand_slot {
             mc_protocol::packets::play::InteractionHand::MainHand
         } else if shield.slot == PlayerInventory::OFFHAND_SLOT {
@@ -7576,7 +7476,7 @@ fn plan_active_shield_damage(
     };
     let current_hand_slot = shield_hand_slot(
         shield_use.hand,
-        PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot),
+        PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot()),
         PlayerInventory::OFFHAND_SLOT,
     );
     if !shield_use_matches(
@@ -7806,9 +7706,9 @@ async fn run_sheep_grazing_owned(
         resident_edits.push(mc_world::ResidentBlockEdit {
             pos: edit.pos,
             new_state: edit.new_state,
-            preserve_light: table.is_some_and(|table| {
-                !block_edit_changes_light(table, expected_state, edit.new_state)
-            }),
+            // The resident kernel derives light preservation from the actual
+            // previous state plus the light table.
+            preserve_light: false,
         });
         resident_preconditions.push(mc_world::ResidentBlockPrecondition {
             pos: edit.pos,
@@ -7911,7 +7811,7 @@ async fn commit_random_tick_region_fanout(
     ),
     (),
 > {
-    let lane_count = resources.cpu_limit().max(1).min(plans.len());
+    let lane_count = resources.cpu_capacity().max(1).min(plans.len());
     let mut lanes = BTreeMap::<usize, Vec<RandomTickRegionJob>>::new();
     for (index, planned) in plans.into_iter().enumerate() {
         let journal_chunks = resident_block_journal_chunks(world_read, &planned.plan.edits);
@@ -8059,7 +7959,7 @@ async fn commit_random_tick_region_fanout(
                         .into_iter()
                         .filter(|drop| applied_positions.contains(&drop.source)),
                 );
-                let additional = simulation::resident_block_edit_result_outcome(
+                let additional = block_edit_commit::resident_block_edit_result_outcome(
                     mc_world::ResidentBlockEditBatchResult::Applied(applied),
                 )
                 .expect("applied random-tick regional job has an outcome");
@@ -8130,7 +8030,7 @@ async fn run_random_ticks_owned(
     let mut applied_by_pass = HashSet::<mc_world::BlockPos>::new();
     let mut accepted_leaf_drops = Vec::new();
     let mut wave = None;
-    let fanout_plans = if cpu_resources.is_some_and(|resources| resources.cpu_limit() > 1)
+    let fanout_plans = if cpu_resources.is_some_and(|resources| resources.cpu_capacity() > 1)
         && world_mutation.is_some()
         && groups.len() > 1
     {
@@ -8259,7 +8159,7 @@ async fn run_random_ticks_owned(
         match resident_result {
             Some(mc_world::ResidentBlockEditBatchResult::Applied(applied)) => {
                 plan_applied_positions.extend(applied.iter().map(|edit| edit.pos));
-                let additional = simulation::resident_block_edit_result_outcome(
+                let additional = block_edit_commit::resident_block_edit_result_outcome(
                     mc_world::ResidentBlockEditBatchResult::Applied(applied),
                 )
                 .expect("applied resident random ticks have an outcome");
@@ -8539,7 +8439,7 @@ async fn commit_resident_block_edits(
         };
         return Ok(match result {
             mc_world::ResidentBlockEditBatchResult::Applied(applied) => {
-                simulation::resident_block_edit_result_outcome(
+                block_edit_commit::resident_block_edit_result_outcome(
                     mc_world::ResidentBlockEditBatchResult::Applied(applied),
                 )
             }
@@ -8661,7 +8561,7 @@ async fn commit_resident_block_edits(
             return Err(());
         }
     }
-    Ok(simulation::resident_block_edit_result_outcome(
+    Ok(block_edit_commit::resident_block_edit_result_outcome(
         mc_world::ResidentBlockEditBatchResult::Applied(applied),
     ))
 }
@@ -8771,7 +8671,7 @@ async fn commit_cross_region_scheduled_block_tick(
         }) {
             mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Applied(
                 applied,
-            ) => Ok(simulation::resident_block_edit_result_outcome(
+            ) => Ok(block_edit_commit::resident_block_edit_result_outcome(
                 mc_world::ResidentBlockEditBatchResult::Applied(applied),
             )),
             mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Stale => {
@@ -9545,7 +9445,7 @@ async fn run_scheduled_fluid_ticks_owned(
                 leaf_trigger_tick: Some(world_tick.saturating_add(1)),
             }) {
                 mc_world::ResidentBlockEditBatchResult::Applied(applied) => {
-                    simulation::resident_block_edit_result_outcome(
+                    block_edit_commit::resident_block_edit_result_outcome(
                         mc_world::ResidentBlockEditBatchResult::Applied(applied),
                     )
                 }
@@ -9764,67 +9664,6 @@ fn plan_scheduled_block_tick_edits(
     plan_scheduled_block_tick_edits_with_blocks(&config.blocks, snapshot, ticks, protection)
 }
 
-async fn plan_scheduled_block_regions_off_owner(
-    blocks: Arc<BlockRegistry>,
-    snapshot: mc_world::WorldReadSnapshot,
-    region_ticks: Vec<(RegionKey, Vec<ScheduledBlockTick>)>,
-    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
-    cpu_resources: Option<&ChunkPipelineResources>,
-) -> Result<Vec<ScheduledBlockRegionPlan>, ()> {
-    let permit = match cpu_resources {
-        Some(resources) => match resources.acquire_cpu().await {
-            Ok(permit) => Some(permit),
-            Err(error) => {
-                warn!(%error, "scheduled block planning CPU admission closed");
-                return Err(());
-            }
-        },
-        None => None,
-    };
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        region_ticks
-            .into_iter()
-            .map(|(region, due)| ScheduledBlockRegionPlan {
-                region,
-                plan: plan_scheduled_block_tick_edits_with_blocks(
-                    &blocks,
-                    &snapshot,
-                    &due,
-                    protection.as_deref(),
-                )
-                .expect("simple scheduled block region has a plan"),
-                due,
-            })
-            .collect()
-    })
-    .await
-    .map_err(|error| {
-        warn!(%error, "scheduled block planning worker failed");
-    })
-}
-
-async fn plan_scheduled_block_region_off_owner(
-    blocks: Arc<BlockRegistry>,
-    snapshot: mc_world::WorldReadSnapshot,
-    region: RegionKey,
-    due: Vec<ScheduledBlockTick>,
-    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
-    cpu_resources: Option<&ChunkPipelineResources>,
-) -> Result<ScheduledBlockRegionPlan, ()> {
-    let mut plans = plan_scheduled_block_regions_off_owner(
-        blocks,
-        snapshot,
-        vec![(region, due)],
-        protection,
-        cpu_resources,
-    )
-    .await?;
-    Ok(plans
-        .pop()
-        .expect("one scheduled block region produces one plan"))
-}
-
 fn requeue_stale_scheduled_block_ticks(
     storage: &mut mc_world::WorldStorage,
     ticks: &[ScheduledBlockTick],
@@ -9984,6 +9823,46 @@ async fn commit_scheduled_block_tick_coordinator(
     }
 }
 
+async fn plan_scheduled_block_regions_off_owner(
+    blocks: Arc<BlockRegistry>,
+    snapshot: mc_world::WorldReadSnapshot,
+    region_ticks: Vec<(RegionKey, Vec<ScheduledBlockTick>)>,
+    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
+    cpu_resources: Option<&ChunkPipelineResources>,
+) -> Result<Vec<ScheduledBlockRegionPlan>, ()> {
+    let permit = match cpu_resources {
+        Some(resources) => match resources.acquire_cpu().await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                warn!(%error, "scheduled block planning CPU admission closed");
+                return Err(());
+            }
+        },
+        None => None,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        region_ticks
+            .into_iter()
+            .map(|(region, due)| ScheduledBlockRegionPlan {
+                region,
+                plan: plan_scheduled_block_tick_edits_with_blocks(
+                    &blocks,
+                    &snapshot,
+                    &due,
+                    protection.as_deref(),
+                )
+                .expect("simple scheduled block region has a plan"),
+                due,
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| {
+        warn!(%error, "scheduled block planning worker failed");
+    })
+}
+
 fn scheduled_block_region_plan_fits(region: RegionKey, plan: &ScheduledBlockTickPlan) -> bool {
     let owns = |position: mc_world::BlockPos| block_world_region(position) == (region.x, region.z);
     if !plan.edits.iter().all(|edit| owns(edit.pos))
@@ -10010,7 +9889,7 @@ async fn commit_scheduled_block_region_fanout(
     plans: Vec<ScheduledBlockRegionPlan>,
     #[cfg(test)] probe: Option<simulation::RegionalBlockEditProbe>,
 ) -> Result<(BlockEditBatchOutcome, Vec<ScheduledBlockTick>), ()> {
-    let lane_count = resources.cpu_limit().max(1).min(plans.len());
+    let lane_count = resources.cpu_capacity().max(1).min(plans.len());
     let mut lanes = BTreeMap::<usize, Vec<ScheduledBlockRegionJob>>::new();
     for (index, planned) in plans.into_iter().enumerate() {
         let mut journal_chunks = resident_block_journal_chunks(world_read, &planned.plan.edits);
@@ -10152,7 +10031,7 @@ async fn commit_scheduled_block_region_fanout(
         wave.touched.extend(result.touched.iter().copied());
         match result.result {
             mc_world::ResidentBlockEditBatchResult::Applied(applied) => {
-                let additional = simulation::resident_block_edit_result_outcome(
+                let additional = block_edit_commit::resident_block_edit_result_outcome(
                     mc_world::ResidentBlockEditBatchResult::Applied(applied),
                 )
                 .expect("applied scheduled regional job has an outcome");
@@ -10319,7 +10198,7 @@ async fn run_scheduled_block_ticks_owned(
             }
         };
         let mut journal_failed = false;
-        let can_fanout = cpu_resources.is_some_and(|resources| resources.cpu_limit() > 1)
+        let can_fanout = cpu_resources.is_some_and(|resources| resources.cpu_capacity() > 1)
             && region_plans.as_ref().is_some_and(|plans| {
                 plans.len() > 1
                     && plans
@@ -10362,22 +10241,28 @@ async fn run_scheduled_block_ticks_owned(
             }
         }
         if let Some(region_plans) = region_plans {
-            for planned in region_plans {
-                let region_due = planned.due;
-                let current_snapshot =
-                    world_read.snapshot_chunks(&scheduled_block_planning_chunks(&region_due));
-                let planned = match plan_scheduled_block_region_off_owner(
-                    Arc::clone(&config.blocks),
-                    current_snapshot,
-                    planned.region,
-                    region_due,
-                    protection.clone(),
-                    cpu_resources,
-                )
-                .await
-                {
-                    Ok(planned) => planned,
-                    Err(()) => break,
+            for (index, planned) in region_plans.into_iter().enumerate() {
+                // Nothing in this batch has committed before its first plan.
+                // Later groups must observe preceding groups' mutations.
+                let planned = if index == 0 {
+                    planned
+                } else {
+                    let current_snapshot =
+                        world_read.snapshot_chunks(&scheduled_block_planning_chunks(&planned.due));
+                    match plan_scheduled_block_regions_off_owner(
+                        Arc::clone(&config.blocks),
+                        current_snapshot,
+                        vec![(planned.region, planned.due)],
+                        protection.clone(),
+                        cpu_resources,
+                    )
+                    .await
+                    {
+                        Ok(mut plans) => plans
+                            .pop()
+                            .expect("one scheduled block region produces one plan"),
+                        Err(()) => break,
+                    }
                 };
                 let region_due = planned.due;
                 let plan = planned.plan;
@@ -10422,7 +10307,7 @@ async fn run_scheduled_block_ticks_owned(
                 };
                 match resident_result {
                     Some(mc_world::ResidentBlockEditBatchResult::Applied(applied)) => {
-                        let additional = simulation::resident_block_edit_result_outcome(
+                        let additional = block_edit_commit::resident_block_edit_result_outcome(
                             mc_world::ResidentBlockEditBatchResult::Applied(applied),
                         )
                         .expect("applied resident block edits have an outcome");
@@ -11813,7 +11698,7 @@ where
         state.pending_use = Some(PendingUse {
             started_tick: state.sessions.simulation_tick(),
             required_ticks: item_use_ticks(Duration::from_secs(60)),
-            held_hotbar_slot: state.selected_hotbar_slot,
+            held_hotbar_slot: state.selected_hotbar_slot(),
             held_slot,
             held_item_id,
             kind: UseKind::Bow,
@@ -11839,7 +11724,7 @@ where
     state.pending_use = Some(PendingUse {
         started_tick: state.sessions.simulation_tick(),
         required_ticks: item_use_ticks(required_time),
-        held_hotbar_slot: state.selected_hotbar_slot,
+        held_hotbar_slot: state.selected_hotbar_slot(),
         held_slot,
         held_item_id,
         kind: UseKind::Food(rule),
@@ -12702,7 +12587,6 @@ where
                     state.pending_break = None;
                     state.pending_use = None;
                     clear_shield_use(state);
-                    state.selected_hotbar_slot = slot;
                     debug!(slot, "hotbar selection updated");
                 }
             } else {
@@ -12770,8 +12654,6 @@ struct ClientMetadataIngressContext<'a, W> {
     effective_client_view_distance: &'a mut i32,
     client_brand: &'a mut Option<String>,
     client_preferences: &'a mut Option<ClientPreferences>,
-    extension: Option<&'a ExtensionEventSink>,
-    extension_player_id: PlayerId,
     scripts: Option<&'a ScriptEventSink>,
     loader_eligible: bool,
     client_load: &'a mut ClientLoadGate,
@@ -12811,8 +12693,6 @@ where
         effective_client_view_distance,
         client_brand,
         client_preferences,
-        extension,
-        extension_player_id,
         scripts,
         loader_eligible,
         client_load,
@@ -12875,14 +12755,13 @@ where
                 if let Some(preferences) = client_preferences.as_mut() {
                     preferences.brand = Some(brand.clone());
                 }
-                let brand_for_event = brand.clone();
-                *client_brand = Some(brand);
-                if let Some(extension) = extension {
-                    extension.enqueue_event(InboundEvent::ClientBrand {
-                        player_id: extension_player_id,
-                        brand: brand_for_event,
-                    });
+                if let Some(scripts) = scripts {
+                    match ScriptEvent::client_brand(ScriptPlayerId::new(session_id), &brand) {
+                        Ok(event) => scripts.enqueue_event(event),
+                        Err(error) => debug!(?error, "client brand event rejected"),
+                    }
                 }
+                *client_brand = Some(brand);
             }
             PlayCustomPayloadAction::LoaderInteraction(payload) => {
                 if let Err(error) = session::route_client_loader_interaction(
@@ -12902,12 +12781,14 @@ where
                 }
             }
             PlayCustomPayloadAction::Unknown { channel, payload } => {
-                if let Some(extension) = extension {
-                    extension.enqueue_custom_payload(
-                        extension_player_id,
-                        ProtocolPhase::Play,
+                if let Some(scripts) = scripts
+                    && scripts.boundary().allows_custom_payload(&channel)
+                {
+                    scripts.enqueue_custom_payload(
+                        ScriptPlayerId::new(session_id),
+                        ScriptProtocolPhase::Play,
                         &channel,
-                        payload.as_ref(),
+                        payload.to_vec(),
                     );
                 } else {
                     debug!(channel = %channel, len = payload.len(), "custom payload ignored");
@@ -12916,7 +12797,7 @@ where
             PlayCustomPayloadAction::Oversized { len } => {
                 warn!(
                     len,
-                    max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
+                    max = MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES,
                     "oversized custom payload rejected before decode"
                 );
             }
@@ -13926,8 +13807,6 @@ async fn play_loop<R, W>(
     server_view_distance: i32,
     player_uuid: String,
     player_name: String,
-    extension: Option<ExtensionEventSink>,
-    extension_player_id: PlayerId,
     scripts: Option<ScriptEventSink>,
     script_zones: Option<PluginZoneAdapter>,
 ) -> Result<(), ConnectionError>
@@ -13960,8 +13839,6 @@ where
         server_view_distance,
         player_uuid,
         player_name,
-        extension,
-        extension_player_id,
         scripts,
         script_zones,
     ))
@@ -14283,8 +14160,6 @@ async fn play_loop_inner<R, W>(
     server_view_distance: i32,
     player_uuid: String,
     player_name: String,
-    extension: Option<ExtensionEventSink>,
-    extension_player_id: PlayerId,
     scripts: Option<ScriptEventSink>,
     script_zones: Option<PluginZoneAdapter>,
 ) -> Result<(), ConnectionError>
@@ -14514,7 +14389,10 @@ where
                         }
                     }
                     Some(OutboundCommand::DespawnEntity(entity)) => {
-                        send_entity_despawn(writer, compression, &entity).await?;
+                        send_entities_despawn(writer, compression, vec![entity.id.0]).await?;
+                    }
+                    Some(OutboundCommand::DespawnEntities(entity_ids)) => {
+                        send_entities_despawn(writer, compression, entity_ids).await?;
                     }
                     Some(OutboundCommand::AnimatePlayer { entity_id }) => {
                         send_player_animation(writer, compression, entity_id).await?;
@@ -14804,11 +14682,7 @@ where
                             debug!(teleport_id = confirm.teleport_id, "teleport confirmed");
                         }
                         TeleportConfirmResult::Mismatched { expected } => {
-                            warn!(
-                                expected,
-                                received = confirm.teleport_id,
-                                "teleport confirmation id mismatch"
-                            );
+                            note_teleport_confirm_mismatch(expected, confirm.teleport_id);
                         }
                         TeleportConfirmResult::Unexpected => {
                             debug!(teleport_id = confirm.teleport_id, "unexpected teleport confirmation ignored");
@@ -14929,8 +14803,6 @@ where
                             effective_client_view_distance: &mut effective_client_view_distance,
                             client_brand: &mut client_brand,
                             client_preferences: &mut client_preferences,
-                            extension: extension.as_ref(),
-                            extension_player_id,
                             scripts: scripts.as_ref(),
                             loader_eligible,
                             client_load: &mut client_load,
@@ -15122,15 +14994,18 @@ mod campfire_output_recovery_tests {
         assert_eq!(storage.flush_dirty().unwrap(), 1);
 
         let (entity_journal, entity_pending) =
-            persistence::FileRegionalDecisionJournal::open(root).unwrap();
+            persistence::FileRegionalDecisionJournal::open_for_test(root).unwrap();
         assert!(entity_pending.is_empty());
         let sessions = Arc::new(SessionRegistry::new_with_entity_owner_journal(
             1,
             Box::new(entity_journal),
         ));
-        let (world_journal, world_pending) =
-            world_journal::WorldChunkJournal::open(root, Arc::clone(&blocks), Arc::clone(&items))
-                .unwrap();
+        let (world_journal, world_pending) = world_journal::WorldChunkJournal::open_for_test(
+            root,
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+        )
+        .unwrap();
         assert!(world_pending.is_empty());
         sessions.install_world_chunk_journal(world_journal);
         assert!(sessions.restore_campfire_cooking(position, cooking));
@@ -15151,14 +15026,17 @@ mod campfire_output_recovery_tests {
         let mut storage = mc_world::WorldStorage::open(root, Arc::clone(&blocks))
             .unwrap()
             .with_item_registry(Arc::clone(&items));
-        let (world_journal, world_pending) =
-            world_journal::WorldChunkJournal::open(root, Arc::clone(&blocks), Arc::clone(&items))
-                .unwrap();
+        let (world_journal, world_pending) = world_journal::WorldChunkJournal::open_for_test(
+            root,
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+        )
+        .unwrap();
         for chunk in world_journal.decode_pending(&world_pending).unwrap() {
             storage.replay_journal_chunk(chunk).unwrap();
         }
         let (entity_journal, entity_pending) =
-            persistence::FileRegionalDecisionJournal::open(root).unwrap();
+            persistence::FileRegionalDecisionJournal::open_for_test(root).unwrap();
         let sessions = Arc::new(SessionRegistry::new_with_entity_owner_journal(
             1,
             Box::new(entity_journal),
@@ -15224,7 +15102,8 @@ mod campfire_output_recovery_tests {
         let blocks = campfire_test_blocks();
         let items = Arc::new(mc_data::items::solaris_required_items());
         let (journal, pending) =
-            world_journal::WorldChunkJournal::open(root, blocks, Arc::clone(&items)).unwrap();
+            world_journal::WorldChunkJournal::open_for_test(root, blocks, Arc::clone(&items))
+                .unwrap();
         pending_output_from_decisions(&journal, &pending, &items, position)
     }
 

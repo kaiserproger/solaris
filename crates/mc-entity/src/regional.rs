@@ -13,23 +13,31 @@ use crate::lock_policy::{
 };
 use crate::{
     AnimalBreedingState, EntityDamage, EntityDamageRequest, EntityEffectRequest,
-    EntityEffectResult, EntityGoalCheckpoint, EntityGoalFence, EntityId, EntityItemStack,
-    EntityKinematics, EntityLifecycle, EntityMotionState, EntitySimulationProjection,
-    EntitySnapshot, EntityStore, EntityView, GoalState, GoalTickStats, PathingBudget, PathingProbe,
-    PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3, deterministic_uuid, snapshot_from_spawn,
+    EntityEffectResult, EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics,
+    EntityLifecycle, EntityMotionState, EntityPhysicsQuery, EntityPhysicsStep,
+    EntitySimulationProjection, EntitySimulationResult, EntitySnapshot, EntityStore,
+    EntityTrackingMotion, EntityView, EntityVillagerGoalUpdate, GoalState, GoalTickStats,
+    PathingBudget, PathingProbe, PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3,
+    deterministic_uuid, snapshot_from_spawn,
 };
 
+mod entity_projections;
 mod owner_lane;
 #[cfg(test)]
 mod owner_lane_tests;
+mod tick;
 #[cfg(test)]
 mod villager_binding_tests;
 
-use owner_lane::RegionalOwnerLaneReader;
+use owner_lane::{
+    FencedKinematicsCandidate, LocalKinematicsRegionBatch, LocalPhysicsInput,
+    LocalPhysicsRegionBatch, RegionalOwnerLaneReader,
+};
 pub use owner_lane::{
     RegionOwnerBatch, RegionOwnerCompletion, RegionOwnerLaneError, RegionOwnerLaneStartError,
     RegionOwnerMutation, RegionalOwnerLane, SequencedRegionMutation,
 };
+pub use tick::{RegionalTickWorld, warm_physics_caches};
 
 pub const REGION_SIZE_CHUNKS: i32 = 8;
 const CHUNK_SIZE_BLOCKS: f64 = 16.0;
@@ -107,21 +115,28 @@ impl VillagerBindingClaim {
     }
 }
 
-fn validate_villager_binding_query(
-    center: Vec3,
-    radius: f64,
-    token: &str,
-) -> Result<(), RegionOwnerLaneError> {
+fn validate_villager_binding_token(token: &str) -> Result<(), RegionOwnerLaneError> {
     let valid_token = !token.is_empty()
         && token.len() <= 64
         && token.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
         });
+    if !valid_token {
+        return Err(RegionOwnerLaneError::InvalidQuery);
+    }
+    Ok(())
+}
+
+fn validate_villager_binding_query(
+    center: Vec3,
+    radius: f64,
+    token: &str,
+) -> Result<(), RegionOwnerLaneError> {
+    validate_villager_binding_token(token)?;
     if !center.is_finite()
         || !radius.is_finite()
         || radius <= 0.0
         || radius > MAX_VILLAGER_BINDING_RADIUS
-        || !valid_token
     {
         return Err(RegionOwnerLaneError::InvalidQuery);
     }
@@ -749,6 +764,109 @@ struct PendingInsert {
     snapshot: EntitySnapshot,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegionalVillagerProfessionOffer {
+    pub profession: crate::VillagerProfession,
+    pub merchant: crate::villager_merchant_26_1_2::VillagerMerchantState,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegionalVillagerGoalTickInputs {
+    pub day_time: i64,
+    pub profile: Arc<crate::villager_26_1_2::VillagerBrainProfile>,
+    pub profession_offers: Arc<HashMap<EntityId, RegionalVillagerProfessionOffer>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegionalGoalTickInputs {
+    pub active_chunks: Option<Arc<HashSet<(i32, i32)>>>,
+    pub terrain_pathing_entities: Arc<HashSet<EntityId>>,
+    pub hostile_target_positions: Option<Arc<[Vec3]>>,
+    pub combat_targets: Arc<HashMap<i32, Vec3>>,
+    pub mob_behaviors: Arc<mc_data::mob_behavior_26_1_2::MobBehaviorTable>,
+    pub villager: Option<Arc<RegionalVillagerGoalTickInputs>>,
+}
+
+impl Default for RegionalGoalTickInputs {
+    fn default() -> Self {
+        Self {
+            active_chunks: None,
+            terrain_pathing_entities: Arc::new(HashSet::new()),
+            hostile_target_positions: None,
+            combat_targets: Arc::new(HashMap::new()),
+            mob_behaviors: Arc::new(
+                mc_data::mob_behavior_26_1_2::MobBehaviorTable::vanilla_26_1_2(),
+            ),
+            villager: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RegionalEntityTickInput {
+    pub tick: u64,
+    pub simulation_chunks: Arc<HashSet<(i32, i32)>>,
+    pub goals: RegionalGoalTickInputs,
+    pub world: Arc<RegionalTickWorld>,
+    pub pathing_budget: PathingBudget,
+    pub profession_offers_by_block_state: Arc<HashMap<u32, RegionalVillagerProfessionOffer>>,
+}
+
+pub struct RegionalEntityTickOutput {
+    pub goal_stats: GoalTickStats,
+    pub active_entity_count: usize,
+    pub active_hostile_ids: Vec<(EntityId, Vec3)>,
+    pub villager_population_candidates: Vec<(EntityId, Vec3)>,
+    pub villager_ids: Vec<(EntityId, Vec3)>,
+    pub villager_proximity_seeds: Vec<(EntityId, Vec3)>,
+    pub fallback_entity_ids: HashSet<EntityId>,
+    pub prepared_physics: RegionalPreparedEntityPhysics,
+    pub resolved_direct_paths: HashSet<EntityId>,
+    pub villager_profession_updates: Vec<EntitySnapshot>,
+}
+
+pub struct RegionalPreparedEntityPhysics {
+    authority: RegionalAuthorityId,
+    simulation_chunks: Arc<HashSet<(i32, i32)>>,
+    world: Arc<RegionalTickWorld>,
+    lanes: Vec<RegionalPreparedLanePhysics>,
+}
+
+struct RegionalPreparedLanePhysics {
+    lane: usize,
+    regions: Vec<RegionLease>,
+    goal_committed_motion: Vec<(RegionLease, EntityTrackingMotion)>,
+}
+
+/// Lane-side timing split for one owned-region physics commit. All fields are
+/// wall time in microseconds on the lane/coordinator clock. `worker_wait_us`
+/// is the summed sequential nested per-lane completion wait (aggregate stall
+/// on the coordinator); `worker_exec_us` is the slowest single per-lane
+/// worker execution (max). With one lane, worker message-queue wait is
+/// approximately `worker_wait_us` minus `worker_exec_us`; with several lanes
+/// compare max-to-max instead of subtracting aggregates.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaneCommitTimings {
+    /// Whole coordinator execution: admission locks, lane dispatch, nested
+    /// worker completion, validation and fence assembly.
+    pub exec_us: u64,
+    /// Waiting to acquire all lane admission locks.
+    pub admission_wait_us: u64,
+    /// Waiting on nested per-lane worker completion channels.
+    pub worker_wait_us: u64,
+    /// Slowest per-lane worker execution of this physics message itself
+    /// (dispatch receipt to output assembly on the worker thread).
+    pub worker_exec_us: u64,
+}
+
+pub struct RegionalEntityPhysicsOutput {
+    pub fallback_results: Vec<EntitySimulationResult>,
+    pub fallback_fence: Option<VersionedEntityKinematics>,
+    pub committed_motion: Vec<EntityTrackingMotion>,
+    pub publication_fence: VersionedEntitySnapshots,
+    pub terrain_pathing_additions: HashSet<EntityId>,
+    pub lane_timings: LaneCommitTimings,
+}
 #[derive(Debug)]
 pub struct RegionalPreparedGoalTick {
     authority: RegionalAuthorityId,
@@ -756,10 +874,16 @@ pub struct RegionalPreparedGoalTick {
     leases: BTreeMap<RegionKey, RegionLease>,
     lane_versions: BTreeMap<usize, u64>,
     batches: BTreeMap<RegionKey, PreparedGoalTick>,
+    simulation_ids: BTreeMap<RegionKey, Vec<EntityId>>,
     follow_targets: BTreeMap<RegionKey, HashMap<EntityId, Vec3>>,
     follow_target_sources: BTreeMap<EntityId, RegionalFollowTargetSource>,
     expected_missing_follow_targets: HashSet<EntityId>,
-    goal_inputs: BTreeMap<EntityId, EntityGoalCheckpoint>,
+    goal_inputs: BTreeMap<RegionKey, Vec<EntityGoalCheckpoint>>,
+    goal_overrides: BTreeMap<RegionKey, Vec<(EntityId, GoalState)>>,
+    snapshot_overrides: BTreeMap<RegionKey, Vec<(EntitySnapshot, EntitySnapshot)>>,
+    villager_updates: BTreeMap<RegionKey, Vec<EntityVillagerGoalUpdate>>,
+    cross_region_villager_candidates: HashSet<EntityId>,
+    pathing_aabbs: HashMap<EntityId, mc_physics::Aabb>,
 }
 
 #[derive(Debug)]
@@ -769,10 +893,14 @@ pub struct RegionalResolvedGoalTick {
     leases: BTreeMap<RegionKey, RegionLease>,
     lane_versions: BTreeMap<usize, u64>,
     batches: BTreeMap<RegionKey, ResolvedGoalTick>,
+    simulation_ids: BTreeMap<RegionKey, Vec<EntityId>>,
     follow_targets: BTreeMap<RegionKey, HashMap<EntityId, Vec3>>,
     follow_target_sources: BTreeMap<EntityId, RegionalFollowTargetSource>,
     expected_missing_follow_targets: HashSet<EntityId>,
-    goal_inputs: BTreeMap<EntityId, EntityGoalCheckpoint>,
+    goal_inputs: BTreeMap<RegionKey, Vec<EntityGoalCheckpoint>>,
+    goal_overrides: BTreeMap<RegionKey, Vec<(EntityId, GoalState)>>,
+    snapshot_overrides: BTreeMap<RegionKey, Vec<(EntitySnapshot, EntitySnapshot)>>,
+    villager_updates: BTreeMap<RegionKey, Vec<EntityVillagerGoalUpdate>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -782,10 +910,11 @@ struct RegionalFollowTargetSource {
 }
 
 struct CapturedFollowTargets {
-    remote_by_region: BTreeMap<RegionKey, HashMap<EntityId, Vec3>>,
+    complete_by_region: BTreeMap<RegionKey, HashMap<EntityId, Vec3>>,
     sources: BTreeMap<EntityId, RegionalFollowTargetSource>,
     expected_missing_follow_targets: HashSet<EntityId>,
-    inputs: BTreeMap<EntityId, EntityGoalCheckpoint>,
+
+    inputs: BTreeMap<RegionKey, Vec<EntityGoalCheckpoint>>,
 }
 
 impl RegionalPreparedGoalTick {
@@ -796,12 +925,26 @@ impl RegionalPreparedGoalTick {
             .filter(|batch| batch.pathing_request_count() > 0)
             .count()
     }
+    #[must_use]
+    pub fn pathing_request_count(&self) -> usize {
+        self.batches
+            .values()
+            .map(PreparedGoalTick::pathing_request_count)
+            .sum()
+    }
+
+    pub fn goal_entity_count(&self) -> usize {
+        self.goal_inputs.values().map(Vec::len).sum::<usize>() + self.pathing_request_count()
+    }
 
     #[must_use]
-    pub fn goal_fence(&self, entity: EntityId) -> Option<EntityGoalFence> {
-        self.goal_inputs
-            .get(&entity)
-            .map(|checkpoint| EntityGoalFence::from_goal(&checkpoint.goal))
+    pub fn pathing_aabbs(&self) -> &HashMap<EntityId, mc_physics::Aabb> {
+        &self.pathing_aabbs
+    }
+
+    #[must_use]
+    pub fn cross_region_villager_candidates(&self) -> &HashSet<EntityId> {
+        &self.cross_region_villager_candidates
     }
 
     pub fn visit_pathing_probe_positions(
@@ -820,20 +963,27 @@ impl RegionalPreparedGoalTick {
         probe: &dyn PathingProbe,
         budget: PathingBudget,
     ) -> RegionalResolvedGoalTick {
+        let mut goal_inputs = self.goal_inputs;
+        let mut batches = BTreeMap::new();
+        for (key, prepared) in self.batches {
+            remove_pathing_checkpoints(&mut goal_inputs, key, &prepared);
+            let (resolved, checkpoints) = prepared.resolve_for_regional(probe, budget);
+            insert_resolved_goal_batch(&mut goal_inputs, &mut batches, key, resolved, checkpoints);
+        }
         RegionalResolvedGoalTick {
             authority: self.authority,
             phase: self.phase,
             leases: self.leases,
             lane_versions: self.lane_versions,
+            simulation_ids: self.simulation_ids,
             follow_targets: self.follow_targets,
             follow_target_sources: self.follow_target_sources,
             expected_missing_follow_targets: self.expected_missing_follow_targets,
-            goal_inputs: self.goal_inputs,
-            batches: self
-                .batches
-                .into_iter()
-                .map(|(key, prepared)| (key, prepared.resolve(probe, budget)))
-                .collect(),
+            goal_inputs,
+            goal_overrides: self.goal_overrides,
+            snapshot_overrides: self.snapshot_overrides,
+            villager_updates: self.villager_updates,
+            batches,
         }
     }
 
@@ -854,12 +1004,21 @@ impl RegionalPreparedGoalTick {
             phase,
             leases,
             lane_versions,
+            simulation_ids,
             batches,
             follow_targets,
             follow_target_sources,
             expected_missing_follow_targets,
-            goal_inputs,
+            mut goal_inputs,
+            goal_overrides,
+            snapshot_overrides,
+            villager_updates,
+            cross_region_villager_candidates: _,
+            pathing_aabbs: _,
         } = self;
+        for (&key, prepared) in &batches {
+            remove_pathing_checkpoints(&mut goal_inputs, key, prepared);
+        }
         let batch_count = batches.len();
         let (parallel_batches, inline_batches): (Vec<_>, Vec<_>) = batches
             .into_iter()
@@ -876,7 +1035,11 @@ impl RegionalPreparedGoalTick {
                 scope.spawn(move |_| {
                     let worker_results = bucket
                         .into_iter()
-                        .map(|(key, prepared)| (key, prepared.resolve(probe, budget)))
+                        .map(|(key, prepared)| {
+                            let (resolved, checkpoints) =
+                                prepared.resolve_for_regional(probe, budget);
+                            (key, resolved, checkpoints)
+                        })
                         .collect::<Vec<_>>();
                     lock_authoritative_mutex(resolved, "regional.goal_parallel_results")
                         .extend(worker_results);
@@ -885,29 +1048,87 @@ impl RegionalPreparedGoalTick {
             let local_results = inline_batches
                 .into_iter()
                 .chain(local)
-                .map(|(key, prepared)| (key, prepared.resolve(probe, budget)))
+                .map(|(key, prepared)| {
+                    let (resolved, checkpoints) = prepared.resolve_for_regional(probe, budget);
+                    (key, resolved, checkpoints)
+                })
                 .collect::<Vec<_>>();
             lock_authoritative_mutex(&resolved, "regional.goal_parallel_results")
                 .extend(local_results);
         });
         let resolved = resolved
             .into_inner()
-            .expect("regional goal parallel result lock poisoned")
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
+            .expect("regional goal parallel result lock poisoned");
+        let mut batches = BTreeMap::new();
+        for (key, resolved, checkpoints) in resolved {
+            insert_resolved_goal_batch(&mut goal_inputs, &mut batches, key, resolved, checkpoints);
+        }
 
         RegionalResolvedGoalTick {
             authority,
             phase,
             leases,
             lane_versions,
-            batches: resolved,
+            simulation_ids,
+            batches,
             follow_targets,
             follow_target_sources,
             expected_missing_follow_targets,
             goal_inputs,
+            goal_overrides,
+            snapshot_overrides,
+            villager_updates,
         }
     }
+}
+
+fn remove_pathing_checkpoints(
+    goal_inputs: &mut BTreeMap<RegionKey, Vec<EntityGoalCheckpoint>>,
+    region: RegionKey,
+    prepared: &PreparedGoalTick,
+) {
+    let Some(inputs) = goal_inputs.get_mut(&region) else {
+        return;
+    };
+    let pathing_ids = prepared.pathing_request_ids().collect::<HashSet<_>>();
+    if !pathing_ids.is_empty() {
+        inputs.retain(|checkpoint| !pathing_ids.contains(&checkpoint.id));
+    }
+}
+
+fn insert_resolved_goal_batch(
+    goal_inputs: &mut BTreeMap<RegionKey, Vec<EntityGoalCheckpoint>>,
+    batches: &mut BTreeMap<RegionKey, ResolvedGoalTick>,
+    region: RegionKey,
+    resolved: ResolvedGoalTick,
+    pathing_checkpoints: Vec<EntityGoalCheckpoint>,
+) {
+    let explicit = goal_inputs.entry(region).or_default();
+    if explicit.is_empty() {
+        *explicit = pathing_checkpoints;
+    } else if !pathing_checkpoints.is_empty() {
+        let mut left = std::mem::take(explicit).into_iter().peekable();
+        let mut right = pathing_checkpoints.into_iter().peekable();
+        let mut merged = Vec::with_capacity(left.len() + right.len());
+        while let (Some(left_checkpoint), Some(right_checkpoint)) = (left.peek(), right.peek()) {
+            assert_ne!(
+                left_checkpoint.id, right_checkpoint.id,
+                "pathing and explicit goal checkpoints must be disjoint"
+            );
+            if left_checkpoint.id < right_checkpoint.id {
+                merged.push(left.next().expect("peeked left checkpoint"));
+            } else {
+                merged.push(right.next().expect("peeked right checkpoint"));
+            }
+        }
+        merged.extend(left);
+        merged.extend(right);
+        *explicit = merged;
+    }
+    assert!(
+        batches.insert(region, resolved).is_none(),
+        "resolved regional goal batches must be unique"
+    );
 }
 
 #[derive(Debug)]
@@ -947,6 +1168,8 @@ struct VillagerBindingAuthority {
 
 struct MutationExecution {
     goal_stats: GoalTickStats,
+    goal_candidate_runs: Vec<Vec<FencedKinematicsCandidate>>,
+    lane_versions: BTreeMap<usize, u64>,
     effect_results: Vec<(u64, EntityEffectResult)>,
 }
 
@@ -1206,6 +1429,26 @@ struct CachedEntityReadRoute {
     owner: RegionalOwnerLaneReader,
 }
 
+struct CachedSnapshotCommit {
+    fence: RegionalVersionFence,
+    snapshots: Vec<EntitySnapshot>,
+}
+
+impl CachedSnapshotCommit {
+    fn into_snapshots(self) -> Vec<EntitySnapshot> {
+        self.snapshots
+    }
+
+    fn into_versioned(self, authority: RegionalAuthorityId) -> VersionedEntitySnapshots {
+        VersionedEntitySnapshots {
+            authority,
+            fence: self.fence,
+            snapshots: self.snapshots,
+            publication_readers: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegionalOwnerStatus {
     pub entity_count: usize,
@@ -1223,6 +1466,7 @@ pub struct VersionedEntitySnapshots {
     authority: RegionalAuthorityId,
     fence: RegionalVersionFence,
     snapshots: Vec<EntitySnapshot>,
+    publication_readers: Option<Arc<BTreeMap<usize, RegionalOwnerLaneReader>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1231,6 +1475,161 @@ pub struct VersionedEntityKinematics {
     authority: RegionalAuthorityId,
     fence: RegionalVersionFence,
     expected: Vec<CompactEntityKinematicsFence>,
+    routes: Vec<RegionLease>,
+    motion_states: Option<Vec<EntityMotionState>>,
+    owner_readers: Option<Arc<BTreeMap<usize, RegionalOwnerLaneReader>>>,
+}
+impl VersionedEntityKinematics {
+    /// Reports whether this one-use fence covers exactly the requested IDs.
+    #[must_use]
+    pub fn covers_ids(&self, mut ids: impl ExactSizeIterator<Item = EntityId>) -> bool {
+        if self.expected.len() != ids.len() {
+            return false;
+        }
+        let expected_ids = self
+            .expected
+            .iter()
+            .map(|expected| expected.id)
+            .collect::<HashSet<_>>();
+        expected_ids.len() == self.expected.len() && ids.all(|id| expected_ids.contains(&id))
+    }
+    pub fn subset_for_states(&self, states: &[EntityKinematics]) -> Option<Self> {
+        if states.is_empty() {
+            return None;
+        }
+        let mut seen = HashSet::with_capacity(states.len());
+        let mut expected = Vec::with_capacity(states.len());
+        let mut routes = Vec::with_capacity(states.len());
+        let mut lanes = BTreeSet::new();
+        let expected_indices = self
+            .expected
+            .iter()
+            .enumerate()
+            .map(|(index, expected)| (expected.id, index))
+            .collect::<HashMap<_, _>>();
+        for state in states {
+            if !state.is_finite() || !seen.insert(state.id) {
+                return None;
+            }
+            let index = *expected_indices.get(&state.id)?;
+            let previous = *self.expected.get(index)?;
+            let lease = *self.routes.get(index)?;
+            lanes.insert(lease.lane);
+            routes.push(lease);
+            expected.push(previous);
+        }
+        let mut lane_versions = BTreeMap::new();
+        for lane in &lanes {
+            lane_versions.insert(*lane, *self.fence.lane_versions.get(lane)?);
+        }
+        let owner_readers = self.owner_readers.as_ref().map(|readers| {
+            lanes
+                .iter()
+                .map(|lane| Some((*lane, readers.get(lane)?.clone())))
+                .collect::<Option<BTreeMap<_, _>>>()
+        });
+        let owner_readers = match owner_readers {
+            Some(Some(readers)) => Some(Arc::new(readers)),
+            Some(None) => return None,
+            None => None,
+        };
+        let motion_states = match self.motion_states.as_ref() {
+            Some(motion_states) => Some(
+                states
+                    .iter()
+                    .map(|state| {
+                        motion_states
+                            .binary_search_by_key(&state.id, |motion| motion.id)
+                            .ok()
+                            .and_then(|index| motion_states.get(index))
+                            .copied()
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        Some(Self {
+            authority: self.authority,
+            fence: RegionalVersionFence {
+                leases: HashMap::new(),
+                lane_versions,
+            },
+            expected,
+            routes,
+            motion_states,
+            owner_readers,
+        })
+    }
+    pub fn take_motion_states(&mut self) -> Option<Vec<EntityMotionState>> {
+        self.motion_states.take()
+    }
+
+    #[must_use]
+    pub fn motion_states(&self) -> Option<&[EntityMotionState]> {
+        self.motion_states.as_deref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionedKinematicsCommit {
+    states: Vec<EntityKinematics>,
+    fence: VersionedEntitySnapshots,
+    before_lane_versions: BTreeMap<usize, u64>,
+}
+
+impl VersionedKinematicsCommit {
+    #[must_use]
+    pub fn states(&self) -> &[EntityKinematics] {
+        &self.states
+    }
+
+    /// Retains the post-commit routing/version fence for publication CAS.
+    #[must_use]
+    pub fn publication_fence(&self) -> VersionedEntitySnapshots {
+        self.fence.fence_only()
+    }
+
+    pub fn rebase_snapshots(&self, selected: &mut VersionedEntitySnapshots) -> bool {
+        if self.fence.authority != selected.authority
+            || selected
+                .fence
+                .lane_versions
+                .iter()
+                .any(|(lane, version)| self.before_lane_versions.get(lane) != Some(version))
+            || selected
+                .fence
+                .lane_versions
+                .keys()
+                .any(|lane| !self.fence.fence.lane_versions.contains_key(lane))
+            || self.states.iter().any(|state| {
+                selected
+                    .snapshots
+                    .binary_search_by_key(&state.id, |snapshot| snapshot.id)
+                    .is_err()
+            })
+        {
+            return false;
+        }
+        for (lane, version) in &mut selected.fence.lane_versions {
+            *version = self.fence.fence.lane_versions[lane];
+        }
+        for state in &self.states {
+            let index = selected
+                .snapshots
+                .binary_search_by_key(&state.id, |snapshot| snapshot.id)
+                .expect("kinematics snapshot ids were prevalidated");
+            let snapshot = &mut selected.snapshots[index];
+            snapshot.position = state.position;
+            snapshot.rotation = state.rotation;
+            snapshot.velocity = state.velocity;
+            snapshot.on_ground = state.on_ground;
+        }
+        true
+    }
+
+    pub fn into_states(self) -> Vec<EntityKinematics> {
+        self.states
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1252,6 +1651,28 @@ impl CompactEntityKinematicsFence {
             && self.id == self.expected.id
     }
 }
+#[derive(Debug, Clone, Copy)]
+struct CompactEntityPhysicsFence {
+    id: EntityId,
+    uuid: Uuid,
+    lifecycle: crate::EntityLifecycle,
+    rotation: crate::Rotation,
+    pickup_claimed: bool,
+    vehicle_attached: bool,
+}
+
+impl From<CompactEntityKinematicsFence> for CompactEntityPhysicsFence {
+    fn from(fence: CompactEntityKinematicsFence) -> Self {
+        Self {
+            id: fence.id,
+            uuid: fence.uuid,
+            lifecycle: fence.lifecycle,
+            rotation: fence.expected.rotation,
+            pickup_claimed: fence.pickup_claimed,
+            vehicle_attached: fence.vehicle_attached,
+        }
+    }
+}
 
 impl VersionedEntitySnapshots {
     #[must_use]
@@ -1259,14 +1680,81 @@ impl VersionedEntitySnapshots {
         &self.snapshots
     }
 
-    fn into_snapshots(self) -> Vec<EntitySnapshot> {
+    /// Reports whether this fence covers exactly the requested entity IDs.
+    #[must_use]
+    pub fn covers_ids(&self, mut ids: impl ExactSizeIterator<Item = EntityId>) -> bool {
+        self.fence.leases.len() == ids.len() && ids.all(|id| self.fence.leases.contains_key(&id))
+    }
+
+    #[must_use]
+    pub fn kinematics_fence(&self) -> Option<VersionedEntityKinematics> {
+        if self.snapshots.is_empty() {
+            return None;
+        }
+        Some(VersionedEntityKinematics {
+            authority: self.authority,
+            fence: self.fence.clone(),
+            routes: self
+                .snapshots
+                .iter()
+                .map(|snapshot| self.fence.leases.get(&snapshot.id).copied())
+                .collect::<Option<Vec<_>>>()?,
+            expected: self
+                .snapshots
+                .iter()
+                .map(|snapshot| CompactEntityKinematicsFence {
+                    id: snapshot.id,
+                    uuid: snapshot.uuid,
+                    lifecycle: snapshot.lifecycle,
+                    expected: EntityKinematics {
+                        id: snapshot.id,
+                        position: snapshot.position,
+                        rotation: snapshot.rotation,
+                        velocity: snapshot.velocity,
+                        on_ground: snapshot.on_ground,
+                    },
+                    pickup_claimed: snapshot.retained.item_pickup_claim.is_some(),
+                    vehicle_attached: snapshot.vehicle.is_some(),
+                })
+                .collect(),
+            motion_states: None,
+            owner_readers: None,
+        })
+    }
+
+    /// Retain only the routing/version fence after snapshot consumers finish.
+    ///
+    /// The full snapshots must remain present until any kinematics rebase has
+    /// completed. This is used only for the publication CAS fence, which never
+    /// reads the snapshot payload.
+    #[must_use]
+    pub fn without_snapshots(self) -> Self {
+        Self {
+            authority: self.authority,
+            fence: self.fence,
+            snapshots: Vec::new(),
+            publication_readers: self.publication_readers,
+        }
+    }
+    #[must_use]
+    pub fn fence_only(&self) -> Self {
+        Self {
+            authority: self.authority,
+            fence: self.fence.clone(),
+            snapshots: Vec::new(),
+            publication_readers: self.publication_readers.clone(),
+        }
+    }
+
+    /// Consume the publication and return its authoritative snapshots.
+    pub fn into_snapshots(self) -> Vec<EntitySnapshot> {
         self.snapshots
     }
 }
 
 #[derive(Debug, Clone)]
 struct RegionalVersionFence {
-    leases: BTreeMap<EntityId, RegionLease>,
+    leases: HashMap<EntityId, RegionLease>,
     lane_versions: BTreeMap<usize, u64>,
 }
 
@@ -1329,6 +1817,15 @@ pub enum RegionalOwnerRuntimeShutdownError {
     Owner(RegionalOwnerShutdownError),
 }
 
+type GoalApplySimulationResult = Result<
+    Option<(
+        GoalTickStats,
+        Vec<EntitySimulationResult>,
+        Option<VersionedEntityKinematics>,
+    )>,
+    RegionOwnerLaneError,
+>;
+
 type GoalApplyKinematicsResult = Result<
     Option<(
         GoalTickStats,
@@ -1337,6 +1834,30 @@ type GoalApplyKinematicsResult = Result<
     )>,
     RegionOwnerLaneError,
 >;
+type VersionedKinematicsRead = (Vec<EntityKinematics>, Option<VersionedEntityKinematics>);
+type VersionedSimulationResultsRead = (
+    Vec<EntitySimulationResult>,
+    Option<VersionedEntityKinematics>,
+);
+type SelectedPhysicsCommit = (
+    Vec<EntityId>,
+    Vec<EntityMotionState>,
+    Vec<EntityKinematics>,
+    VersionedEntitySnapshots,
+);
+type FencedSimulationResults = (
+    Vec<EntityKinematics>,
+    Vec<EntitySimulationResult>,
+    Option<VersionedEntityKinematics>,
+);
+
+#[derive(Clone)]
+enum SnapshotSelection {
+    All,
+    SheepGrazing {
+        include_idle: Arc<HashSet<EntityId>>,
+    },
+}
 
 enum RegionalOwnerCommand {
     Snapshot {
@@ -1348,12 +1869,28 @@ enum RegionalOwnerCommand {
     },
     SnapshotsForIds {
         entities: HashSet<EntityId>,
+        selection: SnapshotSelection,
         reply: std::sync::mpsc::Sender<Result<VersionedEntitySnapshots, RegionOwnerLaneError>>,
+    },
+    AliveKinematicsForIds {
+        entities: HashSet<EntityId>,
+        reply: std::sync::mpsc::Sender<Result<VersionedKinematicsRead, RegionOwnerLaneError>>,
+    },
+    SimulationResultsForIds {
+        entities: HashSet<EntityId>,
+        reply:
+            std::sync::mpsc::Sender<Result<VersionedSimulationResultsRead, RegionOwnerLaneError>>,
     },
     SimulationProjectionsForIds {
         entities: HashSet<EntityId>,
         reply:
             std::sync::mpsc::Sender<Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError>>,
+    },
+    DespawnProjectionsForIds {
+        entities: HashSet<EntityId>,
+        reply: std::sync::mpsc::Sender<
+            Result<Vec<crate::EntityDespawnProjection>, RegionOwnerLaneError>,
+        >,
     },
     ContainsUuid {
         uuid: Uuid,
@@ -1369,6 +1906,10 @@ enum RegionalOwnerCommand {
         token: String,
         goal: GoalState,
         reply: std::sync::mpsc::Sender<Result<Option<EntityId>, RegionOwnerLaneError>>,
+    },
+    ReleaseVillagerBinding {
+        token: String,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
     Status {
         reply: std::sync::mpsc::Sender<Result<RegionalOwnerStatus, RegionOwnerLaneError>>,
@@ -1497,12 +2038,14 @@ enum RegionalOwnerCommand {
     ApplyKinematicsIfCurrent {
         states: Vec<(EntitySnapshot, EntityKinematics)>,
         defer_journal: bool,
-        reply: std::sync::mpsc::Sender<Result<Vec<EntityKinematics>, RegionOwnerLaneError>>,
+        reply: std::sync::mpsc::Sender<Result<VersionedEntitySnapshots, RegionOwnerLaneError>>,
     },
     ApplyKinematicsIfVersioned {
         expected: VersionedEntityKinematics,
         states: Vec<EntityKinematics>,
-        reply: std::sync::mpsc::Sender<Result<Option<Vec<EntityKinematics>>, RegionOwnerLaneError>>,
+        reply: std::sync::mpsc::Sender<
+            Result<Option<VersionedKinematicsCommit>, RegionOwnerLaneError>,
+        >,
     },
     DamageIfCurrent {
         expected: Box<EntitySnapshot>,
@@ -1521,8 +2064,9 @@ enum RegionalOwnerCommand {
     },
     PrepareGoalTick {
         tick: u64,
-        active_ids: HashSet<EntityId>,
+        active_ids: Arc<HashSet<EntityId>>,
         selected: Option<VersionedEntitySnapshots>,
+        inputs: RegionalGoalTickInputs,
         reply: std::sync::mpsc::Sender<Result<RegionalPreparedGoalTick, RegionOwnerLaneError>>,
     },
     ApplyPreparedGoalTick {
@@ -1531,15 +2075,23 @@ enum RegionalOwnerCommand {
     },
     ApplyPreparedGoalTickAndKinematics {
         resolved: Box<RegionalResolvedGoalTick>,
-        entities: HashSet<EntityId>,
+        entities: Arc<HashSet<EntityId>>,
         defer_journal: bool,
-        reply: std::sync::mpsc::Sender<GoalApplyKinematicsResult>,
+        reply: std::sync::mpsc::Sender<GoalApplySimulationResult>,
     },
 
     #[cfg(test)]
     HoldForTest {
         entered: std::sync::mpsc::Sender<()>,
         release: Receiver<()>,
+    },
+    TickOwnedRegions {
+        input: RegionalEntityTickInput,
+        reply: std::sync::mpsc::Sender<Result<RegionalEntityTickOutput, RegionOwnerLaneError>>,
+    },
+    CommitOwnedRegionPhysics {
+        prepared: Box<RegionalPreparedEntityPhysics>,
+        reply: std::sync::mpsc::Sender<Result<RegionalEntityPhysicsOutput, RegionOwnerLaneError>>,
     },
     #[cfg(test)]
     HoldLaneForTest {
@@ -1578,6 +2130,12 @@ impl RegionalOwnerCommand {
             Self::SnapshotsForIds { entities, .. } => Some(RegionalOwnerLaneScope::Entities(
                 entities.iter().copied().collect(),
             )),
+            Self::AliveKinematicsForIds { entities, .. } => Some(RegionalOwnerLaneScope::Entities(
+                entities.iter().copied().collect(),
+            )),
+            Self::SimulationResultsForIds { entities, .. } => Some(
+                RegionalOwnerLaneScope::Entities(entities.iter().copied().collect()),
+            ),
             Self::SetAnimalStatesIfCurrent { states, .. } => {
                 Some(RegionalOwnerLaneScope::Entities(
                     states.iter().map(|(snapshot, _)| snapshot.id).collect(),
@@ -1612,11 +2170,14 @@ impl RegionalOwnerCommand {
             }
             Self::PrepareGoalTick { .. } => Some(RegionalOwnerLaneScope::TopologyOnly),
             Self::ApplyPreparedGoalTick { resolved, .. } => {
-                Some(goal_apply_lane_scope(resolved, std::iter::empty()))
+                Some(goal_apply_lane_scope(resolved, None))
             }
             Self::ApplyPreparedGoalTickAndKinematics {
                 resolved, entities, ..
-            } => Some(goal_apply_lane_scope(resolved, entities.iter().copied())),
+            } => Some(goal_apply_lane_scope(resolved, Some(entities))),
+            Self::TickOwnedRegions { .. } | Self::CommitOwnedRegionPhysics { .. } => {
+                Some(RegionalOwnerLaneScope::TopologyOnly)
+            }
             #[cfg(test)]
             Self::HoldLaneForTest { entity, .. } => {
                 Some(RegionalOwnerLaneScope::Entities(vec![*entity]))
@@ -1653,6 +2214,8 @@ impl RegionalOwnerCommand {
                 | Self::Damage { .. }
                 | Self::ApplyPreparedGoalTick { .. }
                 | Self::ApplyPreparedGoalTickAndKinematics { .. }
+                | Self::TickOwnedRegions { .. }
+                | Self::CommitOwnedRegionPhysics { .. }
         )
     }
 
@@ -1661,6 +2224,7 @@ impl RegionalOwnerCommand {
             || matches!(
                 self,
                 Self::ClaimNearestVillager { .. }
+                    | Self::ReleaseVillagerBinding { .. }
                     | Self::ReconfigureLanes { .. }
                     | Self::SaveBarrier { .. }
                     | Self::Shutdown { .. }
@@ -1715,29 +2279,41 @@ fn owner_readers_for_scope(
 
 fn goal_apply_lane_scope(
     resolved: &RegionalResolvedGoalTick,
-    extra_entities: impl IntoIterator<Item = EntityId>,
+    extra_entities: Option<&HashSet<EntityId>>,
 ) -> RegionalOwnerLaneScope {
-    RegionalOwnerLaneScope::EntitiesAndRegions {
-        entities: resolved
-            .goal_inputs
-            .keys()
-            .chain(resolved.follow_target_sources.keys())
-            .copied()
-            .chain(extra_entities)
-            .collect(),
-        regions: resolved
-            .leases
-            .keys()
-            .chain(resolved.batches.keys())
-            .copied()
-            .chain(
-                resolved
-                    .follow_target_sources
+    let prepared_len = resolved
+        .simulation_ids
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
+    let entities = extra_entities
+        .filter(|entities| {
+            prepared_len != entities.len()
+                || resolved
+                    .simulation_ids
                     .values()
-                    .map(|source| source.region),
-            )
-            .collect(),
-    }
+                    .flatten()
+                    .any(|entity| !entities.contains(entity))
+        })
+        .map_or_else(Vec::new, |entities| entities.iter().copied().collect());
+    // Valid goal applies already fence every mutated and followed-target
+    // region. Route only those few regions; malformed combined commands retain
+    // their explicit entity scope so topology failure remains conservative.
+    let regions = resolved
+        .leases
+        .keys()
+        .chain(resolved.batches.keys())
+        .copied()
+        .chain(
+            resolved
+                .follow_target_sources
+                .values()
+                .map(|source| source.region),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    RegionalOwnerLaneScope::EntitiesAndRegions { entities, regions }
 }
 
 fn topology_access_for_command(
@@ -1764,6 +2340,15 @@ impl RegionalOwnerHandle {
 
     fn unavailable_error(&self) -> RegionOwnerLaneError {
         self.worker_health.error_after_disconnect()
+    }
+    fn local_physics_fallback_error(&self, error: RegionOwnerLaneError) -> bool {
+        match error {
+            RegionOwnerLaneError::StaleLease
+            | RegionOwnerLaneError::UnknownRegion
+            | RegionOwnerLaneError::Busy => true,
+            RegionOwnerLaneError::Closed => self.ensure_operational().is_ok(),
+            _ => false,
+        }
     }
 
     fn ensure_operational(&self) -> Result<(), RegionOwnerLaneError> {
@@ -1828,20 +2413,10 @@ impl RegionalOwnerHandle {
             .map_err(|_| self.unavailable_error())?;
         result.recv().map_err(|_| self.unavailable_error())?
     }
-
-    pub fn simulation_projections_for_ids(
-        &self,
-        entities: &HashSet<EntityId>,
-    ) -> Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError> {
-        if entities.is_empty() {
-            return Ok(Vec::new());
-        }
+    pub fn release_villager_binding(&self, token: String) -> Result<bool, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
-            .send(RegionalOwnerCommand::SimulationProjectionsForIds {
-                entities: entities.clone(),
-                reply,
-            })
+            .send(RegionalOwnerCommand::ReleaseVillagerBinding { token, reply })
             .map_err(|_| self.unavailable_error())?;
         result.recv().map_err(|_| self.unavailable_error())?
     }
@@ -1850,13 +2425,37 @@ impl RegionalOwnerHandle {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        if let Some(selected) = self.read_cached_selected_entities(entities) {
+        self.snapshots_for_ids_selected(entities, SnapshotSelection::All)
+    }
+
+    pub fn sheep_grazing_snapshots_for_ids(
+        &self,
+        entities: &HashSet<EntityId>,
+        include_idle: HashSet<EntityId>,
+    ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.snapshots_for_ids_selected(
+            entities,
+            SnapshotSelection::SheepGrazing {
+                include_idle: Arc::new(include_idle),
+            },
+        )
+    }
+
+    fn snapshots_for_ids_selected(
+        &self,
+        entities: &HashSet<EntityId>,
+        selection: SnapshotSelection,
+    ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        if matches!(selection, SnapshotSelection::All)
+            && let Some(selected) = self.read_cached_selected_entities(entities)
+        {
             return Ok(selected.snapshots);
         }
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::SnapshotsForIds {
                 entities: entities.clone(),
+                selection,
                 reply,
             })
             .map_err(|_| self.unavailable_error())?;
@@ -1877,6 +2476,41 @@ impl RegionalOwnerHandle {
         self.sender
             .send(RegionalOwnerCommand::SnapshotsForIds {
                 entities: entities.clone(),
+                selection: SnapshotSelection::All,
+                reply,
+            })
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
+    }
+    pub fn alive_kinematics_for_ids_versioned(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<(Vec<EntityKinematics>, Option<VersionedEntityKinematics>), RegionOwnerLaneError>
+    {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::AliveKinematicsForIds {
+                entities: entities.clone(),
+                reply,
+            })
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
+    }
+
+    pub fn simulation_results_for_ids_versioned(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<
+        (
+            Vec<EntitySimulationResult>,
+            Option<VersionedEntityKinematics>,
+        ),
+        RegionOwnerLaneError,
+    > {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::SimulationResultsForIds {
+                entities: entities.clone(),
                 reply,
             })
             .map_err(|_| self.unavailable_error())?;
@@ -1892,6 +2526,7 @@ impl RegionalOwnerHandle {
             authority: self.authority,
             fence: selected.fence,
             snapshots: selected.snapshots,
+            publication_readers: None,
         })
     }
 
@@ -1907,6 +2542,19 @@ impl RegionalOwnerHandle {
         self.ensure_operational()?;
         if selected.authority != self.authority {
             return Err(RegionOwnerLaneError::StaleLease);
+        }
+        if let Some(owner_readers) = selected.publication_readers.as_ref() {
+            if !selected.fence.leases.is_empty()
+                || !selected.snapshots.is_empty()
+                || !owner_readers.keys().eq(selected.fence.lane_versions.keys())
+            {
+                return Ok(false);
+            }
+            return Ok(selected.fence.lane_versions.iter().all(|(lane, version)| {
+                owner_readers
+                    .get(lane)
+                    .is_some_and(|owner| owner.state_version() == *version)
+            }));
         }
         let routes =
             read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
@@ -1926,6 +2574,37 @@ impl RegionalOwnerHandle {
         drop(routes);
         Ok(selected.fence.lane_versions.iter().all(|(lane, version)| {
             owners
+                .get(lane)
+                .is_some_and(|owner| owner.state_version() == *version)
+        }))
+    }
+
+    pub fn versioned_kinematics_are_current(
+        &self,
+        selected: &VersionedEntityKinematics,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        self.ensure_operational()?;
+        if selected.authority != self.authority || selected.expected.len() != selected.routes.len()
+        {
+            return Err(RegionOwnerLaneError::StaleLease);
+        }
+        let Some(owner_readers) = selected.owner_readers.as_ref() else {
+            return Ok(false);
+        };
+        let mut lanes = BTreeSet::new();
+        for (expected, lease) in selected.expected.iter().zip(&selected.routes) {
+            if RegionKey::from_position(expected.expected.position) != Some(lease.key)
+                || !owner_readers.contains_key(&lease.lane)
+            {
+                return Ok(false);
+            }
+            lanes.insert(lease.lane);
+        }
+        if !lanes.iter().eq(selected.fence.lane_versions.keys()) {
+            return Ok(false);
+        }
+        Ok(selected.fence.lane_versions.iter().all(|(lane, version)| {
+            owner_readers
                 .get(lane)
                 .is_some_and(|owner| owner.state_version() == *version)
         }))
@@ -2674,7 +3353,6 @@ impl RegionalOwnerHandle {
             .map_err(|_| self.unavailable_error())?;
         result.recv().map_err(|_| self.unavailable_error())?
     }
-
     fn try_commit_cached_snapshot_mutation(
         &self,
         expected: EntitySnapshot,
@@ -2703,13 +3381,14 @@ impl RegionalOwnerHandle {
             false,
             false,
         )
+        .map(|result| result.map(CachedSnapshotCommit::into_snapshots))
     }
 
-    fn try_commit_cached_standalone_snapshot_mutations_with_journal(
+    fn try_commit_cached_standalone_snapshot_mutations_with_journal_versioned(
         &self,
         expected_mutations: Vec<(EntitySnapshot, RegionOwnerMutation)>,
         journal_commit: bool,
-    ) -> Option<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>> {
+    ) -> Option<Result<CachedSnapshotCommit, RegionOwnerLaneError>> {
         self.try_commit_cached_snapshot_mutations_inner(
             expected_mutations,
             journal_commit,
@@ -2769,6 +3448,7 @@ impl RegionalOwnerHandle {
             return None;
         }
         self.try_commit_cached_snapshot_mutations_inner(expected_mutations, true, false, true, true)
+            .map(|result| result.map(CachedSnapshotCommit::into_snapshots))
     }
 
     fn try_commit_cached_snapshot_mutations_inner(
@@ -2778,9 +3458,15 @@ impl RegionalOwnerHandle {
         require_standalone: bool,
         mutation_gate_held: bool,
         lane_admission_held: bool,
-    ) -> Option<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>> {
+    ) -> Option<Result<CachedSnapshotCommit, RegionOwnerLaneError>> {
         if expected_mutations.is_empty() {
-            return Some(Ok(Vec::new()));
+            return Some(Ok(CachedSnapshotCommit {
+                fence: RegionalVersionFence {
+                    leases: HashMap::new(),
+                    lane_versions: BTreeMap::new(),
+                },
+                snapshots: Vec::new(),
+            }));
         }
         let _mutation_gate = (!mutation_gate_held)
             .then(|| read_authoritative_rwlock(&self.mutation_gate, "regional.mutation_gate"));
@@ -2867,7 +3553,15 @@ impl RegionalOwnerHandle {
             match committed.recv().map_err(|_| self.unavailable_error())? {
                 Ok(completion) if completion.phase == phase => {}
                 Ok(_) => return Err(RegionOwnerLaneError::StalePhase),
-                Err(RegionOwnerLaneError::InvalidMutation) => return Ok(Vec::new()),
+                Err(RegionOwnerLaneError::InvalidMutation) => {
+                    return Ok(CachedSnapshotCommit {
+                        fence: RegionalVersionFence {
+                            leases: HashMap::new(),
+                            lane_versions: BTreeMap::new(),
+                        },
+                        snapshots: Vec::new(),
+                    });
+                }
                 Err(error) => return Err(error),
             }
 
@@ -2931,7 +3625,21 @@ impl RegionalOwnerHandle {
             }
             let finalized = owner.finalize(phase)?;
             match finalized.recv().map_err(|_| self.unavailable_error())? {
-                Ok(finalized) if finalized == phase => Ok(upserts),
+                Ok(finalized) if finalized == phase => {
+                    let lane = selected_lane.ok_or(RegionOwnerLaneError::WrongLane)?;
+                    let leases = upserts
+                        .iter()
+                        .map(|snapshot| (snapshot.id, routes[&snapshot.id].lease))
+                        .collect();
+                    let lane_versions = BTreeMap::from([(lane, owner.state_version())]);
+                    Ok(CachedSnapshotCommit {
+                        fence: RegionalVersionFence {
+                            leases,
+                            lane_versions,
+                        },
+                        snapshots: upserts,
+                    })
+                }
                 Ok(_) => Err(RegionOwnerLaneError::StalePhase),
                 Err(error) => Err(error),
             }
@@ -3184,10 +3892,11 @@ impl RegionalOwnerHandle {
                 None => Ok(VersionedEntitySnapshots {
                     authority: self.authority,
                     fence: RegionalVersionFence {
-                        leases: BTreeMap::new(),
+                        leases: HashMap::new(),
                         lane_versions: BTreeMap::new(),
                     },
                     snapshots: Vec::new(),
+                    publication_readers: None,
                 }),
             });
         }
@@ -3284,7 +3993,7 @@ impl RegionalOwnerHandle {
             return Some(Err(RegionOwnerLaneError::OutcomeUnknown));
         }
         upserts.sort_unstable_by_key(|snapshot| snapshot.id);
-        let mut leases = BTreeMap::new();
+        let mut leases = HashMap::new();
         let mut lane_versions = BTreeMap::new();
         for snapshot in &upserts {
             let route = &routes[&snapshot.id];
@@ -3300,6 +4009,7 @@ impl RegionalOwnerHandle {
                 lane_versions,
             },
             snapshots: upserts,
+            publication_readers: None,
         }))
     }
 
@@ -3387,14 +4097,41 @@ impl RegionalOwnerHandle {
             .map(|committed| committed.len() == expected_count)
     }
 
+    fn empty_versioned_snapshots(&self) -> VersionedEntitySnapshots {
+        VersionedEntitySnapshots {
+            authority: self.authority,
+            fence: RegionalVersionFence {
+                leases: HashMap::new(),
+                lane_versions: BTreeMap::new(),
+            },
+            snapshots: Vec::new(),
+            publication_readers: None,
+        }
+    }
+
     fn apply_kinematics_if_current_inner(
         &self,
         states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
         journal_commit: bool,
     ) -> Result<Vec<EntityKinematics>, RegionOwnerLaneError> {
+        self.apply_kinematics_if_current_inner_versioned(states, journal_commit)
+            .map(|selected| {
+                selected
+                    .into_snapshots()
+                    .into_iter()
+                    .map(snapshot_kinematics)
+                    .collect()
+            })
+    }
+
+    fn apply_kinematics_if_current_inner_versioned(
+        &self,
+        states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
+        journal_commit: bool,
+    ) -> Result<VersionedEntitySnapshots, RegionOwnerLaneError> {
         let states = states.into_iter().collect::<Vec<_>>();
         if states.is_empty() {
-            return Ok(Vec::new());
+            return Ok(self.empty_versioned_snapshots());
         }
         let expected_count = states.len();
         let mut ids = HashSet::with_capacity(expected_count);
@@ -3407,21 +4144,23 @@ impl RegionalOwnerHandle {
             }
             if expected.retained.item_pickup_claim.is_some() && state.position != expected.position
             {
-                return Ok(Vec::new());
+                return Ok(self.empty_versioned_snapshots());
             }
             direct_eligible &= RegionKey::from_position(state.position) == Some(source);
         }
         if direct_eligible {
             let direct = kinematics_direct_mutations(&states)?;
-            if let Some(result) = self.try_commit_cached_standalone_snapshot_mutations_with_journal(
-                direct,
-                journal_commit,
-            ) {
-                return result.map(|snapshots| {
-                    if snapshots.len() == expected_count {
-                        snapshots.into_iter().map(snapshot_kinematics).collect()
+            if let Some(result) = self
+                .try_commit_cached_standalone_snapshot_mutations_with_journal_versioned(
+                    direct,
+                    journal_commit,
+                )
+            {
+                return result.map(|commit| {
+                    if commit.snapshots.len() != expected_count {
+                        self.empty_versioned_snapshots()
                     } else {
-                        Vec::new()
+                        commit.into_versioned(self.authority)
                     }
                 });
             }
@@ -3445,11 +4184,27 @@ impl RegionalOwnerHandle {
         self.apply_kinematics_if_current_inner(states, false)
     }
 
+    pub fn apply_kinematics_if_current_deferred_journal_committed_versioned(
+        &self,
+        states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
+    ) -> Result<VersionedEntitySnapshots, RegionOwnerLaneError> {
+        self.apply_kinematics_if_current_inner_versioned(states, false)
+    }
+
     pub fn try_apply_kinematics_if_versioned_deferred_journal(
         &self,
         expected: VersionedEntityKinematics,
         states: Vec<EntityKinematics>,
     ) -> Result<Option<Vec<EntityKinematics>>, RegionOwnerLaneError> {
+        self.try_apply_kinematics_if_versioned_deferred_journal_with_fence(expected, states)
+            .map(|committed| committed.map(VersionedKinematicsCommit::into_states))
+    }
+
+    pub fn try_apply_kinematics_if_versioned_deferred_journal_with_fence(
+        &self,
+        expected: VersionedEntityKinematics,
+        states: Vec<EntityKinematics>,
+    ) -> Result<Option<VersionedKinematicsCommit>, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyKinematicsIfVersioned {
@@ -3459,6 +4214,194 @@ impl RegionalOwnerHandle {
             })
             .map_err(|_| self.unavailable_error())?;
         result.recv().map_err(|_| self.unavailable_error())?
+    }
+
+    pub fn try_apply_entity_physics_from_selected_routes(
+        &self,
+        expected: &VersionedEntityKinematics,
+        queries: &[EntityPhysicsQuery],
+        steps: &[EntityPhysicsStep],
+        publish_ids: &HashSet<EntityId>,
+    ) -> Result<Option<SelectedPhysicsCommit>, RegionOwnerLaneError> {
+        self.ensure_operational()?;
+        match self.try_apply_entity_physics_from_selected_routes_inner(
+            expected,
+            queries,
+            steps,
+            publish_ids,
+        ) {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn try_apply_entity_physics_from_selected_routes_inner(
+        &self,
+        expected: &VersionedEntityKinematics,
+        queries: &[EntityPhysicsQuery],
+        steps: &[EntityPhysicsStep],
+        publish_ids: &HashSet<EntityId>,
+    ) -> Option<Result<SelectedPhysicsCommit, RegionOwnerLaneError>> {
+        if expected.authority != self.authority
+            || expected.expected.len() != queries.len()
+            || queries.len() != steps.len()
+            || expected.routes.len() != queries.len()
+            || expected.expected.len() != expected.routes.len()
+        {
+            return None;
+        }
+        let owner_readers = expected.owner_readers.as_ref()?;
+        let _mutation_gate =
+            read_authoritative_rwlock(&self.mutation_gate, "regional.mutation_gate");
+        let mut lanes = BTreeMap::<
+            usize,
+            (
+                RegionalOwnerLaneReader,
+                BTreeMap<RegionKey, LocalPhysicsRegionBatch>,
+            ),
+        >::new();
+        for (((previous, lease), query), step) in expected
+            .expected
+            .iter()
+            .copied()
+            .zip(expected.routes.iter().copied())
+            .zip(queries.iter().copied())
+            .zip(steps.iter().copied())
+        {
+            if previous.id != query.id
+                || query.id != step.id
+                || !previous.eligible()
+                || previous.expected.position != query.position
+                || previous.expected.velocity != query.velocity
+                || previous.expected.on_ground != query.on_ground
+                || !step.position.is_finite()
+                || !step.velocity.is_finite()
+                || RegionKey::from_position(query.position) != Some(lease.key)
+                || RegionKey::from_position(step.position) != Some(lease.key)
+            {
+                return None;
+            }
+            let needs_region = lanes
+                .get(&lease.lane)
+                .is_none_or(|(_, regions)| !regions.contains_key(&lease.key));
+            if needs_region {
+                let owner = owner_readers.get(&lease.lane)?.clone();
+                lanes
+                    .entry(lease.lane)
+                    .or_insert_with(|| (owner, BTreeMap::new()))
+                    .1
+                    .insert(
+                        lease.key,
+                        LocalPhysicsRegionBatch {
+                            lease,
+                            inputs: Vec::new(),
+                            world_fence: None,
+                        },
+                    );
+            }
+            let (_, regions) = lanes.get_mut(&lease.lane)?;
+            let batch = regions
+                .get_mut(&lease.key)
+                .expect("validated physics region batch");
+            batch.inputs.push(LocalPhysicsInput {
+                previous: previous.into(),
+                expected: query,
+                step,
+                publish: !publish_ids.is_empty() && publish_ids.contains(&query.id),
+            });
+        }
+        if lanes.len() != expected.fence.lane_versions.len() {
+            return None;
+        }
+        let owners = lanes
+            .iter()
+            .map(|(lane, (owner, _))| (*lane, owner.clone()))
+            .collect::<Vec<_>>();
+        let batches = lanes
+            .into_iter()
+            .map(|(lane, (_, regions))| (lane, regions.into_values().collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let _lane_admissions = owners
+            .iter()
+            .map(|(_, owner)| {
+                lock_authoritative_mutex(owner.admission(), "regional.owner_lane_admission")
+            })
+            .collect::<Vec<_>>();
+        let mut pending = Vec::with_capacity(owners.len());
+        let mut immediate_rejected = Vec::new();
+        for ((lane, owner), (batch_lane, batches)) in owners.iter().zip(batches) {
+            debug_assert_eq!(*lane, batch_lane);
+            let expected_state_version = expected.fence.lane_versions.get(lane).copied()?;
+            let lane_ids = batches
+                .iter()
+                .flat_map(|batch| batch.inputs.iter().map(|input| input.previous.id))
+                .collect::<Vec<_>>();
+            match owner.apply_local_physics_if_current(expected_state_version, batches) {
+                Ok(completion) => {
+                    pending.push((*lane, owner.clone(), lane_ids, completion));
+                }
+                Err(error) if self.local_physics_fallback_error(error) => {
+                    immediate_rejected.extend(lane_ids);
+                }
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        Some((|| {
+            let mut rejected = immediate_rejected;
+            let mut accepted = Vec::new();
+            let mut states = Vec::new();
+            let mut leases = HashMap::new();
+            let mut lane_versions = BTreeMap::new();
+            for (lane, owner, lane_ids, completion) in pending {
+                let completion = match completion.recv() {
+                    Ok(Ok(completion)) => completion,
+                    Ok(Err(error)) if self.local_physics_fallback_error(error) => {
+                        rejected.extend(lane_ids);
+                        continue;
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        let error = owner.unavailable_error();
+                        if self.local_physics_fallback_error(error) {
+                            rejected.extend(lane_ids);
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+                if !completion.accepted.is_empty() {
+                    lane_versions.insert(lane, completion.state_version);
+                }
+                rejected.extend(completion.rejected);
+                for (lease, motion) in completion.accepted {
+                    if lease.lane != lane
+                        || RegionKey::from_position(motion.position) != Some(lease.key)
+                    {
+                        return Err(RegionOwnerLaneError::InvalidQuery);
+                    }
+                    leases.insert(motion.id, lease);
+                    accepted.push(motion);
+                }
+                states.extend(completion.states);
+            }
+            rejected.sort_unstable();
+            accepted.sort_unstable_by_key(|motion| motion.id);
+            states.sort_unstable_by_key(|state| state.id);
+            Ok((
+                rejected,
+                accepted,
+                states,
+                VersionedEntitySnapshots {
+                    authority: self.authority,
+                    fence: RegionalVersionFence {
+                        leases,
+                        lane_versions,
+                    },
+                    snapshots: Vec::new(),
+                    publication_readers: None,
+                },
+            ))
+        })())
     }
 
     /// Attempts the cached multi-lane deferred-journal kinematics fast path and
@@ -3477,10 +4420,11 @@ impl RegionalOwnerHandle {
             return Ok(Some(VersionedEntitySnapshots {
                 authority: self.authority,
                 fence: RegionalVersionFence {
-                    leases: BTreeMap::new(),
+                    leases: HashMap::new(),
                     lane_versions: BTreeMap::new(),
                 },
                 snapshots: Vec::new(),
+                publication_readers: None,
             }));
         }
         let mut ids = HashSet::with_capacity(states.len());
@@ -3496,10 +4440,11 @@ impl RegionalOwnerHandle {
                 return Ok(Some(VersionedEntitySnapshots {
                     authority: self.authority,
                     fence: RegionalVersionFence {
-                        leases: BTreeMap::new(),
+                        leases: HashMap::new(),
                         lane_versions: BTreeMap::new(),
                     },
                     snapshots: Vec::new(),
+                    publication_readers: None,
                 }));
             }
             direct_eligible &= RegionKey::from_position(state.position) == Some(source);
@@ -3744,35 +4689,90 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| self.unavailable_error())?
     }
 
+    pub fn tick_owned_regions(
+        &self,
+        input: RegionalEntityTickInput,
+    ) -> Result<RegionalEntityTickOutput, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::TickOwnedRegions { input, reply })
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
+    }
+
+    pub fn commit_owned_region_physics(
+        &self,
+        prepared: RegionalPreparedEntityPhysics,
+    ) -> Result<RegionalEntityPhysicsOutput, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::CommitOwnedRegionPhysics {
+                prepared: Box::new(prepared),
+                reply,
+            })
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
+    }
+
     pub fn prepare_goal_tick_with_pathing_for_ids(
         &self,
         tick: u64,
-        active_ids: &HashSet<EntityId>,
+        active_ids: Arc<HashSet<EntityId>>,
     ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
-        self.prepare_goal_tick_with_optional_snapshots(tick, active_ids, None)
+        self.prepare_goal_tick_with_pathing_for_ids_with_inputs(
+            tick,
+            active_ids,
+            RegionalGoalTickInputs::default(),
+        )
+    }
+
+    pub fn prepare_goal_tick_with_pathing_for_ids_with_inputs(
+        &self,
+        tick: u64,
+        active_ids: Arc<HashSet<EntityId>>,
+        inputs: RegionalGoalTickInputs,
+    ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
+        self.prepare_goal_tick_with_optional_snapshots(tick, active_ids, inputs, None)
     }
 
     pub fn prepare_goal_tick_with_pathing_for_versioned_snapshots(
         &self,
         tick: u64,
-        active_ids: &HashSet<EntityId>,
+        active_ids: Arc<HashSet<EntityId>>,
         selected: VersionedEntitySnapshots,
     ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
-        self.prepare_goal_tick_with_optional_snapshots(tick, active_ids, Some(selected))
+        self.prepare_goal_tick_with_pathing_for_versioned_snapshots_with_inputs(
+            tick,
+            active_ids,
+            selected,
+            RegionalGoalTickInputs::default(),
+        )
+    }
+
+    pub fn prepare_goal_tick_with_pathing_for_versioned_snapshots_with_inputs(
+        &self,
+        tick: u64,
+        active_ids: Arc<HashSet<EntityId>>,
+        selected: VersionedEntitySnapshots,
+        inputs: RegionalGoalTickInputs,
+    ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
+        self.prepare_goal_tick_with_optional_snapshots(tick, active_ids, inputs, Some(selected))
     }
 
     fn prepare_goal_tick_with_optional_snapshots(
         &self,
         tick: u64,
-        active_ids: &HashSet<EntityId>,
+        active_ids: Arc<HashSet<EntityId>>,
+        inputs: RegionalGoalTickInputs,
         selected: Option<VersionedEntitySnapshots>,
     ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::PrepareGoalTick {
                 tick,
-                active_ids: active_ids.clone(),
+                active_ids,
                 selected,
+                inputs,
                 reply,
             })
             .map_err(|_| self.unavailable_error())?;
@@ -3796,30 +4796,72 @@ impl RegionalOwnerHandle {
     pub fn apply_prepared_goal_tick_and_kinematics_for_ids(
         &self,
         resolved: RegionalResolvedGoalTick,
-        entities: &HashSet<EntityId>,
+        entities: Arc<HashSet<EntityId>>,
     ) -> GoalApplyKinematicsResult {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics {
                 resolved: Box::new(resolved),
-                entities: entities.clone(),
+                entities,
                 defer_journal: false,
                 reply,
             })
             .map_err(|_| self.unavailable_error())?;
-        result.recv().map_err(|_| self.unavailable_error())?
+        result
+            .recv()
+            .map_err(|_| self.unavailable_error())?
+            .map(|applied| {
+                applied.map(|(stats, results, versioned)| {
+                    let states = results
+                        .into_iter()
+                        .map(|result| EntityKinematics {
+                            id: result.physics.id,
+                            position: result.physics.position,
+                            rotation: result.rotation,
+                            velocity: result.physics.velocity,
+                            on_ground: result.physics.on_ground,
+                        })
+                        .collect();
+                    (stats, states, versioned)
+                })
+            })
     }
 
     pub fn apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(
         &self,
         resolved: RegionalResolvedGoalTick,
-        entities: &HashSet<EntityId>,
+        entities: Arc<HashSet<EntityId>>,
     ) -> GoalApplyKinematicsResult {
+        self.apply_prepared_goal_tick_and_simulation_results_for_ids_deferred_journal(
+            resolved, entities,
+        )
+        .map(|applied| {
+            applied.map(|(stats, results, versioned)| {
+                let states = results
+                    .into_iter()
+                    .map(|result| EntityKinematics {
+                        id: result.physics.id,
+                        position: result.physics.position,
+                        rotation: result.rotation,
+                        velocity: result.physics.velocity,
+                        on_ground: result.physics.on_ground,
+                    })
+                    .collect();
+                (stats, states, versioned)
+            })
+        })
+    }
+
+    pub fn apply_prepared_goal_tick_and_simulation_results_for_ids_deferred_journal(
+        &self,
+        resolved: RegionalResolvedGoalTick,
+        entities: Arc<HashSet<EntityId>>,
+    ) -> GoalApplySimulationResult {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics {
                 resolved: Box::new(resolved),
-                entities: entities.clone(),
+                entities,
                 defer_journal: true,
                 reply,
             })
@@ -4074,18 +5116,25 @@ fn run_regional_owner_runtime(
                 }
                 let _ = reply.send(result);
             }
-            RegionalOwnerCommand::SnapshotsForIds { entities, reply } => {
+            RegionalOwnerCommand::SnapshotsForIds {
+                entities,
+                selection,
+                reply,
+            } => {
                 let result = coordinator
-                    .snapshots_for_ids(&entities)
+                    .snapshots_for_ids_selected(&entities, &selection)
                     .and_then(|snapshots| {
                         let fence = selected_version_fence(&coordinator, &snapshots)?;
                         Ok(VersionedEntitySnapshots {
                             authority: coordinator.authority,
                             fence,
                             snapshots,
+                            publication_readers: None,
                         })
                     });
-                if let Ok(selected) = &result {
+                if matches!(selection, SnapshotSelection::All)
+                    && let Ok(selected) = &result
+                {
                     publish_selected_read_routes(
                         &coordinator,
                         &selected_read_routes,
@@ -4095,8 +5144,35 @@ fn run_regional_owner_runtime(
                 }
                 let _ = reply.send(result);
             }
+            RegionalOwnerCommand::AliveKinematicsForIds { entities, reply } => {
+                let result = coordinator.alive_kinematics_for_ids(&entities);
+                if let Ok((_, Some(selected))) = &result {
+                    publish_selected_kinematics_routes(
+                        &coordinator,
+                        &selected_read_routes,
+                        &entities,
+                        selected,
+                    );
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::SimulationResultsForIds { entities, reply } => {
+                let result = coordinator.simulation_results_for_ids(&entities);
+                if let Ok((_, Some(selected))) = &result {
+                    publish_selected_kinematics_routes(
+                        &coordinator,
+                        &selected_read_routes,
+                        &entities,
+                        selected,
+                    );
+                }
+                let _ = reply.send(result);
+            }
             RegionalOwnerCommand::SimulationProjectionsForIds { entities, reply } => {
                 let _ = reply.send(coordinator.simulation_projections_for_ids(&entities));
+            }
+            RegionalOwnerCommand::DespawnProjectionsForIds { entities, reply } => {
+                let _ = reply.send(coordinator.despawn_projections_for_ids(&entities));
             }
             RegionalOwnerCommand::ContainsUuid { uuid, reply } => {
                 let _ = reply.send(
@@ -4116,6 +5192,9 @@ fn run_regional_owner_runtime(
             }
             RegionalOwnerCommand::ApplyVillagerBindingGoal { token, goal, reply } => {
                 let _ = reply.send(coordinator.apply_villager_binding_goal(token, goal));
+            }
+            RegionalOwnerCommand::ReleaseVillagerBinding { token, reply } => {
+                let _ = reply.send(coordinator.release_villager_binding(token));
             }
             RegionalOwnerCommand::Status { reply } => {
                 let _ = reply.send(
@@ -4394,23 +5473,54 @@ fn run_regional_owner_runtime(
                         != RegionKey::from_position(state.position)
                 });
                 let expected_count = ids.len();
+                let mut publication_snapshots = states
+                    .iter()
+                    .map(|(expected, state)| snapshot_with_kinematics(expected.clone(), *state))
+                    .collect::<Vec<_>>();
+                publication_snapshots.sort_unstable_by_key(|snapshot| snapshot.id);
                 let result = coordinator
                     .apply_kinematics_if_current_inner(states, !defer_journal)
                     .and_then(|applied| {
                         if !applied {
-                            return Ok(Vec::new());
+                            return Ok(VersionedEntitySnapshots {
+                                authority: coordinator.authority,
+                                fence: RegionalVersionFence {
+                                    leases: HashMap::new(),
+                                    lane_versions: BTreeMap::new(),
+                                },
+                                snapshots: Vec::new(),
+                                publication_readers: None,
+                            });
                         }
-                        coordinator.snapshots_for_ids(&ids).map(|snapshots| {
-                            snapshots.into_iter().map(snapshot_kinematics).collect()
+                        if crosses_region {
+                            publication_snapshots = coordinator.snapshots_for_ids(&ids)?;
+                            if publication_snapshots.len() != expected_count {
+                                return Err(RegionOwnerLaneError::InvalidMutation);
+                            }
+                        }
+                        let fence = selected_version_fence(&coordinator, &publication_snapshots)?;
+                        Ok(VersionedEntitySnapshots {
+                            authority: coordinator.authority,
+                            fence,
+                            snapshots: publication_snapshots,
+                            publication_readers: None,
                         })
                     });
                 if result
                     .as_ref()
-                    .is_ok_and(|committed| committed.len() == expected_count)
-                    && crosses_region
+                    .is_ok_and(|selected| selected.snapshots().len() == expected_count)
                 {
-                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
-                        .clear();
+                    if crosses_region {
+                        write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
+                            .clear();
+                    } else if let Ok(selected) = &result {
+                        publish_selected_read_routes(
+                            &coordinator,
+                            &selected_read_routes,
+                            &ids,
+                            selected.snapshots(),
+                        );
+                    }
                 }
                 let _ = reply.send(result);
             }
@@ -4419,8 +5529,9 @@ fn run_regional_owner_runtime(
                 states,
                 reply,
             } => {
-                let _ = reply
-                    .send(coordinator.apply_kinematics_if_versioned_inner(expected, states, false));
+                let _ = reply.send(
+                    coordinator.apply_kinematics_if_versioned_with_fence(expected, states, false),
+                );
             }
             RegionalOwnerCommand::DamageIfCurrent {
                 expected,
@@ -4443,10 +5554,26 @@ fn run_regional_owner_runtime(
             } => {
                 let _ = reply.send(coordinator.damage(entity, request));
             }
+            RegionalOwnerCommand::TickOwnedRegions { input, reply } => {
+                let _ = reply.send(coordinator.tick_owned_regions(input));
+            }
+            RegionalOwnerCommand::CommitOwnedRegionPhysics { prepared, reply } => {
+                let lane_exec_started = std::time::Instant::now();
+                let mut output = coordinator.commit_owned_region_physics(*prepared);
+                if let Ok(output) = output.as_mut() {
+                    output.lane_timings.exec_us = lane_exec_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX))
+                        as u64;
+                }
+                let _ = reply.send(output);
+            }
             RegionalOwnerCommand::PrepareGoalTick {
                 tick,
                 active_ids,
                 selected,
+                inputs,
                 reply,
             } => {
                 #[cfg(test)]
@@ -4468,16 +5595,12 @@ fn run_regional_owner_runtime(
                         tick,
                         &active_ids,
                         selected,
+                        inputs,
                     ),
                 );
             }
             RegionalOwnerCommand::ApplyPreparedGoalTick { resolved, reply } => {
-                let entities = resolved.goal_inputs.keys().copied().collect::<Vec<_>>();
-                let result = coordinator.apply_prepared_goal_tick(*resolved);
-                if result.is_ok() {
-                    invalidate_selected_read_routes(&selected_read_routes, entities);
-                }
-                let _ = reply.send(result);
+                let _ = reply.send(coordinator.apply_prepared_goal_tick(*resolved));
             }
             RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics {
                 resolved,
@@ -4490,9 +5613,10 @@ fn run_regional_owner_runtime(
                     &entities,
                     !defer_journal,
                 );
-                if result.is_ok() {
-                    invalidate_selected_read_routes(&selected_read_routes, entities);
-                }
+                drop(entities);
+                // Goal batches never change entity routing. The selected-read
+                // route remains valid; rebuilding or invalidating it would turn
+                // an owner-local goal commit into a second 100k coordinator scan.
                 let _ = reply.send(result);
             }
 
@@ -4533,11 +5657,21 @@ fn snapshot_kinematics(snapshot: EntitySnapshot) -> EntityKinematics {
     }
 }
 
+fn snapshot_with_kinematics(
+    mut snapshot: EntitySnapshot,
+    state: EntityKinematics,
+) -> EntitySnapshot {
+    snapshot.position = state.position;
+    snapshot.rotation = state.rotation;
+    snapshot.velocity = state.velocity;
+    snapshot.on_ground = state.on_ground;
+    snapshot
+}
 fn selected_version_fence(
     coordinator: &RegionalOwnerCoordinator,
     snapshots: &[EntitySnapshot],
 ) -> Result<RegionalVersionFence, RegionOwnerLaneError> {
-    let mut leases = BTreeMap::new();
+    let mut leases = HashMap::new();
     let mut versions = BTreeMap::new();
     for snapshot in snapshots {
         let key = coordinator
@@ -4600,6 +5734,61 @@ fn versioned_snapshots_are_current(
                 .get(lane)
                 .is_some_and(|owner| owner.reader().state_version() == *version)
         })
+}
+
+fn publish_selected_kinematics_routes(
+    coordinator: &RegionalOwnerCoordinator,
+    routes: &RwLock<HashMap<EntityId, CachedEntityReadRoute>>,
+    requested: &HashSet<EntityId>,
+    selected: &VersionedEntityKinematics,
+) {
+    if selected.expected.len() == requested.len()
+        && selected.expected.len() == selected.routes.len()
+    {
+        let cached = read_benign_rwlock(routes, "regional.selected_read_routes");
+        if selected
+            .expected
+            .iter()
+            .zip(&selected.routes)
+            .all(|(expected, lease)| {
+                cached
+                    .get(&expected.id)
+                    .is_some_and(|route| route.uuid == expected.uuid && *lease == route.lease)
+            })
+        {
+            return;
+        }
+    }
+    let mut refreshed = Vec::with_capacity(selected.expected.len());
+    for (expected, lease) in selected.expected.iter().zip(&selected.routes) {
+        let Some(key) = coordinator.locations.get(&expected.id).copied() else {
+            return;
+        };
+        let Some(owner) = coordinator.lanes.get(&lease.lane) else {
+            return;
+        };
+        if coordinator.uuids.get(&expected.uuid).copied() != Some(expected.id)
+            || RegionKey::from_position(expected.expected.position) != Some(key)
+            || lease.key != key
+        {
+            return;
+        }
+        refreshed.push((
+            expected.id,
+            CachedEntityReadRoute {
+                lease: *lease,
+                uuid: expected.uuid,
+                standalone: !coordinator.vehicle_passengers.contains_key(&expected.id)
+                    && !coordinator.passenger_vehicles.contains_key(&expected.id),
+                owner: owner.reader(),
+            },
+        ));
+    }
+    let mut routes = write_benign_rwlock(routes, "regional.selected_read_routes");
+    for entity in requested {
+        routes.remove(entity);
+    }
+    routes.extend(refreshed);
 }
 
 fn publish_selected_read_routes(
@@ -5175,6 +6364,18 @@ impl RegionalOwnerCoordinator {
             .replace_snapshot_if_current(snapshot, next)?
             .then_some(entity))
     }
+    pub fn release_villager_binding(
+        &mut self,
+        token: String,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
+        validate_villager_binding_token(&token)?;
+        if !self.villager_bindings.contains_key(&token) {
+            return Ok(false);
+        }
+        self.remove_villager_binding(&token);
+        Ok(true)
+    }
 
     fn remove_villager_binding(&mut self, token: &str) {
         let Some(binding) = self.villager_bindings.remove(token) else {
@@ -5228,63 +6429,10 @@ impl RegionalOwnerCoordinator {
         Ok(snapshots)
     }
 
-    fn simulation_projections_for_ids(
+    fn fenced_simulation_results_for_ids(
         &self,
         entities: &HashSet<EntityId>,
-    ) -> Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError> {
-        self.commit_state.ensure_committed_state()?;
-        let mut ordered = entities.iter().copied().collect::<Vec<_>>();
-        ordered.sort_unstable();
-        let mut requests = BTreeMap::<usize, Vec<(RegionLease, EntityId)>>::new();
-        for entity in ordered {
-            let Some(expected_key) = self.locations.get(&entity).copied() else {
-                continue;
-            };
-            let lease = self
-                .ownership
-                .lease(expected_key)
-                .ok_or(RegionOwnerLaneError::StaleLease)?;
-            requests
-                .entry(lease.lane)
-                .or_default()
-                .push((lease, entity));
-        }
-        let mut pending = Vec::with_capacity(requests.len());
-        for (lane, entities) in requests {
-            let owner = self
-                .lanes
-                .get(&lane)
-                .ok_or(RegionOwnerLaneError::WrongLane)?;
-            pending.push(
-                owner
-                    .reader()
-                    .request_simulation_projections_for_ids(entities)?,
-            );
-        }
-        let mut projections = Vec::with_capacity(entities.len());
-        for completion in pending {
-            projections.extend(
-                completion
-                    .recv()
-                    .map_err(|_| RegionOwnerLaneError::Closed)??,
-            );
-        }
-        projections.sort_unstable_by_key(|projection| projection.id);
-        if projections.iter().any(|projection| {
-            !entities.contains(&projection.id)
-                || self.locations.get(&projection.id).copied()
-                    != RegionKey::from_position(projection.position)
-        }) {
-            return Err(RegionOwnerLaneError::InvalidMutation);
-        }
-        Ok(projections)
-    }
-
-    fn alive_kinematics_for_ids(
-        &self,
-        entities: &HashSet<EntityId>,
-    ) -> Result<(Vec<EntityKinematics>, Option<VersionedEntityKinematics>), RegionOwnerLaneError>
-    {
+    ) -> Result<FencedSimulationResults, RegionOwnerLaneError> {
         self.commit_state.ensure_committed_state()?;
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
@@ -5313,7 +6461,8 @@ impl RegionalOwnerCoordinator {
                 owner.reader().request_alive_kinematics_for_ids(entities)?,
             ));
         }
-        let mut candidates = Vec::with_capacity(entities.len());
+        let mut candidate_runs = Vec::with_capacity(pending.len());
+        let mut motion_states = Vec::new();
         let mut lane_versions = BTreeMap::new();
         for (expected_lane, completion) in pending {
             let read = completion
@@ -5326,68 +6475,174 @@ impl RegionalOwnerCoordinator {
             {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
-            candidates.extend(read.candidates);
+            candidate_runs.push(read.candidates);
+            motion_states.extend(read.motion_states);
         }
-        candidates.sort_unstable_by_key(|candidate| candidate.expected.id);
-        let mut states = candidates
-            .iter()
-            .map(|candidate| candidate.expected.expected)
-            .collect::<Vec<_>>();
-        states.sort_unstable_by_key(|state| state.id);
-        if states.iter().any(|state| {
-            !entities.contains(&state.id)
-                || self.locations.get(&state.id).copied()
-                    != RegionKey::from_position(state.position)
-        }) {
+        let candidates = owner_lane::merge_fenced_kinematics_candidate_runs(candidate_runs);
+        motion_states.sort_unstable_by_key(|motion| motion.id);
+        self.fenced_simulation_results_from_candidates(
+            entities,
+            candidates,
+            lane_versions,
+            Some(motion_states),
+            false,
+        )
+    }
+
+    fn fenced_simulation_results_from_candidates(
+        &self,
+        entities: &HashSet<EntityId>,
+        candidates: Vec<FencedKinematicsCandidate>,
+        lane_versions: BTreeMap<usize, u64>,
+        motion_states: Option<Vec<EntityMotionState>>,
+        selection_is_exact: bool,
+    ) -> Result<FencedSimulationResults, RegionOwnerLaneError> {
+        self.fenced_simulation_results_from_candidate_runs(
+            entities,
+            vec![candidates],
+            lane_versions,
+            motion_states,
+            selection_is_exact,
+        )
+    }
+
+    fn fenced_simulation_results_from_candidate_runs(
+        &self,
+        entities: &HashSet<EntityId>,
+        mut candidate_runs: Vec<Vec<FencedKinematicsCandidate>>,
+        mut lane_versions: BTreeMap<usize, u64>,
+        motion_states: Option<Vec<EntityMotionState>>,
+        selection_is_exact: bool,
+    ) -> Result<FencedSimulationResults, RegionOwnerLaneError> {
+        if selection_is_exact {
+            // The goal token was already checked for exact set equality before
+            // owner commit, and each candidate ID was checked against its
+            // regional store during owner preflight.
+            if candidate_runs.iter().map(Vec::len).sum::<usize>() != entities.len() {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+        } else {
+            for candidates in &mut candidate_runs {
+                candidates.retain(|candidate| entities.contains(&candidate.id));
+            }
+        }
+        let candidate_count = candidate_runs.iter().map(Vec::len).sum::<usize>();
+        let motion_states = motion_states.map(|mut motion_states| {
+            motion_states.retain(|motion| entities.contains(&motion.id));
+            motion_states
+        });
+        if motion_states
+            .as_ref()
+            .is_some_and(|motion_states| motion_states.len() != candidate_count)
+        {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
-        let eligible = candidates
-            .iter()
-            .all(|candidate| candidate.expected.eligible())
-            && states.iter().all(|state| {
-                !self.vehicle_passengers.contains_key(&state.id)
-                    && !self.passenger_vehicles.contains_key(&state.id)
+
+        let vehicle_free = self.vehicle_passengers.is_empty() && self.passenger_vehicles.is_empty();
+        let mut previous_id = None;
+        let mut eligible = true;
+        let mut results = Vec::with_capacity(candidate_count);
+        let mut routes = Vec::with_capacity(candidate_count);
+        let mut expected = Vec::with_capacity(candidate_count);
+        let mut selected_lanes = BTreeSet::new();
+        for (index, candidate) in candidate_runs.into_iter().flatten().enumerate() {
+            if (!selection_is_exact && previous_id.is_some_and(|previous| previous >= candidate.id))
+                || motion_states
+                    .as_ref()
+                    .is_some_and(|states| states[index].id != candidate.id)
+            {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            previous_id = Some(candidate.id);
+            eligible &= candidate.eligible()
+                && (vehicle_free
+                    || (!self.vehicle_passengers.contains_key(&candidate.id)
+                        && !self.passenger_vehicles.contains_key(&candidate.id)));
+            if let Some(result) = candidate.result {
+                results.push(result);
+            }
+            if let Some(checkpoint) = candidate.expected() {
+                expected.push(checkpoint);
+            }
+            selected_lanes.insert(candidate.lease.lane);
+            routes.push(candidate.lease);
+        }
+
+        let states = motion_states
+            .as_ref()
+            .map_or_else(Vec::new, |motion_states| {
+                motion_states
+                    .iter()
+                    .map(|motion| EntityKinematics {
+                        id: motion.id,
+                        position: motion.position,
+                        rotation: motion.rotation,
+                        velocity: motion.velocity,
+                        on_ground: motion.on_ground,
+                    })
+                    .collect()
             });
         let versioned = if eligible {
-            let mut leases = BTreeMap::new();
-            for state in &states {
-                let key = self
-                    .locations
-                    .get(&state.id)
-                    .copied()
-                    .ok_or(RegionOwnerLaneError::UnknownEntity)?;
-                let lease = self
-                    .ownership
-                    .lease(key)
-                    .ok_or(RegionOwnerLaneError::StaleLease)?;
-                if !lane_versions.contains_key(&lease.lane) {
+            for (result, lease) in results.iter().zip(&routes) {
+                if RegionKey::from_position(result.physics.position) != Some(lease.key)
+                    || !lane_versions.contains_key(&lease.lane)
+                {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
-                leases.insert(state.id, lease);
             }
-            let selected_lanes = leases
-                .values()
-                .map(|lease| lease.lane)
-                .collect::<BTreeSet<_>>();
             lane_versions.retain(|lane, _| selected_lanes.contains(lane));
             if !selected_lanes.iter().eq(lane_versions.keys()) {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
+            let owner_readers = Arc::new(
+                selected_lanes
+                    .iter()
+                    .map(|lane| {
+                        self.lanes
+                            .get(lane)
+                            .map(|owner| (*lane, owner.reader()))
+                            .ok_or(RegionOwnerLaneError::WrongLane)
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?,
+            );
             Some(VersionedEntityKinematics {
                 authority: self.authority,
                 fence: RegionalVersionFence {
-                    leases,
+                    leases: HashMap::new(),
                     lane_versions,
                 },
-                expected: candidates
-                    .into_iter()
-                    .map(|candidate| candidate.expected)
-                    .collect(),
+                routes,
+                motion_states,
+                expected,
+                owner_readers: Some(owner_readers),
             })
         } else {
             None
         };
+        Ok((states, results, versioned))
+    }
+
+    fn alive_kinematics_for_ids(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<(Vec<EntityKinematics>, Option<VersionedEntityKinematics>), RegionOwnerLaneError>
+    {
+        let (states, _, versioned) = self.fenced_simulation_results_for_ids(entities)?;
         Ok((states, versioned))
+    }
+
+    fn simulation_results_for_ids(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<
+        (
+            Vec<EntitySimulationResult>,
+            Option<VersionedEntityKinematics>,
+        ),
+        RegionOwnerLaneError,
+    > {
+        let (_, results, versioned) = self.fenced_simulation_results_for_ids(entities)?;
+        Ok((results, versioned))
     }
 
     #[must_use]
@@ -5478,6 +6733,14 @@ impl RegionalOwnerCoordinator {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.snapshots_for_ids_selected(entities, &SnapshotSelection::All)
+    }
+
+    fn snapshots_for_ids_selected(
+        &self,
+        entities: &HashSet<EntityId>,
+        selection: &SnapshotSelection,
+    ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
         self.commit_state.ensure_committed_state()?;
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
@@ -5501,7 +6764,7 @@ impl RegionalOwnerCoordinator {
                 .lanes
                 .get(&lane)
                 .ok_or(RegionOwnerLaneError::WrongLane)?;
-            pending.push(owner.request_snapshots_for_ids(entities)?);
+            pending.push(owner.request_snapshots_for_ids(entities, selection.clone())?);
         }
         let mut snapshots = Vec::with_capacity(entities.len());
         for completion in pending {
@@ -5950,8 +7213,13 @@ impl RegionalOwnerCoordinator {
         {
             return Ok(false);
         }
-        let (vehicle_passengers, passenger_vehicles) =
-            self.vehicle_indexes_after_replacements(std::iter::once(&next))?;
+        let changes_vehicle_indexes = source != target
+            || snapshot_vehicle_reference(&expected) != snapshot_vehicle_reference(&next);
+        let vehicle_indexes = if changes_vehicle_indexes {
+            Some(self.vehicle_indexes_after_replacements(std::iter::once(&next))?)
+        } else {
+            None
+        };
         self.ensure_region(target)?;
         let mutation_count = if source == target { 1 } else { 2 };
         let (first_sequence, sequence) = self.commit_state.reserve_sequences(mutation_count)?;
@@ -5998,8 +7266,10 @@ impl RegionalOwnerCoordinator {
         match self.execute_mutations_with_stats(mutations, sequence, journal_commit) {
             Ok(_) => {
                 self.locations.insert(entity_id, target);
-                self.vehicle_passengers = vehicle_passengers;
-                self.passenger_vehicles = passenger_vehicles;
+                if let Some((vehicle_passengers, passenger_vehicles)) = vehicle_indexes {
+                    self.vehicle_passengers = vehicle_passengers;
+                    self.passenger_vehicles = passenger_vehicles;
+                }
                 Ok(true)
             }
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
@@ -6951,7 +8221,6 @@ impl RegionalOwnerCoordinator {
             };
             if self.locations.get(&expected.id).copied() != Some(source)
                 || self.in_flight_transfers.contains_key(&expected.id)
-                || self.snapshot(expected.id)?.as_ref() != Some(expected)
             {
                 return Ok(false);
             }
@@ -6960,11 +8229,36 @@ impl RegionalOwnerCoordinator {
                 .ok_or(RegionOwnerLaneError::InvalidMutation)?;
             locations.push((expected.id, source, target));
         }
+        self.commit_state.ensure_committed_state()?;
+        let changes_vehicle_indexes = locations.iter().any(|(_, source, target)| source != target)
+            || snapshots.iter().any(|(expected, next)| {
+                snapshot_vehicle_reference(expected) != snapshot_vehicle_reference(next)
+            });
+        // In-place state changes are validated atomically by owner preparation.
+        // Topology changes keep their coordinator preflight before index planning.
+        if changes_vehicle_indexes {
+            let current = self.snapshots_for_ids(&entity_ids)?;
+            if current.len() != snapshots.len()
+                || snapshots.iter().any(|(expected, _)| {
+                    current
+                        .binary_search_by_key(&expected.id, |snapshot| snapshot.id)
+                        .ok()
+                        .is_none_or(|index| current[index] != *expected)
+                })
+            {
+                return Ok(false);
+            }
+        }
         for (_, _, target) in &locations {
             self.ensure_region(*target)?;
         }
-        let (vehicle_passengers, passenger_vehicles) =
-            self.vehicle_indexes_after_replacements(snapshots.iter().map(|(_, next)| next))?;
+        // Timer and other in-region state updates cannot change passenger
+        // topology. Do not snapshot the whole population for those batches.
+        let vehicle_indexes = if changes_vehicle_indexes {
+            Some(self.vehicle_indexes_after_replacements(snapshots.iter().map(|(_, next)| next))?)
+        } else {
+            None
+        };
 
         let (first_sequence, sequence_watermark) =
             self.commit_state.reserve_sequences(mutation_count)?;
@@ -7023,8 +8317,10 @@ impl RegionalOwnerCoordinator {
                 for (entity, _, target) in locations {
                     self.locations.insert(entity, target);
                 }
-                self.vehicle_passengers = vehicle_passengers;
-                self.passenger_vehicles = passenger_vehicles;
+                if let Some((vehicle_passengers, passenger_vehicles)) = vehicle_indexes {
+                    self.vehicle_passengers = vehicle_passengers;
+                    self.passenger_vehicles = passenger_vehicles;
+                }
                 Ok(true)
             }
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
@@ -7507,58 +8803,129 @@ impl RegionalOwnerCoordinator {
         self.apply_kinematics_if_current_inner(states, true)
     }
 
+    #[cfg(test)]
     fn apply_kinematics_if_versioned_inner(
         &mut self,
         expected: VersionedEntityKinematics,
         states: Vec<EntityKinematics>,
         journal_commit: bool,
     ) -> Result<Option<Vec<EntityKinematics>>, RegionOwnerLaneError> {
+        self.apply_kinematics_if_versioned_with_fence(expected, states, journal_commit)
+            .map(|committed| committed.map(VersionedKinematicsCommit::into_states))
+    }
+
+    fn apply_kinematics_if_versioned_with_fence(
+        &mut self,
+        expected: VersionedEntityKinematics,
+        states: Vec<EntityKinematics>,
+        journal_commit: bool,
+    ) -> Result<Option<VersionedKinematicsCommit>, RegionOwnerLaneError> {
         if expected.authority != self.authority
             || expected.expected.is_empty()
             || expected.expected.len() != states.len()
-            || expected.fence.leases.len() != expected.expected.len()
+            || expected.routes.len() != expected.expected.len()
         {
+            #[cfg(feature = "load-bench")]
+            eprintln!(
+                "PHYSICS_VERSIONED_REJECT reason=shape expected={} states={}",
+                expected.expected.len(),
+                states.len()
+            );
             return Ok(None);
         }
+        let local_lane_apply = !journal_commit
+            && expected
+                .expected
+                .iter()
+                .zip(&expected.routes)
+                .zip(&states)
+                .all(|((previous, lease), state)| {
+                    previous.eligible()
+                        && previous.id == state.id
+                        && state.is_finite()
+                        && self.locations.get(&state.id).copied() == Some(lease.key)
+                        && self.ownership.lease(lease.key) == Some(*lease)
+                        && RegionKey::from_position(previous.expected.position) == Some(lease.key)
+                        && RegionKey::from_position(state.position) == Some(lease.key)
+                        && !self.vehicle_passengers.contains_key(&state.id)
+                        && !self.passenger_vehicles.contains_key(&state.id)
+                });
+        if local_lane_apply {
+            return self.apply_local_kinematics_if_versioned(expected, states);
+        }
+        #[cfg(feature = "load-bench")]
+        let validation_started = std::time::Instant::now();
         let mut ids = HashSet::with_capacity(states.len());
-        let mut by_region =
-            BTreeMap::<RegionKey, (Vec<CompactEntityKinematicsFence>, Vec<EntityKinematics>)>::new(
-            );
-        for (previous, state) in expected.expected.iter().zip(&states) {
-            let Some(lease) = expected.fence.leases.get(&previous.id).copied() else {
-                return Ok(None);
-            };
+        let mut by_region = BTreeMap::<
+            RegionKey,
+            (
+                RegionLease,
+                Vec<CompactEntityKinematicsFence>,
+                Vec<EntityKinematics>,
+            ),
+        >::new();
+        for ((previous, lease), state) in
+            expected.expected.iter().zip(&expected.routes).zip(&states)
+        {
+            let lease = *lease;
+            let duplicate = !ids.insert(state.id);
             if !previous.eligible()
                 || previous.id != state.id
                 || !state.is_finite()
-                || !ids.insert(state.id)
+                || duplicate
                 || self.locations.get(&state.id).copied() != Some(lease.key)
                 || self.ownership.lease(lease.key) != Some(lease)
                 || RegionKey::from_position(previous.expected.position) != Some(lease.key)
                 || RegionKey::from_position(state.position) != Some(lease.key)
                 || self.vehicle_passengers.contains_key(&state.id)
-                || self.passenger_vehicles.contains_key(&state.id)
             {
+                #[cfg(feature = "load-bench")]
+                eprintln!(
+                    "PHYSICS_VERSIONED_REJECT reason=validation expected={} states={} id={:?} eligible={} id_match={} finite={} duplicate={} location={} ownership={} previous_region={} state_region={} passenger={}",
+                    expected.expected.len(),
+                    states.len(),
+                    state.id,
+                    previous.eligible(),
+                    previous.id == state.id,
+                    state.is_finite(),
+                    duplicate,
+                    self.locations.get(&state.id).copied() == Some(lease.key),
+                    self.ownership.lease(lease.key) == Some(lease),
+                    RegionKey::from_position(previous.expected.position) == Some(lease.key),
+                    RegionKey::from_position(state.position) == Some(lease.key),
+                    self.vehicle_passengers.contains_key(&state.id)
+                );
                 return Ok(None);
             }
-            let (previous_states, next_states) = by_region.entry(lease.key).or_default();
+            let (_, previous_states, next_states) = by_region
+                .entry(lease.key)
+                .or_insert_with(|| (lease, Vec::new(), Vec::new()));
             previous_states.push(*previous);
             next_states.push(*state);
         }
         let lanes = expected
-            .fence
-            .leases
-            .values()
+            .routes
+            .iter()
             .map(|lease| lease.lane)
             .collect::<BTreeSet<_>>();
         if !lanes.iter().eq(expected.fence.lane_versions.keys()) {
+            #[cfg(feature = "load-bench")]
+            eprintln!(
+                "PHYSICS_VERSIONED_REJECT reason=lanes expected={} states={}",
+                expected.expected.len(),
+                states.len()
+            );
             return Ok(None);
         }
+        #[cfg(feature = "load-bench")]
+        let validation_us = validation_started.elapsed().as_micros();
+        #[cfg(feature = "load-bench")]
+        let setup_started = std::time::Instant::now();
+        let before_lane_versions = expected.fence.lane_versions.clone();
         let (first_sequence, next_sequence) =
             self.commit_state.reserve_sequences(by_region.len())?;
         let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
-        for (offset, (_key, (previous, states))) in by_region.into_iter().enumerate() {
-            let lease = expected.fence.leases[&previous[0].id];
+        for (offset, (_key, (lease, previous, states))) in by_region.into_iter().enumerate() {
             mutations
                 .entry(lease.lane)
                 .or_default()
@@ -7572,11 +8939,142 @@ impl RegionalOwnerCoordinator {
                     },
                 });
         }
-        match self.execute_mutations_with_stats(mutations, next_sequence, journal_commit) {
-            Ok(_) => Ok(Some(states)),
-            Err(RegionOwnerLaneError::InvalidMutation) => Ok(None),
+        #[cfg(feature = "load-bench")]
+        let setup_us = setup_started.elapsed().as_micros();
+        #[cfg(feature = "load-bench")]
+        let execution_started = std::time::Instant::now();
+        let execution = self.execute_mutations_with_stats(mutations, next_sequence, journal_commit);
+        match execution {
+            Ok(_) => {
+                #[cfg(feature = "load-bench")]
+                let reconstruction_started = std::time::Instant::now();
+                let mut lane_versions = BTreeMap::new();
+                for lane in expected.fence.lane_versions.keys() {
+                    let Some(owner) = self.lanes.get(lane) else {
+                        return Err(RegionOwnerLaneError::WrongLane);
+                    };
+                    lane_versions.insert(*lane, owner.reader().state_version());
+                }
+                #[cfg(feature = "load-bench")]
+                eprintln!(
+                    "PHYSICS_VERSIONED_COMMIT_PROFILE expected={} validation_us={} setup_us={} execute_us={} reconstruction_us={}",
+                    expected.expected.len(),
+                    validation_us,
+                    setup_us,
+                    execution_started.elapsed().as_micros(),
+                    reconstruction_started.elapsed().as_micros()
+                );
+                Ok(Some(VersionedKinematicsCommit {
+                    states,
+                    fence: VersionedEntitySnapshots {
+                        authority: self.authority,
+                        fence: RegionalVersionFence {
+                            leases: expected
+                                .expected
+                                .iter()
+                                .zip(&expected.routes)
+                                .map(|(previous, lease)| (previous.id, *lease))
+                                .collect(),
+                            lane_versions,
+                        },
+                        snapshots: Vec::new(),
+                        publication_readers: None,
+                    },
+                    before_lane_versions,
+                }))
+            }
+            Err(RegionOwnerLaneError::InvalidMutation) => {
+                #[cfg(feature = "load-bench")]
+                eprintln!(
+                    "PHYSICS_VERSIONED_REJECT reason=execution expected={} states={}",
+                    expected.expected.len(),
+                    states.len()
+                );
+                Ok(None)
+            }
             Err(error) => Err(error),
         }
+    }
+
+    fn apply_local_kinematics_if_versioned(
+        &mut self,
+        expected: VersionedEntityKinematics,
+        states: Vec<EntityKinematics>,
+    ) -> Result<Option<VersionedKinematicsCommit>, RegionOwnerLaneError> {
+        let mut by_lane = BTreeMap::<usize, BTreeMap<RegionKey, LocalKinematicsRegionBatch>>::new();
+        for ((previous, lease), state) in
+            expected.expected.iter().zip(&expected.routes).zip(&states)
+        {
+            let lease = *lease;
+            let batch = by_lane
+                .entry(lease.lane)
+                .or_default()
+                .entry(lease.key)
+                .or_insert_with(|| LocalKinematicsRegionBatch {
+                    lease,
+                    previous: Vec::new(),
+                    states: Vec::new(),
+                });
+            batch.previous.push(*previous);
+            batch.states.push(*state);
+        }
+
+        let mut pending = Vec::with_capacity(by_lane.len());
+        for (lane, regions) in by_lane {
+            let owner = self
+                .lanes
+                .get(&lane)
+                .ok_or(RegionOwnerLaneError::WrongLane)?;
+            pending.push((
+                lane,
+                owner.apply_local_kinematics_if_version(regions.into_values().collect())?,
+            ));
+        }
+
+        let mut committed_states = Vec::with_capacity(states.len());
+        let mut committed_leases = HashMap::new();
+        let mut lane_versions = BTreeMap::new();
+        let routes_by_id = expected
+            .expected
+            .iter()
+            .zip(&expected.routes)
+            .map(|(previous, route)| (previous.id, *route))
+            .collect::<HashMap<_, _>>();
+        for (lane, completion) in pending {
+            let Some(commit) = completion
+                .recv()
+                .map_err(|_| RegionOwnerLaneError::Closed)??
+            else {
+                continue;
+            };
+            lane_versions.insert(lane, commit.state_version);
+            for state in commit.states {
+                let lease = *routes_by_id
+                    .get(&state.id)
+                    .expect("committed kinematics were prevalidated");
+                committed_leases.insert(state.id, lease);
+                committed_states.push(state);
+            }
+        }
+        committed_states.sort_unstable_by_key(|state| state.id);
+        if committed_states.is_empty() {
+            return Ok(None);
+        }
+        let mut before_lane_versions = expected.fence.lane_versions;
+        before_lane_versions.retain(|lane, _| lane_versions.contains_key(lane));
+        Ok(Some(VersionedKinematicsCommit {
+            states: committed_states,
+            fence: VersionedEntitySnapshots {
+                authority: self.authority,
+                fence: RegionalVersionFence {
+                    leases: committed_leases,
+                    lane_versions,
+                },
+                snapshots: Vec::new(),
+                publication_readers: None,
+            },
+            before_lane_versions,
+        }))
     }
 
     fn apply_kinematics_if_current_inner(
@@ -8004,76 +9502,272 @@ impl RegionalOwnerCoordinator {
         self.execute_mutations(mutations, next_sequence)
     }
 
+    fn tick_owned_regions(
+        &self,
+        input: RegionalEntityTickInput,
+    ) -> Result<RegionalEntityTickOutput, RegionOwnerLaneError> {
+        let readers = self
+            .lanes
+            .iter()
+            .map(|(&lane, owner)| (lane, owner.reader()))
+            .collect::<Vec<_>>();
+        // Prevent a multi-lane transaction from landing between tick fanout
+        // messages, but release admissions before waiting for lane work.
+        let admissions = readers
+            .iter()
+            .map(|(_, reader)| {
+                lock_authoritative_mutex(reader.admission(), "regional.owner_lane_admission")
+            })
+            .collect::<Vec<_>>();
+        let mut pending = Vec::with_capacity(readers.len());
+        for (lane, reader) in &readers {
+            pending.push((
+                *lane,
+                reader.clone(),
+                reader.tick_owned_regions(input.clone())?,
+            ));
+        }
+        drop(admissions);
+
+        let mut goal_stats = GoalTickStats::default();
+        let mut active_entity_count = 0usize;
+        let mut active_hostile_ids = Vec::new();
+        let mut villager_population_candidates = Vec::new();
+        let mut villager_ids = Vec::new();
+        let mut villager_proximity_seeds = Vec::new();
+        let mut fallback_entity_ids = HashSet::new();
+        let mut resolved_direct_paths = HashSet::new();
+        let mut villager_profession_updates = Vec::new();
+        let mut prepared_lanes = Vec::new();
+        for (lane, owner, completed) in pending {
+            let output = completed.recv().map_err(|_| owner.unavailable_error())??;
+            add_goal_tick_stats(&mut goal_stats, output.goal_stats);
+            active_entity_count = active_entity_count.saturating_add(output.active_entity_count);
+            active_hostile_ids.extend(output.active_hostile_ids);
+            villager_population_candidates.extend(output.villager_population_candidates);
+            villager_ids.extend(output.villager_ids);
+            villager_proximity_seeds.extend(output.villager_proximity_seeds);
+            fallback_entity_ids.extend(output.fallback_entity_ids);
+            resolved_direct_paths.extend(output.resolved_direct_paths);
+            villager_profession_updates.extend(output.villager_profession_updates);
+            if !output.physics_regions.is_empty() || !output.goal_committed_motion.is_empty() {
+                for (lease, motion) in &output.goal_committed_motion {
+                    if lease.lane != lane
+                        || self.ownership.lease(lease.key) != Some(*lease)
+                        || RegionKey::from_position(motion.position) != Some(lease.key)
+                    {
+                        return Err(RegionOwnerLaneError::StaleLease);
+                    }
+                }
+                prepared_lanes.push(RegionalPreparedLanePhysics {
+                    lane,
+                    regions: output.physics_regions,
+                    goal_committed_motion: output.goal_committed_motion,
+                });
+            }
+        }
+        active_hostile_ids.sort_unstable_by_key(|(entity, _)| *entity);
+        villager_population_candidates.sort_unstable_by_key(|(entity, _)| *entity);
+        villager_ids.sort_unstable_by_key(|(entity, _)| *entity);
+        villager_proximity_seeds.sort_unstable_by_key(|(entity, _)| *entity);
+        villager_profession_updates.sort_unstable_by_key(|snapshot| snapshot.id);
+        villager_profession_updates.dedup_by_key(|snapshot| snapshot.id);
+
+        Ok(RegionalEntityTickOutput {
+            goal_stats,
+            active_entity_count,
+            active_hostile_ids,
+            villager_population_candidates,
+            villager_ids,
+            villager_proximity_seeds,
+            fallback_entity_ids,
+            prepared_physics: RegionalPreparedEntityPhysics {
+                authority: self.authority,
+                simulation_chunks: input.simulation_chunks,
+                world: input.world,
+                lanes: prepared_lanes,
+            },
+            resolved_direct_paths,
+            villager_profession_updates,
+        })
+    }
+
+    fn commit_owned_region_physics(
+        &self,
+        prepared: RegionalPreparedEntityPhysics,
+    ) -> Result<RegionalEntityPhysicsOutput, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
+        if prepared.authority != self.authority {
+            return Err(RegionOwnerLaneError::StaleLease);
+        }
+        let readers = prepared
+            .lanes
+            .iter()
+            .map(|lane| {
+                self.lanes
+                    .get(&lane.lane)
+                    .map(|owner| (lane.lane, owner.reader()))
+                    .ok_or(RegionOwnerLaneError::WrongLane)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let admission_started = std::time::Instant::now();
+        let admissions = readers
+            .iter()
+            .map(|(_, reader)| {
+                lock_authoritative_mutex(reader.admission(), "regional.owner_lane_admission")
+            })
+            .collect::<Vec<_>>();
+        let admission_wait_us = admission_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let mut pending = Vec::with_capacity(readers.len());
+        for (plan, (lane, reader)) in prepared.lanes.into_iter().zip(&readers) {
+            if plan.lane != *lane {
+                return Err(RegionOwnerLaneError::WrongLane);
+            }
+            let completed =
+                reader.tick_owned_region_physics(owner_lane::OwnerLanePhysicsTickInput {
+                    regions: plan.regions,
+                    goal_motion: plan.goal_committed_motion,
+                    simulation_chunks: Arc::clone(&prepared.simulation_chunks),
+                    world: Arc::clone(&prepared.world),
+                })?;
+            pending.push((*lane, reader.clone(), completed));
+        }
+        drop(admissions);
+
+        let mut fallback_candidates = Vec::new();
+        let mut committed_motion = Vec::new();
+        let mut terrain_pathing_additions = HashSet::new();
+        let mut lane_versions = BTreeMap::new();
+        let mut owner_readers = BTreeMap::new();
+        let mut publication_lanes = BTreeSet::new();
+        let mut worker_wait_us = 0;
+        let mut worker_exec_us = 0;
+        for (lane, owner, completed) in pending {
+            let worker_started = std::time::Instant::now();
+            let output = completed.recv().map_err(|_| owner.unavailable_error())??;
+            worker_exec_us = worker_exec_us.max(output.worker_exec_us);
+            worker_wait_us += worker_started
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            let lane_motion = output.committed_motion;
+            for (lease, motion) in &lane_motion {
+                if lease.lane != lane
+                    || self.ownership.lease(lease.key) != Some(*lease)
+                    || RegionKey::from_position(motion.position) != Some(lease.key)
+                {
+                    return Err(RegionOwnerLaneError::StaleLease);
+                }
+            }
+            if !lane_motion.is_empty() || !output.fallback_candidates.is_empty() {
+                lane_versions.insert(lane, output.state_version);
+            }
+            if !lane_motion.is_empty() {
+                publication_lanes.insert(lane);
+            }
+            owner_readers.insert(lane, owner);
+            fallback_candidates.extend(output.fallback_candidates);
+            committed_motion.extend(lane_motion.into_iter().map(|(_, motion)| motion));
+            terrain_pathing_additions.extend(output.terrain_pathing_additions);
+        }
+        fallback_candidates.sort_unstable_by_key(|candidate| candidate.id);
+
+        let publication_fence = VersionedEntitySnapshots {
+            authority: self.authority,
+            fence: RegionalVersionFence {
+                leases: HashMap::new(),
+                lane_versions: publication_lanes
+                    .iter()
+                    .filter_map(|lane| lane_versions.get(lane).map(|&version| (*lane, version)))
+                    .collect(),
+            },
+            snapshots: Vec::new(),
+            publication_readers: Some(Arc::new(
+                publication_lanes
+                    .into_iter()
+                    .filter_map(|lane| owner_readers.get(&lane).cloned().map(|owner| (lane, owner)))
+                    .collect(),
+            )),
+        };
+        let fallback_results = fallback_candidates
+            .iter()
+            .filter_map(|candidate| candidate.result)
+            .collect::<Vec<_>>();
+        let fallback_fence = if fallback_candidates.is_empty() {
+            None
+        } else {
+            let routes = fallback_candidates
+                .iter()
+                .map(|candidate| candidate.lease)
+                .collect::<Vec<_>>();
+            let expected = fallback_candidates
+                .iter()
+                .filter_map(|candidate| candidate.expected())
+                .collect::<Vec<_>>();
+            if expected.len() != routes.len() {
+                return Err(RegionOwnerLaneError::InvalidQuery);
+            }
+            let leases = fallback_candidates
+                .iter()
+                .map(|candidate| (candidate.id, candidate.lease))
+                .collect::<HashMap<_, _>>();
+            let selected_lanes = routes
+                .iter()
+                .map(|lease| lease.lane)
+                .collect::<BTreeSet<_>>();
+            Some(VersionedEntityKinematics {
+                authority: self.authority,
+                fence: RegionalVersionFence {
+                    leases,
+                    lane_versions: selected_lanes
+                        .into_iter()
+                        .filter_map(|lane| lane_versions.get(&lane).map(|&version| (lane, version)))
+                        .collect(),
+                },
+                expected,
+                routes,
+                motion_states: None,
+                owner_readers: Some(Arc::new(owner_readers)),
+            })
+        };
+        Ok(RegionalEntityPhysicsOutput {
+            fallback_results,
+            fallback_fence,
+            committed_motion,
+            publication_fence,
+            terrain_pathing_additions,
+            lane_timings: LaneCommitTimings {
+                admission_wait_us,
+                worker_wait_us,
+                worker_exec_us,
+                exec_us: 0,
+            },
+        })
+    }
+
     pub fn prepare_goal_tick_with_pathing_for_ids(
         &self,
         tick: u64,
         active_ids: &HashSet<EntityId>,
     ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
-        self.prepare_goal_tick_with_pathing_for_ids_from_snapshots(tick, active_ids, None)
+        self.prepare_goal_tick_with_pathing_for_ids_from_snapshots(
+            tick,
+            active_ids,
+            None,
+            RegionalGoalTickInputs::default(),
+        )
     }
 
     fn prepare_goal_tick_with_pathing_for_ids_from_snapshots(
         &self,
         tick: u64,
         active_ids: &HashSet<EntityId>,
-        selected: Option<(Vec<EntitySnapshot>, BTreeMap<usize, u64>)>,
+        _selected: Option<(Vec<EntitySnapshot>, BTreeMap<usize, u64>)>,
+        inputs: RegionalGoalTickInputs,
     ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
-        let mut checkpoints = BTreeMap::new();
-        let mut lane_versions = BTreeMap::new();
-        let mut selected_is_complete = selected.is_some();
-        if let Some((selected, selected_lane_versions)) = selected {
-            for snapshot in selected {
-                if active_ids.contains(&snapshot.id) {
-                    let checkpoint = goal_checkpoint_from_snapshot(snapshot);
-                    if checkpoints.insert(checkpoint.id, checkpoint).is_some() {
-                        selected_is_complete = false;
-                        break;
-                    }
-                }
-            }
-            selected_is_complete &= checkpoints.len() == active_ids.len();
-            if selected_is_complete {
-                lane_versions = selected_lane_versions;
-            }
-        }
-        if !selected_is_complete {
-            let (selected, versions) = self.goal_checkpoints_for_ids_admitted(active_ids)?;
-            checkpoints = selected
-                .into_iter()
-                .map(|checkpoint| (checkpoint.id, checkpoint))
-                .collect();
-            lane_versions = versions;
-        }
-        let referenced_target_ids = checkpoints
-            .values()
-            .filter_map(|checkpoint| goal_reference(&checkpoint.goal))
-            .collect::<HashSet<_>>();
-        let target_ids = referenced_target_ids
-            .iter()
-            .copied()
-            .filter(|target| !checkpoints.contains_key(target))
-            .filter(|target| self.locations.contains_key(target))
-            .collect::<HashSet<_>>();
-        if !target_ids.is_empty() {
-            let (targets, target_versions) = self.goal_checkpoints_for_ids_admitted(&target_ids)?;
-            for (lane, version) in target_versions {
-                if lane_versions
-                    .insert(lane, version)
-                    .is_some_and(|existing| existing != version)
-                {
-                    return Err(RegionOwnerLaneError::Busy);
-                }
-            }
-            checkpoints.extend(
-                targets
-                    .into_iter()
-                    .map(|checkpoint| (checkpoint.id, checkpoint)),
-            );
-        }
-        let expected_missing_follow_targets = referenced_target_ids
-            .into_iter()
-            .filter(|target| !checkpoints.contains_key(target))
-            .collect::<HashSet<_>>();
         let mut ids_by_region = BTreeMap::<RegionKey, HashSet<EntityId>>::new();
         for id in active_ids {
             let key = self
@@ -8084,50 +9778,15 @@ impl RegionalOwnerCoordinator {
             ids_by_region.entry(key).or_default().insert(*id);
         }
 
-        let mut follow_targets = BTreeMap::<RegionKey, HashMap<EntityId, Vec3>>::new();
-        let mut follow_target_sources = BTreeMap::new();
-        for (&region, ids) in &ids_by_region {
-            for id in ids {
-                let follower = checkpoints
-                    .get(id)
-                    .ok_or(RegionOwnerLaneError::UnknownEntity)?;
-                let Some(target) = goal_reference(&follower.goal) else {
-                    continue;
-                };
-                let Some(target_region) = self.locations.get(&target).copied() else {
-                    continue;
-                };
-                let target_checkpoint = checkpoints
-                    .get(&target)
-                    .ok_or(RegionOwnerLaneError::UnknownEntity)?;
-                follow_target_sources.insert(
-                    target,
-                    RegionalFollowTargetSource {
-                        region: target_region,
-                        checkpoint: target_checkpoint.clone(),
-                    },
-                );
-                if target_region != region {
-                    follow_targets
-                        .entry(region)
-                        .or_default()
-                        .insert(target, target_checkpoint.position);
-                }
-            }
-        }
-
-        let mut goal_inputs = BTreeMap::new();
-        let mut ordered_active_ids = active_ids.iter().copied().collect::<Vec<_>>();
-        ordered_active_ids.sort_unstable();
-        for id in ordered_active_ids {
-            let checkpoint = checkpoints
-                .remove(&id)
-                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
-            goal_inputs.insert(id, checkpoint);
-        }
-
+        let mut goal_inputs = BTreeMap::<RegionKey, Vec<EntityGoalCheckpoint>>::new();
+        let mut goal_overrides = BTreeMap::new();
+        let mut snapshot_overrides = BTreeMap::new();
+        let mut villager_updates = BTreeMap::new();
+        let mut cross_region_villager_candidates = HashSet::new();
+        let mut pathing_aabbs = HashMap::new();
+        let mut lane_versions = BTreeMap::new();
         let mut pending = Vec::with_capacity(ids_by_region.len());
-        for (key, ids) in ids_by_region {
+        for (&key, ids) in &ids_by_region {
             let lease = self
                 .ownership
                 .lease(key)
@@ -8136,16 +9795,17 @@ impl RegionalOwnerCoordinator {
                 .lanes
                 .get(&lease.lane)
                 .ok_or(RegionOwnerLaneError::WrongLane)?;
-            let current_version = owner.reader().state_version();
+            let (current_version, completion) =
+                owner.request_goal_tick_admitted(lease, tick, ids.clone(), inputs.clone())?;
             if lane_versions
                 .insert(lease.lane, current_version)
                 .is_some_and(|existing| existing != current_version)
             {
                 return Err(RegionOwnerLaneError::Busy);
             }
-            let completion = owner.request_goal_tick_admitted(lease, tick, ids)?;
             pending.push((key, lease.lane, completion));
         }
+
         let mut batches = BTreeMap::new();
         for (key, lane, completion) in pending {
             let prepared = completion
@@ -8160,8 +9820,99 @@ impl RegionalOwnerCoordinator {
             if lane_versions.get(&lane).copied() != Some(current_version) {
                 return Err(RegionOwnerLaneError::Busy);
             }
-            batches.insert(key, prepared);
+            if goal_inputs.insert(key, prepared.checkpoints).is_some() {
+                return Err(RegionOwnerLaneError::Busy);
+            }
+            if !prepared.goal_overrides.is_empty() {
+                goal_overrides.insert(key, prepared.goal_overrides);
+            }
+            if !prepared.snapshot_overrides.is_empty() {
+                snapshot_overrides.insert(key, prepared.snapshot_overrides);
+            }
+            if !prepared.villager_updates.is_empty() {
+                villager_updates.insert(key, prepared.villager_updates);
+            }
+            cross_region_villager_candidates.extend(prepared.cross_region_villager_candidates);
+            for (entity, aabb) in prepared.pathing_aabbs {
+                if pathing_aabbs.insert(entity, aabb).is_some() {
+                    return Err(RegionOwnerLaneError::Busy);
+                }
+            }
+            batches.insert(key, prepared.goal_tick);
         }
+
+        let referenced_target_ids = goal_inputs
+            .values()
+            .flatten()
+            .filter_map(|checkpoint| goal_reference(&checkpoint.goal))
+            .collect::<HashSet<_>>();
+        let mut target_checkpoints = goal_inputs
+            .values()
+            .flatten()
+            .filter(|checkpoint| referenced_target_ids.contains(&checkpoint.id))
+            .map(|checkpoint| (checkpoint.id, checkpoint.clone()))
+            .collect::<HashMap<_, _>>();
+        let target_ids = referenced_target_ids
+            .iter()
+            .copied()
+            .filter(|target| !target_checkpoints.contains_key(target))
+            .filter(|target| self.locations.contains_key(target))
+            .collect::<HashSet<_>>();
+        if !target_ids.is_empty() {
+            let (targets, target_versions) = self.goal_checkpoints_for_ids_admitted(&target_ids)?;
+            for (lane, version) in target_versions {
+                if lane_versions
+                    .insert(lane, version)
+                    .is_some_and(|existing| existing != version)
+                {
+                    return Err(RegionOwnerLaneError::Busy);
+                }
+            }
+            target_checkpoints.extend(
+                targets
+                    .into_iter()
+                    .map(|checkpoint| (checkpoint.id, checkpoint)),
+            );
+        }
+        let expected_missing_follow_targets = referenced_target_ids
+            .into_iter()
+            .filter(|target| !target_checkpoints.contains_key(target))
+            .collect::<HashSet<_>>();
+
+        let mut follow_targets = BTreeMap::<RegionKey, HashMap<EntityId, Vec3>>::new();
+        let mut follow_target_sources = BTreeMap::new();
+        for (&region, followers) in &goal_inputs {
+            for follower in followers {
+                let Some(target) = goal_reference(&follower.goal) else {
+                    continue;
+                };
+                let Some(target_region) = self.locations.get(&target).copied() else {
+                    continue;
+                };
+                let target_checkpoint = target_checkpoints
+                    .get(&target)
+                    .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+                follow_target_sources.insert(
+                    target,
+                    RegionalFollowTargetSource {
+                        region: target_region,
+                        checkpoint: target_checkpoint.clone(),
+                    },
+                );
+                follow_targets
+                    .entry(region)
+                    .or_default()
+                    .insert(target, target_checkpoint.position);
+            }
+        }
+        let simulation_ids = ids_by_region
+            .into_iter()
+            .map(|(key, ids)| {
+                let mut ids = ids.into_iter().collect::<Vec<_>>();
+                ids.sort_unstable();
+                (key, ids)
+            })
+            .collect();
         let lease_keys = batches
             .keys()
             .copied()
@@ -8180,11 +9931,17 @@ impl RegionalOwnerCoordinator {
                 })
                 .collect::<Result<_, _>>()?,
             lane_versions,
+            simulation_ids,
             batches,
             follow_targets,
             follow_target_sources,
             expected_missing_follow_targets,
             goal_inputs,
+            goal_overrides,
+            snapshot_overrides,
+            villager_updates,
+            cross_region_villager_candidates,
+            pathing_aabbs,
         })
     }
 
@@ -8201,8 +9958,8 @@ impl RegionalOwnerCoordinator {
         journal_commit: bool,
     ) -> Result<GoalTickStats, RegionOwnerLaneError> {
         Ok(self
-            .try_apply_prepared_goal_tick_inner(resolved, journal_commit)?
-            .unwrap_or_default())
+            .try_apply_prepared_goal_tick_inner(resolved, journal_commit, None)?
+            .map_or_else(GoalTickStats::default, |execution| execution.goal_stats))
     }
 
     fn apply_prepared_goal_tick_and_kinematics_for_ids(
@@ -8210,19 +9967,28 @@ impl RegionalOwnerCoordinator {
         resolved: RegionalResolvedGoalTick,
         entities: &HashSet<EntityId>,
         journal_commit: bool,
-    ) -> GoalApplyKinematicsResult {
-        let Some(stats) = self.try_apply_prepared_goal_tick_inner(resolved, journal_commit)? else {
+    ) -> GoalApplySimulationResult {
+        let Some(execution) =
+            self.try_apply_prepared_goal_tick_inner(resolved, journal_commit, Some(entities))?
+        else {
             return Ok(None);
         };
-        let (states, versioned) = self.alive_kinematics_for_ids(entities)?;
-        Ok(Some((stats, states, versioned)))
+        let (_, results, versioned) = self.fenced_simulation_results_from_candidate_runs(
+            entities,
+            execution.goal_candidate_runs,
+            execution.lane_versions,
+            None,
+            true,
+        )?;
+        Ok(Some((execution.goal_stats, results, versioned)))
     }
 
     fn try_apply_prepared_goal_tick_inner(
         &mut self,
         mut resolved: RegionalResolvedGoalTick,
         journal_commit: bool,
-    ) -> Result<Option<GoalTickStats>, RegionOwnerLaneError> {
+        simulation_entities: Option<&HashSet<EntityId>>,
+    ) -> Result<Option<MutationExecution>, RegionOwnerLaneError> {
         if resolved.authority != self.authority || resolved.phase != RegionPhase(0) {
             return Ok(None);
         }
@@ -8247,11 +10013,6 @@ impl RegionalOwnerCoordinator {
         }) {
             return Ok(None);
         }
-        if resolved.goal_inputs.values().any(|expected| {
-            self.locations.get(&expected.id).copied() != RegionKey::from_position(expected.position)
-        }) {
-            return Ok(None);
-        }
 
         let validation_ids = resolved
             .follow_target_sources
@@ -8272,17 +10033,27 @@ impl RegionalOwnerCoordinator {
         if resolved.batches.is_empty() {
             return Ok(None);
         }
+        let mut candidate_ids_by_region = if let Some(entities) = simulation_entities {
+            let prepared_len = resolved
+                .simulation_ids
+                .values()
+                .map(Vec::len)
+                .sum::<usize>();
+            if prepared_len != entities.len()
+                || resolved
+                    .simulation_ids
+                    .values()
+                    .flatten()
+                    .any(|entity| !entities.contains(entity))
+            {
+                return Ok(None);
+            }
+            std::mem::take(&mut resolved.simulation_ids)
+        } else {
+            BTreeMap::new()
+        };
 
-        let mut expected_by_region = BTreeMap::<RegionKey, Vec<EntityGoalCheckpoint>>::new();
-        for (_, checkpoint) in std::mem::take(&mut resolved.goal_inputs) {
-            let key = self
-                .locations
-                .get(&checkpoint.id)
-                .copied()
-                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
-            expected_by_region.entry(key).or_default().push(checkpoint);
-        }
-
+        let mut expected_by_region = std::mem::take(&mut resolved.goal_inputs);
         let batch_count = resolved.batches.len();
         let (first_sequence, next_sequence) = self.commit_state.reserve_sequences(batch_count)?;
         let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
@@ -8300,6 +10071,7 @@ impl RegionalOwnerCoordinator {
                     lease,
                     mutation: RegionOwnerMutation::ApplyGoalBatch {
                         expected,
+                        candidate_ids: candidate_ids_by_region.remove(&key).unwrap_or_default(),
                         expected_state_version: resolved
                             .lane_versions
                             .get(&lease.lane)
@@ -8307,11 +10079,20 @@ impl RegionalOwnerCoordinator {
                             .ok_or(RegionOwnerLaneError::WrongLane)?,
                         resolved: Box::new(batch),
                         follow_targets: resolved.follow_targets.remove(&key).unwrap_or_default(),
+                        goal_overrides: resolved.goal_overrides.remove(&key).unwrap_or_default(),
+                        snapshot_overrides: resolved
+                            .snapshot_overrides
+                            .remove(&key)
+                            .unwrap_or_default(),
+                        villager_updates: resolved
+                            .villager_updates
+                            .remove(&key)
+                            .unwrap_or_default(),
                     },
                 });
         }
         match self.execute_mutations_with_stats(mutations, next_sequence, journal_commit) {
-            Ok(execution) => Ok(Some(execution.goal_stats)),
+            Ok(execution) => Ok(Some(execution)),
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(None),
             Err(error) => Err(error),
         }
@@ -8342,12 +10123,13 @@ impl RegionalOwnerCoordinator {
             .begin_allocated_phase_for_lanes(phase, participants.clone())
             .map_err(|_| RegionOwnerLaneError::Busy)?;
         let mut goal_stats = GoalTickStats::default();
+        let mut goal_candidate_runs = Vec::with_capacity(participants.len());
         let mut effect_results = Vec::new();
 
         let mut prepared = Vec::with_capacity(participants.len());
         let mut prepared_and_committed = Vec::new();
         let mut first_error = None;
-        for (index, &lane) in participants.iter().enumerate() {
+        for &lane in &participants {
             let owner = self
                 .lanes
                 .get(&lane)
@@ -8357,7 +10139,7 @@ impl RegionalOwnerCoordinator {
                 sequence_watermark,
                 mutations: mutations.remove(&lane).unwrap_or_default(),
             };
-            if participants.len() == 1 && index == 0 {
+            if participants.len() == 1 {
                 match owner.prepare_and_commit(batch) {
                     Ok(completion) => prepared_and_committed.push((lane, completion)),
                     Err(error) => first_error = first_error.or(Some(error)),
@@ -8392,6 +10174,7 @@ impl RegionalOwnerCoordinator {
             match completion.recv() {
                 Ok(Ok(result)) if result.phase == phase => {
                     add_goal_tick_stats(&mut goal_stats, result.goal_stats);
+                    goal_candidate_runs.extend(result.goal_candidate_runs);
                     effect_results.extend(result.effect_results);
                     ready.insert(lane);
                     applied.insert(lane);
@@ -8419,6 +10202,7 @@ impl RegionalOwnerCoordinator {
                 match completion.recv() {
                     Ok(Ok(result)) if result.phase == phase => {
                         add_goal_tick_stats(&mut goal_stats, result.goal_stats);
+                        goal_candidate_runs.extend(result.goal_candidate_runs);
                         effect_results.extend(result.effect_results);
                         applied.insert(lane);
                     }
@@ -8456,18 +10240,20 @@ impl RegionalOwnerCoordinator {
                 first_error = Some(RegionOwnerLaneError::Journal);
             }
             if first_error.is_none() && applied.len() == participants.len() {
-                for lane in applied {
+                let mut finalized = Vec::with_capacity(applied.len());
+                for &lane in &applied {
                     match self.lanes[&lane].finalize(phase) {
-                        Ok(completion) => match completion.recv() {
-                            Ok(Ok(finalized)) if finalized == phase => {
-                                settled.insert(lane);
-                            }
-                            Ok(Err(error)) => first_error = first_error.or(Some(error)),
-                            _ => {
-                                first_error = first_error.or(Some(RegionOwnerLaneError::Closed));
-                            }
-                        },
+                        Ok(completion) => finalized.push((lane, completion)),
                         Err(error) => first_error = first_error.or(Some(error)),
+                    }
+                }
+                for (lane, completion) in finalized {
+                    match completion.recv() {
+                        Ok(Ok(finalized)) if finalized == phase => {
+                            settled.insert(lane);
+                        }
+                        Ok(Err(error)) => first_error = first_error.or(Some(error)),
+                        _ => first_error = first_error.or(Some(RegionOwnerLaneError::Closed)),
                     }
                 }
             } else {
@@ -8497,8 +10283,23 @@ impl RegionalOwnerCoordinator {
                 }
             }
         } else {
-            let mut aborted = Vec::with_capacity(ready.len());
-            for lane in ready {
+            let mut rolled_back = Vec::with_capacity(applied.len());
+            for &lane in &applied {
+                match self.lanes[&lane].rollback(phase) {
+                    Ok(completion) => rolled_back.push((lane, completion)),
+                    Err(error) => first_error = first_error.or(Some(error)),
+                }
+            }
+            for (lane, completion) in rolled_back {
+                if matches!(completion.recv(), Ok(Ok(rolled_back_phase)) if rolled_back_phase == phase)
+                {
+                    settled.insert(lane);
+                } else {
+                    first_error = first_error.or(Some(RegionOwnerLaneError::Closed));
+                }
+            }
+            let mut aborted = Vec::with_capacity(ready.len().saturating_sub(applied.len()));
+            for lane in ready.difference(&applied).copied() {
                 match self.lanes[&lane].abort(phase) {
                     Ok(completion) => aborted.push((lane, completion)),
                     Err(error) => first_error = first_error.or(Some(error)),
@@ -8512,6 +10313,19 @@ impl RegionalOwnerCoordinator {
                 }
             }
         }
+        let lane_versions = if first_error.is_none() {
+            participants
+                .iter()
+                .map(|lane| {
+                    self.lanes
+                        .get(lane)
+                        .map(|owner| (*lane, owner.reader().state_version()))
+                        .ok_or(RegionOwnerLaneError::WrongLane)
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            BTreeMap::new()
+        };
         for lane in settled {
             if self.ownership.acknowledge_lane(phase, lane).is_err() {
                 first_error = first_error.or(Some(RegionOwnerLaneError::StalePhase));
@@ -8524,6 +10338,8 @@ impl RegionalOwnerCoordinator {
             Some(error) => Err(error),
             None => Ok(MutationExecution {
                 goal_stats,
+                goal_candidate_runs,
+                lane_versions,
                 effect_results,
             }),
         }
@@ -9003,6 +10819,14 @@ impl RegionalEntityStore {
             self.validate_access(phase, lease)?;
         }
 
+        let simulation_ids = ids_by_region
+            .iter()
+            .map(|(&key, ids)| {
+                let mut ids = ids.iter().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                (key, ids)
+            })
+            .collect();
         let captured = self.capture_follow_targets(&ids_by_region);
 
         let mut batches = BTreeMap::new();
@@ -9034,11 +10858,17 @@ impl RegionalEntityStore {
                 })
                 .collect(),
             lane_versions: BTreeMap::new(),
+            simulation_ids,
             batches,
-            follow_targets: captured.remote_by_region,
+            follow_targets: captured.complete_by_region,
             follow_target_sources: captured.sources,
             expected_missing_follow_targets: captured.expected_missing_follow_targets,
             goal_inputs: captured.inputs,
+            goal_overrides: BTreeMap::new(),
+            snapshot_overrides: BTreeMap::new(),
+            villager_updates: BTreeMap::new(),
+            cross_region_villager_candidates: HashSet::new(),
+            pathing_aabbs: HashMap::new(),
         })
     }
 
@@ -9514,18 +11344,19 @@ impl RegionalEntityStore {
         &self,
         ids_by_region: &BTreeMap<RegionKey, HashSet<EntityId>>,
     ) -> CapturedFollowTargets {
-        let mut remote_by_region = BTreeMap::new();
+        let mut complete_by_region = BTreeMap::new();
         let mut sources = BTreeMap::new();
         let mut expected_missing_follow_targets = HashSet::new();
         let mut inputs = BTreeMap::new();
         for (&region, ids) in ids_by_region {
-            let mut remote = HashMap::new();
+            let mut targets = HashMap::new();
+            let mut region_inputs = Vec::with_capacity(ids.len());
             for &id in ids {
                 let Some(follower) = self.snapshot(id) else {
                     continue;
                 };
                 let follower = goal_checkpoint_from_snapshot(follower);
-                inputs.insert(id, follower.clone());
+                region_inputs.push(follower.clone());
                 let Some(target) = goal_reference(&follower.goal) else {
                     continue;
                 };
@@ -9545,16 +11376,15 @@ impl RegionalEntityStore {
                         checkpoint: target_checkpoint.clone(),
                     },
                 );
-                if target_region != region {
-                    remote.insert(target, target_checkpoint.position);
-                }
+                targets.insert(target, target_checkpoint.position);
             }
-            if !remote.is_empty() {
-                remote_by_region.insert(region, remote);
+            inputs.insert(region, region_inputs);
+            if !targets.is_empty() {
+                complete_by_region.insert(region, targets);
             }
         }
         CapturedFollowTargets {
-            remote_by_region,
+            complete_by_region,
             sources,
             expected_missing_follow_targets,
             inputs,
@@ -9575,12 +11405,16 @@ impl RegionalEntityStore {
         })
     }
 
-    fn goal_inputs_match(&self, expected: &BTreeMap<EntityId, EntityGoalCheckpoint>) -> bool {
-        expected.iter().all(|(&id, expected)| {
-            self.snapshot(id)
-                .map(goal_checkpoint_from_snapshot)
-                .as_ref()
-                == Some(expected)
+    fn goal_inputs_match(&self, expected: &BTreeMap<RegionKey, Vec<EntityGoalCheckpoint>>) -> bool {
+        expected.iter().all(|(&region, checkpoints)| {
+            checkpoints.iter().all(|expected| {
+                RegionKey::from_position(expected.position) == Some(region)
+                    && self
+                        .snapshot(expected.id)
+                        .map(goal_checkpoint_from_snapshot)
+                        .as_ref()
+                        == Some(expected)
+            })
         })
     }
 
@@ -10266,6 +12100,14 @@ impl RegionalEntityAuthority {
                 ids_by_region.entry(key).or_default().insert(*id);
             }
         }
+        let simulation_ids = ids_by_region
+            .iter()
+            .map(|(&key, ids)| {
+                let mut ids = ids.iter().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                (key, ids)
+            })
+            .collect();
         let captured = self.regions.capture_follow_targets(&ids_by_region);
         let batches: BTreeMap<RegionKey, PreparedGoalTick> = ids_by_region
             .into_iter()
@@ -10300,11 +12142,17 @@ impl RegionalEntityAuthority {
                 })
                 .collect(),
             lane_versions: BTreeMap::new(),
+            simulation_ids,
             batches,
-            follow_targets: captured.remote_by_region,
+            follow_targets: captured.complete_by_region,
             follow_target_sources: captured.sources,
             expected_missing_follow_targets: captured.expected_missing_follow_targets,
             goal_inputs: captured.inputs,
+            goal_overrides: BTreeMap::new(),
+            snapshot_overrides: BTreeMap::new(),
+            villager_updates: BTreeMap::new(),
+            cross_region_villager_candidates: HashSet::new(),
+            pathing_aabbs: HashMap::new(),
         }
     }
 
@@ -11189,6 +13037,43 @@ mod tests {
     }
 
     #[test]
+    fn versioned_kinematics_allows_unrelated_lane_mutation() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let ids = coordinator
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(1.5, 64.0, 0.5)),
+            ])
+            .expect("same-lane cows");
+        let target = ids[0];
+        let unrelated = ids[1];
+        let fence = fenced_kinematics(&coordinator, &HashSet::from([target]));
+        let unrelated_velocity = Vec3::new(0.1, 0.0, 0.0);
+        coordinator
+            .set_velocities([(unrelated, unrelated_velocity)])
+            .expect("unrelated velocity mutation");
+
+        let target_next = movement(target, Vec3::new(1.5, 64.0, 0.5));
+        assert!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(fence, vec![target_next], false)
+                .expect("unrelated-lane compact compare")
+                .is_some(),
+            "disjoint lane traffic must not force a full snapshot fallback"
+        );
+        assert_eq!(
+            coordinator.snapshot(target).unwrap().unwrap().position,
+            target_next.position
+        );
+        assert_eq!(
+            coordinator.snapshot(unrelated).unwrap().unwrap().velocity,
+            unrelated_velocity
+        );
+    }
+
+    #[test]
     fn versioned_kinematics_rejects_changed_motion_even_with_current_version() {
         let mut coordinator =
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
@@ -11201,7 +13086,7 @@ mod tests {
         coordinator
             .set_velocities([(id, changed_velocity)])
             .expect("changed-motion mutation");
-        let lane = fence.fence.leases[&id].lane;
+        let lane = fence.routes[0].lane;
         fence
             .fence
             .lane_versions
@@ -11222,6 +13107,94 @@ mod tests {
             changed_velocity,
             "the intervening motion remains authoritative after compact rejection"
         );
+    }
+
+    #[test]
+    fn versioned_kinematics_rejects_same_region_attached_passenger_without_commit() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let passenger = coordinator
+            .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
+            .expect("passenger");
+        let boat = coordinator
+            .spawn(SpawnEntity::vehicle(
+                VehicleKind::Boat,
+                1,
+                "minecraft:oak_boat",
+                Vec3::new(0.5, 64.0, 0.5),
+            ))
+            .expect("boat");
+        let mut fence = fenced_kinematics(&coordinator, &HashSet::from([passenger]));
+
+        let detached = coordinator.snapshot(boat).unwrap().unwrap();
+        let mut attached = detached.clone();
+        attached.vehicle.as_mut().expect("boat state").passenger = Some(passenger);
+        assert!(
+            coordinator
+                .replace_snapshot_if_current(detached, attached)
+                .expect("attach passenger")
+        );
+
+        let lane = fence.routes[0].lane;
+        fence
+            .fence
+            .lane_versions
+            .insert(lane, coordinator.lanes[&lane].reader().state_version());
+        let target = movement(passenger, Vec3::new(2.5, 64.0, 0.5));
+
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(fence, vec![target], false)
+                .expect("attached-passenger compact compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(boat).unwrap().unwrap().position,
+            Vec3::new(0.5, 64.0, 0.5)
+        );
+        assert_eq!(
+            coordinator.snapshot(passenger).unwrap().unwrap().position,
+            Vec3::new(1.5, 64.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn versioned_kinematics_rejects_intervening_pickup_claim_without_commit() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("entity");
+        let mut fence = fenced_kinematics(&coordinator, &HashSet::from([id]));
+        let current = coordinator.snapshot(id).unwrap().unwrap();
+        let mut claimed = current.clone();
+        claimed.retained.item_pickup_claim = Some(77);
+        assert!(
+            coordinator
+                .replace_snapshot_if_current(current, claimed)
+                .expect("install pickup claim")
+        );
+
+        let lane = fence.routes[0].lane;
+        fence
+            .fence
+            .lane_versions
+            .insert(lane, coordinator.lanes[&lane].reader().state_version());
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![movement(id, Vec3::new(1.5, 64.0, 0.5))],
+                    false,
+                )
+                .expect("claimed compact compare"),
+            None
+        );
+        let snapshot = coordinator.snapshot(id).unwrap().unwrap();
+        assert_eq!(snapshot.position, Vec3::new(0.5, 64.0, 0.5));
+        assert_eq!(snapshot.retained.item_pickup_claim, Some(77));
     }
 
     #[test]
@@ -11257,7 +13230,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_kinematics_one_stale_lane_rejects_whole_batch() {
+    fn versioned_kinematics_stale_lane_does_not_block_fresh_lane() {
         let mut coordinator =
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("coordinator");
@@ -11272,20 +13245,22 @@ mod tests {
         coordinator
             .set_velocities([(ids[1], Vec3::new(0.25, 0.0, 0.0))])
             .expect("stale-lane mutation");
-        let targets = vec![
-            movement(ids[0], Vec3::new(1.5, 64.0, 0.5)),
-            movement(ids[1], Vec3::new(129.5, 64.0, 0.5)),
-        ];
+        let fresh_target = movement(ids[0], Vec3::new(1.5, 64.0, 0.5));
+        let stale_target = movement(ids[1], Vec3::new(129.5, 64.0, 0.5));
 
         assert_eq!(
             coordinator
-                .apply_kinematics_if_versioned_inner(fence, targets, false)
-                .expect("multi-lane compact compare"),
-            None
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![fresh_target, stale_target],
+                    false,
+                )
+                .expect("independent lane compact compare"),
+            Some(vec![fresh_target])
         );
         assert_eq!(
             coordinator.snapshot(ids[0]).unwrap().unwrap().position,
-            Vec3::new(0.5, 64.0, 0.5)
+            Vec3::new(1.5, 64.0, 0.5)
         );
         assert_eq!(
             coordinator.snapshot(ids[1]).unwrap().unwrap().position,
@@ -11301,11 +13276,14 @@ mod tests {
         let id = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let ids = HashSet::from([id]);
         let resolved = handle
-            .prepare_goal_tick_with_pathing_for_ids(1, &ids)
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(ids.clone()))
             .expect("goal prepare")
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
         let (_, _, versioned) = handle
-            .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(resolved, &ids)
+            .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(
+                resolved,
+                Arc::new(ids.clone()),
+            )
             .expect("goal apply")
             .expect("fresh goal apply");
         let fence = versioned.expect("compact fence");
@@ -11381,7 +13359,9 @@ mod tests {
             .request_alive_kinematics_for_ids(vec![(lease, id)])
             .expect("lane kinematics request");
         let read = completion.recv().expect("lane reply").expect("lane read");
-        let previous = read.candidates[0].expected;
+        let previous = read.candidates[0]
+            .expected()
+            .expect("living candidate has simulation result");
 
         coordinator
             .set_velocities([(id, Vec3::new(0.25, 0.0, 0.0))])
@@ -11434,7 +13414,7 @@ mod tests {
             .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("cow");
         let mut fence = fenced_kinematics(&coordinator, &HashSet::from([id]));
-        fence.fence.leases.remove(&id);
+        fence.routes.clear();
         assert_eq!(
             coordinator
                 .apply_kinematics_if_versioned_inner(
@@ -11459,7 +13439,7 @@ mod tests {
         let mut boat = SpawnEntity::vehicle(
             VehicleKind::Boat,
             1,
-            "minecraft:boat",
+            "minecraft:oak_boat",
             Vec3::new(0.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
@@ -13916,7 +15896,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_goal_apply_returns_sorted_kinematics_without_post_apply_snapshots() {
+    fn owner_goal_apply_returns_sorted_simulation_results_without_post_apply_snapshots() {
         let mut coordinator =
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("owner coordinator");
@@ -13938,17 +15918,24 @@ mod tests {
             lane.reset_snapshot_batch_request_count();
         }
 
-        let (stats, projection, versioned) = coordinator
-            .apply_prepared_goal_tick_and_kinematics_for_ids(resolved, &active, true)
-            .expect("apply goals and project kinematics")
+        let (stats, results, versioned) = coordinator
+            .apply_prepared_goal_tick_and_kinematics_for_ids(resolved, &active, false)
+            .expect("apply goals and project simulation results")
             .expect("fresh goals apply");
 
         assert_eq!(stats.decisions_applied, 2);
         assert_eq!(
-            projection.iter().map(|state| state.id).collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|result| result.physics.id)
+                .collect::<Vec<_>>(),
             vec![west, east]
         );
-        assert!(projection.iter().all(|state| state.velocity != Vec3::ZERO));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.physics.velocity != Vec3::ZERO)
+        );
         assert!(versioned.is_some());
         assert!(
             coordinator
@@ -13962,6 +15949,10 @@ mod tests {
             .prepare_goal_tick_with_pathing_for_ids(24, &active)
             .expect("prepare stale goals")
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
+        let east_before_stale = coordinator
+            .snapshot(east)
+            .expect("east read before stale apply")
+            .expect("east snapshot before stale apply");
         let current_velocity = Vec3::new(0.125, 0.25, 0.375);
         coordinator
             .set_velocities([(west, current_velocity)])
@@ -13970,7 +15961,7 @@ mod tests {
             lane.reset_snapshot_batch_request_count();
         }
         let rejected = coordinator
-            .apply_prepared_goal_tick_and_kinematics_for_ids(stale, &active, true)
+            .apply_prepared_goal_tick_and_kinematics_for_ids(stale, &active, false)
             .expect("reject stale goals");
 
         assert!(rejected.is_none());
@@ -13982,6 +15973,14 @@ mod tests {
                 .velocity,
             current_velocity
         );
+        assert_eq!(
+            coordinator
+                .snapshot(east)
+                .expect("east read after stale apply")
+                .expect("east snapshot after stale apply"),
+            east_before_stale,
+            "a fresh lane committed during one-phase admission must roll back when its peer is stale"
+        );
         assert!(
             coordinator
                 .lanes
@@ -13989,6 +15988,78 @@ mod tests {
                 .all(|lane| lane.snapshot_batch_request_count() == 0),
             "stale typed projection must not materialize full snapshots"
         );
+    }
+
+    #[test]
+    fn owner_hostile_goal_selection_is_explicit_and_applies_atomically() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let original_target = Vec3::new(10.5, 64.0, 0.5);
+        let mut zombie = SpawnEntity::new(54, "minecraft:zombie", Vec3::new(0.5, 64.0, 0.5));
+        zombie.goal = GoalState::FollowPosition {
+            target: original_target,
+            speed: 0.05,
+        };
+        let zombie = handle.spawn(zombie).expect("zombie");
+        let active = HashSet::from([zombie]);
+
+        let prepared = handle
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(active.clone()))
+            .expect("prepare without hostile selection");
+        handle
+            .apply_prepared_goal_tick_and_simulation_results_for_ids_deferred_journal(
+                prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT),
+                Arc::new(active.clone()),
+            )
+            .expect("apply without hostile selection")
+            .expect("fresh default goal apply");
+        assert_eq!(
+            handle
+                .snapshot(zombie)
+                .expect("zombie read")
+                .expect("zombie")
+                .goal,
+            GoalState::FollowPosition {
+                target: original_target,
+                speed: 0.05,
+            },
+            "default goal inputs must not reseat hostile targets"
+        );
+
+        let target = Vec3::new(3.5, 64.0, 0.5);
+        let prepared = handle
+            .prepare_goal_tick_with_pathing_for_ids_with_inputs(
+                2,
+                Arc::new(active.clone()),
+                super::RegionalGoalTickInputs {
+                    hostile_target_positions: Some(Arc::from([target])),
+                    ..super::RegionalGoalTickInputs::default()
+                },
+            )
+            .expect("prepare explicit hostile selection");
+        let (_, results, _) = handle
+            .apply_prepared_goal_tick_and_simulation_results_for_ids_deferred_journal(
+                prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT),
+                Arc::new(active.clone()),
+            )
+            .expect("apply explicit hostile selection")
+            .expect("fresh explicit goal apply");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            handle
+                .snapshot(zombie)
+                .expect("zombie read")
+                .expect("zombie")
+                .goal,
+            GoalState::FollowPosition {
+                target,
+                speed: 1.25,
+            },
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
     }
 
     #[test]
@@ -14043,6 +16114,7 @@ mod tests {
                         coordinator.lanes[&0].reader().state_version(),
                     )]),
                 )),
+                super::RegionalGoalTickInputs::default(),
             )
             .expect("prepare follower goal")
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
@@ -14214,7 +16286,7 @@ mod tests {
         );
         let active = HashSet::from([ids[0], ids[1]]);
         let resolved = handle
-            .prepare_goal_tick_with_pathing_for_ids(1, &active)
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(active.clone()))
             .expect("prepare mutual target goals")
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
         let stats = handle
@@ -14575,66 +16647,7 @@ mod tests {
         assert!(!coordinator.passenger_vehicles.contains_key(&passenger));
     }
 
-    #[test]
-    fn owner_coordinator_moves_vehicle_group_across_lanes_with_leader_delta() {
-        let mut source = RegionalEntityStore::new();
-        let source_lease = source
-            .assign_region(RegionKey::new(0, 0), 0)
-            .expect("source region");
-        let phase = source.begin_phase().expect("source phase");
-        let passenger = source
-            .spawn(phase, source_lease, cow(Vec3::new(127.0, 64.0, 0.5)))
-            .expect("passenger");
-        let mut boat = SpawnEntity::vehicle(
-            VehicleKind::Boat,
-            8,
-            "minecraft:oak_boat",
-            Vec3::new(127.5, 64.0, 0.5),
-        );
-        boat.vehicle.as_mut().expect("boat state").passenger = Some(passenger);
-        let boat = source.spawn(phase, source_lease, boat).expect("boat");
-        let snapshots = source.snapshots().collect::<Vec<_>>();
-        let mut coordinator =
-            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
-                .expect("owner coordinator");
-        coordinator
-            .insert_snapshots_batch(snapshots)
-            .expect("restore vehicle group");
-        let expected_boat = coordinator
-            .snapshot(boat)
-            .expect("boat read")
-            .expect("boat snapshot");
-        let expected_passenger = coordinator
-            .snapshot(passenger)
-            .expect("passenger read")
-            .expect("passenger snapshot");
-
-        assert!(
-            coordinator
-                .apply_kinematics_if_current([
-                    (
-                        expected_passenger,
-                        movement(passenger, Vec3::new(130.0, 64.0, 0.5)),
-                    ),
-                    (expected_boat, movement(boat, Vec3::new(128.5, 64.0, 0.5))),
-                ])
-                .expect("vehicle migration")
-        );
-        let moved_boat = coordinator
-            .snapshot(boat)
-            .expect("moved boat read")
-            .expect("moved boat");
-        let moved_passenger = coordinator
-            .snapshot(passenger)
-            .expect("moved passenger read")
-            .expect("moved passenger");
-        assert_eq!(moved_boat.position, Vec3::new(128.5, 64.0, 0.5));
-        assert_eq!(moved_passenger.position, Vec3::new(128.0, 64.0, 0.5));
-        assert_eq!(
-            moved_boat.vehicle.and_then(|vehicle| vehicle.passenger),
-            Some(passenger)
-        );
-    }
+    mod vehicle_transfer_tests;
 
     #[test]
     fn owner_runtime_routes_exact_commands_and_returns_state_on_shutdown() {
@@ -16303,7 +18316,7 @@ mod tests {
                 .expect("set pathing goal")
         );
         let prepared = handle
-            .prepare_goal_tick_with_pathing_for_ids(1, &HashSet::from([entity]))
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(HashSet::from([entity])))
             .expect("prepare retained path state");
         handle
             .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
@@ -16374,7 +18387,7 @@ mod tests {
         );
         let selected = HashSet::from(ids);
         let prepared = handle
-            .prepare_goal_tick_with_pathing_for_ids(1, &selected)
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(selected.clone()))
             .expect("prepare retained path states");
         handle
             .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
@@ -16478,7 +18491,7 @@ mod tests {
                 .expect("set wander goal")
         );
         let prepared = handle
-            .prepare_goal_tick_with_pathing_for_ids(1, &HashSet::from([entity]))
+            .prepare_goal_tick_with_pathing_for_ids(1, Arc::new(HashSet::from([entity])))
             .expect("prepare retained path state");
         handle
             .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
@@ -16965,6 +18978,7 @@ mod tests {
         let (reply, _) = mpsc::channel();
         let selected = super::RegionalOwnerCommand::SnapshotsForIds {
             entities: selected_ids.clone(),
+            selection: super::SnapshotSelection::All,
             reply,
         };
         assert!(matches!(
@@ -16982,8 +18996,9 @@ mod tests {
         assert!(matches!(
             super::RegionalOwnerCommand::PrepareGoalTick {
                 tick: 1,
-                active_ids: HashSet::from([entity]),
+                active_ids: Arc::new(HashSet::from([entity])),
                 selected: None,
+                inputs: super::RegionalGoalTickInputs::default(),
                 reply,
             }
             .lane_scope(),
@@ -17239,14 +19254,15 @@ mod tests {
         handle.notify_goal_prepare_entered_for_test(prepare_entered);
         let (prepare_complete, prepare_complete_rx) = mpsc::channel();
         let prepare_handle = handle.clone();
-        let prepare_worker = std::thread::spawn(move || {
-            prepare_complete
-                .send(
-                    prepare_handle
-                        .prepare_goal_tick_with_pathing_for_ids(17, &HashSet::from([west])),
-                )
-                .expect("publish goal preparation result");
-        });
+        let prepare_worker =
+            std::thread::spawn(move || {
+                prepare_complete
+                    .send(prepare_handle.prepare_goal_tick_with_pathing_for_ids(
+                        17,
+                        Arc::new(HashSet::from([west])),
+                    ))
+                    .expect("publish goal preparation result");
+            });
         prepare_entered_rx
             .recv()
             .expect("actor entered goal preparation");
@@ -17316,14 +19332,15 @@ mod tests {
         handle.notify_goal_prepare_entered_for_test(prepare_entered);
         let (prepare_complete, prepare_complete_rx) = mpsc::channel();
         let prepare_handle = handle.clone();
-        let prepare = std::thread::spawn(move || {
-            prepare_complete
-                .send(
-                    prepare_handle
-                        .prepare_goal_tick_with_pathing_for_ids(18, &HashSet::from([entity])),
-                )
-                .expect("publish goal preparation");
-        });
+        let prepare =
+            std::thread::spawn(move || {
+                prepare_complete
+                    .send(prepare_handle.prepare_goal_tick_with_pathing_for_ids(
+                        18,
+                        Arc::new(HashSet::from([entity])),
+                    ))
+                    .expect("publish goal preparation");
+            });
         prepare_entered_rx
             .recv()
             .expect("actor entered goal preparation");
@@ -17374,7 +19391,7 @@ mod tests {
             routes[&west].owner.clone()
         };
         let resolved = handle
-            .prepare_goal_tick_with_pathing_for_ids(19, &HashSet::from([west]))
+            .prepare_goal_tick_with_pathing_for_ids(19, Arc::new(HashSet::from([west])))
             .expect("prepare west goal")
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
 
@@ -17463,13 +19480,13 @@ mod tests {
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
         assert!(resolved.batches.contains_key(&active_region));
         assert!(resolved.follow_target_sources.contains_key(&target));
-        resolved.goal_inputs.remove(&active);
+        resolved.goal_inputs.remove(&active_region);
         resolved.leases.remove(&active_region);
 
         let (reply, _) = mpsc::channel();
         let command = super::RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics {
             resolved: Box::new(resolved),
-            entities: HashSet::from([kinematics]),
+            entities: Arc::new(HashSet::from([kinematics])),
             defer_journal: false,
             reply,
         };
@@ -17499,6 +19516,66 @@ mod tests {
                 .assign(active_region, active_lease.lane)
                 .expect("restore batch route"),
             active_lease
+        );
+
+        coordinator.shutdown().expect("coordinator shutdown");
+    }
+
+    #[test]
+    fn deferred_multi_lane_goal_rejection_does_not_commit_prepared_peer() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                .expect("owner coordinator");
+        let west = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("west cow");
+        let east = coordinator
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("east cow");
+        let west_region = coordinator.locations[&west];
+        let east_region = coordinator.locations[&east];
+        let west_lane = coordinator.ownership.lease(west_region).unwrap().lane;
+        let east_lane = coordinator.ownership.lease(east_region).unwrap().lane;
+        assert_ne!(west_lane, east_lane);
+        let entities = HashSet::from([west, east]);
+        let before = coordinator
+            .snapshots_for_ids(&entities)
+            .expect("snapshots before rejected apply");
+        let versions_before = coordinator
+            .lanes
+            .iter()
+            .map(|(&lane, owner)| (lane, owner.reader().state_version()))
+            .collect::<BTreeMap<_, _>>();
+        let mut resolved = coordinator
+            .prepare_goal_tick_with_pathing_for_ids(21, &entities)
+            .expect("prepare two-lane goal")
+            .resolve(&WalkablePathing, PathingBudget::DEFAULT);
+        resolved
+            .goal_overrides
+            .entry(east_region)
+            .or_default()
+            .extend([(east, GoalState::Idle), (east, GoalState::Idle)]);
+
+        assert!(matches!(
+            coordinator
+                .apply_prepared_goal_tick_and_kinematics_for_ids(resolved, &entities, false,),
+            Ok(None)
+        ));
+        assert_eq!(
+            coordinator
+                .snapshots_for_ids(&entities)
+                .expect("snapshots after rejected apply"),
+            before
+        );
+        assert_eq!(
+            coordinator.lanes[&west_lane].reader().state_version(),
+            versions_before[&west_lane] + 1,
+            "the valid peer must stop after prepare"
+        );
+        assert_eq!(
+            coordinator.lanes[&east_lane].reader().state_version(),
+            versions_before[&east_lane],
+            "the rejected peer must not prepare"
         );
 
         coordinator.shutdown().expect("coordinator shutdown");
@@ -17691,7 +19768,7 @@ mod tests {
             .expect("east cow");
 
         let prepared = handle
-            .prepare_goal_tick_with_pathing_for_ids(17, &HashSet::from([west]))
+            .prepare_goal_tick_with_pathing_for_ids(17, Arc::new(HashSet::from([west])))
             .expect("prepare runtime goal");
         let stats = handle
             .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
@@ -17752,7 +19829,11 @@ mod tests {
         );
 
         let prepared = handle
-            .prepare_goal_tick_with_pathing_for_versioned_snapshots(17, &active, selected)
+            .prepare_goal_tick_with_pathing_for_versioned_snapshots(
+                17,
+                Arc::new(active.clone()),
+                selected,
+            )
             .expect("prepare from stale input");
         let stats = handle
             .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
@@ -17788,6 +19869,7 @@ mod tests {
             authority: coordinator.authority,
             fence,
             snapshots,
+            publication_readers: None,
         };
         assert!(super::versioned_snapshots_are_current(
             &coordinator,
@@ -18415,11 +20497,14 @@ mod tests {
             let tick_started = Instant::now();
             let goal_started = Instant::now();
             let prepared = handle
-                .prepare_goal_tick_with_pathing_for_ids(tick, active)
+                .prepare_goal_tick_with_pathing_for_ids(tick, Arc::new(active.clone()))
                 .expect("prepare battle goal tick");
             let resolved = prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT);
             let (stats, selected, versioned) = handle
-                .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(resolved, active)
+                .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(
+                    resolved,
+                    Arc::new(active.clone()),
+                )
                 .expect("apply battle goal tick and capture kinematics")
                 .expect("fresh battle goal tick");
             missing_follow_targets += stats.missing_follow_targets as u64;

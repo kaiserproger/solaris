@@ -219,9 +219,11 @@ async fn wait_for_chunk_pipeline_idle(
         .unwrap_or_else(|_| panic!("chunk pipeline did not go idle before {duration:?}"))
 }
 
+// Follow the drop vertically in a clear column, not into the blocks above it.
 async fn mine_block_and_wait_for_stack(
     client: &mut Client,
     pos: (i32, i32, i32),
+    pickup_column: (f64, f64),
     start_sequence: i32,
     completion_ticks: i64,
     item_id: u32,
@@ -288,47 +290,41 @@ async fn mine_block_and_wait_for_stack(
         } else if frame.id == AddEntity::ID {
             let mut body = frame.body;
             let pkt = AddEntity::decode(&mut body).expect("decode drop AddEntity");
-            drop_positions.push((pkt.entity_id, pkt.x, pkt.y, pkt.z));
+            drop_positions.push((pkt.entity_id, pkt.y));
         } else if frame.id == MoveEntityPos::ID {
             let mut body = frame.body;
             let pkt = MoveEntityPos::decode(&mut body).expect("decode drop relative move");
-            if let Some((_, x, y, z)) = drop_positions
+            if let Some((_, y)) = drop_positions
                 .iter_mut()
-                .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+                .find(|(entity_id, _)| *entity_id == pkt.entity_id)
             {
-                *x += f64::from(pkt.delta_x) / 4096.0;
                 *y += f64::from(pkt.delta_y) / 4096.0;
-                *z += f64::from(pkt.delta_z) / 4096.0;
                 if target_drop_entity_id == Some(pkt.entity_id) {
-                    move_into_item_touch_box(client, *x, *y, *z).await;
+                    move_into_item_touch_box(client, pickup_column.0, *y, pickup_column.1).await;
                 }
             }
         } else if frame.id == MoveEntityPosRot::ID {
             let mut body = frame.body;
             let pkt = MoveEntityPosRot::decode(&mut body).expect("decode drop relative move+rot");
-            if let Some((_, x, y, z)) = drop_positions
+            if let Some((_, y)) = drop_positions
                 .iter_mut()
-                .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+                .find(|(entity_id, _)| *entity_id == pkt.entity_id)
             {
-                *x += f64::from(pkt.delta_x) / 4096.0;
                 *y += f64::from(pkt.delta_y) / 4096.0;
-                *z += f64::from(pkt.delta_z) / 4096.0;
                 if target_drop_entity_id == Some(pkt.entity_id) {
-                    move_into_item_touch_box(client, *x, *y, *z).await;
+                    move_into_item_touch_box(client, pickup_column.0, *y, pickup_column.1).await;
                 }
             }
         } else if frame.id == EntityPositionSync::ID {
             let mut body = frame.body;
             let pkt = EntityPositionSync::decode(&mut body).expect("decode drop position sync");
-            if let Some((_, x, y, z)) = drop_positions
+            if let Some((_, y)) = drop_positions
                 .iter_mut()
-                .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+                .find(|(entity_id, _)| *entity_id == pkt.entity_id)
             {
-                *x = pkt.values.position.x;
                 *y = pkt.values.position.y;
-                *z = pkt.values.position.z;
                 if target_drop_entity_id == Some(pkt.entity_id) {
-                    move_into_item_touch_box(client, *x, *y, *z).await;
+                    move_into_item_touch_box(client, pickup_column.0, *y, pickup_column.1).await;
                 }
             }
         } else if frame.id == ClientboundSetEntityData::ID {
@@ -343,13 +339,13 @@ async fn mine_block_and_wait_for_stack(
             });
             saw_drop_stack |= matching_drop;
             if matching_drop
-                && let Some((_, x, y, z)) = drop_positions
+                && let Some((_, y)) = drop_positions
                     .iter()
-                    .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+                    .find(|(entity_id, _)| *entity_id == pkt.entity_id)
                     .copied()
             {
                 target_drop_entity_id = Some(pkt.entity_id);
-                move_into_item_touch_box(client, x, y, z).await;
+                move_into_item_touch_box(client, pickup_column.0, y, pickup_column.1).await;
             }
         } else if frame.id == SynchronizePlayerPosition::ID {
             let mut body = frame.body;

@@ -4,7 +4,7 @@ use super::SettlementInhabitantSpawn;
 use super::block_edit_commit::{
     apply_block_edit_batch_to_storage_conditionally,
     apply_block_edit_batch_with_scheduled_ticks_to_storage_conditionally,
-    apply_opaque_block_entity_to_storage_conditionally,
+    resident_block_edit_result_outcome, resident_block_edits, resident_block_preconditions,
 };
 use super::explosions::{
     CommittedTntIgnition, EntityExplosionImpact, ExplosionBlockSample, JavaLegacyRandom,
@@ -35,15 +35,15 @@ use super::session::{
     FurnaceTransaction, FurnaceTransactionRequest, OutboundCommand, PlayerAttackResult,
     PlayerEntityAttack, PlayerInventoryCommitError, ScriptPlayerTeleportCompletion,
     ServerEntityExplosionImpact, SessionId, SessionRegistry, SurvivalBreakTransaction,
-    SurvivalPlacementTransaction, VisibilityDispatch, dispatch_visibility_commands,
+    SurvivalPlacementTransaction, VillagerPopulationSelection, VisibilityDispatch,
+    dispatch_visibility_commands,
 };
 use super::{
-    AppliedBlockEdit, BlockDelta, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition,
+    AppliedBlockEdit, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition,
     BlockMutationSnapshot, CAMPFIRE_BLOCK_ENTITY_TYPE_ID, CampfireCookingState, ChestCommitOutcome,
-    ChestView, ContainerDropPlan, ContainerPlayerPlan, ContainerXpPlan, EntityPhysicsQuery,
-    EntityPhysicsStep, EntityProjectilePhysicsFacts, FurnaceCommitOutcome, GameMode,
-    PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose, SharedContainerCommit,
-    SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
+    ChestView, ContainerDropPlan, ContainerPlayerPlan, ContainerXpPlan, FurnaceCommitOutcome,
+    GameMode, PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose,
+    SharedContainerCommit, SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
     chest_menu_state_change_count, chest_slot_stacks, furnace_output_was_taken,
     furnace_slot_stacks, is_campfire_block, schedule_fluid_ticks_near_applied,
     schedule_leaf_ticks_near_applied,
@@ -55,15 +55,15 @@ use mc_entity::runtime_26_1_2::TargetKind;
 use mc_entity::villager_population_26_1_2::VillagerFoodItemIds;
 use mc_entity::{
     EntityEffectOperation, EntityEffectRequest, EntityEffectResult, EntityId, EntityItemStack,
-    EntitySnapshot, REGION_SIZE_CHUNKS, RegionKey, RegionLease, RegionOwnership,
-    RegionOwnershipError, RegionPhase, Rotation, Vec3,
+    EntitySnapshot, EntityTrackingMotion, REGION_SIZE_CHUNKS, RegionKey, RegionLease,
+    RegionOwnership, RegionOwnershipError, RegionPhase, Rotation, Vec3,
 };
 use mc_physics::BlockMaterialIds;
 use mc_script::ScriptPlayerTeleportFailure;
 use mc_world::{
     BlockMutationToken, BlockPos, BlockRegistry, BlockStateId, ChestBlockEntity,
-    FurnaceBlockEntity, ResidentBlockEdit, ResidentBlockEditBatchResult, ResidentBlockPrecondition,
-    ScheduledBlockTick, WorldError, WorldMutationView, WorldReadView, WorldStorage,
+    FurnaceBlockEntity, ResidentBlockEditBatchResult, ScheduledBlockTick, WorldError,
+    WorldMutationView, WorldReadView, WorldStorage,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -85,6 +85,7 @@ mod player_teleport_tests;
 mod queue;
 mod regional_mutation;
 mod request_wait;
+mod save_barrier;
 
 #[allow(unused_imports)]
 pub(crate) use queue::SIMULATION_COMMAND_QUEUE_CAPACITY;
@@ -202,10 +203,10 @@ pub(crate) enum SimulationRequestError {
 #[derive(Debug)]
 pub(super) struct SimulationAuthority(());
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct EntitySimulationWorldContext<'a> {
     world_read: Option<&'a mc_world::WorldReadView>,
-    pathing_materials: Option<&'a mc_physics::BlockMaterialIds>,
+    pathing_materials: Option<Arc<mc_physics::BlockMaterialIds>>,
     blocks: Option<&'a mc_world::BlockRegistry>,
     items: Option<&'a mc_data::items::ItemRegistry>,
 }
@@ -216,7 +217,26 @@ pub(crate) struct EntitySimulationTickPolicy {
     pub(crate) simulation_distance: i32,
 }
 
+pub(crate) struct RegionallyCommittedEntityMovement {
+    pub(crate) states: Vec<EntityTrackingMotion>,
+    pub(crate) fence: mc_entity::VersionedEntitySnapshots,
+}
+
 impl<'a> EntitySimulationWorldContext<'a> {
+    pub(crate) fn new(
+        world_read: Option<&'a mc_world::WorldReadView>,
+        pathing_materials: Option<&Arc<mc_physics::BlockMaterialIds>>,
+        blocks: &'a mc_world::BlockRegistry,
+        items: &'a mc_data::items::ItemRegistry,
+    ) -> Self {
+        Self {
+            world_read,
+            pathing_materials: pathing_materials.cloned(),
+            blocks: Some(blocks),
+            items: Some(items),
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::play) const fn empty() -> Self {
         Self {
@@ -227,17 +247,33 @@ impl<'a> EntitySimulationWorldContext<'a> {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::play) fn with_pathing_for_test(
+        world_read: &'a mc_world::WorldReadView,
+        pathing_materials: Arc<mc_physics::BlockMaterialIds>,
+    ) -> Self {
+        Self {
+            world_read: Some(world_read),
+            pathing_materials: Some(pathing_materials),
+            blocks: None,
+            items: None,
+        }
+    }
+
     pub(in crate::play) fn pathing(
-        self,
-    ) -> Option<(
-        &'a mc_world::WorldReadView,
-        &'a mc_physics::BlockMaterialIds,
-    )> {
-        self.world_read.zip(self.pathing_materials)
+        &self,
+    ) -> Option<(&'a mc_world::WorldReadView, &mc_physics::BlockMaterialIds)> {
+        self.world_read.zip(self.pathing_materials.as_deref())
+    }
+
+    pub(in crate::play) fn regional_pathing_materials(
+        &self,
+    ) -> Option<Arc<mc_physics::BlockMaterialIds>> {
+        self.pathing_materials.clone()
     }
 
     pub(in crate::play) fn profession_context(
-        self,
+        &self,
     ) -> Option<(
         &'a mc_world::WorldReadView,
         &'a mc_world::BlockRegistry,
@@ -1125,7 +1161,7 @@ pub(super) fn resident_block_edit_outcome(
     preconditions: &[BlockEditPrecondition],
     scheduled_block_ticks: &[ScheduledBlockTick],
 ) -> Option<BlockEditBatchOutcome> {
-    let resident_edits = resident_block_edits(edits, preconditions, block_light);
+    let resident_edits = resident_block_edits(edits);
     let resident_preconditions = resident_block_preconditions(preconditions);
     resident_block_edit_result_outcome(mutation.apply_block_edits_conditionally(
         &resident_edits,
@@ -1134,83 +1170,6 @@ pub(super) fn resident_block_edit_outcome(
         block_light,
         Some(world_tick.saturating_add(1)),
     ))
-}
-
-fn resident_block_edits(
-    edits: &[BlockEdit],
-    preconditions: &[BlockEditPrecondition],
-    block_light: Option<&BlockLightTable>,
-) -> Vec<ResidentBlockEdit> {
-    edits
-        .iter()
-        .map(|edit| ResidentBlockEdit {
-            pos: edit.pos,
-            new_state: edit.new_state,
-            preserve_light: block_light.is_some_and(|table| {
-                preconditions
-                    .iter()
-                    .find(|precondition| precondition.pos == edit.pos)
-                    .is_some_and(|precondition| {
-                        !block_edit_changes_light(
-                            table,
-                            precondition.expected_state,
-                            edit.new_state,
-                        )
-                    })
-            }),
-        })
-        .collect()
-}
-
-fn resident_block_preconditions(
-    preconditions: &[BlockEditPrecondition],
-) -> Vec<ResidentBlockPrecondition> {
-    preconditions
-        .iter()
-        .map(|precondition| ResidentBlockPrecondition {
-            pos: precondition.pos,
-            expected_state: precondition.expected_state,
-            expected_token: precondition.expected_token,
-        })
-        .collect()
-}
-
-pub(super) fn resident_block_edit_result_outcome(
-    result: ResidentBlockEditBatchResult,
-) -> Option<BlockEditBatchOutcome> {
-    let ResidentBlockEditBatchResult::Applied(applied) = result else {
-        return None;
-    };
-    let mut outcome = BlockEditBatchOutcome::default();
-    for edit in applied {
-        let chunk = (edit.pos.x.div_euclid(16), edit.pos.z.div_euclid(16));
-        let changes_light = edit.changes_light;
-        if let Some(previous_light) = edit.previous_light {
-            outcome
-                .previous_light_chunks
-                .entry(chunk)
-                .or_insert(previous_light);
-        }
-        outcome.applied.push(AppliedBlockEdit {
-            pos: edit.pos,
-            previous: edit.previous,
-            new_state: edit.new_state,
-        });
-        outcome
-            .resulting_tokens
-            .insert(edit.pos, edit.resulting_token);
-        outcome.deltas.push(BlockDelta {
-            x: edit.pos.x,
-            y: edit.pos.y,
-            z: edit.pos.z,
-            state_id: edit.new_state,
-        });
-        outcome.edit_chunks.insert(chunk);
-        if changes_light {
-            outcome.light_edit_chunks.insert(chunk);
-        }
-    }
-    Some(outcome)
 }
 
 fn regional_light_updates(
@@ -3424,9 +3383,11 @@ impl SimulationOwner {
         births
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick_villager_population(
         &self,
         sessions: &SessionRegistry,
+        population: &VillagerPopulationSelection,
         current_tick: u64,
         food_items: VillagerFoodItemIds,
         villager_type_id: i32,
@@ -3435,6 +3396,7 @@ impl SimulationOwner {
     ) -> usize {
         let (births, dispatches) = sessions.tick_villager_population(
             &self.authority,
+            population,
             current_tick,
             food_items,
             villager_type_id,
@@ -3606,67 +3568,6 @@ impl SimulationOwner {
     ) -> usize {
         super::land_falling_blocks_owned(&self.authority, config, sessions, world_read, candidates)
             .await
-    }
-
-    pub(crate) fn entity_world_context<'a>(
-        &self,
-        world_read: Option<&'a mc_world::WorldReadView>,
-        pathing_materials: Option<&'a mc_physics::BlockMaterialIds>,
-        blocks: &'a mc_world::BlockRegistry,
-        items: &'a mc_data::items::ItemRegistry,
-    ) -> EntitySimulationWorldContext<'a> {
-        EntitySimulationWorldContext {
-            world_read,
-            pathing_materials,
-            blocks: Some(blocks),
-            items: Some(items),
-        }
-    }
-
-    pub(crate) fn collect_entity_physics_queries(
-        &self,
-        sessions: &SessionRegistry,
-        cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
-        tick: u64,
-        policy: EntitySimulationTickPolicy,
-        world: EntitySimulationWorldContext<'_>,
-    ) -> Vec<EntityPhysicsQuery> {
-        sessions.tick_entities_and_collect_physics_queries_owned(
-            &self.authority,
-            cpu_resources,
-            tick,
-            policy,
-            world,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_entity_physics(
-        &self,
-        sessions: &SessionRegistry,
-        tick: u64,
-        steps: &[EntityPhysicsStep],
-    ) {
-        sessions.apply_entity_physics_and_dispatch_owned(&self.authority, tick, steps);
-    }
-
-    pub(crate) fn apply_entity_physics_if_current(
-        &self,
-        sessions: &SessionRegistry,
-        cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
-        tick: u64,
-        expected: &[EntityPhysicsQuery],
-        steps: &[EntityPhysicsStep],
-        projectile_physics_facts: &EntityProjectilePhysicsFacts,
-    ) -> Vec<EntityPhysicsStep> {
-        sessions.apply_entity_physics_if_current_and_dispatch_owned(
-            &self.authority,
-            cpu_resources,
-            tick,
-            expected,
-            steps,
-            projectile_physics_facts,
-        )
     }
 
     pub(crate) fn restore_persisted_entities(
@@ -3909,7 +3810,6 @@ impl SimulationOwner {
                 self.process_regional_block_edit_run(
                     sessions,
                     access,
-                    block_light,
                     journaled_block_edit.then(|| {
                         world_chunk_journal
                             .as_ref()
@@ -3974,13 +3874,22 @@ impl SimulationOwner {
                             std::time::Instant::now(),
                             world.lock().await,
                         );
-                        self.process_batch(
-                            sessions,
-                            BatchWorldAccess::Storage(&mut storage),
-                            block_light,
-                            Some(&mut pending_relight),
-                            vec![envelope],
-                        )
+                        if matches!(
+                            envelope.command,
+                            SimulationCommand::SaveBarrier {
+                                capture_world: true
+                            }
+                        ) {
+                            self.process_world_save_barrier(sessions, storage, envelope)
+                        } else {
+                            self.process_batch(
+                                sessions,
+                                BatchWorldAccess::Storage(&mut storage),
+                                block_light,
+                                Some(&mut pending_relight),
+                                vec![envelope],
+                            )
+                        }
                     };
                     processed += report.processed;
                     if let Some(table) = block_light {
@@ -4286,7 +4195,7 @@ impl SimulationOwner {
                 }
             }
 
-            let resident_edits = resident_block_edits(&edits, &preconditions, block_light);
+            let resident_edits = resident_block_edits(&edits);
             let resident_preconditions = resident_block_preconditions(&preconditions);
             let (raw_outcome, touched_chunks) = if let Some(decision_id) = decision_id {
                 mutation.apply_block_edits_conditionally_journaled(
@@ -4819,8 +4728,7 @@ impl SimulationOwner {
             self.record_world_access_error(world_error);
             return Err(world_error);
         };
-        match apply_opaque_block_entity_to_storage_conditionally(
-            storage,
+        match storage.commit_opaque_block_entity_conditionally(
             position,
             expected_state,
             expected_token,
@@ -5007,52 +4915,6 @@ impl SimulationOwner {
             Err(world_error)
         };
         SimulationResponse::FurnaceSnapshot(result)
-    }
-
-    fn save_barrier_response(
-        &self,
-        sessions: &SessionRegistry,
-        storage: Option<&mut WorldStorage>,
-        world_error: SimulationRequestError,
-        capture_world: bool,
-    ) -> SimulationResponse {
-        let simulation_tick = sessions.simulation_tick();
-        let world_flush_plan = if capture_world {
-            match storage {
-                Some(storage) => match storage.plan_dirty_flush_at_tick(simulation_tick) {
-                    Ok(plan) => Ok(Some(plan)),
-                    Err(error) => {
-                        self.metrics
-                            .rejected_world_mutation
-                            .fetch_add(1, Ordering::Relaxed);
-                        warn!(%error, "simulation save barrier world plan failed");
-                        Err(SimulationRequestError::WorldMutationFailed)
-                    }
-                },
-                None => {
-                    self.record_world_access_error(world_error);
-                    Err(world_error)
-                }
-            }
-        } else {
-            Ok(None)
-        };
-        SimulationResponse::SaveSnapshot(world_flush_plan.map(|world_flush_plan| {
-            let (entities, entity_journal_phases) = sessions.persisted_entity_save_snapshot();
-            Box::new(SimulationSaveSnapshot {
-                players: sessions.persisted_player_states(),
-                entities,
-                entity_journal_phases,
-                world_chunk_journal_watermark: sessions.world_chunk_journal_watermark(),
-                world_time: sessions.world_time(),
-                daylight_cycle_enabled: sessions.daylight_cycle_enabled(),
-                weather: sessions.weather(),
-                players_sleeping_percentage: sessions.players_sleeping_percentage(),
-                keep_inventory: sessions.keep_inventory(),
-                simulation_tick,
-                world_flush_plan,
-            })
-        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5537,6 +5399,28 @@ impl SimulationOwner {
         SimulationResponse::CampfireUse(result)
     }
 
+    fn active_session_envelope(
+        &self,
+        sessions: &SessionRegistry,
+        envelope: SimulationCommandEnvelope,
+    ) -> Option<SimulationCommandEnvelope> {
+        if envelope.response_is_closed() {
+            self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if envelope
+            .session_fence
+            .is_some_and(|session_id| !sessions.is_active_session(session_id))
+        {
+            self.metrics
+                .rejected_stale_session
+                .fetch_add(1, Ordering::Relaxed);
+            envelope.respond(Err(SimulationRequestError::StaleSession));
+            return None;
+        }
+        Some(envelope)
+    }
+
     fn process_batch(
         &mut self,
         sessions: &SessionRegistry,
@@ -5598,20 +5482,9 @@ impl SimulationOwner {
                 processed += 1;
                 continue;
             }
-            if envelope.response_is_closed() {
-                self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+            let Some(envelope) = self.active_session_envelope(sessions, envelope) else {
                 continue;
-            }
-            if envelope
-                .session_fence
-                .is_some_and(|session_id| !sessions.is_active_session(session_id))
-            {
-                self.metrics
-                    .rejected_stale_session
-                    .fetch_add(1, Ordering::Relaxed);
-                envelope.respond(Err(SimulationRequestError::StaleSession));
-                continue;
-            }
+            };
             if let Some(first_pose) = regular_player_pose_command(&envelope.command) {
                 processed += self
                     .process_regular_player_pose_batch(sessions, envelope, first_pose, &mut batch);
@@ -7513,7 +7386,7 @@ mod tests {
         let mutation_view = storage.mutation_view();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let sessions = SessionRegistry::new();
-        let (journal, pending) = super::super::world_journal::WorldChunkJournal::open(
+        let (journal, pending) = super::super::world_journal::WorldChunkJournal::open_for_test(
             temp.path(),
             Arc::clone(&blocks),
             Arc::clone(&items),
@@ -7608,7 +7481,7 @@ mod tests {
         let mutation_view = storage.mutation_view();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let sessions = SessionRegistry::new();
-        let (journal, pending) = super::super::world_journal::WorldChunkJournal::open(
+        let (journal, pending) = super::super::world_journal::WorldChunkJournal::open_for_test(
             temp.path(),
             Arc::clone(&blocks),
             Arc::clone(&items),
@@ -7687,7 +7560,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn regional_block_edit_append_failure_rejects_success_and_poisons_journal() {
+    async fn journal_failure_after_ram_acceptance_stops_further_world_mutations() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("region")).unwrap();
         let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
@@ -7714,15 +7587,20 @@ mod tests {
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let sessions = Arc::new(SessionRegistry::new());
         let mut journal_failure = sessions.subscribe_world_chunk_journal_failure();
-        let (journal, pending) = super::super::world_journal::WorldChunkJournal::open(
+        let (journal, pending) = super::super::world_journal::WorldChunkJournal::open_for_test(
             temp.path(),
             Arc::clone(&blocks),
             Arc::clone(&items),
         )
         .unwrap();
         assert!(pending.is_empty());
+        let writer = Arc::clone(&journal.writer);
+        world.lock().await.set_journal_barrier({
+            let writer = Arc::clone(&writer);
+            Arc::new(move || writer.flush().map_err(std::io::Error::other))
+        });
         sessions.install_world_chunk_journal(journal);
-        let (session, mut outbound) = register_test_session_with_outbound(&sessions, "WalFailure");
+        let (session, _outbound) = register_test_session_with_outbound(&sessions, "WalFailure");
         let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let response = handle
@@ -7766,21 +7644,27 @@ mod tests {
         tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
             .await
             .unwrap();
+        writer.flush().unwrap();
+        let (paused, resume_writer) = std::sync::mpsc::sync_channel(0);
+        writer
+            .requests
+            .send(super::super::world_journal::WriterRequest::Flush { reply: paused })
+            .unwrap();
         let journal_path = temp.path().join("solaris/world-chunk-journal.bin");
         std::fs::remove_file(&journal_path).unwrap();
         std::fs::create_dir(&journal_path).unwrap();
         release_tx.send(()).unwrap();
 
         assert_eq!(owner_task.await.unwrap().processed, 1);
-        assert!(matches!(
-            response.await.unwrap(),
-            Err(SimulationRequestError::WorldMutationFailed)
-        ));
+        response.await.unwrap().unwrap();
+        resume_writer.recv().unwrap();
         journal_failure.changed().await.unwrap();
         assert!(*journal_failure.borrow_and_update());
-        assert!(outbound.try_recv().is_err());
         assert_eq!(read_view.get_cached_block(position), Some(BlockStateId(0)));
-        assert!(world.lock().await.plan_dirty_flush().unwrap().is_empty());
+        assert!(matches!(
+            world.lock().await.plan_dirty_flush().unwrap().write(),
+            Err(mc_world::WorldError::JournalBarrier(_))
+        ));
 
         let snapshot = read_view.snapshot_chunks(&[chunk_position]);
         let error = sessions
@@ -11165,7 +11049,7 @@ mod tests {
             owner.advance_world_time(&registry, super::super::ITEM_DESPAWN_AGE_TICKS),
             super::super::ITEM_DESPAWN_AGE_TICKS
         );
-        owner.apply_entity_physics(&registry, super::super::ITEM_DESPAWN_AGE_TICKS, &[]);
+        registry.apply_entity_physics_and_dispatch(super::super::ITEM_DESPAWN_AGE_TICKS, &[]);
 
         assert!(registry.nearby_item_entities(position, 2.25).is_empty());
     }
@@ -16550,14 +16434,14 @@ mod tests {
         let bytes = vec![10, 0, 0, 0];
         let (mut direct_storage, pos, direct_token) = test_block_storage();
         assert!(
-            apply_opaque_block_entity_to_storage_conditionally(
-                &mut direct_storage,
-                pos,
-                BlockStateId(1),
-                direct_token,
-                bytes.clone(),
-            )
-            .unwrap()
+            direct_storage
+                .commit_opaque_block_entity_conditionally(
+                    pos,
+                    BlockStateId(1),
+                    direct_token,
+                    bytes.clone(),
+                )
+                .unwrap()
         );
 
         let (queued_storage, queued_pos, queued_token) = test_block_storage();

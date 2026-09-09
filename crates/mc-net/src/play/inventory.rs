@@ -4,11 +4,9 @@ use mc_data::items::ItemRegistry;
 use mc_protocol::codec::Identifier;
 
 use super::InteractionState;
-
 static EMPTY_STACK: ItemStack = ItemStack::EMPTY;
 
 pub(crate) type ArmorStats = mc_data::armor::ArmorStats;
-
 /// 46-slot player inventory (window 0).
 ///
 /// Layout (vanilla wire numbering):
@@ -34,6 +32,19 @@ impl PlayerInventory {
         Self {
             slots: std::array::from_fn(|_| ItemStack::EMPTY),
         }
+    }
+
+    /// Publish a prepared inventory only after every check succeeds.
+    ///
+    /// The immutable input keeps failed planning from partially changing the
+    /// authoritative inventory. The caller retains its player-state lock.
+    pub(crate) fn try_update<E>(
+        &mut self,
+        prepare: impl FnOnce(&Self) -> Result<Self, E>,
+    ) -> Result<(), E> {
+        let updated = prepare(self)?;
+        *self = updated;
+        Ok(())
     }
 
     pub(crate) fn held(&self, hotbar_slot: u8) -> Option<&ItemStack> {

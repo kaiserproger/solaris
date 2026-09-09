@@ -68,6 +68,13 @@ async fn two_hundred_torch_break_drop_pickups_stay_below_lock_and_tick_budgets()
 
     let (mut client, sync) = connect_to_play(addr, "P0ItemLockGate").await;
     drain_until_chunk(&mut client, (0, 0)).await;
+
+    // The survival movement verifier rejects per-packet displacements beyond
+    // its ceiling, and the current seed's safe spawn can sit several blocks
+    // away from the arena origin. Approach the first torch column in bounded
+    // hops like an ordinary client instead of one absolute teleport.
+    let walk_y = f64::from(torch_y);
+    walk_to_first_target(&mut client, (sync.x, sync.y, sync.z), (0.5, walk_y, 0.5)).await;
     let initial_window = wait_for_item_lock_tick_window(&telemetry, &mut ticks, 1).await;
     let baseline_source_tick = initial_window.source_tick;
     let baseline_telemetry = telemetry.snapshot();
@@ -78,7 +85,7 @@ async fn two_hundred_torch_break_drop_pickups_stay_below_lock_and_tick_budgets()
         client
             .write_packet(&ServerboundMovePlayerPosRot {
                 x: f64::from(x) + 0.5,
-                y: sync.y,
+                y: walk_y,
                 z: f64::from(z) + 0.5,
                 yaw: 0.0,
                 pitch: 90.0,
@@ -86,8 +93,8 @@ async fn two_hundred_torch_break_drop_pickups_stay_below_lock_and_tick_budgets()
             })
             .await
             .expect("move to item lock gate torch");
-        let sequence = i32::try_from(index + 1).expect("bounded gate sequence");
         let target = (x, torch_y, z);
+        let sequence = i32::try_from(index + 1).expect("bounded gate sequence");
         client
             .write_packet(&ServerboundPlayerAction {
                 action: PlayerActionKind::StartDestroyBlock,
@@ -181,10 +188,7 @@ async fn two_hundred_torch_break_drop_pickups_stay_below_lock_and_tick_budgets()
 
     eprintln!(
         "P0 item lock gate actions={} ticks={:?} session={:?} player={:?}",
-        ITEM_LOCK_GATE_ACTIONS,
-        final_window.tick,
-        locks.session_registry,
-        locks.player_persistence,
+        ITEM_LOCK_GATE_ACTIONS, final_window.tick, locks.session_registry, locks.player_persistence,
     );
 
     shutdown.request();
@@ -194,6 +198,54 @@ async fn two_hundred_torch_break_drop_pickups_stay_below_lock_and_tick_budgets()
         .expect("item lock gate server shutdown timeout")
         .expect("item lock gate server task joins")
         .expect("item lock gate server exits cleanly");
+}
+
+/// Walk from the login spawn to the arena's first torch column in bounded
+/// per-packet hops that stay below the survival displacement ceiling. The Y
+/// transition to the arena floor happens on the first hop.
+async fn walk_to_first_target(
+    client: &mut Client,
+    spawn: (f64, f64, f64),
+    target: (f64, f64, f64),
+) {
+    const HOP: f64 = 8.0;
+    let mut x = spawn.0;
+    let mut y = spawn.1;
+    let mut z = spawn.2;
+    let mut first = true;
+    loop {
+        let next_x = step_toward(x, target.0, HOP);
+        let next_z = step_toward(z, target.2, HOP);
+        let next_y = if first { target.1 } else { y };
+        first = false;
+        if next_x == x && next_z == z && next_y == y {
+            return;
+        }
+        x = next_x;
+        y = next_y;
+        z = next_z;
+        client
+            .write_packet(&ServerboundMovePlayerPosRot {
+                x,
+                y,
+                z,
+                yaw: 0.0,
+                pitch: 90.0,
+                flags: MovePlayerFlags::new(true, false),
+            })
+            .await
+            .expect("hop toward item lock gate arena");
+    }
+}
+
+fn step_toward(current: f64, target: f64, hop: f64) -> f64 {
+    if (current - target).abs() <= hop {
+        target
+    } else if current < target {
+        current + hop
+    } else {
+        current - hop
+    }
 }
 
 async fn wait_for_item_lock_pickup(
@@ -213,7 +265,9 @@ async fn wait_for_item_lock_pickup(
     let mut saw_remove = false;
     while !(saw_air && saw_ack && saw_stack && saw_take && saw_remove) {
         let frame = client
-            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
             .expect("item lock gate action response");
         if handle_keepalive(client, frame.id, &frame.body).await {

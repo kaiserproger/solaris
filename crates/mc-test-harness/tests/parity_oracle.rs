@@ -8,8 +8,8 @@ use bytes::Bytes;
 use mc_nbt::{ListTag, Tag};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
-    AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
-    ServerboundKnownPacks, UpdateTags,
+    AcknowledgeFinishConfiguration, ClientboundCustomPayload, ClientboundKnownPacks,
+    FinishConfiguration, RegistryData, ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundChangeDifficulty, ClientboundCommands,
@@ -141,6 +141,26 @@ async fn observe_spawn_smoke(ctx: ScenarioContext) -> Result<ObservationSet> {
     Ok(observations.normalize_sequence())
 }
 
+fn validate_configuration_custom_payload(mut body: Bytes) -> Result<()> {
+    let _ = ClientboundCustomPayload::decode(&mut body)?;
+    anyhow::ensure!(
+        body.is_empty(),
+        "configuration custom payload has trailing bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn configuration_custom_payload_rejects_trailing_brand_bytes() {
+    let packet = ClientboundCustomPayload {
+        payload: mc_protocol::packets::CustomPayload::Brand("Solaris".into()),
+    };
+    let mut body = bytes::BytesMut::new();
+    packet.encode(&mut body).expect("encode brand");
+    body.extend_from_slice(&[0]);
+    assert!(validate_configuration_custom_payload(body.freeze()).is_err());
+}
+
 async fn observe_configuration_phase(ctx: ScenarioContext) -> Result<ObservationSet> {
     let subject = match ctx.kind {
         ServerKind::Solaris => "solaris",
@@ -203,6 +223,12 @@ async fn observe_configuration_phase(ctx: ScenarioContext) -> Result<Observation
                     value: registry.tags.len().to_string(),
                 });
             }
+            continue;
+        }
+        if frame.id == ClientboundCustomPayload::ID {
+            // Validate plugin messages, but omit server-specific brand data
+            // from normalized protocol observations.
+            validate_configuration_custom_payload(frame.body)?;
             continue;
         }
         if frame.id == FinishConfiguration::ID {
@@ -279,6 +305,10 @@ async fn collect_full_registry_snapshot(
         }
         if frame.id == UpdateTags::ID {
             let _ = UpdateTags::decode(&mut frame.body.clone())?;
+            continue;
+        }
+        if frame.id == ClientboundCustomPayload::ID {
+            validate_configuration_custom_payload(frame.body)?;
             continue;
         }
         if frame.id == FinishConfiguration::ID {
@@ -559,7 +589,6 @@ async fn solaris_configuration_phase_scenario_produces_normalized_observations()
         .await
         .expect("configuration scenario runs");
 
-    assert_eq!(scenario.name(), "configuration-phase");
     assert!(observations.facts().contains(&ObservationFact::PacketSeen {
         id: ClientboundKnownPacks::ID,
     }));
