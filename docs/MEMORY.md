@@ -26,8 +26,10 @@ one-use helpers; run varied load scenarios and fix measured hot paths. Loader
 feature development remains frozen. The owner now authorizes committing and
 pushing the entire accumulated core change, with local artifacts excluded, and
 creating/publishing the public `solaris-loader` and `solaris-default-plugins`
-repositories first so hosted CI can resolve them. No tags, release publication,
-or frozen-archive replacement is authorized.
+repositories first so hosted CI can resolve them. The owner subsequently
+authorized tagging and publishing `v0.0.3-alpha.1` for curl installation and
+manual play, superseding the CI-wait interruption. The existing frozen local
+archive remains untouched; tag CI builds new public assets from current source.
 
 Publication completed on `main`: core `f6e9426b`, Loader `6a383c2d`, default
 plugins `d71ce84d`. The owner then prioritized the hosted CI failures in

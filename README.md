@@ -4,8 +4,8 @@ Solaris is an authoritative Minecraft Java Edition server written in Rust. It
 targets the vanilla **Minecraft Java Edition 26.1.2** protocol and also supports
 optional client content through Solaris Loader.
 
-> **Development status:** `main` is the in-progress `v0.0.3-alpha.1` line. The
-> latest published release is **`v0.0.2-alpha.1`**. Solaris is suitable for
+> **Development status:** this is the **`v0.0.3-alpha.1`** prerelease line.
+> Maturity remains **draft**, not release-ready. Solaris is suitable for
 > testing, plugin development, and bounded multiplayer field tests; it is not a
 > production-safe replacement for vanilla, Paper, Fabric, Forge, or NeoForge.
 > Alpha worlds, plugin APIs, and Loader contracts may change without migration.
@@ -21,11 +21,11 @@ Published archives are available for Linux x86_64 and AArch64. Pin the release
 because GitHub's `latest` alias does not resolve prereleases:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
-  SOLARIS_VERSION="v0.0.2-alpha.1" bash
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.3-alpha.1/install.sh | \
+  SOLARIS_VERSION="v0.0.3-alpha.1" bash
 
 curl -fsSLo server.toml \
-  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.2-alpha.1/example.toml
+  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.3-alpha.1/example.toml
 solaris --check --config server.toml
 solaris --config server.toml
 ```
@@ -179,7 +179,7 @@ launching a graphical or twenty-minute profile.
 ## More documentation
 
 - [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — design and compatibility scope
-- [`docs/releases/v0.0.2-alpha.1.md`](docs/releases/v0.0.2-alpha.1.md) — latest released alpha
+- [Current alpha release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.3-alpha.1) — binaries, checksums and release notes
 - [`docs/PUBLIC_ALPHA3_PLAN.md`](docs/PUBLIC_ALPHA3_PLAN.md) — current development work
 - [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) — replacement-readiness limits
 - [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — recorded evidence
