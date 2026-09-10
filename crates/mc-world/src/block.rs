@@ -83,6 +83,62 @@ pub struct BlockRegistry {
 }
 
 impl BlockRegistry {
+    /// On-demand allocation-capacity estimates. Shared block definitions are
+    /// charged once, not once per state; hash control bytes are excluded.
+    pub fn memory_profile(&self) -> std::collections::BTreeMap<&'static str, usize> {
+        let strings = |values: &Vec<(String, String)>| {
+            values.capacity() * std::mem::size_of::<(String, String)>()
+                + values
+                    .iter()
+                    .map(|(key, value)| key.capacity() + value.capacity())
+                    .sum::<usize>()
+        };
+        let definitions = self.by_name.capacity() * std::mem::size_of::<(Identifier, Arc<Block>)>()
+            + self
+                .by_name
+                .iter()
+                .map(|(key, block)| {
+                    key.as_str().len()
+                        + std::mem::size_of::<Block>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + block.id.as_str().len()
+                        + block.states.capacity() * std::mem::size_of::<BlockStateId>()
+                        + block.properties.capacity() * std::mem::size_of::<(String, Vec<String>)>()
+                        + block
+                            .properties
+                            .iter()
+                            .map(|(key, values)| {
+                                key.capacity()
+                                    + values.capacity() * std::mem::size_of::<String>()
+                                    + values.iter().map(String::capacity).sum::<usize>()
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        let states = self.by_id.capacity() * std::mem::size_of::<Arc<BlockState>>()
+            + self
+                .by_id
+                .iter()
+                .map(|state| {
+                    std::mem::size_of::<BlockState>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + strings(&state.properties)
+                })
+                .sum::<usize>();
+        let lookup = self.by_key.capacity()
+            * std::mem::size_of::<((Identifier, Vec<(String, String)>), BlockStateId)>()
+            + self
+                .by_key
+                .keys()
+                .map(|(id, props)| id.as_str().len() + strings(props))
+                .sum::<usize>();
+        std::collections::BTreeMap::from([
+            ("block_definitions", definitions),
+            ("block_states", states),
+            ("state_lookup_keys", lookup),
+        ])
+    }
+
     /// Build the registry from a parsed `blocks.json` report. Verifies
     /// that state ids are dense from 0..n with no duplicates and that
     /// every block declares exactly one default state.

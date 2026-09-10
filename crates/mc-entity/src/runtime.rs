@@ -1078,6 +1078,8 @@ impl EntityRuntime {
                     entity_physics_kind(entity_type, gameplay, ordinary_living),
                     EntityPhysicsKind::Living
                         | EntityPhysicsKind::PowderSnowWalkableLiving
+                        | EntityPhysicsKind::FishLiving
+                        | EntityPhysicsKind::SquidLiving
                         | EntityPhysicsKind::AquaticLiving
                 );
             visitor(
@@ -1381,7 +1383,10 @@ impl EntityRuntime {
                     .and_then(|state| state.last_damage_tick)
                     .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
             });
-            if inputs.terrain_pathing_entities.contains(&id) {
+            if inputs.terrain_pathing_entities.contains(&id)
+                || crate::aquatic_motion::Swimmer::for_type(&entity_type.name)
+                    != crate::aquatic_motion::Swimmer::Other
+            {
                 pathing_aabbs.push((
                     id,
                     crate::natural_spawn_26_1_2::entity_geometry(
@@ -1440,6 +1445,7 @@ impl EntityRuntime {
                     path,
                     tick,
                     panic_since,
+                    &entity_type.name,
                 )
                 .is_some_and(|request| {
                     pathing_requests.push(request);
@@ -1497,6 +1503,7 @@ impl EntityRuntime {
             &AiPathState,
             Option<&AnimalState>,
             Option<&GameplayDecisionState>,
+            &EntityTypeState,
         ), (
             Without<ItemStackState>,
             Without<ExperienceState>,
@@ -1506,19 +1513,28 @@ impl EntityRuntime {
         )>();
         let mut requests = query
             .iter(&self.world)
-            .filter(|(_, _, _, lifecycle, _, _, _, _)| lifecycle.0 == EntityLifecycle::Alive)
-            .filter(|(identity, _, _, _, _, _, _, _)| {
+            .filter(|(_, _, _, lifecycle, _, _, _, _, _)| lifecycle.0 == EntityLifecycle::Alive)
+            .filter(|(identity, _, _, _, _, _, _, _, _)| {
                 active_filter.is_none_or(|active_ids| active_ids.contains(&identity.id))
             })
             .filter_map(
-                |(identity, transform, motion, _, goal, path, animal, gameplay)| {
+                |(identity, transform, motion, _, goal, path, animal, gameplay, entity_type)| {
                     let goal = goal_overrides.get(&identity.id).unwrap_or(&goal.0);
                     let panic_since = animal.and_then(|_| {
                         gameplay
                             .and_then(|state| state.last_damage_tick)
                             .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
                     });
-                    goal_pathing_request(identity, transform, motion, goal, path, tick, panic_since)
+                    goal_pathing_request(
+                        identity,
+                        transform,
+                        motion,
+                        goal,
+                        path,
+                        tick,
+                        panic_since,
+                        &entity_type.name,
+                    )
                 },
             )
             .collect::<Vec<_>>();
@@ -1562,6 +1578,7 @@ impl EntityRuntime {
             path,
             tick,
             panic_since,
+            &entity.get::<EntityTypeState>()?.name,
         )
     }
 
@@ -1819,6 +1836,10 @@ fn active_set_covers_world(world: &World, active_ids: &HashSet<EntityId>) -> boo
     active_ids.len() == index.0.len() && index.0.keys().all(|id| active_ids.contains(id))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Builds a request from existing ECS component borrows and tick context"
+)]
 fn goal_pathing_request(
     identity: &StableIdentity,
     transform: &TransformState,
@@ -1827,8 +1848,30 @@ fn goal_pathing_request(
     path: &AiPathState,
     tick: u64,
     panic_since: Option<u64>,
+    type_name: &str,
 ) -> Option<GoalPathingRequest> {
     let (target, target_epoch, speed) = match goal {
+        GoalState::AquaticWander {
+            speed,
+            vertical_speed,
+            period_ticks,
+        } => {
+            if crate::aquatic_motion::Swimmer::for_type(type_name)
+                == crate::aquatic_motion::Swimmer::Other
+            {
+                return None;
+            }
+            let (target, epoch) = crate::aquatic_motion::wander_target(
+                identity.id,
+                transform.position,
+                path.0,
+                tick,
+                *period_ticks,
+                *vertical_speed,
+                crate::aquatic_motion::Swimmer::for_type(type_name),
+            );
+            (target, Some(epoch), *speed)
+        }
         GoalState::FollowPosition { target, speed } if *speed != 0.0 => (*target, None, *speed),
         GoalState::Wander {
             speed,
@@ -1882,6 +1925,8 @@ fn goal_pathing_request(
         target,
         target_epoch,
         speed,
+        aquatic: matches!(goal, GoalState::AquaticWander { .. })
+            .then(|| crate::aquatic_motion::Swimmer::for_type(type_name)),
     })
 }
 
@@ -2624,6 +2669,14 @@ fn entity_physics_kind(
             revision: Some(state.projectile.revision),
             gravity_bits: 0.05_f64.to_bits(),
         }
+    } else if crate::aquatic_motion::Swimmer::for_type(type_name)
+        == crate::aquatic_motion::Swimmer::Fish
+    {
+        EntityPhysicsKind::FishLiving
+    } else if crate::aquatic_motion::Swimmer::for_type(type_name)
+        == crate::aquatic_motion::Swimmer::Squid
+    {
+        EntityPhysicsKind::SquidLiving
     } else if entity_type.aquatic_physics {
         EntityPhysicsKind::AquaticLiving
     } else if type_name == "minecraft:falling_block" {
@@ -3638,8 +3691,18 @@ fn apply_goal_tick(
     )>();
     if let Some(active_entities) = active_entities {
         for entity in active_entities {
-            let Ok((identity, _, mut transform, mut motion, lifecycle, _, goal, mut path, _, _)) =
-                query.get_mut(world, entity)
+            let Ok((
+                identity,
+                entity_type,
+                mut transform,
+                mut motion,
+                lifecycle,
+                _,
+                goal,
+                mut path,
+                _,
+                _,
+            )) = query.get_mut(world, entity)
             else {
                 continue;
             };
@@ -3647,6 +3710,7 @@ fn apply_goal_tick(
                 &request,
                 &positions,
                 identity,
+                entity_type,
                 &mut transform,
                 &mut motion,
                 lifecycle,
@@ -3693,6 +3757,7 @@ fn apply_goal_tick(
                     &request,
                     &positions,
                     identity,
+                    entity_type,
                     &mut transform,
                     &mut motion,
                     lifecycle,
@@ -3860,6 +3925,7 @@ fn apply_goal_to_entity(
     request: &GoalTickRequest,
     positions: &BTreeMap<EntityId, Vec3>,
     identity: &StableIdentity,
+    entity_type: &EntityTypeState,
     transform: &mut TransformState,
     motion: &mut MotionState,
     lifecycle: &LifecycleState,
@@ -3873,6 +3939,10 @@ fn apply_goal_to_entity(
     }
     let goal_uses_pathing = match &goal.0 {
         GoalState::Wander { .. } => true,
+        GoalState::AquaticWander { .. } => {
+            crate::aquatic_motion::Swimmer::for_type(&entity_type.name)
+                != crate::aquatic_motion::Swimmer::Other
+        }
         GoalState::FollowPosition { speed, .. } => *speed != 0.0,
         _ => false,
     };
@@ -3935,20 +4005,18 @@ fn apply_goal_to_entity(
             motion.velocity.z = direction.z * speed;
             face_horizontal_motion(&mut transform.rotation, motion.velocity);
         }
-        GoalState::AquaticWander {
-            speed,
-            vertical_speed,
-            period_ticks,
-        } => {
-            let period = u64::from((*period_ticks).max(1));
-            let phase = request.tick / period;
-            let angle = crate::deterministic_angle(identity.id, phase);
-            let vertical_wave = crate::deterministic_wave(identity.id, phase);
-            motion.velocity.x = angle.cos() * speed;
-            motion.velocity.z = angle.sin() * speed;
-            motion.velocity.y = vertical_wave * vertical_speed;
-            motion.on_ground = false;
-            transform.rotation = crate::aquatic_rotation_from_velocity(motion.velocity);
+        GoalState::AquaticWander { .. } => {
+            motion.velocity = crate::aquatic_motion::apply_goal(
+                identity.id,
+                &entity_type.name,
+                request.tick,
+                transform.position,
+                &mut transform.rotation,
+                motion.velocity,
+                &mut path.0,
+                &goal.0,
+                pathing_result,
+            );
         }
         GoalState::FollowTarget { target, speed } => {
             let direction = if let Some(target_position) = positions.get(target) {

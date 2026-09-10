@@ -175,6 +175,9 @@ async fn successful_d2_checkpoint_does_not_resurrect_campfire_output() {
     assert_eq!(world_pending.len(), 2, "D1 and D2 must precede checkpoint");
     drop(world_pending);
     drop(journal);
+    // Append acceptance precedes disk completion. Observe the existing writer
+    // barrier before inspecting its on-disk recovery image.
+    runtime.writer.flush().unwrap();
     let (_, entity_pending) =
         persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
     assert_eq!(entity_pending.len(), 1, "E must precede checkpoint");

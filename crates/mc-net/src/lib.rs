@@ -32,6 +32,7 @@ mod login;
 mod memory_pressure;
 mod operator_metrics;
 mod play;
+pub mod resource_profile;
 mod runtime_entity_budget;
 mod runtime_tick_metrics;
 mod script;

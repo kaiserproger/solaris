@@ -42,7 +42,13 @@ pub(crate) async fn write_dirty_flush_blocking(
 pub(crate) async fn write_dirty_flush_blocking_typed(
     flush_plan: mc_world::storage::DirtyFlushPlan,
 ) -> Result<mc_world::storage::DirtyFlushCommit, DirtyFlushWriteError> {
-    match tokio::task::spawn_blocking(move || flush_plan.write()).await {
+    match tokio::task::spawn_blocking(move || {
+        crate::resource_profile::measure(crate::resource_profile::CpuStage::Saving, || {
+            flush_plan.write()
+        })
+    })
+    .await
+    {
         Ok(Ok(commit)) => Ok(commit),
         Ok(Err(err)) => Err(DirtyFlushWriteError::World(err)),
         Err(err) => Err(DirtyFlushWriteError::Join(err)),
@@ -52,7 +58,13 @@ pub(crate) async fn write_dirty_flush_blocking_typed(
 pub(crate) async fn sync_dirty_flush_install_blocking_typed(
     install: mc_world::storage::DirtyFlushInstall,
 ) -> Result<mc_world::storage::DirtyFlushSynced, DirtyFlushWriteError> {
-    match tokio::task::spawn_blocking(move || install.sync()).await {
+    match tokio::task::spawn_blocking(move || {
+        crate::resource_profile::measure(crate::resource_profile::CpuStage::Saving, || {
+            install.sync()
+        })
+    })
+    .await
+    {
         Ok(Ok(synced)) => Ok(synced),
         Ok(Err(err)) => Err(DirtyFlushWriteError::World(err)),
         Err(err) => Err(DirtyFlushWriteError::Join(err)),

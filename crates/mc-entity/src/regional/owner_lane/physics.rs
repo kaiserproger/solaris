@@ -74,6 +74,8 @@ pub(super) fn tick_owned_region_physics(
                     result.physics.kind,
                     crate::EntityPhysicsKind::Living
                         | crate::EntityPhysicsKind::PowderSnowWalkableLiving
+                        | crate::EntityPhysicsKind::FishLiving
+                        | crate::EntityPhysicsKind::SquidLiving
                         | crate::EntityPhysicsKind::AquaticLiving
                 )
             {

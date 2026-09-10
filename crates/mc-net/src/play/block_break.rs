@@ -579,6 +579,14 @@ pub(super) fn plan_break_block_edits(
             });
         }
     }
+    if let Some(edit) = super::block_placement::chest::reset_partner(
+        blocks,
+        |position| storage.get_cached_block(position),
+        pos,
+        state_id,
+    ) {
+        edits.push(edit);
+    }
     append_vertical_support_cascade(blocks, storage, &mut edits, pos, air);
     edits
 }

@@ -334,7 +334,7 @@ pub(super) fn runtime_control_status_message(
     let snapshot = runtime_control.snapshot();
     let limits = snapshot.limits;
     format!(
-        "Runtime control: draining={} action={} pressure={} limits=view_distance:{},send:{},load:{},generate:{} pressure_ticks={} healthy_ticks={} reason={}",
+        "Runtime control: draining={} action={} pressure={} limits=view_distance:{},send:{},load:{},generate:{} pressure_seconds={} healthy_seconds={} reason={}",
         snapshot.draining,
         autoscale_action_label(snapshot.last_decision.action),
         autoscale_pressure_label(snapshot.last_decision.pressure),
@@ -342,8 +342,8 @@ pub(super) fn runtime_control_status_message(
         limits.chunk_send_rate,
         limits.chunk_load_rate,
         limits.chunk_generate_rate,
-        snapshot.pressure_ticks,
-        snapshot.healthy_ticks,
+        snapshot.pressure_seconds,
+        snapshot.healthy_seconds,
         snapshot.last_decision.reason
     )
 }

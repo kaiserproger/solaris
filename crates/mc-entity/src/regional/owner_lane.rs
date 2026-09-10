@@ -2361,6 +2361,8 @@ fn apply_local_physics_if_current(
                 expected.kind,
                 crate::EntityPhysicsKind::Living
                     | crate::EntityPhysicsKind::PowderSnowWalkableLiving
+                    | crate::EntityPhysicsKind::FishLiving
+                    | crate::EntityPhysicsKind::SquidLiving
                     | crate::EntityPhysicsKind::AquaticLiving
             );
             if version_current && ordinary_living && !step.horizontal_collision {

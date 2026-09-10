@@ -8,21 +8,21 @@ async fn background_scale_up_wakes_queued_preparation() {
     let resources = ChunkPipelineResources::with_limits(1, 5);
     let first = resources.acquire_prepare_request().await.unwrap();
     let second = resources.acquire_prepare_request().await.unwrap();
+    let third = resources.acquire_prepare_request().await.unwrap();
     resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
     assert!(resources.try_acquire_prepare_request().is_none());
 
-    let mut third = std::pin::pin!(resources.acquire_prepare_request());
+    let mut fourth = std::pin::pin!(resources.acquire_prepare_request());
     std::future::poll_fn(|cx| {
-        assert!(third.as_mut().poll(cx).is_pending());
+        assert!(fourth.as_mut().poll(cx).is_pending());
         Poll::Ready(())
     })
     .await;
     resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleUp, false);
-    let third = tokio::time::timeout(Duration::from_secs(1), third)
+    let fourth = tokio::time::timeout(Duration::from_secs(1), fourth)
         .await
         .expect("scale-up wakes queued preparation")
         .unwrap();
-    let fourth = resources.try_acquire_prepare_request().unwrap();
     assert!(resources.try_acquire_prepare_request().is_none());
     drop((first, second, third, fourth));
 }

@@ -1185,3 +1185,33 @@ async fn stale_furnace_click_after_peer_mutation_resyncs_without_mutating_storag
     assert_eq!(packets[0].items[0], ItemStack::new(stone_id, 2));
     assert!(packets[0].carried_item.is_empty());
 }
+#[test]
+fn embedded_recipes_cook_fish_in_furnace_and_smoker() {
+    let names = ["cod", "cooked_cod", "salmon", "cooked_salmon", "coal"];
+    let reports = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| ItemReport {
+            id: Identifier::parse(&format!("minecraft:{name}")).unwrap(),
+            protocol_id: index as u32 + 1,
+        })
+        .collect::<Vec<_>>();
+    let items = ItemRegistry::from_report(&reports);
+    let tags = mc_data::tags::solaris_required_item_tags(&items);
+    let recipes = mc_data::recipes::solaris_required_recipes();
+    for (raw, cooked) in [(1, 2), (3, 4)] {
+        for (kind, ticks) in [(FurnaceKind::Furnace, 200), (FurnaceKind::Smoker, 100)] {
+            let mut furnace = FurnaceBlockEntity::default();
+            furnace.slots[0] = stack_to_furnace_slot(&ItemStack::new(raw, 1));
+            furnace.slots[1] = stack_to_furnace_slot(&ItemStack::new(5, 1));
+            for _ in 0..ticks {
+                tick_furnace(&recipes, &items, &tags, &mut furnace, kind);
+            }
+            assert_eq!(
+                furnace_slot_to_stack(&furnace.slots[2]),
+                ItemStack::new(cooked, 1)
+            );
+            assert!(furnace_slot_to_stack(&furnace.slots[0]).is_empty());
+        }
+    }
+}

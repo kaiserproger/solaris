@@ -29,7 +29,7 @@ def write_server_only_config(
     plugin_root = run_dir / "plugins"
     plugin_root.mkdir()
     shutil.copytree(
-        REPO_ROOT / "examples" / "plugins" / "basic-economy",
+        REPO_ROOT.parent / "solaris-default-plugins" / "basic-economy",
         plugin_root / "basic-economy",
     )
     economy_config = plugin_root / "basic-economy" / "config.toml"
@@ -71,7 +71,6 @@ def write_server_only_config(
                 "",
                 "[data]",
                 f'world_dir = "{world_dir.relative_to(REPO_ROOT).as_posix()}"',
-                'vanilla_data_dir = "data/vanilla"',
                 "seed = 0",
                 'worldgen_mode = "tellus_like"',
                 "",

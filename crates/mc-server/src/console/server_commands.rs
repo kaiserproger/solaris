@@ -20,15 +20,27 @@ impl CommandHandler for ServerCommands {
         let message = match command {
             ConsoleCommand::Help => ConsoleCommand::help(),
             ConsoleCommand::Profile => {
-                let snapshot = self.stats.stats();
+                let provider = Arc::clone(&self.stats);
+                let snapshot = tokio::task::spawn_blocking(move || provider.profile()).await?;
                 tokio::fs::create_dir_all("logs").await?;
                 let report = serde_json::to_vec_pretty(&snapshot)?;
-                tokio::fs::write("logs/profile.json", report).await?;
+                tokio::fs::write("logs/profile.json.tmp", report).await?;
+                tokio::fs::rename("logs/profile.json.tmp", "logs/profile.json").await?;
+                let mib = |value: &serde_json::Value| {
+                    value
+                        .as_u64()
+                        .map(|bytes| (bytes / (1024 * 1024)).to_string())
+                        .unwrap_or_else(|| "unavailable".to_owned())
+                };
                 format!(
-                    "Profile saved: logs/profile.json ({} tick samples, p95 {} us, memory {} MiB)",
-                    snapshot.tick.total.samples,
-                    snapshot.tick.total.p95_us,
-                    snapshot.memory.used_mb,
+                    "Profile saved: logs/profile.json (RSS {} MiB, Rust live {} MiB, CPU {} cores, capture {} ms)",
+                    mib(&snapshot.process["rss_bytes"]),
+                    mib(&snapshot.allocations["rust_requested_live_bytes"]),
+                    snapshot.cpu["average_cores_used"]
+                        .as_f64()
+                        .map(|v| format!("{v:.2}"))
+                        .unwrap_or_else(|| "unavailable".to_owned()),
+                    snapshot.capture_wall_ms,
                 )
             }
             ConsoleCommand::Status => {

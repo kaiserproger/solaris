@@ -958,6 +958,18 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
     }
 
     if !saw_pickup_event {
+        // Cross above the neighbouring column before descending into its hole.
+        // A diagonal move down from the placed block sweeps through its side and
+        // can be rejected after the drop has already settled below pickup reach.
+        client
+            .write_packet(&ServerboundMovePlayerPos {
+                x: f64::from(survival_target.0) + 0.5,
+                y: sync.y,
+                z: f64::from(survival_target.2) + 0.5,
+                flags: MovePlayerFlags::new(false, false),
+            })
+            .await
+            .expect("step above the committed survival drop");
         client
             .write_packet(&ServerboundMovePlayerPos {
                 x: f64::from(survival_target.0) + 0.5,

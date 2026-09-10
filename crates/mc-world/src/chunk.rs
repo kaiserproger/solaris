@@ -13,6 +13,7 @@
 //! `status`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mc_data::Identifier;
@@ -22,6 +23,12 @@ use mc_nbt::Tag;
 use crate::block::BlockStateId;
 use crate::light::ChunkLight;
 use crate::section::{ChunkSection, PackedBitArray, SECTION_DIM};
+
+mod memory_profile;
+pub use memory_profile::ChunkMemoryProfile;
+
+#[cfg(test)]
+mod light_compact_tests;
 
 /// Lowest world Y coordinate (inclusive).
 pub const MIN_Y: i32 = -64;
@@ -516,19 +523,160 @@ impl Heightmap {
     }
 }
 
-/// Per-section 4-bit-per-cell light arrays. Both layers are `None`
-/// when Anvil didn't write them — vanilla omits the array when the
-/// section is uniformly default (sky-15 above terrain, block-0
-/// everywhere), and our test world is mostly in pre-`light`
-/// generation status so most sections come back as `None`.
-///
-/// When present, the buffer holds `LIGHT_LAYER_BYTES` (2048) bytes
-/// in the same `(y, z, x)` linear order the section block-state
-/// container uses, two cells packed per byte (low nibble first).
+/// A known section light channel in vanilla low-nibble-first cell order.
+/// Uniform packed bytes allocate nothing; mixed layers share immutable storage
+/// until a cell is changed. Absence belongs to [`SectionLight`], not this type.
+#[derive(Debug, Clone)]
+pub struct LightSection {
+    storage: LightSectionStorage,
+    nonzero_nibbles: u16,
+}
+
+#[derive(Debug, Clone)]
+enum LightSectionStorage {
+    Uniform(u8),
+    Shared(Arc<[u8; LIGHT_LAYER_BYTES]>),
+}
+
+impl LightSection {
+    #[must_use]
+    pub fn uniform(packed_byte: u8) -> Self {
+        Self {
+            storage: LightSectionStorage::Uniform(packed_byte),
+            nonzero_nibbles: (u16::from(packed_byte & 0x0F != 0)
+                + u16::from(packed_byte >> 4 != 0))
+                * LIGHT_LAYER_BYTES as u16,
+        }
+    }
+
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; LIGHT_LAYER_BYTES]) -> Self {
+        if bytes.iter().all(|&byte| byte == bytes[0]) {
+            return Self::uniform(bytes[0]);
+        }
+        let nonzero_nibbles = bytes
+            .iter()
+            .map(|byte| u16::from(byte & 0x0F != 0) + u16::from(byte >> 4 != 0))
+            .sum();
+        Self {
+            storage: LightSectionStorage::Shared(Arc::new(bytes)),
+            nonzero_nibbles,
+        }
+    }
+
+    /// Reuse the nibble count already accumulated by the light packing kernel.
+    pub(crate) fn from_bytes_with_nonzero_count(
+        bytes: [u8; LIGHT_LAYER_BYTES],
+        nonzero_nibbles: u16,
+    ) -> Self {
+        if nonzero_nibbles == 0 {
+            return Self::uniform(0);
+        }
+        if bytes.iter().all(|&byte| byte == bytes[0]) {
+            return Self::uniform(bytes[0]);
+        }
+        Self {
+            storage: LightSectionStorage::Shared(Arc::new(bytes)),
+            nonzero_nibbles,
+        }
+    }
+
+    #[must_use]
+    pub fn byte(&self, index: usize) -> u8 {
+        assert!(index < LIGHT_LAYER_BYTES);
+        match &self.storage {
+            LightSectionStorage::Uniform(byte) => *byte,
+            LightSectionStorage::Shared(bytes) => bytes[index],
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, cell: usize) -> u8 {
+        (self.byte(cell / 2) >> ((cell & 1) * 4)) & 0x0F
+    }
+
+    pub fn set(&mut self, cell: usize, value: u8) {
+        assert!(value <= 15);
+        let old = self.get(cell);
+        if old == value {
+            return;
+        }
+        if let LightSectionStorage::Uniform(byte) = &self.storage {
+            self.storage = LightSectionStorage::Shared(Arc::new([*byte; LIGHT_LAYER_BYTES]));
+        }
+        let LightSectionStorage::Shared(bytes) = &mut self.storage else {
+            unreachable!()
+        };
+        let byte = &mut Arc::make_mut(bytes)[cell / 2];
+        let shift = (cell & 1) * 4;
+        *byte = (*byte & !(0x0F << shift)) | (value << shift);
+        self.nonzero_nibbles = self.nonzero_nibbles - u16::from(old != 0) + u16::from(value != 0);
+        if self.is_zero() {
+            self.storage = LightSectionStorage::Uniform(0);
+        }
+    }
+
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.nonzero_nibbles == 0
+    }
+
+    pub fn bytes(&self) -> impl ExactSizeIterator<Item = u8> + '_ {
+        (0..LIGHT_LAYER_BYTES).map(|index| self.byte(index))
+    }
+
+    /// Expand only at a vanilla serialization boundary.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u8> {
+        match &self.storage {
+            LightSectionStorage::Uniform(byte) => vec![*byte; LIGHT_LAYER_BYTES],
+            LightSectionStorage::Shared(bytes) => bytes.to_vec(),
+        }
+    }
+
+    /// Heap bytes referenced by this layer, including the Arc counters.
+    /// Shared owners must deduplicate [`Self::shared_allocation`] for a physical total.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> usize {
+        self.shared_allocation().map_or(0, |(_, bytes)| bytes)
+    }
+
+    /// Stable allocation identity and size while any owning layer remains alive.
+    #[must_use]
+    pub fn shared_allocation(&self) -> Option<(*const u8, usize)> {
+        match &self.storage {
+            LightSectionStorage::Uniform(_) => None,
+            LightSectionStorage::Shared(bytes) => Some((
+                bytes.as_ptr(),
+                LIGHT_LAYER_BYTES + 2 * std::mem::size_of::<usize>(),
+            )),
+        }
+    }
+}
+
+impl PartialEq for LightSection {
+    fn eq(&self, other: &Self) -> bool {
+        if self.nonzero_nibbles != other.nonzero_nibbles {
+            return false;
+        }
+        match (&self.storage, &other.storage) {
+            (LightSectionStorage::Uniform(a), LightSectionStorage::Uniform(b)) => a == b,
+            (LightSectionStorage::Shared(a), LightSectionStorage::Shared(b)) => {
+                Arc::ptr_eq(a, b) || a == b
+            }
+            _ => self.bytes().eq(other.bytes()),
+        }
+    }
+}
+
+impl Eq for LightSection {}
+
+/// Per-section light channels. `None` is missing/unknown, distinct from a
+/// present allocation-free zero layer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SectionLight {
-    pub block: Option<Vec<u8>>,
-    pub sky: Option<Vec<u8>>,
+    pub block: Option<LightSection>,
+    pub sky: Option<LightSection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,8 +945,11 @@ impl Chunk {
                     self.section_lights
                         .iter()
                         .map(|light| {
-                            light.block.as_ref().map_or(0, Vec::capacity)
-                                + light.sky.as_ref().map_or(0, Vec::capacity)
+                            light
+                                .block
+                                .as_ref()
+                                .map_or(0, LightSection::allocated_bytes)
+                                + light.sky.as_ref().map_or(0, LightSection::allocated_bytes)
                         })
                         .sum::<usize>(),
                 ),
@@ -1971,9 +2122,9 @@ mod tests {
     #[test]
     fn set_block_and_update_clears_stale_baked_light_layers() {
         let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
-        c.section_lights[0].sky = Some(vec![0xFF; LIGHT_LAYER_BYTES]);
-        c.section_lights[0].block = Some(vec![0x11; LIGHT_LAYER_BYTES]);
-        c.section_lights[3].sky = Some(vec![0x22; LIGHT_LAYER_BYTES]);
+        c.section_lights[0].sky = Some(crate::chunk::LightSection::uniform(0xFF));
+        c.section_lights[0].block = Some(crate::chunk::LightSection::uniform(0x11));
+        c.section_lights[3].sky = Some(crate::chunk::LightSection::uniform(0x22));
 
         let prev = c
             .set_block_and_update(0, 0, 0, stone(), air(), false)
@@ -1991,9 +2142,9 @@ mod tests {
     #[test]
     fn proven_light_inert_block_update_preserves_baked_light_layers() {
         let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
-        c.section_lights[0].sky = Some(vec![0xFF; LIGHT_LAYER_BYTES]);
-        c.section_lights[0].block = Some(vec![0x11; LIGHT_LAYER_BYTES]);
-        c.section_lights[3].sky = Some(vec![0x22; LIGHT_LAYER_BYTES]);
+        c.section_lights[0].sky = Some(crate::chunk::LightSection::uniform(0xFF));
+        c.section_lights[0].block = Some(crate::chunk::LightSection::uniform(0x11));
+        c.section_lights[3].sky = Some(crate::chunk::LightSection::uniform(0x22));
         let expected = c.section_lights.clone();
         let light_source = c.light_source_token();
 
@@ -2009,8 +2160,8 @@ mod tests {
     #[test]
     fn incremental_relight_update_retains_baked_light_and_changes_source_token() {
         let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
-        c.section_lights[0].sky = Some(vec![0xFF; LIGHT_LAYER_BYTES]);
-        c.section_lights[0].block = Some(vec![0x11; LIGHT_LAYER_BYTES]);
+        c.section_lights[0].sky = Some(crate::chunk::LightSection::uniform(0xFF));
+        c.section_lights[0].block = Some(crate::chunk::LightSection::uniform(0x11));
         let expected = c.section_lights.clone();
         let light_source = c.light_source_token();
 

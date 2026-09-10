@@ -347,13 +347,10 @@ mod tests {
         assert!(report.is_degraded());
     }
 
-    #[test]
-    fn bounded_soak_report_marks_observed_runtime_control_pressure_decision_as_present() {
+    #[tokio::test(start_paused = true)]
+    async fn bounded_soak_report_marks_sustained_runtime_control_pressure_decision_as_present() {
         let mut controller = RuntimeControlPlane::new(
-            AutoscalePolicy {
-                scale_down_after_ticks: 1,
-                ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
-            },
+            AutoscalePolicy::for_profile(AutoscaleProfile::Balanced),
             RuntimeControlLimits {
                 view_distance: 8,
                 chunk_send_rate: 16,
@@ -364,7 +361,22 @@ mod tests {
         let decision = controller.observe_signal(RuntimeControlSignal::ChunkPressure {
             saturated_sources: 1,
         });
+        assert_eq!(decision.action, AutoscaleAction::Hold);
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        assert_eq!(
+            controller
+                .observe_signal(RuntimeControlSignal::ChunkPressure {
+                    saturated_sources: 1,
+                })
+                .action,
+            AutoscaleAction::Hold
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let decision = controller.observe_signal(RuntimeControlSignal::ChunkPressure {
+            saturated_sources: 1,
+        });
         assert_eq!(decision.action, AutoscaleAction::ScaleDown);
+        assert_eq!(decision.limits.chunk_send_rate, 15);
         assert_eq!(decision.pressure, Some(AutoscalePressure::ChunkQueue));
         let runtime_control = controller.snapshot();
 

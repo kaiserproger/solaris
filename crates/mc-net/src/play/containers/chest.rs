@@ -194,31 +194,6 @@ pub(in crate::play) fn chest_slot_stacks(view: &ChestView) -> Vec<ItemStack> {
         .collect()
 }
 
-pub(in crate::play) fn adjacent_chest_positions(position: BlockPos) -> [BlockPos; 4] {
-    [
-        BlockPos {
-            x: position.x - 1,
-            y: position.y,
-            z: position.z,
-        },
-        BlockPos {
-            x: position.x + 1,
-            y: position.y,
-            z: position.z,
-        },
-        BlockPos {
-            x: position.x,
-            y: position.y,
-            z: position.z - 1,
-        },
-        BlockPos {
-            x: position.x,
-            y: position.y,
-            z: position.z + 1,
-        },
-    ]
-}
-
 pub(in crate::play) fn chest_player_slot(storage_slots: usize, menu_slot: usize) -> Option<usize> {
     let main_end = storage_slots + 26;
     let hotbar_start = storage_slots + 27;

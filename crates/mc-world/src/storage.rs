@@ -3,7 +3,7 @@
 //! Opens a vanilla world directory (the one containing
 //! `dimensions/minecraft/overworld/region/` or, on older saves,
 //! `region/` directly), and serves block queries by loading the
-//! covering region file on demand. Chunk and decoded-region LRUs keep
+//! covering region file on demand. Chunk and indexed-region LRUs keep
 //! recent data resident; dirty chunks are flushed back through region
 //! planning/write/commit paths.
 
@@ -20,10 +20,8 @@ use mc_data::Identifier;
 use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 
-use crate::anvil::{
-    ChunkNbtError, ChunkPayload, RegionError, chunk_from_payload_with_items_at_position,
-    read_region,
-};
+use crate::anvil::region::RegionReader;
+use crate::anvil::{ChunkNbtError, RegionError, chunk_from_payload_with_items_at_position};
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
     BlockPos, ChestBlockEntity, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity,
@@ -57,20 +55,11 @@ pub use read_view::{
 
 const REGION_AXIS_CHUNKS: i32 = 32;
 const DEFAULT_LRU_CAPACITY: usize = 16;
-/// How many decoded regions (`.mca` files with per-chunk payloads
-/// already decompressed) we hold resident at once. Each entry is on
-/// the order of tens of MB for a dense overworld region; four is a
-/// pragmatic default that covers the M3.e view-distance ring around
-/// a single player without growing unboundedly.
+/// How many region indexes and open `.mca` handles we retain at once.
+/// Compressed payloads are read by slot; decoded NBT is never cached.
 const DEFAULT_REGION_LRU_CAPACITY: usize = 4;
 const DEFAULT_RESIDENT_BYTES_PER_CHUNK: usize = 8 * 1024 * 1024;
 const DEFAULT_FLUSH_RESERVE_BYTES: usize = 16 * 1024 * 1024;
-/// A decoded region: per-chunk payload bytes ready for
-/// `mc_nbt::read_named`, keyed by the chunk's local-to-region
-/// coordinates `(local_x, local_z)`. Wrapped in an `Arc` in
-/// [`WorldStorage`] so the per-chunk lookup can clone a handle
-/// without copying the payload bytes.
-type DecodedRegion = HashMap<(u8, u8), ChunkPayload>;
 
 #[derive(Debug, Error)]
 pub enum WorldError {
@@ -182,13 +171,10 @@ pub struct WorldStorage {
     resident_byte_budget: usize,
     dirty_byte_budget: usize,
     save_healthy: bool,
-    /// LRU of *decoded* region files, keyed by region coordinates.
-    /// Each entry maps `(local_x, local_z)` → already-decompressed
-    /// chunk payload (raw NBT bytes ready for `mc_nbt::read_named`).
-    /// This eliminates the per-chunk re-open + re-decompress of the
-    /// same `.mca` when many chunks in the same region are touched
-    /// in quick succession — the M2 follow-up #1 noted at close-out.
-    regions: HashMap<(i32, i32), Arc<DecodedRegion>>,
+    /// LRU of validated region indexes and open files. Each chunk miss reads
+    /// and decompresses only its own slot, without retaining raw NBT alongside
+    /// the resident decoded chunks.
+    regions: HashMap<(i32, i32), Arc<RegionReader>>,
     region_lru: VecDeque<(i32, i32)>,
     region_capacity: usize,
     item_registry: Option<Arc<ItemRegistry>>,
@@ -1083,8 +1069,10 @@ impl WorldStorage {
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
         let local_z = cpos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
 
-        let region = self.ensure_region(rx, rz)?;
-        let payload = region.and_then(|r| r.get(&(local_x, local_z)).cloned());
+        let payload = match self.ensure_region(rx, rz)? {
+            Some(region) => region.read_chunk(local_x, local_z)?,
+            None => None,
+        };
 
         if let Some(payload) = payload {
             let chunk = chunk_from_payload_with_items_at_position(
@@ -1108,34 +1096,24 @@ impl WorldStorage {
     }
 
     /// Bring the region at `(rx, rz)` into the region cache and return
-    /// a shared handle to its per-chunk payload map. Returns `None`
-    /// when the underlying `.mca` file doesn't exist on disk.
-    fn ensure_region(
-        &mut self,
-        rx: i32,
-        rz: i32,
-    ) -> Result<Option<Arc<DecodedRegion>>, WorldError> {
+    /// its validated index and open file. Returns `None` when the underlying
+    /// `.mca` file doesn't exist on disk.
+    fn ensure_region(&mut self, rx: i32, rz: i32) -> Result<Option<&RegionReader>, WorldError> {
         let key = (rx, rz);
-        if let Some(region) = self.regions.get(&key) {
-            let region = Arc::clone(region);
+        if self.regions.contains_key(&key) {
             self.touch_region(key);
-            return Ok(Some(region));
+        } else {
+            let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
+            if !region_path.is_file() {
+                return Ok(None);
+            }
+            let reader = Arc::new(RegionReader::open(&region_path)?);
+            self.insert_region(key, reader);
         }
-        let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
-        if !region_path.is_file() {
-            return Ok(None);
-        }
-        let payloads = read_region(&region_path)?;
-        let map: HashMap<(u8, u8), ChunkPayload> = payloads
-            .into_iter()
-            .map(|p| ((p.local_x, p.local_z), p))
-            .collect();
-        let arc = Arc::new(map);
-        self.insert_region(key, Arc::clone(&arc));
-        Ok(Some(arc))
+        Ok(self.regions.get(&key).map(Arc::as_ref))
     }
 
-    fn insert_region(&mut self, key: (i32, i32), region: Arc<DecodedRegion>) {
+    fn insert_region(&mut self, key: (i32, i32), region: Arc<RegionReader>) {
         while self.regions.len() >= self.region_capacity {
             if let Some(evict) = self.region_lru.pop_front() {
                 self.regions.remove(&evict);
@@ -1219,8 +1197,7 @@ impl WorldStorage {
         self.resident.len()
     }
 
-    /// How many decoded regions are currently resident. Tests and
-    /// the M3.f bench use this to confirm the region cache fires.
+    /// How many validated region indexes and open files are currently cached.
     #[must_use]
     pub fn region_cache_len(&self) -> usize {
         self.regions.len()
@@ -3351,9 +3328,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-        chunk.section_lights[0].block = Some(block_light.clone());
-        chunk.section_lights[0].sky = Some(sky_light.clone());
-        chunk.section_lights[4].sky = Some(block_light.clone());
+        chunk.section_lights[0].block = Some(crate::chunk::LightSection::from_bytes(
+            block_light.clone().try_into().unwrap(),
+        ));
+        chunk.section_lights[0].sky = Some(crate::chunk::LightSection::from_bytes(
+            sky_light.clone().try_into().unwrap(),
+        ));
+        chunk.section_lights[4].sky = Some(crate::chunk::LightSection::from_bytes(
+            block_light.clone().try_into().unwrap(),
+        ));
         chunk.mark_dirty();
 
         let mut world =
@@ -3369,16 +3352,28 @@ mod tests {
         let chunk = reopened.get_chunk(cpos).unwrap().unwrap();
 
         assert_eq!(
-            chunk.section_lights[0].block.as_deref(),
-            Some(&block_light[..])
+            chunk.section_lights[0]
+                .block
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(block_light.clone())
         );
-        assert_eq!(chunk.section_lights[0].sky.as_deref(), Some(&sky_light[..]));
+        assert_eq!(
+            chunk.section_lights[0]
+                .sky
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(sky_light)
+        );
         assert_eq!(chunk.section_lights[1].block, None);
         assert_eq!(chunk.section_lights[1].sky, None);
         assert_eq!(chunk.section_lights[4].block, None);
         assert_eq!(
-            chunk.section_lights[4].sky.as_deref(),
-            Some(&block_light[..])
+            chunk.section_lights[4]
+                .sky
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(block_light)
         );
     }
 
@@ -4157,9 +4152,9 @@ mod tests {
         );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
-        // Match the production chunk-LRU default. M3.e thrashes this
-        // at vd=10 because the LRU only holds 16 of the 121 hot
-        // chunks; the region cache is what de-amortises it.
+        // Match the production chunk-LRU default. Revisiting 121 chunks
+        // thrashes its 16 slots; the region cache retains only the index,
+        // so each missed chunk is read and decompressed again.
         let mut world = WorldStorage::open(&world_dir, registry).unwrap();
 
         for cz in 0..=10 {
@@ -4190,11 +4185,8 @@ mod tests {
             ms = elapsed.as_millis(),
             per_chunk_us = elapsed.as_micros() as f64 / hit as f64,
         );
-        // Generous ceiling. With no region cache and chunk-LRU=16
-        // this typically sits around 1–2 s; once the M3.f region
-        // cache lands it should drop to tens of ms. Set the cap at
-        // 10 s so the test still fails loudly on a 10× regression
-        // but doesn't flake on a contended CI runner.
+        // Generous ceiling for a contended runner; report the elapsed time
+        // above so local probes can compare indexed per-slot loading.
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "vd-quadrant stream took {elapsed:?} — suspicious regression",

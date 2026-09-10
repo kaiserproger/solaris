@@ -112,6 +112,22 @@ letters, digits, or `_`) or a UUID. Names are normalized to lowercase and
 output is deterministic. Repeating `add` is a no-op; `remove` is also safe when
 the identity is absent. Unknown fields in existing operator profiles (for
 example `level`) are retained.
+Removal revokes the whole profile when either its name or UUID matches, including
+overlapping duplicate profiles that share an identity. It does not leave the
+other identity authorized. Explicit identities in `[admin].operators` are a
+separate source and must be removed there if they also grant the same access.
+
+File mutations serialize the complete read–modify–write through a persistent
+`ops.json.lock` sidecar (or `<configured-file>.lock`). Do not remove that sidecar
+while managers run. The new JSON is written and synced in the same directory,
+then atomically replaced and the directory synced. Cooperating CLI processes do
+not lose each other's updates; external editors do not participate in this lock.
+An error after replacement during directory sync has an uncertain durability
+outcome: inspect the file rather than assuming the old version remains.
+
+Management refuses symlink, multiply linked, and read-only mutation targets.
+Existing Unix ownership and permission bits are preserved; extended ACLs and
+xattrs are not explicitly copied. New files use private tempfile permissions.
 
 `operators_file` is resolved relative to the selected config. If it is absent,
 the CLI uses the deterministic `ops.json` path beside the config without
@@ -146,6 +162,12 @@ worldgen mode, chunk geometry, ore profile, or settlement plan. Changing one of
 those values requires an empty/new `world_dir`; do not delete only the contract
 file or combine region files from two contracts. Back up the complete directory
 before upgrading an alpha.
+
+Worldgen revision 20 makes rivers wider and deeper while retaining seeded width
+variation, shallow banks and varying channel beds. It is not compatible with
+revision-19 generated worlds: select a fresh `world_dir` to use the new terrain.
+Existing chunks are not retroactively reshaped, and editing `world.json` to bypass
+the revision check would mix incompatible terrain.
 
 Plugin worldgen declarations are startup-only and become part of this contract.
 An unversioned vanilla Anvil import cannot use Solaris plugin worldgen to fill
@@ -191,6 +213,17 @@ fluid, light, player-distance and collision checks remain in effect. An interval
 of zero disables that category's attempts. Ground wander pauses are short;
 injured animals preserve the initial impulse, then run for up to five seconds.
 
+Cod, salmon, pufferfish and tropical fish use momentum-preserving, smoothed swim
+steering and fish-specific water travel. Squid and glow squid use separate
+pulse/coast movement rather than the fish controller. Their local navigation
+checks known water and turns away from unsafe next positions; fresh swimmers do
+not require a previous solid collision to receive terrain samples.
+These changes use 26.1.2 bytecode evidence, not complete AI parity: schooling,
+full vanilla pathfinding, squid flee/animation synchronization and exact fluid
+height semantics remain outside this implementation. Other aquatic wanderers
+retain their existing species behavior with direction continuity and corrected
+yaw; they are not forced through fish navigation.
+
 After a successful save, clean chunks outside retained client views are trimmed
 to a 64-chunk warm cache. Loaded and dirty chunks are never discarded by this
 trim. Old natural populations are preserved, but cannot keep growing past caps.
@@ -209,11 +242,23 @@ pressure. It is not an external cluster autoscaler and does not add worker
 processes. The starter `balanced` profile is the recommended baseline.
 
 Optional bounds include `min_view_distance`, `max_view_distance`,
-`target_tick_ms`, `target_first_chunk_ms`, `scale_down_after_ticks`, and
-`scale_up_after_ticks`. The `[chunk_pipeline]` values provide the configured
-initial rates. Use `--check` to inspect `effective_chunk_pipeline` and
-`effective_autoscale` after normalization instead of assuming the raw TOML is
-the final policy.
+`target_tick_ms`, `target_first_chunk_ms`, `scale_down_after_seconds`, and
+`scale_up_after_seconds`. The two durations default to 60 and normalize to at
+least 60 seconds. Scaling requires **strictly more** than that duration of
+continuous pressure or stable headroom, measured by a monotonic clock, not by
+counting ticks or queue notifications. A break in the condition resets its
+window; each adjustment starts a fresh window. View distance, throughput and
+eligible deferred-work budgets change one unit per step, not by halving/doubling.
+Recovery requires at least 20% tick headroom. Immediate bounded admission,
+memory-pressure waiting and explicit shutdown/drain do not wait for autoscale.
+
+Without explicit view-bound overrides, the upper bound follows
+`[server].view_distance`: configuring 16 no longer starts at a profile cap of
+10 before any overload. The `[chunk_pipeline]` values provide the initial
+rates. Use `--check` to inspect `effective_chunk_pipeline` and
+`effective_autoscale`. The old `scale_*_after_ticks` keys are removed; replace
+them with the seconds-based keys rather than carrying short observation counts
+into a new config.
 
 ## Plugins
 
@@ -296,7 +341,63 @@ The local console provides `help`, `status`, `profile`, `list`, world controls,
 `save-all` and `stop`. `--no-console` retains plain stdin commands without the TUI.
 Runtime logs are written to `logs/latest.log` and `logs/debug.log`, not to the
 console. Files start fresh on launch; `RUST_LOG` filters the debug file.
-`profile` exports current measured tick-stage latency distributions, RSS and
-population/chunk/network counters to `logs/profile.json`; it is not a flamegraph
-or allocation trace. Operator-file changes still take effect on restart.
+`profile` atomically replaces `logs/profile.json` with a fresh diagnostic capture
+on a blocking worker, not on the simulation tick. Run it once before reproducing
+the workload and again afterwards; CPU/allocation deltas span those captures
+(the first interval starts when the provider is created). Ordinary dashboard
+polling does not perform this expensive capture. The console confirms RSS,
+requested live Rust bytes, average CPU cores and capture duration.
+
+- `process`: actual process RSS, anonymous/file/shared residency, Linux mapping
+  totals and I/O. The older `memory.used_mb` remains the autoscaler pressure
+  domain, which can be cgroup usage rather than process RSS.
+- `allocations`: requested Rust live bytes and allocation/deallocation churn,
+  measured by atomic counters around the existing system allocator.
+  `component_reconciliation.owners` sorts observed owner estimates: block
+  registry, published chunks, reusable lighting scratch, prepared frames,
+  session views and entity tables. The unclassified remainder stays explicit.
+- `resources`: block registry definitions/states/lookup keys; chunk block
+  palettes, bit widths, biomes, heightmaps, light arrays, preserved NBT and other
+  state; dirty/cache/prepared/queued populations and reusable worker capacities.
+  Shared block/light payloads are deduplicated within the published chunk set;
+  prepared-light reachable bytes are non-additive because arrays can be shared.
+- `cpu`: process CPU and exclusive thread CPU attributed to chunk disk decode,
+  generation, block encoding, heightmaps, lighting, light encoding, framing/
+  compression, other preparation, simulation, saving and network execution.
+  Async scopes measure each poll, excluding suspension. Inclusive execution wall
+  time and `resources.lock_pressure_wall_time` are not CPU or additive totals.
+  Per-thread CPU and runnable-wait deltas are in `process`; exited threads can
+  be absent there but remain included in process CPU.
+
+This is not a flamegraph or allocation-stack trace. Capacity estimates and
+allocator counters are sampled sequentially, not transactionally; completed CPU
+scopes can straddle interval boundaries. Native allocations bypassing Rust,
+allocator page retention, older external snapshots and other unmeasured owners
+are not falsely assigned to chunks. RSS minus requested Rust bytes is **not**
+an exact retained/free-page measurement. Unsupported/unavailable counters are
+null or explicitly unavailable. Operator-file changes still take effect on restart.
+RSS can remain high after chunk owners release their allocations: the system
+allocator may keep free pages for reuse. Ticket counts, resident chunk counts,
+live allocations and RSS are different measurements. Region caching retains
+small indexed readers and decodes requested chunks on demand rather than keeping
+all decompressed region NBT. Neither this cache change nor a low tick percentile
+proves a whole-server RAM target. Compare vanilla only with matching view and
+simulation distances, workload, save state and memory metric.
+For a chunk-disappearance report, reproduce with the intended view/simulation
+distances and type exactly `blink` in ordinary chat (case-insensitive). It remains
+normal chat and also records a `chunk_blink_marker` event with player/session,
+pose and tick. Copy both logs and a newly requested `profile.json` **before
+restarting**; an old profile is not a snapshot of the new log session.
+
+The DEBUG target `solaris::chunk_visibility` records successful chunk/radius/
+unload writes with session, generation and coordinates. `chunk_radius_sent`
+includes previous/new radius and the last applied autoscale decision;
+`chunk_unload_sent` distinguishes movement, client settings and runtime control.
+`chunk_sent`, `chunk_send_invalidated` and `chunk_view_replay` distinguish ordinary
+delivery, a post-write invalidation/requeue and explicit full-view replay.
+Correlate coordinate histories around the marker; counters alone do not prove
+duplicates. Successful writes are not proof of client rendering, and the last
+autoscale reason is not necessarily the cause of a client-settings change.
+Default debug logging includes these events; a restrictive `RUST_LOG` needs
+`solaris::chunk_visibility=debug`. These logs contain player identities/positions.
 The optional remote dashboard is read-only and unauthenticated.

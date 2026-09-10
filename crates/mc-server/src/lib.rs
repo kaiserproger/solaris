@@ -5,7 +5,7 @@
 //! Part of the Solaris engine.
 
 use std::collections::BTreeSet;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +29,9 @@ pub mod dashboard_stats;
 #[cfg(test)]
 #[path = "dashboard_tests.rs"]
 mod dashboard_tests;
+#[cfg(test)]
+mod operator_file_tests;
+pub mod profile;
 pub mod startup_data;
 
 /// Crate version, exposed so other crates and the binary can report it.
@@ -369,7 +372,11 @@ impl ServerConfig {
     /// When `admin.operators_file` is absent, the management caller may supply
     /// the default `ops.json` path in memory; startup auto-loads that file when
     /// it exists beside the selected config. Add/remove preserve unknown profile
-    /// metadata and normalize duplicate identities while writing deterministic JSON.
+    /// metadata and normalize identities while writing deterministic JSON.
+    /// Removal revokes the complete profile and any overlapping aliases. Mutations
+    /// use a persistent `.lock` sidecar and durable same-directory replacement.
+    /// Management refuses symlink and multiply linked targets rather than silently
+    /// changing which file an existing link updates.
     pub fn manage_operator_file(
         &self,
         config_path: &Path,
@@ -381,18 +388,39 @@ impl ServerConfig {
                 config_path.display()
             )
         })?;
-        let path = resolve_config_relative_path(config_path, configured_path);
+        let configured = resolve_config_relative_path(config_path, configured_path);
+        let parent = configured
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .with_context(|| {
+                format!("resolving operator file directory {}", configured.display())
+            })?;
+        let path = parent.join(
+            configured
+                .file_name()
+                .context("operator file path must have a file name")?,
+        );
         let requested_identity = match &operation {
             OperatorFileOperation::Add(raw) | OperatorFileOperation::Remove(raw) => {
                 Some(normalize_operator_identity(raw)?)
             }
             OperatorFileOperation::List => None,
         };
-        if !path.exists() && matches!(&operation, OperatorFileOperation::Add(_)) {
-            write_operator_profiles(&path, &[])?;
-        }
-        let (_, values) =
-            read_access_control_values(config_path, configured_path, "admin.operators_file")?;
+        // The sidecar survives replacement. Locking ops.json itself would protect
+        // only the old inode and permit concurrent read-modify-write lost updates.
+        let _lock = if matches!(&operation, OperatorFileOperation::List) {
+            None
+        } else {
+            Some(lock_operator_file(&path)?)
+        };
+        let metadata = operator_file_metadata(&path)?;
+        let values = if metadata.is_none() && matches!(&operation, OperatorFileOperation::Add(_)) {
+            Vec::new()
+        } else {
+            read_access_control_values(config_path, &path, "admin.operators_file")?.1
+        };
         let (mut values, mut identities) =
             canonicalize_operator_profiles(values, "admin.operators_file", &path)?;
 
@@ -432,30 +460,37 @@ impl ServerConfig {
                 let identity = requested_identity
                     .as_deref()
                     .expect("remove operation has a normalized identity");
+                // Keep paired identities together, including duplicate/overlapping
+                // profiles. Removing only a field can leave an alias authorized.
+                let mut removed_identities = BTreeSet::from([identity.to_owned()]);
                 let mut removed = false;
-                let mut retained = Vec::with_capacity(values.len());
-                for mut value in values {
-                    let Some(profile) = value.as_object_mut() else {
-                        retained.push(value);
-                        continue;
-                    };
-                    for key in ["name", "uuid"] {
-                        let matches = profile
-                            .get(key)
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|value| normalize_profile_identity(key, value).ok())
-                            .is_some_and(|value| value == identity);
+                loop {
+                    let previous_len = values.len();
+                    values.retain(|value| {
+                        let profile = value.as_object().expect("validated operator profile");
+                        let matches = ["name", "uuid"].iter().any(|key| {
+                            profile
+                                .get(*key)
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|identity| removed_identities.contains(identity))
+                        });
                         if matches {
-                            profile.remove(key);
-                            removed = true;
+                            for key in ["name", "uuid"] {
+                                if let Some(identity) =
+                                    profile.get(key).and_then(serde_json::Value::as_str)
+                                {
+                                    removed_identities.insert(identity.to_owned());
+                                }
+                            }
                         }
+                        !matches
+                    });
+                    if values.len() == previous_len {
+                        break;
                     }
-                    if profile.contains_key("name") || profile.contains_key("uuid") {
-                        retained.push(value);
-                    }
+                    removed = true;
                 }
-                values = retained;
-                identities.remove(identity);
+                identities.retain(|identity| !removed_identities.contains(identity));
                 if !removed {
                     return Ok(OperatorFileResult {
                         changed: false,
@@ -465,7 +500,7 @@ impl ServerConfig {
             }
         }
 
-        write_operator_profiles(&path, &values)?;
+        write_operator_profiles(&path, &values, metadata.as_ref())?;
         Ok(OperatorFileResult {
             changed: true,
             identities: identities.into_iter().collect(),
@@ -585,24 +620,22 @@ fn canonicalize_operator_profiles(
         if let Some(name) = profile.name.as_deref() {
             let identity = validate_access_control_name(name, field, path, index)?;
             populated = true;
-            if !identities.insert(identity) {
-                value
-                    .as_object_mut()
-                    .expect("access-control profile must be a JSON object")
-                    .remove("name");
-            }
+            identities.insert(identity.clone());
+            value
+                .as_object_mut()
+                .expect("validated operator profile")
+                .insert("name".to_owned(), serde_json::Value::String(identity));
         }
         if let Some(raw_uuid) = profile.uuid.as_deref() {
             let identity = normalize_profile_identity("uuid", raw_uuid).map_err(|message| {
                 anyhow::anyhow!("{field} entry {index} from {} {message}", path.display())
             })?;
             populated = true;
-            if !identities.insert(identity) {
-                value
-                    .as_object_mut()
-                    .expect("access-control profile must be a JSON object")
-                    .remove("uuid");
-            }
+            identities.insert(identity.clone());
+            value
+                .as_object_mut()
+                .expect("validated operator profile")
+                .insert("uuid".to_owned(), serde_json::Value::String(identity));
         }
         if !populated {
             bail!(
@@ -610,12 +643,9 @@ fn canonicalize_operator_profiles(
                 path.display()
             );
         }
-        let object = value
-            .as_object()
-            .expect("access-control profile must be a JSON object");
-        if object.contains_key("name") || object.contains_key("uuid") {
-            canonical.push(value);
-        }
+        // Do not deduplicate individual fields: that discards the relationship
+        // needed to revoke all aliases in overlapping profiles.
+        canonical.push(value);
     }
     Ok((canonical, identities))
 }
@@ -656,11 +686,106 @@ fn normalize_operator_identity(raw: &str) -> anyhow::Result<String> {
         .map_err(|message| anyhow::anyhow!("invalid operator identity `{raw}`: {message}"))
 }
 
-fn write_operator_profiles(path: &Path, values: &[serde_json::Value]) -> anyhow::Result<()> {
+fn write_operator_profiles(
+    path: &Path,
+    values: &[serde_json::Value],
+    metadata: Option<&std::fs::Metadata>,
+) -> anyhow::Result<()> {
     let mut rendered = serde_json::to_vec_pretty(values).context("rendering operator file JSON")?;
     rendered.push(b'\n');
-    std::fs::write(path, rendered)
-        .with_context(|| format!("writing operator file {}", path.display()))
+    if values.len() > MAX_ACCESS_CONTROL_FILE_ENTRIES
+        || rendered.len() as u64 > MAX_ACCESS_CONTROL_FILE_BYTES
+    {
+        bail!("updated operator file exceeds access-control file limits");
+    }
+    if let Some(metadata) = metadata {
+        if metadata.permissions().readonly() {
+            bail!(
+                "operator management refuses to replace a read-only file: {}",
+                path.display()
+            );
+        }
+        // Rename permission comes from the directory, not the target. Do not
+        // bypass the target's existing write permissions during replacement.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("checking operator file write access {}", path.display()))?;
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+    .with_context(|| format!("creating temporary operator file for {}", path.display()))?;
+    temporary
+        .write_all(&rendered)
+        .with_context(|| format!("writing temporary operator file for {}", path.display()))?;
+    if let Some(metadata) = metadata {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::os::unix::fs::chown(temporary.path(), Some(metadata.uid()), Some(metadata.gid()))
+                .context("preserving operator file ownership")?;
+        }
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .context("preserving operator file permissions")?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary operator file for {}", path.display()))?;
+    mc_world::atomic_file::replace_file_durable(temporary.path(), path)
+        .with_context(|| format!("replacing and syncing operator file {}", path.display()))
+}
+
+fn operator_file_metadata(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading metadata for {}", path.display()));
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!(
+            "operator management requires a regular, non-symlink file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!(
+                "operator management refuses multiply linked files: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(Some(metadata))
+}
+
+fn lock_operator_file(path: &Path) -> anyhow::Result<std::fs::File> {
+    let mut name = path
+        .file_name()
+        .context("operator file path must have a file name")?
+        .to_os_string();
+    name.push(".lock");
+    let lock_path = path.with_file_name(name);
+    operator_file_metadata(&lock_path)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening operator lock {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("locking operator file {}", path.display()))?;
+    Ok(lock)
 }
 
 fn resolve_config_relative_path(config_path: &Path, configured_path: &Path) -> PathBuf {
@@ -720,9 +845,9 @@ pub struct AutoscaleSection {
     #[serde(default)]
     pub target_first_chunk_ms: Option<u64>,
     #[serde(default)]
-    pub scale_down_after_ticks: Option<u32>,
+    pub scale_down_after_seconds: Option<u32>,
     #[serde(default)]
-    pub scale_up_after_ticks: Option<u32>,
+    pub scale_up_after_seconds: Option<u32>,
 }
 
 impl Default for AutoscaleSection {
@@ -734,33 +859,38 @@ impl Default for AutoscaleSection {
             max_view_distance: None,
             target_tick_ms: None,
             target_first_chunk_ms: None,
-            scale_down_after_ticks: None,
-            scale_up_after_ticks: None,
+            scale_down_after_seconds: None,
+            scale_up_after_seconds: None,
         }
     }
 }
 
 impl AutoscaleSection {
     #[must_use]
-    pub fn to_policy(&self, chunk_pipeline: &ChunkPipelineSection) -> mc_net::AutoscalePolicy {
+    pub fn to_policy(
+        &self,
+        server: &ServerSection,
+        chunk_pipeline: &ChunkPipelineSection,
+    ) -> mc_net::AutoscalePolicy {
         let mut policy = mc_net::AutoscalePolicy::for_profile(self.profile.to_network());
-        if let Some(value) = self.min_view_distance {
-            policy.min_view_distance = value;
-        }
-        if let Some(value) = self.max_view_distance {
-            policy.max_view_distance = value;
-        }
+        policy.max_view_distance = self.max_view_distance.unwrap_or(server.view_distance);
+        policy.min_view_distance = self.min_view_distance.unwrap_or(
+            policy
+                .min_view_distance
+                .min(server.view_distance)
+                .min(policy.max_view_distance),
+        );
         if let Some(value) = self.target_tick_ms {
             policy.target_tick_ms = value;
         }
         if let Some(value) = self.target_first_chunk_ms {
             policy.target_first_chunk_ms = value;
         }
-        if let Some(value) = self.scale_down_after_ticks {
-            policy.scale_down_after_ticks = value;
+        if let Some(value) = self.scale_down_after_seconds {
+            policy.scale_down_after_seconds = value;
         }
-        if let Some(value) = self.scale_up_after_ticks {
-            policy.scale_up_after_ticks = value;
+        if let Some(value) = self.scale_up_after_seconds {
+            policy.scale_up_after_seconds = value;
         }
 
         policy.min_chunk_send_rate = policy
@@ -796,7 +926,7 @@ impl AutoscaleSection {
             chunk_load_rate: chunk_pipeline.chunk_load_rate.max(1),
             chunk_generate_rate: chunk_pipeline.chunk_generate_rate.max(1),
         }
-        .bounded(self.to_policy(chunk_pipeline))
+        .bounded(self.to_policy(server, chunk_pipeline))
     }
 }
 
@@ -986,7 +1116,7 @@ impl ServerConfig {
         let mut chunk_pipeline = self.chunk_pipeline.to_network();
         if self.autoscale.enabled {
             chunk_pipeline.runtime_control = Some(mc_net::RuntimeControlConfig {
-                policy: self.autoscale.to_policy(&self.chunk_pipeline),
+                policy: self.autoscale.to_policy(&self.server, &self.chunk_pipeline),
                 initial_limits: self
                     .autoscale
                     .initial_limits(&self.server, &self.chunk_pipeline),
@@ -1192,7 +1322,7 @@ mod tests {
         assert!(cfg.autoscale.enabled);
         assert_eq!(cfg.autoscale.min_view_distance, Some(4));
         assert_eq!(cfg.autoscale.max_view_distance, Some(4));
-        let autoscale_policy = cfg.autoscale.to_policy(&cfg.chunk_pipeline);
+        let autoscale_policy = cfg.autoscale.to_policy(&cfg.server, &cfg.chunk_pipeline);
         assert_eq!(autoscale_policy.min_view_distance, 4);
         assert_eq!(autoscale_policy.max_view_distance, 4);
     }
@@ -1627,11 +1757,11 @@ mod tests {
             max_view_distance = 6
             target_tick_ms = 45
             target_first_chunk_ms = 1200
-            scale_down_after_ticks = 2
-            scale_up_after_ticks = 7
+            scale_down_after_seconds = 90
+            scale_up_after_seconds = 120
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
-        let policy = cfg.autoscale.to_policy(&cfg.chunk_pipeline);
+        let policy = cfg.autoscale.to_policy(&cfg.server, &cfg.chunk_pipeline);
         let limits = cfg
             .autoscale
             .initial_limits(&cfg.server, &cfg.chunk_pipeline);
@@ -1642,8 +1772,8 @@ mod tests {
         assert_eq!(policy.max_view_distance, 6);
         assert_eq!(policy.target_tick_ms, 45);
         assert_eq!(policy.target_first_chunk_ms, 1200);
-        assert_eq!(policy.scale_down_after_ticks, 2);
-        assert_eq!(policy.scale_up_after_ticks, 7);
+        assert_eq!(policy.scale_down_after_seconds, 90);
+        assert_eq!(policy.scale_up_after_seconds, 120);
         assert_eq!(limits.view_distance, 6);
         assert_eq!(limits.chunk_send_rate, 8);
         assert_eq!(limits.chunk_load_rate, 16);
@@ -1671,6 +1801,46 @@ mod tests {
             .expect("enabled autoscale wires runtime control");
         assert_eq!(runtime.policy, policy);
         assert_eq!(runtime.initial_limits, limits);
+    }
+
+    #[test]
+    fn autoscale_default_bounds_preserve_configured_view_sixteen() {
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            name = "S"
+            motd = "M"
+            view_distance = 16
+            simulation_distance = 16
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+        "#,
+        )
+        .expect("server configuration parses");
+        let policy = config
+            .autoscale
+            .to_policy(&config.server, &config.chunk_pipeline);
+        let initial = config
+            .autoscale
+            .initial_limits(&config.server, &config.chunk_pipeline);
+        let controller = mc_net::RuntimeControlPlane::new(policy, initial);
+        assert_eq!(controller.snapshot().limits.view_distance, 16);
+        assert_eq!(policy.max_view_distance, 16);
+        assert!(policy.min_view_distance < 16);
+
+        config.autoscale.max_view_distance = Some(4);
+        let bounded = config
+            .autoscale
+            .initial_limits(&config.server, &config.chunk_pipeline);
+        assert_eq!(bounded.view_distance, 4);
+
+        config.autoscale.min_view_distance = Some(20);
+        config.autoscale.max_view_distance = Some(24);
+        let bounded = config
+            .autoscale
+            .initial_limits(&config.server, &config.chunk_pipeline);
+        assert_eq!(bounded.view_distance, 20);
     }
 
     #[test]

@@ -15,6 +15,7 @@ const MOUNTAIN_SCALE_A: f64 = 2_200.0;
 const MOUNTAIN_SCALE_B: f64 = 1_550.0;
 const MOUNTAIN_DETAIL_LONG_SCALE: f64 = 520.0;
 const MOUNTAIN_DETAIL_CROSS_SCALE: f64 = 210.0;
+const MAX_CHANNEL_DEPTH: f64 = 7.5;
 // Climate is evaluated in three spatial bands. The macro band keeps a family
 // coherent over a region, the regional band bends its boundary, and the local
 // band is deliberately capped so it can only add variation inside transition
@@ -161,7 +162,8 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         // Quintic falloff has maximum slope 15/8. Reserve one block of the
         // three-block terrain-step budget for existing relief and use the
         // remaining two for carving; taller banks therefore become wider.
-        let bank_relief = (height - sea + 3.6).max(0.0) * coast_connection * low_relief;
+        let bank_relief =
+            (height - sea + MAX_CHANNEL_DEPTH).max(0.0) * coast_connection * low_relief;
         drainage::sample(
             router.seed,
             block_x,
@@ -173,7 +175,10 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         drainage::DrainageSample::default()
     };
     let river_weight = drainage.channel_weight * coast_connection * low_relief;
-    let channel_depth = (2.4 + drainage.accumulation * 0.10).clamp(2.4, 3.6);
+    // Runoff varies between reaches; existing broad relief varies the bed along
+    // a reach without adding noise sampling or flattening it to one depth.
+    let channel_depth =
+        (4.5 + drainage.accumulation * 0.35 + hills * 1.5).clamp(4.5, MAX_CHANNEL_DEPTH);
     let river_floor = sea - channel_depth + detail.abs() * 0.45;
     let channel_center_y = lerp(
         height,

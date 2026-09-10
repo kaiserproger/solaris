@@ -94,7 +94,6 @@ fn control(queue_pressure_percent: u8, view_distance: i32) -> crate::RuntimeCont
             max_chunk_generate_rate: 16,
             target_first_chunk_ms: 1,
             queue_pressure_percent,
-            scale_down_after_ticks: 1,
             ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
         },
         initial_limits: crate::RuntimeControlLimits {
@@ -171,6 +170,10 @@ async fn completing_step_recovers_active_chunk_pressure_once() {
     );
     assert_eq!(
         next_signal(&mut signals).await,
+        crate::control_plane::RuntimeControlSignal::SourcesRecovered
+    );
+    assert_eq!(
+        next_signal(&mut signals).await,
         crate::control_plane::RuntimeControlSignal::ChunkPressure {
             saturated_sources: 1,
         }
@@ -227,6 +230,10 @@ async fn aborted_step_recovers_active_chunk_pressure_before_drop() {
     );
     assert_eq!(
         next_signal(&mut signals).await,
+        crate::control_plane::RuntimeControlSignal::SourcesRecovered
+    );
+    assert_eq!(
+        next_signal(&mut signals).await,
         crate::control_plane::RuntimeControlSignal::ChunkPressure {
             saturated_sources: 0,
         }
@@ -247,6 +254,10 @@ async fn dropping_stream_recovers_active_chunk_pressure_once() {
     drop(stream);
     assert_eq!(
         next_signal(&mut signals).await,
+        crate::control_plane::RuntimeControlSignal::SourcesRecovered
+    );
+    assert_eq!(
+        next_signal(&mut signals).await,
         crate::control_plane::RuntimeControlSignal::ChunkPressure {
             saturated_sources: 0,
         }
@@ -254,8 +265,8 @@ async fn dropping_stream_recovers_active_chunk_pressure_once() {
     assert_eq!(signals.try_recv(), None);
 }
 
-#[tokio::test]
-async fn first_actual_chunk_send_publishes_sla_pressure_and_source_recovery() {
+#[tokio::test(start_paused = true)]
+async fn first_actual_chunk_send_publishes_transient_sla_pressure_without_scaling() {
     let control = control(100, 1);
     let mut signals = control.take_signal_receiver().unwrap();
     let mut stream = test_stream(control.clone(), 1);
@@ -270,21 +281,33 @@ async fn first_actual_chunk_send_publishes_sla_pressure_and_source_recovery() {
         EmitReadyResult::SentPacket
     );
     drop(stream);
+    let continuity = next_signal(&mut signals).await;
+    assert_eq!(
+        continuity,
+        crate::control_plane::RuntimeControlSignal::SourcesRecovered
+    );
+    assert_eq!(observe_signal(&control, continuity).pressure, None);
 
     let pressure = next_signal(&mut signals).await;
+    let decision = control.observe_signal_and_apply(pressure, |_decision, _draining| {});
     assert_eq!(
-        control
-            .observe_signal_and_apply(pressure, |_decision, _draining| {})
-            .pressure,
+        decision.pressure,
         Some(crate::AutoscalePressure::FirstChunkSla)
     );
+    assert_eq!(decision.action, crate::AutoscaleAction::Hold);
     let recovery = next_signal(&mut signals).await;
-    assert_eq!(
-        control
-            .observe_signal_and_apply(recovery, |_decision, _draining| {})
-            .pressure,
-        None
-    );
+    let decision = control.observe_signal_and_apply(recovery, |_decision, _draining| {});
+    assert_eq!(decision.pressure, None);
+    assert_eq!(decision.action, crate::AutoscaleAction::Hold);
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let decision = control.observe(crate::RuntimeControlInput {
+        tick_ms: 0,
+        memory_used_mb: 0,
+        memory_limit_mb: 0,
+    });
+    assert_eq!(decision.action, crate::AutoscaleAction::Hold);
+    assert_eq!(decision.limits.chunk_send_rate, 16);
+    assert_eq!(control.snapshot().scale_down_decisions, 0);
 }
 
 #[tokio::test]
@@ -313,17 +336,21 @@ async fn replan_recovers_active_queue_and_first_chunk_tokens_once_before_receive
     assert!(!stream.first_chunk_sla_active);
     assert_eq!(
         signals.try_recv(),
-        Some(crate::control_plane::RuntimeControlSignal::FirstChunkSla { active_sources: 1 })
+        Some(crate::control_plane::RuntimeControlSignal::SourcesRecovered)
     );
     assert_eq!(
         signals.try_recv(),
-        Some(crate::control_plane::RuntimeControlSignal::FirstChunkSla { active_sources: 0 })
+        Some(crate::control_plane::RuntimeControlSignal::FirstChunkSla { active_sources: 1 })
     );
     assert_eq!(
         signals.try_recv(),
         Some(crate::control_plane::RuntimeControlSignal::ChunkPressure {
             saturated_sources: 1,
         })
+    );
+    assert_eq!(
+        signals.try_recv(),
+        Some(crate::control_plane::RuntimeControlSignal::FirstChunkSla { active_sources: 0 })
     );
     assert_eq!(
         signals.try_recv(),
@@ -452,6 +479,12 @@ fn concurrent_independent_sources_preserve_counts_and_recovery_isolation() {
 
     drop(first_chunk_second);
     drop(queue_second);
+    let continuity = signals.try_recv().unwrap();
+    assert_eq!(
+        continuity,
+        crate::control_plane::RuntimeControlSignal::SourcesRecovered
+    );
+    assert_eq!(observe_signal(&control, continuity).pressure, None);
     let last_first_chunk_recovery = signals.try_recv().unwrap();
     assert_eq!(
         last_first_chunk_recovery,
@@ -459,7 +492,7 @@ fn concurrent_independent_sources_preserve_counts_and_recovery_isolation() {
     );
     assert_eq!(
         observe_signal(&control, last_first_chunk_recovery).pressure,
-        Some(crate::AutoscalePressure::ChunkQueue)
+        None
     );
     let last_queue_recovery = signals.try_recv().unwrap();
     assert_eq!(

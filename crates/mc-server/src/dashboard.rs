@@ -174,6 +174,8 @@ pub struct StatsPayload {
 pub trait DashboardStats: Send + Sync + 'static {
     /// Snapshot of the current server statistics.
     fn stats(&self) -> StatsPayload;
+    /// Explicit, potentially expensive capture. Call from a blocking worker.
+    fn profile(&self) -> crate::profile::ProfileReport;
 }
 
 /// Where the dashboard HTTP listener binds.

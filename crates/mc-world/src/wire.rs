@@ -389,9 +389,8 @@ fn encode_block_palette(
             // SingleValuePalette: bpe=0, VarInt single state id, no
             // backing storage.
             //
-            // `palette() == None` implies the section was constructed
-            // via `ChunkSection::filled(state, _)`; `state` is what
-            // every cell holds, recoverable from `get(0,0,0)`.
+            // Single sections, including admitted one-entry palettes,
+            // expose their uniform state through `get(0, 0, 0)`.
             buf.push(0);
             write_varint(
                 buf,
@@ -403,7 +402,8 @@ fn encode_block_palette(
             if indices.bits_per_entry() >= DIRECT_BITS_THRESHOLD {
                 encode_block_direct(buf, palette, indices, project);
             } else {
-                buf.push(indices.bits_per_entry());
+                let bits = indices.bits_per_entry().max(4);
+                buf.push(bits);
                 write_varint(
                     buf,
                     i32::try_from(palette.len()).expect("palette len < i32::MAX"),
@@ -414,9 +414,7 @@ fn encode_block_palette(
                         i32::try_from(project(*state).0).expect("state id < i32::MAX"),
                     );
                 }
-                for word in pack_fixed_longs(indices.bits_per_entry(), indices.len(), |idx| {
-                    indices.get(idx)
-                }) {
+                for word in indices.words_at_bits(bits) {
                     buf.extend_from_slice(&(word as i64).to_be_bytes());
                 }
             }
@@ -614,12 +612,11 @@ pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
     }
 }
 
-/// Copy one section's 2048-byte nibble layer if it contains non-zero
-/// light. Missing lazy sections are all-zero and omitted from the wire
-/// present mask.
+/// Expand nonzero light at the wire boundary. Known zero sections use the
+/// empty mask rather than a redundant array.
 fn pack_section_layer(channel: &LightLayer, section_idx: usize) -> Option<Vec<u8>> {
     let layer = channel.section(section_idx)?;
-    Some(layer.to_vec())
+    (!layer.is_zero()).then(|| layer.to_vec())
 }
 
 fn write_varint(buf: &mut Vec<u8>, value: i32) {
@@ -637,6 +634,10 @@ fn write_varint(buf: &mut Vec<u8>, value: i32) {
 // -------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "wire_palette_tests.rs"]
+mod palette_tests;
 
 #[cfg(test)]
 mod tests {
@@ -858,7 +859,7 @@ mod tests {
             .expect("encode chunk data");
         assert_eq!(data.len(), geometry.section_count() * 8);
 
-        chunk.section_lights[15].block = Some(vec![0x0F; LIGHT_LAYER_BYTES]);
+        chunk.section_lights[15].block = Some(crate::chunk::LightSection::uniform(0x0F));
         let light = ChunkLight::from_section_lights(&chunk.section_lights)
             .expect("rebuild baked custom-geometry light");
         let wire = encode_chunk_light(&light);

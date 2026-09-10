@@ -1,0 +1,132 @@
+use std::sync::Arc;
+
+use mc_data::Identifier;
+use mc_protocol::packets::play::Direction;
+use mc_world::{BlockPos, BlockRegistry, BlockStateId};
+
+use super::super::PlayerPose;
+use super::super::use_item_on_adapter::placement_snapshot_for_test;
+use super::{chest, plan_block_placement, property};
+
+fn blocks() -> Arc<BlockRegistry> {
+    Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
+    )
+}
+
+fn default(blocks: &BlockRegistry, name: &str) -> BlockStateId {
+    blocks
+        .block(&Identifier::parse(name).unwrap())
+        .unwrap()
+        .default
+}
+
+#[test]
+fn adjacent_chest_placement_updates_both_halves_and_break_resets_partner() {
+    let blocks = blocks();
+    let air = default(&blocks, "minecraft:air");
+    let single = default(&blocks, "minecraft:chest");
+    let pos = BlockPos { x: 0, y: 64, z: 0 };
+    let neighbor = BlockPos { x: 1, ..pos };
+    let snapshot = placement_snapshot_for_test(Arc::clone(&blocks), &[(neighbor, single)]);
+    let pose = PlayerPose::new(0.0, 64.0, 0.0);
+    let plan = plan_block_placement(
+        &blocks,
+        single,
+        Some(&snapshot),
+        pos,
+        pose,
+        Direction::Up,
+        0.5,
+        air,
+    )
+    .unwrap();
+    let first = plan
+        .edits
+        .iter()
+        .find(|edit| edit.pos == pos)
+        .unwrap()
+        .new_state;
+    let second = plan
+        .edits
+        .iter()
+        .find(|edit| edit.pos == neighbor)
+        .unwrap()
+        .new_state;
+    assert_eq!(property(blocks.by_id(first).unwrap(), "type"), Some("left"));
+    assert_eq!(
+        property(blocks.by_id(second).unwrap(), "type"),
+        Some("right")
+    );
+    let paired =
+        placement_snapshot_for_test(Arc::clone(&blocks), &[(pos, first), (neighbor, second)]);
+    assert_eq!(
+        chest::paired_position(&blocks, |p| paired.get_cached_block(p), pos, first),
+        Some(neighbor)
+    );
+    assert_eq!(
+        chest::paired_position(&blocks, |p| paired.get_cached_block(p), neighbor, second),
+        Some(pos)
+    );
+    let reset = chest::reset_partner(&blocks, |p| paired.get_cached_block(p), pos, first).unwrap();
+    assert_eq!(reset.pos, neighbor);
+    assert_eq!(
+        property(blocks.by_id(reset.new_state).unwrap(), "type"),
+        Some("single")
+    );
+    let third = BlockPos { x: 2, ..pos };
+    let plan = plan_block_placement(
+        &blocks,
+        single,
+        Some(&paired),
+        third,
+        pose,
+        Direction::Up,
+        0.5,
+        air,
+    )
+    .unwrap();
+    assert_eq!(
+        property(blocks.by_id(plan.edits[0].new_state).unwrap(), "type"),
+        Some("single")
+    );
+    assert!(!plan.edits.iter().any(|edit| edit.pos == neighbor));
+}
+
+#[test]
+fn secondary_use_on_ground_keeps_adjacent_chests_separate() {
+    let blocks = blocks();
+    let single = default(&blocks, "minecraft:chest");
+    let air = default(&blocks, "minecraft:air");
+    let pos = BlockPos { x: 0, y: 64, z: 0 };
+    let neighbor = BlockPos { x: 1, ..pos };
+    let snapshot = placement_snapshot_for_test(Arc::clone(&blocks), &[(neighbor, single)]);
+    let pose = PlayerPose {
+        shifting: true,
+        ..PlayerPose::new(0.0, 64.0, 0.0)
+    };
+    let plan = plan_block_placement(
+        &blocks,
+        single,
+        Some(&snapshot),
+        pos,
+        pose,
+        Direction::Up,
+        0.5,
+        air,
+    )
+    .unwrap();
+    assert_eq!(
+        property(blocks.by_id(plan.edits[0].new_state).unwrap(), "type"),
+        Some("single")
+    );
+    assert!(!plan.edits.iter().any(|edit| edit.pos == neighbor));
+    let separate = placement_snapshot_for_test(
+        Arc::clone(&blocks),
+        &[(pos, plan.edits[0].new_state), (neighbor, single)],
+    );
+    assert_eq!(
+        chest::paired_position(&blocks, |p| separate.get_cached_block(p), pos, single),
+        None
+    );
+}

@@ -22,6 +22,10 @@ impl DashboardStats for FixedProvider {
     fn stats(&self) -> StatsPayload {
         self.payload.clone()
     }
+
+    fn profile(&self) -> crate::profile::ProfileReport {
+        crate::profile::ProfileSampler::new().capture(self.stats(), || serde_json::Value::Null)
+    }
 }
 
 /// Fully populated payload exercising every contract field.

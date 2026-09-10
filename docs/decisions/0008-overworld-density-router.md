@@ -1,7 +1,7 @@
 # ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, worldgen revision 18
+**Status:** Accepted, worldgen revision 20
 
 ## Context
 
@@ -12,6 +12,30 @@ height or decoration fix can remove. Tree placement also accepted any non-fluid
 block as support instead of the surface planned for that column.
 
 ## Decision
+
+Worldgen revision 20 widens the existing seeded river reaches and deepens their
+variable beds. Base width bounds increase from 16–32 to 20–40; these are carving
+falloff radii, not guaranteed water-surface widths. Runoff, the existing seeded
+reach multiplier, world scale and relief-dependent bank widening still vary
+width. Bed depth uses upstream runoff and the already evaluated broad hill field,
+bounded to 4.5–7.5 blocks before the existing coast/strength/detail blending.
+Shallow banks and weaker tributaries therefore remain shallower than channel
+centres; the generator does not produce a constant-depth canal.
+
+The bank-slope budget now reserves the same 7.5-block maximum bed depth used by
+carving. Existing curve/pruning bounds derive from the width constants and bank
+relief, so the wider/deeper profile does not add a second search authority,
+noise evaluation, cache or topology change. Both terrain modes use this profile.
+The existing persisted revision fence is unchanged: revision-19 worlds, including
+the owner's `sarvar`, require a fresh `world_dir` for revision 20. No existing
+chunks or owner metadata are rewritten and mixed-revision generation is rejected.
+
+Same-window diagnostic sampling on seeds 42, 91 and 80566456455891250 in both
+modes finds river-biome water-depth medians rising from 1–2 to 3–4 blocks,
+with sampled maxima 5–6 instead of 2–3. Width and bed cross-sections remain
+nonuniform. `.analysis/codex-logs/river-profile/` preserves the unchanged probe,
+baseline/candidate results and matched-coordinate sections. These measurements
+cover generated column geometry, not a graphical client acceptance pass.
 
 Worldgen revision 18 selects ocean temperature variants and snowy beaches from
 the same temperature and transition-domain field as inland and riparian biomes.

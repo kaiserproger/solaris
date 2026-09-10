@@ -11,6 +11,7 @@ use std::ops::Range;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
+pub mod aquatic_motion;
 pub mod attributes_26_1_2;
 pub mod dragon_26_1_2;
 pub mod effects_26_1_2;
@@ -1068,6 +1069,8 @@ impl EntityPhysicsQuery {
             | EntityPhysicsKind::ExternalFlight
             | EntityPhysicsKind::Living
             | EntityPhysicsKind::PowderSnowWalkableLiving
+            | EntityPhysicsKind::FishLiving
+            | EntityPhysicsKind::SquidLiving
             | EntityPhysicsKind::FallingBlock
             | EntityPhysicsKind::AquaticLiving => true,
         };
@@ -1097,6 +1100,8 @@ pub enum EntityPhysicsKind {
     ExternalFlight,
     Living,
     PowderSnowWalkableLiving,
+    FishLiving,
+    SquidLiving,
     AquaticLiving,
     FallingBlock,
     ArrowProjectile {
@@ -1434,6 +1439,12 @@ pub trait PathingProbe {
         self.can_stand_at(position)
     }
 
+    /// Water-only, collision-free occupancy for aquatic navigation. Unknown
+    /// terrain must not silently permit a swimmer to leave the water.
+    fn can_entity_swim_at(&self, _entity_id: EntityId, _position: Vec3) -> PathingProbeResult {
+        PathingProbeResult::Unloaded
+    }
+
     fn direct_path_resolved(&self, _entity_id: EntityId) {}
 }
 
@@ -1494,6 +1505,8 @@ struct RetainedPathState {
     target_reached: bool,
     #[serde(default)]
     resume_tick: u64,
+    #[serde(default)]
+    swim_speed: f32,
 }
 
 impl Default for RetainedPathState {
@@ -1514,6 +1527,7 @@ impl Default for RetainedPathState {
             stopped: false,
             target_reached: false,
             resume_tick: 0,
+            swim_speed: 0.0,
         }
     }
 }
@@ -1558,6 +1572,7 @@ struct GoalPathingRequest {
     target: Vec3,
     target_epoch: Option<u64>,
     speed: f64,
+    aquatic: Option<aquatic_motion::Swimmer>,
 }
 
 impl GoalPathingRequest {
@@ -1654,6 +1669,12 @@ impl PreparedGoalTick {
         mut visitor: impl FnMut(EntityId, Vec3),
     ) {
         for request in &self.pathing_requests {
+            if request.aquatic.is_some() {
+                aquatic_motion::visit_probe_positions(request, self.tick, budget, |position| {
+                    visitor(request.id, position);
+                });
+                continue;
+            }
             if request.speed <= 0.0 {
                 continue;
             }
@@ -2590,6 +2611,9 @@ fn resolve_retained_pathing(
     probe: &dyn PathingProbe,
     budget: PathingBudget,
 ) -> (PathingDecision, RetainedPathState) {
+    if request.aquatic.is_some() {
+        return aquatic_motion::resolve(request, tick, probe, budget);
+    }
     let mut path = request.expected_path;
     let current = request.expected_position;
     let mut probes = BudgetedPathingProbe::new(probe, budget.max_candidates_per_entity);
@@ -3094,10 +3118,6 @@ fn deterministic_unit(id: EntityId, phase: u64) -> f64 {
     mixed as f64 / u64::MAX as f64
 }
 
-fn deterministic_wave(id: EntityId, phase: u64) -> f64 {
-    deterministic_angle(id, phase.wrapping_add(0x41)).sin()
-}
-
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -3110,21 +3130,6 @@ fn yaw_from_velocity(velocity: Vec3) -> f32 {
         0.0
     } else {
         velocity.z.atan2(velocity.x).to_degrees() as f32 - 90.0
-    }
-}
-
-fn aquatic_rotation_from_velocity(velocity: Vec3) -> Rotation {
-    let yaw = yaw_from_velocity(velocity) + 90.0;
-    let horizontal = velocity.horizontal_len();
-    let pitch = if horizontal <= f64::EPSILON && velocity.y == 0.0 {
-        0.0
-    } else {
-        (-velocity.y).atan2(horizontal).to_degrees() as f32
-    };
-    Rotation {
-        yaw,
-        pitch: pitch.clamp(-35.0, 35.0),
-        head_yaw: yaw,
     }
 }
 
@@ -3677,27 +3682,6 @@ mod tests {
         let after_change = store.input_ai_stage_runs_for_test();
         assert_eq!(store.set_goals(goals), 2);
         assert_eq!(store.input_ai_stage_runs_for_test(), after_change);
-    }
-
-    #[test]
-    fn aquatic_wander_sets_3d_motion_and_pitch() {
-        let mut store = EntityStore::new();
-        let mut fish = SpawnEntity::new(2, "minecraft:cod", Vec3::new(0.0, 50.0, 0.0));
-        fish.goal = GoalState::AquaticWander {
-            speed: 0.2,
-            vertical_speed: 0.1,
-            period_ticks: 20,
-        };
-        let id = store.spawn(fish);
-
-        store.tick_goals(40);
-        let snapshot = store.snapshot(id).unwrap();
-
-        assert!(snapshot.velocity.horizontal_len() > 0.0);
-        assert!(snapshot.velocity.y.abs() > 0.0);
-        assert!(!snapshot.on_ground);
-        assert_ne!(snapshot.rotation.pitch, 0.0);
-        assert_eq!(snapshot.rotation.yaw, snapshot.rotation.head_yaw);
     }
 
     #[test]
@@ -4468,6 +4452,7 @@ mod tests {
                 target,
                 target_epoch: None,
                 speed: 1.0,
+                aquatic: None,
             }],
         };
         let mut declared = HashSet::new();
@@ -4750,6 +4735,7 @@ mod tests {
                 target,
                 target_epoch: None,
                 speed: 1.0,
+                aquatic: None,
             }],
         };
         let probe = CountingBlockedProbe(Cell::new(0));

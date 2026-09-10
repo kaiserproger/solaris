@@ -38,14 +38,20 @@ fn aquatic_entities_do_not_receive_generic_surface_buoyancy() {
 }
 
 #[test]
-fn aquatic_entities_keep_vanilla_fish_water_drag() {
+fn fish_move_before_drag_and_sink_while_squid_travel_does_not_double_damp() {
     let body = EntityBody {
         velocity: Vec3::new(1.0, 0.0, 0.0),
         ..stationary_body()
     };
-    let result = super::step_entity(body, &WaterWorld, PhysicsConfig::aquatic_entity());
+    let fish = super::step_entity(body, &WaterWorld, PhysicsConfig::fish_entity());
+    let squid = super::step_entity(body, &WaterWorld, PhysicsConfig::squid_entity());
 
-    assert!((result.body.velocity.x - 0.9).abs() < f64::EPSILON);
+    assert!((fish.body.position.x - 0.55).abs() < 1.0e-12);
+    assert_eq!(fish.body.position.y, body.position.y);
+    assert!((fish.body.velocity.x - 0.9).abs() < 1.0e-12);
+    assert!((fish.body.velocity.y + 0.1).abs() < 1.0e-12);
+    assert_eq!(squid.body.position, fish.body.position);
+    assert_eq!(squid.body.velocity, body.velocity);
 }
 
 /// Open water with the surface at the top of `y = 63`: fluid at and below,

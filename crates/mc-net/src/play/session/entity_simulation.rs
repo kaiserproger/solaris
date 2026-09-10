@@ -1188,7 +1188,7 @@ impl SessionRegistry {
         };
         let pathing_request_count = prepared_goal_tick.pathing_request_count();
         let pathing_aabbs = prepared_goal_tick.pathing_aabbs().clone();
-        let terrain_snapshot = if terrain_pathing_entities.is_empty() {
+        let terrain_snapshot = if terrain_pathing_entities.is_empty() && pathing_aabbs.is_empty() {
             None
         } else {
             world_read.zip(pathing_materials).map(|(world_read, _)| {

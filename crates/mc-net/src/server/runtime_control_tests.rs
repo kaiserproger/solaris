@@ -31,7 +31,7 @@ fn chunk_queue_backpressure_preserves_capacity_to_drain_work() {
 
     decision.pressure = Some(crate::AutoscalePressure::TickTime);
     apply_runtime_control_decision(&resources, &sessions, &decision, false).unwrap();
-    let permits: Vec<_> = (0..4)
+    let permits: Vec<_> = (0..7)
         .map(|_| {
             resources
                 .try_acquire_prepare_request()

@@ -101,3 +101,62 @@ Negative:
   generation change wakes and cancels stale waiters. It must not start a
   competing full flush. Tests without the server worker may use the bounded
   eight-chunk fallback, but that fallback is not a second production owner.
+- Indirect `ChunkSection` palettes and packed indices share an immutable
+  `Arc` payload across chunk snapshots. Editing detaches only the changed
+  section; no-op writes do not detach. Single-valued sections stay
+  allocation-free. The chunk mutation/replacement fences, Anvil encoding,
+  persistence authority and visible block values are unchanged.
+  Per-chunk heap budgeting conservatively charges the shared payload and its
+  reference-count header; it is not a deduplicated process-heap measurement.
+  This removes full-section copies during snapshot overlap, not the need to
+  retain genuinely live chunks or buffers. Reverting the private section payload
+  representation removes the optimization without a world-format migration.
+  The fixed 1,089-chunk allocation probe measured 1.7% less resident payload and
+  35.5% less live heap during edits with an old snapshot held. Its setter-heavy
+  workload was 18.5% slower by the median of four alternating-order run pairs;
+  this is not a TPS or whole-server memory comparison. Reproduction sources,
+  requested allocation bytes and RSS are in
+  `.analysis/codex-logs/chunk-memory/measurements.json`.
+- A writable world keeps its process-exclusive root lease until the final
+  `WorldRootLease` owner is dropped. That drop explicitly unlocks the file:
+  close-on-exec alone can leave the open-file-description lock alive in a
+  concurrently spawned child before exec. Private duplicated descriptors are
+  not additional world owners; supported same-process storage handles retain
+  the shared `Arc` lease. A duplicate-description regression preserves LSN 73
+  through flush/drop/reopen, while the independent-process exclusion and crash
+  recovery tests retain their separate contract. This demonstrates a concrete
+  lifetime defect, not the exact cause of a historical CI run.
+- The region LRU retains validated Anvil headers/location indexes and shared
+  open readers, not decompressed NBT for every chunk in a visited region.
+  Requested slots reuse bounded decoding; the reader mutex protects seek/read
+  only and is released before decompression. Flush replacement invalidates the
+  cache as before, and captured disk plans retain their existing reader lifetime.
+  Location-table corruption remains eager; payload corruption is reported when
+  that slot is requested. Whole-region operations retain aggregate decode limits.
+  On 1,811 stored owner chunks, standalone live heap fell from 198,570,425 to
+  100,825,394 bytes with identical resident checksum. Four alternating run pairs
+  measured median load time 0.593 versus 0.557 seconds. Evidence:
+  `.analysis/codex-logs/aquatic-ram/region-cache-comparison.json`.
+- Light layers now store repeated packed bytes inline and mixed 2,048-byte
+  arrays behind `Arc`, detaching on mutation. Unknown light remains distinct
+  from computed zero; fully computed zero persists explicitly and uses the
+  vanilla empty-light wire mask. Indirect block palettes use 1–3 bits in RAM
+  when possible; disk and wire repack to their minimum four-bit representation
+  without changing state values. The 256-to-257-state direct-wire boundary and
+  projected palette encoding have independent decoder regressions.
+  The same 1,811 stored chunks measured 100,825,603→42,859,987 requested live
+  bytes (57.5% less) with the frozen versus compact builds. Both released to
+  244 bytes after world drop while RSS retained its high-water allocation.
+  The probe's `checksum` is an estimated-byte sum, not a semantic hash.
+  Evidence: `.analysis/codex-logs/compact-profile/receipt.json`.
+- Explicit `profile` capture runs on a blocking worker. Published chunk
+  snapshots are cloned under short shard locks and traversed afterwards;
+  private pointer sets deduplicate shared payloads only inside the captured
+  publication set. Registry, worker scratch and other owner capacities are
+  separate estimates, not another world-budget authority. The system allocator
+  is unchanged; `stats_alloc` adds atomic requested-allocation counters, not
+  trimming, arena tuning or allocation stack tracing. CPU scopes use thread CPU
+  clocks, subtract nested scopes and poll async futures separately, so suspension
+  is not billed as CPU. Uninstrumented work, interval-boundary skew and unowned
+  heap remain explicit. No persistence ordering, mutation fence or worldgen
+  revision change is required by these storage/profile changes.

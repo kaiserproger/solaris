@@ -7,8 +7,8 @@ const MIN_CELL_BLOCKS: f64 = 32.0;
 const ACCUMULATION_DEPTH: u8 = 1;
 const MIN_CHANNEL_ACCUMULATION: f64 = 0.7;
 const FULL_CHANNEL_ACCUMULATION: f64 = 2.5;
-const MIN_CHANNEL_WIDTH_BLOCKS: f64 = 16.0;
-const MAX_CHANNEL_WIDTH_BLOCKS: f64 = 32.0;
+const MIN_CHANNEL_WIDTH_BLOCKS: f64 = 20.0;
+const MAX_CHANNEL_WIDTH_BLOCKS: f64 = 40.0;
 // Jitter removes the axis/diagonal lattice alignment; a smooth bend between
 // shared endpoints avoids replacing one ruler-straight reach with two.
 const ANCHOR_JITTER_FRACTION: f64 = 0.30;

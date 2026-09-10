@@ -105,9 +105,20 @@ Chunk generation, preparation and simulation planning share bounded CPU
 admission. Chunk-queue pressure includes requests still awaiting execution, not
 only completed results. It reduces producer rates and view limits without
 reducing the CPU capacity needed to drain those requests. Tick-time and memory
-pressure retain their existing CPU reductions; shutdown draining still reduces
-capacity to one. The application policy lives in `server/runtime_control.rs`;
+pressure reduce admission gradually; shutdown draining still reduces capacity
+to one immediately. The application policy lives in `server/runtime_control.rs`;
 there is no second executor, inline planning bypass or operator thread setting.
+
+Adaptive view/rate limits and work budgets use monotonic, continuous pressure
+and recovery windows, independently reset after each one-unit step. Both policy
+durations are seconds, normalized to at least 60; a step requires strictly more
+than that duration. Recovery also requires 20% tick-time headroom. Source recovery
+rechecks the latest tick and memory observation rather than manufacturing a
+healthy sample. Coalesced producer notifications retain an aggregate-zero
+recovery barrier before pending pressure states, including recovery followed by
+reactivation before consumption. Isolated slow-client shedding cannot establish
+continuous overload. Queue and memory admission fences and explicit draining
+remain immediate; delaying adaptive tuning does not delay those safety bounds.
 
 Resident and dirty byte usage are updated with the existing chunk-publication
 counters. Publication measures the replaced chunk before releasing its snapshot

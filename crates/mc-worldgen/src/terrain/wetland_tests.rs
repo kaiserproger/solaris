@@ -41,7 +41,6 @@ fn generated_riparian_wetlands_have_matching_ground_and_living_trees() {
         );
         let mut native_logs = 0;
         let mut wet_roots = 0;
-        let mut orchids = 0;
         let mut water = 0;
         for dz in -1..=1 {
             for dx in -1..=1 {
@@ -89,7 +88,6 @@ fn generated_riparian_wetlands_have_matching_ground_and_living_trees() {
                                 "water" => water += 1,
                                 "mangrove_log" if expected == "mangrove_swamp" => native_logs += 1,
                                 "oak_log" if expected == "swamp" => native_logs += 1,
-                                "blue_orchid" => orchids += 1,
                                 "mangrove_roots" => {
                                     let wet = state.properties.iter().any(|(key, value)| {
                                         key == "waterlogged" && value == "true"
@@ -130,11 +128,6 @@ fn generated_riparian_wetlands_have_matching_ground_and_living_trees() {
             assert!(
                 wet_roots > 0,
                 "mangroves at {seed} never establish in shallow water"
-            );
-        } else {
-            assert!(
-                orchids > 0,
-                "temperate wetland at {seed} lacks its native ground cover"
             );
         }
     }

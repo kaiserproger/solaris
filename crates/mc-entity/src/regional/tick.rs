@@ -81,6 +81,8 @@ impl RegionalTickWorld {
                     PhysicsConfig::living_entity()
                 }
                 EntityPhysicsKind::AquaticLiving => PhysicsConfig::aquatic_entity(),
+                EntityPhysicsKind::FishLiving => PhysicsConfig::fish_entity(),
+                EntityPhysicsKind::SquidLiving => PhysicsConfig::squid_entity(),
                 _ => continue,
             };
             let bounds = physics_sample_bounds(query, config);
@@ -131,6 +133,8 @@ impl RegionalPhysicsWorld {
                 PhysicsConfig::living_entity()
             }
             EntityPhysicsKind::AquaticLiving => PhysicsConfig::aquatic_entity(),
+            EntityPhysicsKind::FishLiving => PhysicsConfig::fish_entity(),
+            EntityPhysicsKind::SquidLiving => PhysicsConfig::squid_entity(),
             _ => return None,
         };
         if !self.samples_are_complete(query, config) {
@@ -540,6 +544,17 @@ impl OwnerPathingProbe<'_> {
 impl PathingProbe for OwnerPathingProbe<'_> {
     fn can_stand_at(&self, position: Vec3) -> PathingProbeResult {
         self.can_entity_stand_at(EntityId(i32::MIN), position)
+    }
+
+    fn can_entity_swim_at(&self, entity_id: EntityId, position: Vec3) -> PathingProbeResult {
+        crate::aquatic_motion::water_occupancy(
+            position,
+            physics_aabb(self.entity_aabbs, entity_id),
+            |x, y, z| {
+                self.state_at(x, y, z)
+                    .map(|state| self.world.materials.classify(state))
+            },
+        )
     }
 
     fn can_entity_stand_at(&self, entity_id: EntityId, position: Vec3) -> PathingProbeResult {

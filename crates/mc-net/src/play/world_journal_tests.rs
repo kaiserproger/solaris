@@ -39,8 +39,8 @@ fn snapshot(blocks: &BlockRegistry, position: ChunkPos, current_tick: u64) -> Ch
         .set_block(1, 64, 2, stone)
         .expect("test position is in the chunk");
     chunk.section_lights[8] = SectionLight {
-        block: Some(vec![0x21; mc_world::LIGHT_LAYER_BYTES]),
-        sky: Some(vec![0x54; mc_world::LIGHT_LAYER_BYTES]),
+        block: Some(mc_world::LightSection::uniform(0x21)),
+        sky: Some(mc_world::LightSection::uniform(0x54)),
     };
     chunk
         .extras
@@ -90,8 +90,8 @@ fn round_trips_full_chunk_snapshot_and_restart_relative_tick() {
     assert_eq!(chunks[0].pos, position);
     assert_eq!(chunks[0].get_block(1, 64, 2).unwrap().0, 1);
     assert_eq!(
-        chunks[0].section_lights[8].block.as_deref(),
-        Some(&vec![0x21; mc_world::LIGHT_LAYER_BYTES][..])
+        chunks[0].section_lights[8].block,
+        Some(mc_world::LightSection::uniform(0x21))
     );
     assert_eq!(chunks[0].scheduled_block_ticks()[0].trigger_tick, 17);
     assert!(

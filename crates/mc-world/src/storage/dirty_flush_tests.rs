@@ -7,6 +7,42 @@ use mc_data::block_light::BlockLightTable;
 use mc_nbt::Tag;
 
 #[test]
+fn dirty_flush_reopens_cached_region_after_replace_and_preserves_unrequested_chunk() {
+    let registry = air_stone_registry();
+    let temp = tempfile::tempdir().unwrap();
+    let region_dir = temp.path().join("region");
+    std::fs::create_dir_all(&region_dir).unwrap();
+    let path = region_dir.join("r.0.0.mca");
+    let mut payloads = Vec::new();
+    for x in [0, 1] {
+        let mut chunk = Chunk::empty(
+            ChunkPos { x, z: 0 },
+            BlockStateId(0),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        if x == 1 {
+            chunk.set_block(0, 64, 0, BlockStateId(1));
+        }
+        payloads.push(crate::anvil::chunk_to_payload(&chunk, &registry, 0).unwrap());
+    }
+    crate::anvil::write_region(&path, &payloads).unwrap();
+    let mut world = WorldStorage::open_with_capacities(temp.path(), registry, 1, 1).unwrap();
+    let edited = BlockPos { x: 0, y: 64, z: 0 };
+    let neighbor = BlockPos { x: 16, y: 64, z: 0 };
+    assert_eq!(world.get_block(edited).unwrap(), Some(BlockStateId(0)));
+    world
+        .set_block_at(edited, BlockStateId(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(world.flush_dirty().unwrap(), 1);
+
+    // Loading the untouched neighbor evicts the edited resident chunk while
+    // keeping this region cached. Its next read must use the replaced file.
+    assert_eq!(world.get_block(neighbor).unwrap(), Some(BlockStateId(1)));
+    assert_eq!(world.get_block(edited).unwrap(), Some(BlockStateId(1)));
+}
+
+#[test]
 fn dirty_flush_rejects_snapshot_position_mismatch_before_writing() {
     let tmp_world = tempfile::tempdir().unwrap();
     let region_dir = tmp_world.path().join("region");

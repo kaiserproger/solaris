@@ -162,6 +162,7 @@ pub(super) struct ChunkStreamState {
     direction_yaw: f32,
     view_distance: i32,
     last_sent_view_distance: Option<i32>,
+    last_observed_autoscale_decision: Option<crate::AutoscaleDecision>,
     client_view_distance_cap: i32,
     runtime_view_distance_limit: i32,
     scheduler: ChunkScheduler,
@@ -500,6 +501,7 @@ impl ChunkStreamState {
             direction_yaw,
             view_distance: vd,
             last_sent_view_distance: None,
+            last_observed_autoscale_decision: None,
             client_view_distance_cap: vd,
             runtime_view_distance_limit: vd,
             scheduler,
@@ -778,6 +780,18 @@ impl ChunkStreamState {
         self.publish_active_generation();
         self.reset_window_metrics();
         self.progress_notify.notify_one();
+        debug!(
+            target: "solaris::chunk_visibility",
+            event = "chunk_view_replay",
+            session_id = self.session_id,
+            tick = self.sessions.simulation_tick(),
+            generation = self.scheduler.current_generation().0,
+            center_cx = self.center_cx,
+            center_cz = self.center_cz,
+            radius = self.view_distance,
+            reason = "respawn",
+            "chunk view scheduled for full replay"
+        );
     }
 
     fn reset_window_metrics(&mut self) {
@@ -873,6 +887,28 @@ impl ChunkStreamState {
                 self.compression,
             )
             .await?;
+            let decision = self.last_observed_autoscale_decision.as_ref();
+            debug!(
+                target: "solaris::chunk_visibility",
+                event = "chunk_radius_sent",
+                session_id = self.session_id,
+                tick = self.sessions.simulation_tick(),
+                generation = self.scheduler.current_generation().0,
+                previous_radius = ?self.last_sent_view_distance,
+                new_radius = self.view_distance,
+                client_radius_cap = self.client_view_distance_cap,
+                runtime_radius_limit = self.runtime_view_distance_limit,
+                center_cx = self.center_cx,
+                center_cz = self.center_cz,
+                autoscale_last_action = decision.map(|decision| {
+                    crate::control_plane::autoscale_action_label(decision.action)
+                }),
+                autoscale_last_pressure = decision.map(|decision| {
+                    crate::control_plane::autoscale_pressure_label(decision.pressure)
+                }),
+                autoscale_last_reason = decision.map(|decision| decision.reason.as_str()),
+                "chunk cache radius packet written"
+            );
             self.last_sent_view_distance = Some(self.view_distance);
         }
         for (chunk_x, chunk_z) in unloads {
@@ -886,6 +922,7 @@ impl ChunkStreamState {
                 self.compression,
             )
             .await?;
+            self.log_chunk_unload(chunk_x, chunk_z, "runtime_control");
         }
         if !self.memory_pressure_active {
             self.dispatch_available().await;
@@ -934,6 +971,23 @@ impl ChunkStreamState {
         Ok(sent > 0)
     }
 
+    pub(super) fn log_chunk_unload(&self, chunk_x: i32, chunk_z: i32, reason: &'static str) {
+        debug!(
+            target: "solaris::chunk_visibility",
+            event = "chunk_unload_sent",
+            session_id = self.session_id,
+            tick = self.sessions.simulation_tick(),
+            generation = self.scheduler.current_generation().0,
+            chunk_x,
+            chunk_z,
+            center_cx = self.center_cx,
+            center_cz = self.center_cz,
+            radius = self.view_distance,
+            reason,
+            "chunk unload packet written"
+        );
+    }
+
     fn observe_runtime_control(&mut self) -> Vec<(i32, i32)> {
         let Some(runtime_control) = self.runtime_control.clone() else {
             return Vec::new();
@@ -962,6 +1016,11 @@ impl ChunkStreamState {
             self.shed_memory_pressure_work();
         }
         let unloads = self.apply_runtime_control_limits(snapshot.limits);
+        if tracing::enabled!(target: "solaris::chunk_visibility", tracing::Level::DEBUG) {
+            // Preserve the decision from the snapshot actually applied, not a
+            // newer control-plane decision sampled after the socket write.
+            self.last_observed_autoscale_decision = Some(snapshot.last_decision);
+        }
         self.memory_pressure_active = memory_pressure_active;
         if memory_pressure_active {
             self.set_stop_reason(ChunkPipelineStopReason::MemoryPressure);
@@ -1328,31 +1387,34 @@ impl ChunkStreamState {
                     }
                 };
                 let _request_admission = request_admission;
-                prepare_chunk_request(
-                    request,
-                    world,
-                    world_read,
-                    world_mutation,
-                    biomes,
-                    blocks,
-                    block_light,
-                    items,
-                    tags,
-                    recipes,
-                    block_entity_types,
-                    passive_herd_surface,
-                    passive_herd_fallback_surfaces,
-                    passive_herd_water,
-                    passive_herd_passable,
-                    passive_spawn_rules,
-                    entity_types,
-                    compression,
-                    resources,
-                    dirty_flush,
-                    active_generation,
-                    generation_changed,
-                    current_tick,
-                    loader_block_projection,
+                crate::resource_profile::measure_future(
+                    crate::resource_profile::CpuStage::ChunkPreparation,
+                    prepare_chunk_request(
+                        request,
+                        world,
+                        world_read,
+                        world_mutation,
+                        biomes,
+                        blocks,
+                        block_light,
+                        items,
+                        tags,
+                        recipes,
+                        block_entity_types,
+                        passive_herd_surface,
+                        passive_herd_fallback_surfaces,
+                        passive_herd_water,
+                        passive_herd_passable,
+                        passive_spawn_rules,
+                        entity_types,
+                        compression,
+                        resources,
+                        dirty_flush,
+                        active_generation,
+                        generation_changed,
+                        current_tick,
+                        loader_block_projection,
+                    ),
                 )
                 .await
             });
@@ -1472,31 +1534,34 @@ impl ChunkStreamState {
                         {
                             return;
                         }
-                        let result = prepare_chunk_request(
-                            request,
-                            Arc::clone(&world),
-                            world_read.clone(),
-                            world_mutation,
-                            Arc::clone(&biomes),
-                            Arc::clone(&blocks),
-                            block_light.as_ref().map(Arc::clone),
-                            Arc::clone(&items),
-                            Arc::clone(&tags),
-                            Arc::clone(&recipes),
-                            Arc::clone(&block_entity_types),
-                            passive_herd_surface,
-                            Arc::clone(&passive_herd_fallback_surfaces),
-                            Arc::clone(&passive_herd_water),
-                            Arc::clone(&passive_herd_passable),
-                            Arc::clone(&passive_spawn_rules),
-                            Arc::clone(&entity_types),
-                            compression,
-                            resources.clone(),
-                            dirty_flush,
-                            Arc::new(AtomicU64::new(request.generation.0)),
-                            Arc::new(tokio::sync::Notify::new()),
-                            current_tick,
-                            None,
+                        let result = crate::resource_profile::measure_future(
+                            crate::resource_profile::CpuStage::ChunkPreparation,
+                            prepare_chunk_request(
+                                request,
+                                Arc::clone(&world),
+                                world_read.clone(),
+                                world_mutation,
+                                Arc::clone(&biomes),
+                                Arc::clone(&blocks),
+                                block_light.as_ref().map(Arc::clone),
+                                Arc::clone(&items),
+                                Arc::clone(&tags),
+                                Arc::clone(&recipes),
+                                Arc::clone(&block_entity_types),
+                                passive_herd_surface,
+                                Arc::clone(&passive_herd_fallback_surfaces),
+                                Arc::clone(&passive_herd_water),
+                                Arc::clone(&passive_herd_passable),
+                                Arc::clone(&passive_spawn_rules),
+                                Arc::clone(&entity_types),
+                                compression,
+                                resources.clone(),
+                                dirty_flush,
+                                Arc::new(AtomicU64::new(request.generation.0)),
+                                Arc::new(tokio::sync::Notify::new()),
+                                current_tick,
+                                None,
+                            ),
                         )
                         .await;
                         if let ChunkPrepareOutcome::Ready(prepared) = result.outcome {
@@ -1633,12 +1698,41 @@ impl ChunkStreamState {
                 crate::operator_metrics::record_chunk_streamed();
                 crate::operator_metrics::record_outbound_bytes(prepared.frame.len() as u64);
                 write_timing.socket_write_ms = socket_write_started.elapsed().as_millis() as u64;
+                debug!(
+                    target: "solaris::chunk_visibility",
+                    event = "chunk_sent",
+                    session_id = self.session_id,
+                    tick = self.sessions.simulation_tick(),
+                    generation = request.generation.0,
+                    sequence = request.priority.sequence,
+                    chunk_x = cx,
+                    chunk_z = cz,
+                    prepared_revision = ?prepared_revision,
+                    already_loaded = self.loaded.contains(&loaded_chunk),
+                    center_cx = self.center_cx,
+                    center_cz = self.center_cz,
+                    radius = self.view_distance,
+                    framed_bytes = prepared.frame.len(),
+                    "chunk data packet written"
+                );
                 let visibility = if let Some(revision) = prepared_revision {
                     let Some(visibility) = self.sessions.mark_loaded_if_prepared_revision_current(
                         self.session_id,
                         (cx, cz),
                         revision,
                     ) else {
+                        debug!(
+                            target: "solaris::chunk_visibility",
+                            event = "chunk_send_invalidated",
+                            session_id = self.session_id,
+                            tick = self.sessions.simulation_tick(),
+                            generation = request.generation.0,
+                            sequence = request.priority.sequence,
+                            chunk_x = cx,
+                            chunk_z = cz,
+                            prepared_revision = revision,
+                            "chunk invalidated after socket write; requeueing"
+                        );
                         light_cache.remove(ChunkPos { x: cx, z: cz });
                         self.release_prepare_claim((cx, cz), prepare_claim);
                         if !self.scheduler.defer(request) {
@@ -2311,7 +2405,7 @@ async fn prepare_chunk_request(
         let _permit = cpu_permit;
         let built = if let Some(table) = block_light.as_deref() {
             CHUNK_LIGHT_WORKSPACE.with_borrow_mut(|workspace| {
-                build_chunk_packet(
+                let result = build_chunk_packet(
                     centre.as_ref(),
                     &neighbourhood,
                     biomes.as_ref(),
@@ -2327,11 +2421,14 @@ async fn prepare_chunk_request(
                     passive_herd_passable.as_ref(),
                     passive_spawn_rules.as_ref(),
                     entity_types.as_ref(),
-                    Some(workspace),
+                    Some(&mut *workspace),
                     request.chunk_x,
                     request.chunk_z,
                     loader_block_projection.as_ref(),
-                )
+                );
+                CHUNK_LIGHT_WORKSPACE_GAUGE
+                    .with_borrow_mut(|gauge| gauge.update(workspace.allocated_bytes()));
+                result
             })
         } else {
             build_chunk_packet(
@@ -2357,7 +2454,10 @@ async fn prepare_chunk_request(
             )
         }
         .map_err(|err| err.to_string())?;
-        frame_chunk_packet(built, compression).map_err(|err| err.to_string())
+        crate::resource_profile::measure(crate::resource_profile::CpuStage::PacketFraming, || {
+            frame_chunk_packet(built, compression)
+        })
+        .map_err(|err| err.to_string())
     })
     .await
     {
@@ -3123,7 +3223,9 @@ async fn load_chunk_from_disk(
     }
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        plan.load()
+        crate::resource_profile::measure(crate::resource_profile::CpuStage::ChunkDisk, || {
+            plan.load()
+        })
     })
     .await
     {
@@ -3152,7 +3254,10 @@ async fn generate_fresh_chunk(
     }
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut chunk = generator.generate(pos);
+        let mut chunk = crate::resource_profile::measure(
+            crate::resource_profile::CpuStage::ChunkGeneration,
+            || generator.generate(pos),
+        );
         chunk.mark_dirty();
         chunk
     })
@@ -3193,22 +3298,35 @@ fn build_chunk_packet(
     cz: i32,
     loader_block_projection: Option<&crate::loader::LoaderBlockProjection>,
 ) -> Result<BuiltChunkPacket, mc_world::wire::WireError> {
+    let _cpu =
+        crate::resource_profile::CpuScope::new(crate::resource_profile::CpuStage::ChunkPreparation);
     let mut timing = ChunkBuildTiming::default();
 
     let chunk_data_started = Instant::now();
     let data = match loader_block_projection {
-        Some(projection) => mc_world::wire::encode_chunk_data_with_block_projection(
-            centre,
-            biomes,
-            blocks,
-            &|state| projection.project(state),
-        )?,
-        None => encode_chunk_data(centre, biomes, blocks)?,
+        Some(projection) => {
+            crate::resource_profile::measure(crate::resource_profile::CpuStage::ChunkData, || {
+                mc_world::wire::encode_chunk_data_with_block_projection(
+                    centre,
+                    biomes,
+                    blocks,
+                    &|state| projection.project(state),
+                )
+            })?
+        }
+        None => {
+            crate::resource_profile::measure(crate::resource_profile::CpuStage::ChunkData, || {
+                encode_chunk_data(centre, biomes, blocks)
+            })?
+        }
     };
     timing.chunk_data_ms = chunk_data_started.elapsed().as_millis() as u64;
 
     let heightmap_started = Instant::now();
-    let heightmaps = client_heightmaps(centre)
+    let heightmaps =
+        crate::resource_profile::measure(crate::resource_profile::CpuStage::Heightmaps, || {
+            client_heightmaps(centre)
+        })
         .into_iter()
         .map(|h| ChunkHeightmap {
             type_id: h.type_id,
@@ -3221,7 +3339,10 @@ fn build_chunk_packet(
     let light = if block_light.is_some() {
         if let Some(baked) = ChunkLight::from_chunk(centre) {
             let light_encode_started = Instant::now();
-            let wire = encode_chunk_light(&baked);
+            let wire = crate::resource_profile::measure(
+                crate::resource_profile::CpuStage::LightEncoding,
+                || encode_chunk_light(&baked),
+            );
             timing.light_encode_ms = light_encode_started.elapsed().as_millis() as u64;
             computed_light = Some(baked);
             LightData {
@@ -3244,11 +3365,17 @@ fn build_chunk_packet(
             refs[1][1] = Some(centre);
 
             let light_compute_started = Instant::now();
-            let computed = compute_chunk_light_in(ws, refs, table);
+            let computed = crate::resource_profile::measure(
+                crate::resource_profile::CpuStage::Lighting,
+                || compute_chunk_light_in(ws, refs, table),
+            );
             timing.light_compute_ms = light_compute_started.elapsed().as_millis() as u64;
 
             let light_encode_started = Instant::now();
-            let wire = encode_chunk_light(&computed);
+            let wire = crate::resource_profile::measure(
+                crate::resource_profile::CpuStage::LightEncoding,
+                || encode_chunk_light(&computed),
+            );
             timing.light_encode_ms = light_encode_started.elapsed().as_millis() as u64;
             computed_light = Some(computed);
             LightData {
@@ -4496,31 +4623,34 @@ mod tests {
             generation: ChunkPipelineGeneration(1),
         };
 
-        let result = prepare_chunk_request(
-            request,
-            Arc::clone(&world),
-            None,
-            None,
-            Arc::new(test_biome_registry()),
-            registry,
-            None,
-            Arc::new(ItemRegistry::from_report(&[])),
-            Arc::new(TagsData::default()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
-            None,
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-            Compression::Disabled,
-            resources,
-            None,
-            Arc::new(AtomicU64::new(2)),
-            Arc::new(tokio::sync::Notify::new()),
-            0,
-            None,
+        let result = crate::resource_profile::measure_future(
+            crate::resource_profile::CpuStage::ChunkPreparation,
+            prepare_chunk_request(
+                request,
+                Arc::clone(&world),
+                None,
+                None,
+                Arc::new(test_biome_registry()),
+                registry,
+                None,
+                Arc::new(ItemRegistry::from_report(&[])),
+                Arc::new(TagsData::default()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+                None,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+                Compression::Disabled,
+                resources,
+                None,
+                Arc::new(AtomicU64::new(2)),
+                Arc::new(tokio::sync::Notify::new()),
+                0,
+                None,
+            ),
         )
         .await;
 
@@ -4544,8 +4674,11 @@ mod tests {
         let mut block = vec![0; mc_world::chunk::LIGHT_LAYER_BYTES];
         sky[0] = 0x21;
         block[0] = 0x43;
-        centre.section_lights[0].sky = Some(sky.clone());
-        centre.section_lights[0].block = Some(block.clone());
+        centre.section_lights[0].sky =
+            Some(mc_world::LightSection::from_bytes(sky.try_into().unwrap()));
+        centre.section_lights[0].block = Some(mc_world::LightSection::from_bytes(
+            block.try_into().unwrap(),
+        ));
         let neighbourhood: [[Option<Arc<Chunk>>; 3]; 3] =
             std::array::from_fn(|_| std::array::from_fn(|_| None));
         let table =
@@ -4579,8 +4712,8 @@ mod tests {
             .light
             .expect("baked light should populate the play light cache");
         assert_eq!(built.timing.light_compute_ms, 0);
-        assert_eq!(light.sky.section(0).unwrap()[0], 0x21);
-        assert_eq!(light.block.section(0).unwrap()[0], 0x43);
+        assert_eq!(light.sky.section(0).unwrap().byte(0), 0x21);
+        assert_eq!(light.block.section(0).unwrap().byte(0), 0x43);
     }
 
     #[test]
@@ -4650,36 +4783,39 @@ mod tests {
             generation: ChunkPipelineGeneration(1),
         };
 
-        let result = prepare_chunk_request(
-            request,
-            Arc::clone(&world),
-            Some(world_read.clone()),
-            Some(world_mutation),
-            Arc::new(test_biome_registry()),
-            Arc::clone(&registry),
-            Some(Arc::new(BlockLightTable::from_arrays(
-                "test",
-                vec![0],
-                vec![0],
-                vec![true],
-            ))),
-            Arc::new(ItemRegistry::from_report(&[])),
-            Arc::new(TagsData::default()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
-            None,
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-            Compression::Disabled,
-            ChunkPipelineResources::with_limits(1, 1),
-            None,
-            Arc::new(AtomicU64::new(1)),
-            Arc::new(tokio::sync::Notify::new()),
-            0,
-            None,
+        let result = crate::resource_profile::measure_future(
+            crate::resource_profile::CpuStage::ChunkPreparation,
+            prepare_chunk_request(
+                request,
+                Arc::clone(&world),
+                Some(world_read.clone()),
+                Some(world_mutation),
+                Arc::new(test_biome_registry()),
+                Arc::clone(&registry),
+                Some(Arc::new(BlockLightTable::from_arrays(
+                    "test",
+                    vec![0],
+                    vec![0],
+                    vec![true],
+                ))),
+                Arc::new(ItemRegistry::from_report(&[])),
+                Arc::new(TagsData::default()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+                None,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+                Compression::Disabled,
+                ChunkPipelineResources::with_limits(1, 1),
+                None,
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(tokio::sync::Notify::new()),
+                0,
+                None,
+            ),
         )
         .await;
 
@@ -5202,31 +5338,34 @@ mod tests {
         let mut light_cache = LightCache::new();
 
         let request = stream.scheduler.poll_next().expect("request");
-        let result = prepare_chunk_request(
-            request,
-            Arc::clone(&world),
-            None,
-            None,
-            Arc::new(test_biome_registry()),
-            Arc::clone(&registry),
-            None,
-            Arc::new(ItemRegistry::from_report(&[])),
-            Arc::new(TagsData::default()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
-            None,
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-            Compression::Disabled,
-            ChunkPipelineResources::with_limits(1, 1),
-            None,
-            Arc::clone(&stream.active_generation),
-            Arc::clone(&stream.generation_changed),
-            0,
-            None,
+        let result = crate::resource_profile::measure_future(
+            crate::resource_profile::CpuStage::ChunkPreparation,
+            prepare_chunk_request(
+                request,
+                Arc::clone(&world),
+                None,
+                None,
+                Arc::new(test_biome_registry()),
+                Arc::clone(&registry),
+                None,
+                Arc::new(ItemRegistry::from_report(&[])),
+                Arc::new(TagsData::default()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+                None,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+                Compression::Disabled,
+                ChunkPipelineResources::with_limits(1, 1),
+                None,
+                Arc::clone(&stream.active_generation),
+                Arc::clone(&stream.generation_changed),
+                0,
+                None,
+            ),
         )
         .await;
         assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));
@@ -5622,8 +5761,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn runtime_control_queue_pressure_scales_live_send_budget() {
+    #[tokio::test(start_paused = true)]
+    async fn sustained_runtime_control_queue_pressure_scales_live_send_budget() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
             Arc::clone(&registry),
@@ -5645,7 +5784,7 @@ mod tests {
                 min_chunk_generate_rate: 1,
                 max_chunk_generate_rate: 32,
                 queue_pressure_percent: 75,
-                scale_down_after_ticks: 1,
+                scale_down_after_seconds: 60,
                 ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
             },
             initial_limits: crate::RuntimeControlLimits {
@@ -5725,7 +5864,35 @@ mod tests {
         stream.observe_runtime_control();
         assert!(stream.chunk_queue_saturated);
         let owner_decision = observe_next_runtime_control_signal(&control, &mut signals).await;
-        assert_eq!(owner_decision.action, crate::AutoscaleAction::ScaleDown);
+        assert_eq!(owner_decision.action, crate::AutoscaleAction::Hold);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            control.observe(healthy_runtime_control_input()).action,
+            crate::AutoscaleAction::Hold
+        );
+        assert_eq!(control.snapshot().limits.chunk_send_rate, 4);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            control.observe(healthy_runtime_control_input()).action,
+            crate::AutoscaleAction::ScaleDown
+        );
+        let request = stream.scheduler.poll_next().expect("fourth queued chunk");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            prepare_claim: None,
+            fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
+            staged: Vec::new(),
+            outcome: ChunkPrepareOutcome::Ready(Box::new(PreparedChunkFrame {
+                frame: Bytes::from_static(b"prepared-frame"),
+                light: None,
+                herd_spawns: Vec::new(),
+                hydrated_campfires: Vec::new(),
+                packet_data_len: 1,
+                build_timing: ChunkBuildTiming::default(),
+                write_timing: ChunkWriteTiming::default(),
+            })),
+        });
         stream.observe_runtime_control();
         let mut writer = tokio::io::sink();
         let mut light_cache = LightCache::new();
@@ -5746,8 +5913,8 @@ mod tests {
             snapshot.last_decision.pressure,
             Some(crate::AutoscalePressure::ChunkQueue)
         );
-        assert_eq!(snapshot.limits.chunk_send_rate, 2);
-        assert_eq!(stream.emitted, 2);
+        assert_eq!(snapshot.limits.chunk_send_rate, 3);
+        assert_eq!(stream.emitted, 3);
         assert_eq!(stream.ready.len(), 1);
         assert_eq!(stream.last_stop_reason, ChunkPipelineStopReason::SendBudget);
     }
@@ -5854,7 +6021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_control_memory_pressure_sheds_ready_and_in_flight_work() {
+    async fn runtime_control_memory_admission_immediately_sheds_ready_and_in_flight_work() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
             Arc::clone(&registry),
@@ -5869,8 +6036,8 @@ mod tests {
         let control = crate::RuntimeControlHandle::new_with_memory_pressure(
             crate::RuntimeControlConfig {
                 policy: crate::AutoscalePolicy {
-                    min_view_distance: 1,
-                    max_view_distance: 1,
+                    min_view_distance: 16,
+                    max_view_distance: 16,
                     min_chunk_send_rate: 1,
                     max_chunk_send_rate: 4,
                     min_chunk_load_rate: 1,
@@ -5879,11 +6046,10 @@ mod tests {
                     max_chunk_generate_rate: 32,
                     queue_pressure_percent: 100,
                     memory_pressure_percent: 50,
-                    scale_down_after_ticks: 1,
                     ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
                 },
                 initial_limits: crate::RuntimeControlLimits {
-                    view_distance: 1,
+                    view_distance: 16,
                     chunk_send_rate: 4,
                     chunk_load_rate: 64,
                     chunk_generate_rate: 32,
@@ -5917,7 +6083,7 @@ mod tests {
             0,
             0,
             0.0,
-            1,
+            16,
             ChunkPipelineResources::with_limits(1, 1),
             policy,
         )
@@ -5945,6 +6111,10 @@ mod tests {
         stream.observe_runtime_control();
 
         let snapshot = control.snapshot();
+        assert_eq!(snapshot.last_decision.action, crate::AutoscaleAction::Hold);
+        assert_eq!(snapshot.limits.view_distance, 16);
+        assert_eq!(stream.view_distance, 16);
+        assert_eq!(snapshot.limits.chunk_send_rate, 4);
         assert_eq!(
             snapshot.last_decision.pressure,
             Some(crate::AutoscalePressure::Memory)
@@ -5965,7 +6135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_control_memory_pressure_pauses_dispatch_until_pressure_clears() {
+    async fn runtime_control_memory_admission_immediately_pauses_dispatch_until_pressure_clears() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
             Arc::clone(&registry),
@@ -5980,8 +6150,8 @@ mod tests {
         let control = crate::RuntimeControlHandle::new_with_memory_pressure(
             crate::RuntimeControlConfig {
                 policy: crate::AutoscalePolicy {
-                    min_view_distance: 1,
-                    max_view_distance: 1,
+                    min_view_distance: 16,
+                    max_view_distance: 16,
                     min_chunk_send_rate: 1,
                     max_chunk_send_rate: 4,
                     min_chunk_load_rate: 1,
@@ -5989,12 +6159,10 @@ mod tests {
                     min_chunk_generate_rate: 1,
                     max_chunk_generate_rate: 32,
                     memory_pressure_percent: 50,
-                    scale_down_after_ticks: 1,
-                    scale_up_after_ticks: 1,
                     ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
                 },
                 initial_limits: crate::RuntimeControlLimits {
-                    view_distance: 1,
+                    view_distance: 16,
                     chunk_send_rate: 4,
                     chunk_load_rate: 64,
                     chunk_generate_rate: 32,
@@ -6028,7 +6196,7 @@ mod tests {
             0,
             0,
             0.0,
-            1,
+            16,
             ChunkPipelineResources::with_limits(1, 1),
             policy,
         )
@@ -6039,6 +6207,7 @@ mod tests {
         stream.step(&mut writer, &mut light_cache).await.unwrap();
 
         assert_eq!(stream.scheduler.in_flight_len(), 0);
+        assert_eq!(stream.view_distance, 16);
         assert_eq!(
             stream.last_stop_reason,
             ChunkPipelineStopReason::MemoryPressure
@@ -6057,8 +6226,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn runtime_control_queue_pressure_replans_live_view_distance() {
+    #[tokio::test(start_paused = true)]
+    async fn sustained_runtime_control_queue_pressure_replans_live_view_distance() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
             Arc::clone(&registry),
@@ -6090,7 +6259,7 @@ mod tests {
                 min_chunk_generate_rate: 32,
                 max_chunk_generate_rate: 32,
                 queue_pressure_percent: 1,
-                scale_down_after_ticks: 1,
+                scale_down_after_seconds: 60,
                 ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
             },
             initial_limits: crate::RuntimeControlLimits {
@@ -6153,7 +6322,18 @@ mod tests {
 
         stream.step(&mut server, &mut light_cache).await.unwrap();
         let owner_decision = observe_next_runtime_control_signal(&control, &mut signals).await;
-        assert_eq!(owner_decision.action, crate::AutoscaleAction::ScaleDown);
+        assert_eq!(owner_decision.action, crate::AutoscaleAction::Hold);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            control.observe(healthy_runtime_control_input()).action,
+            crate::AutoscaleAction::Hold
+        );
+        assert_eq!(control.snapshot().limits.view_distance, 3);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            control.observe(healthy_runtime_control_input()).action,
+            crate::AutoscaleAction::ScaleDown
+        );
         stream.step(&mut server, &mut light_cache).await.unwrap();
 
         let snapshot = control.snapshot();
@@ -6838,7 +7018,7 @@ mod tests {
                 min_chunk_generate_rate: 1,
                 max_chunk_generate_rate: 32,
                 target_tick_ms: 1,
-                scale_down_after_ticks: 1,
+                scale_down_after_seconds: 60,
                 ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
             },
             initial_limits: crate::RuntimeControlLimits {
@@ -6989,8 +7169,9 @@ mod tests {
             ..ChunkPipelinePolicy::default()
         };
         let resources = ChunkPipelineResources::with_limits(8, 8);
-        resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
-        resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
+        for _ in 0..5 {
+            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
+        }
         assert_eq!(resources.prepare_limit(), 2);
         let mut stream = ChunkStreamState::new(
             Arc::clone(&world),
@@ -7777,8 +7958,8 @@ mod tests {
         assert!(sessions.release_prepared_chunk_claim(chunk, replacement));
     }
 
-    #[tokio::test]
-    async fn runtime_control_step_scales_prepare_dispatch_before_spawning_workers() {
+    #[tokio::test(start_paused = true)]
+    async fn sustained_runtime_control_pressure_scales_prepare_dispatch_before_spawning_workers() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
             Arc::clone(&registry),
@@ -7801,7 +7982,7 @@ mod tests {
                 min_chunk_generate_rate: 64,
                 max_chunk_generate_rate: 64,
                 queue_pressure_percent: 1,
-                scale_down_after_ticks: 1,
+                scale_down_after_seconds: 60,
                 ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
             },
             initial_limits: crate::RuntimeControlLimits {
@@ -7856,7 +8037,18 @@ mod tests {
 
         stream.observe_runtime_control();
         let owner_decision = observe_next_runtime_control_signal(&control, &mut signals).await;
-        assert_eq!(owner_decision.action, crate::AutoscaleAction::ScaleDown);
+        assert_eq!(owner_decision.action, crate::AutoscaleAction::Hold);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            control.observe(healthy_runtime_control_input()).action,
+            crate::AutoscaleAction::Hold
+        );
+        assert_eq!(control.snapshot().limits.chunk_load_rate, 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            control.observe(healthy_runtime_control_input()).action,
+            crate::AutoscaleAction::ScaleDown
+        );
         stream.step(&mut writer, &mut light_cache).await.unwrap();
 
         let snapshot = control.snapshot();
@@ -8116,31 +8308,34 @@ mod tests {
         let mut light_cache = LightCache::new();
 
         let request = stream.scheduler.poll_next().expect("request");
-        let result = prepare_chunk_request(
-            request,
-            Arc::clone(&world),
-            None,
-            None,
-            Arc::new(test_biome_registry()),
-            Arc::clone(&registry),
-            None,
-            Arc::new(ItemRegistry::from_report(&[])),
-            Arc::new(TagsData::default()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
-            None,
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-            Compression::Disabled,
-            ChunkPipelineResources::with_limits(1, 1),
-            None,
-            Arc::clone(&stream.active_generation),
-            Arc::clone(&stream.generation_changed),
-            0,
-            None,
+        let result = crate::resource_profile::measure_future(
+            crate::resource_profile::CpuStage::ChunkPreparation,
+            prepare_chunk_request(
+                request,
+                Arc::clone(&world),
+                None,
+                None,
+                Arc::new(test_biome_registry()),
+                Arc::clone(&registry),
+                None,
+                Arc::new(ItemRegistry::from_report(&[])),
+                Arc::new(TagsData::default()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+                None,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+                Compression::Disabled,
+                ChunkPipelineResources::with_limits(1, 1),
+                None,
+                Arc::clone(&stream.active_generation),
+                Arc::clone(&stream.generation_changed),
+                0,
+                None,
+            ),
         )
         .await;
         assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));

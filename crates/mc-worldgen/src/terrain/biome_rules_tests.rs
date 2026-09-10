@@ -16,7 +16,17 @@ fn inland_river_bank_retains_a_grass_surface() {
         tiny_registry(),
         super::super::WorldgenMode::TellusLike(Default::default()),
     );
-    let (x, z) = (-252_i32, 59_i32);
+    // Locate an exposed inland shoulder instead of pinning a column that can
+    // become part of the water channel when its width or depth changes.
+    let (x, z) = (-288..=-224)
+        .flat_map(|x| (24..=88).map(move |z| (x, z)))
+        .find(|&(x, z)| {
+            let sample = g.density_router().sample(x, z);
+            sample.surface_y == SEA_LEVEL + 2
+                && sample.continentalness > 0.025
+                && sample.river < 0.10
+        })
+        .expect("the sampled reach must have an exposed inland bank");
     let chunk = g.generate(mc_world::ChunkPos {
         x: x.div_euclid(16),
         z: z.div_euclid(16),

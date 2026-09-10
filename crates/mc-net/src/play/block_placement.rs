@@ -16,6 +16,11 @@ use super::{
 };
 use mc_world::plant_rules_26_1_2::vertical_plant_can_survive_at;
 
+pub(super) mod chest;
+
+#[cfg(test)]
+mod chest_tests;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PlannedBlockPlacement {
     pub(super) edits: Vec<BlockEdit>,
@@ -106,6 +111,15 @@ pub(super) fn plan_block_placement(
     let target_state = snapshot.get_cached_block(pos)?;
     let placed_state = merge_or_waterlogged(blocks, target_state, placed_state)?;
     let placed = blocks.by_id(placed_state)?;
+    if chest::is_chest(placed) {
+        return append_stair_transition_to_placement(
+            blocks,
+            snapshot,
+            pos,
+            target_state,
+            chest::placement(blocks, snapshot, pos, placed, player_pose, direction)?,
+        );
+    }
     if is_stair_identity(placed) {
         if !matches!(
             classify_stair_state(blocks, placed_state),

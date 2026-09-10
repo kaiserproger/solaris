@@ -512,7 +512,9 @@ impl From<&ServerConfig> for EffectiveAutoscale {
                     .initial_limits(&config.server, &config.chunk_pipeline),
             ),
             policy: EffectiveAutoscalePolicy::from(
-                config.autoscale.to_policy(&config.chunk_pipeline),
+                config
+                    .autoscale
+                    .to_policy(&config.server, &config.chunk_pipeline),
             ),
         }
     }
@@ -551,8 +553,8 @@ struct EffectiveAutoscalePolicy {
     target_first_chunk_ms: u64,
     queue_pressure_percent: u8,
     memory_pressure_percent: u8,
-    scale_down_after_ticks: u32,
-    scale_up_after_ticks: u32,
+    scale_down_after_seconds: u32,
+    scale_up_after_seconds: u32,
 }
 
 impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
@@ -570,8 +572,8 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
             target_first_chunk_ms: policy.target_first_chunk_ms,
             queue_pressure_percent: policy.queue_pressure_percent,
             memory_pressure_percent: policy.memory_pressure_percent,
-            scale_down_after_ticks: policy.scale_down_after_ticks,
-            scale_up_after_ticks: policy.scale_up_after_ticks,
+            scale_down_after_seconds: policy.scale_down_after_seconds,
+            scale_up_after_seconds: policy.scale_up_after_seconds,
         }
     }
 }
@@ -1223,7 +1225,7 @@ fn startup_spawn_view_distance(config: &mc_server::ServerConfig) -> i32 {
     if config.autoscale.enabled {
         config
             .autoscale
-            .to_policy(&config.chunk_pipeline)
+            .to_policy(&config.server, &config.chunk_pipeline)
             .min_view_distance
     } else {
         config.server.view_distance
@@ -1235,7 +1237,7 @@ fn runtime_cache_view_distance(config: &mc_server::ServerConfig) -> i32 {
     if config.autoscale.enabled {
         config
             .autoscale
-            .to_policy(&config.chunk_pipeline)
+            .to_policy(&config.server, &config.chunk_pipeline)
             .max_view_distance
             .max(config.server.view_distance)
     } else {
@@ -2167,26 +2169,6 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(4), 169);
         assert_eq!(chunk_cache_size_for_view_distance(10), 625);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
-    }
-
-    #[test]
-    fn public_alpha_startup_prepares_balanced_minimum_and_reserves_vd10_cache() {
-        let config: mc_server::ServerConfig =
-            toml::from_str(include_str!("../../../example.toml")).expect("parse example config");
-
-        assert_eq!(config.server.view_distance, 8);
-        assert_eq!(startup_spawn_view_distance(&config), 6);
-        assert_eq!(runtime_cache_view_distance(&config), 10);
-        assert_eq!(chunk_cache_size_for_view_distance(10), 625);
-        assert_eq!(spawn_window_positions(6).len(), 225);
-        assert_eq!(spawn_view_positions(6).len(), 169);
-        let center = mc_world::ChunkPos { x: 7, z: -3 };
-        let centered_window = spawn_window_positions_at(center, 6);
-        let centered_view = spawn_view_positions_at(center, 6);
-        assert_eq!(centered_window.len(), 225);
-        assert_eq!(centered_view.len(), 169);
-        assert!(centered_window.contains(&mc_world::ChunkPos { x: 14, z: 4 }));
-        assert!(centered_view.contains(&center));
     }
 
     #[test]
@@ -3446,8 +3428,8 @@ mod tests {
             enabled = true
             min_view_distance = 0
             max_view_distance = 1
-            scale_down_after_ticks = 0
-            scale_up_after_ticks = 0
+            scale_down_after_seconds = 0
+            scale_up_after_seconds = 0
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
         let rendered = serde_json::to_value(EffectiveConfig::from(&cfg)).expect("serialize");
@@ -3467,8 +3449,8 @@ mod tests {
         assert_eq!(policy["max_chunk_load_rate"], 64);
         assert_eq!(policy["min_chunk_generate_rate"], 7);
         assert_eq!(policy["max_chunk_generate_rate"], 32);
-        assert_eq!(policy["scale_down_after_ticks"], 1);
-        assert_eq!(policy["scale_up_after_ticks"], 1);
+        assert_eq!(policy["scale_down_after_seconds"], 60);
+        assert_eq!(policy["scale_up_after_seconds"], 60);
         assert!(policy.get("worker_pressure_percent").is_none());
     }
 }

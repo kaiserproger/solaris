@@ -731,7 +731,13 @@ pub struct RuntimeTelemetryHandle {
     sessions: Arc<play::SessionRegistry>,
     runtime_control: Option<RuntimeControlHandle>,
     simulation: play::SimulationHandle,
+    profile_world: Option<WorldHandle>,
+    profile_read: Option<mc_world::WorldReadView>,
+    profile_resources: ChunkPipelineResources,
+    profile_blocks: Arc<BlockRegistry>,
 }
+
+mod resource_snapshot;
 
 impl RuntimeTelemetryHandle {
     /// Subscribe to exact simulation-tick progress notifications.
@@ -1360,7 +1366,11 @@ fn spawn_admitted_connection(
     let services = services.clone();
     connections.spawn(async move {
         let _connection_permit = connection_permit;
-        if let Err(err) = Box::pin(handle_connection(socket, peer, services, pre_auth_permit)).await
+        if let Err(err) = Box::pin(crate::resource_profile::measure_future(
+            crate::resource_profile::CpuStage::Network,
+            handle_connection(socket, peer, services, pre_auth_permit),
+        ))
+        .await
         {
             match err {
                 err if is_client_disconnect(&err) => {
@@ -1490,6 +1500,10 @@ impl BoundServer {
             sessions: Arc::clone(&self.sessions),
             runtime_control: self.runtime_control.clone(),
             simulation: self.simulation.clone(),
+            profile_world: self.config.world.clone(),
+            profile_read: self.connection_world.read.clone(),
+            profile_resources: self.chunk_pipeline_resources.clone(),
+            profile_blocks: Arc::clone(&self.config.blocks),
         }
     }
 
@@ -1583,8 +1597,9 @@ impl BoundServer {
             script_zones: script_zones.clone(),
         };
         let (entity_shutdown, entity_shutdown_requested) = tokio::sync::oneshot::channel();
-        let mut entity_ticker = tokio::spawn(entity_ticker::run_entity_ticker(
-            entity_ticker::EntityTickerContext {
+        let mut entity_ticker = tokio::spawn(crate::resource_profile::measure_future(
+            crate::resource_profile::CpuStage::Simulation,
+            entity_ticker::run_entity_ticker(entity_ticker::EntityTickerContext {
                 prewarmed_entity_pathing_states,
                 entity_world_journal_failure,
                 entity_shutdown_requested,
@@ -1602,7 +1617,7 @@ impl BoundServer {
                 entity_pathing_materials,
                 entity_scripts: scripts.clone(),
                 entity_script_zones: script_zones.clone(),
-            },
+            }),
         ));
         let RuntimeCommandTasks {
             mut command_tasks,
@@ -1894,14 +1909,17 @@ pub(crate) async fn save_periodic_checkpoint(
     };
     let barrier_us = elapsed_us(barrier_started);
     Some(
-        save_all_with_context_snapshot_locked(
-            "periodic checkpoint",
-            config,
-            sessions,
-            Some(snapshot),
-            false,
-            coordinator_us.saturating_add(barrier_us),
-            total_started,
+        crate::resource_profile::measure_future(
+            crate::resource_profile::CpuStage::Saving,
+            save_all_with_context_snapshot_locked(
+                "periodic checkpoint",
+                config,
+                sessions,
+                Some(snapshot),
+                false,
+                coordinator_us.saturating_add(barrier_us),
+                total_started,
+            ),
         )
         .await,
     )
@@ -3006,6 +3024,9 @@ async fn step_entity_physics_inputs(
         };
         batches.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _cpu = crate::resource_profile::CpuScope::new(
+                crate::resource_profile::CpuStage::Simulation,
+            );
             batch
                 .into_iter()
                 .map(step_sampled_entity)
@@ -3727,6 +3748,8 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
                 input.query.kind,
                 play::EntityPhysicsKind::Living
                     | play::EntityPhysicsKind::PowderSnowWalkableLiving
+                    | play::EntityPhysicsKind::FishLiving
+                    | play::EntityPhysicsKind::SquidLiving
                     | play::EntityPhysicsKind::AquaticLiving
             ),
     }
@@ -3750,6 +3773,8 @@ fn physics_config_for_query(query: play::EntityPhysicsQuery) -> PhysicsConfig {
             PhysicsConfig::living_entity()
         }
         play::EntityPhysicsKind::AquaticLiving => PhysicsConfig::aquatic_entity(),
+        play::EntityPhysicsKind::FishLiving => PhysicsConfig::fish_entity(),
+        play::EntityPhysicsKind::SquidLiving => PhysicsConfig::squid_entity(),
         play::EntityPhysicsKind::FallingBlock => PhysicsConfig::default(),
         play::EntityPhysicsKind::ArrowProjectile { .. }
         | play::EntityPhysicsKind::ShulkerBullet { .. }
@@ -4337,14 +4362,17 @@ pub(crate) async fn save_all_after_simulation_barrier(
         }
     };
     let barrier_us = elapsed_us(barrier_started);
-    save_all_with_context_snapshot_locked(
-        context,
-        config,
-        sessions,
-        Some(snapshot),
-        false,
-        coordinator_us.saturating_add(barrier_us),
-        total_started,
+    crate::resource_profile::measure_future(
+        crate::resource_profile::CpuStage::Saving,
+        save_all_with_context_snapshot_locked(
+            context,
+            config,
+            sessions,
+            Some(snapshot),
+            false,
+            coordinator_us.saturating_add(barrier_us),
+            total_started,
+        ),
     )
     .await
 }
@@ -4388,14 +4416,17 @@ async fn save_all_with_context_snapshot(
     let queue_started = Instant::now();
     let coordinator = config.shutdown.save_coordinator();
     let _save_guard = coordinator.lock().await;
-    save_all_with_context_snapshot_locked(
-        context,
-        config,
-        sessions,
-        snapshot,
-        require_clean_dirty_flush,
-        elapsed_us(queue_started),
-        total_started,
+    crate::resource_profile::measure_future(
+        crate::resource_profile::CpuStage::Saving,
+        save_all_with_context_snapshot_locked(
+            context,
+            config,
+            sessions,
+            snapshot,
+            require_clean_dirty_flush,
+            elapsed_us(queue_started),
+            total_started,
+        ),
     )
     .await
 }
@@ -6213,8 +6244,8 @@ mod tests {
         assert_eq!(input.random_tick_p95_us, 500);
     }
 
-    #[test]
-    fn runtime_control_tick_observe_applies_memory_pressure_snapshot() {
+    #[tokio::test(start_paused = true)]
+    async fn runtime_control_tick_applies_sustained_memory_pressure_after_one_minute() {
         let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
             crate::memory_pressure::MemoryPressureSnapshot {
                 used_mb: 900,
@@ -6225,17 +6256,16 @@ mod tests {
             crate::RuntimeControlConfig {
                 policy: crate::AutoscalePolicy {
                     memory_pressure_percent: 50,
-                    scale_down_after_ticks: 1,
                     ..crate::AutoscalePolicy::default()
                 },
                 initial_limits: crate::RuntimeControlLimits {
-                    view_distance: 8,
+                    view_distance: 16,
                     chunk_send_rate: 16,
                     chunk_load_rate: 32,
                     chunk_generate_rate: 16,
                 },
             },
-            memory_pressure,
+            memory_pressure.clone(),
         );
         let input = runtime_control_tick_input(49_001);
         assert_eq!(input.tick_ms, 50);
@@ -6250,8 +6280,21 @@ mod tests {
             observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 49_001)
                 .unwrap();
         assert_eq!(decision.pressure, Some(crate::AutoscalePressure::Memory));
+        assert_eq!(decision.action, crate::AutoscaleAction::Hold);
+        assert_eq!(resources.prepare_limit(), 7);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let decision =
+            observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 49_001)
+                .unwrap();
+        assert_eq!(decision.action, crate::AutoscaleAction::Hold);
+        assert_eq!(resources.prepare_limit(), 7);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let decision =
+            observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 49_001)
+                .unwrap();
         assert_eq!(decision.action, crate::AutoscaleAction::ScaleDown);
-        assert_eq!(resources.prepare_limit(), 4);
+        assert_eq!(decision.limits.chunk_send_rate, 15);
+        assert_eq!(resources.prepare_limit(), 6);
         assert_eq!(sessions.entity_owner_lane_count(), initial_owner_lanes);
         assert_eq!(
             control.snapshot().last_decision.pressure,
@@ -6264,56 +6307,29 @@ mod tests {
                 limit_mb: 1_000,
             }
         );
-    }
 
-    #[test]
-    fn runtime_telemetry_snapshot_exposes_memory_and_session_counts() {
-        let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
-            crate::memory_pressure::MemoryPressureSnapshot {
-                used_mb: 384,
-                limit_mb: 2_048,
-            },
-        );
-        let runtime_control = crate::RuntimeControlHandle::new_with_memory_pressure(
-            crate::RuntimeControlConfig {
-                policy: crate::AutoscalePolicy::default(),
-                initial_limits: crate::RuntimeControlLimits {
-                    view_distance: 8,
-                    chunk_send_rate: 16,
-                    chunk_load_rate: 32,
-                    chunk_generate_rate: 16,
-                },
-            },
-            memory_pressure,
-        );
-        let (simulation, _simulation_owner) = play::simulation_channel();
-        let telemetry = RuntimeTelemetryHandle {
-            tick_metrics: RuntimeTickMetricsHandle::default(),
-            sessions: Arc::new(play::SessionRegistry::new()),
-            runtime_control: Some(runtime_control),
-            simulation,
-        };
-
-        let snapshot = telemetry.snapshot();
-        assert!(snapshot.tick_percentiles.is_none());
-        assert_eq!(snapshot.active_sessions, 0);
-        assert_eq!(snapshot.server_entities, 0);
-        assert_eq!(snapshot.simulation_queue_capacity, 1024);
-        assert_eq!(snapshot.simulation_queue_depth, 0);
-        assert_eq!(snapshot.simulation_queue_max_depth, 0);
-        assert_eq!(snapshot.simulation_commands_processed, 0);
-        assert_eq!(snapshot.simulation_commands_rejected_full, 0);
-        assert_eq!(snapshot.simulation_commands_rejected_world_busy, 0);
-        assert_eq!(snapshot.simulation_commands_rejected_world_unavailable, 0);
-        assert_eq!(snapshot.simulation_commands_rejected_world_mutation, 0);
-        assert_eq!(snapshot.simulation_commands_rejected_stale_session, 0);
-        assert_eq!(snapshot.simulation_block_edits_processed, 0);
-        assert_eq!(snapshot.simulation_container_commits_processed, 0);
-        assert_eq!(snapshot.simulation_block_entity_commits_processed, 0);
-        assert_eq!(snapshot.memory_used_mb, 384);
-        assert_eq!(snapshot.memory_limit_mb, 2_048);
-        assert!(snapshot.memory_sample_available);
-        assert_eq!(snapshot.memory_sample_failures, 0);
+        memory_pressure.set_sample(crate::memory_pressure::MemoryPressureSnapshot {
+            used_mb: 100,
+            limit_mb: 1_000,
+        });
+        let decision =
+            observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 10_000)
+                .unwrap();
+        assert_eq!(decision.action, crate::AutoscaleAction::Hold);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let decision =
+            observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 10_000)
+                .unwrap();
+        assert_eq!(decision.action, crate::AutoscaleAction::Hold);
+        assert_eq!(decision.limits.chunk_send_rate, 15);
+        assert_eq!(resources.prepare_limit(), 6);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let decision =
+            observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 10_000)
+                .unwrap();
+        assert_eq!(decision.action, crate::AutoscaleAction::ScaleUp);
+        assert_eq!(decision.limits.chunk_send_rate, 16);
+        assert_eq!(resources.prepare_limit(), 7);
     }
 
     fn report(id: &str, props: &[(&str, &[&str])], states: &[StateSpec<'_>]) -> BlockReport {

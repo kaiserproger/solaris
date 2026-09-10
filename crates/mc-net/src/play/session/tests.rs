@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::{ConnectionReader, PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout};
 
+mod aquatic_motion;
 mod entity_save_barrier;
 mod regional_physics;
 
@@ -3938,84 +3939,6 @@ fn hostile_forgets_dead_player_target_during_goal_tick() {
 }
 
 #[test]
-fn fish_physics_queries_use_aquatic_water_rules() {
-    let registry = SessionRegistry::new();
-    let alice = register_test_session(&registry, "FishPhysicsAlice");
-    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    registry.spawn_command_entity(
-        &SimulationAuthority::for_test(),
-        1,
-        "minecraft:cod".to_string(),
-        Vec3::new(4.5, 62.0, 0.5),
-    );
-
-    {
-        let entities = registry.lock_entities("inspect command-spawned fish goal");
-        let fish = entities.snapshots().next().expect("spawned fish");
-        assert_eq!(
-            fish.goal,
-            GoalState::AquaticWander {
-                speed: PASSIVE_WANDER_SPEED * 0.9,
-                vertical_speed: 0.18,
-                period_ticks: 45,
-            }
-        );
-        assert!(!fish.on_ground);
-    }
-
-    let queries = registry.tick_entities_and_collect_physics_queries(45);
-
-    assert_eq!(queries.len(), 1);
-    assert_eq!(queries[0].kind, EntityPhysicsKind::AquaticLiving);
-    assert!(queries[0].velocity.horizontal_len() > 0.0);
-    assert!(queries[0].velocity.y.abs() > 0.0);
-    assert!(!queries[0].on_ground);
-}
-
-#[test]
-fn all_living_aquatic_and_amphibious_classes_use_aquatic_water_rules() {
-    for type_name in [
-        "minecraft:axolotl",
-        "minecraft:cod",
-        "minecraft:dolphin",
-        "minecraft:drowned",
-        "minecraft:elder_guardian",
-        "minecraft:frog",
-        "minecraft:glow_squid",
-        "minecraft:guardian",
-        "minecraft:nautilus",
-        "minecraft:pufferfish",
-        "minecraft:salmon",
-        "minecraft:squid",
-        "minecraft:tadpole",
-        "minecraft:tropical_fish",
-        "minecraft:turtle",
-        "minecraft:zombie_nautilus",
-    ] {
-        assert!(
-            super::entity_physics_class::entity_type_uses_aquatic_physics(type_name),
-            "{type_name}"
-        );
-        let mut entity = SpawnEntity::new(1, type_name, Vec3::ZERO);
-        super::entity_goal_defaults::apply_default_mob_goal(
-            &mut entity,
-            &mc_data::mob_behavior_26_1_2::MobBehaviorTable::vanilla_26_1_2(),
-        );
-        assert_eq!(
-            entity.goal,
-            GoalState::AquaticWander {
-                speed: PASSIVE_WANDER_SPEED * 0.9,
-                vertical_speed: 0.18,
-                period_ticks: 45,
-            },
-            "{type_name}"
-        );
-        assert!(!entity.on_ground, "{type_name}");
-    }
-    assert!(!super::entity_physics_class::entity_type_uses_aquatic_physics("minecraft:zombie"));
-}
-
-#[test]
 fn vanilla_powder_snow_walkable_mob_tag_is_exact() {
     for type_name in [
         "minecraft:rabbit",
@@ -4630,7 +4553,7 @@ fn loaded_chunk_pathing_probe_reports_unloaded_chunk_in_world_height() {
 }
 
 #[test]
-fn terrain_snapshot_chunks_cover_only_terrain_probe_footprints() {
+fn terrain_snapshot_chunks_include_swimmers_before_their_first_collision() {
     let terrain_entity = EntityId(1);
     let active_chunks = (-8..=8)
         .flat_map(|x| (-8..=8).map(move |z| (x, z)))
@@ -4645,6 +4568,7 @@ fn terrain_snapshot_chunks_cover_only_terrain_probe_footprints() {
         [
             (terrain_entity, Vec3::new(16.1, 64.0, 0.5)),
             (EntityId(2), Vec3::new(96.5, 64.0, 96.5)),
+            (EntityId(3), Vec3::new(112.5, 64.0, 112.5)),
         ],
         &terrain_pathing_entities,
         &entity_aabbs,
@@ -4654,7 +4578,7 @@ fn terrain_snapshot_chunks_cover_only_terrain_probe_footprints() {
     .map(|chunk| (chunk.x, chunk.z))
     .collect::<HashSet<_>>();
 
-    assert_eq!(chunks, HashSet::from([(0, 0), (1, 0)]));
+    assert_eq!(chunks, HashSet::from([(0, 0), (1, 0), (6, 6)]));
 }
 
 fn two_block_wall_pathing_world() -> (mc_world::WorldReadView, mc_physics::BlockMaterialIds) {
@@ -4861,6 +4785,42 @@ fn loaded_chunk_pathing_probe_keeps_bottom_layer_fluid_walkable() {
             PathingProbeResult::Walkable
         );
     });
+}
+
+#[test]
+fn fresh_swimmer_probes_water_without_the_ground_collision_shortcut() {
+    let water = vanilla_block_state_id("minecraft:water", &[("level", "0")]);
+    let (world_read, materials) = vanilla_collision_pathing_world(&[(1, 64, 1, water)]);
+    let materials = materials.with_water_states(vec![water]);
+    let entity_id = EntityId(1);
+    let active_chunks = HashSet::from([(0, 0)]);
+    let terrain_pathing_entities = HashSet::new();
+    let entity_aabbs = HashMap::from([(
+        entity_id,
+        mc_physics::Aabb {
+            half_width: 0.25,
+            height: 0.3,
+        },
+    )]);
+    let snapshot = world_read.snapshot_chunks(&[ChunkPos { x: 0, z: 0 }]);
+    let probe = LoadedChunkPathingProbe::new(
+        &active_chunks,
+        &terrain_pathing_entities,
+        &entity_aabbs,
+        Some(LoadedTerrainPathingProbe::new(&snapshot, &materials)),
+    );
+    assert_eq!(
+        probe.can_entity_swim_at(entity_id, Vec3::new(1.5, 64.0, 1.5)),
+        PathingProbeResult::Walkable
+    );
+    assert_eq!(
+        probe.can_entity_swim_at(entity_id, Vec3::new(1.5, 64.8, 1.5)),
+        PathingProbeResult::Blocked
+    );
+    assert_eq!(
+        probe.can_entity_swim_at(entity_id, Vec3::new(16.5, 64.0, 1.5)),
+        PathingProbeResult::Unloaded
+    );
 }
 
 #[test]

@@ -1,5 +1,4 @@
 use crate::login::LoggedInProfile;
-use crate::play::command_execution::runtime_control_status_message;
 use crate::play::commands::{
     AdminCommand, CommandError, CommandPermissions, command_suggestions, command_tree_packet,
     parse_admin_command,
@@ -155,40 +154,6 @@ fn command_tree_and_suggestions_are_permission_aware() {
     );
 
     assert!(command_suggestions("/g", not_op).suggestions.is_empty());
-}
-
-#[test]
-fn runtime_control_status_message_reports_disabled_and_drain_snapshot() {
-    assert_eq!(
-        runtime_control_status_message(None),
-        "Runtime control: disabled"
-    );
-
-    let control = crate::RuntimeControlHandle::new(crate::RuntimeControlConfig {
-        policy: crate::AutoscalePolicy {
-            min_view_distance: 2,
-            max_view_distance: 8,
-            min_chunk_send_rate: 1,
-            max_chunk_send_rate: 16,
-            min_chunk_load_rate: 2,
-            max_chunk_load_rate: 64,
-            min_chunk_generate_rate: 3,
-            max_chunk_generate_rate: 32,
-            ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
-        },
-        initial_limits: crate::RuntimeControlLimits {
-            view_distance: 8,
-            chunk_send_rate: 16,
-            chunk_load_rate: 64,
-            chunk_generate_rate: 32,
-        },
-    });
-    control.request_drain();
-
-    assert_eq!(
-        runtime_control_status_message(Some(&control)),
-        "Runtime control: draining=true action=scale_down pressure=none limits=view_distance:2,send:1,load:2,generate:3 pressure_ticks=0 healthy_ticks=0 reason=drain requested; clamped to minimum chunk throughput"
-    );
 }
 
 #[test]

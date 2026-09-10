@@ -86,9 +86,12 @@ server owns stdin; do not run a second reader alongside it.
 Runtime events go to `logs/latest.log` (INFO/WARN/ERROR) and `logs/debug.log`
 (DEBUG and above; `RUST_LOG` controls this file). Both files start fresh on launch.
 The `profile` console command writes `logs/profile.json`: measured tick-stage
-latencies, process memory, chunks, populations and network counters. This is a
+latencies, RSS/cgroup memory, chunks, populations and network counters. This is a
 runtime metrics profile, not a CPU stack-sampling or heap-allocation trace.
 `--check` and the `operator` subcommands leave existing server logs untouched.
+If chunks blink, send `blink` in ordinary chat and save `logs/debug.log` before
+restarting. The marker and chunk radius/send/unload events can be correlated as
+described in [the operating guide](docs/OPERATING.md).
 
 ## Network address and port
 
@@ -126,8 +129,10 @@ Detailed examples are in
   enabling local-dev operators or editing JSON. Keep
   `allow_local_dev_operators = false` outside throwaway loopback development.
 - **Autoscale:** `[autoscale]` is enabled by default with the `balanced` profile.
-  It adapts bounded view distance and chunk work budgets to runtime pressure;
-  `--check` prints the normalized limits and policy.
+  It changes bounded view distance and chunk work budgets one unit at a time,
+  only after more than 60 continuous seconds of overload or stable recovery.
+  Each step starts a fresh window; `--check` prints normalized limits and the
+  `scale_down_after_seconds` / `scale_up_after_seconds` policy.
 - **Plugins:** external Luau packages are discovered below
   `[plugins].directory` (normally `plugins/`). Deploy selected packages from
   the sibling `solaris-default-plugins` repository. Use strict deployment and

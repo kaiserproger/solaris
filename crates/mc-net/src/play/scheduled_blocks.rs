@@ -15,9 +15,9 @@ use super::campfire::{
     campfire_recipe_result_stack, is_campfire_block,
 };
 use super::containers::{
-    ChestView, FurnaceKind, adjacent_chest_positions, chest_slot_stacks, decrement_furnace_slot,
-    find_campfire_recipe_in, find_cooking_recipe_for_item, furnace_kind_for_block_id,
-    furnace_slot_to_stack, is_fuel_item_id,
+    ChestView, FurnaceKind, chest_slot_stacks, decrement_furnace_slot, find_campfire_recipe_in,
+    find_cooking_recipe_for_item, furnace_kind_for_block_id, furnace_slot_to_stack,
+    is_fuel_item_id,
 };
 use super::random_ticks::next_leaf_distance_state;
 use super::session::SessionRegistry;
@@ -813,15 +813,13 @@ fn cached_storage_chest_like_positions(
     }
 
     let mut positions = vec![pos];
-    for neighbour in adjacent_chest_positions(pos) {
-        let is_chest = storage
-            .get_cached_block(neighbour)
-            .and_then(|state_id| blocks.by_id(state_id))
-            .is_some_and(|state| state.block.id.as_str() == "minecraft:chest");
-        if is_chest {
-            positions.push(neighbour);
-            break;
-        }
+    if let Some(neighbour) = super::block_placement::chest::paired_position(
+        blocks,
+        |position| storage.get_cached_block(position),
+        pos,
+        state.id,
+    ) {
+        positions.push(neighbour);
     }
     positions.sort_by_key(|pos| (pos.x, pos.y, pos.z));
     positions.dedup();

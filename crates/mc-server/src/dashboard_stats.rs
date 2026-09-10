@@ -96,6 +96,7 @@ pub struct ServerDashboardStats {
     warnings: Arc<WarningRing>,
     tps_sample: Mutex<Option<(u64, Instant)>>,
     cached_payload: Mutex<Option<(Instant, StatsPayload)>>,
+    profile_sampler: crate::profile::ProfileSampler,
 }
 
 impl ServerDashboardStats {
@@ -135,6 +136,7 @@ impl ServerDashboardStats {
             warnings,
             tps_sample: Mutex::new(None),
             cached_payload: Mutex::new(None),
+            profile_sampler: crate::profile::ProfileSampler::new(),
         }
     }
 
@@ -183,6 +185,11 @@ impl DashboardStats for ServerDashboardStats {
             .lock()
             .expect("cached payload lock poisoned") = Some((Instant::now(), payload.clone()));
         payload
+    }
+
+    fn profile(&self) -> crate::profile::ProfileReport {
+        self.profile_sampler
+            .capture(self.compute_stats(), || self.telemetry.resource_profile())
     }
 }
 

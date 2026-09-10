@@ -201,6 +201,48 @@
     "experience": 0.35,
     "cookingtime": 200
   },
+  "minecraft:cooked_cod": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:cod",
+    "result": { "id": "minecraft:cooked_cod", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 200
+  },
+  "minecraft:cooked_salmon": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:salmon",
+    "result": { "id": "minecraft:cooked_salmon", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 200
+  },
+  "minecraft:cooked_cod_from_smoking": {
+    "type": "minecraft:smoking",
+    "ingredient": "minecraft:cod",
+    "result": { "id": "minecraft:cooked_cod", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 100
+  },
+  "minecraft:cooked_salmon_from_smoking": {
+    "type": "minecraft:smoking",
+    "ingredient": "minecraft:salmon",
+    "result": { "id": "minecraft:cooked_salmon", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 100
+  },
+  "minecraft:cooked_cod_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "ingredient": "minecraft:cod",
+    "result": { "id": "minecraft:cooked_cod", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 600
+  },
+  "minecraft:cooked_salmon_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "ingredient": "minecraft:salmon",
+    "result": { "id": "minecraft:cooked_salmon", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 600
+  },
   "minecraft:baked_potato": {
     "type": "minecraft:smelting",
     "ingredient": "minecraft:potato",

@@ -34,13 +34,14 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+tempfile = "3"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+stats_alloc = "0.1.10"
 
 [dev-dependencies]
 assert_cmd = "2"
-tempfile = "3"
 predicates = "3"
 bytes = { workspace = true }
 rsa = { workspace = true }

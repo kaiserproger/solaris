@@ -15,6 +15,14 @@ pub(super) struct WorldRootLease {
     _file: File,
 }
 
+impl Drop for WorldRootLease {
+    fn drop(&mut self) {
+        // Closing our fd alone does not release an advisory lock if a concurrent
+        // fork still holds the same open file description before exec.
+        let _ = self._file.unlock();
+    }
+}
+
 fn world_leases() -> &'static Mutex<HashMap<PathBuf, Weak<WorldRootLease>>> {
     WORLD_LEASES.get_or_init(|| Mutex::new(HashMap::new()))
 }

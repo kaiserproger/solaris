@@ -43,6 +43,9 @@ num-bigint = { workspace = true }
 reqwest = { workspace = true }
 zip = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["time"] }
+
 [dev-dependencies]
 mc-entity = { path = "../mc-entity" }
 mc-script = { path = "../mc-script", features = ["lua-runtime"] }

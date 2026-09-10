@@ -1,18 +1,17 @@
 //! Chunk section: a 16×16×16 cube of block states with a small,
 //! growable palette.
 //!
-//! Storage mirrors vanilla / Anvil:
+//! RAM storage keeps palette indices compact:
 //!
 //! - **Single** — the whole section is one state. No index array, no
 //!   palette overhead. Common for the void above the build height and
 //!   for the stone-only mid-overworld layers.
 //! - **Indirect** — a `Vec<BlockStateId>` palette and a packed
 //!   bit-array of indices. `bits_per_entry` grows naturally with
-//!   palette size, minimum 4 (vanilla's pad-to-4 convention for
-//!   the on-wire LinearPalette format). M5.c.3 removed the
-//!   256-entry cap; sections with more than 256 distinct states
-//!   stay indirect on disk but the wire encoder converts to the
-//!   direct format described below at emit time.
+//!   palette size, starting at one bit for two states. Disk and wire
+//!   encoders pad block indices to vanilla's four-bit minimum.
+//!   Sections with more than 256 distinct states stay indirect on
+//!   disk but the wire encoder converts to direct format at emit time.
 //!
 //! On the wire (`mc_world::wire::encode_chunk_data`), sections with
 //! `bits_per_entry >= 9` switch to the **GlobalPalette / Direct**
@@ -26,12 +25,14 @@
 //! bits in each word are padding. This matches what real `.mca`
 //! files contain.
 
+use std::sync::Arc;
+
 use crate::block::BlockStateId;
 
 pub const SECTION_DIM: usize = 16;
 pub const SECTION_VOLUME: usize = SECTION_DIM * SECTION_DIM * SECTION_DIM;
 
-const MIN_INDIRECT_BITS: u8 = 4;
+const MIN_INDIRECT_BITS: u8 = 1;
 
 /// A 16×16×16 cube of block states.
 ///
@@ -49,10 +50,15 @@ pub struct ChunkSection {
 #[derive(Debug, Clone)]
 enum BlockStorage {
     Single(BlockStateId),
-    Indirect {
-        palette: Vec<BlockStateId>,
-        indices: PackedBitArray,
-    },
+    Indirect(Arc<IndirectStorage>),
+}
+
+/// Unchanged sections stay shared when a resident chunk snapshot is cloned.
+/// A block edit detaches only this section's palette and packed indices.
+#[derive(Debug, Clone)]
+struct IndirectStorage {
+    palette: Vec<BlockStateId>,
+    indices: PackedBitArray,
 }
 
 impl ChunkSection {
@@ -77,9 +83,9 @@ impl ChunkSection {
         let idx = cell_index(x, y, z);
         match &self.storage {
             BlockStorage::Single(s) => *s,
-            BlockStorage::Indirect { palette, indices } => {
-                let p = indices.get(idx) as usize;
-                palette[p]
+            BlockStorage::Indirect(storage) => {
+                let p = storage.indices.get(idx) as usize;
+                storage.palette[p]
             }
         }
     }
@@ -96,12 +102,13 @@ impl ChunkSection {
                 self.storage = promote_from_single(current, state, idx);
                 current
             }
-            BlockStorage::Indirect { palette, indices } => {
-                let prev_p = indices.get(idx) as usize;
-                let prev_state = palette[prev_p];
+            BlockStorage::Indirect(storage) => {
+                let prev_p = storage.indices.get(idx) as usize;
+                let prev_state = storage.palette[prev_p];
                 if prev_state == state {
                     return prev_state;
                 }
+                let IndirectStorage { palette, indices } = Arc::make_mut(storage);
                 let new_p = match palette.iter().position(|&s| s == state) {
                     Some(p) => p,
                     None => {
@@ -129,15 +136,25 @@ impl ChunkSection {
     /// Build a section directly from a palette + index array. The
     /// codec uses this when loading vanilla `.mca` files. Caller must
     /// supply a `PackedBitArray` of length `SECTION_VOLUME` whose
-    /// every entry is < `palette.len()`. `non_air_count` is computed
-    /// by walking the indices once.
+    /// every entry is < `palette.len()`. Indices are compacted to the
+    /// palette's required width on admission; one-entry palettes use
+    /// allocation-free Single storage. `non_air_count` scans the indices.
     #[must_use]
     pub fn from_indirect(
         palette: Vec<BlockStateId>,
-        indices: PackedBitArray,
+        mut indices: PackedBitArray,
         air: BlockStateId,
     ) -> Self {
         assert_eq!(indices.len(), SECTION_VOLUME);
+        assert!(!palette.is_empty());
+        if palette.len() == 1 {
+            return Self::filled(palette[0], air);
+        }
+        let bits = bits_for_palette(palette.len());
+        if indices.bits_per_entry() != bits {
+            let words = indices.words_at_bits(bits).collect();
+            indices = PackedBitArray::from_words(bits, SECTION_VOLUME, words);
+        }
         let non_air_count = (0..SECTION_VOLUME)
             .filter(|&i| {
                 let p = indices.get(i) as usize;
@@ -145,18 +162,30 @@ impl ChunkSection {
             })
             .count() as u16;
         Self {
-            storage: BlockStorage::Indirect { palette, indices },
+            storage: BlockStorage::Indirect(Arc::new(IndirectStorage { palette, indices })),
             non_air_count,
             air,
         }
     }
 
-    /// Access the raw packed indices, for the Anvil writer.
+    /// Access RAM-packed indices. Block codecs must apply vanilla's minimum width.
     #[must_use]
     pub fn indices(&self) -> Option<&PackedBitArray> {
         match &self.storage {
             BlockStorage::Single(_) => None,
-            BlockStorage::Indirect { indices, .. } => Some(indices),
+            BlockStorage::Indirect(storage) => Some(&storage.indices),
+        }
+    }
+
+    /// Identity, owner count and full heap charge for deduplicated snapshot accounting.
+    pub(crate) fn shared_heap_allocation(&self) -> Option<(usize, usize, usize)> {
+        match &self.storage {
+            BlockStorage::Single(_) => None,
+            BlockStorage::Indirect(storage) => Some((
+                Arc::as_ptr(storage) as usize,
+                Arc::strong_count(storage),
+                self.estimated_heap_bytes(),
+            )),
         }
     }
 
@@ -176,7 +205,7 @@ impl ChunkSection {
     pub fn palette(&self) -> Option<&[BlockStateId]> {
         match &self.storage {
             BlockStorage::Single(_) => None,
-            BlockStorage::Indirect { palette, .. } => Some(palette),
+            BlockStorage::Indirect(storage) => Some(&storage.palette),
         }
     }
 
@@ -184,10 +213,15 @@ impl ChunkSection {
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         match &self.storage {
             BlockStorage::Single(_) => 0,
-            BlockStorage::Indirect { palette, indices } => palette
-                .capacity()
-                .saturating_mul(std::mem::size_of::<BlockStateId>())
-                .saturating_add(indices.estimated_heap_bytes()),
+            BlockStorage::Indirect(storage) => std::mem::size_of::<IndirectStorage>()
+                .saturating_add(2 * std::mem::size_of::<usize>())
+                .saturating_add(
+                    storage
+                        .palette
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<BlockStateId>()),
+                )
+                .saturating_add(storage.indices.estimated_heap_bytes()),
         }
     }
 }
@@ -200,7 +234,7 @@ fn promote_from_single(current: BlockStateId, new: BlockStateId, idx: usize) -> 
     // Every cell currently maps to palette index 0 (zeroed); flip the
     // one we're setting to palette index 1.
     indices.set(idx, 1);
-    BlockStorage::Indirect { palette, indices }
+    BlockStorage::Indirect(Arc::new(IndirectStorage { palette, indices }))
 }
 
 fn cell_index(x: u8, y: u8, z: u8) -> usize {
@@ -225,10 +259,8 @@ fn bits_for_palette(palette_len: usize) -> u8 {
 /// `len` entries of `bits_per_entry` bits, packed into `u64` words
 /// without crossing word boundaries (the vanilla / Anvil layout).
 ///
-/// Padding bits at the top of each word are unused; this wastes a
-/// few bits per section relative to a fully contiguous packing but
-/// matches what `.mca` files write on disk, so the codec in M2.e
-/// can move bytes through verbatim.
+/// Padding bits at the top of each word are unused. Disk and wire
+/// codecs may need to widen RAM indices to their minimum entry width.
 #[derive(Debug, Clone)]
 pub struct PackedBitArray {
     bits_per_entry: u8,
@@ -332,6 +364,27 @@ impl PackedBitArray {
         &self.data
     }
 
+    /// Stream words at a codec's required width without a temporary packed array.
+    /// Matching widths reuse the stored words, including their padding.
+    pub(crate) fn words_at_bits(&self, bits: u8) -> impl ExactSizeIterator<Item = u64> + '_ {
+        assert!((1..=32).contains(&bits));
+        let epw = entries_per_word(bits);
+        (0..self.len.div_ceil(epw)).map(move |word| {
+            if bits == self.bits_per_entry {
+                return self.data[word];
+            }
+            let start = word * epw;
+            let end = (start + epw).min(self.len);
+            let mut packed = 0;
+            for idx in start..end {
+                let value = u64::from(self.get(idx));
+                assert!(value < (1u64 << bits), "palette index exceeds target width");
+                packed |= value << ((idx - start) * bits as usize);
+            }
+            packed
+        })
+    }
+
     #[must_use]
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         self.data
@@ -349,196 +402,5 @@ fn entries_per_word(bits_per_entry: u8) -> usize {
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const AIR: BlockStateId = BlockStateId(0);
-    const STONE: BlockStateId = BlockStateId(1);
-
-    // ----- PackedBitArray -----
-
-    #[test]
-    fn packed_round_trip_4bit() {
-        let mut a = PackedBitArray::zeroed(4, 100);
-        for i in 0..100 {
-            a.set(i, (i % 16) as u32);
-        }
-        for i in 0..100 {
-            assert_eq!(a.get(i), (i % 16) as u32);
-        }
-    }
-
-    #[test]
-    fn packed_word_boundary() {
-        // 5 bits per entry, 12 entries per word — entry 12 starts a
-        // fresh word. Confirm the boundary is respected.
-        let mut a = PackedBitArray::zeroed(5, 30);
-        for i in 0..30 {
-            a.set(i, (i as u32) & 0x1F);
-        }
-        for i in 0..30 {
-            assert_eq!(a.get(i), (i as u32) & 0x1F);
-        }
-        // Top 4 bits of each word are padding for 5-bit packing.
-        for w in a.words() {
-            assert_eq!(w >> 60, 0);
-        }
-    }
-
-    #[test]
-    fn packed_rebit_preserves_values() {
-        let mut a = PackedBitArray::zeroed(4, 50);
-        for i in 0..50 {
-            a.set(i, (i % 16) as u32);
-        }
-        a.rebit(8);
-        assert_eq!(a.bits_per_entry(), 8);
-        for i in 0..50 {
-            assert_eq!(a.get(i), (i % 16) as u32);
-        }
-    }
-
-    // ----- ChunkSection -----
-
-    #[test]
-    fn filled_air_is_empty() {
-        let s = ChunkSection::filled(AIR, AIR);
-        assert_eq!(s.non_air_count(), 0);
-        assert!(s.is_empty());
-        assert_eq!(s.get(0, 0, 0), AIR);
-        assert_eq!(s.get(15, 15, 15), AIR);
-        assert!(s.palette().is_none());
-    }
-
-    #[test]
-    fn filled_stone_counts_all_cells() {
-        let s = ChunkSection::filled(STONE, AIR);
-        assert_eq!(s.non_air_count(), SECTION_VOLUME as u16);
-        assert_eq!(s.get(7, 3, 12), STONE);
-    }
-
-    #[test]
-    fn first_set_promotes_to_indirect_and_tracks_count() {
-        let mut s = ChunkSection::filled(AIR, AIR);
-        assert_eq!(s.set(1, 2, 3, STONE), AIR);
-        assert_eq!(s.get(1, 2, 3), STONE);
-        assert_eq!(s.get(0, 0, 0), AIR);
-        assert_eq!(s.non_air_count(), 1);
-        let palette = s.palette().unwrap();
-        assert_eq!(palette, &[AIR, STONE]);
-    }
-
-    #[test]
-    fn set_back_to_air_decrements_count() {
-        let mut s = ChunkSection::filled(AIR, AIR);
-        s.set(1, 2, 3, STONE);
-        s.set(1, 2, 3, AIR);
-        assert_eq!(s.non_air_count(), 0);
-        assert_eq!(s.get(1, 2, 3), AIR);
-    }
-
-    #[test]
-    fn growing_palette_widens_bits() {
-        let mut s = ChunkSection::filled(AIR, AIR);
-        // 17 distinct non-air states forces the 4-bit packed array
-        // to widen to 5 bits (palette grows past 16 entries).
-        for i in 1..=17u32 {
-            s.set(i as u8 % 16, (i / 16) as u8, 0, BlockStateId(i));
-        }
-        let palette_len = s.palette().unwrap().len();
-        assert!(palette_len >= 17);
-        // Spot-check: cells we set are still readable.
-        for i in 1..=17u32 {
-            let got = s.get(i as u8 % 16, (i / 16) as u8, 0);
-            assert_eq!(got, BlockStateId(i));
-        }
-    }
-
-    #[test]
-    fn coordinate_corners_are_addressable() {
-        let mut s = ChunkSection::filled(AIR, AIR);
-        s.set(0, 0, 0, BlockStateId(10));
-        s.set(15, 15, 15, BlockStateId(20));
-        s.set(15, 0, 0, BlockStateId(30));
-        s.set(0, 15, 0, BlockStateId(40));
-        s.set(0, 0, 15, BlockStateId(50));
-        assert_eq!(s.get(0, 0, 0), BlockStateId(10));
-        assert_eq!(s.get(15, 15, 15), BlockStateId(20));
-        assert_eq!(s.get(15, 0, 0), BlockStateId(30));
-        assert_eq!(s.get(0, 15, 0), BlockStateId(40));
-        assert_eq!(s.get(0, 0, 15), BlockStateId(50));
-        assert_eq!(s.non_air_count(), 5);
-    }
-
-    #[test]
-    fn palette_grows_past_256_entries_without_panicking() {
-        // M5.c.3: removed the MAX_INDIRECT_BITS = 8 cap. Inserting
-        // 260 distinct synthetic state ids into one section must
-        // produce a palette of length ≥ 260 and a packed bit-width
-        // wide enough to address it (≥ 9 bits).
-        let mut s = ChunkSection::filled(AIR, AIR);
-        for i in 1..=260u32 {
-            // Walk (x, y) so every set hits a distinct cell.
-            let cell = i - 1;
-            let x = (cell & 0x0F) as u8;
-            let y = ((cell >> 4) & 0x0F) as u8;
-            let z = ((cell >> 8) & 0x0F) as u8;
-            s.set(x, y, z, BlockStateId(i));
-        }
-        let palette = s.palette().unwrap();
-        assert!(
-            palette.len() >= 260,
-            "expected ≥ 260 palette entries, got {}",
-            palette.len(),
-        );
-        let bits = s.indices().unwrap().bits_per_entry();
-        assert!(
-            bits >= 9,
-            "expected ≥ 9 bits per entry past the 256-state threshold, got {bits}",
-        );
-        // Spot-check that all 260 distinct cells round-trip.
-        for i in 1..=260u32 {
-            let cell = i - 1;
-            let x = (cell & 0x0F) as u8;
-            let y = ((cell >> 4) & 0x0F) as u8;
-            let z = ((cell >> 8) & 0x0F) as u8;
-            assert_eq!(s.get(x, y, z), BlockStateId(i));
-        }
-    }
-
-    /// Random sequence of sets — `non_air_count` must match a linear
-    /// scan. Catches off-by-one in the +/- bookkeeping in `set`.
-    #[test]
-    fn non_air_count_matches_linear_scan() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut s = ChunkSection::filled(AIR, AIR);
-        // Deterministic pseudo-random walk: 200 ops.
-        let mut h = DefaultHasher::new();
-        for op in 0..200u64 {
-            op.hash(&mut h);
-            let r = h.finish();
-            let x = (r & 0x0F) as u8;
-            let y = ((r >> 4) & 0x0F) as u8;
-            let z = ((r >> 8) & 0x0F) as u8;
-            let state = if (r >> 12) & 0x07 == 0 {
-                AIR
-            } else {
-                BlockStateId((r >> 16) as u32 & 0xFF)
-            };
-            s.set(x, y, z, state);
-        }
-        let mut linear = 0u16;
-        for y in 0..16u8 {
-            for z in 0..16u8 {
-                for x in 0..16u8 {
-                    if s.get(x, y, z) != AIR {
-                        linear += 1;
-                    }
-                }
-            }
-        }
-        assert_eq!(s.non_air_count(), linear);
-    }
-}
+#[path = "section_tests.rs"]
+mod tests;

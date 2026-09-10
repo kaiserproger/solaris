@@ -2243,11 +2243,11 @@ async fn vd8_multi_client_stop_drains_and_flushes_disk_world_under_stream_load()
     assert!(!startup_runtime_control.draining);
     assert!(startup_runtime_control.application_stop_reason.is_none());
     eprintln!(
-        "O2 VD8 startup autoscale scale_down_decisions={} scale_up_decisions={} pressure_ticks={} healthy_ticks={} limits={:?} last_decision={:?}",
+        "O2 VD8 startup autoscale scale_down_decisions={} scale_up_decisions={} pressure_seconds={} healthy_seconds={} limits={:?} last_decision={:?}",
         startup_runtime_control.scale_down_decisions,
         startup_runtime_control.scale_up_decisions,
-        startup_runtime_control.pressure_ticks,
-        startup_runtime_control.healthy_ticks,
+        startup_runtime_control.pressure_seconds,
+        startup_runtime_control.healthy_seconds,
         startup_runtime_control.limits,
         startup_runtime_control.last_decision,
     );

@@ -1,45 +1,100 @@
 # Solaris current cursor
 
-## Current checkpoint: v0.0.5 release
+## Current checkpoint: owner-requested as-is handoff to main
 
-The owner explicitly requested `v0.0.5` with a changelog, authorizing the release
-commit, push, tag and GitHub publication. Version and installer pins are `0.0.5`;
-the GitHub release is preliminary and maturity remains `draft`. Do not turn
-native checks into graphical acceptance or remove the recorded owner gaps.
+The owner stopped implementation and explicitly requested an immediate single
+commit and push to `main`, with unfinished work documented for another agent.
+Read [FIELD_TEST_HANDOFF.md](FIELD_TEST_HANDOFF.md) first: it contains all twelve
+reported issues, evidence, source entrypoints, partial changes and acceptance
+steps. Do not treat this snapshot as a release or a completed gameplay fix.
 
-Changelog: [releases/v0.0.5.md](releases/v0.0.5.md), also packaged as
-`CHANGELOG.md` in both Linux archives. The field-fix implementation and earlier
-evidence remain recorded in `.analysis/codex-logs/field-bugs/receipt.json`.
+Fish cooking has a passing focused before/after regression. Double-chest changes
+are partial. The final correctness gate passed formatting but failed strict Clippy
+at `play/tests/furnace.rs:1195` (`&format!` needless borrow); full tests did not run.
+Receipt: `.analysis/validation/20260910T095908-correctness-0t0ey1bm/result.json`.
+The installed owner binary/process/world were not changed by these field fixes.
+Maturity remains `draft`.
 
-The fresh release-candidate workspace test run passed 4,475 tests with 194
-ignored. Formatter, strict Clippy, code-health, installer and harness checks
-passed. One independent release reviewer passed version consistency, packaging
-and the draft-prerelease publication plan without running validation.
+Next: resume the documented issues, starting with the exact Clippy error and
+chest regressions; then close the remaining gameplay and save-allocation defects.
+The older checkpoint narrative below is historical, not the active queue.
 
-Earlier Lua gameplay-event integration timeouts remain unexplained. Call-site
-diagnostics were added; assertions and timeouts were not relaxed. Ten bounded
-direct diagnostic runs and the fresh complete native test gate passed, but this
-does not establish a deterministic root-cause fix.
+## Previous checkpoint: compact chunk storage and actionable profiles
 
-Graphical owner acceptance, external online-login acceptance, vanilla recapture
-and gameplay RSS/performance comparisons remain unperformed. The owner-requested
-feet-and-eyes breathing policy is intentional, and public offline listening
-retains the documented impersonation risk. Existing animals are not culled.
+The owner-approved uniform/shared lighting, 1–3-bit in-memory block palettes and
+memory/CPU profile breakdown are implemented. Source remains uncommitted.
+No installed binary, owner process, world or configuration was changed.
+
+Light arrays use inline repeated bytes or shared copy-on-write 2,048-byte
+payloads. Unknown and computed-zero light remain distinct. Small palettes use
+1/2/3 bits in RAM, with valid minimum-four-bit Anvil/wire encoding.
+On the same isolated copy of 1,811 stored owner chunks, requested live heap fell
+100,825,603→42,859,987 bytes (96.2→40.9 MiB, 57.5% less). Both probes released to
+244 bytes after world drop; RSS remained retained. The probe's printed checksum
+is an estimated-byte sum, not a semantic content hash.
+
+`profile` now captures actual process RSS/Linux mappings/I/O/thread CPU,
+requested live Rust allocations and churn, sorted owner estimates, chunk
+categories with shared-payload deduplication, reusable lighting scratch,
+prepared/session/entity capacities, and exclusive CPU by subsystem.
+Async polling excludes suspension; lock/runnable wait and inclusive wall time
+remain separate. Run profile before and after the workload for interval deltas.
+The system allocator is unchanged; no trimming or arena tuning was introduced.
+The unclassified heap/CPU remainder and non-transactional capture limits are
+explicit, not labeled a leak or exact allocator retention.
+
+Final isolated debug-server smoke passed four 1,089-chunk initial streams,
+128 unloads and regrowths each, zero retained resends and normal chat.
+After explicit `save-all` acknowledgement, profile measured 235.1 MiB RSS and
+48.2 MiB requested Rust live bytes: estimated registry 21.4 MiB, light scratch
+6.8 MiB, published chunks 1.5 MiB, prepared frames 0.17 MiB and 18.4 MiB outside
+classified owners. Capture took 12 ms. The exercised interval attributed
+43.5 of 49.4 CPU seconds; other preparation, disk decode and saving dominated.
+These are a native debug workload and capacity estimates, not graphical
+acceptance, a TPS target or exact RSS ownership. The combined changes did not
+regress the measured warmed stream timings; profiler overhead was not isolated
+from the storage savings.
+
+Validation: complete workspace 4,500 passed/194 ignored; formatter, strict
+workspace Clippy and code-health passed. Final registry/CPU attribution
+refinements additionally passed strict workspace Clippy, mc-world 280/15 and
+mc-server 76/0, debug build and the native profile/save/stream scenario.
+One independent read-only review found no blockers in compact storage and the
+initial profiler; Main verified the final attribution refinements.
+The existing Lua gameplay-event fixture now moves horizontally off its supporting
+block before descending to the item; all event assertions remain and both its
+focused test and complete workspace rerun pass. An old telemetry fixture that
+only asserted defaults/copied values was removed, not re-pinned.
 
 ```yaml
-base_tree: 60be6039bfc63e97a40299a378f3e66e6a7cac17
-release_tag: v0.0.5
-publication_evidence: .analysis/releases/public-v0.0.5/receipt.json
-field_evidence: .analysis/codex-logs/field-bugs/receipt.json
+base_tree: 8414d7e05b379b0d5b78e9506036d14bc7f98378
+snapshot: .analysis/codex-logs/compact-profile/receipt.json
+previous_snapshot: .analysis/codex-logs/river-profile/receipt.json
+validation:
+  - .analysis/validation/20260910T075629-test-bec1lr2p/result.json
+  - .analysis/validation/20260910T081626-code-health-bqumxzwb/result.json
+  - .analysis/codex-logs/compact-profile/final-validation.json
+  - .analysis/codex-logs/compact-profile/final-after-save.json
 resume:
-  next: Owner exercises the reported field scenarios on v0.0.5 and records client/server evidence for any remaining failure.
+  next: Owner graphical field test of target/debug/mc-server with a fresh world_dir, collecting profile before and after exploration; keep the current sarvar world and installed process unchanged until separately authorized.
 ```
 
-The release receipt records actual publication status, commit, hosted gates,
-asset checksums and downloaded-artifact smoke evidence. Its publication status
-must be checked rather than inferred from this preparation cursor. Sibling
-Loader/plugin checkouts were restored for native fixtures only; they were not
-edited or published in this checkpoint.
+Earlier aquatic movement, region-reader cache and wider/deeper variable rivers
+remain implemented; their evidence is in the previous snapshot and
+`.analysis/codex-logs/aquatic-ram/receipt.json`. Worldgen revision remains 20:
+the prior river change requires a fresh world rather than rewriting the owner's
+revision-19 chunks. This compact-storage/profile checkpoint did not bump it.
+`target/debug/mc-server` includes all these changes. `target/release/mc-server`
+remains the earlier aquatic/RAM revision-19 build. Subsequently, on explicit owner
+request, the current debug build was installed atomically as
+`~/.local/bin/solaris`; the previous executable was backed up. SHA-256 matches
+the tested source binary and installed `--version` reports `mc-server 0.0.5`.
+No running server was restarted and no world/configuration was modified.
+Installation receipt and backup location:
+`.analysis/codex-logs/compact-profile/installation/receipt.json`.
+Published version remains v0.0.5 and
+maturity `draft`. Graphical movement/parity and historical failed/manual-pending
+scenarios remain unverified; native/Cargo passes do not close them.
 
 ## Standing architecture objective
 

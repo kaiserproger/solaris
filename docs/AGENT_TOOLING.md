@@ -46,6 +46,10 @@ Do not enable this variable for ordinary operator launches.
   plus Xvfb process management and MCP state events — not sleeps.
   Set `SOLARIS_LOADER_ROOT` to use a different Loader checkout; the default
   is the sibling `../solaris-loader`, never an in-core compatibility copy.
+- The `core-client` and `inventory` economy fixture comes from
+  `../solaris-default-plugins/basic-economy`, not an in-core plugin copy.
+  CI pins both sibling source revisions in `.github/workflows/ci.yml`; the
+  Java test command runs once and does not retry test failures.
 - Loopback must be free on the needed ports (default MCP `39095`, scenario
   server ports such as `25565`/`25567`, per-run agent bridge ports). A run that
   cannot bind fails closed; there is no invented exit code.
@@ -237,19 +241,24 @@ log, and client-state events.
 - Terrain capture (`seed-review`, `seed-contact-sheet`) never grants owner
   `ACCEPT`; that decision lives outside the harness.
 
-### Current evidence and limits (2026-09-06)
+### Retained evidence (2026-09-06, not current release status)
+
+This is historical run evidence, not the current workspace version or a fresh
+gameplay result. [MEMORY.md](MEMORY.md) owns current checkpoint evidence; the
+published version is described in [the README](../README.md). Unrerun failures
+below remain unclosed, but do not establish failure on every later revision.
 
 - Green: `harness-check` (9 tests plus shell syntax), 49 manifest tests,
   `java` / `installer` / `fixture-check` / `oracle-check`, and the graphical
   inventory plus core-client compatibility gate at
   `.analysis/validation/20260906T084650-inventory-njrj95iy/result.json`.
-- Red: the full alpha `playable` loop currently **fails** after natural spruce
+- Red: that full alpha `playable` run **failed** after natural spruce
   pickup/crafting — no dry crafting-table placement target in the snowy terrain
-  under test (Main investigates; never mark green). The frozen load matrix
+  under test (not rerun here; never mark green). The frozen load matrix
   remains 20 PASS / 22 FAIL with no owner terrain `ACCEPT`, and the full core
   redesign is incomplete.
-- Workspace version and latest published prerelease are `v0.0.3-alpha.1`
-  (workspace version without the `v`). Tag workflow
+- At that checkpoint, workspace version and latest published prerelease were
+  `v0.0.3-alpha.1` (workspace version without the `v`). Tag workflow
   [34356580571](https://github.com/kaiserproger/solaris/actions/runs/34356580571)
   passed, including both native Linux release builds and archive checks.
   Public curl installation, configuration validation and isolated startup passed
@@ -259,8 +268,8 @@ log, and client-state events.
   `.analysis/releases/v0.0.3-alpha.1/solaris-x86_64-unknown-linux-gnu.tar.gz`.
   It passed isolated version/config/startup checks, not full survival acceptance.
   SHA-256: `925a825b709e5e44d8ad17957d741e3751ed955dba3e510ee4baa8ee78ed6b36`.
-- Owner correction: stop fixed-seed tuning. Use the frozen archive for manual
-  field testing first, then graphical exploratory runs across varied seeds.
+- The owner's field-test instruction at that checkpoint was to stop fixed-seed
+  tuning and test the frozen archive before varied-seed graphical exploration.
   Record each seed, generated config, steps, logs and screenshots; retain failing
   seeds as reproductions, not as the only terrain used for acceptance.
 

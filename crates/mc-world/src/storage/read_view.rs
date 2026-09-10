@@ -6,14 +6,13 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use mc_data::items::ItemRegistry;
 
 use crate::anvil::chunk_from_payload_with_items_at_position;
-use crate::anvil::region::read_chunk;
+use crate::anvil::region::{RegionReader, read_chunk};
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos, FurnaceBlockEntity};
 use crate::section::SECTION_DIM;
 
 use super::{
-    DecodedRegion, REGION_AXIS_CHUNKS, WorldError, WorldStorage, chunk_pos_of,
-    make_cached_chunk_mut, region_of,
+    REGION_AXIS_CHUNKS, WorldError, WorldStorage, chunk_pos_of, make_cached_chunk_mut, region_of,
 };
 
 const READ_VIEW_REGION_AXIS_CHUNKS: i32 = 8;
@@ -220,6 +219,24 @@ impl WorldReadView {
             publication: Arc::new(ResidentPublicationState::new()),
             spawn: Arc::new(RwLock::new(WorldSpawn::default())),
         }
+    }
+
+    /// Explicit diagnostic capture. Clones handles under short shard locks,
+    /// then walks allocations without holding storage or publication locks.
+    /// Shards are observed sequentially, not as one transactional snapshot.
+    pub fn memory_profile(&self) -> crate::ChunkMemoryProfile {
+        let mut snapshots = Vec::new();
+        for shard in self.chunks.iter() {
+            let chunks = shard
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snapshots.extend(chunks.values().cloned());
+        }
+        let mut profile = crate::ChunkMemoryProfile::default();
+        for chunk in &snapshots {
+            profile.observe(chunk);
+        }
+        profile
     }
 
     pub(crate) fn publication_state(&self) -> Arc<ResidentPublicationState> {
@@ -756,7 +773,7 @@ pub struct ChunkDiskLoadPlan {
     local: (u8, u8),
     region_path: PathBuf,
     disk_backed: bool,
-    cached_region: Option<Arc<DecodedRegion>>,
+    cached_region: Option<Arc<RegionReader>>,
     registry: Arc<BlockRegistry>,
     item_registry: Option<Arc<ItemRegistry>>,
 }
@@ -766,13 +783,13 @@ impl ChunkDiskLoadPlan {
     pub fn has_load_source(&self) -> bool {
         self.cached_region
             .as_ref()
-            .is_some_and(|region| region.contains_key(&self.local))
+            .is_some_and(|region| region.has_chunk(self.local.0, self.local.1))
             || (self.disk_backed && self.region_path.is_file())
     }
 
     pub fn load(self) -> Result<Option<Chunk>, WorldError> {
         let payload = if let Some(region) = self.cached_region {
-            region.get(&self.local).cloned()
+            region.read_chunk(self.local.0, self.local.1)?
         } else if self.disk_backed && self.region_path.is_file() {
             read_chunk(&self.region_path, self.local.0, self.local.1)?
         } else {

@@ -24,6 +24,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use flate2::bufread::GzDecoder;
 use flate2::write::ZlibEncoder;
@@ -199,15 +200,22 @@ struct ChunkLocation {
     count: u8,
 }
 
-struct RegionReader {
+/// A validated region index and open file, with no retained decoded payloads.
+/// Reads seek directly to one slot; callers must discard the reader after
+/// replacing the region file so the index and file handle stay current.
+pub(crate) struct RegionReader {
     path: PathBuf,
-    file: File,
+    file: Mutex<File>,
     header: [u8; HEADER_BYTES],
     locations: [Option<ChunkLocation>; REGION_CHUNK_COUNT],
 }
 
 impl RegionReader {
-    fn open(path: &Path, limits: RegionLimits) -> Result<Self, RegionError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, RegionError> {
+        Self::open_with_limits(path, DEFAULT_REGION_LIMITS)
+    }
+
+    fn open_with_limits(path: &Path, limits: RegionLimits) -> Result<Self, RegionError> {
         let mut file = File::open(path).map_err(|source| RegionError::Io {
             path: path.to_path_buf(),
             source,
@@ -241,14 +249,30 @@ impl RegionReader {
         let locations = validate_location_table(path, &header, file_len)?;
         Ok(Self {
             path: path.to_path_buf(),
-            file,
+            file: Mutex::new(file),
             header,
             locations,
         })
     }
 
+    /// Decode only the requested slot, enforcing the per-chunk decode budget.
+    /// Location-table corruption anywhere in the region is rejected at open;
+    /// payload corruption is checked when that particular slot is requested.
+    pub(crate) fn read_chunk(
+        &self,
+        local_x: u8,
+        local_z: u8,
+    ) -> Result<Option<ChunkPayload>, RegionError> {
+        let slot = chunk_slot(local_x, local_z)?;
+        self.read_slot(slot, 0, DEFAULT_REGION_LIMITS)
+    }
+
+    pub(crate) fn has_chunk(&self, local_x: u8, local_z: u8) -> bool {
+        chunk_slot(local_x, local_z).is_ok_and(|slot| self.locations[slot].is_some())
+    }
+
     fn read_slot(
-        &mut self,
+        &self,
         slot: usize,
         decoded_so_far: usize,
         limits: RegionLimits,
@@ -261,15 +285,19 @@ impl RegionReader {
         let start = u64::from(location.sector) * SECTOR_SIZE as u64;
         let bytes_available = usize::from(location.count) * SECTOR_SIZE;
 
-        self.file
-            .seek(SeekFrom::Start(start))
+        // A shared reader serializes file-position changes, not decompression.
+        // Every read seeks anew, so a previous failed read cannot misalign it.
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        file.seek(SeekFrom::Start(start))
             .map_err(|source| RegionError::Io {
                 path: self.path.clone(),
                 source,
             })?;
         let mut chunk_header = [0_u8; 5];
-        self.file
-            .read_exact(&mut chunk_header)
+        file.read_exact(&mut chunk_header)
             .map_err(|source| RegionError::Io {
                 path: self.path.clone(),
                 source,
@@ -313,12 +341,12 @@ impl RegionReader {
                     source,
                 }
             })?;
-        self.file
-            .read_exact(&mut payload)
+        file.read_exact(&mut payload)
             .map_err(|source| RegionError::Io {
                 path: self.path.clone(),
                 source,
             })?;
+        drop(file);
 
         let uncompressed_nbt = decompress_bounded(comp, &payload, cx, cz, decoded_so_far, limits)?;
         let ts_off = SECTOR_SIZE + slot * 4;
@@ -444,6 +472,11 @@ pub(crate) fn read_chunk(
     local_x: u8,
     local_z: u8,
 ) -> Result<Option<ChunkPayload>, RegionError> {
+    let slot = chunk_slot(local_x, local_z)?;
+    RegionReader::open(path.as_ref())?.read_slot(slot, 0, DEFAULT_REGION_LIMITS)
+}
+
+fn chunk_slot(local_x: u8, local_z: u8) -> Result<usize, RegionError> {
     if usize::from(local_x) >= CHUNKS_PER_REGION_AXIS
         || usize::from(local_z) >= CHUNKS_PER_REGION_AXIS
     {
@@ -452,9 +485,7 @@ pub(crate) fn read_chunk(
             cz: local_z,
         });
     }
-    let mut reader = RegionReader::open(path.as_ref(), DEFAULT_REGION_LIMITS)?;
-    let slot = usize::from(local_z) * CHUNKS_PER_REGION_AXIS + usize::from(local_x);
-    reader.read_slot(slot, 0, DEFAULT_REGION_LIMITS)
+    Ok(usize::from(local_z) * CHUNKS_PER_REGION_AXIS + usize::from(local_x))
 }
 
 fn read_region_with_limits(
@@ -462,7 +493,7 @@ fn read_region_with_limits(
     limits: RegionLimits,
     mut visitor: impl FnMut(ChunkPayload),
 ) -> Result<(), RegionError> {
-    let mut reader = RegionReader::open(path, limits)?;
+    let reader = RegionReader::open_with_limits(path, limits)?;
     let mut decoded_total = 0_usize;
     for slot in 0..REGION_CHUNK_COUNT {
         if let Some(payload) = reader.read_slot(slot, decoded_total, limits)? {
@@ -1581,6 +1612,10 @@ mod tests {
             assert_eq!(chunks[0].local_z, 0);
             assert_eq!(chunks[0].timestamp, 1_700_000_000);
             assert_eq!(chunks[0].uncompressed_nbt, raw);
+            let reader = RegionReader::open(region.path()).unwrap();
+            let chunk = reader.read_chunk(0, 0).unwrap().unwrap();
+            assert_eq!(chunk.timestamp, 1_700_000_000);
+            assert_eq!(chunk.uncompressed_nbt, raw);
         }
     }
 
@@ -1633,6 +1668,20 @@ mod tests {
 
         let target = read_chunk(region.path(), 1, 1).unwrap().unwrap();
         assert_eq!(target.uncompressed_nbt, b"target");
+        let reader = RegionReader::open(region.path()).unwrap();
+        assert_eq!(
+            reader.read_chunk(1, 1).unwrap().unwrap().uncompressed_nbt,
+            b"target"
+        );
+        assert_eq!(
+            reader.read_chunk(0, 0).unwrap().unwrap().uncompressed_nbt,
+            b"zero"
+        );
+        assert!(reader.read_chunk(2, 2).unwrap().is_none());
+        assert!(matches!(
+            reader.read_chunk(32, 0),
+            Err(RegionError::InvalidChunkCoordinates { cx: 32, cz: 0 })
+        ));
         assert!(read_chunk(region.path(), 2, 2).unwrap().is_none());
         assert!(matches!(
             read_chunk(region.path(), 32, 0),
@@ -1651,14 +1700,60 @@ mod tests {
     }
 
     #[test]
+    fn shared_slot_reader_keeps_concurrent_reads_isolated() {
+        let first = vec![0x35; 4096];
+        let second = vec![0xa7; 8192];
+        let region = synthetic_region_chunks(&[
+            (0, CompressionType::Zlib as u8, zlib_payload(&first)),
+            (1, CompressionType::Zlib as u8, zlib_payload(&second)),
+        ]);
+        let reader = RegionReader::open(region.path()).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (x, expected) in [(0, &first), (1, &second)] {
+                let reader = &reader;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..32 {
+                        assert_eq!(
+                            reader.read_chunk(x, 0).unwrap().unwrap().uncompressed_nbt,
+                            *expected
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn slot_reader_isolated_from_unrelated_corrupt_slot() {
         let region = synthetic_region_chunks(&[
             (0, 0x7F, b"corrupt".to_vec()),
+            (1, CompressionType::Zlib as u8, b"not zlib".to_vec()),
+            (2, 0x80 | CompressionType::Zlib as u8, Vec::new()),
             (33, CompressionType::Uncompressed as u8, b"target".to_vec()),
         ]);
 
         let target = read_chunk(region.path(), 1, 1).unwrap().unwrap();
         assert_eq!(target.uncompressed_nbt, b"target");
+        let reader = RegionReader::open(region.path()).unwrap();
+        assert!(matches!(
+            reader.read_chunk(0, 0),
+            Err(RegionError::UnknownCompression(0x7F))
+        ));
+        assert!(matches!(
+            reader.read_chunk(1, 0),
+            Err(RegionError::Decompress { cx: 1, cz: 0, .. })
+        ));
+        assert!(matches!(
+            reader.read_chunk(2, 0),
+            Err(RegionError::Oversized)
+        ));
+        assert_eq!(
+            reader.read_chunk(1, 1).unwrap().unwrap().uncompressed_nbt,
+            b"target"
+        );
         assert!(matches!(
             read_region(region.path()),
             Err(RegionError::UnknownCompression(0x7F))
@@ -1691,6 +1786,10 @@ mod tests {
             (1, CompressionType::Uncompressed as u8, b"second".to_vec()),
         ]);
         overwrite_location(overlap.path(), 1, 2, 1);
+        assert!(matches!(
+            RegionReader::open(overlap.path()),
+            Err(RegionError::OverlappingChunkSectors { .. })
+        ));
         let mut visited = 0_usize;
         let error = visit_region(overlap.path(), |_| visited += 1).unwrap_err();
         assert_eq!(visited, 0, "structural validation must precede visitors");

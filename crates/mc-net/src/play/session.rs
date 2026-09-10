@@ -509,6 +509,8 @@ struct PreparedChunkCache {
     prewarm_frontier_counts: HashMap<(i32, i32), usize>,
 }
 
+mod resource_snapshot;
+
 #[derive(Debug, Clone, Default)]
 struct ArrowKillRewards {
     item_entity_type_id: Option<i32>,

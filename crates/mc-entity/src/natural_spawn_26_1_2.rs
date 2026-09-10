@@ -385,9 +385,26 @@ pub fn apply_default_mob_goal(entity: &mut SpawnEntity, behaviors: &MobBehaviorT
         MobMovementPolicy::AquaticWander | MobMovementPolicy::AmphibiousWander => {
             entity.on_ground = false;
             GoalState::AquaticWander {
-                speed: profile.wander_speed * 0.9,
+                // FishSwimGoal's modifier is 1.0; FishMoveControl multiplies
+                // it by MOVEMENT_SPEED. Squid ignores this attribute in travel.
+                speed: if crate::aquatic_motion::Swimmer::for_type(&entity.type_name)
+                    == crate::aquatic_motion::Swimmer::Fish
+                {
+                    entity
+                        .attributes
+                        .base(&AttributeKind::MovementSpeed)
+                        .unwrap_or(0.7)
+                } else {
+                    profile.wander_speed * 0.9
+                },
                 vertical_speed: 0.18,
-                period_ticks: profile.wander_period_ticks.max(20),
+                period_ticks: if crate::aquatic_motion::Swimmer::for_type(&entity.type_name)
+                    == crate::aquatic_motion::Swimmer::Fish
+                {
+                    40
+                } else {
+                    profile.wander_period_ticks.max(20)
+                },
             }
         }
         MobMovementPolicy::HostilePursuit => GoalState::Wander {

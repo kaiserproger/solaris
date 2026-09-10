@@ -109,14 +109,15 @@ region_cache_size = 9
 # compression_level = 1
 
 [autoscale]
-# Runtime control owns chunk throughput plus random/scheduled work budgets
-# selected from the hardware profile and runtime p95 pressure.
+# Runtime control changes throughput/view and deferred-work budgets only after
+# sustained overload or stable headroom for more than a minute, one unit per step.
 enabled = true
 profile = "balanced"
-# Optional overrides. Omit to use the profile defaults.
+# Optional overrides. Default view bounds follow server.view_distance.
 # min_view_distance = 8
 # max_view_distance = 32
 # target_tick_ms = 50
 # target_first_chunk_ms = 1000
-# scale_down_after_ticks = 4
-# scale_up_after_ticks = 12
+# Seconds, not tick/observation counts; both normalize to a minimum of 60.
+# scale_down_after_seconds = 60
+# scale_up_after_seconds = 60

@@ -330,7 +330,7 @@ use containers::{
     FurnaceKind, FurnaceWindow, MERCHANT_MENU_TYPE_ID, MerchantWindow, QuickCraftClick,
     QuickCraftOutcome, QuickCraftState, STONECUTTER_MENU_TYPE_ID, ScriptMenuClick,
     ScriptMenuClickDisposition, ScriptMenuOpenError, ScriptMenuWindow, StonecutterClickAction,
-    StonecutterClickInput, StonecutterWindow, adjacent_chest_positions,
+    StonecutterClickInput, StonecutterWindow,
     can_place_in_enchanting_menu_slot as can_place_in_enchanting_menu_slot_with_data,
     chest_menu_state_change_count, chest_menu_title_nbt, chest_slot_stacks, chest_wire_items,
     client_close_matches, count_valid_enchanting_bookshelves, crafting_menu_title_nbt,
@@ -557,6 +557,7 @@ fn apply_outside_pickup_click(state: &mut InteractionState, button: i8) -> Optio
 
 thread_local! {
     static CHUNK_LIGHT_WORKSPACE: RefCell<LightWorkspace> = RefCell::new(LightWorkspace::new());
+    static CHUNK_LIGHT_WORKSPACE_GAUGE: RefCell<crate::resource_profile::LightWorkspaceGauge> = RefCell::default();
 }
 
 /// How often we ping the client. Vanilla's value.
@@ -858,8 +859,6 @@ const SKELETON_SHOT_RANGE: f64 = 16.0;
 const SKELETON_ARROW_SPEED: f64 = 1.6;
 #[cfg(test)]
 const HOSTILE_FOLLOW_SPEED: f64 = 1.25;
-#[cfg(test)]
-const PASSIVE_WANDER_SPEED: f64 = 0.8;
 fn world_time_is_night(world_time: u64) -> bool {
     world_time % DAY_LENGTH_TICKS >= NIGHT_START_TICK
 }
@@ -3588,14 +3587,15 @@ where
             return Ok(false);
         };
         let mut positions = vec![position];
-        if title == "Chest" {
-            for neighbour in adjacent_chest_positions(position) {
-                let neighbour_state = state.world_read.get_cached_block(neighbour);
-                if neighbour_state.is_some_and(|block_state| is_chest_state(state, block_state)) {
-                    positions.push(neighbour);
-                    break;
-                }
-            }
+        if title == "Chest"
+            && let Some(neighbour) = block_placement::chest::paired_position(
+                &state.blocks,
+                |pos| state.world_read.get_cached_block(pos),
+                position,
+                clicked,
+            )
+        {
+            positions.push(neighbour);
         }
         positions.sort_by_key(|pos| (pos.x, pos.y, pos.z));
         (positions, title)
@@ -11846,6 +11846,7 @@ where
                 });
             }
             write_packet(writer, &ForgetLevelChunk { chunk_x, chunk_z }, compression).await?;
+            stream.log_chunk_unload(chunk_x, chunk_z, "movement");
         }
     }
     debug!(
@@ -12747,6 +12748,7 @@ where
                     for (chunk_x, chunk_z) in unloads {
                         write_packet(writer, &ForgetLevelChunk { chunk_x, chunk_z }, compression)
                             .await?;
+                        stream.log_chunk_unload(chunk_x, chunk_z, "client_information");
                     }
                 }
             }
@@ -12939,6 +12941,18 @@ where
         }
         ServerboundChat::ID => {
             let chat = ServerboundChat::decode(&mut body)?;
+            if chat.message.eq_ignore_ascii_case("blink") {
+                debug!(
+                    target: "solaris::chunk_visibility",
+                    event = "chunk_blink_marker",
+                    session_id,
+                    player_name,
+                    player_uuid,
+                    tick = sessions.simulation_tick(),
+                    pose = ?player_pose,
+                    "player reported chunk blink"
+                );
+            }
             if let Some(scripts) = scripts {
                 scripts.enqueue_event(ScriptEvent::player_chat_with_context(
                     ScriptPlayerId::new(session_id),
@@ -14898,6 +14912,7 @@ mod campfire_output_recovery_tests {
         sessions: Arc<SessionRegistry>,
         simulation: simulation::SimulationHandle,
         owner: simulation::SimulationOwner,
+        writer: Arc<world_journal::JournalWriter>,
     }
 
     fn campfire_test_blocks() -> Arc<BlockRegistry> {
@@ -15005,17 +15020,19 @@ mod campfire_output_recovery_tests {
             .unwrap();
         assert_eq!(storage.flush_dirty().unwrap(), 1);
 
+        let writer = world_journal::JournalWriter::open(root).unwrap();
         let (entity_journal, entity_pending) =
-            persistence::FileRegionalDecisionJournal::open_for_test(root).unwrap();
+            persistence::FileRegionalDecisionJournal::open(root, Arc::clone(&writer)).unwrap();
         assert!(entity_pending.is_empty());
         let sessions = Arc::new(SessionRegistry::new_with_entity_owner_journal(
             1,
             Box::new(entity_journal),
         ));
-        let (world_journal, world_pending) = world_journal::WorldChunkJournal::open_for_test(
+        let (world_journal, world_pending) = world_journal::WorldChunkJournal::open(
             root,
             Arc::clone(&blocks),
             Arc::clone(&items),
+            Arc::clone(&writer),
         )
         .unwrap();
         assert!(world_pending.is_empty());
@@ -15028,6 +15045,7 @@ mod campfire_output_recovery_tests {
             sessions,
             simulation,
             owner,
+            writer,
         }
     }
 
@@ -15038,17 +15056,19 @@ mod campfire_output_recovery_tests {
         let mut storage = mc_world::WorldStorage::open(root, Arc::clone(&blocks))
             .unwrap()
             .with_item_registry(Arc::clone(&items));
-        let (world_journal, world_pending) = world_journal::WorldChunkJournal::open_for_test(
+        let writer = world_journal::JournalWriter::open(root).unwrap();
+        let (world_journal, world_pending) = world_journal::WorldChunkJournal::open(
             root,
             Arc::clone(&blocks),
             Arc::clone(&items),
+            Arc::clone(&writer),
         )
         .unwrap();
         for chunk in world_journal.decode_pending(&world_pending).unwrap() {
             storage.replay_journal_chunk(chunk).unwrap();
         }
         let (entity_journal, entity_pending) =
-            persistence::FileRegionalDecisionJournal::open_for_test(root).unwrap();
+            persistence::FileRegionalDecisionJournal::open(root, Arc::clone(&writer)).unwrap();
         let sessions = Arc::new(SessionRegistry::new_with_entity_owner_journal(
             1,
             Box::new(entity_journal),
@@ -15076,6 +15096,7 @@ mod campfire_output_recovery_tests {
                 sessions,
                 simulation,
                 owner,
+                writer,
             },
             recovered,
         )

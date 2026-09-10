@@ -371,9 +371,9 @@ impl ChunkPipelineResources {
         } else {
             match action {
                 crate::AutoscaleAction::Hold => current,
-                crate::AutoscaleAction::ScaleDown => current.div_ceil(2).max(1),
+                crate::AutoscaleAction::ScaleDown => current.saturating_sub(1).max(1),
                 crate::AutoscaleAction::ScaleUp => current
-                    .saturating_mul(2)
+                    .saturating_add(1)
                     .min(self.cpu_capacity.saturating_sub(1).max(1)),
             }
         };

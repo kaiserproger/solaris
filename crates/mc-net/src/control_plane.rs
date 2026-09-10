@@ -6,8 +6,10 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::lock_policy::lock_authoritative_mutex;
 use crate::memory_pressure::{
@@ -18,8 +20,15 @@ use crate::memory_pressure::{
 /// A producer-observed state change that may require runtime admission control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeControlSignal {
-    ChunkPressure { saturated_sources: usize },
-    FirstChunkSla { active_sources: usize },
+    /// All persistent producer sources recovered, even if they reactivated
+    /// before this coalesced channel was consumed.
+    SourcesRecovered,
+    ChunkPressure {
+        saturated_sources: usize,
+    },
+    FirstChunkSla {
+        active_sources: usize,
+    },
     SlowClientShed,
 }
 
@@ -28,6 +37,7 @@ struct RuntimeControlSignalState {
     chunk_pressure_changed: bool,
     first_chunk_sla_changed: bool,
     slow_client_shed: bool,
+    sources_recovered: bool,
     saturated_chunk_sources: usize,
     pending_chunk_saturation_peak: usize,
     active_first_chunk_sla_sources: usize,
@@ -41,6 +51,7 @@ impl Default for RuntimeControlSignalState {
             chunk_pressure_changed: false,
             first_chunk_sla_changed: false,
             slow_client_shed: false,
+            sources_recovered: false,
             saturated_chunk_sources: 0,
             pending_chunk_saturation_peak: 0,
             active_first_chunk_sla_sources: 0,
@@ -129,11 +140,21 @@ impl RuntimeControlSignalReceiver {
 
     fn take_pending(&self) -> Option<RuntimeControlSignal> {
         let mut state = self.channel.lock_state();
+        if state.sources_recovered {
+            state.sources_recovered = false;
+            return Some(RuntimeControlSignal::SourcesRecovered);
+        }
         if state.slow_client_shed {
             state.slow_client_shed = false;
             return Some(RuntimeControlSignal::SlowClientShed);
         }
-        if state.first_chunk_sla_changed {
+        // Publish a pending activation before another source's recovery so a
+        // continuously overloaded handoff cannot manufacture a healthy interval.
+        if state.first_chunk_sla_changed
+            && (state.pending_first_chunk_sla_peak > 0
+                || !state.chunk_pressure_changed
+                || state.pending_chunk_saturation_peak == 0)
+        {
             let active_sources = state
                 .pending_first_chunk_sla_peak
                 .max(state.active_first_chunk_sla_sources);
@@ -199,6 +220,9 @@ impl RuntimeControlChunkPressureSource {
                 .checked_sub(1)
                 .expect("chunk pressure source recovered without matching saturation");
         }
+        if state.saturated_chunk_sources == 0 && state.active_first_chunk_sla_sources == 0 {
+            state.sources_recovered = true;
+        }
         if had_pending_change {
             state.pending_chunk_saturation_peak = state
                 .pending_chunk_saturation_peak
@@ -249,6 +273,9 @@ impl RuntimeControlFirstChunkSlaSource {
                 .active_first_chunk_sla_sources
                 .checked_sub(1)
                 .expect("first-chunk SLA source recovered without matching pressure");
+        }
+        if state.saturated_chunk_sources == 0 && state.active_first_chunk_sla_sources == 0 {
+            state.sources_recovered = true;
         }
         if had_pending_change {
             state.pending_first_chunk_sla_peak = state
@@ -307,8 +334,8 @@ pub struct AutoscalePolicy {
     pub target_first_chunk_ms: u64,
     pub queue_pressure_percent: u8,
     pub memory_pressure_percent: u8,
-    pub scale_down_after_ticks: u32,
-    pub scale_up_after_ticks: u32,
+    pub scale_down_after_seconds: u32,
+    pub scale_up_after_seconds: u32,
 }
 
 impl Default for AutoscalePolicy {
@@ -335,8 +362,8 @@ impl AutoscalePolicy {
                 target_first_chunk_ms: 2_500,
                 queue_pressure_percent: 70,
                 memory_pressure_percent: 85,
-                scale_down_after_ticks: 2,
-                scale_up_after_ticks: 8,
+                scale_down_after_seconds: 60,
+                scale_up_after_seconds: 60,
             },
             AutoscaleProfile::Balanced => Self {
                 profile,
@@ -352,8 +379,8 @@ impl AutoscalePolicy {
                 target_first_chunk_ms: 1_500,
                 queue_pressure_percent: 75,
                 memory_pressure_percent: 85,
-                scale_down_after_ticks: 3,
-                scale_up_after_ticks: 10,
+                scale_down_after_seconds: 60,
+                scale_up_after_seconds: 60,
             },
             AutoscaleProfile::HighEnd => Self {
                 profile,
@@ -369,8 +396,8 @@ impl AutoscalePolicy {
                 target_first_chunk_ms: 1_000,
                 queue_pressure_percent: 80,
                 memory_pressure_percent: 90,
-                scale_down_after_ticks: 4,
-                scale_up_after_ticks: 12,
+                scale_down_after_seconds: 60,
+                scale_up_after_seconds: 60,
             },
         }
     }
@@ -402,8 +429,8 @@ impl AutoscalePolicy {
             target_first_chunk_ms: self.target_first_chunk_ms.max(1),
             queue_pressure_percent: self.queue_pressure_percent.clamp(1, 100),
             memory_pressure_percent: self.memory_pressure_percent.clamp(1, 100),
-            scale_down_after_ticks: self.scale_down_after_ticks.max(1),
-            scale_up_after_ticks: self.scale_up_after_ticks.max(1),
+            scale_down_after_seconds: self.scale_down_after_seconds.max(60),
+            scale_up_after_seconds: self.scale_up_after_seconds.max(60),
         }
     }
 }
@@ -571,8 +598,8 @@ pub struct RuntimeControlSnapshot {
     pub last_decision: AutoscaleDecision,
     pub work_budgets: RuntimeWorkBudgets,
     pub last_work_decision: RuntimeWorkDecision,
-    pub pressure_ticks: u32,
-    pub healthy_ticks: u32,
+    pub pressure_seconds: u64,
+    pub healthy_seconds: u64,
     pub scale_down_decisions: u64,
     pub scale_up_decisions: u64,
     pub draining: bool,
@@ -668,8 +695,12 @@ pub struct RuntimeControlPlane {
     work_bounds: RuntimeWorkBudgetBounds,
     work_budgets: RuntimeWorkBudgets,
     last_work_decision: RuntimeWorkDecision,
-    pressure_ticks: u32,
-    healthy_ticks: u32,
+    pressure_since: Option<Instant>,
+    healthy_since: Option<Instant>,
+    work_pressure_since: Option<Instant>,
+    work_healthy_since: Option<Instant>,
+    latest_input: Option<RuntimeControlInput>,
+    latest_work_input: Option<RuntimeWorkInput>,
     scale_down_decisions: u64,
     scale_up_decisions: u64,
     active_chunk_saturations: usize,
@@ -704,8 +735,12 @@ impl RuntimeControlPlane {
                 budgets: work_budgets,
                 reason: "initialized from autoscale profile".to_string(),
             },
-            pressure_ticks: 0,
-            healthy_ticks: 0,
+            pressure_since: None,
+            healthy_since: None,
+            work_pressure_since: None,
+            work_healthy_since: None,
+            latest_input: None,
+            latest_work_input: None,
             scale_down_decisions: 0,
             scale_up_decisions: 0,
             active_chunk_saturations: 0,
@@ -717,6 +752,10 @@ impl RuntimeControlPlane {
 
     fn decide_drain(&mut self) -> AutoscaleDecision {
         self.draining = true;
+        self.pressure_since = None;
+        self.healthy_since = None;
+        self.work_pressure_since = None;
+        self.work_healthy_since = None;
         self.limits = RuntimeControlLimits {
             view_distance: self.policy.min_view_distance,
             chunk_send_rate: self.policy.min_chunk_send_rate,
@@ -739,7 +778,43 @@ impl RuntimeControlPlane {
     }
 
     fn decide_observation(&mut self, input: RuntimeControlInput) -> AutoscaleDecision {
-        match self.pressure(input) {
+        self.latest_input = Some(input);
+        self.observe_source_pressure()
+    }
+
+    fn decide_signal(&mut self, signal: RuntimeControlSignal) -> AutoscaleDecision {
+        match signal {
+            RuntimeControlSignal::SourcesRecovered => {
+                self.active_chunk_saturations = 0;
+                self.active_first_chunk_sla_sources = 0;
+                self.observe_source_pressure()
+            }
+            RuntimeControlSignal::ChunkPressure { saturated_sources } => {
+                self.active_chunk_saturations = saturated_sources;
+                self.observe_source_pressure()
+            }
+            RuntimeControlSignal::FirstChunkSla { active_sources } => {
+                self.active_first_chunk_sla_sources = active_sources;
+                self.observe_source_pressure()
+            }
+            RuntimeControlSignal::SlowClientShed => self.record(AutoscaleDecision {
+                action: AutoscaleAction::Hold,
+                pressure: Some(AutoscalePressure::SlowClientShed),
+                limits: self.limits,
+                reason:
+                    "isolated slow-client event; sustained pressure requires state observations"
+                        .to_string(),
+            }),
+        }
+    }
+
+    fn observe_source_pressure(&mut self) -> AutoscaleDecision {
+        let input = self.latest_input.unwrap_or(RuntimeControlInput {
+            tick_ms: self.policy.target_tick_ms,
+            memory_used_mb: 0,
+            memory_limit_mb: 0,
+        });
+        let decision = match self.pressure(input) {
             Some(pressure) => self.observe_pressure(pressure),
             None if percent_at_most_u64(
                 input.tick_ms,
@@ -750,33 +825,11 @@ impl RuntimeControlPlane {
                 self.observe_healthy()
             }
             None => self.observe_tick_deadband(),
+        };
+        if let Some(work) = self.latest_work_input {
+            self.decide_work(work);
         }
-    }
-
-    fn decide_signal(&mut self, signal: RuntimeControlSignal) -> AutoscaleDecision {
-        match signal {
-            RuntimeControlSignal::ChunkPressure { saturated_sources } => {
-                self.active_chunk_saturations = saturated_sources;
-                self.observe_source_pressure()
-            }
-            RuntimeControlSignal::FirstChunkSla { active_sources } => {
-                self.active_first_chunk_sla_sources = active_sources;
-                self.observe_source_pressure()
-            }
-            RuntimeControlSignal::SlowClientShed => {
-                self.observe_pressure(AutoscalePressure::SlowClientShed)
-            }
-        }
-    }
-
-    fn observe_source_pressure(&mut self) -> AutoscaleDecision {
-        if self.active_first_chunk_sla_sources > 0 {
-            self.observe_pressure(AutoscalePressure::FirstChunkSla)
-        } else if self.active_chunk_saturations > 0 {
-            self.observe_pressure(AutoscalePressure::ChunkQueue)
-        } else {
-            self.observe_recovered_signal()
-        }
+        decision
     }
 
     fn observe_pressure(&mut self, pressure: AutoscalePressure) -> AutoscaleDecision {
@@ -784,14 +837,13 @@ impl RuntimeControlPlane {
             return self.hold_drain();
         }
 
-        self.yield_random_tick_work(pressure);
-        self.pressure_ticks = self.pressure_ticks.saturating_add(1);
-        self.healthy_ticks = 0;
-        if self.pressure_ticks >= self.policy.scale_down_after_ticks {
+        let now = Instant::now();
+        let elapsed = now.duration_since(*self.pressure_since.get_or_insert(now));
+        self.healthy_since = None;
+        if elapsed > Duration::from_secs(u64::from(self.policy.scale_down_after_seconds)) {
             let before = self.limits;
             self.limits = self.scale_down();
-            let pressure_ticks = self.pressure_ticks;
-            self.pressure_ticks = 0;
+            self.pressure_since = Some(now);
             return self.record(AutoscaleDecision {
                 action: if self.limits == before {
                     AutoscaleAction::Hold
@@ -801,8 +853,8 @@ impl RuntimeControlPlane {
                 pressure: Some(pressure),
                 limits: self.limits,
                 reason: format!(
-                    "pressure persisted for {} observations; applying bounded degradation",
-                    pressure_ticks
+                    "pressure persisted for {:.3} seconds; applying one bounded degradation step",
+                    elapsed.as_secs_f64()
                 ),
             });
         }
@@ -811,8 +863,8 @@ impl RuntimeControlPlane {
             pressure: Some(pressure),
             limits: self.limits,
             reason: format!(
-                "pressure observed for {} observations; waiting for hysteresis",
-                self.pressure_ticks
+                "pressure observed for {:.3} seconds; waiting for sustained overload",
+                elapsed.as_secs_f64()
             ),
         })
     }
@@ -822,13 +874,13 @@ impl RuntimeControlPlane {
             return self.hold_drain();
         }
 
-        self.healthy_ticks = self.healthy_ticks.saturating_add(1);
-        self.pressure_ticks = 0;
-        if self.healthy_ticks >= self.policy.scale_up_after_ticks {
+        let now = Instant::now();
+        let elapsed = now.duration_since(*self.healthy_since.get_or_insert(now));
+        self.pressure_since = None;
+        if elapsed > Duration::from_secs(u64::from(self.policy.scale_up_after_seconds)) {
             let before = self.limits;
             self.limits = self.scale_up();
-            let healthy_ticks = self.healthy_ticks;
-            self.healthy_ticks = 0;
+            self.healthy_since = Some(now);
             return self.record(AutoscaleDecision {
                 action: if self.limits == before {
                     AutoscaleAction::Hold
@@ -838,8 +890,8 @@ impl RuntimeControlPlane {
                 pressure: None,
                 limits: self.limits,
                 reason: format!(
-                    "healthy for {} observations; restoring bounded throughput",
-                    healthy_ticks
+                    "healthy for {:.3} seconds; restoring one bounded throughput step",
+                    elapsed.as_secs_f64()
                 ),
             });
         }
@@ -849,19 +901,9 @@ impl RuntimeControlPlane {
             pressure: None,
             limits: self.limits,
             reason: format!(
-                "healthy for {} observations; waiting for hysteresis",
-                self.healthy_ticks
+                "healthy for {:.3} seconds; waiting for stable headroom",
+                elapsed.as_secs_f64()
             ),
-        })
-    }
-
-    fn observe_recovered_signal(&mut self) -> AutoscaleDecision {
-        self.pressure_ticks = 0;
-        self.record(AutoscaleDecision {
-            action: AutoscaleAction::Hold,
-            pressure: None,
-            limits: self.limits,
-            reason: "producer recovered; tick health retains recovery hysteresis".to_string(),
         })
     }
 
@@ -869,8 +911,8 @@ impl RuntimeControlPlane {
         if self.draining {
             return self.hold_drain();
         }
-        self.pressure_ticks = 0;
-        self.healthy_ticks = 0;
+        self.pressure_since = None;
+        self.healthy_since = None;
         self.record(AutoscaleDecision {
             action: AutoscaleAction::Hold,
             pressure: None,
@@ -892,6 +934,7 @@ impl RuntimeControlPlane {
     }
 
     fn decide_work(&mut self, input: RuntimeWorkInput) -> RuntimeWorkDecision {
+        self.latest_work_input = Some(input);
         if self.draining {
             return self.record_work(RuntimeWorkDecision {
                 action: AutoscaleAction::Hold,
@@ -910,64 +953,93 @@ impl RuntimeControlPlane {
             .entity_goals_p95_us
             .saturating_add(input.entity_physics_p95_us)
             .saturating_add(input.entity_dispatch_p95_us);
-
-        let (focus, reason) = if input.scheduled_budget_exhausted {
-            self.work_budgets.random_tick_chunks = halve_floor_usize(
-                self.work_budgets.random_tick_chunks,
-                self.work_bounds.min.random_tick_chunks,
-            );
-            self.work_budgets.scheduled_ticks = double_ceiling_usize(
-                self.work_budgets.scheduled_ticks,
-                self.work_bounds.max.scheduled_ticks,
-            );
-            (
-                Some(RuntimeWorkFocus::ScheduledTicks),
-                "scheduled work exhausted its budget; preserving its quota and reducing random ticks",
+        let runtime_pressure = self.active_chunk_saturations > 0
+            || self.active_first_chunk_sla_sources > 0
+            || self
+                .latest_input
+                .is_some_and(|input| self.pressure(input).is_some());
+        let overloaded = runtime_pressure
+            || input.scheduled_budget_exhausted
+            || input.tick_p95_us > target_tick_us;
+        let healthy = !overloaded
+            && percent_at_most_u64(
+                input.tick_p95_us,
+                target_tick_us,
+                SCALE_UP_TICK_HEADROOM_PERCENT,
             )
-        } else if input.tick_p95_us > target_tick_us
-            && entity_us >= input.random_tick_p95_us
-            && entity_us >= scheduled_us
-        {
-            (
-                Some(RuntimeWorkFocus::EntitySimulation),
-                "tick p95 exceeded target; entity pathing candidates stay fixed at the profile maximum",
-            )
-        } else if input.tick_p95_us > target_tick_us && input.random_tick_p95_us >= scheduled_us {
-            self.work_budgets.random_tick_chunks = halve_floor_usize(
-                self.work_budgets.random_tick_chunks,
-                self.work_bounds.min.random_tick_chunks,
-            );
-            (
-                Some(RuntimeWorkFocus::RandomTicks),
-                "tick p95 exceeded target; reducing the more expensive random-tick class",
-            )
+            && self.latest_input.is_none_or(|input| {
+                percent_at_most_u64(
+                    input.tick_ms,
+                    self.policy.target_tick_ms,
+                    SCALE_UP_TICK_HEADROOM_PERCENT,
+                )
+            });
+        let focus = if input.scheduled_budget_exhausted {
+            Some(RuntimeWorkFocus::ScheduledTicks)
         } else if input.tick_p95_us > target_tick_us {
-            self.work_budgets.scheduled_ticks = halve_floor_usize(
-                self.work_budgets.scheduled_ticks,
-                self.work_bounds.min.scheduled_ticks,
-            );
-            (
-                Some(RuntimeWorkFocus::ScheduledTicks),
-                "tick p95 exceeded target; reducing the more expensive scheduled-tick class",
-            )
+            if entity_us >= input.random_tick_p95_us && entity_us >= scheduled_us {
+                Some(RuntimeWorkFocus::EntitySimulation)
+            } else if input.random_tick_p95_us >= scheduled_us {
+                Some(RuntimeWorkFocus::RandomTicks)
+            } else {
+                Some(RuntimeWorkFocus::ScheduledTicks)
+            }
+        } else if runtime_pressure {
+            Some(RuntimeWorkFocus::RandomTicks)
         } else {
-            self.work_budgets.random_tick_chunks = recover_toward_ceiling_usize(
-                self.work_budgets.random_tick_chunks,
-                self.work_bounds.max.random_tick_chunks,
-            );
-            self.work_budgets.scheduled_ticks = recover_toward_ceiling_usize(
-                self.work_budgets.scheduled_ticks,
-                self.work_bounds.max.scheduled_ticks,
-            );
-            (None, "tick p95 is healthy; restoring profile work budgets")
+            None
         };
-
+        let now = Instant::now();
+        let reason = if overloaded {
+            self.work_healthy_since = None;
+            let elapsed = now.duration_since(*self.work_pressure_since.get_or_insert(now));
+            if elapsed > Duration::from_secs(u64::from(self.policy.scale_down_after_seconds)) {
+                self.work_pressure_since = Some(now);
+                if input.scheduled_budget_exhausted || focus == Some(RuntimeWorkFocus::RandomTicks)
+                {
+                    self.work_budgets.random_tick_chunks = self
+                        .work_budgets
+                        .random_tick_chunks
+                        .saturating_sub(1)
+                        .max(self.work_bounds.min.random_tick_chunks);
+                } else if focus == Some(RuntimeWorkFocus::ScheduledTicks) {
+                    self.work_budgets.scheduled_ticks = self
+                        .work_budgets
+                        .scheduled_ticks
+                        .saturating_sub(1)
+                        .max(self.work_bounds.min.scheduled_ticks);
+                }
+                "sustained work pressure; applying one bounded step, preserving entity and exhausted scheduled quotas"
+            } else {
+                "work pressure; waiting for sustained overload"
+            }
+        } else if healthy {
+            self.work_pressure_since = None;
+            let elapsed = now.duration_since(*self.work_healthy_since.get_or_insert(now));
+            if elapsed > Duration::from_secs(u64::from(self.policy.scale_up_after_seconds)) {
+                self.work_healthy_since = Some(now);
+                self.work_budgets.random_tick_chunks = self
+                    .work_budgets
+                    .random_tick_chunks
+                    .saturating_add(1)
+                    .min(self.work_bounds.max.random_tick_chunks);
+                self.work_budgets.scheduled_ticks = self
+                    .work_budgets
+                    .scheduled_ticks
+                    .saturating_add(1)
+                    .min(self.work_bounds.max.scheduled_ticks);
+                "stable work headroom; restoring one bounded step"
+            } else {
+                "healthy work; waiting for stable headroom"
+            }
+        } else {
+            self.work_pressure_since = None;
+            self.work_healthy_since = None;
+            "work is within the recovery deadband"
+        };
         let action = if self.work_budgets == before {
             AutoscaleAction::Hold
-        } else if self.work_budgets.entity_pathing_candidates < before.entity_pathing_candidates
-            || self.work_budgets.random_tick_chunks < before.random_tick_chunks
-            || self.work_budgets.scheduled_ticks < before.scheduled_ticks
-        {
+        } else if overloaded {
             AutoscaleAction::ScaleDown
         } else {
             AutoscaleAction::ScaleUp
@@ -980,23 +1052,6 @@ impl RuntimeControlPlane {
         })
     }
 
-    fn yield_random_tick_work(&mut self, pressure: AutoscalePressure) {
-        let before = self.work_budgets.random_tick_chunks;
-        self.work_budgets.random_tick_chunks =
-            halve_floor_usize(before, self.work_bounds.min.random_tick_chunks);
-        if self.work_budgets.random_tick_chunks == before {
-            return;
-        }
-        self.last_work_decision = RuntimeWorkDecision {
-            action: AutoscaleAction::ScaleDown,
-            focus: Some(RuntimeWorkFocus::RandomTicks),
-            budgets: self.work_budgets,
-            reason: format!(
-                "runtime {pressure:?} pressure; random ticks yielded before throughput hysteresis"
-            ),
-        };
-    }
-
     #[must_use]
     pub fn snapshot(&self) -> RuntimeControlSnapshot {
         RuntimeControlSnapshot {
@@ -1005,8 +1060,12 @@ impl RuntimeControlPlane {
             last_decision: self.last_decision.clone(),
             work_budgets: self.work_budgets,
             last_work_decision: self.last_work_decision.clone(),
-            pressure_ticks: self.pressure_ticks,
-            healthy_ticks: self.healthy_ticks,
+            pressure_seconds: self
+                .pressure_since
+                .map_or(0, |since| since.elapsed().as_secs()),
+            healthy_seconds: self
+                .healthy_since
+                .map_or(0, |since| since.elapsed().as_secs()),
             scale_down_decisions: self.scale_down_decisions,
             scale_up_decisions: self.scale_up_decisions,
             draining: self.draining,
@@ -1056,36 +1115,42 @@ impl RuntimeControlPlane {
     fn scale_down(&self) -> RuntimeControlLimits {
         RuntimeControlLimits {
             view_distance: (self.limits.view_distance - 1).max(self.policy.min_view_distance),
-            chunk_send_rate: halve_floor(
-                self.limits.chunk_send_rate,
-                self.policy.min_chunk_send_rate,
-            ),
-            chunk_load_rate: halve_floor(
-                self.limits.chunk_load_rate,
-                self.policy.min_chunk_load_rate,
-            ),
-            chunk_generate_rate: halve_floor(
-                self.limits.chunk_generate_rate,
-                self.policy.min_chunk_generate_rate,
-            ),
+            chunk_send_rate: self
+                .limits
+                .chunk_send_rate
+                .saturating_sub(1)
+                .max(self.policy.min_chunk_send_rate),
+            chunk_load_rate: self
+                .limits
+                .chunk_load_rate
+                .saturating_sub(1)
+                .max(self.policy.min_chunk_load_rate),
+            chunk_generate_rate: self
+                .limits
+                .chunk_generate_rate
+                .saturating_sub(1)
+                .max(self.policy.min_chunk_generate_rate),
         }
     }
 
     fn scale_up(&self) -> RuntimeControlLimits {
         RuntimeControlLimits {
             view_distance: (self.limits.view_distance + 1).min(self.policy.max_view_distance),
-            chunk_send_rate: double_ceiling(
-                self.limits.chunk_send_rate,
-                self.policy.max_chunk_send_rate,
-            ),
-            chunk_load_rate: double_ceiling(
-                self.limits.chunk_load_rate,
-                self.policy.max_chunk_load_rate,
-            ),
-            chunk_generate_rate: double_ceiling(
-                self.limits.chunk_generate_rate,
-                self.policy.max_chunk_generate_rate,
-            ),
+            chunk_send_rate: self
+                .limits
+                .chunk_send_rate
+                .saturating_add(1)
+                .min(self.policy.max_chunk_send_rate),
+            chunk_load_rate: self
+                .limits
+                .chunk_load_rate
+                .saturating_add(1)
+                .min(self.policy.max_chunk_load_rate),
+            chunk_generate_rate: self
+                .limits
+                .chunk_generate_rate
+                .saturating_add(1)
+                .min(self.policy.max_chunk_generate_rate),
         }
     }
 
@@ -1381,26 +1446,6 @@ pub(crate) fn autoscale_pressure_label(pressure: Option<AutoscalePressure>) -> &
     }
 }
 
-fn halve_floor(value: u32, floor: u32) -> u32 {
-    value.saturating_sub(value / 2).max(floor)
-}
-
-fn double_ceiling(value: u32, ceiling: u32) -> u32 {
-    value.saturating_mul(2).min(ceiling)
-}
-
-fn halve_floor_usize(value: usize, floor: usize) -> usize {
-    value.saturating_sub(value / 2).max(floor)
-}
-
-fn double_ceiling_usize(value: usize, ceiling: usize) -> usize {
-    value.saturating_mul(2).min(ceiling)
-}
-
-fn recover_toward_ceiling_usize(value: usize, ceiling: usize) -> usize {
-    value.saturating_add(ceiling.saturating_sub(value).div_ceil(2))
-}
-
 fn percent_at_least_u64(value: u64, capacity: u64, threshold: u8) -> bool {
     capacity > 0 && value.saturating_mul(100) >= capacity.saturating_mul(threshold as u64)
 }
@@ -1410,16 +1455,16 @@ fn percent_at_most_u64(value: u64, capacity: u64, threshold: u8) -> bool {
 }
 
 #[cfg(test)]
+#[path = "control_plane_tests.rs"]
+mod sustained_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn balanced_controller() -> RuntimeControlPlane {
+    pub(super) fn balanced_controller() -> RuntimeControlPlane {
         RuntimeControlPlane::new(
-            AutoscalePolicy {
-                scale_down_after_ticks: 2,
-                scale_up_after_ticks: 3,
-                ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
-            },
+            AutoscalePolicy::for_profile(AutoscaleProfile::Balanced),
             RuntimeControlLimits {
                 view_distance: 8,
                 chunk_send_rate: 16,
@@ -1429,7 +1474,7 @@ mod tests {
         )
     }
 
-    fn healthy_input() -> RuntimeControlInput {
+    pub(super) fn healthy_input() -> RuntimeControlInput {
         RuntimeControlInput {
             tick_ms: 35,
             memory_used_mb: 512,
@@ -1439,10 +1484,7 @@ mod tests {
 
     fn transactional_control() -> RuntimeControlHandle {
         RuntimeControlHandle::new(RuntimeControlConfig {
-            policy: AutoscalePolicy {
-                scale_up_after_ticks: 1,
-                ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
-            },
+            policy: AutoscalePolicy::for_profile(AutoscaleProfile::Balanced),
             initial_limits: RuntimeControlLimits {
                 view_distance: 6,
                 chunk_send_rate: 8,
@@ -1459,9 +1501,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn failed_application_restores_prior_controller_state_before_stop() {
+    #[tokio::test(start_paused = true)]
+    async fn failed_application_restores_prior_controller_state_before_stop() {
         let control = transactional_control();
+        control.observe(healthy_input());
+        tokio::time::advance(Duration::from_secs(61)).await;
         let before = control.snapshot();
 
         let failed = control.apply(
@@ -1487,10 +1531,9 @@ mod tests {
         assert_eq!(control.snapshot(), expected);
     }
 
-    #[test]
-    fn failed_work_application_restores_prior_budgets_before_stop() {
+    #[tokio::test(start_paused = true)]
+    async fn failed_work_application_restores_prior_budgets_before_stop() {
         let control = transactional_control();
-        let before = control.snapshot();
         let input = RuntimeWorkInput {
             tick_p95_us: 80_000,
             entity_goals_p95_us: 1_000,
@@ -1501,6 +1544,11 @@ mod tests {
             fluid_tick_p95_us: 2_000,
             scheduled_budget_exhausted: false,
         };
+        control
+            .apply(RuntimeControlOperation::ObserveWork(input), |_, _| Ok(()))
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let before = control.snapshot();
 
         let failed = control.apply(
             RuntimeControlOperation::ObserveWork(input),
@@ -1508,7 +1556,7 @@ mod tests {
                 let RuntimeControlOutcome::Work(decision) = outcome else {
                     panic!("expected work outcome");
                 };
-                assert_eq!(decision.budgets.random_tick_chunks, 32);
+                assert_eq!(decision.budgets.random_tick_chunks, 63);
                 assert_eq!(proposed.work_budgets, decision.budgets);
                 Err(RuntimeControlApplyError::controlled_stop(
                     "work-budget consumer rejected target",
@@ -1578,11 +1626,13 @@ mod tests {
         assert_eq!(resources.applications, 2);
     }
 
-    #[test]
-    fn concurrent_observations_apply_in_exact_controller_order() {
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_observations_apply_in_exact_controller_order() {
         use std::sync::mpsc;
 
         let control = Arc::new(transactional_control());
+        control.observe(healthy_input());
+        tokio::time::advance(Duration::from_secs(61)).await;
         let events = Arc::new(Mutex::new(Vec::new()));
         let (first_started_tx, first_started_rx) = mpsc::channel();
         let (release_first_tx, release_first_rx) = mpsc::channel();
@@ -1590,7 +1640,9 @@ mod tests {
         let first = {
             let control = Arc::clone(&control);
             let events = Arc::clone(&events);
+            let runtime = tokio::runtime::Handle::current();
             std::thread::spawn(move || {
+                let _entered = runtime.enter();
                 control.apply(
                     RuntimeControlOperation::Observe(healthy_input()),
                     |outcome, proposed| {
@@ -1620,7 +1672,9 @@ mod tests {
         let second = {
             let control = Arc::clone(&control);
             let events = Arc::clone(&events);
+            let runtime = tokio::runtime::Handle::current();
             std::thread::spawn(move || {
+                let _entered = runtime.enter();
                 second_attempt_tx
                     .send(())
                     .expect("second attempt is observed");
@@ -1628,8 +1682,9 @@ mod tests {
                     RuntimeControlOperation::Observe(healthy_input()),
                     |outcome, proposed| {
                         let decision = autoscale_outcome(outcome);
-                        assert_eq!(decision.limits.view_distance, 8);
-                        assert_eq!(proposed.limits.view_distance, 8);
+                        assert_eq!(decision.limits.view_distance, 7);
+                        assert_eq!(proposed.limits.view_distance, 7);
+                        assert_eq!(decision.action, AutoscaleAction::Hold);
                         events
                             .lock()
                             .expect("test lock poisoned")
@@ -1663,7 +1718,7 @@ mod tests {
                 "second application",
             ]
         );
-        assert_eq!(control.snapshot().limits.view_distance, 8);
+        assert_eq!(control.snapshot().limits.view_distance, 7);
     }
 
     #[test]
@@ -1805,6 +1860,10 @@ mod tests {
         assert!(second.set_saturated(false));
         assert_eq!(
             consumer.recv().await,
+            Some(RuntimeControlSignal::SourcesRecovered)
+        );
+        assert_eq!(
+            consumer.recv().await,
             Some(RuntimeControlSignal::ChunkPressure {
                 saturated_sources: 0,
             })
@@ -1835,6 +1894,10 @@ mod tests {
         drop(second);
         assert_eq!(
             consumer.recv().await,
+            Some(RuntimeControlSignal::SourcesRecovered)
+        );
+        assert_eq!(
+            consumer.recv().await,
             Some(RuntimeControlSignal::FirstChunkSla { active_sources: 0 })
         );
     }
@@ -1851,8 +1914,6 @@ mod tests {
             controller.observe_signal(RuntimeControlSignal::FirstChunkSla { active_sources: 0 });
 
         assert_eq!(decision.pressure, Some(AutoscalePressure::ChunkQueue));
-        assert_eq!(controller.active_chunk_saturations, 1);
-        assert_eq!(controller.active_first_chunk_sla_sources, 0);
     }
 
     #[test]
@@ -1866,19 +1927,19 @@ mod tests {
             saturated_sources: 1,
         });
         assert_eq!(first_recovery.pressure, Some(AutoscalePressure::ChunkQueue));
-        assert_eq!(first_recovery.action, AutoscaleAction::ScaleDown);
+        assert_eq!(first_recovery.action, AutoscaleAction::Hold);
 
         let last_recovery = controller.observe_signal(RuntimeControlSignal::ChunkPressure {
             saturated_sources: 0,
         });
         assert_eq!(last_recovery.action, AutoscaleAction::Hold);
         assert_eq!(last_recovery.pressure, None);
-        assert_eq!(controller.snapshot().pressure_ticks, 0);
-        assert_eq!(controller.snapshot().healthy_ticks, 0);
+        assert_eq!(controller.snapshot().pressure_seconds, 0);
+        assert_eq!(controller.snapshot().healthy_seconds, 0);
     }
 
-    #[test]
-    fn sustained_chunk_saturation_survives_zero_depth_tick_observations() {
+    #[tokio::test(start_paused = true)]
+    async fn sustained_chunk_saturation_survives_zero_depth_tick_observations() {
         let mut controller = balanced_controller();
 
         let transition = controller.observe_signal(RuntimeControlSignal::ChunkPressure {
@@ -1886,11 +1947,12 @@ mod tests {
         });
         assert_eq!(transition.action, AutoscaleAction::Hold);
         assert_eq!(transition.pressure, Some(AutoscalePressure::ChunkQueue));
+        tokio::time::advance(Duration::from_secs(61)).await;
 
         let sustained = controller.observe(healthy_input());
         assert_eq!(sustained.action, AutoscaleAction::ScaleDown);
         assert_eq!(sustained.pressure, Some(AutoscalePressure::ChunkQueue));
-        assert_eq!(controller.snapshot().healthy_ticks, 0);
+        assert_eq!(controller.snapshot().healthy_seconds, 0);
     }
 
     #[test]
@@ -1915,16 +1977,13 @@ mod tests {
         assert!(!producer.push_slow_client_shed());
     }
 
-    #[test]
-    fn autoscale_application_then_drain_finishes_at_drain_limits() {
+    #[tokio::test(start_paused = true)]
+    async fn autoscale_application_then_drain_finishes_at_drain_limits() {
         use std::sync::Barrier;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let control = Arc::new(RuntimeControlHandle::new(RuntimeControlConfig {
-            policy: AutoscalePolicy {
-                scale_up_after_ticks: 1,
-                ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
-            },
+            policy: AutoscalePolicy::for_profile(AutoscaleProfile::Balanced),
             initial_limits: RuntimeControlLimits {
                 view_distance: 6,
                 chunk_send_rate: 8,
@@ -1932,6 +1991,8 @@ mod tests {
                 chunk_generate_rate: 8,
             },
         }));
+        control.observe(healthy_input());
+        tokio::time::advance(Duration::from_secs(61)).await;
         let applied_limit = Arc::new(AtomicUsize::new(1));
         let scale_apply_started = Arc::new(Barrier::new(2));
         let release_scale_apply = Arc::new(Barrier::new(2));
@@ -1942,7 +2003,9 @@ mod tests {
             let applied_limit = Arc::clone(&applied_limit);
             let scale_apply_started = Arc::clone(&scale_apply_started);
             let release_scale_apply = Arc::clone(&release_scale_apply);
+            let runtime = tokio::runtime::Handle::current();
             std::thread::spawn(move || {
+                let _entered = runtime.enter();
                 control.observe_and_apply(healthy_input(), |decision, draining| {
                     assert_eq!(decision.action, AutoscaleAction::ScaleUp);
                     assert!(!draining);
@@ -1982,10 +2045,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let control = Arc::new(RuntimeControlHandle::new(RuntimeControlConfig {
-            policy: AutoscalePolicy {
-                scale_up_after_ticks: 1,
-                ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
-            },
+            policy: AutoscalePolicy::for_profile(AutoscaleProfile::Balanced),
             initial_limits: RuntimeControlLimits {
                 view_distance: 6,
                 chunk_send_rate: 8,
@@ -2040,120 +2100,6 @@ mod tests {
     }
 
     #[test]
-    fn pressure_requires_hysteresis_before_scaling_down() {
-        let mut controller = balanced_controller();
-        let input = RuntimeControlInput {
-            tick_ms: 80,
-            ..healthy_input()
-        };
-
-        let first = controller.observe(input);
-        assert_eq!(first.action, AutoscaleAction::Hold);
-        assert_eq!(first.pressure, Some(AutoscalePressure::TickTime));
-        assert_eq!(controller.snapshot().scale_down_decisions, 0);
-
-        let second = controller.observe(input);
-        assert_eq!(second.action, AutoscaleAction::ScaleDown);
-        assert_eq!(controller.snapshot().scale_down_decisions, 1);
-        assert_eq!(second.limits.view_distance, 7);
-        assert_eq!(second.limits.chunk_send_rate, 8);
-        assert_eq!(
-            second.reason,
-            "pressure persisted for 2 observations; applying bounded degradation"
-        );
-
-        let cooldown = controller.observe(input);
-        assert_eq!(cooldown.action, AutoscaleAction::Hold);
-        assert_eq!(cooldown.limits, second.limits);
-    }
-
-    #[test]
-    fn first_runtime_pressure_immediately_yields_random_tick_work() {
-        let mut controller = balanced_controller();
-
-        let decision = controller.observe_signal(RuntimeControlSignal::ChunkPressure {
-            saturated_sources: 1,
-        });
-
-        assert_eq!(decision.action, AutoscaleAction::Hold);
-        assert_eq!(decision.pressure, Some(AutoscalePressure::ChunkQueue));
-        assert_eq!(controller.snapshot().work_budgets.random_tick_chunks, 32);
-        assert_eq!(controller.snapshot().work_budgets.scheduled_ticks, 256);
-    }
-
-    #[test]
-    fn healthy_ticks_restore_throughput_without_overshooting_bounds() {
-        let mut controller = balanced_controller();
-        controller.observe_signal(RuntimeControlSignal::ChunkPressure {
-            saturated_sources: 1,
-        });
-        controller.observe(healthy_input());
-        controller.observe_signal(RuntimeControlSignal::ChunkPressure {
-            saturated_sources: 0,
-        });
-
-        assert_eq!(controller.snapshot().limits.view_distance, 7);
-        assert_eq!(
-            controller.observe(healthy_input()).action,
-            AutoscaleAction::Hold
-        );
-        assert_eq!(
-            controller.observe(healthy_input()).action,
-            AutoscaleAction::Hold
-        );
-        let restored = controller.observe(healthy_input());
-
-        assert_eq!(restored.action, AutoscaleAction::ScaleUp);
-        assert_eq!(controller.snapshot().scale_up_decisions, 1);
-        assert_eq!(restored.limits.view_distance, 8);
-        assert_eq!(restored.limits.chunk_send_rate, 16);
-        assert_eq!(
-            restored.reason,
-            "healthy for 3 observations; restoring bounded throughput"
-        );
-
-        let cooldown = controller.observe(healthy_input());
-        assert_eq!(cooldown.action, AutoscaleAction::Hold);
-        assert_eq!(cooldown.limits, restored.limits);
-    }
-
-    #[test]
-    fn target_boundary_does_not_restore_capacity_without_headroom() {
-        let mut controller = balanced_controller();
-        let pressure = RuntimeControlInput {
-            tick_ms: 80,
-            ..healthy_input()
-        };
-        controller.observe(pressure);
-        let reduced = controller.observe(pressure);
-        assert_eq!(reduced.action, AutoscaleAction::ScaleDown);
-
-        let deadband = RuntimeControlInput {
-            tick_ms: 45,
-            ..healthy_input()
-        };
-        for _ in 0..30 {
-            let held = controller.observe(deadband);
-            assert_eq!(held.action, AutoscaleAction::Hold);
-            assert_eq!(held.limits, reduced.limits);
-        }
-        assert_eq!(controller.snapshot().healthy_ticks, 0);
-
-        assert_eq!(
-            controller.observe(healthy_input()).action,
-            AutoscaleAction::Hold
-        );
-        assert_eq!(
-            controller.observe(healthy_input()).action,
-            AutoscaleAction::Hold
-        );
-        assert_eq!(
-            controller.observe(healthy_input()).action,
-            AutoscaleAction::ScaleUp
-        );
-    }
-
-    #[test]
     fn memory_pressure_takes_priority_over_a_full_chunk_queue() {
         let mut controller = balanced_controller();
         controller.observe_signal(RuntimeControlSignal::ChunkPressure {
@@ -2184,8 +2130,8 @@ mod tests {
         assert!(controller.snapshot().draining);
     }
 
-    #[test]
-    fn runtime_control_handle_applies_memory_snapshot_to_all_observations() {
+    #[tokio::test(start_paused = true)]
+    async fn runtime_control_handle_applies_memory_snapshot_to_all_observations() {
         let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
             crate::memory_pressure::MemoryPressureSnapshot {
                 used_mb: 900,
@@ -2196,7 +2142,7 @@ mod tests {
             RuntimeControlConfig {
                 policy: AutoscalePolicy {
                     memory_pressure_percent: 50,
-                    scale_down_after_ticks: 1,
+                    scale_down_after_seconds: 60,
                     ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
                 },
                 initial_limits: RuntimeControlLimits {
@@ -2209,6 +2155,8 @@ mod tests {
             memory_pressure,
         );
 
+        control.observe(healthy_input());
+        tokio::time::advance(Duration::from_secs(61)).await;
         let decision = control.observe(RuntimeControlInput {
             memory_used_mb: 0,
             memory_limit_mb: 0,
@@ -2220,8 +2168,8 @@ mod tests {
         assert_eq!(decision.limits.view_distance, 7);
     }
 
-    #[test]
-    fn failed_memory_sample_applies_conservative_pressure() {
+    #[tokio::test(start_paused = true)]
+    async fn failed_memory_sample_applies_conservative_pressure() {
         let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
             crate::memory_pressure::MemoryPressureSnapshot {
                 used_mb: 100,
@@ -2233,7 +2181,7 @@ mod tests {
             RuntimeControlConfig {
                 policy: AutoscalePolicy {
                     memory_pressure_percent: 90,
-                    scale_down_after_ticks: 1,
+                    scale_down_after_seconds: 60,
                     ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
                 },
                 initial_limits: RuntimeControlLimits {
@@ -2246,6 +2194,8 @@ mod tests {
             memory_pressure,
         );
 
+        control.observe(healthy_input());
+        tokio::time::advance(Duration::from_secs(61)).await;
         let decision = control.observe(RuntimeControlInput {
             memory_used_mb: 0,
             memory_limit_mb: 0,
@@ -2262,7 +2212,7 @@ mod tests {
             RuntimeControlConfig {
                 policy: AutoscalePolicy {
                     memory_pressure_percent: 1,
-                    scale_down_after_ticks: 1,
+                    scale_down_after_seconds: 60,
                     ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
                 },
                 initial_limits: RuntimeControlLimits {
@@ -2295,8 +2245,8 @@ mod tests {
             min_chunk_send_rate: 0,
             queue_pressure_percent: 0,
             memory_pressure_percent: 0,
-            scale_down_after_ticks: 0,
-            scale_up_after_ticks: 0,
+            scale_down_after_seconds: 0,
+            scale_up_after_seconds: 0,
             ..AutoscalePolicy::for_profile(AutoscaleProfile::LowEnd)
         }
         .normalized();
@@ -2307,8 +2257,8 @@ mod tests {
         assert_eq!(policy.max_chunk_send_rate, 1);
         assert_eq!(policy.queue_pressure_percent, 1);
         assert_eq!(policy.memory_pressure_percent, 1);
-        assert_eq!(policy.scale_down_after_ticks, 1);
-        assert_eq!(policy.scale_up_after_ticks, 1);
+        assert_eq!(policy.scale_down_after_seconds, 60);
+        assert_eq!(policy.scale_up_after_seconds, 60);
     }
 
     #[test]
@@ -2324,13 +2274,9 @@ mod tests {
         assert_eq!(policy.max_view_distance, 32);
     }
 
-    #[test]
-    fn high_end_profile_scales_view_distance_between_eight_and_thirty_two() {
-        let policy = AutoscalePolicy {
-            scale_down_after_ticks: 1,
-            scale_up_after_ticks: 1,
-            ..AutoscalePolicy::for_profile(AutoscaleProfile::HighEnd)
-        };
+    #[tokio::test(start_paused = true)]
+    async fn high_end_profile_scales_view_distance_between_eight_and_thirty_two() {
+        let policy = AutoscalePolicy::for_profile(AutoscaleProfile::HighEnd);
         assert_eq!(policy.min_view_distance, 8);
         assert_eq!(policy.max_view_distance, 32);
 
@@ -2348,7 +2294,9 @@ mod tests {
             memory_used_mb: 512,
             memory_limit_mb: 4096,
         };
+        controller.observe(pressured);
         for expected in (8..32).rev() {
+            tokio::time::advance(Duration::from_secs(61)).await;
             let decision = controller.observe(pressured);
             assert_eq!(decision.action, AutoscaleAction::ScaleDown);
             assert_eq!(decision.pressure, Some(AutoscalePressure::TickTime));
@@ -2358,7 +2306,9 @@ mod tests {
         assert_eq!(floor.action, AutoscaleAction::Hold);
         assert_eq!(floor.limits.view_distance, 8);
 
+        controller.observe(healthy_input());
         for expected in 9..=32 {
+            tokio::time::advance(Duration::from_secs(61)).await;
             let decision = controller.observe(healthy_input());
             assert_eq!(decision.action, AutoscaleAction::ScaleUp);
             assert_eq!(decision.limits.view_distance, expected);
@@ -2368,32 +2318,11 @@ mod tests {
         assert_eq!(ceiling.limits.view_distance, 32);
     }
 
-    #[test]
-    fn work_pressure_reduces_the_measured_expensive_random_tick_budget() {
+    #[tokio::test(start_paused = true)]
+    async fn work_pressure_keeps_entity_pathing_candidates_at_profile_max() {
         let mut controller = balanced_controller();
 
-        let decision = controller.observe_work(RuntimeWorkInput {
-            tick_p95_us: 60_000,
-            entity_goals_p95_us: 1_000,
-            entity_physics_p95_us: 1_000,
-            entity_dispatch_p95_us: 1_000,
-            random_tick_p95_us: 18_000,
-            block_tick_p95_us: 2_000,
-            fluid_tick_p95_us: 1_000,
-            scheduled_budget_exhausted: false,
-        });
-
-        assert_eq!(decision.action, AutoscaleAction::ScaleDown);
-        assert_eq!(decision.focus, Some(RuntimeWorkFocus::RandomTicks));
-        assert_eq!(decision.budgets.random_tick_chunks, 32);
-        assert_eq!(decision.budgets.scheduled_ticks, 256);
-    }
-
-    #[test]
-    fn work_pressure_keeps_entity_pathing_candidates_at_profile_max() {
-        let mut controller = balanced_controller();
-
-        let decision = controller.observe_work(RuntimeWorkInput {
+        let input = RuntimeWorkInput {
             tick_p95_us: 60_000,
             entity_goals_p95_us: 12_000,
             entity_physics_p95_us: 18_000,
@@ -2402,7 +2331,10 @@ mod tests {
             block_tick_p95_us: 2_000,
             fluid_tick_p95_us: 1_000,
             scheduled_budget_exhausted: false,
-        });
+        };
+        controller.observe_work(input);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let decision = controller.observe_work(input);
 
         assert_eq!(decision.action, AutoscaleAction::Hold);
         assert_eq!(decision.focus, Some(RuntimeWorkFocus::EntitySimulation));
@@ -2431,11 +2363,11 @@ mod tests {
         assert_eq!(decision.budgets.entity_pathing_candidates, 8);
     }
 
-    #[test]
-    fn scheduled_backlog_keeps_its_budget_and_yields_random_tick_work() {
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_backlog_keeps_its_budget_and_yields_random_tick_work() {
         let mut controller = balanced_controller();
 
-        let decision = controller.observe_work(RuntimeWorkInput {
+        let input = RuntimeWorkInput {
             tick_p95_us: 60_000,
             entity_goals_p95_us: 1_000,
             entity_physics_p95_us: 1_000,
@@ -2444,41 +2376,14 @@ mod tests {
             block_tick_p95_us: 30_000,
             fluid_tick_p95_us: 20_000,
             scheduled_budget_exhausted: true,
-        });
+        };
+        assert_eq!(controller.observe_work(input).action, AutoscaleAction::Hold);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let decision = controller.observe_work(input);
 
         assert_eq!(decision.action, AutoscaleAction::ScaleDown);
         assert_eq!(decision.focus, Some(RuntimeWorkFocus::ScheduledTicks));
-        assert_eq!(decision.budgets.random_tick_chunks, 32);
-        assert_eq!(decision.budgets.scheduled_ticks, 256);
-    }
-
-    #[test]
-    fn healthy_work_window_recovers_reduced_budget_without_jumping_to_maximum() {
-        let mut controller = balanced_controller();
-        controller.observe_work(RuntimeWorkInput {
-            tick_p95_us: 60_000,
-            entity_goals_p95_us: 1_000,
-            entity_physics_p95_us: 1_000,
-            entity_dispatch_p95_us: 1_000,
-            random_tick_p95_us: 18_000,
-            block_tick_p95_us: 2_000,
-            fluid_tick_p95_us: 1_000,
-            scheduled_budget_exhausted: false,
-        });
-
-        let decision = controller.observe_work(RuntimeWorkInput {
-            tick_p95_us: 30_000,
-            entity_goals_p95_us: 1_000,
-            entity_physics_p95_us: 1_000,
-            entity_dispatch_p95_us: 1_000,
-            random_tick_p95_us: 1_000,
-            block_tick_p95_us: 1_000,
-            fluid_tick_p95_us: 1_000,
-            scheduled_budget_exhausted: false,
-        });
-
-        assert_eq!(decision.action, AutoscaleAction::ScaleUp);
-        assert_eq!(decision.budgets.random_tick_chunks, 48);
+        assert_eq!(decision.budgets.random_tick_chunks, 63);
         assert_eq!(decision.budgets.scheduled_ticks, 256);
     }
 }

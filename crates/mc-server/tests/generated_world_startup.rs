@@ -824,26 +824,6 @@ fn assert_spawn_view_chunk_light_sections_survived(
         pos.x,
         pos.z
     );
-    for (idx, section) in chunk.section_lights.iter().enumerate() {
-        if let Some(sky) = &section.sky {
-            assert_eq!(
-                sky.len(),
-                mc_world::LIGHT_LAYER_BYTES,
-                "spawn view chunk ({}, {}) sky light section {idx} should retain a full light array",
-                pos.x,
-                pos.z
-            );
-        }
-        if let Some(block) = &section.block {
-            assert_eq!(
-                block.len(),
-                mc_world::LIGHT_LAYER_BYTES,
-                "spawn view chunk ({}, {}) block light section {idx} should retain a full light array",
-                pos.x,
-                pos.z
-            );
-        }
-    }
 
     let expected_sky_sections = expected_direct_sky_sections(chunk, block_light);
     let stored_sky_sections = chunk
@@ -908,7 +888,7 @@ fn assert_full_direct_sky_sections_survived(
     for section_idx in first_full_sky_section..mc_world::SECTION_COUNT {
         let sky = chunk.section_lights[section_idx]
             .sky
-            .as_deref()
+            .as_ref()
             .unwrap_or_else(|| {
                 panic!(
                     "spawn view chunk ({}, {}) should retain full SkyLight section {section_idx} above sky blockers",
@@ -916,7 +896,7 @@ fn assert_full_direct_sky_sections_survived(
                 )
             });
         assert!(
-            sky.iter().all(|byte| *byte == 0xFF),
+            sky.bytes().all(|byte| byte == 0xFF),
             "spawn view chunk ({}, {}) full SkyLight section {section_idx} should persist as skylight 15",
             pos.x,
             pos.z

@@ -645,7 +645,7 @@ fn decode_section_light(cmp: &[(String, Tag)]) -> Result<SectionLight, ChunkNbtE
 fn decode_light_layer(
     cmp: &[(String, Tag)],
     field: &'static str,
-) -> Result<Option<Vec<u8>>, ChunkNbtError> {
+) -> Result<Option<crate::chunk::LightSection>, ChunkNbtError> {
     let Some(tag) = cmp.iter().find(|(k, _)| k == field).map(|(_, v)| v) else {
         return Ok(None);
     };
@@ -658,7 +658,9 @@ fn decode_light_layer(
                     got: bytes.len(),
                 });
             }
-            Ok(Some(bytes.iter().map(|&b| b as u8).collect()))
+            Ok(Some(crate::chunk::LightSection::from_bytes(
+                std::array::from_fn(|index| bytes[index] as u8),
+            )))
         }
         other => Err(ChunkNbtError::WrongType {
             field,
@@ -754,10 +756,10 @@ pub fn chunk_to_nbt_with_items_at_tick(
             ("block_states".into(), encode_block_section(sec, registry)?),
             ("biomes".into(), encode_biome_section(&chunk.biomes[i])),
         ];
-        if let Some(tag) = encode_light_layer("BlockLight", &chunk.section_lights[i].block)? {
+        if let Some(tag) = encode_light_layer(&chunk.section_lights[i].block) {
             s_cmp.push(("BlockLight".into(), tag));
         }
-        if let Some(tag) = encode_light_layer("SkyLight", &chunk.section_lights[i].sky)? {
+        if let Some(tag) = encode_light_layer(&chunk.section_lights[i].sky) {
             s_cmp.push(("SkyLight".into(), tag));
         }
         sections.push(Tag::Compound(s_cmp));
@@ -861,23 +863,10 @@ pub fn chunk_to_nbt_with_items_at_tick(
     Ok(Tag::Compound(root))
 }
 
-fn encode_light_layer(
-    field: &'static str,
-    layer: &Option<Vec<u8>>,
-) -> Result<Option<Tag>, ChunkNbtError> {
-    let Some(layer) = layer else {
-        return Ok(None);
-    };
-    if layer.len() != LIGHT_LAYER_BYTES {
-        return Err(ChunkNbtError::LightLengthMismatch {
-            field,
-            expected: LIGHT_LAYER_BYTES,
-            got: layer.len(),
-        });
-    }
-    Ok(Some(Tag::ByteArray(
-        layer.iter().copied().map(|byte| byte as i8).collect(),
-    )))
+fn encode_light_layer(layer: &Option<crate::chunk::LightSection>) -> Option<Tag> {
+    layer
+        .as_ref()
+        .map(|layer| Tag::ByteArray(layer.bytes().map(|byte| byte as i8).collect()))
 }
 
 fn encode_scheduled_block_ticks(
@@ -969,7 +958,10 @@ fn encode_block_section(
                 }),
             ));
             let indices = section.indices().expect("indirect mode has indices");
-            let longs: Vec<i64> = indices.words().iter().map(|&w| w as i64).collect();
+            let longs = indices
+                .words_at_bits(block_states_bits_per_entry(palette.len()))
+                .map(|word| word as i64)
+                .collect();
             out.push(("data".into(), Tag::LongArray(longs)));
         }
     }
@@ -1574,6 +1566,10 @@ fn leak_field_name(s: &str) -> &'static str {
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "block_palette_tests.rs"]
+mod palette_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2743,14 +2739,29 @@ mod tests {
 
         // Section Y=-4 → idx 0: both layers present.
         assert_eq!(
-            chunk.section_lights[0].block.as_deref(),
-            Some(&expected[..])
+            chunk.section_lights[0]
+                .block
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(expected.clone())
         );
-        assert_eq!(chunk.section_lights[0].sky.as_deref(), Some(&expected[..]));
+        assert_eq!(
+            chunk.section_lights[0]
+                .sky
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(expected.clone())
+        );
 
         // Section Y=0 → idx 4: only sky present.
         assert_eq!(chunk.section_lights[4].block, None);
-        assert_eq!(chunk.section_lights[4].sky.as_deref(), Some(&expected[..]));
+        assert_eq!(
+            chunk.section_lights[4]
+                .sky
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(expected.clone())
+        );
 
         // Untouched sections keep the default (no light).
         assert_eq!(chunk.section_lights[1], SectionLight::default());
@@ -2758,12 +2769,11 @@ mod tests {
 
         // Layer is exactly LIGHT_LAYER_BYTES bytes; sanity-check the
         // i8 → u8 reinterpretation didn't shift anything.
-        let sky = chunk.section_lights[0].sky.as_deref().unwrap();
-        assert_eq!(sky.len(), LIGHT_LAYER_BYTES);
-        assert_eq!(sky[0x00], 0x00);
-        assert_eq!(sky[0x7F], 0x7F);
-        assert_eq!(sky[0x80], 0x80);
-        assert_eq!(sky[0xFF], 0xFF);
+        let sky = chunk.section_lights[0].sky.as_ref().unwrap();
+        assert_eq!(sky.byte(0x00), 0x00);
+        assert_eq!(sky.byte(0x7F), 0x7F);
+        assert_eq!(sky.byte(0x80), 0x80);
+        assert_eq!(sky.byte(0xFF), 0xFF);
     }
 
     #[test]
@@ -2776,9 +2786,15 @@ mod tests {
             BlockStateId(0),
             Identifier::parse("minecraft:plains").unwrap(),
         );
-        chunk.section_lights[0].block = Some(expected.clone());
-        chunk.section_lights[0].sky = Some(expected.clone());
-        chunk.section_lights[4].sky = Some(expected.clone());
+        chunk.section_lights[0].block = Some(crate::chunk::LightSection::from_bytes(
+            expected.clone().try_into().unwrap(),
+        ));
+        chunk.section_lights[0].sky = Some(crate::chunk::LightSection::from_bytes(
+            expected.clone().try_into().unwrap(),
+        ));
+        chunk.section_lights[4].sky = Some(crate::chunk::LightSection::from_bytes(
+            expected.clone().try_into().unwrap(),
+        ));
 
         let root = chunk_to_nbt(&chunk, &registry).expect("encode");
         let sections = get_optional_list(expect_compound(&root, "root").unwrap(), "sections")
@@ -2818,17 +2834,26 @@ mod tests {
 
         let decoded = chunk_from_nbt(&root, &registry).expect("decode encoded light");
         assert_eq!(
-            decoded.section_lights[0].block.as_deref(),
-            Some(&expected[..])
+            decoded.section_lights[0]
+                .block
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(expected.clone())
         );
         assert_eq!(
-            decoded.section_lights[0].sky.as_deref(),
-            Some(&expected[..])
+            decoded.section_lights[0]
+                .sky
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(expected.clone())
         );
         assert_eq!(decoded.section_lights[4].block, None);
         assert_eq!(
-            decoded.section_lights[4].sky.as_deref(),
-            Some(&expected[..])
+            decoded.section_lights[4]
+                .sky
+                .as_ref()
+                .map(|layer| layer.to_vec()),
+            Some(expected.clone())
         );
     }
 
@@ -2916,12 +2941,8 @@ mod tests {
                 chunks_with_sky += 1;
             }
             for sl in &chunk.section_lights {
-                if let Some(layer) = &sl.sky {
-                    assert_eq!(layer.len(), LIGHT_LAYER_BYTES);
+                if sl.sky.is_some() {
                     sections_with_sky += 1;
-                }
-                if let Some(layer) = &sl.block {
-                    assert_eq!(layer.len(), LIGHT_LAYER_BYTES);
                 }
             }
         }

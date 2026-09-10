@@ -53,6 +53,8 @@ use uuid::Uuid;
 
 const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES + 1;
 const SCRIPT_CHANNEL: &str = "solaris:test";
+#[path = "play/operator_file_tests.rs"]
+mod operator_file_tests;
 
 async fn start_server() -> SocketAddr {
     start_server_with_max(8).await

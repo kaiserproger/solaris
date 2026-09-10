@@ -113,3 +113,40 @@ fn writable_world_lease_is_process_exclusive_and_recovers_after_crash() {
     assert_ne!(refreshed_metadata, stale_metadata);
     drop(reopened);
 }
+
+#[test]
+fn world_reopen_releases_lease_with_inherited_file_description() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("region")).unwrap();
+    let registry = single_air_registry();
+    let mut world = WorldStorage::open(root.path(), Arc::clone(&registry)).unwrap();
+    let position = crate::ChunkPos { x: -1, z: 2 };
+    let mut chunk = crate::Chunk::empty(
+        position,
+        crate::block::BlockStateId(0),
+        mc_data::Identifier::parse("minecraft:plains").unwrap(),
+    );
+    chunk.set_world_journal_lsn(73);
+    world.insert_chunk(position, chunk).unwrap();
+    assert_eq!(world.flush_dirty().unwrap(), 1);
+    // dup and fork share the same open file description on Unix. A concurrent
+    // process spawn may retain it until exec, despite close-on-exec on our fd.
+    let inherited_file = world
+        ._world_lease
+        .as_ref()
+        .unwrap()
+        ._file
+        .try_clone()
+        .unwrap();
+    drop(world);
+    let mut reopened = WorldStorage::open(root.path(), registry).unwrap();
+    assert_eq!(
+        reopened
+            .get_chunk(position)
+            .unwrap()
+            .unwrap()
+            .world_journal_lsn(),
+        73
+    );
+    drop(inherited_file);
+}

@@ -43,8 +43,8 @@ use wide::{i16x8, u8x16, u16x8};
 
 use crate::block::BlockStateId;
 use crate::chunk::{
-    Chunk, ChunkGeometry, ChunkPos, LIGHT_LAYER_BYTES, MIN_Y, OVERWORLD_GEOMETRY, SECTION_COUNT,
-    SectionLight, top_opaque_column,
+    Chunk, ChunkGeometry, ChunkPos, LIGHT_LAYER_BYTES, LightSection, MIN_Y, OVERWORLD_GEOMETRY,
+    SECTION_COUNT, SectionLight, top_opaque_column,
 };
 use crate::section::{SECTION_DIM, SECTION_VOLUME};
 
@@ -72,13 +72,11 @@ impl LightKernelBackend {
     }
 }
 
-/// One light channel for a chunk, stored as lazy per-section nibble
-/// arrays. Missing sections are all-zero; present sections are already
-/// in the 2048-byte vanilla nibble layout, low nibble first.
+/// One computed light channel. Every section is known, including zero;
+/// uniform sections allocate nothing and mixed sections use copy-on-write storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LightLayer {
-    sections: Vec<Option<Box<[u8; crate::chunk::LIGHT_LAYER_BYTES]>>>,
-    nonzero_nibbles: Vec<u16>,
+    sections: Vec<LightSection>,
 }
 
 impl LightLayer {
@@ -89,8 +87,7 @@ impl LightLayer {
 
     fn zeroed_for_sections(section_count: usize) -> Self {
         Self {
-            sections: (0..section_count).map(|_| None).collect(),
-            nonzero_nibbles: vec![0; section_count],
+            sections: vec![LightSection::uniform(0); section_count],
         }
     }
 
@@ -100,16 +97,10 @@ impl LightLayer {
     }
 
     fn filled_for_sections(value: u8, section_count: usize) -> Self {
-        debug_assert!(value <= 15);
-        if value == 0 {
-            return Self::zeroed_for_sections(section_count);
-        }
+        assert!(value <= 15);
         let packed = value | (value << 4);
         Self {
-            sections: (0..section_count)
-                .map(|_| Some(Box::new([packed; crate::chunk::LIGHT_LAYER_BYTES])))
-                .collect(),
-            nonzero_nibbles: vec![SECTION_VOLUME as u16; section_count],
+            sections: vec![LightSection::uniform(packed); section_count],
         }
     }
 
@@ -119,10 +110,7 @@ impl LightLayer {
         debug_assert!(local_y < self.sections.len() * SECTION_DIM);
         debug_assert!(z < SECTION_DIM);
         let section_idx = local_y / SECTION_DIM;
-        let Some(layer) = self.sections[section_idx].as_ref() else {
-            return 0;
-        };
-        get_nibble(layer, section_cell_idx(x, local_y % SECTION_DIM, z))
+        self.sections[section_idx].get(section_cell_idx(x, local_y % SECTION_DIM, z))
     }
 
     pub fn set(&mut self, x: usize, local_y: usize, z: usize, value: u8) {
@@ -131,55 +119,36 @@ impl LightLayer {
         debug_assert!(z < SECTION_DIM);
         debug_assert!(value <= 15);
         let section_idx = local_y / SECTION_DIM;
-        if value == 0 && self.sections[section_idx].is_none() {
-            return;
-        }
-        let layer = self.sections[section_idx]
-            .get_or_insert_with(|| Box::new([0; crate::chunk::LIGHT_LAYER_BYTES]));
-        let cell = section_cell_idx(x, local_y % SECTION_DIM, z);
-        let old = get_nibble(layer, cell);
-        if old == value {
-            return;
-        }
-        set_nibble(layer, cell, value);
-        if old == 0 && value != 0 {
-            self.nonzero_nibbles[section_idx] += 1;
-        } else if old != 0 && value == 0 {
-            self.nonzero_nibbles[section_idx] -= 1;
-        }
-        if self.nonzero_nibbles[section_idx] == 0 {
-            self.sections[section_idx] = None;
-        }
+        self.sections[section_idx].set(section_cell_idx(x, local_y % SECTION_DIM, z), value);
     }
 
     #[must_use]
-    pub fn section(&self, section_idx: usize) -> Option<&[u8; crate::chunk::LIGHT_LAYER_BYTES]> {
-        self.sections.get(section_idx)?.as_deref()
+    pub fn section(&self, section_idx: usize) -> Option<&LightSection> {
+        self.sections.get(section_idx)
+    }
+
+    /// Nonallocating access for accounting shared section storage.
+    pub fn sections(&self) -> &[LightSection] {
+        &self.sections
+    }
+
+    /// Referenced heap bytes; deduplicate section allocations for physical totals.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.sections.capacity() * std::mem::size_of::<LightSection>()
+            + self
+                .sections
+                .iter()
+                .map(LightSection::allocated_bytes)
+                .sum::<usize>()
     }
 
     pub(crate) fn section_count(&self) -> usize {
         self.sections.len()
     }
 
-    fn set_section_from_slice(&mut self, section_idx: usize, bytes: &[u8]) -> bool {
-        if section_idx >= self.sections.len() || bytes.len() != LIGHT_LAYER_BYTES {
-            return false;
-        }
-        let nonzero_nibbles = bytes
-            .iter()
-            .map(|byte| u16::from(byte & 0x0F != 0) + u16::from(byte >> 4 != 0))
-            .sum();
-        if nonzero_nibbles == 0 {
-            self.sections[section_idx] = None;
-            self.nonzero_nibbles[section_idx] = 0;
-            return true;
-        }
-        let Ok(layer) = <[u8; LIGHT_LAYER_BYTES]>::try_from(bytes) else {
-            return false;
-        };
-        self.sections[section_idx] = Some(Box::new(layer));
-        self.nonzero_nibbles[section_idx] = nonzero_nibbles;
-        true
+    fn set_section(&mut self, section_idx: usize, layer: &LightSection) {
+        self.sections[section_idx] = layer.clone();
     }
 }
 
@@ -192,6 +161,12 @@ pub struct ChunkLight {
 }
 
 impl ChunkLight {
+    /// Referenced heap bytes, counting shared payload once per owner.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.sky.estimated_heap_bytes() + self.block.estimated_heap_bytes()
+    }
+
     /// Fresh light, all zero. Useful for direct unit-testing without
     /// invoking the engine.
     #[must_use]
@@ -254,15 +229,11 @@ impl ChunkLight {
         let mut any = false;
         for (section_idx, section) in section_lights.iter().enumerate() {
             if let Some(sky) = &section.sky {
-                if !out.sky.set_section_from_slice(section_idx, sky) {
-                    return None;
-                }
+                out.sky.set_section(section_idx, sky);
                 any = true;
             }
             if let Some(block) = &section.block {
-                if !out.block.set_section_from_slice(section_idx, block) {
-                    return None;
-                }
+                out.block.set_section(section_idx, block);
                 any = true;
             }
         }
@@ -271,8 +242,8 @@ impl ChunkLight {
 
     pub(crate) fn write_section_lights(&self, section_lights: &mut [SectionLight]) {
         for (section_idx, section) in section_lights.iter_mut().enumerate() {
-            section.sky = self.sky.section(section_idx).map(|layer| layer.to_vec());
-            section.block = self.block.section(section_idx).map(|layer| layer.to_vec());
+            section.sky = self.sky.section(section_idx).cloned();
+            section.block = self.block.section(section_idx).cloned();
         }
     }
 
@@ -304,24 +275,6 @@ impl ChunkLight {
 
 fn section_cell_idx(x: usize, section_y: usize, z: usize) -> usize {
     section_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x
-}
-
-fn get_nibble(layer: &[u8; crate::chunk::LIGHT_LAYER_BYTES], cell: usize) -> u8 {
-    let byte = layer[cell / 2];
-    if cell & 1 == 0 {
-        byte & 0x0F
-    } else {
-        byte >> 4
-    }
-}
-
-fn set_nibble(layer: &mut [u8; crate::chunk::LIGHT_LAYER_BYTES], cell: usize, value: u8) {
-    let byte = &mut layer[cell / 2];
-    if cell & 1 == 0 {
-        *byte = (*byte & 0xF0) | value;
-    } else {
-        *byte = (*byte & 0x0F) | (value << 4);
-    }
 }
 
 /// Reusable working buffers for the lighting engine. Allocating
@@ -360,6 +313,17 @@ impl LightWorkspace {
         }
     }
 
+    /// Retained scratch heap storage, including queue spare capacity.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> usize {
+        self.sky.capacity()
+            + self.block.capacity()
+            + self.opacity.capacity()
+            + self.propagates_sky.capacity() * std::mem::size_of::<bool>()
+            + self.queue.capacity() * std::mem::size_of::<u32>()
+            + self.emitters.capacity() * std::mem::size_of::<u32>()
+    }
+
     fn reset_for_geometry(&mut self, geometry: ChunkGeometry) {
         let volume = grid_volume(geometry.height() as usize);
         if self.geometry != geometry {
@@ -390,11 +354,8 @@ impl Default for LightWorkspace {
 /// exactly once at login), and mutated in place by
 /// [`apply_block_change_to_light`] on subsequent edits.
 ///
-/// Memory: ~200 KB per cached chunk × the spawn view-window. With
-/// view distance 10 and a ~21×21 emit, the upper bound is ~17 MB per
-/// connection. Chunks the all-air fast path returned for are *not*
-/// cached (their light is reconstructable on demand) so a fresh-world
-/// connection sits well below that.
+/// Uniform sections have no payload allocation; mixed sections share their
+/// packed storage with baked chunk snapshots until a light write forks them.
 #[derive(Debug, Default, Clone)]
 pub struct LightCache {
     chunks: HashMap<ChunkPos, ChunkLight>,
@@ -1548,11 +1509,9 @@ fn extract_light_layer_scalar(grid: &[u8], section_count: usize) -> LightLayer {
 #[cfg(target_endian = "little")]
 fn extract_light_layer_portable(grid: &[u8], section_count: usize) -> LightLayer {
     debug_assert_eq!(grid.len(), grid_volume(section_count * SECTION_DIM));
-    let mut sections: Vec<Option<Box<[u8; LIGHT_LAYER_BYTES]>>> =
-        (0..section_count).map(|_| None).collect();
-    let mut nonzero_nibbles = vec![0_u16; section_count];
+    let mut sections = Vec::with_capacity(section_count);
     for section_idx in 0..section_count {
-        let mut packed = Box::new([0_u8; LIGHT_LAYER_BYTES]);
+        let mut packed = [0_u8; LIGHT_LAYER_BYTES];
         let mut nonzero = 0_u16;
         for section_y in 0..SECTION_DIM {
             let local_y = section_idx * SECTION_DIM + section_y;
@@ -1569,15 +1528,9 @@ fn extract_light_layer_portable(grid: &[u8], section_count: usize) -> LightLayer
                 nonzero += first_nonzero + second_nonzero;
             }
         }
-        if nonzero != 0 {
-            sections[section_idx] = Some(packed);
-            nonzero_nibbles[section_idx] = nonzero;
-        }
+        sections.push(LightSection::from_bytes_with_nonzero_count(packed, nonzero));
     }
-    LightLayer {
-        sections,
-        nonzero_nibbles,
-    }
+    LightLayer { sections }
 }
 
 #[cfg(target_endian = "little")]
@@ -1603,11 +1556,9 @@ fn extract_light_layer(
     mut pack_row: impl FnMut(&[u8], &mut [u8]) -> u16,
 ) -> LightLayer {
     debug_assert_eq!(grid.len(), grid_volume(section_count * SECTION_DIM));
-    let mut sections: Vec<Option<Box<[u8; LIGHT_LAYER_BYTES]>>> =
-        (0..section_count).map(|_| None).collect();
-    let mut nonzero_nibbles = vec![0_u16; section_count];
+    let mut sections = Vec::with_capacity(section_count);
     for section_idx in 0..section_count {
-        let mut packed = Box::new([0_u8; LIGHT_LAYER_BYTES]);
+        let mut packed = [0_u8; LIGHT_LAYER_BYTES];
         let mut nonzero = 0_u16;
         for section_y in 0..SECTION_DIM {
             let local_y = section_idx * SECTION_DIM + section_y;
@@ -1620,15 +1571,9 @@ fn extract_light_layer(
                 );
             }
         }
-        if nonzero != 0 {
-            sections[section_idx] = Some(packed);
-            nonzero_nibbles[section_idx] = nonzero;
-        }
+        sections.push(LightSection::from_bytes_with_nonzero_count(packed, nonzero));
     }
-    LightLayer {
-        sections,
-        nonzero_nibbles,
-    }
+    LightLayer { sections }
 }
 
 #[doc(hidden)]
@@ -1797,17 +1742,21 @@ mod tests {
         let mut block = vec![0; crate::chunk::LIGHT_LAYER_BYTES];
         sky[0] = 0x21;
         block[7] = 0xF0;
-        chunk.section_lights[0].sky = Some(sky.clone());
-        chunk.section_lights[2].block = Some(block.clone());
+        chunk.section_lights[0].sky = Some(crate::chunk::LightSection::from_bytes(
+            sky.clone().try_into().unwrap(),
+        ));
+        chunk.section_lights[2].block = Some(crate::chunk::LightSection::from_bytes(
+            block.clone().try_into().unwrap(),
+        ));
 
         let light = ChunkLight::from_section_lights(&chunk.section_lights)
             .expect("present baked layers should rebuild chunk light");
 
-        assert_eq!(light.sky.section(0).unwrap()[0], 0x21);
-        assert_eq!(light.block.section(2).unwrap()[7], 0xF0);
+        assert_eq!(light.sky.section(0).unwrap().byte(0), 0x21);
+        assert_eq!(light.block.section(2).unwrap().byte(7), 0xF0);
         assert_eq!(light.sky.get(0, 0, 0), 1);
         assert_eq!(light.sky.get(1, 0, 0), 2);
-        assert_eq!(light.block.section(0), None);
+        assert!(light.block.section(0).unwrap().is_zero());
     }
 
     #[test]
@@ -1815,7 +1764,9 @@ mod tests {
         let mut chunk = custom_air_chunk();
         let mut block = vec![0; crate::chunk::LIGHT_LAYER_BYTES];
         block[0] = 0x0F;
-        chunk.section_lights[0].block = Some(block);
+        chunk.section_lights[0].block = Some(crate::chunk::LightSection::from_bytes(
+            block.try_into().unwrap(),
+        ));
 
         let light =
             ChunkLight::from_chunk(&chunk).expect("present baked layer should rebuild chunk light");

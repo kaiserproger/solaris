@@ -586,6 +586,9 @@ pub struct PhysicsConfig {
     pub vertical_air_drag: f64,
     pub water_drag: f64,
     pub water_buoyancy: f64,
+    /// Fish travel moves before drag and adds its idle sink after drag.
+    pub water_drag_after_move: bool,
+    pub water_sink: f64,
     pub step_height: f64,
     pub jump_speed: f64,
     pub stop_on_solid: bool,
@@ -602,6 +605,8 @@ impl Default for PhysicsConfig {
             vertical_air_drag: 1.0,
             water_drag: WATER_DRAG,
             water_buoyancy: WATER_BUOYANCY_BLOCKS_PER_SECOND_SQUARED,
+            water_drag_after_move: false,
+            water_sink: 0.0,
             step_height: STEP_HEIGHT,
             jump_speed: 0.0,
             stop_on_solid: false,
@@ -633,6 +638,33 @@ impl PhysicsConfig {
             water_drag: 0.9,
             water_buoyancy: 0.0,
             ..Self::living_entity()
+        }
+    }
+
+    /// AbstractFish.travelInWater: move(delta), scale(.9), add(0,-.005,0).
+    #[must_use]
+    pub fn fish_entity() -> Self {
+        Self {
+            water_drag_after_move: true,
+            water_sink: 0.005 * 20.0,
+            jump_speed: 0.0,
+            step_height: 0.0,
+            ..Self::aquatic_entity()
+        }
+    }
+
+    /// Squid.travel only moves; its pulsed damping is applied by Squid.aiStep,
+    /// not again by LivingEntity's generic water travel.
+    #[must_use]
+    pub fn squid_entity() -> Self {
+        Self {
+            water_drag: 1.0,
+            jump_speed: 0.0,
+            step_height: 0.0,
+            gravity: 0.08 * 20.0 * 20.0,
+            air_drag: 0.0,
+            vertical_air_drag: 0.980_000_019_073_486_3,
+            ..Self::aquatic_entity()
         }
     }
 
@@ -768,9 +800,11 @@ pub fn step_entity<S: BlockSampler>(
         } else {
             body.velocity.y += config.water_buoyancy * config.tick_seconds;
         }
-        body.velocity.x *= config.water_drag;
-        body.velocity.y *= config.water_drag;
-        body.velocity.z *= config.water_drag;
+        if !config.water_drag_after_move {
+            body.velocity.x *= config.water_drag;
+            body.velocity.y *= config.water_drag;
+            body.velocity.z *= config.water_drag;
+        }
     } else {
         body.velocity.y -= config.gravity * config.tick_seconds;
         body.velocity.x *= config.air_drag;
@@ -885,6 +919,12 @@ pub fn step_entity<S: BlockSampler>(
         body.velocity.x *= config.ground_friction;
         body.velocity.z *= config.ground_friction;
     }
+    if in_fluid && config.water_drag_after_move {
+        body.velocity.x *= config.water_drag;
+        body.velocity.y *= config.water_drag;
+        body.velocity.z *= config.water_drag;
+        body.velocity.y -= config.water_sink;
+    }
 
     StepResult {
         body,
@@ -911,6 +951,7 @@ fn valid_step_input(body: EntityBody, config: PhysicsConfig) -> bool {
         config.vertical_air_drag,
         config.water_drag,
         config.water_buoyancy,
+        config.water_sink,
         config.step_height,
         config.jump_speed,
     ];
@@ -923,6 +964,7 @@ fn valid_step_input(body: EntityBody, config: PhysicsConfig) -> bool {
         && (0.0..=1.0).contains(&config.vertical_air_drag)
         && (0.0..=1.0).contains(&config.water_drag)
         && config.water_buoyancy >= 0.0
+        && config.water_sink >= 0.0
         && config.step_height >= 0.0
         && config.jump_speed >= 0.0
         && body.aabb.half_width > 0.0

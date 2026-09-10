@@ -118,7 +118,9 @@ pub(super) fn insert_terrain_snapshot_chunks_for_probe_position(
 ) {
     const EPSILON: f64 = 1.0e-6;
 
-    if !terrain_pathing_entities.contains(&entity_id) || !position.is_finite() {
+    if (!terrain_pathing_entities.contains(&entity_id) && !entity_aabbs.contains_key(&entity_id))
+        || !position.is_finite()
+    {
         return;
     }
     let aabb = entity_aabbs
@@ -203,6 +205,21 @@ impl<'a> LoadedTerrainPathingProbe<'a> {
 impl PathingProbe for LoadedChunkPathingProbe<'_> {
     fn can_stand_at(&self, position: Vec3) -> PathingProbeResult {
         self.can_entity_stand_at(EntityId(i32::MIN), position)
+    }
+
+    fn can_entity_swim_at(&self, entity_id: EntityId, position: Vec3) -> PathingProbeResult {
+        let Some(terrain) = self.terrain.as_ref() else {
+            return PathingProbeResult::Unloaded;
+        };
+        let aabb = self
+            .entity_aabbs
+            .get(&entity_id)
+            .copied()
+            .unwrap_or(mc_physics::Aabb::COW);
+        mc_entity::aquatic_motion::water_occupancy(position, aabb, |x, y, z| {
+            self.state_at(terrain, x, y, z)
+                .map(|state| terrain.materials.classify(state))
+        })
     }
 
     fn can_entity_stand_at(&self, entity_id: EntityId, position: Vec3) -> PathingProbeResult {
