@@ -10,6 +10,9 @@ use super::quickcraft::{
 };
 use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
 
+#[cfg(test)]
+mod component_tests;
+
 pub(in crate::play) const CHEST_MENU_TYPE_ID: i32 = 2;
 pub(in crate::play) const DOUBLE_CHEST_MENU_TYPE_ID: i32 = 5;
 pub(in crate::play) const SINGLE_CHEST_STORAGE_SLOTS: usize = 27;

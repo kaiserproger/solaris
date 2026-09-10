@@ -15,7 +15,7 @@ use crate::play::wire_entities::ServerEntityWireMove;
 pub(super) use super::entity_tracking::LastSentEntityState;
 use super::outbound::{
     OutboundCommand, PlayerEntitySnapshot, ServerEntityMove, ServerEntitySnapshot,
-    SessionRecipient, VisibilityDispatch,
+    SessionRecipient, VisibilityDispatch, is_bow_skeleton_type_26_1_2,
 };
 use super::{
     PlaySession, SessionEntityGuards, SessionId, SessionRegistryInner,
@@ -283,6 +283,11 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
         .retained
         .guardian_beam
         .map_or(0, EntityGuardianBeamState::active_target_entity_id);
+    // Vanilla `RangedBowAttackGoal` sets aggressive while it holds a target;
+    // Solaris tracks that as a target-acquired `FollowPosition` goal, so the
+    // draw pose needs no new state: goal flips already clear on target loss.
+    let aggressive = is_bow_skeleton_type_26_1_2(&entity.type_name)
+        && matches!(entity.goal, mc_entity::GoalState::FollowPosition { .. });
     ServerEntitySnapshot {
         id: entity.id,
         uuid: entity.uuid,
@@ -307,20 +312,33 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
         crossbow_charging,
         blaze_charged,
         guardian_attack_target_entity_id,
+        aggressive,
     }
 }
 
 fn default_main_hand_item_26_1_2(entity_type: &str) -> Option<EntityItemStack> {
-    // Solaris has no mutable mob-equipment path yet; a supported 26.1.2 pillager therefore
-    // projects the canonical crossbow assigned by Pillager.finalizeSpawn.
+    // Solaris has no mutable mob-equipment path yet; supported 26.1.2 mobs
+    // therefore project the canonical items assigned by their finalizeSpawn:
+    // pillagers hold a crossbow, bow skeletons a bow.
     static CROSSBOW_ITEM_ID: LazyLock<u32> = LazyLock::new(|| {
         let crossbow = Identifier::parse("minecraft:crossbow").expect("canonical crossbow id");
         mc_data::items::solaris_required_items()
             .id_of(&crossbow)
             .expect("embedded 26.1.2 item registry contains crossbow")
     });
-
-    (entity_type == "minecraft:pillager").then(|| EntityItemStack::new(*CROSSBOW_ITEM_ID, 1))
+    static BOW_ITEM_ID: LazyLock<u32> = LazyLock::new(|| {
+        let bow = Identifier::parse("minecraft:bow").expect("canonical bow id");
+        mc_data::items::solaris_required_items()
+            .id_of(&bow)
+            .expect("embedded 26.1.2 item registry contains bow")
+    });
+    if entity_type == "minecraft:pillager" {
+        return Some(EntityItemStack::new(*CROSSBOW_ITEM_ID, 1));
+    }
+    if is_bow_skeleton_type_26_1_2(entity_type) {
+        return Some(EntityItemStack::new(*BOW_ITEM_ID, 1));
+    }
+    None
 }
 
 pub(super) fn spawned_xp_observer_ids(dispatches: &[VisibilityDispatch]) -> Vec<SessionId> {

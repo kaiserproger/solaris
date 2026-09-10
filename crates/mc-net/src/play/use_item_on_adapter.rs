@@ -108,10 +108,9 @@ pub(super) struct UseItemOnResyncOptions {
 }
 
 impl UseItemOnResyncOptions {
-    const WITH_BUCKET: Self = Self {
+    pub(super) const WITH_BUCKET: Self = Self {
         held_resync: UseItemOnHeldResync::BucketOnly,
     };
-
     pub(super) const WITH_HELD_ITEM: Self = Self {
         held_resync: UseItemOnHeldResync::HeldItem,
     };
@@ -479,6 +478,7 @@ where
         state,
         writer,
         game_mode,
+        player_pose,
         action.sequence,
         target.clicked_pos,
         action.direction,

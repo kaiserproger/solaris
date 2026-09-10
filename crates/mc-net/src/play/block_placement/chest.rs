@@ -1,3 +1,5 @@
+use mc_data::block_placement_26_1_2::opposite;
+
 use super::{
     BlockEdit, BlockEditPrecondition, BlockPos, BlockRegistry, BlockState, BlockStateId, Direction,
     PlannedBlockPlacement, PlayerPose, WorldReadSnapshot, horizontal_direction,
@@ -17,11 +19,6 @@ fn clockwise(direction: Direction) -> Direction {
         Direction::West => Direction::North,
         _ => direction,
     }
-}
-
-fn opposite(direction: Direction) -> Direction {
-    let direction = clockwise(direction);
-    clockwise(direction)
 }
 
 fn state_with(
@@ -67,11 +64,18 @@ pub(super) fn placement(
     };
     for direction in candidates.into_iter().flatten() {
         let neighbor_pos = relative(pos, direction);
-        let neighbor_id = snapshot.get_cached_block(neighbor_pos)?;
+        // An unloaded neighbor cannot pair: place single rather than
+        // aborting the whole plan. Loaded cells keep their preconditions.
+        let Some(neighbor_id) = snapshot.get_cached_block(neighbor_pos) else {
+            continue;
+        };
+        let Some(expected_token) = snapshot.block_mutation_token(neighbor_pos) else {
+            continue;
+        };
         dependencies.push(BlockEditPrecondition {
             pos: neighbor_pos,
             expected_state: neighbor_id,
-            expected_token: snapshot.block_mutation_token(neighbor_pos)?,
+            expected_token,
         });
         let neighbor = blocks.by_id(neighbor_id)?;
         if neighbor.block.id != state.block.id || property(neighbor, "type") != Some("single") {

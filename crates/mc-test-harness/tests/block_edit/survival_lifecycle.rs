@@ -77,19 +77,9 @@ async fn survival_double_chest_opens_combined_storage_and_mutates_second_half_in
             .expect("interior chest support chunk is loaded");
     }
     let mut left_chest = mc_world::ChestBlockEntity::default();
-    left_chest.slots[0] = mc_world::FurnaceSlot {
-        item_id: dirt_id,
-        count: 5,
-        damage: None,
-        enchantments: Vec::new(),
-    };
+    left_chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 5, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
     let mut right_chest = mc_world::ChestBlockEntity::default();
-    right_chest.slots[0] = mc_world::FurnaceSlot {
-        item_id: dirt_id,
-        count: 7,
-        damage: None,
-        enchantments: Vec::new(),
-    };
+    right_chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 7, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
     for (position, chest) in [(left_pos, left_chest), (right_pos, right_chest)] {
         storage
             .set_block_at(position, chest_state)

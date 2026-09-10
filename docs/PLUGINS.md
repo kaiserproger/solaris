@@ -222,6 +222,7 @@ are not additional callable host functions.
 | Messaging | `send_message`, `broadcast`, `disconnect`, `send_custom_payload` | [Commands](#commands) |
 | Entity mutations | `spawn_entity`, `damage_entity` | [Commands](#commands) |
 | Storage | `storage_get`, `storage_cas`, `storage_delete` | [Commands](#commands) |
+| Durable batch storage | `storage_batch_cas`, `storage_scan`, `operation_status` | [Commands](#commands) |
 | Menus | `open_inventory_menu`, `close_inventory_menu` | [Commands](#commands) |
 | Inventory | `inventory_transaction`, `inventory_storage_transaction` | [Commands](#commands) |
 | World and players | `set_world_time`, `set_block`, `list_online_players` | [Commands](#commands) |
@@ -749,6 +750,7 @@ fail synchronously; an unknown capability rejects discovery.
 | Capability | Allows |
 | --- | --- |
 | `storage` | `storage_get`, `storage_cas`, `storage_delete` |
+| `storage_batches` | `storage_batch_cas`, `storage_scan`, `operation_status`; also requires `required_features = ["storage_batches"]` |
 | `inventory_menus` | `open_inventory_menu`, `close_inventory_menu` |
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
 | `player_inventory` | `inventory_transaction` |
@@ -844,6 +846,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
 | `plugin.storage.cas_result` | `on_plugin_storage_cas_result` | `request_id`, `key`, `applied`, `version`, `failure` |
 | `plugin.storage.delete_result` | `on_plugin_storage_delete_result` | `request_id`, `key`, `deleted`, `version`, `failure` |
+| `operation.result` | `on_operation_result` | `request_id`, optional `operation_id`, `state`, optional `revision`/`failure`, typed `payload` |
 | `inventory.menu.clicked` | `on_inventory_menu_clicked` | player snapshot, `menu_id`, `slot`, `click` |
 | `inventory.storage_transaction.result` | `on_inventory_storage_transaction_result` | `request_id`, `committed` |
 | `player.inventory_transaction_result` | `on_player_inventory_transaction_result` | `request_id`, `player_id`, `committed`, `failure` |
@@ -1150,6 +1153,65 @@ requests are consumed into explicit failure results. Later submissions either
 receive the same explicit failure after that drain or stop command orchestration
 if their queue is closed during shutdown.
 
+**Durable batch storage and snapshot scans**
+
+These calls require both `capabilities = ["storage_batches"]` and
+`required_features = ["storage_batches"]` in the package manifest. API version
+`0.6.0` alone does not advertise this extension. An unknown required feature,
+or this capability without its required feature, fails package admission.
+
+```luau
+solaris.storage_batch_cas(request_id, operation_id, {
+    { operation = "cas", key = "ledger", expected_version = 4, value = "7" },
+    { operation = "cas", key = "intent", expected_version = nil, value = "paid" },
+})
+solaris.storage_scan(request_id, prefix, cursor, limit)
+solaris.operation_status(request_id, operation_id)
+```
+
+`request_id` correlates delivery; `operation_id` identifies the durable mutation.
+Both use the existing lowercase ASCII letters/digits/underscore/hyphen grammar
+and 64-byte bound. A batch contains 1–16 distinct keys, uses the same CAS/delete
+preconditions and value limits as standalone storage, and changes every key
+at one revision or changes none. Mutation order is canonicalized by key.
+Successful operation fingerprints and outcomes survive delivery acknowledgement,
+compaction and restart. A new request id with identical operation content
+replays that outcome without applying the batch again; substituted content
+returns `operation_conflict`. The host supplies the owner namespace.
+
+Results are targeted to `on_operation_result`; no broadcast subscription is
+needed. These synchronous storage calls use `state = "committed"` or
+`"rejected"`. Successful results carry an integer `revision`; rejection carries
+an explicit `failure`. Revisions crossing Luau are bounded by `2^53-1`.
+The closed payload forms are:
+
+- `kind = "storage_batch"`: `changes`, a one-based array of `{ key, deleted }`.
+- `kind = "storage_page"`: `entries`, a one-based array of
+  `{ key, value, revision }`, and an optional continuation `cursor`.
+- `kind = "none"` for a rejected request.
+
+Batch precondition conflicts return `stale_revision`; exhausted capacity returns
+`capacity`. An unavailable or fail-stopped storage actor returns
+`runtime_unavailable`. An uncertain post-append synchronization result is not
+reported as rejection: recovery resolves the journal and replays its pending
+receipt. `operation_status` returns the saved owner-scoped outcome;
+`not_found` is a failed lookup, not evidence of a stored rejected operation.
+
+For a scan, pass `nil` as the first cursor, an optional empty-string prefix,
+and a required limit of 1–64. Records are sorted by key. Continuations retain
+the original snapshot revision and values despite concurrent writes; retrying
+the same cursor returns the same page. Continue with the same prefix and limit.
+A cursor belongs to one plugin, expires after 60 seconds, and is invalid after
+server restart. Foreign cursors return `forbidden`; expired/unknown cursors
+return `cursor_expired`; changing query parameters returns `invalid_request`.
+Start a new scan after expiry. A terminal page has `cursor = nil`.
+
+The host retains at most eight paginated snapshots per plugin, 64 globally,
+and 64 MiB of charged snapshot data including cursor/key overhead. Snapshot
+creation scans only the bounded owner namespace, not the world or other plugins.
+Retained immutable records share their values with live storage; quota accounting
+still charges the full retained value size.
+
 The inventory adapter owns menus after admission. Plugins describe fixed
 display slots but do not receive container, slot-stack, NBT, or click-packet
 state:
@@ -1190,22 +1252,46 @@ solaris.inventory_storage_transaction(player_id, request_id,
 
 Storage mutations use `operation = "cas"` or `operation = "delete"`; both use
 the same expected-version semantics as the standalone commands. The storage
-actor prepares every key first, holds the canonical player-state lock while it
-appends and syncs one CRC-framed storage batch, then replaces the inventory and
-publishes one ordered reliable authoritative snapshot. Concurrent inventory
+actor prepares every key first and holds the canonical player-state lock and
+server save coordinator while appending and synchronizing one inventory decision
+in the existing world journal. It durably projects the storage batch and
+playerdata before replacing live inventory and publishing one ordered reliable
+authoritative snapshot. Concurrent inventory
 operations therefore cannot observe or interleave half of a successful runtime
 transaction. A per-session lifetime gate makes disconnect either reject a
 captured-but-not-started request or wait for an already-started commit before
 the disconnected player state becomes saveable. Every storage record changed
 by the batch receives the same revision.
 
-The storage journal and vanilla playerdata are not yet one crash-recovery log.
-If the process dies, or `sync_all` returns an unknown outcome after a complete
-batch append, startup can replay the storage half while the last playerdata save
-still contains the old inventory. The actor fail-stops on that uncertainty and
-does not publish a guessed result. This is a documented crash-atomicity gap, not
-a runtime atomicity claim; closing it requires a player-inventory recovery intent
-in the durable transaction record.
+The world decision contains the ledger mutations, canonical named-item inventory
+NBT after-image and player UUID. Plugin-storage contains only its ledger
+projection, not a second inventory recovery authority. Startup replays world
+chunks, then restores storage and playerdata before admitting gameplay or saves,
+including when Lua is disabled. Playerdata uses `SolarisInventoryWorldJournalLsn`;
+this is a world journal LSN, not a plugin-storage revision.
+
+The after-image includes the cursor and crafting/enchanting/merchant inputs.
+Normal saves preserve newer recovered inventory while still saving unrelated
+player state; a later inventory save at the same LSN is not overwritten by
+replay. World checkpoints retain a decision until every durable projection is
+complete. Startup reconstructs that readiness by replay, so recovered decisions
+can subsequently be checkpointed.
+
+Process-crash coverage kills the process after world sync with no storage
+projection, after a storage append with uncertain sync, and after complete
+projection. It verifies recovery, preservation of a later independent inventory
+save, and checkpoint removal after recovery. An uncertain decision or failed
+projection fences the player's inventory and signals the existing world
+fail-stop path. Native item/container, pickup, survival, and plugin owner commits
+check the inventory fence before effects. The uncertain transaction is not
+reported as rejected or assumed committed.
+
+The existing boolean callback is unchanged: this closes its ledger/playerdata
+recovery gap, not every gameplay persistence transaction, and does not add
+operation-id receipts to the older `inventory_storage_transaction` signature.
+Owned inventory transfers/reservations and resident integration remain separate
+work. Canonical container stacks now retain supported custom names and item
+models alongside damage/enchantments through container moves and Anvil saves.
 
 The separate player-inventory API performs one atomic main-inventory and
 hotbar mutation without touching plugin storage:

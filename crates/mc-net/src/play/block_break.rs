@@ -476,10 +476,8 @@ pub(super) fn plan_survival_break_drops(
         .filter(|(edit, precondition)| {
             edit.pos == request.position
                 || (edit.new_state == air
-                    && is_vertical_support_cascade_state(
-                        &request.blocks,
-                        precondition.expected_state,
-                    ))
+                    && is_support_cascade_state(&request.blocks, precondition.expected_state)
+                    && !is_upper_double_plant_half(&request.blocks, precondition.expected_state))
         })
         .flat_map(|(edit, precondition)| {
             let loot_seed = block_break_loot_seed(
@@ -487,6 +485,11 @@ pub(super) fn plan_survival_break_drops(
                 precondition.expected_state,
                 precondition.expected_token,
             );
+            // Vanilla support destruction carries no held tool: a support-pop
+            // of e.g. short grass must not grant a shears-only grass item.
+            let cascade_tool = (edit.pos == request.position)
+                .then_some(held_item)
+                .flatten();
             let drops = if edit.pos == request.position {
                 request
                     .loader_block_drop
@@ -499,7 +502,7 @@ pub(super) fn plan_survival_break_drops(
                             &request.item_facts,
                             &request.blocks,
                             precondition.expected_state,
-                            held_item,
+                            cascade_tool,
                             loot_seed,
                         )
                     })
@@ -510,7 +513,7 @@ pub(super) fn plan_survival_break_drops(
                     &request.item_facts,
                     &request.blocks,
                     precondition.expected_state,
-                    held_item,
+                    cascade_tool,
                     loot_seed,
                 )
             };
@@ -591,7 +594,7 @@ pub(super) fn plan_break_block_edits(
     edits
 }
 
-fn append_vertical_support_cascade(
+pub(super) fn append_vertical_support_cascade(
     blocks: &mc_world::BlockRegistry,
     storage: &impl BlockPlanningRead,
     edits: &mut Vec<BlockEdit>,
@@ -607,14 +610,33 @@ fn append_vertical_support_cascade(
         let Some(state) = blocks.by_id(state_id) else {
             break;
         };
-        if !is_vertical_support_cascade_block(state.block.id.path()) {
-            break;
+        let path = state.block.id.path();
+        if is_vertical_support_cascade_block(path) {
+            edits.push(BlockEdit {
+                pos,
+                new_state: air,
+            });
+            y += 1;
+            continue;
         }
-        edits.push(BlockEdit {
-            pos,
-            new_state: air,
-        });
-        y += 1;
+        if y == base.y + 1 && is_ground_support_plant(path) {
+            edits.push(BlockEdit {
+                pos,
+                new_state: air,
+            });
+            let upper = mc_world::BlockPos { y: y + 1, ..base };
+            if let Some(upper_id) = storage.get_cached_block(upper)
+                && let Some(upper_state) = blocks.by_id(upper_id)
+                && upper_state.block.id == state.block.id
+                && super::block_state_property(upper_state, "half") == Some("upper")
+            {
+                edits.push(BlockEdit {
+                    pos: upper,
+                    new_state: air,
+                });
+            }
+        }
+        break;
     }
 }
 
@@ -622,13 +644,27 @@ fn is_vertical_support_cascade_block(path: &str) -> bool {
     matches!(path, "sugar_cane" | "cactus" | "bamboo")
 }
 
-fn is_vertical_support_cascade_state(
+fn is_ground_support_plant(path: &str) -> bool {
+    mc_world::plant_rules_26_1_2::is_ground_support_plant(path)
+}
+
+fn is_upper_double_plant_half(
     blocks: &mc_world::BlockRegistry,
     state_id: mc_world::BlockStateId,
 ) -> bool {
     blocks
         .by_id(state_id)
-        .is_some_and(|state| is_vertical_support_cascade_block(state.block.id.path()))
+        .is_some_and(|state| super::block_state_property(state, "half") == Some("upper"))
+}
+
+fn is_support_cascade_state(
+    blocks: &mc_world::BlockRegistry,
+    state_id: mc_world::BlockStateId,
+) -> bool {
+    blocks.by_id(state_id).is_some_and(|state| {
+        is_vertical_support_cascade_block(state.block.id.path())
+            || is_ground_support_plant(state.block.id.path())
+    })
 }
 
 pub(super) fn break_replacement_state_in_storage(

@@ -41,6 +41,62 @@ pub trait PlantBlockRead {
     fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId>;
 }
 
+/// Ground plants whose vanilla `BushBlock` survival requires soil below: they
+/// pop when the block under them is removed. Column plants (sugar cane,
+/// cactus, bamboo) use the vertical column rules instead; face-attached
+/// vegetation (vine, glow lichen) and leaves survive by their own rules.
+#[must_use]
+pub fn is_ground_support_plant(path: &str) -> bool {
+    if path.ends_with("_sapling") {
+        return true;
+    }
+    matches!(
+        path,
+        // small flowers
+        "poppy"
+            | "dandelion"
+            | "golden_dandelion"
+            | "blue_orchid"
+            | "allium"
+            | "azure_bluet"
+            | "oxeye_daisy"
+            | "cornflower"
+            | "lily_of_the_valley"
+            | "torchflower"
+            | "wither_rose"
+            | "open_eyeblossom"
+            | "closed_eyeblossom"
+            | "orange_tulip"
+            | "red_tulip"
+            | "pink_tulip"
+            | "white_tulip"
+            | "cactus_flower"
+            // grass and bush family
+            | "short_grass"
+            | "short_dry_grass"
+            | "tall_dry_grass"
+            | "tall_grass"
+            | "fern"
+            | "large_fern"
+            | "bush"
+            | "firefly_bush"
+            | "leaf_litter"
+            | "dead_bush"
+            // double flowers
+            | "sunflower"
+            | "lilac"
+            | "rose_bush"
+            | "peony"
+            | "pitcher_plant"
+            // rooted and submerged soil plants (hanging_roots is ceiling-hung: excluded)
+            | "crimson_roots"
+            | "warped_roots"
+            | "nether_sprouts"
+            | "seagrass"
+            | "tall_seagrass"
+    )
+}
+
 impl PlantBlockRead for WorldStorage {
     fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
         WorldStorage::get_cached_block(self, pos)

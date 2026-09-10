@@ -41,6 +41,8 @@ use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 const REGION_AXIS_CHUNKS: i32 = 32;
 const DAMAGE_COMPONENT: &str = "minecraft:damage";
 const ENCHANTMENTS_COMPONENT: &str = "minecraft:enchantments";
+const CUSTOM_NAME_COMPONENT: &str = "minecraft:custom_name";
+const ITEM_MODEL_COMPONENT: &str = "minecraft:item_model";
 const TARGET_DATA_VERSION: i32 = 4_790;
 const VANILLA_METADATA_KEYS: &[&str] = &["DataVersion", "LastUpdate", "InhabitedTime"];
 
@@ -1312,11 +1314,32 @@ fn decode_container_stack(
         }
         enchantments.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     }
+    let custom_name = components
+        .map(|components| get_optional_compound(components, CUSTOM_NAME_COMPONENT))
+        .transpose()?
+        .flatten()
+        .filter(|component| component.len() == 1)
+        .map(|component| get_optional_string(component, "text"))
+        .transpose()?
+        .flatten()
+        .map(str::to_owned);
+    let item_model = components
+        .map(|components| get_optional_string(components, ITEM_MODEL_COMPONENT))
+        .transpose()?
+        .flatten()
+        .map(|name| {
+            Identifier::parse(name.to_owned())
+                .map(std::sync::Arc::new)
+                .map_err(|_| ChunkNbtError::InvalidIdentifier(name.to_owned()))
+        })
+        .transpose()?;
     Ok(FurnaceSlot {
         count: get_int(item, "count")?,
         item_id,
         damage,
         enchantments,
+        custom_name,
+        item_model,
     })
 }
 
@@ -1352,6 +1375,18 @@ fn encode_container_stack(
                     })
                     .collect(),
             ),
+        ));
+    }
+    if let Some(name) = &stack.custom_name {
+        components.push((
+            CUSTOM_NAME_COMPONENT.into(),
+            Tag::Compound(vec![("text".into(), Tag::String(name.clone()))]),
+        ));
+    }
+    if let Some(model) = &stack.item_model {
+        components.push((
+            ITEM_MODEL_COMPONENT.into(),
+            Tag::String(model.as_str().to_owned()),
         ));
     }
     if !components.is_empty() {
@@ -1536,6 +1571,27 @@ fn get_optional_compound<'a>(
         other => Err(ChunkNbtError::WrongType {
             field: name,
             expected: "Compound",
+            got: other.type_id(),
+        }),
+    }
+}
+
+fn get_optional_string<'a>(
+    cmp: &'a [(String, Tag)],
+    name: &'static str,
+) -> Result<Option<&'a str>, ChunkNbtError> {
+    let Some(tag) = cmp
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+    else {
+        return Ok(None);
+    };
+    match tag {
+        Tag::String(value) => Ok(Some(value)),
+        other => Err(ChunkNbtError::WrongType {
+            field: name,
+            expected: "String",
             got: other.type_id(),
         }),
     }
@@ -1846,12 +1902,16 @@ mod tests {
                 id: Identifier::parse("minecraft:efficiency").unwrap(),
                 level: 1,
             }],
+            custom_name: None,
+            item_model: None,
         };
         hopper.slots[4] = FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         chunk.hoppers.insert(pos, hopper.clone());
 

@@ -89,6 +89,36 @@ pub struct ChunkPayload {
     pub uncompressed_nbt: Vec<u8>,
 }
 
+/// One chunk slot's verbatim on-disk record: compression byte, compressed
+/// bytes and timestamp, exactly as stored. Region rewrites can copy these
+/// bytes for untouched slots instead of decoding and recompressing them.
+/// [`read_region_raw`] verifies each record decodes within budget (without
+/// retaining the decoded bytes), so raw and decoded reads reject the same
+/// corrupt inputs; only the allocating decode-and-retain step is skipped.
+#[derive(Debug, Clone)]
+pub struct RawChunkRecord {
+    /// Local chunk x within the region, `0..32`.
+    pub local_x: u8,
+    /// Local chunk z within the region, `0..32`.
+    pub local_z: u8,
+    /// Epoch seconds from the timestamps table.
+    pub timestamp: u32,
+    /// Stored compression byte (`CompressionType` discriminant, high bit clear).
+    pub compression: u8,
+    /// Stored compressed payload bytes (without the 5-byte chunk header).
+    pub compressed: Vec<u8>,
+}
+
+/// One slot for a region rewrite: a freshly encoded payload or a verbatim
+/// preserved record.
+#[derive(Debug, Clone)]
+pub enum RegionChunkOutput {
+    /// Encode (zlib) and store with the payload's timestamp.
+    Fresh(ChunkPayload),
+    /// Copy stored bytes verbatim with the record's timestamp.
+    Preserved(RawChunkRecord),
+}
+
 #[derive(Debug, Error)]
 pub enum RegionError {
     #[error("region io error at {path}: {source}")]
@@ -270,13 +300,36 @@ impl RegionReader {
     pub(crate) fn has_chunk(&self, local_x: u8, local_z: u8) -> bool {
         chunk_slot(local_x, local_z).is_ok_and(|slot| self.locations[slot].is_some())
     }
-
     fn read_slot(
         &self,
         slot: usize,
         decoded_so_far: usize,
         limits: RegionLimits,
     ) -> Result<Option<ChunkPayload>, RegionError> {
+        let Some(record) = self.read_slot_raw(slot)? else {
+            return Ok(None);
+        };
+        let uncompressed_nbt = decompress_bounded(
+            CompressionType::from_byte(record.compression)?,
+            &record.compressed,
+            record.local_x,
+            record.local_z,
+            decoded_so_far,
+            limits,
+        )?;
+        Ok(Some(ChunkPayload {
+            local_x: record.local_x,
+            local_z: record.local_z,
+            timestamp: record.timestamp,
+            uncompressed_nbt,
+        }))
+    }
+
+    /// Read one slot's stored bytes without decoding them. Location-table,
+    /// compression-type and size validation match [`Self::read_slot`]; the
+    /// caller applies [`count_slot_payload`] when it needs the same
+    /// decode-budget fence without retaining decoded bytes.
+    fn read_slot_raw(&self, slot: usize) -> Result<Option<RawChunkRecord>, RegionError> {
         let cx = (slot % CHUNKS_PER_REGION_AXIS) as u8;
         let cz = (slot / CHUNKS_PER_REGION_AXIS) as u8;
         let Some(location) = self.locations[slot] else {
@@ -307,7 +360,9 @@ impl RegionReader {
         if comp_byte & 0x80 != 0 {
             return Err(RegionError::Oversized);
         }
-        let comp = CompressionType::from_byte(comp_byte)?;
+        // Reject unknown compression ids here so preserved records can never
+        // smuggle an unreadable byte through a rewrite.
+        CompressionType::from_byte(comp_byte)?;
         let payload_len = usize::try_from(len)
             .expect("u32 chunk length fits usize")
             .checked_sub(1)
@@ -334,32 +389,32 @@ impl RegionReader {
             });
         }
 
-        let mut payload =
+        let mut compressed =
             allocate_exact_bytes(payload_len, "compressed Anvil chunk").map_err(|source| {
                 RegionError::Io {
                     path: self.path.clone(),
                     source,
                 }
             })?;
-        file.read_exact(&mut payload)
+        file.read_exact(&mut compressed)
             .map_err(|source| RegionError::Io {
                 path: self.path.clone(),
                 source,
             })?;
         drop(file);
 
-        let uncompressed_nbt = decompress_bounded(comp, &payload, cx, cz, decoded_so_far, limits)?;
         let ts_off = SECTOR_SIZE + slot * 4;
         let timestamp = u32::from_be_bytes(
             self.header[ts_off..ts_off + 4]
                 .try_into()
                 .expect("4-byte slice"),
         );
-        Ok(Some(ChunkPayload {
+        Ok(Some(RawChunkRecord {
             local_x: cx,
             local_z: cz,
             timestamp,
-            uncompressed_nbt,
+            compression: comp_byte,
+            compressed,
         }))
     }
 }
@@ -506,6 +561,41 @@ fn read_region_with_limits(
     Ok(())
 }
 
+/// Read every populated chunk's stored bytes without decoding them, in
+/// slot-order `(cz * 32 + cx)`. Same location-table validation as
+/// [`read_region`]; per-slot compression-type and size checks still apply,
+/// but no chunk is decompressed, so the aggregate decode budgets do not.
+pub fn read_region_raw(path: impl AsRef<Path>) -> Result<Vec<RawChunkRecord>, RegionError> {
+    let path = path.as_ref();
+    let mut out = Vec::new();
+    out.try_reserve_exact(REGION_CHUNK_COUNT)
+        .map_err(|error| RegionError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("reserve region chunk list: {error}")),
+        })?;
+    let limits = DEFAULT_REGION_LIMITS;
+    let reader = RegionReader::open_with_limits(path, limits)?;
+    let mut decoded_total = 0_usize;
+    for slot in 0..REGION_CHUNK_COUNT {
+        if let Some(record) = reader.read_slot_raw(slot)? {
+            let comp = CompressionType::from_byte(record.compression)?;
+            let decoded_len = count_slot_payload(
+                comp,
+                &record.compressed,
+                record.local_x,
+                record.local_z,
+                decoded_total,
+                limits,
+            )?;
+            decoded_total = decoded_total
+                .checked_add(decoded_len)
+                .expect("aggregate limit prevents decoded byte overflow");
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
 /// Write a fresh region file at `path`, packing each chunk with zlib.
 /// Slots not represented in `chunks` are left empty (`(0, 0)` in the
 /// locations table).
@@ -536,57 +626,150 @@ fn write_region_with_options(
 
     for c in chunks {
         let slot = usize::from(c.local_z) * CHUNKS_PER_REGION_AXIS + usize::from(c.local_x);
-        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
-        zlib.write_all(&c.uncompressed_nbt)
-            .map_err(|e| RegionError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        let compressed = zlib.finish().map_err(|e| RegionError::Io {
+        let compressed = encode_fresh_slot(path, &c.uncompressed_nbt)?;
+        next_sector = append_slot_bytes(
+            &mut body,
+            next_sector,
+            path,
+            slot,
+            c.timestamp,
+            CompressionType::Zlib as u8,
+            &compressed,
+            &mut locations,
+            &mut timestamps,
+        )?;
+    }
+
+    write_assembled_region(path, &locations, &timestamps, &body, create_new)
+}
+
+/// Write a fresh region file at `path`, failing if it already exists, copying
+/// [`RegionChunkOutput::Preserved`] slots verbatim and encoding `Fresh` ones
+/// with zlib. Slots not represented are left empty. Byte-identical preserved
+/// records keep their timestamp, compression byte and compressed bytes, so a
+/// rewrite that only replaces dirty slots never recompresses the rest.
+pub fn write_region_create_new_mixed(
+    path: impl AsRef<Path>,
+    records: &[RegionChunkOutput],
+) -> Result<(), RegionError> {
+    let path = path.as_ref();
+    validate_write_records(records, DEFAULT_REGION_LIMITS)?;
+
+    let mut locations = [0_u32; REGION_CHUNK_COUNT];
+    let mut timestamps = [0_u32; REGION_CHUNK_COUNT];
+    let mut next_sector = HEADER_SECTORS as u32;
+    let mut body: Vec<u8> = Vec::new();
+
+    for record in records {
+        let (local_x, local_z, timestamp, comp_byte, compressed) = match record {
+            RegionChunkOutput::Fresh(payload) => (
+                payload.local_x,
+                payload.local_z,
+                payload.timestamp,
+                CompressionType::Zlib as u8,
+                std::borrow::Cow::Owned(encode_fresh_slot(path, &payload.uncompressed_nbt)?),
+            ),
+            RegionChunkOutput::Preserved(record) => (
+                record.local_x,
+                record.local_z,
+                record.timestamp,
+                record.compression,
+                std::borrow::Cow::Borrowed(record.compressed.as_slice()),
+            ),
+        };
+        let slot = usize::from(local_z) * CHUNKS_PER_REGION_AXIS + usize::from(local_x);
+        next_sector = append_slot_bytes(
+            &mut body,
+            next_sector,
+            path,
+            slot,
+            timestamp,
+            comp_byte,
+            &compressed,
+            &mut locations,
+            &mut timestamps,
+        )?;
+    }
+
+    write_assembled_region(path, &locations, &timestamps, &body, true)
+}
+
+fn encode_fresh_slot(path: &Path, uncompressed_nbt: &[u8]) -> Result<Vec<u8>, RegionError> {
+    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+    zlib.write_all(uncompressed_nbt)
+        .map_err(|e| RegionError::Io {
             path: path.to_path_buf(),
             source: e,
         })?;
+    zlib.finish().map_err(|e| RegionError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
 
-        // [len:4][comp:1][payload …] padded to a sector.
-        let (len, padded_len, sectors_used) =
-            encoded_chunk_layout(compressed.len(), c.local_x, c.local_z)?;
-        let raw_len = 5 + compressed.len();
-        let pad = padded_len - raw_len;
-        reserve_region_bytes(&mut body, padded_len, path, "region body")?;
+/// Append one `[len:4][comp:1][payload …]` sector-padded record to `body` and
+/// record its location/timestamp. Returns the next free sector.
+#[allow(clippy::too_many_arguments)]
+fn append_slot_bytes(
+    body: &mut Vec<u8>,
+    next_sector: u32,
+    path: &Path,
+    slot: usize,
+    timestamp: u32,
+    comp_byte: u8,
+    compressed: &[u8],
+    locations: &mut [u32; REGION_CHUNK_COUNT],
+    timestamps: &mut [u32; REGION_CHUNK_COUNT],
+) -> Result<u32, RegionError> {
+    let (len, padded_len, sectors_used) = encoded_chunk_layout(
+        compressed.len(),
+        (slot % CHUNKS_PER_REGION_AXIS) as u8,
+        (slot / CHUNKS_PER_REGION_AXIS) as u8,
+    )?;
+    let raw_len = 5 + compressed.len();
+    let pad = padded_len - raw_len;
+    reserve_region_bytes(body, padded_len, path, "region body")?;
 
-        body.extend_from_slice(&len.to_be_bytes());
-        body.push(CompressionType::Zlib as u8);
-        body.extend_from_slice(&compressed);
-        body.extend(std::iter::repeat_n(0u8, pad));
+    body.extend_from_slice(&len.to_be_bytes());
+    body.push(comp_byte);
+    body.extend_from_slice(compressed);
+    body.extend(std::iter::repeat_n(0u8, pad));
 
-        let following_sector = next_sector
-            .checked_add(sectors_used)
-            .ok_or(RegionError::RegionSizeOverflow)?;
-        let following_bytes = u64::from(following_sector) * SECTOR_SIZE as u64;
-        if following_bytes > MAX_REGION_FILE_BYTES {
-            return Err(RegionError::RegionTooLarge {
-                bytes: following_bytes,
-                max: MAX_REGION_FILE_BYTES,
-            });
-        }
-        debug_assert!(next_sector < (1 << 24));
-        locations[slot] = (next_sector << 8) | sectors_used;
-        timestamps[slot] = c.timestamp;
-        next_sector = following_sector;
+    let following_sector = next_sector
+        .checked_add(sectors_used)
+        .ok_or(RegionError::RegionSizeOverflow)?;
+    let following_bytes = u64::from(following_sector) * SECTOR_SIZE as u64;
+    if following_bytes > MAX_REGION_FILE_BYTES {
+        return Err(RegionError::RegionTooLarge {
+            bytes: following_bytes,
+            max: MAX_REGION_FILE_BYTES,
+        });
     }
+    debug_assert!(next_sector < (1 << 24));
+    locations[slot] = (next_sector << 8) | sectors_used;
+    timestamps[slot] = timestamp;
+    Ok(following_sector)
+}
 
+fn write_assembled_region(
+    path: &Path,
+    locations: &[u32; REGION_CHUNK_COUNT],
+    timestamps: &[u32; REGION_CHUNK_COUNT],
+    body: &[u8],
+    create_new: bool,
+) -> Result<(), RegionError> {
     let out_len = HEADER_BYTES
         .checked_add(body.len())
         .ok_or(RegionError::RegionSizeOverflow)?;
     let mut out = Vec::new();
     reserve_region_bytes(&mut out, out_len, path, "region image")?;
-    for &loc in &locations {
+    for &loc in locations {
         out.extend_from_slice(&loc.to_be_bytes());
     }
-    for &ts in &timestamps {
+    for &ts in timestamps {
         out.extend_from_slice(&ts.to_be_bytes());
     }
-    out.extend_from_slice(&body);
+    out.extend_from_slice(body);
 
     let mut file = if create_new {
         OpenOptions::new().write(true).create_new(true).open(path)
@@ -646,6 +829,81 @@ fn validate_write_chunks(chunks: &[ChunkPayload], limits: RegionLimits) -> Resul
     Ok(())
 }
 
+fn validate_write_records(
+    records: &[RegionChunkOutput],
+    limits: RegionLimits,
+) -> Result<(), RegionError> {
+    let mut seen = [false; REGION_CHUNK_COUNT];
+    let mut decoded_total = 0_usize;
+    for record in records {
+        let (local_x, local_z) = match record {
+            RegionChunkOutput::Fresh(payload) => (payload.local_x, payload.local_z),
+            RegionChunkOutput::Preserved(record) => (record.local_x, record.local_z),
+        };
+        if usize::from(local_x) >= CHUNKS_PER_REGION_AXIS
+            || usize::from(local_z) >= CHUNKS_PER_REGION_AXIS
+        {
+            return Err(RegionError::InvalidChunkCoordinates {
+                cx: local_x,
+                cz: local_z,
+            });
+        }
+        let slot = usize::from(local_z) * CHUNKS_PER_REGION_AXIS + usize::from(local_x);
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(RegionError::DuplicateChunkSlot {
+                cx: local_x,
+                cz: local_z,
+            });
+        }
+        match record {
+            RegionChunkOutput::Fresh(payload) => {
+                if payload.uncompressed_nbt.len() > limits.max_chunk_bytes {
+                    return Err(RegionError::DecompressedChunkTooLarge {
+                        cx: local_x,
+                        cz: local_z,
+                        bytes: payload.uncompressed_nbt.len(),
+                        max: limits.max_chunk_bytes,
+                    });
+                }
+                decoded_total = decoded_total.saturating_add(payload.uncompressed_nbt.len());
+                if decoded_total > limits.max_region_bytes {
+                    return Err(RegionError::DecompressedRegionTooLarge {
+                        bytes: decoded_total,
+                        max: limits.max_region_bytes,
+                    });
+                }
+            }
+            RegionChunkOutput::Preserved(record) => {
+                if record.compression & 0x80 != 0 {
+                    return Err(RegionError::Oversized);
+                }
+                let comp = CompressionType::from_byte(record.compression)?;
+                // Sector/size limits for the stored bytes.
+                encoded_chunk_layout(record.compressed.len(), local_x, local_z)?;
+                // Same decode budgets as fresh payloads, without retaining
+                // anything: hand-built records must clear the fence raw-read
+                // records already passed.
+                let decoded_len = count_slot_payload(
+                    comp,
+                    &record.compressed,
+                    local_x,
+                    local_z,
+                    decoded_total,
+                    limits,
+                )?;
+                decoded_total = decoded_total.saturating_add(decoded_len);
+                if decoded_total > limits.max_region_bytes {
+                    return Err(RegionError::DecompressedRegionTooLarge {
+                        bytes: decoded_total,
+                        max: limits.max_region_bytes,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn encoded_chunk_layout(
     compressed_len: usize,
     cx: u8,
@@ -697,6 +955,26 @@ fn decompress_bounded(
     decoded_so_far: usize,
     limits: RegionLimits,
 ) -> Result<Vec<u8>, RegionError> {
+    let decoded_len = count_slot_payload(comp, payload, cx, cz, decoded_so_far, limits)?;
+    decompress_exact(comp, payload, decoded_len).map_err(|source| RegionError::Decompress {
+        cx,
+        cz,
+        source,
+    })
+}
+
+/// Verify a stored payload decodes within budget without retaining the
+/// decoded bytes. Same fence as the counting half of [`decompress_bounded`];
+/// shared by decoded reads and raw (preserving) reads so both reject the
+/// same corrupt inputs.
+fn count_slot_payload(
+    comp: CompressionType,
+    payload: &[u8],
+    cx: u8,
+    cz: u8,
+    decoded_so_far: usize,
+    limits: RegionLimits,
+) -> Result<usize, RegionError> {
     let decoded_len = match count_decoded_bytes(comp, payload, limits.max_chunk_bytes)
         .map_err(|source| RegionError::Decompress { cx, cz, source })?
     {
@@ -717,11 +995,7 @@ fn decompress_bounded(
             max: limits.max_region_bytes,
         });
     }
-    decompress_exact(comp, payload, decoded_len).map_err(|source| RegionError::Decompress {
-        cx,
-        cz,
-        source,
-    })
+    Ok(decoded_len)
 }
 
 fn count_decoded_bytes(
@@ -1019,6 +1293,22 @@ fn count_lz4_bytes(payload: &[u8], max: usize) -> Result<BoundedLength, std::io:
         }
         if header.token & 0xF0 == LZ4_BLOCK_METHOD_RAW {
             verify_lz4_checksum(&payload[pos..pos + header.compressed_len], header.checksum)?;
+        } else if header.token & 0xF0 == LZ4_BLOCK_METHOD_COMPRESSED {
+            // Compressed blocks carry no self-describing checksum: decode
+            // into scratch and verify, mirroring decompress_lz4_exact, so
+            // counting rejects the same corrupt inputs decoding rejects.
+            let block = &payload[pos..pos + header.compressed_len];
+            let mut scratch =
+                allocate_exact_bytes(header.decompressed_len, "LZ4 verification block")?;
+            let written = lz4_flex::block::decompress_into(block, &mut scratch)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if written != header.decompressed_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "LZ4 block decompressed length mismatch",
+                ));
+            }
+            verify_lz4_checksum(&scratch, header.checksum)?;
         }
         pos += header.compressed_len;
     }
@@ -2119,5 +2409,139 @@ mod tests {
         let mut frame = lz4_flex::frame::FrameDecoder::new(payload.as_slice());
         let mut frame_out = Vec::new();
         assert!(frame.read_to_end(&mut frame_out).is_err());
+    }
+
+    #[test]
+    fn mixed_rewrite_preserves_untouched_slot_bytes_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("r.0.0.mca");
+        write_region(
+            &source,
+            &[
+                ChunkPayload {
+                    local_x: 0,
+                    local_z: 0,
+                    timestamp: 111,
+                    uncompressed_nbt: vec![0x0Au8; 512],
+                },
+                ChunkPayload {
+                    local_x: 1,
+                    local_z: 0,
+                    timestamp: 222,
+                    uncompressed_nbt: vec![0x0Bu8; 256],
+                },
+            ],
+        )
+        .unwrap();
+        let raw_before = read_region_raw(&source).unwrap();
+        assert_eq!(raw_before.len(), 2);
+
+        let target = dir.path().join("r.0.1.mca");
+        let fresh_nbt = vec![0x0Cu8; 128];
+        let kept = raw_before
+            .into_iter()
+            .find(|record| record.local_x == 0)
+            .expect("kept slot present");
+        write_region_create_new_mixed(
+            &target,
+            &[
+                RegionChunkOutput::Preserved(kept.clone()),
+                RegionChunkOutput::Fresh(ChunkPayload {
+                    local_x: 1,
+                    local_z: 0,
+                    timestamp: 333,
+                    uncompressed_nbt: fresh_nbt.clone(),
+                }),
+            ],
+        )
+        .unwrap();
+
+        let raw_after = read_region_raw(&target).unwrap();
+        let kept_after = raw_after
+            .iter()
+            .find(|record| record.local_x == 0)
+            .expect("kept slot rewritten");
+        assert_eq!(kept_after.timestamp, kept.timestamp);
+        assert_eq!(kept_after.compression, kept.compression);
+        assert_eq!(kept_after.compressed, kept.compressed);
+        let decoded = read_region(&target).unwrap();
+        assert_eq!(decoded.len(), 2);
+        let fresh = decoded
+            .iter()
+            .find(|payload| payload.local_x == 1)
+            .expect("fresh slot rewritten");
+        assert_eq!(fresh.timestamp, 333);
+        assert_eq!(fresh.uncompressed_nbt, fresh_nbt);
+    }
+
+    #[test]
+    fn mixed_rewrite_rejects_unknown_compression_and_duplicate_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = RawChunkRecord {
+            local_x: 0,
+            local_z: 0,
+            timestamp: 1,
+            compression: 9,
+            compressed: vec![0u8; 16],
+        };
+        assert!(matches!(
+            write_region_create_new_mixed(
+                dir.path().join("bad-comp.mca"),
+                &[RegionChunkOutput::Preserved(bogus)]
+            ),
+            Err(RegionError::UnknownCompression(9))
+        ));
+
+        let fresh = ChunkPayload {
+            local_x: 2,
+            local_z: 0,
+            timestamp: 1,
+            uncompressed_nbt: vec![0x0Au8; 32],
+        };
+        let dupe = RawChunkRecord {
+            local_x: 2,
+            local_z: 0,
+            timestamp: 1,
+            compression: CompressionType::Zlib as u8,
+            compressed: zlib_payload(&[0x0Au8; 32]),
+        };
+        assert!(matches!(
+            write_region_create_new_mixed(
+                dir.path().join("dupe.mca"),
+                &[
+                    RegionChunkOutput::Fresh(fresh),
+                    RegionChunkOutput::Preserved(dupe),
+                ]
+            ),
+            Err(RegionError::DuplicateChunkSlot { .. })
+        ));
+
+        let corrupt = RawChunkRecord {
+            local_x: 3,
+            local_z: 0,
+            timestamp: 1,
+            compression: CompressionType::Zlib as u8,
+            compressed: vec![0xFFu8; 64],
+        };
+        assert!(matches!(
+            write_region_create_new_mixed(
+                dir.path().join("corrupt.mca"),
+                &[RegionChunkOutput::Preserved(corrupt)]
+            ),
+            Err(RegionError::Decompress { .. })
+        ));
+    }
+    #[test]
+    fn raw_read_rejects_undecodable_payload_like_decoded_read() {
+        // A corrupt compressed payload must fail the rewrite's raw read just
+        // as it fails a decoded read: preserving rewrites never silently
+        // carry corruption forward.
+        let good_nbt = vec![0x0Au8; 256];
+        let region = synthetic_region_chunks(&[
+            (0, CompressionType::Zlib as u8, zlib_payload(&good_nbt)),
+            (1, CompressionType::Zlib as u8, vec![0xFFu8; 64]),
+        ]);
+        assert!(read_region(region.path()).is_err());
+        assert!(read_region_raw(region.path()).is_err());
     }
 }

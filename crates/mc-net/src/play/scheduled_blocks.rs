@@ -496,9 +496,7 @@ fn eject_items_from_hopper(
     };
     let moving = FurnaceSlot {
         count: 1,
-        item_id: hopper.slots[hopper_slot].item_id,
-        damage: hopper.slots[hopper_slot].damage,
-        enchantments: hopper.slots[hopper_slot].enchantments.clone(),
+        ..hopper.slots[hopper_slot].clone()
     };
 
     if let Some(target_positions) =
@@ -600,11 +598,7 @@ fn suck_items_into_hopper(
         };
         let moving = FurnaceSlot {
             count: 1,
-            item_id: source.chests[source_chest].slots[source_slot].item_id,
-            damage: source.chests[source_chest].slots[source_slot].damage,
-            enchantments: source.chests[source_chest].slots[source_slot]
-                .enchantments
-                .clone(),
+            ..source.chests[source_chest].slots[source_slot].clone()
         };
         let Some(hopper_slot) = target_hopper_inventory_slot(hopper, &moving) else {
             return false;
@@ -635,9 +629,7 @@ fn suck_items_into_hopper(
         }
         let moving = FurnaceSlot {
             count: 1,
-            item_id: source.slots[2].item_id,
-            damage: source.slots[2].damage,
-            enchantments: source.slots[2].enchantments.clone(),
+            ..source.slots[2].clone()
         };
         let Some(hopper_slot) = target_hopper_inventory_slot(hopper, &moving) else {
             return false;
@@ -684,6 +676,8 @@ fn target_hopper_inventory_slot(
             || (slot.item_id == moving.item_id
                 && slot.damage == moving.damage
                 && slot.enchantments == moving.enchantments
+                && slot.custom_name == moving.custom_name
+                && slot.item_model == moving.item_model
                 && slot.count < HOPPER_TRANSFER_MAX_STACK)
     })
 }
@@ -903,6 +897,8 @@ fn target_hopper_insert_slot(target: &ChestView, moving: &FurnaceSlot) -> Option
                         || (slot.item_id == moving.item_id
                             && slot.damage == moving.damage
                             && slot.enchantments == moving.enchantments
+                            && slot.custom_name == moving.custom_name
+                            && slot.item_model == moving.item_model
                             && slot.count < HOPPER_TRANSFER_MAX_STACK)
                 })
                 .map(|slot| (chest, slot))
@@ -927,14 +923,14 @@ fn insert_hopper_input_into_furnace(
     if target.is_empty() {
         *target = FurnaceSlot {
             count: 1,
-            item_id: moving.item_id,
-            damage: moving.damage,
-            enchantments: moving.enchantments.clone(),
+            ..moving.clone()
         };
         Some(())
     } else if target.item_id == moving.item_id
         && target.damage == moving.damage
         && target.enchantments == moving.enchantments
+        && target.custom_name == moving.custom_name
+        && target.item_model == moving.item_model
         && target.count < HOPPER_TRANSFER_MAX_STACK
     {
         target.count += 1;
@@ -965,8 +961,8 @@ pub(super) fn insert_hopper_stack_into_campfire(
         item_id: moving.item_id,
         damage: moving.damage,
         enchantments: moving.enchantments.clone(),
-        custom_name: None,
-        item_model: None,
+        custom_name: moving.custom_name.clone(),
+        item_model: moving.item_model.clone(),
     };
     context.sessions.commit_campfire_cooking_insert(
         position,
@@ -1066,14 +1062,14 @@ fn insert_hopper_fuel_into_furnace(
     if target.is_empty() {
         *target = FurnaceSlot {
             count: 1,
-            item_id: moving.item_id,
-            damage: moving.damage,
-            enchantments: moving.enchantments.clone(),
+            ..moving.clone()
         };
         Some(())
     } else if target.item_id == moving.item_id
         && target.damage == moving.damage
         && target.enchantments == moving.enchantments
+        && target.custom_name == moving.custom_name
+        && target.item_model == moving.item_model
         && target.count < HOPPER_TRANSFER_MAX_STACK
     {
         target.count += 1;

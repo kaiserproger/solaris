@@ -22,6 +22,7 @@ pub use chunk_nbt::{
     chunk_to_payload_with_items_at_tick_for_position, repair_chunk_nbt_position,
 };
 pub use region::{
-    CHUNKS_PER_REGION_AXIS, ChunkPayload, CompressionType, RegionError, read_region, visit_region,
-    write_region, write_region_create_new,
+    CHUNKS_PER_REGION_AXIS, ChunkPayload, CompressionType, RawChunkRecord, RegionChunkOutput,
+    RegionError, read_region, read_region_raw, visit_region, write_region, write_region_create_new,
+    write_region_create_new_mixed,
 };

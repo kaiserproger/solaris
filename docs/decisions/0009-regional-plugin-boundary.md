@@ -151,6 +151,29 @@ instead of mutating persistence from the script router. The compound
 inventory/storage transaction remains an explicit typed coordinator with an
 internal session gate shared with standalone inventory owner commands; this
 keeps their plan, durable mutation, and ordered owner application serialized.
+The existing world journal owns the compound commit decision: its inventory
+frame contains canonical named-item player after-images and the prepared ledger
+batch. Storage and playerdata are durable projections, completed before live
+inventory publication. Player after-images include cursor and open crafting,
+enchanting and merchant inputs. `SolarisInventoryWorldJournalLsn` fences replay
+and stale saves; plugin-storage revision is a separate ordering domain.
+The live projection uses the existing server save coordinator. Startup replays
+chunks and inventory decisions before save/gameplay admission, even without Lua.
+Checkpoint readiness is reconstructed by that replay, not plugin event delivery.
+Unprojected decisions remain retained. Uncertain commit/projection marks the
+canonical inventory recovery-required while its mutex is held and signals the
+existing world fail-stop path. Native/session/regional commit preconditions
+check the inventory fence before effects, including callbacks reacquiring the
+mutex after planning. This is a concrete compound recovery mechanism, not a
+claim of global gameplay atomicity.
+
+The `storage_batches` feature adds owner-scoped operation receipts and bounded
+snapshot pagination behind the same storage actor. Successful batch identity
+and fingerprint remain durable after acknowledgement and compaction; uncertain
+synchronization leaves recovery responsible for the outcome. Scan cursors hold
+bounded immutable snapshots, not live mutable world references. Owned endpoint
+transfers/reservations and resident adapters are not implemented by this change.
+
 The actor protection path still reads the bounded
 registry mutex; explosion planning, bounded random-fire planning, and baseline
 normal-piston planning use an immutable snapshot. Piston edits are one atomic

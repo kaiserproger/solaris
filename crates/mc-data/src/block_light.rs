@@ -193,10 +193,22 @@ impl BlockLightTable {
 
         for block in report {
             let path = block.id.path();
+            let chest = path == "chest" || path.ends_with("_chest");
             for state in &block.states {
                 let idx = state.id as usize;
                 emission[idx] = conservative_emission(path, &state.properties);
-                let op = conservative_opacity(path);
+                // Vanilla chests are sub-cube shapes: opacity 0, or 1 when
+                // waterlogged (26.1.2 block-light report) — never 15.
+                let op = if chest {
+                    u8::from(
+                        state
+                            .properties
+                            .get("waterlogged")
+                            .is_some_and(|value| value == "true"),
+                    )
+                } else {
+                    conservative_opacity(path)
+                };
                 opacity[idx] = op;
                 propagates_sky[idx] = op == 0;
                 suffocating[idx] = op == 15;
@@ -588,6 +600,26 @@ mod tests {
         assert_eq!(conservative_opacity("cave_vines_plant"), 0);
     }
 
+    #[test]
+    fn conservative_chest_opacity_follows_waterlogged_state() {
+        let state = |id: u32, waterlogged: &str| BlockStateReport {
+            id,
+            default: waterlogged == "false",
+            properties: BTreeMap::from([("waterlogged".to_string(), waterlogged.to_string())]),
+        };
+        let report = vec![BlockReport {
+            id: Identifier::parse("minecraft:chest").unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![state(0, "false"), state(1, "true")],
+        }];
+        let table = BlockLightTable::conservative_from_blocks_report(&report);
+        assert_eq!(table.opacity[0], 0);
+        assert_eq!(table.opacity[1], 1);
+        assert!(table.propagates_sky[0]);
+        assert!(!table.propagates_sky[1]);
+        assert!(!table.suffocating[0]);
+        assert!(!table.suffocating[1]);
+    }
     #[test]
     fn loads_synthetic_table() {
         let dir = TempDir::new().unwrap();

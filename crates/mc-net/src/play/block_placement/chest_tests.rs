@@ -130,3 +130,91 @@ fn secondary_use_on_ground_keeps_adjacent_chests_separate() {
         None
     );
 }
+
+#[test]
+fn mirrored_placement_order_pairs_with_complementary_types() {
+    let blocks = blocks();
+    let air = default(&blocks, "minecraft:air");
+    let single = default(&blocks, "minecraft:chest");
+    let pos = BlockPos { x: 0, y: 64, z: 0 };
+    let neighbor = BlockPos { x: -1, ..pos };
+    let snapshot =
+        placement_snapshot_for_test(Arc::clone(&blocks), &[(pos, air), (neighbor, single)]);
+    let pose = PlayerPose::new(0.0, 64.0, 0.0);
+    let plan = plan_block_placement(
+        &blocks,
+        single,
+        Some(&snapshot),
+        pos,
+        pose,
+        Direction::Up,
+        0.5,
+        air,
+    )
+    .unwrap();
+    assert_eq!(plan.edits.len(), 2);
+    let first = plan
+        .edits
+        .iter()
+        .find(|edit| edit.pos == pos)
+        .unwrap()
+        .new_state;
+    let second = plan
+        .edits
+        .iter()
+        .find(|edit| edit.pos == neighbor)
+        .unwrap()
+        .new_state;
+    let first_type = property(blocks.by_id(first).unwrap(), "type");
+    let second_type = property(blocks.by_id(second).unwrap(), "type");
+    assert!(
+        matches!(
+            (first_type, second_type),
+            (Some("left"), Some("right")) | (Some("right"), Some("left"))
+        ),
+        "mirrored order must pair with complementary types"
+    );
+    assert_eq!(
+        property(blocks.by_id(first).unwrap(), "facing"),
+        property(blocks.by_id(second).unwrap(), "facing")
+    );
+    let paired =
+        placement_snapshot_for_test(Arc::clone(&blocks), &[(pos, first), (neighbor, second)]);
+    assert_eq!(
+        chest::paired_position(&blocks, |p| paired.get_cached_block(p), pos, first),
+        Some(neighbor),
+        "opening from the new half must find the partner"
+    );
+    assert_eq!(
+        chest::paired_position(&blocks, |p| paired.get_cached_block(p), neighbor, second),
+        Some(pos),
+        "opening from the old half must find the partner"
+    );
+}
+
+#[test]
+fn unloaded_neighbor_places_single_instead_of_aborting() {
+    let blocks = blocks();
+    let air = default(&blocks, "minecraft:air");
+    let single = default(&blocks, "minecraft:chest");
+    let pos = BlockPos { x: 0, y: 64, z: 0 };
+    // Only the placed cell's chunk is loaded; the west neighbor chunk is not.
+    let snapshot = placement_snapshot_for_test(Arc::clone(&blocks), &[(pos, air)]);
+    let pose = PlayerPose::new(0.0, 64.0, 0.0);
+    let plan = plan_block_placement(
+        &blocks,
+        single,
+        Some(&snapshot),
+        pos,
+        pose,
+        Direction::Up,
+        0.5,
+        air,
+    )
+    .expect("unloaded neighbor must not abort placement");
+    assert_eq!(plan.edits.len(), 1);
+    assert_eq!(
+        property(blocks.by_id(plan.edits[0].new_state).unwrap(), "type"),
+        Some("single")
+    );
+}

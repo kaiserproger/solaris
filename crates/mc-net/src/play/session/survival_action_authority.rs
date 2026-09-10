@@ -94,7 +94,8 @@ impl SessionRegistry {
                 wait_started,
                 guard,
             );
-            if player.selected_hotbar_slot != plan.held.hotbar_slot
+            if player.inventory_recovery_required
+                || player.selected_hotbar_slot != plan.held.hotbar_slot
                 || player.inventory.slots[tool_slot] != plan.held.expected
             {
                 return Ok(None);
@@ -158,7 +159,8 @@ impl SessionRegistry {
                     wait_started,
                     guard,
                 );
-                if player.selected_hotbar_slot != plan.held.hotbar_slot
+                if player.inventory_recovery_required
+                    || player.selected_hotbar_slot != plan.held.hotbar_slot
                     || player.inventory.slots != expected_inventory.slots
                 {
                     false
@@ -220,7 +222,9 @@ impl SessionRegistry {
         {
             return Ok(None);
         }
-        if player_state.inventory.slots[held_slot] != plan.held.expected {
+        if player_state.inventory_recovery_required
+            || player_state.inventory.slots[held_slot] != plan.held.expected
+        {
             return Ok(None);
         }
         let mut inventory = player_state.inventory.clone();
@@ -326,6 +330,9 @@ impl SessionRegistry {
             wait_started,
             guard,
         );
+        if player_state.inventory_recovery_required {
+            return Ok(None);
+        }
         let (inventory, changed_slots) = if let Some(change) = &plan.inventory {
             if player_state.inventory.slots[change.held_slot] != change.expected_held {
                 return Ok(None);

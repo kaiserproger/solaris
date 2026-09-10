@@ -57,6 +57,19 @@ pub(in crate::play) struct ServerEntitySnapshot {
     pub(in crate::play) crossbow_charging: bool,
     pub(in crate::play) blaze_charged: bool,
     pub(in crate::play) guardian_attack_target_entity_id: i32,
+    /// Vanilla `Mob.isAggressive` projection for bow skeletons: the client
+    /// poses `BOW_AND_ARROW` only while aggressive with a bow in hand.
+    pub(in crate::play) aggressive: bool,
+}
+
+/// Skeletons that hold a bow by `finalizeSpawn` (`MobCombatPolicy::Arrow`):
+/// the only mobs whose draw pose is driven by the aggressive flag.
+#[must_use]
+pub(in crate::play) fn is_bow_skeleton_type_26_1_2(entity_type: &str) -> bool {
+    matches!(
+        entity_type,
+        "minecraft:skeleton" | "minecraft:stray" | "minecraft:bogged"
+    )
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1213,7 +1213,7 @@ mod tests {
             recipes
                 .iter()
                 .position(|recipe| recipe.id.as_str() == "minecraft:wooden_hoe"),
-            Some(30)
+            Some(36)
         );
     }
 
@@ -1327,16 +1327,16 @@ mod tests {
         };
 
         assert_eq!(display_id("minecraft:chest"), 5);
-        assert_eq!(display_id("minecraft:crafting_table"), 10);
-        assert_eq!(display_id("minecraft:furnace"), 13);
-        assert_eq!(display_id("minecraft:torch"), 27);
-        assert_eq!(display_id("minecraft:wooden_pickaxe"), 31);
+        assert_eq!(display_id("minecraft:crafting_table"), 16);
+        assert_eq!(display_id("minecraft:furnace"), 19);
+        assert_eq!(display_id("minecraft:torch"), 33);
+        assert_eq!(display_id("minecraft:wooden_pickaxe"), 37);
 
         let white_bed_display_id = recipes
             .iter()
             .position(|recipe| recipe.result.item.as_str() == "minecraft:white_bed")
             .expect("white bed fallback recipe");
-        assert_eq!(white_bed_display_id, 34);
+        assert_eq!(white_bed_display_id, 40);
         let recipe = &recipes[white_bed_display_id];
         assert_eq!(recipe.result.count, 1);
 
@@ -1372,22 +1372,22 @@ mod tests {
         };
 
         assert_eq!(display_id("minecraft:chest"), 5);
-        assert_eq!(display_id("minecraft:crafting_table"), 10);
-        assert_eq!(display_id("minecraft:furnace"), 13);
-        assert_eq!(display_id("minecraft:torch"), 27);
-        assert_eq!(display_id("minecraft:wooden_pickaxe"), 31);
-        assert_eq!(display_id("minecraft:zz_playable_white_bed"), 34);
+        assert_eq!(display_id("minecraft:crafting_table"), 16);
+        assert_eq!(display_id("minecraft:furnace"), 19);
+        assert_eq!(display_id("minecraft:torch"), 33);
+        assert_eq!(display_id("minecraft:wooden_pickaxe"), 37);
+        assert_eq!(display_id("minecraft:zz_playable_white_bed"), 40);
 
         for (wood, expected_display_id) in [
-            ("acacia", 35),
-            ("birch", 36),
-            ("cherry", 37),
-            ("dark_oak", 38),
-            ("jungle", 39),
-            ("mangrove", 40),
-            ("oak", 41),
-            ("pale_oak", 42),
-            ("spruce", 43),
+            ("acacia", 41),
+            ("birch", 42),
+            ("cherry", 43),
+            ("dark_oak", 44),
+            ("jungle", 45),
+            ("mangrove", 46),
+            ("oak", 47),
+            ("pale_oak", 48),
+            ("spruce", 49),
         ] {
             let recipe_id = format!("minecraft:zz_playable_wooden_{wood}_door");
             let recipe = &recipes[display_id(&recipe_id)];
@@ -1424,23 +1424,23 @@ mod tests {
         };
 
         assert_eq!(display_id("minecraft:chest"), 5);
-        assert_eq!(display_id("minecraft:crafting_table"), 10);
-        assert_eq!(display_id("minecraft:furnace"), 13);
-        assert_eq!(display_id("minecraft:torch"), 27);
-        assert_eq!(display_id("minecraft:wooden_pickaxe"), 31);
-        assert_eq!(display_id("minecraft:zz_playable_white_bed"), 34);
-        assert_eq!(display_id("minecraft:zz_playable_wooden_spruce_door"), 43);
+        assert_eq!(display_id("minecraft:crafting_table"), 16);
+        assert_eq!(display_id("minecraft:furnace"), 19);
+        assert_eq!(display_id("minecraft:torch"), 33);
+        assert_eq!(display_id("minecraft:wooden_pickaxe"), 37);
+        assert_eq!(display_id("minecraft:zz_playable_white_bed"), 40);
+        assert_eq!(display_id("minecraft:zz_playable_wooden_spruce_door"), 49);
 
         for (wood, expected_display_id) in [
-            ("acacia", 44),
-            ("birch", 45),
-            ("cherry", 46),
-            ("dark_oak", 47),
-            ("jungle", 48),
-            ("mangrove", 49),
-            ("oak", 50),
-            ("pale_oak", 51),
-            ("spruce", 52),
+            ("acacia", 50),
+            ("birch", 51),
+            ("cherry", 52),
+            ("dark_oak", 53),
+            ("jungle", 54),
+            ("mangrove", 55),
+            ("oak", 56),
+            ("pale_oak", 57),
+            ("spruce", 58),
         ] {
             let recipe_id = format!("minecraft:zz_playable_wooden_zsign_{wood}");
             let recipe = &recipes[display_id(&recipe_id)];
@@ -1483,14 +1483,14 @@ mod tests {
         };
 
         assert_eq!(display_id("minecraft:chest"), 5);
-        assert_eq!(display_id("minecraft:crafting_table"), 10);
-        assert_eq!(display_id("minecraft:furnace"), 13);
-        assert_eq!(display_id("minecraft:torch"), 27);
-        assert_eq!(display_id("minecraft:wooden_pickaxe"), 31);
-        assert_eq!(display_id("minecraft:zz_playable_wooden_zsign_spruce"), 52);
+        assert_eq!(display_id("minecraft:crafting_table"), 16);
+        assert_eq!(display_id("minecraft:furnace"), 19);
+        assert_eq!(display_id("minecraft:torch"), 33);
+        assert_eq!(display_id("minecraft:wooden_pickaxe"), 37);
+        assert_eq!(display_id("minecraft:zz_playable_wooden_zsign_spruce"), 58);
 
         let campfire = &recipes[display_id("minecraft:zz_playable_zz_campfire")];
-        assert_eq!(display_id("minecraft:zz_playable_zz_campfire"), 53);
+        assert_eq!(display_id("minecraft:zz_playable_zz_campfire"), 59);
         assert_eq!(campfire.result.item.as_str(), "minecraft:campfire");
         assert_eq!(campfire.result.count, 1);
         let RecipeKind::Shaped(shaped) = &campfire.kind else {
@@ -1524,19 +1524,19 @@ mod tests {
                 "minecraft:beef",
                 "minecraft:cooked_beef",
                 "minecraft:zz_playable_zz_campfire_cooked_beef",
-                54,
+                60,
             ),
             (
                 "minecraft:chicken",
                 "minecraft:cooked_chicken",
                 "minecraft:zz_playable_zz_campfire_cooked_chicken",
-                55,
+                61,
             ),
             (
                 "minecraft:porkchop",
                 "minecraft:cooked_porkchop",
                 "minecraft:zz_playable_zz_campfire_cooked_porkchop",
-                56,
+                62,
             ),
         ] {
             let recipe = &recipes[display_id(recipe_id)];
@@ -1567,18 +1567,18 @@ mod tests {
         };
 
         assert_eq!(display_id("minecraft:chest"), 5);
-        assert_eq!(display_id("minecraft:crafting_table"), 10);
-        assert_eq!(display_id("minecraft:furnace"), 13);
-        assert_eq!(display_id("minecraft:torch"), 27);
-        assert_eq!(display_id("minecraft:wooden_pickaxe"), 31);
+        assert_eq!(display_id("minecraft:crafting_table"), 16);
+        assert_eq!(display_id("minecraft:furnace"), 19);
+        assert_eq!(display_id("minecraft:torch"), 33);
+        assert_eq!(display_id("minecraft:wooden_pickaxe"), 37);
         assert_eq!(
             display_id("minecraft:zz_playable_zz_campfire_cooked_porkchop"),
-            56
+            62
         );
 
         let recipe_id = "minecraft:zz_playable_zz_iron_sword";
         let recipe = &recipes[display_id(recipe_id)];
-        assert_eq!(display_id(recipe_id), 57);
+        assert_eq!(display_id(recipe_id), 63);
         assert_eq!(recipe.result.item.as_str(), "minecraft:iron_sword");
         assert_eq!(recipe.result.count, 1);
         let RecipeKind::Shaped(shaped) = &recipe.kind else {
@@ -1602,7 +1602,7 @@ mod tests {
 
         let shield_recipe_id = "minecraft:zz_playable_zz_shield";
         let shield = &recipes[display_id(shield_recipe_id)];
-        assert_eq!(display_id(shield_recipe_id), 58);
+        assert_eq!(display_id(shield_recipe_id), 64);
         assert_eq!(shield.result.item.as_str(), "minecraft:shield");
         assert_eq!(shield.result.count, 1);
         let RecipeKind::Shaped(shaped) = &shield.kind else {
@@ -1626,7 +1626,7 @@ mod tests {
 
         let chestplate_recipe_id = "minecraft:zz_playable_zzz_iron_chestplate";
         let chestplate = &recipes[display_id(chestplate_recipe_id)];
-        assert_eq!(display_id(chestplate_recipe_id), 59);
+        assert_eq!(display_id(chestplate_recipe_id), 65);
         assert_eq!(chestplate.result.item.as_str(), "minecraft:iron_chestplate");
         assert_eq!(chestplate.result.count, 1);
         let RecipeKind::Shaped(shaped) = &chestplate.kind else {
@@ -1655,11 +1655,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing fallback recipe {id}"))
         };
 
-        assert_eq!(display_id("minecraft:zz_playable_zzz_iron_chestplate"), 59);
+        assert_eq!(display_id("minecraft:zz_playable_zzz_iron_chestplate"), 65);
 
         let recipe_id = "minecraft:zz_playable_zzzz_bread";
         let recipe = &recipes[display_id(recipe_id)];
-        assert_eq!(display_id(recipe_id), 60);
+        assert_eq!(display_id(recipe_id), 66);
         assert_eq!(recipe.result.item.as_str(), "minecraft:bread");
         assert_eq!(recipe.result.count, 1);
         let RecipeKind::Shaped(shaped) = &recipe.kind else {
@@ -1685,11 +1685,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing fallback recipe {id}"))
         };
 
-        assert_eq!(display_id("minecraft:zz_playable_zzzz_bread"), 60);
+        assert_eq!(display_id("minecraft:zz_playable_zzzz_bread"), 66);
 
         let recipe_id = "minecraft:zz_playable_zzzzz_iron_pickaxe";
         let recipe = &recipes[display_id(recipe_id)];
-        assert_eq!(display_id(recipe_id), 61);
+        assert_eq!(display_id(recipe_id), 67);
         assert_eq!(recipe.result.item.as_str(), "minecraft:iron_pickaxe");
         assert_eq!(recipe.result.count, 1);
         let RecipeKind::Shaped(shaped) = &recipe.kind else {
@@ -1744,13 +1744,13 @@ mod tests {
 
         recipe(
             "minecraft:zz_playable_zzzzzz_diamond_pickaxe",
-            62,
+            68,
             "minecraft:diamond_pickaxe",
             &["###", " X ", " X "],
         );
         recipe(
             "minecraft:zz_playable_zzzzzzz_diamond_sword",
-            63,
+            69,
             "minecraft:diamond_sword",
             &["#", "#", "X"],
         );
@@ -1765,7 +1765,7 @@ mod tests {
             .position(|recipe| recipe.id.as_str() == recipe_id)
             .unwrap_or_else(|| panic!("missing fallback recipe {recipe_id}"));
 
-        assert_eq!(display_id, 64);
+        assert_eq!(display_id, 70);
         let recipe = &recipes[display_id];
         assert_eq!(recipe.result.item.as_str(), "minecraft:bucket");
         assert_eq!(recipe.result.count, 1);
@@ -1791,48 +1791,48 @@ mod tests {
             recipes.iter().position(|recipe| {
                 recipe.id.as_str() == "minecraft:zz_playable_zzzzzzzz_bucket"
             }),
-            Some(64)
+            Some(70)
         );
 
         for (id, display_id, output, pattern, uses_stick) in [
             (
                 "minecraft:zz_playable_zzzzzzzzz_iron_axe",
-                65,
+                71,
                 "minecraft:iron_axe",
                 &["XX", "X#", " #"][..],
                 true,
             ),
             (
                 "minecraft:zz_playable_zzzzzzzzzz_iron_shovel",
-                66,
+                72,
                 "minecraft:iron_shovel",
                 &["X", "#", "#"][..],
                 true,
             ),
             (
                 "minecraft:zz_playable_zzzzzzzzzzz_iron_hoe",
-                67,
+                73,
                 "minecraft:iron_hoe",
                 &["XX", " #", " #"][..],
                 true,
             ),
             (
                 "minecraft:zz_playable_zzzzzzzzzzzz_iron_helmet",
-                68,
+                74,
                 "minecraft:iron_helmet",
                 &["XXX", "X X"][..],
                 false,
             ),
             (
                 "minecraft:zz_playable_zzzzzzzzzzzzz_iron_leggings",
-                69,
+                75,
                 "minecraft:iron_leggings",
                 &["XXX", "X X", "X X"][..],
                 false,
             ),
             (
                 "minecraft:zz_playable_zzzzzzzzzzzzzz_iron_boots",
-                70,
+                76,
                 "minecraft:iron_boots",
                 &["X X", "X X"][..],
                 false,
@@ -1881,55 +1881,55 @@ mod tests {
             recipes.iter().position(|recipe| {
                 recipe.id.as_str() == "minecraft:zz_playable_zzzzzzzzzzzzzz_iron_boots"
             }),
-            Some(70)
+            Some(76)
         );
 
         for (id, display_id, output, pattern, uses_stick) in [
             (
                 "minecraft:zzz_playable_diamond_axe",
-                71,
+                77,
                 "minecraft:diamond_axe",
                 &["XX", "X#", " #"][..],
                 true,
             ),
             (
                 "minecraft:zzz_playable_diamond_boots",
-                72,
+                78,
                 "minecraft:diamond_boots",
                 &["X X", "X X"][..],
                 false,
             ),
             (
                 "minecraft:zzz_playable_diamond_chestplate",
-                73,
+                79,
                 "minecraft:diamond_chestplate",
                 &["X X", "XXX", "XXX"][..],
                 false,
             ),
             (
                 "minecraft:zzz_playable_diamond_helmet",
-                74,
+                80,
                 "minecraft:diamond_helmet",
                 &["XXX", "X X"][..],
                 false,
             ),
             (
                 "minecraft:zzz_playable_diamond_hoe",
-                75,
+                81,
                 "minecraft:diamond_hoe",
                 &["XX", " #", " #"][..],
                 true,
             ),
             (
                 "minecraft:zzz_playable_diamond_leggings",
-                76,
+                82,
                 "minecraft:diamond_leggings",
                 &["XXX", "X X", "X X"][..],
                 false,
             ),
             (
                 "minecraft:zzz_playable_diamond_shovel",
-                77,
+                83,
                 "minecraft:diamond_shovel",
                 &["X", "#", "#"][..],
                 true,
@@ -1978,7 +1978,7 @@ mod tests {
             .iter()
             .position(|recipe| recipe.id.as_str() == "minecraft:zzzz_playable_bow")
             .expect("playable bow recipe");
-        assert_eq!(display_id, 78);
+        assert_eq!(display_id, 84);
         let recipe = &recipes[display_id];
         assert_eq!(recipe.result.item.as_str(), "minecraft:bow");
         assert_eq!(recipe.result.count, 1);
@@ -2001,7 +2001,7 @@ mod tests {
             .iter()
             .position(|recipe| recipe.id.as_str() == "minecraft:zzzzz_playable_shears")
             .expect("playable shears recipe");
-        assert_eq!(display_id, 79);
+        assert_eq!(display_id, 85);
         let recipe = &recipes[display_id];
         assert_eq!(recipe.result.item.as_str(), "minecraft:shears");
         assert_eq!(recipe.result.count, 1);

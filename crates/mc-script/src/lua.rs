@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 mod gameplay_rules;
+mod operations;
 pub use gameplay_rules::{
     LuaBiomeSpawns, LuaClayRule, LuaGameplayRules, LuaSpawnEntry, LuaSpawnPlacement, LuaTreeRule,
 };
@@ -1462,6 +1463,8 @@ struct DiskManifest {
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default)]
+    required_features: Vec<String>,
+    #[serde(default)]
     dependencies: Vec<DiskDependency>,
     #[serde(default)]
     permissions: Vec<String>,
@@ -1713,13 +1716,16 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
     })?;
     let startup_contract_declared = rules_declared
         || raw_manifest.get("worldgen").is_some()
-        || raw_manifest.get("client").is_some();
+        || raw_manifest.get("client").is_some()
+        || raw_manifest.get("required_features").is_some();
     let disk: DiskManifest = raw_manifest.try_into().map_err(|error| {
         PluginSourceError::new(
             format!("parsing manifest: {error}"),
             startup_contract_declared,
         )
     })?;
+    operations::validate_required_features(&disk)
+        .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     let requested_api_version = parse_api_version(&disk.api)
         .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     let (
@@ -2400,6 +2406,7 @@ fn declare_disk_capability(
 ) -> Result<ScriptPluginManifest, String> {
     match capability {
         "storage" => Ok(manifest.declare_plugin_storage()),
+        "storage_batches" => Ok(manifest.declare_storage_batches()),
         "inventory_menus" => Ok(manifest.declare_inventory_menus()),
         "inventory_storage_transactions" => Ok(manifest.declare_inventory_storage_transactions()),
         "player_inventory" => Ok(manifest.declare_player_inventory()),
@@ -3206,6 +3213,7 @@ fn install_solaris_api(
     config: toml::Table,
 ) -> mlua::Result<()> {
     let api = lua.create_table()?;
+    operations::install(lua, &api, &invocation)?;
     api.set(
         "config",
         lua.create_function(move |lua, ()| config_table_to_lua(lua, &config))?,
@@ -4046,7 +4054,8 @@ fn bounded_lua_string(
 
 fn bounded_script_id(value: LuaString, field: &'static str) -> mlua::Result<String> {
     let value = bounded_lua_string(value, field, crate::MAX_SCRIPT_ID_BYTES, false)?;
-    crate::validate_script_id(&value).map_err(dto_error)
+    crate::validate_script_id_value(&value).map_err(dto_error)?;
+    Ok(value)
 }
 
 fn parse_inventory_menu(
@@ -4603,6 +4612,11 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("request_id", request_id.as_str())?;
             table.set("committed", *committed)?;
         }
+        ScriptEventKind::OperationResult {
+            request_id,
+            operation_id,
+            outcome,
+        } => operations::set_result(lua, &table, request_id, operation_id.as_deref(), outcome)?,
         ScriptEventKind::PlayerInventoryTransactionResult {
             request_id,
             player_id,
@@ -4859,6 +4873,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::InventoryStorageTransactionResult { .. } => {
             "on_inventory_storage_transaction_result"
         }
+        ScriptEventKind::OperationResult { .. } => "on_operation_result",
         ScriptEventKind::PlayerInventoryTransactionResult { .. } => {
             "on_player_inventory_transaction_result"
         }

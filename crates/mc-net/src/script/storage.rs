@@ -17,8 +17,20 @@ use tracing::{debug, warn};
 use super::events::{
     TargetedEventDelivery, deliver_required_targeted_event, deliver_targeted_event,
 };
-use crate::play::{ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare, SessionRegistry};
+use crate::play::ScriptStoragePrepareOutcome;
+use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::server::{ScriptEventSink, ShutdownHandle};
+
+mod operations;
+#[cfg(test)]
+mod operations_tests;
+mod scan;
+pub(crate) mod world_inventory;
+use operations::{
+    DurableOperationReceipt, OP_OPERATION_DELIVERED, OP_SNAPSHOT_OPERATION, OperationDeliveryAck,
+    OperationExecution,
+};
+use world_inventory::InventoryRuntime;
 
 const STORAGE_DIRECTORY: &str = "solaris/plugin-storage-v1";
 const JOURNAL_FILE: &str = "journal-v1.bin";
@@ -132,6 +144,10 @@ pub(crate) struct PreparedStorageBatch {
     transaction_id: u64,
     plugin_id: String,
     mutations: Vec<DurableStorageBatchMutation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inventory: Option<PlayerInventoryRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation: Option<DurableOperationReceipt>,
 }
 
 impl DurableMutationResult {
@@ -177,22 +193,30 @@ enum DurableMutationCommit {
     Replay(DurableMutationResult),
 }
 
+enum PendingStorageResult {
+    Mutation(DurableMutationResult),
+    Operation(DurableOperationReceipt),
+}
+
 pub(crate) struct PluginStorage {
     directory: PathBuf,
     journal_path: PathBuf,
     journal_bytes: u64,
     revision: u64,
     live_bytes: usize,
-    records: BTreeMap<(String, String), StoredRecord>,
+    records: BTreeMap<(String, String), Arc<StoredRecord>>,
     mutation_results: BTreeMap<(String, String), DurableMutationResult>,
     unknown_result: Option<DurableMutationResult>,
+    operation_results: BTreeMap<(String, String), DurableOperationReceipt>,
+    unknown_operation: Option<DurableOperationReceipt>,
+    scans: scan::StorageScans,
     #[cfg(test)]
     fault: Option<StorageFaultPoint>,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StorageFaultPoint {
+pub(crate) enum StorageFaultPoint {
     Write,
     Sync,
     ResultSync,
@@ -221,6 +245,9 @@ impl PluginStorage {
             records: BTreeMap::new(),
             mutation_results: BTreeMap::new(),
             unknown_result: None,
+            operation_results: BTreeMap::new(),
+            unknown_operation: None,
+            scans: scan::StorageScans::default(),
             #[cfg(test)]
             fault: None,
         };
@@ -277,10 +304,10 @@ impl PluginStorage {
         for index in 0..MAX_RECORDS_PER_PLUGIN {
             self.records.insert(
                 (plugin_id.to_owned(), format!("existing-{index}")),
-                StoredRecord {
+                Arc::new(StoredRecord {
                     value: "x".to_owned(),
                     version: 1,
-                },
+                }),
             );
         }
     }
@@ -322,7 +349,7 @@ impl PluginStorage {
         plugin_id: &str,
         mutations: &[ScriptStorageMutation],
     ) -> Result<bool, PluginStorageMutationError> {
-        match self.prepare_batch(plugin_id, mutations)? {
+        match self.prepare_batch(plugin_id, mutations, None)? {
             ScriptStoragePrepareOutcome::Prepared(batch) => {
                 self.commit_batch(batch)?;
                 Ok(true)
@@ -332,7 +359,7 @@ impl PluginStorage {
     }
 
     #[cfg(test)]
-    pub(super) fn inject_fault_for_test(&mut self, fault: StorageFaultPoint) {
+    pub(crate) fn inject_fault_for_test(&mut self, fault: StorageFaultPoint) {
         self.fault = Some(fault);
     }
 
@@ -437,6 +464,7 @@ impl PluginStorage {
         &mut self,
         plugin_id: &str,
         mutations: &[ScriptStorageMutation],
+        inventory: Option<PlayerInventoryRecovery>,
     ) -> Result<ScriptStoragePrepareOutcome<PreparedStorageBatch>, PluginStorageMutationError> {
         let transaction_id = self
             .revision
@@ -468,14 +496,13 @@ impl PluginStorage {
             transaction_id,
             plugin_id: plugin_id.to_owned(),
             mutations,
+            inventory,
+            operation: None,
         };
         if !self.batch_preconditions_match(&batch) {
             return Ok(ScriptStoragePrepareOutcome::Rejected);
         }
         self.ensure_batch_quota(&batch)?;
-        let payload = encode_storage_batch(&batch)?;
-        let frame = frame(&payload);
-        self.compact_before_append_if_needed(frame.len())?;
         Ok(ScriptStoragePrepareOutcome::Prepared(batch))
     }
 
@@ -483,8 +510,16 @@ impl PluginStorage {
         &mut self,
         batch: PreparedStorageBatch,
     ) -> Result<(), PluginStorageMutationError> {
+        if batch.inventory.is_some() {
+            return Err(std::io::Error::other(
+                "player inventory after-images belong to the world journal",
+            )
+            .into());
+        }
         let payload = encode_storage_batch(&batch)?;
-        self.append_frame(&frame(&payload), false)?;
+        let frame = frame(&payload);
+        self.compact_before_append_if_needed(frame.len())?;
+        self.append_frame(&frame, false)?;
         self.install_storage_batch(batch)
             .expect("prepared storage batch must install after durable append");
         Ok(())
@@ -556,6 +591,11 @@ impl PluginStorage {
         batch: PreparedStorageBatch,
     ) -> Result<(), PluginStorageStartError> {
         validate_storage_batch(&batch)?;
+        if batch.inventory.is_some() {
+            return Err(PluginStorageStartError::Malformed(
+                "player inventory in storage projection",
+            ));
+        }
         if batch.transaction_id
             != self
                 .revision
@@ -567,6 +607,13 @@ impl PluginStorage {
         }
         self.ensure_batch_quota(&batch)
             .map_err(|_| PluginStorageStartError::LiveQuotaExceeded)?;
+        if let Some(receipt) = &batch.operation
+            && self
+                .operation_results
+                .contains_key(&(receipt.plugin_id.clone(), receipt.operation_id.clone()))
+        {
+            return Err(PluginStorageStartError::Malformed("duplicate operation"));
+        }
         for mutation in batch.mutations {
             let entry = (batch.plugin_id.clone(), mutation.key().to_owned());
             match mutation {
@@ -578,10 +625,10 @@ impl PluginStorage {
                     self.live_bytes = self.live_bytes - old_value_bytes + value.len();
                     self.records.insert(
                         entry,
-                        StoredRecord {
+                        Arc::new(StoredRecord {
                             value,
                             version: batch.transaction_id,
-                        },
+                        }),
                     );
                 }
                 DurableStorageBatchMutation::Delete { .. } => {
@@ -594,6 +641,12 @@ impl PluginStorage {
             }
         }
         self.revision = batch.transaction_id;
+        if let Some(receipt) = batch.operation {
+            self.operation_results.insert(
+                (receipt.plugin_id.clone(), receipt.operation_id.clone()),
+                receipt,
+            );
+        }
         Ok(())
     }
 
@@ -660,14 +713,25 @@ impl PluginStorage {
         Ok(())
     }
 
-    fn pending_results(&self) -> Vec<DurableMutationResult> {
+    fn pending_results(&self) -> Vec<PendingStorageResult> {
         let mut pending = self
             .mutation_results
             .values()
             .filter(|result| !result.delivered)
             .cloned()
+            .map(PendingStorageResult::Mutation)
+            .chain(
+                self.operation_results
+                    .values()
+                    .filter(|result| !result.delivered)
+                    .cloned()
+                    .map(PendingStorageResult::Operation),
+            )
             .collect::<Vec<_>>();
-        pending.sort_by_key(|result| result.transaction_id);
+        pending.sort_by_key(|result| match result {
+            PendingStorageResult::Mutation(result) => result.transaction_id,
+            PendingStorageResult::Operation(result) => result.revision,
+        });
         pending
     }
 
@@ -722,7 +786,10 @@ impl PluginStorage {
             if length == 0
                 || length > MAX_TRANSACTION_FRAME_BYTES
                 || (length > MAX_FRAME_BYTES
-                    && bytes.get(offset + 4).copied() != Some(OP_STORAGE_BATCH))
+                    && !matches!(
+                        bytes.get(offset + 4).copied(),
+                        Some(OP_STORAGE_BATCH | OP_SNAPSHOT_OPERATION)
+                    ))
             {
                 return Err(PluginStorageStartError::Malformed("frame length"));
             }
@@ -841,6 +908,29 @@ impl PluginStorage {
                 }
                 Ok(true)
             }
+            OP_SNAPSHOT_OPERATION => {
+                let receipt: DurableOperationReceipt = serde_json::from_slice(rest)
+                    .map_err(|_| PluginStorageStartError::Malformed("operation snapshot"))?;
+                receipt.validate()?;
+                if !snapshot_mode || receipt.revision > self.revision {
+                    return Err(PluginStorageStartError::Malformed(
+                        "operation snapshot revision",
+                    ));
+                }
+                let identity = (receipt.plugin_id.clone(), receipt.operation_id.clone());
+                if self.operation_results.insert(identity, receipt).is_some() {
+                    return Err(PluginStorageStartError::Malformed(
+                        "duplicate operation snapshot",
+                    ));
+                }
+                Ok(true)
+            }
+            OP_OPERATION_DELIVERED => {
+                let ack: OperationDeliveryAck = serde_json::from_slice(rest)
+                    .map_err(|_| PluginStorageStartError::Malformed("operation acknowledgement"))?;
+                self.install_operation_ack(ack)?;
+                Ok(false)
+            }
             OP_STORAGE_BATCH => {
                 let batch = decode_storage_batch(rest)?;
                 self.install_storage_batch(batch)?;
@@ -928,10 +1018,10 @@ impl PluginStorage {
         }
         self.records.insert(
             entry,
-            StoredRecord {
+            Arc::new(StoredRecord {
                 value: value.to_owned(),
                 version,
-            },
+            }),
         );
         Ok(())
     }
@@ -988,6 +1078,18 @@ impl PluginStorage {
                 })?,
             );
             if payload.len() > MAX_FRAME_BYTES {
+                return Err(PluginStorageMutationError::QuotaExceeded);
+            }
+            temporary.write_all(&frame(&payload))?;
+        }
+        for receipt in self.operation_results.values() {
+            let mut payload = vec![OP_SNAPSHOT_OPERATION];
+            payload.extend_from_slice(
+                &serde_json::to_vec(receipt).map_err(|error| {
+                    PluginStorageMutationError::Io(std::io::Error::other(error))
+                })?,
+            );
+            if payload.len() > MAX_TRANSACTION_FRAME_BYTES {
                 return Err(PluginStorageMutationError::QuotaExceeded);
             }
             temporary.write_all(&frame(&payload))?;
@@ -1058,32 +1160,13 @@ impl PluginStorage {
     }
 }
 
-impl ScriptStorageTransactionPrepare for PluginStorage {
-    type Prepared = PreparedStorageBatch;
-    type Error = PluginStorageMutationError;
-
-    fn prepare(
-        &mut self,
-        plugin_id: &str,
-        mutations: &[ScriptStorageMutation],
-    ) -> Result<ScriptStoragePrepareOutcome<Self::Prepared>, Self::Error> {
-        self.prepare_batch(plugin_id, mutations)
-    }
-
-    fn commit(&mut self, prepared: Self::Prepared) -> Result<(), Self::Error> {
-        self.commit_batch(prepared)
-    }
-}
-
 fn encode_storage_batch(
     batch: &PreparedStorageBatch,
 ) -> Result<Vec<u8>, PluginStorageMutationError> {
     validate_storage_batch(batch).map_err(|_| PluginStorageMutationError::QuotaExceeded)?;
     let mut payload = vec![OP_STORAGE_BATCH];
-    payload.extend_from_slice(
-        &serde_json::to_vec(batch)
-            .map_err(|error| PluginStorageMutationError::Io(std::io::Error::other(error)))?,
-    );
+    serde_json::to_writer(&mut payload, batch)
+        .map_err(|error| PluginStorageMutationError::Io(std::io::Error::other(error)))?;
     if payload.len() > MAX_TRANSACTION_FRAME_BYTES {
         return Err(PluginStorageMutationError::QuotaExceeded);
     }
@@ -1116,6 +1199,42 @@ fn validate_storage_batch(batch: &PreparedStorageBatch) -> Result<(), PluginStor
             DurableStorageBatchMutation::Delete { key, .. } => {
                 validate_delete_fields(&batch.plugin_id, key)?;
             }
+        }
+    }
+    if let Some(recovery) = &batch.inventory {
+        recovery
+            .validate()
+            .map_err(|_| PluginStorageStartError::Malformed("player inventory recovery"))?;
+    }
+    if let Some(receipt) = &batch.operation {
+        receipt.validate()?;
+        if receipt.plugin_id != batch.plugin_id
+            || receipt.revision != batch.transaction_id
+            || receipt.delivered
+        {
+            return Err(PluginStorageStartError::Malformed(
+                "storage batch operation identity",
+            ));
+        }
+        let mc_script::ScriptOperationPayload::StorageBatch { changes } = receipt.outcome.payload()
+        else {
+            return Err(PluginStorageStartError::Malformed(
+                "storage batch operation payload",
+            ));
+        };
+        if changes.len() != batch.mutations.len()
+            || changes
+                .iter()
+                .zip(&batch.mutations)
+                .any(|(change, mutation)| {
+                    change.key != mutation.key()
+                        || change.deleted
+                            != matches!(mutation, DurableStorageBatchMutation::Delete { .. })
+                })
+        {
+            return Err(PluginStorageStartError::Malformed(
+                "storage batch operation changes",
+            ));
         }
     }
     Ok(())
@@ -1281,22 +1400,17 @@ impl Drop for StorageActorStopGuard {
 struct StorageActorContext {
     events: ScriptEventSink,
     shutdown: ShutdownHandle,
-    sessions: Arc<SessionRegistry>,
-    items: Arc<mc_data::items::ItemRegistry>,
-    item_facts: Arc<mc_data::item_components::ItemFactsTable>,
+    inventory: InventoryRuntime,
     stopped: Arc<StorageActorStop>,
 }
 
 impl PluginStorageHandle {
     pub(crate) fn start(
-        world_root: &Path,
+        storage: PluginStorage,
+        inventory: InventoryRuntime,
         events: ScriptEventSink,
         shutdown: ShutdownHandle,
-        sessions: Arc<SessionRegistry>,
-        items: Arc<mc_data::items::ItemRegistry>,
-        item_facts: Arc<mc_data::item_components::ItemFactsTable>,
-    ) -> Result<Self, PluginStorageStartError> {
-        let storage = PluginStorage::open(world_root)?;
+    ) -> Self {
         let (commands, receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
         let stopped = Arc::new(StorageActorStop {
             failed: AtomicBool::new(false),
@@ -1309,13 +1423,11 @@ impl PluginStorageHandle {
             StorageActorContext {
                 events,
                 shutdown,
-                sessions,
-                items,
-                item_facts,
+                inventory,
                 stopped: Arc::clone(&stopped),
             },
         ));
-        Ok(Self { commands, stopped })
+        Self { commands, stopped }
     }
 
     pub(crate) async fn enqueue(
@@ -1364,9 +1476,7 @@ async fn run_storage_actor(
     let StorageActorContext {
         events,
         shutdown,
-        sessions,
-        items,
-        item_facts,
+        inventory,
         stopped,
     } = context;
     let _stopped = StorageActorStopGuard(Arc::clone(&stopped));
@@ -1539,14 +1649,74 @@ async fn run_storage_actor(
                 }
                 TargetedEventDelivery::Delivered
             }
+            ScriptCommand::Operation { request } => {
+                let execution = storage.execute_operation(command.plugin_id(), request);
+                let (outcome, receipt) = match execution {
+                    Ok(OperationExecution::Reply(outcome)) => (outcome, None),
+                    Ok(OperationExecution::Durable(receipt)) => {
+                        (receipt.outcome.clone(), Some(receipt))
+                    }
+                    Err(
+                        PluginStorageMutationError::QuotaExceeded
+                        | PluginStorageMutationError::RevisionOverflow,
+                    ) => (
+                        mc_script::ScriptOperationOutcome::rejected(
+                            mc_script::ScriptOperationFailure::Capacity,
+                        ),
+                        None,
+                    ),
+                    Err(PluginStorageMutationError::RequestIdentityConflict) => (
+                        mc_script::ScriptOperationOutcome::rejected(
+                            mc_script::ScriptOperationFailure::OperationConflict,
+                        ),
+                        None,
+                    ),
+                    Err(error @ PluginStorageMutationError::DurabilityUnknown(_)) => {
+                        warn!(
+                            ?error,
+                            "operation durability unknown; leaving receipt for recovery"
+                        );
+                        if let Some(receipt) = storage.unknown_operation.take() {
+                            let _ = command.operation_result(receipt.outcome);
+                        }
+                        stopped.mark_failed();
+                        fail_queued_storage_commands(&mut commands, &events).await;
+                        return;
+                    }
+                    Err(error @ PluginStorageMutationError::Io(_)) => {
+                        warn!(
+                            ?error,
+                            "operation durability failed; stopping storage actor"
+                        );
+                        fail_storage_actor(command, &mut commands, &events, &stopped).await;
+                        return;
+                    }
+                };
+                let event = match command.operation_result(outcome) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        warn!(?error, "operation result construction rejected");
+                        return;
+                    }
+                };
+                let delivery = deliver_targeted_event(&events, event, &shutdown).await;
+                if !matches!(delivery, TargetedEventDelivery::Delivered) {
+                    return;
+                }
+                if let Some(receipt) = receipt
+                    && let Err(error) = storage.acknowledge_operation(&receipt)
+                {
+                    warn!(?error, "operation receipt acknowledgement failed");
+                    stopped.mark_failed();
+                    fail_queued_storage_commands(&mut commands, &events).await;
+                    return;
+                }
+                delivery
+            }
             ScriptCommand::InventoryStorageTransaction { transaction } => {
-                let outcome = sessions.commit_script_inventory_storage_transaction(
-                    command.plugin_id(),
-                    transaction,
-                    &items,
-                    &item_facts,
-                    &mut storage,
-                );
+                let outcome = inventory
+                    .commit_storage(&mut storage, command.plugin_id(), transaction)
+                    .await;
                 let event = match outcome {
                     Ok(committed) => command.inventory_storage_transaction_result(committed),
                     Err(
@@ -1603,7 +1773,10 @@ async fn replay_pending_results(
     shutdown: &ShutdownHandle,
 ) -> bool {
     for result in storage.pending_results() {
-        let event = match result.event() {
+        let event = match match &result {
+            PendingStorageResult::Mutation(result) => result.event(),
+            PendingStorageResult::Operation(result) => result.event(),
+        } {
             Ok(event) => event,
             Err(error) => {
                 warn!(?error, "durable storage result reconstruction rejected");
@@ -1616,7 +1789,13 @@ async fn replay_pending_results(
         ) {
             return false;
         }
-        if let Err(error) = storage.acknowledge_result(result.transaction_id) {
+        let acknowledgement = match &result {
+            PendingStorageResult::Mutation(result) => {
+                storage.acknowledge_result(result.transaction_id)
+            }
+            PendingStorageResult::Operation(result) => storage.acknowledge_operation(result),
+        };
+        if let Err(error) = acknowledgement {
             warn!(
                 ?error,
                 "durable storage result replay acknowledgement failed"
@@ -1711,6 +1890,10 @@ pub(super) fn storage_failure_event(
         ScriptCommand::InventoryStorageTransaction { .. }
     ) {
         command.inventory_storage_transaction_result(false)
+    } else if matches!(command.request(), ScriptCommand::Operation { .. }) {
+        command.operation_result(mc_script::ScriptOperationOutcome::rejected(
+            mc_script::ScriptOperationFailure::RuntimeUnavailable,
+        ))
     } else {
         command.plugin_storage_failure_result(failure)
     }
@@ -1735,15 +1918,20 @@ pub(super) async fn run_storage_actor_for_test(
         stopped: AtomicBool::new(false),
         notify: tokio::sync::Notify::new(),
     });
+    let inventory = InventoryRuntime::new(
+        None,
+        &shutdown,
+        Arc::new(crate::play::SessionRegistry::new()),
+        Arc::new(mc_data::items::ItemRegistry::default()),
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    );
     run_storage_actor(
         storage,
         receiver,
         StorageActorContext {
             events,
             shutdown,
-            sessions: Arc::new(SessionRegistry::new()),
-            items: Arc::new(mc_data::items::ItemRegistry::default()),
-            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            inventory,
             stopped,
         },
     )

@@ -193,7 +193,8 @@ impl SessionRegistry {
                 .chest_viewers
                 .get(&position)
                 .is_some_and(|viewers| viewers.contains_key(&actor_session));
-            if !actor_has_open_view
+            if player_state.inventory_recovery_required
+                || !actor_has_open_view
                 || current_state_id != expected_state_id
                 || player_state.inventory.slots != player.expected_inventory.slots
                 || player_state.carried_item != player.expected_carried_item
@@ -357,7 +358,8 @@ impl SessionRegistry {
                 .furnace_viewers
                 .get(&position)
                 .is_some_and(|viewers| viewers.contains_key(&actor_session));
-            if !actor_has_open_view
+            if player_state.inventory_recovery_required
+                || !actor_has_open_view
                 || current_state_id != expected_state_id
                 || player_state.inventory.slots != player.expected_inventory.slots
                 || player_state.carried_item != player.expected_carried_item

@@ -222,7 +222,7 @@ use outbound::{
 pub(super) use outbound::{
     OutboundCommand, OutboundLightUpdate, PlayerDamagePublication, PlayerEntitySnapshot,
     ServerEntityMove, ServerEntitySnapshot, ShieldCooldownPublication, VisibilityDispatch,
-    dispatch_visibility_commands,
+    dispatch_visibility_commands, is_bow_skeleton_type_26_1_2,
 };
 #[cfg(test)]
 pub(super) use outbound::{PlayerInventorySlotDelta, SessionRecipient};

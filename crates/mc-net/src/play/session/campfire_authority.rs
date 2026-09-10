@@ -94,7 +94,9 @@ impl SessionRegistry {
             wait_started,
             guard,
         );
-        if player_state.inventory.slots[plan.held_slot] != plan.expected_held {
+        if player_state.inventory_recovery_required
+            || player_state.inventory.slots[plan.held_slot] != plan.expected_held
+        {
             return Ok(None);
         }
 

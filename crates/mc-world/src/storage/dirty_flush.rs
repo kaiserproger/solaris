@@ -8,8 +8,8 @@ use std::time::SystemTime;
 use mc_data::items::ItemRegistry;
 
 use crate::anvil::{
-    ChunkPayload, RegionError, chunk_to_payload_with_items_at_tick_for_position, read_region,
-    write_region_create_new,
+    ChunkPayload, RegionChunkOutput, RegionError, chunk_to_payload_with_items_at_tick_for_position,
+    read_region_raw, write_region_create_new_mixed,
 };
 use crate::atomic_file;
 use crate::block::BlockRegistry;
@@ -206,15 +206,23 @@ impl DirtyFlushPlan {
             {
                 return Err(WorldError::StaleRegion(region.region_path));
             }
-            let mut by_slot: HashMap<(u8, u8), ChunkPayload> = if region.expected_version.is_some()
-            {
-                read_region(&region.region_path)?
-                    .into_iter()
-                    .map(|p| ((p.local_x, p.local_z), p))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+            // Untouched slots keep their stored bytes verbatim: read raw
+            // records (no decode, no retained uncompressed payloads) and only
+            // encode the dirty chunks below.
+            let mut by_slot: HashMap<(u8, u8), RegionChunkOutput> =
+                if region.expected_version.is_some() {
+                    read_region_raw(&region.region_path)?
+                        .into_iter()
+                        .map(|record| {
+                            (
+                                (record.local_x, record.local_z),
+                                RegionChunkOutput::Preserved(record),
+                            )
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
 
             let mut committed_chunks = Vec::with_capacity(region.dirty_payloads.len());
             for planned in region.dirty_payloads {
@@ -231,8 +239,12 @@ impl DirtyFlushPlan {
                     planned.pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8,
                     planned.pos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8,
                 );
-                debug_assert_eq!(local, (payload.local_x, payload.local_z));
-                by_slot.insert(local, payload);
+                debug_assert_eq!(
+                    local,
+                    (payload.local_x, payload.local_z),
+                    "encoded payload must land in its planned slot"
+                );
+                by_slot.insert(local, RegionChunkOutput::Fresh(payload));
                 committed_chunks.push(CommittedChunkPayload {
                     pos: planned.pos,
                     dirty_generation: planned.dirty_generation,
@@ -240,10 +252,13 @@ impl DirtyFlushPlan {
                 });
             }
 
-            let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
-            payloads.sort_by_key(|p| (p.local_z, p.local_x));
+            let mut records: Vec<RegionChunkOutput> = by_slot.into_values().collect();
+            records.sort_by_key(|record| match record {
+                RegionChunkOutput::Fresh(payload) => (payload.local_z, payload.local_x),
+                RegionChunkOutput::Preserved(record) => (record.local_z, record.local_x),
+            });
 
-            let tmp_path = write_unique_region_tmp(&region.region_path, &payloads)?;
+            let tmp_path = write_unique_region_tmp(&region.region_path, &records)?;
 
             commits.push(DirtyFlushRegionCommit {
                 region: region.region,
@@ -324,11 +339,11 @@ fn region_file_version(path: &Path) -> Result<Option<RegionFileVersion>, WorldEr
 
 fn write_unique_region_tmp(
     region_path: &Path,
-    payloads: &[ChunkPayload],
+    records: &[RegionChunkOutput],
 ) -> Result<PathBuf, WorldError> {
     for _ in 0..16 {
         let tmp_path = unique_region_tmp_path(region_path);
-        match write_region_create_new(&tmp_path, payloads) {
+        match write_region_create_new_mixed(&tmp_path, records) {
             Ok(()) => return Ok(tmp_path),
             Err(RegionError::Io { source, .. }) if source.kind() == ErrorKind::AlreadyExists => {}
             Err(err) => {

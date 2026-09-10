@@ -645,6 +645,8 @@ fn playable_ruin_slot(
         count,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     })
 }
 

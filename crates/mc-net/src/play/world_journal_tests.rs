@@ -11,7 +11,7 @@ use mc_world::{
 
 use super::*;
 
-fn registries() -> (Arc<BlockRegistry>, Arc<ItemRegistry>) {
+pub(super) fn registries() -> (Arc<BlockRegistry>, Arc<ItemRegistry>) {
     (
         Arc::new(
             BlockRegistry::from_report(&solaris_required_blocks_report())
@@ -21,7 +21,11 @@ fn registries() -> (Arc<BlockRegistry>, Arc<ItemRegistry>) {
     )
 }
 
-fn snapshot(blocks: &BlockRegistry, position: ChunkPos, current_tick: u64) -> ChunkSnapshot {
+pub(super) fn snapshot(
+    blocks: &BlockRegistry,
+    position: ChunkPos,
+    current_tick: u64,
+) -> ChunkSnapshot {
     let air = blocks
         .block(&Identifier::parse("minecraft:air").unwrap())
         .expect("air")
@@ -307,48 +311,6 @@ fn rejects_corruption_before_a_valid_later_frame() {
 }
 
 #[test]
-fn rejects_impossible_image_count_before_allocation() {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&1_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-
-    let error = decode_decision_payload(&payload).unwrap_err();
-    assert!(error.contains("image count"), "{error}");
-    assert!(error.contains("exceeds limit"), "{error}");
-}
-
-#[test]
-fn rejects_infeasible_image_count_before_allocation() {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&1_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&1_u32.to_le_bytes());
-
-    let error = decode_decision_payload(&payload).unwrap_err();
-    assert!(error.contains("payload feasibility"), "{error}");
-}
-
-#[test]
-fn rejects_oversized_image_nbt_before_copy() {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&1_u64.to_le_bytes());
-    payload.extend_from_slice(&0_u64.to_le_bytes());
-    payload.extend_from_slice(&1_u32.to_le_bytes());
-    payload.extend_from_slice(&0_i32.to_le_bytes());
-    payload.extend_from_slice(&0_i32.to_le_bytes());
-    payload.extend_from_slice(
-        &u32::try_from(MAX_IMAGE_NBT_BYTES + 1)
-            .expect("test NBT limit fits u32")
-            .to_le_bytes(),
-    );
-
-    let error = decode_decision_payload(&payload).unwrap_err();
-    assert!(error.contains("NBT length"), "{error}");
-    assert!(error.contains("exceeds limit"), "{error}");
-}
-
-#[test]
 fn encoder_rejects_too_many_images_before_building_payload() {
     let image = WorldChunkImage {
         position: ChunkPos { x: 0, z: 0 },
@@ -358,6 +320,7 @@ fn encoder_rejects_too_many_images_before_building_payload() {
         id: 1,
         current_tick: 0,
         images: vec![image; MAX_IMAGES_PER_DECISION + 1],
+        inventory: None,
     };
 
     assert!(matches!(

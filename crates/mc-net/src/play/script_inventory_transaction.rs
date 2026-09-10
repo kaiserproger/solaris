@@ -7,27 +7,35 @@ use mc_script::{
 };
 
 use super::inventory::{PlayerInventory, item_max_stack};
+use super::persistence::inventory_recovery::PlayerInventoryRecovery;
 
-/// Prepared storage side supplied by the storage actor. The adapter owns
-/// inventory planning; storage owns CAS, quotas, revision allocation, and its
-/// durable journal. The future storage implementation must recheck and commit
-/// this value in the same simulation-owner turn as the inventory CAS.
+/// The adapter owns storage CAS and one world-journal decision for all inventory
+/// participants. Commit returns that decision's persisted world watermark.
 pub(crate) trait ScriptStorageTransactionPrepare {
     type Prepared;
-    type Error;
+    type Error: From<std::io::Error>;
 
     fn prepare(
         &mut self,
         plugin_id: &str,
         mutations: &[ScriptStorageMutation],
+        inventory: PlayerInventoryRecovery,
     ) -> Result<ScriptStoragePrepareOutcome<Self::Prepared>, Self::Error>;
 
-    fn commit(&mut self, prepared: Self::Prepared) -> Result<(), Self::Error>;
+    fn commit(
+        &mut self,
+        prepared: Self::Prepared,
+    ) -> Result<u64, ScriptStorageCommitError<Self::Error>>;
 }
 
 pub(crate) enum ScriptStoragePrepareOutcome<T> {
     Prepared(T),
     Rejected,
+}
+
+pub(crate) enum ScriptStorageCommitError<E> {
+    NotCommitted(E),
+    DurabilityUnknown(E),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

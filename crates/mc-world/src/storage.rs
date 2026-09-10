@@ -2323,6 +2323,8 @@ mod tests {
             item_id: 42,
             damage: Some(7),
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         furnace.cook_progress = 11;
 
@@ -2411,7 +2413,7 @@ mod tests {
         assert!(matches!(
             mutation.commit_furnace_conditionally(position, &stale, &updated),
             crate::ResidentFurnaceCommitResult::Rejected(authoritative)
-                if authoritative == initial
+                if *authoritative == initial
         ));
         assert_eq!(
             world.furnace_block_entity(position).unwrap(),
@@ -2713,6 +2715,8 @@ mod tests {
             item_id: 42,
             damage: Some(7),
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
 
         assert!(world.set_hopper_block_entity(pos, hopper.clone()).unwrap());
@@ -2919,12 +2923,16 @@ mod tests {
             item_id: 10,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         furnace.slots[1] = crate::chunk::FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         world
             .set_furnace_block_entity(pos, furnace.clone())
@@ -2978,13 +2986,21 @@ mod tests {
             item_id: 10,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         chest.slots[26] = crate::chunk::FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
+        chest.slots[0].custom_name = Some("Reserved supplies".to_owned());
+        chest.slots[0].item_model = Some(Arc::new(
+            mc_data::Identifier::parse("solaris:stored_supplies").unwrap(),
+        ));
         world.set_chest_block_entity(pos, chest.clone()).unwrap();
         assert_eq!(world.flush_dirty().unwrap(), 1);
 
@@ -3030,12 +3046,16 @@ mod tests {
             item_id: 10,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         hopper.slots[4] = crate::chunk::FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         world.set_hopper_block_entity(pos, hopper.clone()).unwrap();
         assert_eq!(world.flush_dirty().unwrap(), 1);
@@ -3063,6 +3083,8 @@ mod tests {
             item_id: 10,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         world.set_chest_block_entity(pos, chest).unwrap();
 
@@ -3089,6 +3111,8 @@ mod tests {
             item_id: 10,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         world.set_hopper_block_entity(pos, hopper).unwrap();
 

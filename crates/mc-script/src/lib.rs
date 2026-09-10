@@ -35,6 +35,23 @@ pub use commit_events::{
     ScriptCommitEventOutboxSnapshot, ScriptCommitEventReceiver,
 };
 
+mod inventory_operations;
+pub use inventory_operations::{
+    MAX_INVENTORY_RESOURCE_TYPES, MAX_INVENTORY_WORK_PORTIONS, MAX_OWNED_INVENTORY_SLOTS,
+    MAX_OWNED_INVENTORY_TRANSFERS, ScriptInventoryEnchantment, ScriptInventoryEndpoint,
+    ScriptInventoryExpectedRevision, ScriptInventoryFence, ScriptInventoryItem,
+    ScriptInventoryMaterial, ScriptInventoryReservationQuantity,
+    ScriptInventoryReservationSnapshot, ScriptInventoryResourcePlan, ScriptInventorySlot,
+    ScriptInventoryWorkPortion, ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult,
+    ScriptOwnedInventorySnapshot, ScriptOwnedItemTransfer,
+};
+
+mod operations;
+pub use operations::{
+    MAX_STORAGE_SCAN_PAGE, ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome,
+    ScriptOperationPayload, ScriptOperationRequest, ScriptOperationState, ScriptStorageChange,
+    ScriptStorageEntry,
+};
 #[cfg(feature = "lua-runtime")]
 mod lua;
 
@@ -1180,14 +1197,17 @@ impl ScriptInventoryResourceDelta {
 }
 
 /// One plugin-storage mutation in an atomic inventory and storage transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ScriptStorageMutation {
+    #[serde(rename = "cas")]
     CompareAndSwap {
         key: String,
         expected_version: Option<u64>,
         value: String,
     },
+    #[serde(rename = "delete")]
     Delete {
         key: String,
         expected_version: Option<u64>,
@@ -2286,6 +2306,24 @@ impl ScriptEvent {
         })
     }
 
+    pub fn operation_result(
+        target_plugin_id: impl AsRef<str>,
+        request_id: &str,
+        operation_id: Option<&str>,
+        outcome: ScriptOperationOutcome,
+    ) -> Result<Self, ScriptDtoError> {
+        let event = Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::OperationResult {
+                request_id: validate_script_id(request_id)?,
+                operation_id: operation_id.map(validate_script_id).transpose()?,
+                outcome,
+            },
+        };
+        event.validate()?;
+        Ok(event)
+    }
+
     /// Build the targeted result of one admitted player inventory transaction.
     pub(crate) fn player_inventory_transaction_result(
         target_plugin_id: impl AsRef<str>,
@@ -2690,6 +2728,7 @@ impl ScriptEvent {
             ScriptEventKind::InventoryStorageTransactionResult { .. } => {
                 "inventory.storage_transaction.result"
             }
+            ScriptEventKind::OperationResult { .. } => "operation.result",
             ScriptEventKind::PlayerInventoryTransactionResult { .. } => {
                 "player.inventory_transaction_result"
             }
@@ -2906,6 +2945,17 @@ impl ScriptEvent {
             }
             ScriptEventKind::InventoryStorageTransactionResult { request_id, .. } => {
                 validate_script_id(request_id).map(drop)
+            }
+            ScriptEventKind::OperationResult {
+                request_id,
+                operation_id,
+                outcome,
+            } => {
+                validate_script_id_value(request_id)?;
+                if let Some(operation_id) = operation_id {
+                    validate_script_id_value(operation_id)?;
+                }
+                outcome.validate()
             }
             ScriptEventKind::PlayerZoneEntered {
                 context, zone_id, ..
@@ -3197,6 +3247,11 @@ pub enum ScriptEventKind {
         request_id: String,
         committed: bool,
     },
+    OperationResult {
+        request_id: String,
+        operation_id: Option<String>,
+        outcome: ScriptOperationOutcome,
+    },
     PlayerInventoryTransactionResult {
         request_id: String,
         player_id: ScriptPlayerId,
@@ -3342,6 +3397,9 @@ pub enum ScriptCommand {
     },
     PluginStorageDelete {
         request: ScriptPluginStorageDeleteRequest,
+    },
+    Operation {
+        request: ScriptOperationRequest,
     },
     OpenInventoryMenu {
         player_id: ScriptPlayerId,
@@ -3797,6 +3855,23 @@ impl AdmittedScriptCommand {
         ScriptEvent::inventory_storage_transaction_result(&self.plugin_id, transaction, committed)
     }
 
+    pub fn operation_result(
+        self,
+        outcome: ScriptOperationOutcome,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::Operation { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "operation admission",
+            });
+        };
+        ScriptEvent::operation_result(
+            &self.plugin_id,
+            request.request_id(),
+            request.operation_id(),
+            outcome,
+        )
+    }
+
     pub fn player_inventory_transaction_result(
         self,
         failure: Option<ScriptPlayerInventoryFailure>,
@@ -4074,6 +4149,7 @@ impl ScriptCommand {
             Self::PluginStorageGet { .. }
             | Self::PluginStorageCompareAndSwap { .. }
             | Self::PluginStorageDelete { .. } => Some(RequiredCommandCapability::PluginStorage),
+            Self::Operation { .. } => Some(RequiredCommandCapability::StorageBatches),
             Self::OpenInventoryMenu { .. } | Self::CloseInventoryMenu { .. } => {
                 Some(RequiredCommandCapability::InventoryMenus)
             }
@@ -4178,6 +4254,7 @@ impl ScriptCommand {
                 request.expected_version(),
             )
             .map(drop),
+            Self::Operation { request } => request.validate(),
             Self::CloseInventoryMenu { menu_id, .. } => validate_script_id(menu_id).map(drop),
             Self::InventoryStorageTransaction { transaction } => {
                 ScriptInventoryStorageTransaction::try_new(
@@ -5260,6 +5337,7 @@ pub enum ScriptCommandCapability {
     SpawnEntityType { entity_type: String },
     EntityDamage,
     PluginStorage,
+    StorageBatches,
     InventoryMenus,
     InventoryStorageTransactions,
     PlayerInventory,
@@ -5279,6 +5357,7 @@ pub enum ScriptCommandCapabilityKind {
     SpawnEntity,
     EntityDamage,
     PluginStorage,
+    StorageBatches,
     InventoryMenus,
     InventoryStorageTransactions,
     PlayerInventory,
@@ -5297,6 +5376,7 @@ impl ScriptCommandCapabilityKind {
             Self::SpawnEntity => "spawn_entity",
             Self::EntityDamage => "entity_damage",
             Self::PluginStorage => "plugin_storage",
+            Self::StorageBatches => "storage_batches",
             Self::InventoryMenus => "inventory_menus",
             Self::InventoryStorageTransactions => "inventory_storage_transactions",
             Self::PlayerInventory => "player_inventory",
@@ -5315,6 +5395,7 @@ impl ScriptCommandCapabilityKind {
             Self::SpawnEntity => "spawn entity type",
             Self::EntityDamage => "entity damage",
             Self::PluginStorage => "plugin storage",
+            Self::StorageBatches => "storage batches",
             Self::InventoryMenus => "inventory menu",
             Self::InventoryStorageTransactions => "inventory storage transaction",
             Self::PlayerInventory => "player inventory transaction",
@@ -5334,6 +5415,7 @@ enum RequiredCommandCapability<'a> {
     SpawnEntityType { entity_type: &'a str },
     EntityDamage,
     PluginStorage,
+    StorageBatches,
     InventoryMenus,
     InventoryStorageTransactions,
     PlayerInventory,
@@ -5352,6 +5434,7 @@ impl RequiredCommandCapability<'_> {
             Self::SpawnEntityType { .. } => ScriptCommandCapabilityKind::SpawnEntity,
             Self::EntityDamage => ScriptCommandCapabilityKind::EntityDamage,
             Self::PluginStorage => ScriptCommandCapabilityKind::PluginStorage,
+            Self::StorageBatches => ScriptCommandCapabilityKind::StorageBatches,
             Self::InventoryMenus => ScriptCommandCapabilityKind::InventoryMenus,
             Self::InventoryStorageTransactions => {
                 ScriptCommandCapabilityKind::InventoryStorageTransactions
@@ -5566,6 +5649,12 @@ impl ScriptPluginManifest {
     /// Declare access to the plugin-owned key/value store.
     pub fn declare_plugin_storage(mut self) -> Self {
         self.push_capability(ScriptCommandCapability::PluginStorage);
+        self
+    }
+
+    /// Declare bounded durable operation receipts, storage batches and snapshot scans.
+    pub fn declare_storage_batches(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::StorageBatches);
         self
     }
 
@@ -5963,6 +6052,7 @@ impl ScriptPluginManifest {
                 }
                 ScriptCommandCapability::EntityDamage
                 | ScriptCommandCapability::PluginStorage
+                | ScriptCommandCapability::StorageBatches
                 | ScriptCommandCapability::InventoryMenus
                 | ScriptCommandCapability::InventoryStorageTransactions
                 | ScriptCommandCapability::PlayerInventory
@@ -6112,6 +6202,9 @@ impl ValidatedScriptPluginManifest {
                 }
                 ScriptCommandCapability::PluginStorage => {
                     capabilities = capabilities.allow_plugin_storage();
+                }
+                ScriptCommandCapability::StorageBatches => {
+                    capabilities = capabilities.allow_storage_batches();
                 }
                 ScriptCommandCapability::InventoryMenus => {
                     capabilities = capabilities.allow_inventory_menus();
@@ -6281,6 +6374,7 @@ pub struct CommandCapabilities {
     spawn_entity_types: Vec<String>,
     entity_damage: bool,
     plugin_storage: bool,
+    storage_batches: bool,
     inventory_menus: bool,
     inventory_storage_transactions: bool,
     player_inventory: bool,
@@ -6321,6 +6415,12 @@ impl CommandCapabilities {
     #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_plugin_storage(mut self) -> Self {
         self.plugin_storage = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_storage_batches(mut self) -> Self {
+        self.storage_batches = true;
         self
     }
 
@@ -6405,6 +6505,7 @@ impl CommandCapabilities {
                 .any(|allowed| allowed == entity_type),
             RequiredCommandCapability::EntityDamage => self.entity_damage,
             RequiredCommandCapability::PluginStorage => self.plugin_storage,
+            RequiredCommandCapability::StorageBatches => self.storage_batches,
             RequiredCommandCapability::InventoryMenus => self.inventory_menus,
             RequiredCommandCapability::InventoryStorageTransactions => {
                 self.inventory_storage_transactions
@@ -6543,6 +6644,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "plugin.storage.delete_result"
             | "inventory.menu.clicked"
             | "inventory.storage_transaction.result"
+            | "operation.result"
             | "player.inventory_transaction_result"
             | "player.zone_entered"
             | "player.zone_exited"
@@ -6633,6 +6735,11 @@ fn validate_custom_payload_channel(channel: &str) -> Result<&str, ScriptPluginMa
 }
 
 fn validate_script_id(value: &str) -> Result<String, ScriptDtoError> {
+    validate_script_id_value(value)?;
+    Ok(value.to_owned())
+}
+
+fn validate_script_id_value(value: &str) -> Result<(), ScriptDtoError> {
     if value.is_empty() {
         return Err(ScriptDtoError::EmptyValue { field: "script id" });
     }
@@ -6651,7 +6758,7 @@ fn validate_script_id(value: &str) -> Result<String, ScriptDtoError> {
             actual_bytes: value.len(),
         });
     }
-    Ok(value.to_owned())
+    Ok(())
 }
 
 fn validate_bounded_value(
@@ -6719,6 +6826,11 @@ fn normalize_player_uuid(uuid: &str) -> Result<String, ScriptDtoError> {
 }
 
 fn validate_contract_resource_id(value: &str) -> Result<String, ScriptDtoError> {
+    check_contract_resource_id(value)?;
+    Ok(value.to_owned())
+}
+
+fn check_contract_resource_id(value: &str) -> Result<(), ScriptDtoError> {
     if value.len() > MAX_SCRIPT_RESOURCE_ID_BYTES {
         return Err(ScriptDtoError::ValueTooLong {
             field: "resource id",
@@ -6749,7 +6861,7 @@ fn validate_contract_resource_id(value: &str) -> Result<String, ScriptDtoError> 
             actual_bytes: value.len(),
         });
     }
-    Ok(value.to_owned())
+    Ok(())
 }
 
 fn validate_plugin_storage_key(value: &str) -> Result<String, ScriptDtoError> {

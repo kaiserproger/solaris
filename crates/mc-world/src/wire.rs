@@ -886,6 +886,8 @@ mod tests {
             item_id: 9,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         chunk.chests.insert(pos, chest);
 

@@ -1,5 +1,6 @@
 use super::super::test_support::{air_stone_registry, single_air_registry};
 use super::*;
+use crate::anvil::read_region;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos};
 use mc_data::Identifier;
@@ -40,6 +41,52 @@ fn dirty_flush_reopens_cached_region_after_replace_and_preserves_unrequested_chu
     // keeping this region cached. Its next read must use the replaced file.
     assert_eq!(world.get_block(neighbor).unwrap(), Some(BlockStateId(1)));
     assert_eq!(world.get_block(edited).unwrap(), Some(BlockStateId(1)));
+}
+
+#[test]
+fn dirty_flush_copies_untouched_slot_bytes_verbatim() {
+    let registry = air_stone_registry();
+    let temp = tempfile::tempdir().unwrap();
+    let region_dir = temp.path().join("region");
+    std::fs::create_dir_all(&region_dir).unwrap();
+    let path = region_dir.join("r.0.0.mca");
+    let mut payloads = Vec::new();
+    for x in [0, 1] {
+        let chunk = Chunk::empty(
+            ChunkPos { x, z: 0 },
+            BlockStateId(0),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        payloads.push(crate::anvil::chunk_to_payload(&chunk, &registry, 0).unwrap());
+    }
+    crate::anvil::write_region(&path, &payloads).unwrap();
+    let kept_before = crate::anvil::read_region_raw(&path)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.local_x == 1)
+        .expect("untouched slot stored");
+
+    let mut world = WorldStorage::open_with_capacities(temp.path(), registry, 1, 1).unwrap();
+    world
+        .set_block_at(BlockPos { x: 0, y: 64, z: 0 }, BlockStateId(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(world.flush_dirty().unwrap(), 1);
+
+    let raw_after = crate::anvil::read_region_raw(&path).unwrap();
+    assert_eq!(raw_after.len(), 2);
+    let kept_after = raw_after
+        .iter()
+        .find(|record| record.local_x == 1)
+        .expect("untouched slot rewritten");
+    assert_eq!(kept_after.timestamp, kept_before.timestamp);
+    assert_eq!(kept_after.compression, kept_before.compression);
+    assert_eq!(kept_after.compressed, kept_before.compressed);
+    assert_eq!(
+        world.get_block(BlockPos { x: 0, y: 64, z: 0 }).unwrap(),
+        Some(BlockStateId(1)),
+        "dirty slot must carry the edit after a preserving rewrite"
+    );
 }
 
 #[test]
@@ -186,7 +233,11 @@ fn region_replace_rejects_stale_expected_version() {
     use std::io::Write as _;
     file.write_all(&[0]).unwrap();
 
-    let tmp_path = write_unique_region_tmp(&region_path, &payloads).unwrap();
+    let records: Vec<crate::anvil::RegionChunkOutput> = payloads
+        .into_iter()
+        .map(crate::anvil::RegionChunkOutput::Fresh)
+        .collect();
+    let tmp_path = write_unique_region_tmp(&region_path, &records).unwrap();
     let Err(WorldError::StaleRegion(path)) =
         install_region_file(&region_path, &tmp_path, expected.as_ref())
     else {

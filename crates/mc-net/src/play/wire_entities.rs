@@ -1,4 +1,5 @@
 use super::*;
+use crate::play::session::is_bow_skeleton_type_26_1_2;
 use bytes::{Buf, BufMut};
 use mc_protocol::CodecError;
 use mc_protocol::codec::{ReadMc, WriteMc};
@@ -14,6 +15,10 @@ const BLAZE_ENTITY_DATA_FLAGS_INDEX_26_1_2: u8 = 16;
 const PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2: u8 = 17;
 // Entity 0..7, LivingEntity 8..14, Mob 15, Guardian moving flag 16, target id 17.
 const GUARDIAN_ENTITY_DATA_ATTACK_TARGET_INDEX_26_1_2: u8 = 17;
+// Entity 0..7, LivingEntity 8..14, Mob flags byte 15 (bit 2 = aggressive,
+// read by `Mob.isAggressive`; the skeleton draw-pose driver).
+const MOB_ENTITY_DATA_FLAGS_INDEX_26_1_2: u8 = 15;
+const MOB_ENTITY_FLAG_AGGRESSIVE_26_1_2: i8 = 0x04;
 
 fn is_guardian_type(entity_type: &str) -> bool {
     matches!(
@@ -400,6 +405,12 @@ where
             value: true,
         });
     }
+    if entity.aggressive && is_bow_skeleton_type_26_1_2(&entity.type_name) {
+        values.push(EntityDataValue::Byte {
+            index: MOB_ENTITY_DATA_FLAGS_INDEX_26_1_2,
+            value: MOB_ENTITY_FLAG_AGGRESSIVE_26_1_2,
+        });
+    }
     if is_guardian_type(&entity.type_name) && entity.guardian_attack_target_entity_id != 0 {
         values.push(EntityDataValue::Int {
             index: GUARDIAN_ENTITY_DATA_ATTACK_TARGET_INDEX_26_1_2,
@@ -471,6 +482,16 @@ where
         values.push(EntityDataValue::Boolean {
             index: PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2,
             value: entity.crossbow_charging,
+        });
+    }
+    if is_bow_skeleton_type_26_1_2(&entity.type_name) {
+        values.push(EntityDataValue::Byte {
+            index: MOB_ENTITY_DATA_FLAGS_INDEX_26_1_2,
+            value: if entity.aggressive {
+                MOB_ENTITY_FLAG_AGGRESSIVE_26_1_2
+            } else {
+                0
+            },
         });
     }
     if is_guardian_type(&entity.type_name) {
@@ -756,6 +777,7 @@ mod tests {
             crossbow_charging: charging,
             blaze_charged: false,
             guardian_attack_target_entity_id: 0,
+            aggressive: false,
         }
     }
 
@@ -810,6 +832,103 @@ mod tests {
             assert!(bytes.is_empty());
         }
     }
+    fn skeleton_snapshot(aggressive: bool) -> ServerEntitySnapshot {
+        ServerEntitySnapshot {
+            id: EntityId(44),
+            uuid: uuid::Uuid::from_u128(44),
+            type_id: 24,
+            type_name: "minecraft:skeleton".to_owned(),
+            position: Vec3::new(1.5, 64.0, 1.5),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            health: Some(1.0),
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            animal: None,
+            villager: None,
+            villager_baby: false,
+            main_hand_item: None,
+            crossbow_charging: false,
+            blaze_charged: false,
+            guardian_attack_target_entity_id: 0,
+            aggressive,
+        }
+    }
+
+    #[tokio::test]
+    async fn skeleton_metadata_encodes_aggressive_flag_transitions() {
+        for aggressive in [true, false] {
+            let entity = skeleton_snapshot(aggressive);
+            let mut writer = Vec::new();
+
+            send_entity_data(&mut writer, Compression::Disabled, &entity)
+                .await
+                .unwrap();
+
+            let mut bytes = BytesMut::from(writer.as_slice());
+            let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+                .unwrap()
+                .expect("set entity data frame");
+            assert_eq!(frame.id, ClientboundSetEntityData::ID);
+            let packet = ClientboundSetEntityData::decode(&mut frame.body).unwrap();
+            assert_eq!(packet.entity_id, entity.id.0);
+            let expected = if aggressive {
+                MOB_ENTITY_FLAG_AGGRESSIVE_26_1_2
+            } else {
+                0
+            };
+            assert!(packet.values.iter().any(|value| {
+                matches!(
+                    value,
+                    EntityDataValue::Byte { index, value }
+                        if *index == MOB_ENTITY_DATA_FLAGS_INDEX_26_1_2 && *value == expected
+                )
+            }));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn skeleton_pairing_metadata_includes_aggressive_only_when_aiming() {
+        for aggressive in [true, false] {
+            let entity = skeleton_snapshot(aggressive);
+            let mut writer = Vec::new();
+
+            send_entity_pairing_data(&mut writer, Compression::Disabled, &entity)
+                .await
+                .unwrap();
+
+            let mut bytes = BytesMut::from(writer.as_slice());
+            if !aggressive {
+                assert!(bytes.is_empty());
+                continue;
+            }
+            let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+                .unwrap()
+                .expect("set entity data frame");
+            assert_eq!(frame.id, ClientboundSetEntityData::ID);
+            let packet = ClientboundSetEntityData::decode(&mut frame.body).unwrap();
+            assert!(packet.values.iter().any(|value| {
+                matches!(
+                    value,
+                    EntityDataValue::Byte { index, value }
+                        if *index == MOB_ENTITY_DATA_FLAGS_INDEX_26_1_2
+                            && *value == MOB_ENTITY_FLAG_AGGRESSIVE_26_1_2
+                )
+            }));
+            assert!(bytes.is_empty());
+        }
+        // A stale aggressive bit on a non-bow mob must never leak index 15.
+        let mut non_bow = skeleton_snapshot(true);
+        non_bow.type_name = "minecraft:zombie".to_owned();
+        let mut writer = Vec::new();
+        send_entity_pairing_data(&mut writer, Compression::Disabled, &non_bow)
+            .await
+            .unwrap();
+        assert!(writer.is_empty());
+    }
 
     fn blaze_snapshot(charged: bool) -> ServerEntitySnapshot {
         ServerEntitySnapshot {
@@ -832,6 +951,7 @@ mod tests {
             crossbow_charging: false,
             blaze_charged: charged,
             guardian_attack_target_entity_id: 0,
+            aggressive: false,
         }
     }
 
@@ -885,6 +1005,7 @@ mod tests {
             crossbow_charging: false,
             blaze_charged: false,
             guardian_attack_target_entity_id: target_entity_id,
+            aggressive: false,
         }
     }
 
@@ -972,6 +1093,7 @@ mod tests {
             crossbow_charging: false,
             blaze_charged: false,
             guardian_attack_target_entity_id: 0,
+            aggressive: false,
         };
         let mut writer = Vec::new();
 

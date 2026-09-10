@@ -18,6 +18,10 @@ use thiserror::Error;
 
 use super::*;
 
+pub(crate) mod inventory_recovery;
+
+use inventory_recovery::INVENTORY_OPERATION_REVISION_FIELD;
+
 const PLAYERDATA_DIR: &str = "playerdata";
 const MAX_PERSISTENCE_COMPRESSED_NBT_BYTES: usize = mc_nbt::MAX_NBT_TOTAL_BYTES;
 const MAX_PERSISTENCE_DECOMPRESSED_NBT_BYTES: usize = mc_nbt::MAX_NBT_TOTAL_BYTES;
@@ -1099,6 +1103,10 @@ pub(crate) struct PlayerPersistedState {
     pub(super) game_mode: GameMode,
     pub(super) survival: SurvivalState,
     pub(super) inventory: PlayerInventory,
+    pub(super) inventory_operation_revision: u64,
+    /// A journal append may have committed. Freeze inventory effects until
+    /// restart resolves its after-image; shutdown may save the old watermark.
+    pub(super) inventory_recovery_required: bool,
     pub(super) carried_item: ItemStack,
     pub(super) crafting_table_input: Option<Box<[ItemStack; 9]>>,
     pub(super) enchanting_table_input: Option<Box<[ItemStack; 2]>>,
@@ -1116,6 +1124,8 @@ impl PlayerPersistedState {
             game_mode: GameMode::Survival,
             survival: SurvivalState::FULL,
             inventory: PlayerInventory::empty(),
+            inventory_operation_revision: 0,
+            inventory_recovery_required: false,
             carried_item: ItemStack::EMPTY,
             crafting_table_input: None,
             enchanting_table_input: None,
@@ -1317,6 +1327,7 @@ pub(super) fn load_player_state(
     let _ = root_name;
 
     let mut state = default;
+    state.inventory_operation_revision = inventory_recovery::operation_revision(&fields, &path)?;
     if let Some(pose) = read_pose(&fields) {
         state.pose = pose;
     }
@@ -1465,27 +1476,26 @@ pub(crate) fn save_player_state(
     set_field(&mut fields, "XpP", Tag::Float(state.xp.progress));
     set_field(&mut fields, "XpTotal", Tag::Int(state.xp.total));
     set_field(&mut fields, "XpSeed", Tag::Int(state.xp.seed));
-    set_field(&mut fields, "Inventory", inventory_tag(items, state)?);
-    set_field(
-        &mut fields,
-        CARRIED_ITEM_FIELD,
-        item_stack_tag(items, &state.carried_item)?,
-    );
-    set_field(
-        &mut fields,
-        CRAFTING_TABLE_INPUT_FIELD,
-        item_stack_projection_tag(items, state.crafting_table_input.as_deref())?,
-    );
-    set_field(
-        &mut fields,
-        ENCHANTING_TABLE_INPUT_FIELD,
-        item_stack_projection_tag(items, state.enchanting_table_input.as_deref())?,
-    );
-    set_field(
-        &mut fields,
-        MERCHANT_INPUT_FIELD,
-        item_stack_projection_tag(items, state.merchant_input.as_deref())?,
-    );
+    if inventory_recovery::operation_revision(&fields, &path)? <= state.inventory_operation_revision
+    {
+        for (name, value) in
+            inventory_recovery::snapshot_owned_fields(items, state, &state.inventory)?
+        {
+            set_field(&mut fields, name, value);
+        }
+        set_field(
+            &mut fields,
+            INVENTORY_OPERATION_REVISION_FIELD,
+            Tag::Long(
+                i64::try_from(state.inventory_operation_revision).map_err(|_| {
+                    PlayerPersistenceError::InvalidValue {
+                        path: path.clone(),
+                        field: INVENTORY_OPERATION_REVISION_FIELD,
+                    }
+                })?,
+            ),
+        );
+    }
 
     write_player_root(&path, &root_name, &Tag::Compound(fields))
 }
@@ -2793,9 +2803,10 @@ fn pose_rotation_tag(pose: PlayerPose) -> Tag {
 fn inventory_tag(
     items: &ItemRegistry,
     state: &PlayerPersistedState,
+    inventory: &PlayerInventory,
 ) -> Result<Tag, PlayerPersistenceError> {
     let mut elements = Vec::new();
-    for (slot, stack) in state.inventory.slots.iter().enumerate() {
+    for (slot, stack) in inventory.slots.iter().enumerate() {
         if stack.is_empty() {
             continue;
         }

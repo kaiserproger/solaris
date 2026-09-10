@@ -296,12 +296,7 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots_inner() {
         .expect("seed furnace block")
         .expect("furnace chunk exists");
     let mut furnace = mc_world::FurnaceBlockEntity::default();
-    furnace.slots[0] = mc_world::FurnaceSlot {
-        item_id: raw_iron_id,
-        count: 3,
-        damage: None,
-        enchantments: Vec::new(),
-    };
+    furnace.slots[0] = mc_world::FurnaceSlot { item_id: raw_iron_id, count: 3, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
     storage
         .set_furnace_block_entity(furnace_pos, furnace)
         .expect("seed furnace entity");

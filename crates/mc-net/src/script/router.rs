@@ -123,6 +123,7 @@ impl ScriptRouter {
             | ScriptCommand::PluginStorageGet { .. }
             | ScriptCommand::PluginStorageCompareAndSwap { .. }
             | ScriptCommand::PluginStorageDelete { .. }
+            | ScriptCommand::Operation { .. }
             | ScriptCommand::OpenInventoryMenu { .. }
             | ScriptCommand::CloseInventoryMenu { .. }
             | ScriptCommand::InventoryStorageTransaction { .. }
@@ -159,6 +160,7 @@ impl ScriptRouter {
                 | ScriptCommand::PluginStorageCompareAndSwap { .. }
                 | ScriptCommand::PluginStorageDelete { .. }
                 | ScriptCommand::InventoryStorageTransaction { .. }
+                | ScriptCommand::Operation { .. }
         ) {
             return self
                 .route_storage_admitted(admitted, context.shutdown)
@@ -319,6 +321,7 @@ impl ScriptRouter {
             | ScriptCommand::PluginStorageGet { .. }
             | ScriptCommand::PluginStorageCompareAndSwap { .. }
             | ScriptCommand::PluginStorageDelete { .. }
+            | ScriptCommand::Operation { .. }
             | ScriptCommand::InventoryStorageTransaction { .. } => {
                 debug!("invalid admitted script command rejected");
                 ScriptRouterExit::Continue

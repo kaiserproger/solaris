@@ -89,6 +89,8 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -215,6 +217,8 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
                 item_id: 42,
                 damage: None,
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }
         );
         assert!(
@@ -329,6 +333,8 @@ async fn scheduled_hopper_ejection_schedules_comparator_tick_for_target_chest() 
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage
@@ -377,6 +383,8 @@ async fn scheduled_hopper_ejection_schedules_comparator_tick_for_target_chest() 
                 item_id: 42,
                 damage: None,
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }
         );
         assert_eq!(
@@ -450,6 +458,8 @@ async fn scheduled_hopper_transfer_across_region_boundary_uses_atomic_resident_c
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage
@@ -548,6 +558,8 @@ fn comparator_container_signal_uses_vanilla_discrete_fullness_formula() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_chest_block_entity(chest_pos, chest).unwrap();
     assert_eq!(
@@ -562,6 +574,8 @@ fn comparator_container_signal_uses_vanilla_discrete_fullness_formula() {
             item_id: 42,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
     }
     storage.set_chest_block_entity(chest_pos, chest).unwrap();
@@ -746,6 +760,8 @@ async fn scheduled_block_pass_backfills_loaded_hopper_missing_initial_tick() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -818,6 +834,8 @@ async fn scheduled_block_pass_backfills_loaded_hopper_missing_initial_tick() {
             item_id: 42,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         }
     );
     assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
@@ -1132,6 +1150,8 @@ fn scheduled_hopper_container_dispatch_does_not_hold_world_writer() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage
@@ -1250,6 +1270,8 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -1345,6 +1367,8 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
                 item_id: 42,
                 damage: None,
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }
         );
         assert!(furnace.slots[1].is_empty());
@@ -1436,6 +1460,8 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
         item_id: 44,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -1533,6 +1559,8 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
                 item_id: 44,
                 damage: None,
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }
         );
         assert!(furnace.slots[2].is_empty());
@@ -1623,6 +1651,8 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
         item_id: 43,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage
         .set_furnace_block_entity(furnace_pos, furnace)
@@ -1722,6 +1752,8 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
                 item_id: 43,
                 damage: None,
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }
         );
         let scheduled = storage
@@ -1839,6 +1871,8 @@ async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -2024,6 +2058,8 @@ fn hopper_campfire_persistence_failure_does_not_publish_cooking_state() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
 
     assert!(
@@ -2038,11 +2074,22 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
-            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:chest").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["north"]),
+                    ("type", &["single", "left", "right"]),
+                ]),
+                states: vec![
+                    state(1, true, &[("facing", "north"), ("type", "single")]),
+                    state(2, false, &[("facing", "north"), ("type", "left")]),
+                    state(3, false, &[("facing", "north"), ("type", "right")]),
+                ],
+            },
             BlockReport {
                 id: Identifier::parse("minecraft:hopper").unwrap(),
                 properties: prop_schema(&[("facing", &["east"])]),
-                states: vec![state(2, true, &[("facing", "east")])],
+                states: vec![state(4, true, &[("facing", "east")])],
             },
         ])
         .unwrap(),
@@ -2064,12 +2111,12 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
         )
         .unwrap();
     storage
-        .set_block_at(source_left_pos, BlockStateId(1))
+        .set_block_at(source_left_pos, BlockStateId(2))
         .unwrap();
     storage
-        .set_block_at(source_right_pos, BlockStateId(1))
+        .set_block_at(source_right_pos, BlockStateId(3))
         .unwrap();
-    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(4)).unwrap();
     storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
     storage
         .set_chest_block_entity(source_left_pos, mc_world::ChestBlockEntity::default())
@@ -2080,6 +2127,8 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage
         .set_chest_block_entity(source_right_pos, source_right)
@@ -2148,6 +2197,8 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
             item_id: 42,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         }
     );
     assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
@@ -2158,11 +2209,22 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
-            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:chest").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["north"]),
+                    ("type", &["single", "left", "right"]),
+                ]),
+                states: vec![
+                    state(1, true, &[("facing", "north"), ("type", "single")]),
+                    state(2, false, &[("facing", "north"), ("type", "left")]),
+                    state(3, false, &[("facing", "north"), ("type", "right")]),
+                ],
+            },
             BlockReport {
                 id: Identifier::parse("minecraft:hopper").unwrap(),
                 properties: prop_schema(&[("facing", &["east"])]),
-                states: vec![state(2, true, &[("facing", "east")])],
+                states: vec![state(4, true, &[("facing", "east")])],
             },
             BlockReport {
                 id: Identifier::parse("minecraft:comparator").unwrap(),
@@ -2173,7 +2235,7 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                 ]),
                 states: vec![
                     state(
-                        3,
+                        5,
                         true,
                         &[
                             ("facing", "west"),
@@ -2182,7 +2244,7 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                         ],
                     ),
                     state(
-                        4,
+                        6,
                         false,
                         &[("facing", "west"), ("mode", "compare"), ("powered", "true")],
                     ),
@@ -2209,15 +2271,15 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
         )
         .unwrap();
     storage.set_block_at(source_pos, BlockStateId(1)).unwrap();
-    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(4)).unwrap();
     storage
-        .set_block_at(target_left_pos, BlockStateId(1))
+        .set_block_at(target_left_pos, BlockStateId(2))
         .unwrap();
     storage
-        .set_block_at(target_right_pos, BlockStateId(1))
+        .set_block_at(target_right_pos, BlockStateId(3))
         .unwrap();
     storage
-        .set_block_at(comparator_pos, BlockStateId(3))
+        .set_block_at(comparator_pos, BlockStateId(5))
         .unwrap();
     let mut source = mc_world::ChestBlockEntity::default();
     source.slots[0] = mc_world::FurnaceSlot {
@@ -2225,6 +2287,8 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
         item_id: 42,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -2237,6 +2301,8 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
             item_id: 42,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
     }
     storage
@@ -2311,6 +2377,8 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                     item_id: 42,
                     damage: None,
                     enchantments: Vec::new(),
+                    custom_name: None,
+                    item_model: None,
                 }
         }));
         assert_eq!(
@@ -2320,11 +2388,13 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                 item_id: 42,
                 damage: None,
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }
         );
         assert_eq!(
             storage.get_cached_block(comparator_pos),
-            Some(BlockStateId(4))
+            Some(BlockStateId(6))
         );
     }
 
@@ -2498,6 +2568,8 @@ fn scheduled_hopper_transfer_preserves_enchantments_when_merging_matching_stacks
         item_id: 43,
         damage: None,
         enchantments: vec![efficiency.clone()],
+        custom_name: None,
+        item_model: None,
     };
     let mut target = mc_world::ChestBlockEntity::default();
     target.slots[0] = mc_world::FurnaceSlot {
@@ -2505,6 +2577,8 @@ fn scheduled_hopper_transfer_preserves_enchantments_when_merging_matching_stacks
         item_id: 43,
         damage: None,
         enchantments: vec![efficiency.clone()],
+        custom_name: None,
+        item_model: None,
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage.set_chest_block_entity(target_pos, target).unwrap();
@@ -2541,6 +2615,8 @@ fn scheduled_hopper_transfer_preserves_enchantments_when_merging_matching_stacks
             item_id: 43,
             damage: None,
             enchantments: vec![efficiency],
+            custom_name: None,
+            item_model: None,
         }
     );
 }
@@ -2588,6 +2664,8 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
         item_id: 43,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     let mut target = mc_world::ChestBlockEntity::default();
     for slot in &mut target.slots {
@@ -2596,6 +2674,8 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
             item_id: 43,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
     }
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
@@ -2631,6 +2711,8 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
             item_id: 43,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         }
     );
     assert_eq!(hopper.transfer_cooldown, 0);
@@ -2641,6 +2723,8 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
                 item_id: 43,
                 damage: None,
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }
     }));
 }

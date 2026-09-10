@@ -98,6 +98,9 @@ pub(in crate::play) fn apply_script_player_inventory_transaction(
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
 ) -> Result<(), ScriptPlayerInventoryFailure> {
+    if persisted.inventory_recovery_required {
+        return Err(ScriptPlayerInventoryFailure::RuntimeUnavailable);
+    }
     persisted
         .inventory
         .try_update(|current| {

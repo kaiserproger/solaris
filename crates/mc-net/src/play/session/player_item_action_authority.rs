@@ -34,7 +34,8 @@ impl SessionRegistry {
         };
         let mut player_state =
             crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
-        if player_state.game_mode != plan.game_mode
+        if player_state.inventory_recovery_required
+            || player_state.game_mode != plan.game_mode
             || !matches!(plan.game_mode, GameMode::Creative | GameMode::Survival)
         {
             return Ok(None);
@@ -125,7 +126,8 @@ impl SessionRegistry {
         );
         let selected_slot =
             PlayerInventory::HOTBAR_BASE + usize::from(player_state.selected_hotbar_slot);
-        if (plan.held_slot != PlayerInventory::OFFHAND_SLOT && plan.held_slot != selected_slot)
+        if player_state.inventory_recovery_required
+            || (plan.held_slot != PlayerInventory::OFFHAND_SLOT && plan.held_slot != selected_slot)
             || player_state.survival != plan.expected_survival
             || !mc_entity::player_survival_26_1_2::can_eat(
                 player_state.survival.health,
@@ -179,7 +181,9 @@ impl SessionRegistry {
         );
         let selected_slot =
             PlayerInventory::HOTBAR_BASE + usize::from(player_state.selected_hotbar_slot);
-        if plan.bow_slot != PlayerInventory::OFFHAND_SLOT && plan.bow_slot != selected_slot {
+        if player_state.inventory_recovery_required
+            || (plan.bow_slot != PlayerInventory::OFFHAND_SLOT && plan.bow_slot != selected_slot)
+        {
             return None;
         }
         if plan.arrow_slot >= player_state.inventory.slots.len()
@@ -242,7 +246,9 @@ impl SessionRegistry {
             wait_started,
             guard,
         );
-        if player_state.selected_hotbar_slot != plan.held_hotbar_slot {
+        if player_state.inventory_recovery_required
+            || player_state.selected_hotbar_slot != plan.held_hotbar_slot
+        {
             return None;
         }
         let held_slot = PlayerInventory::HOTBAR_BASE + usize::from(plan.held_hotbar_slot);

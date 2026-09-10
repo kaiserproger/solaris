@@ -9,8 +9,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::login::LoggedInProfile;
 use crate::play::persistence::PlayerPersistedState;
+use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::play::script_inventory_transaction::{
-    ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
+    ScriptStorageCommitError, ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
 };
 use crate::play::{PlayerPose, SessionRegistry};
 
@@ -20,17 +21,21 @@ struct StorageMustNotRun;
 
 impl ScriptStorageTransactionPrepare for StorageMustNotRun {
     type Prepared = ();
-    type Error = std::convert::Infallible;
+    type Error = std::io::Error;
 
     fn prepare(
         &mut self,
         _plugin_id: &str,
         _mutations: &[ScriptStorageMutation],
+        _inventory: PlayerInventoryRecovery,
     ) -> Result<ScriptStoragePrepareOutcome<Self::Prepared>, Self::Error> {
         panic!("storage prepare must not run after unregister wins the lifetime fence")
     }
 
-    fn commit(&mut self, _prepared: Self::Prepared) -> Result<(), Self::Error> {
+    fn commit(
+        &mut self,
+        _prepared: Self::Prepared,
+    ) -> Result<u64, ScriptStorageCommitError<Self::Error>> {
         panic!("storage commit must not run after unregister wins the lifetime fence")
     }
 }

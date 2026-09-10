@@ -138,7 +138,8 @@ impl ChestTransaction {
             .chest_viewers
             .get(&primary_position)
             .is_some_and(|viewers| viewers.contains_key(&self.actor_session));
-        if !actor_has_open_view
+        if player_state.inventory_recovery_required
+            || !actor_has_open_view
             || current_state_id != expected_state_id
             || player_state.inventory.slots != player.expected_inventory.slots
             || player_state.carried_item != player.expected_carried_item
@@ -234,7 +235,8 @@ impl FurnaceTransaction {
             .furnace_viewers
             .get(&position)
             .is_some_and(|viewers| viewers.contains_key(&self.actor_session));
-        if !actor_has_open_view
+        if player_state.inventory_recovery_required
+            || !actor_has_open_view
             || current_state_id != expected_state_id
             || player_state.inventory.slots != player.expected_inventory.slots
             || player_state.carried_item != player.expected_carried_item
@@ -255,7 +257,7 @@ impl FurnaceTransaction {
             mc_world::ResidentFurnaceCommitResult::Rejected(authoritative) => {
                 return Ok(SharedContainerCommit::Rejected {
                     state_id: current_state_id,
-                    authoritative,
+                    authoritative: *authoritative,
                     inventory: player_state.inventory.clone(),
                     carried_item: player_state.carried_item.clone(),
                 });
@@ -301,6 +303,9 @@ impl BucketUseTransaction {
             wait_started,
             guard,
         );
+        if player_state.inventory_recovery_required {
+            return Ok(None);
+        }
         let (inventory, changed_slots) = if let Some(change) = &plan.inventory {
             if player_state.inventory.slots[change.held_slot] != change.expected_held {
                 return Ok(None);
@@ -356,7 +361,9 @@ impl CampfireUseTransaction {
             wait_started,
             guard,
         );
-        if player_state.inventory.slots[plan.held_slot] != plan.expected_held {
+        if player_state.inventory_recovery_required
+            || player_state.inventory.slots[plan.held_slot] != plan.expected_held
+        {
             return Ok(None);
         }
 
@@ -417,7 +424,9 @@ impl SurvivalBreakTransaction {
             wait_started,
             guard,
         );
-        if player_state.selected_hotbar_slot != plan.held.hotbar_slot {
+        if player_state.inventory_recovery_required
+            || player_state.selected_hotbar_slot != plan.held.hotbar_slot
+        {
             return Ok(None);
         }
         let tool_slot = PlayerInventory::HOTBAR_BASE + usize::from(plan.held.hotbar_slot);
@@ -497,7 +506,9 @@ impl SurvivalPlacementTransaction {
         {
             return Ok(None);
         }
-        if player_state.inventory.slots[held_slot] != plan.held.expected {
+        if player_state.inventory_recovery_required
+            || player_state.inventory.slots[held_slot] != plan.held.expected
+        {
             return Ok(None);
         }
         let mut inventory = player_state.inventory.clone();

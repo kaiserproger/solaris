@@ -14,8 +14,9 @@ use tokio::sync::mpsc;
 use crate::login::LoggedInProfile;
 use crate::play::inventory::PlayerInventory;
 use crate::play::persistence::PlayerPersistedState;
+use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::play::script_inventory_transaction::{
-    ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
+    ScriptStorageCommitError, ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
 };
 use crate::play::{PlayerPose, SessionRegistry};
 
@@ -29,12 +30,13 @@ struct SignalingStorage {
 
 impl ScriptStorageTransactionPrepare for SignalingStorage {
     type Prepared = ();
-    type Error = std::convert::Infallible;
+    type Error = std::io::Error;
 
     fn prepare(
         &mut self,
         _plugin_id: &str,
         _mutations: &[ScriptStorageMutation],
+        _inventory: PlayerInventoryRecovery,
     ) -> Result<ScriptStoragePrepareOutcome<Self::Prepared>, Self::Error> {
         self.prepared
             .send(())
@@ -42,8 +44,11 @@ impl ScriptStorageTransactionPrepare for SignalingStorage {
         Ok(ScriptStoragePrepareOutcome::Prepared(()))
     }
 
-    fn commit(&mut self, _prepared: Self::Prepared) -> Result<(), Self::Error> {
-        Ok(())
+    fn commit(
+        &mut self,
+        _prepared: Self::Prepared,
+    ) -> Result<u64, ScriptStorageCommitError<Self::Error>> {
+        Ok(1)
     }
 }
 

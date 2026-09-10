@@ -564,6 +564,8 @@ fn plan_hostile_arrow(
     target_position: Vec3,
     arrow_entity_type_id: i32,
     crossbow: bool,
+    tick: u64,
+    divergence: f32,
 ) -> Option<PlannedArrowAttack> {
     let shooter_eye = Vec3::new(
         hostile.position.x,
@@ -577,13 +579,28 @@ fn plan_hostile_arrow(
         target_position.y + PLAYER_CROSSBOW_TARGET_Y_OFFSET - shooter_eye.y
             + horizontal_distance * 0.2
     } else {
-        target_position.y + 1.0 - shooter_eye.y
+        // Vanilla bow aim: target.getY(0.333) (≈ +0.6 for player-height
+        // targets) plus horizontal_distance * 0.2 drop compensation.
+        target_position.y + SKELETON_BOW_TARGET_Y_OFFSET - shooter_eye.y + horizontal_distance * 0.2
     };
     let length = (dx * dx + dy * dy + dz * dz).sqrt();
     if length <= f64::EPSILON {
         return None;
     }
-    let direction = Vec3::new(dx / length, dy / length, dz / length);
+    let mut direction = Vec3::new(dx / length, dy / length, dz / length);
+    if divergence > 0.0 {
+        // Vanilla Projectile spread: per-axis symmetric triangular offsets
+        // scaled by 0.0172275 * divergence around the normalized aim, then
+        // scaled by velocity (no renormalize). Deterministic per shooter
+        // and tick; no shared RNG.
+        let deviation = PROJECTILE_SPREAD_SCALE * f64::from(divergence);
+        let mut random = spread_seed(hostile.id, tick);
+        direction = Vec3::new(
+            direction.x + triangle_sample(&mut random) * deviation,
+            direction.y + triangle_sample(&mut random) * deviation,
+            direction.z + triangle_sample(&mut random) * deviation,
+        );
+    }
     let velocity = Vec3::new(
         direction.x * SKELETON_ARROW_SPEED,
         direction.y * SKELETON_ARROW_SPEED,
@@ -609,6 +626,35 @@ fn plan_hostile_arrow(
         },
         animate_shooter: !crossbow,
     })
+}
+
+/// Vanilla 26.1.2 skeleton divergence on EASY, the server-advertised
+/// default difficulty: `14 - 4 * difficulty_id`. Revisit with a difficulty
+const SKELETON_ARROW_DIVERGENCE: f32 = 10.0;
+/// Vanilla bow aim height for player-height targets: `getY(0.333)` with a
+/// 1.8-block-tall target. Matches `PLAYER_CROSSBOW_TARGET_Y_OFFSET`.
+const SKELETON_BOW_TARGET_Y_OFFSET: f64 = 0.6;
+/// Vanilla `Projectile` per-axis spread scale.
+const PROJECTILE_SPREAD_SCALE: f64 = 0.017_227_5;
+
+fn spread_seed(entity_id: EntityId, tick: u64) -> u64 {
+    u64::from(entity_id.0.unsigned_abs()).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ tick.rotate_left(29)
+}
+
+fn splitmix_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// Symmetric triangular sample on [-1, 1] from two uniform draws.
+fn triangle_sample(state: &mut u64) -> f64 {
+    const DIVISOR: f64 = u64::MAX as f64;
+    let first = splitmix_next(state) as f64 / DIVISOR;
+    let second = splitmix_next(state) as f64 / DIVISOR;
+    first - second
 }
 
 fn plan_hostile_small_fireball(
@@ -1104,7 +1150,14 @@ fn plan_crossbow_transition(
             }
             let arrow_entity_type_id = arrow_entity_type_id?;
             let (_, target_position) = target?;
-            let shot = plan_hostile_arrow(hostile, target_position, arrow_entity_type_id, true)?;
+            let shot = plan_hostile_arrow(
+                hostile,
+                target_position,
+                arrow_entity_type_id,
+                true,
+                tick,
+                0.0,
+            )?;
             (None, Some(shot))
         }
     };
@@ -1651,6 +1704,7 @@ impl SessionRegistry {
         #[cfg(feature = "load-bench")]
         let classify_started = std::time::Instant::now();
         let mut hostiles = Vec::with_capacity(projections.len());
+        let mut skeleton_aggressive_checks = Vec::new();
         for entity in projections {
             #[cfg(test)]
             self.hostile_entity_scan_visits
@@ -1706,6 +1760,13 @@ impl SessionRegistry {
                 },
                 MobCombatPolicy::None | MobCombatPolicy::UnsupportedSpecial => continue,
             };
+            // Draw-pose aggressive is evaluated every tick for every loaded
+            // bow skeleton from this same budgeted fetch — no due-gating, no
+            // extra owner reads; the publish below diffs.
+            if matches!(kind, HostileAttackKind::Skeleton) {
+                let aiming = matches!(entity.goal, GoalState::FollowPosition { .. });
+                skeleton_aggressive_checks.push((entity.id, aiming));
+            }
             let period = match kind {
                 HostileAttackKind::Creeper
                 | HostileAttackKind::Crossbow
@@ -1753,7 +1814,11 @@ impl SessionRegistry {
         if hostiles.is_empty() {
             #[cfg(feature = "load-bench")]
             metrics.maybe_emit(tick);
-            return (0, fang_dispatches);
+            // Draw-pose flips must not wait for a due hostile: publish from
+            // this tick's classification even when nothing is due to attack.
+            let mut dispatches = fang_dispatches;
+            dispatches.extend(self.publish_skeleton_aggressive_updates(skeleton_aggressive_checks));
+            return (0, dispatches);
         }
         let needs_witch_effect_facts = hostiles
             .iter()
@@ -1863,9 +1928,14 @@ impl SessionRegistry {
                     let Some((_, target_position)) = target else {
                         continue;
                     };
-                    if let Some(attack) =
-                        plan_hostile_arrow(&hostile, target_position, arrow_entity_type_id, false)
-                    {
+                    if let Some(attack) = plan_hostile_arrow(
+                        &hostile,
+                        target_position,
+                        arrow_entity_type_id,
+                        false,
+                        tick,
+                        SKELETON_ARROW_DIVERGENCE,
+                    ) {
                         arrow_attacks.push(attack);
                     }
                 }
@@ -2485,6 +2555,7 @@ impl SessionRegistry {
                 dispatches.extend(updates);
             }
         }
+        dispatches.extend(self.publish_skeleton_aggressive_updates(skeleton_aggressive_checks));
         if !blaze_state_updates.is_empty() {
             let mut inner = self.lock_inner("publish hostile blaze state");
             for entity in blaze_state_updates {
@@ -3416,6 +3487,40 @@ impl SessionRegistry {
         }
         (attacks + creeper_ignitions, dispatches)
     }
+    // Kind `Skeleton` already implies a bow skeleton (`Arrow` policy), so the
+    // planning goal check is sufficient: flip the published bit without
+    // touching the owner lane (the volley budget test pins this).
+    fn publish_skeleton_aggressive_updates(
+        &self,
+        skeleton_aggressive_checks: Vec<(EntityId, bool)>,
+    ) -> Vec<VisibilityDispatch> {
+        if skeleton_aggressive_checks.is_empty() {
+            return Vec::new();
+        }
+        let mut inner = self.lock_inner("publish hostile skeleton aggressive state");
+        let mut dispatches = Vec::new();
+        for (entity_id, aggressive) in skeleton_aggressive_checks {
+            let Some(previous) = inner.published_entity_snapshots.get(&entity_id) else {
+                continue;
+            };
+            if previous.aggressive == aggressive {
+                continue;
+            }
+            let mut updated = previous.clone();
+            updated.aggressive = aggressive;
+            inner
+                .published_entity_snapshots
+                .insert(entity_id, updated.clone());
+            let recipients =
+                session_recipients(&inner, visible_entity_observers_locked(&inner, entity_id));
+            let updates = visibility_dispatches(recipients, || {
+                OutboundCommand::UpdateEntityData(updated.clone())
+            });
+            record_entity_dispatches_locked(&mut inner, &updates);
+            dispatches.extend(updates);
+        }
+        dispatches
+    }
 
     #[cfg(test)]
     pub(super) fn hostile_attack_candidate_count(&self) -> u64 {
@@ -3524,4 +3629,130 @@ pub(super) fn changed_hostile_goal(
     next: GoalState,
 ) -> Option<(EntityId, GoalState)> {
     (current != &next).then_some((entity, next))
+}
+
+#[cfg(test)]
+mod arrow_spread_tests {
+    use super::{
+        HostileAttackKind, HostileAttackTickEntity, SKELETON_ARROW_DIVERGENCE, plan_hostile_arrow,
+    };
+    use crate::play::SKELETON_ARROW_SPEED;
+    use mc_entity::{EntityId, GoalState, Rotation, Vec3};
+
+    fn skeleton_shooter(id: i32) -> HostileAttackTickEntity {
+        HostileAttackTickEntity {
+            id: EntityId(id),
+            kind: HostileAttackKind::Skeleton,
+            position: Vec3::new(0.5, 64.0, 0.5),
+            rotation: Rotation {
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+            },
+            goal: GoalState::Idle,
+            crossbow_attack: None,
+            blaze_attack: None,
+            ghast_attack: None,
+            breeze_attack: None,
+            witch_attack: None,
+            guardian_beam: None,
+            warden_sonic_boom: None,
+            shulker_attack: None,
+            evoker_attack: None,
+        }
+    }
+
+    #[test]
+    fn skeleton_arrow_spread_is_seeded_variance_around_center_aim() {
+        let hostile = skeleton_shooter(7);
+        let target = Vec3::new(10.5, 65.0, 0.5);
+        // Zero divergence preserves exact center aim at full speed.
+        let straight = plan_hostile_arrow(&hostile, target, 99, false, 100, 0.0)
+            .expect("plausible skeleton shot plans");
+        let speed = (straight.velocity.x * straight.velocity.x
+            + straight.velocity.y * straight.velocity.y
+            + straight.velocity.z * straight.velocity.z)
+            .sqrt();
+        assert!((speed - SKELETON_ARROW_SPEED).abs() < 1e-9);
+
+        // Vanilla divergence perturbs the shot but keeps its general aim and
+        // speed, deterministically per shooter and tick.
+        let first = plan_hostile_arrow(&hostile, target, 99, false, 100, SKELETON_ARROW_DIVERGENCE)
+            .expect("divergent skeleton shot plans");
+        let repeat =
+            plan_hostile_arrow(&hostile, target, 99, false, 100, SKELETON_ARROW_DIVERGENCE)
+                .expect("same seed repeats the shot");
+        assert_eq!(first.velocity, repeat.velocity);
+        assert_ne!(
+            first.velocity, straight.velocity,
+            "divergence must actually perturb center aim"
+        );
+        let perturbed_speed = (first.velocity.x * first.velocity.x
+            + first.velocity.y * first.velocity.y
+            + first.velocity.z * first.velocity.z)
+            .sqrt();
+        assert!(
+            (perturbed_speed - SKELETON_ARROW_SPEED).abs() < 0.35,
+            "spread must not collapse or explode arrow speed"
+        );
+        let dot = first.velocity.x * straight.velocity.x
+            + first.velocity.y * straight.velocity.y
+            + first.velocity.z * straight.velocity.z;
+        let cos_angle = dot / (perturbed_speed * speed);
+        assert!(
+            cos_angle > 0.965 && cos_angle <= 1.0,
+            "spread must stay near center aim"
+        );
+
+        // Later ticks draw different samples; different shooters differ too.
+        let later = plan_hostile_arrow(&hostile, target, 99, false, 101, SKELETON_ARROW_DIVERGENCE)
+            .expect("later tick plans");
+        assert_ne!(later.velocity, first.velocity);
+        let other = plan_hostile_arrow(
+            &skeleton_shooter(8),
+            target,
+            99,
+            false,
+            100,
+            SKELETON_ARROW_DIVERGENCE,
+        )
+        .expect("other shooter plans");
+        assert_ne!(other.velocity, first.velocity);
+    }
+    #[test]
+    fn skeleton_bow_aim_compensates_drop_with_distance() {
+        // Same-height targets: vanilla adds horizontal * 0.2 to the aim, so
+        // the launch angle stays roughly constant with distance instead of
+        // flattening (uncompensated +1.0 aim would give near -3.6deg, far
+        // -1.2deg).
+        let hostile = skeleton_shooter(7);
+        let near = Vec3::new(8.5, 65.0, 0.5);
+        let far = Vec3::new(24.5, 65.0, 0.5);
+        let near_shot =
+            plan_hostile_arrow(&hostile, near, 99, false, 100, 0.0).expect("near shot plans");
+        let far_shot =
+            plan_hostile_arrow(&hostile, far, 99, false, 100, 0.0).expect("far shot plans");
+        assert!(
+            (far_shot.rotation.pitch - near_shot.rotation.pitch).abs() < 2.0,
+            "compensation must hold launch angle: near={} far={}",
+            near_shot.rotation.pitch,
+            far_shot.rotation.pitch
+        );
+        assert!(
+            far_shot.rotation.pitch < -8.0,
+            "far shot must still lob: {}",
+            far_shot.rotation.pitch
+        );
+        // Base aim height is getY(0.333) ≈ feet + 0.6, not feet + 1.0:
+        // point-blank aim sits just above the 1.5-high eye (old +1.0 would
+        // pitch near -26.6deg here).
+        let close = Vec3::new(1.5, 65.0, 0.5);
+        let close_shot =
+            plan_hostile_arrow(&hostile, close, 99, false, 100, 0.0).expect("close shot plans");
+        assert!(
+            close_shot.rotation.pitch > -25.0 && close_shot.rotation.pitch < -10.0,
+            "close aim must use waist height: {}",
+            close_shot.rotation.pitch
+        );
+    }
 }

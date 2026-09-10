@@ -57,6 +57,8 @@ fn chest_quick_move_from_storage_uses_vanilla_reverse_player_range() {
         count: 2,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     let mut view = ChestView {
         chests: vec![chest],
@@ -246,6 +248,8 @@ fn chest_menu_revision_counts_source_and_destination_slot_changes() {
         count: 2,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     let before_view = ChestView {
         chests: vec![before_chest],

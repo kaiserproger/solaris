@@ -268,6 +268,7 @@ fn physics_motion_publication_preserves_non_kinematic_state() {
         crossbow_charging: false,
         blaze_charged: false,
         guardian_attack_target_entity_id: 0,
+        aggressive: false,
     };
     let motion = EntityMotionState {
         id: snapshot.id,

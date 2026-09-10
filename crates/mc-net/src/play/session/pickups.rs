@@ -838,7 +838,8 @@ impl SessionRegistry {
                     wait_started,
                     guard,
                 );
-                if player.game_mode != plan.expected_game_mode
+                if player.inventory_recovery_required
+                    || player.game_mode != plan.expected_game_mode
                     || player.survival != plan.expected_survival
                     || player.inventory.slots != plan.expected_inventory.slots
                     || player.selected_hotbar_slot != plan.expected_selected_hotbar_slot
@@ -1144,7 +1145,10 @@ impl SessionRegistry {
                 wait_started,
                 guard,
             );
-            if player_state.game_mode == GameMode::Spectator || player_state.survival.is_dead() {
+            if player_state.inventory_recovery_required
+                || player_state.game_mode == GameMode::Spectator
+                || player_state.survival.is_dead()
+            {
                 return None;
             }
             let mut inventory = player_state.inventory.clone();

@@ -1424,6 +1424,8 @@ async fn replay_shared_chest_pickup(
             count: initial_count,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         world
             .set_chest_block_entity(chest_pos, chest)
@@ -2058,6 +2060,8 @@ async fn concurrent_shared_chest_same_state_commits_one_cursor_transaction() {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         world
             .set_chest_block_entity(chest_pos, chest)

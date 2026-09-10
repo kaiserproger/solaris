@@ -2,7 +2,7 @@ mod events;
 mod inventory;
 mod player_query;
 mod router;
-mod storage;
+pub(crate) mod storage;
 mod teleport;
 mod villager;
 mod zone;

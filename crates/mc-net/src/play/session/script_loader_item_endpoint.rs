@@ -105,6 +105,9 @@ pub(in crate::play) fn apply_loader_item_grant(
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
 ) -> Result<(), ScriptPlayerInventoryFailure> {
+    if persisted.inventory_recovery_required {
+        return Err(ScriptPlayerInventoryFailure::RuntimeUnavailable);
+    }
     persisted.inventory.try_update(|current| {
         let mut updated = current.clone();
         let max_stack = item_max_stack(item_facts, items, stack);

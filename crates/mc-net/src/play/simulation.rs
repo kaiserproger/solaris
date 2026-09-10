@@ -81,6 +81,8 @@ use tracing::{trace, warn};
 #[cfg(test)]
 mod block_drop_tests;
 #[cfg(test)]
+mod inventory_recovery_tests;
+#[cfg(test)]
 mod player_teleport_tests;
 mod queue;
 mod regional_mutation;
@@ -470,7 +472,7 @@ pub(super) enum SimulationCommand {
         expected_state_id: i32,
         actor_session: SessionId,
         expected: FurnaceBlockEntity,
-        updated: FurnaceBlockEntity,
+        updated: Box<FurnaceBlockEntity>,
         player: Box<ContainerPlayerPlan>,
     },
     CommitOpaqueBlockEntity {
@@ -1459,6 +1461,45 @@ fn append_block_edit_outcome(
             .get_or_insert_default()
             .append(&mut updates);
     }
+}
+
+/// Support cascade for one explosion-destroyed cell: ground plants and
+/// columns above it pop under the same transaction. Edits already present
+/// (the blast destroys the plant itself) and unreadable cells are skipped
+/// rather than failing the blast.
+fn plan_explosion_support_cascade(
+    blocks: &mc_world::BlockRegistry,
+    storage: &impl super::BlockPlanningRead,
+    existing: &[super::BlockEdit],
+    base: mc_world::BlockPos,
+    air: mc_world::BlockStateId,
+) -> Vec<(super::BlockEdit, super::BlockEditPrecondition)> {
+    let mut cascade = Vec::new();
+    super::block_break::append_vertical_support_cascade(blocks, storage, &mut cascade, base, air);
+    let mut out: Vec<(super::BlockEdit, super::BlockEditPrecondition)> =
+        Vec::with_capacity(cascade.len());
+    for edit in cascade {
+        if existing.iter().any(|existing| existing.pos == edit.pos)
+            || out.iter().any(|(emitted, _)| emitted.pos == edit.pos)
+        {
+            continue;
+        }
+        let Some(expected_state) = storage.get_cached_block(edit.pos) else {
+            continue;
+        };
+        let Some(expected_token) = storage.block_mutation_token(edit.pos) else {
+            continue;
+        };
+        out.push((
+            edit,
+            super::BlockEditPrecondition {
+                pos: edit.pos,
+                expected_state,
+                expected_token,
+            },
+        ));
+    }
+    out
 }
 
 fn explosion_collision_boxes(
@@ -2750,7 +2791,7 @@ impl SimulationHandle {
             expected_state_id,
             actor_session,
             expected,
-            updated,
+            updated: Box::new(updated),
             player: Box::new(player),
         })?;
         match receiver.await {
@@ -3225,6 +3266,15 @@ impl SimulationOwner {
                         expected_state: state,
                         expected_token: token,
                     });
+                    // Plants and columns above a destroyed support pop with
+                    // it under the same transaction. Cells that cannot be
+                    // read are left alone rather than failing the blast.
+                    for (edit, precondition) in
+                        plan_explosion_support_cascade(blocks, &*storage, &edits, position, air)
+                    {
+                        edits.push(edit);
+                        preconditions.push(precondition);
+                    }
                 }
                 if edits.is_empty() {
                     continue;
@@ -6761,7 +6811,6 @@ fn valid_furnace_commit_command(
         && (!output_was_taken || updated.recipes_used.is_empty())
         && (player.xp_orb.is_none() || !expected.recipes_used.is_empty())
 }
-
 fn valid_block_edit_command(
     edits: &[BlockEdit],
     preconditions: &[BlockEditPrecondition],
@@ -6803,6 +6852,50 @@ mod tests {
     use mc_world::{BlockPos, BlockRegistry, BlockStateId, Chunk, ChunkPos, WorldStorage};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
+
+    #[test]
+    fn explosion_support_cascade_pops_ground_plant_with_precondition() {
+        let reports = vec![
+            block_report("minecraft:air", 0),
+            block_report("minecraft:dirt", 1),
+            block_report("minecraft:poppy", 2),
+        ];
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
+        let chunk = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let support = BlockPos { x: 4, y: 64, z: 4 };
+        let plant = BlockPos { x: 4, y: 65, z: 4 };
+        storage.set_block_at(support, BlockStateId(1)).unwrap();
+        storage.set_block_at(plant, BlockStateId(2)).unwrap();
+
+        let cascade =
+            plan_explosion_support_cascade(&blocks, &storage, &[], support, BlockStateId(0));
+        assert_eq!(cascade.len(), 1);
+        assert_eq!(cascade[0].0.pos, plant);
+        assert_eq!(cascade[0].0.new_state, BlockStateId(0));
+        assert_eq!(cascade[0].1.pos, plant);
+        assert_eq!(cascade[0].1.expected_state, BlockStateId(2));
+
+        // The blast already destroying the plant itself must not duplicate it.
+        let existing = vec![super::BlockEdit {
+            pos: plant,
+            new_state: BlockStateId(0),
+        }];
+        assert!(
+            plan_explosion_support_cascade(&blocks, &storage, &existing, support, BlockStateId(0))
+                .is_empty()
+        );
+    }
 
     struct FailOnceEntityCommitJournal {
         failure: Option<mc_entity::RegionalDecisionJournalError>,
@@ -8154,6 +8247,8 @@ mod tests {
             count: 3,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         storage
             .set_chest_block_entity(position, chest.clone())
@@ -8187,6 +8282,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         storage
             .set_furnace_block_entity(position, furnace.clone())
@@ -15566,6 +15663,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -15618,6 +15717,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -15702,6 +15803,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -15775,6 +15878,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut first_update = initial.clone();
         first_update.slots[0].count = 1;
@@ -15880,6 +15985,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -15979,6 +16086,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut first_update = initial.clone();
         first_update.slots[0].count = 1;
@@ -16118,6 +16227,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut updated = initial.clone();
         updated.slots[1].count = 1;
@@ -16184,6 +16295,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut updated = initial.clone();
         updated.slots[1].count = 1;
@@ -16251,6 +16364,8 @@ mod tests {
             count: 1,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         initial
             .recipes_used
@@ -16337,6 +16452,8 @@ mod tests {
             count: 2,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let mut current = expected.clone();
         current.burn_remaining = 9;
@@ -16406,6 +16523,8 @@ mod tests {
             count: 1,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         let (mut storage, pos) = test_container_storage();
         storage
@@ -16420,7 +16539,7 @@ mod tests {
                 expected_state_id: 1,
                 actor_session: 7,
                 expected: initial.clone(),
-                updated,
+                updated: Box::new(updated),
                 player: Box::new(empty_container_player_plan()),
             })
             .unwrap();

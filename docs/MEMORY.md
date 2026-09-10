@@ -1,6 +1,260 @@
 # Solaris current cursor
 
-## Current checkpoint: owner-requested as-is handoff to main
+## Current checkpoint: skeleton ranged slice (handoff issues 11-equip + 12)
+
+Skeleton arrows now carry vanilla spread: normalize → per-axis triangular
+offsets scaled by 0.0172275 × divergence → scale by 1.6, no renormalize
+(javap evidence from local server-26.1.2.jar `AbstractSkeleton` +
+`Projectile`). Divergence 10.0 = 14 − 4 × EASY, matching the advertised
+`ChangeDifficulty 1`; seeded per (shooter, tick), no shared RNG; crossbow
+passes 0.0 (bit-identical path). Skeletons/strays/bogged project a bow in
+the main hand at spawn (same `finalizeSpawn` projection as pillager
+crossbows, covering late trackers through the shared snapshot fn). Bow aim
+fixed per the same bytecode: `target.getY(0.333)` (≈ +0.6, matching the
+existing crossbow offset) plus `horizontal * 0.2` drop compensation (was
++1.0, no compensation). Draw-pose driver (probed): client `SkeletonModel`
+poses BOW_AND_ARROW iff `isAggressive && mainHandItem.is(BOW)` — no
+using-item flag needed; aggressive = mob-flags byte bit 0x04, published on
+transitions and cleared on lost-target/death/re-track.
+
+Draw pose done (no new state): `server_entity_snapshot_from` projects
+`aggressive` for bow skeletons with a `FollowPosition` goal; the hostile tick
+evaluates it every tick from the same budgeted projection fetch (no
+due-gating, zero owner-lane reads — volley/melee budget tests pin this) and
+diffs against the published snapshot, emitting `Byte{15, 0x04}` on change and
+silence when steady. Index 15 by javap: Entity defines 8 accessors (0-7),
+LivingEntity 7 (8-14, matches `LIVING_FLAGS=8` pin), Mob 1 → 15, PathfinderMob
+0 → `AGEABLE=16` pin holds; aggressive = `Mob.isAggressive` bit 0x04.
+
+Changed (uncommitted, C1 preserved): `session/outbound.rs` (flag +
+`is_bow_skeleton_type_26_1_2`), `session.rs` (re-export), `session/
+visibility.rs` (projection + shared bow predicate), `session/
+visibility_tests.rs` + `wire_entities_tests.rs` (literals), `play/
+wire_entities.rs` (index/bit consts, pairing + update encode, wire tests),
+`session/hostile_authority.rs` (every-tick check + diff publish), `session/
+tests.rs` (acquire/loss/steady/pillager-control test).
+
+Validation: full `mc-net` lib 2069 pass, Clippy clean, harness `fmt` PASS
+(`20260910T234125-fmt-inist4vt`), `code-health` PASS
+(`20260910T234129-code-health-_e243jij`). Three read-only reviews (spread+
+equip, aim delta, draw pose): the draw-pose review caught a real early-return
+drop (fixed: publish helper called from both tick branches; test proven to
+fail muted and pass fixed). Closing nit: pairing gated by bow type for
+symmetry with the update path (+ leak-guard test). Maturity `draft`; no
+commit/push without authorization.
+
+Next: time (8) needs the graphical gate — blocked headless. Queued: fluid
+wash, all graphical gates, light publication ordering, ender emission,
+bucket OUTLINE nit.
+## Current checkpoint: mob hurt flash trace (handoff issue 10, signal half)
+
+Traced all three hit paths with vanilla evidence; no server-side signal bug
+found. `attack_server_entity_locked` (mob/mob, village defense) sends entity
+event 2 + knockback on every accepted nonlethal hit; the player path
+additionally writes event 2 to the attacker stream; dragon/death paths send
+2/`ENTITY_EVENT_DEATH`. Codec verified against local client-26.1.2.jar
+`ClientboundEntityEventPacket`: writeInt entity id + writeByte event id,
+wire id 0x22 — matches ours. Existing session tests pin `Damaged` outcomes
+(which carry the event dispatches) for cow punches. Not yet done: the
+observed-client half — attacker/observer/invuln-reject/death in a real 26.1.2
+graphical run (entity-id mapping at spawn and client handling unverified
+headless). No fake damage events added; no code changed in this slice.
+
+Changed: none (investigation only). Issue 10 stays open past this slice
+pending the graphical gate.
+
+Next: skeletons (11, 12). Queued: fluid wash, time/bucket/chest/fish/light
+graphical gates, light publication ordering + graphical, ender emission.
+
+## Previous checkpoint: chest lighting opacity (handoff issue 7, metadata half)
+
+Confirmed with the local 26.1.2 block-light report: every chest-family state
+is opacity 0 dry / 1 waterlogged, never 15. The conservative fallback table
+gave all chests 15 (opaque, no skylight) — the constant-darkness mechanism.
+Fix: chest branch (`chest`/`*_chest`, 11/11 family IDs verified, no false
+positives) mapping waterlogged→1 else 0, with propagates/suffocating
+derived exactly matching vanilla rows. Intermittency (dark→correct→dark)
+is NOT explained by the static table; publication ordering + graphical gate
+stay queued. Ender emission 7 gap noted, untouched.
+
+Changed (uncommitted, C1 preserved): `mc-data/src/block_light.rs` (branch +
+1 test).
+
+Validation: 13/13 block_light; `mc-data` Clippy clean; harness `fmt` PASS
+(`20260910T142737-fmt-nmqmafam`), `code-health` PASS
+(`20260910T142740-code-health-r9b8pf16`). One read-only reviewer: pass, no
+findings. Maturity `draft`; no commit/push without authorization.
+
+Next: mobs (10), skeletons (11, 12). Queued: fluid wash, time/bucket/chest/
+fish graphical gates, light publication ordering + graphical, ender emission.
+
+## Previous checkpoint: explosion support cascade (plant follow-up, blast half)
+
+Blasts now pop ground plants/columns above destroyed supports in the same
+conditional batch, reusing `append_vertical_support_cascade` (now
+`pub(super)`, body unchanged) via `plan_explosion_support_cascade`, which
+skips already-destroyed and unreadable cells with per-edit preconditions.
+Drops flow through the existing explosion table (upper halves yield nothing,
+matching survival semantics). Incidental: chest placement keeps the
+same-kind/`single` guard and places single (not abort) when a candidate
+neighbor chunk is unloaded. Still queued: fluid wash + placement-neighbor
+paths, and all graphical gates.
+
+Changed (uncommitted, C1 preserved): `play/simulation.rs` (helper + hook +
+1 test), `play/block_break.rs` (visibility only), `play/block_placement/
+chest.rs` + `chest_tests.rs` (unloaded continue + test).
+
+Validation: explosion cascade unit test; 23 block_placement; 20
+furnace/chest/plant neighbors; `mc-net` Clippy clean; harness `fmt` PASS
+(`20260910T142301-fmt-v7nj2ot7`), `code-health` PASS
+(`20260910T142305-code-health-ypubcobo`). One read-only reviewer: pass, no
+findings. Maturity `draft`; no commit/push without authorization.
+
+Next: lighting (7), mobs (10), skeletons (11, 12). Queued: fluid wash,
+bucket OUTLINE nit, chest trapped/waterlogged/two-player/graphical, fish
+campfire/graphical, time graphical gate.
+
+## Previous checkpoint: region flush preservation (handoff issue 9)
+
+`DirtyFlushPlan::write` no longer decodes/retains/recompresses untouched
+slots. New `RawChunkRecord` + `read_region_raw` (location/comp/count/
+aggregate validation, no retention) and `write_region_create_new_mixed`
+(`Fresh` zlib-encodes, `Preserved` copies bytes verbatim with its timestamp).
+The existing writer shares the same assembler with identical behavior.
+Review drove two hardenings, both fixed: LZ4 compressed blocks are now
+checksum-verified while counting (the counter skipped them, unlike exact
+decode), and mixed-write validation enforces decode budgets on preserved
+slots too — corrupt input fails raw read, mixed write, and decoded read
+identically, no silent carry. Unique-tmp/stale-fence/journal/fsync/rename/
+parent-sync/dirty-generation semantics untouched.
+Benchmark (same 64-slot/4-dirty copied workload, debug build, receipt +
+log in `.analysis/codex-logs/flush-preserve-bench/`): rewrite-all 2309ms vs
+preserving 286ms (8.1x), retained uncompressed 3.11MB vs 86KB per flush
+(36x). Synthetic NBT caveat noted in receipt; owner-workload RSS/CPU still
+needs the owner environment.
+
+Changed (uncommitted, C1 preserved): `anvil/region.rs` (raw + mixed +
+validator + 4 tests), `anvil/mod.rs` exports, `storage/dirty_flush.rs`
+(raw map + mixed tmp + 1 test). Throwaway bench file removed after receipt.
+
+Validation: 288/288 `mc-world` lib; `mc-world` Clippy clean; harness `fmt`
+PASS (`20260910T140833-fmt-fl0uwii1`), `code-health` PASS
+(`20260910T140837-code-health-7_ar5vrc`). One read-only reviewer returned 2
+findings (LZ4 count gap, write-budget gap); both fixed, no second review per
+policy. Maturity `draft`; no commit/push without authorization.
+
+Next: lighting (7), mobs (10), skeletons (11, 12), plant explosion follow-up.
+Queued parity nits: bucket ray vs grass OUTLINE, chest trapped/waterlogged/
+two-player/graphical, fish campfire/graphical, time graphical gate.
+
+## Previous checkpoint: time set trace (handoff issue 8, server half)
+
+Server chain verified end to end with vanilla evidence; no server-side value
+bug found. Console `night` parses to 13000 (aliases ruled out already);
+`OperatorControlHandle` uses the server-owned fence; simulation stores then
+broadcasts; `send_outbound_world_time` maps simulation_tick→game_time and
+world_time→overworld total (existing `world_time.rs` test pins both clocks).
+Vanilla `javap` on local client-26.1.2.jar: `WorldClocks.bootstrap`
+registers OVERWORLD first (id 0) then THE_END (id 1) — our constants match;
+`ClientboundSetTimePacket` layout (gameTime, holder-id map, VarLong total,
+floats) matches our codec; client `handleSetTime` applies `gameTime` via
+`setTimeFromServer` AND clock updates via `ClientClockManager.handleUpdates`,
+which keys by holder and sets total/partial/rate. Encoding suspects ruled out.
+Not yet done: the observed-client half — capture the actual packet bytes and
+sky/hostile-spawn agreement for night/day/noon/midnight in a real 26.1.2
+graphical run (no client credentials in this environment). A subsequent
+tick/sleep override was reviewed in code shape only (sleep `Skipped` is the
+sole alternate publisher; dedup cannot resurrect stale values).
+
+Changed: none (investigation only). No fix claimed; issue 8 stays open past
+this slice pending the graphical gate.
+
+Next: handoff issue 9 (region flush), then lighting (7), mobs (10),
+skeletons (11, 12), plant explosion follow-up. Queued parity nits: bucket ray
+vs grass OUTLINE, chest trapped/waterlogged/two-player/graphical, fish
+campfire/graphical.
+
+## Previous checkpoint: fish display IDs (handoff issue 2, logic half)
+
+The 6 real vanilla fish recipes sort right after `minecraft:chest`, shifting
+every later display ID +6. Per handoff 43-46 the shift is accepted (no
+ordering hack, no fake `zz_` IDs): 76 pins across 15 `mc-data` recipe tests
+moved +6, `chest`=5 untouched, production `solaris_required_recipes()`
+(BTreeMap sorted + `bone_meal` tail) unchanged. Advertisement and lookup
+share the same ordered set, so client/server stay consistent by construction.
+A reverted `STABLE_TAIL_IDS` detour is recorded and was wrong: it broke
+sorted order to preserve pins, against the handoff.
+Queued: campfire real-item + graphical client acceptance.
+
+Changed (uncommitted, C1 preserved): `mc-data/src/recipes.rs` test module
+only, on top of the chest + bucket + flower/grass slices below.
+
+Validation: 28/28 `mc-data` recipe tests; fish furnace/smoker regression;
+32 campfire; 2 play recipes; `mc-data` Clippy clean; harness `fmt` PASS
+(`20260910T133935-fmt-e27bi13b`), `code-health` PASS
+(`20260910T133939-code-health-l3s2h58o`). One read-only reviewer: pass.
+Maturity remains `draft`; no commit/push without explicit owner authorization.
+
+Next: handoff issue 8 (time set), then issue 9 (region flush). Queued plant
+follow-up: explosion candidates (`plan_explosion_candidates`) and
+fluid/placement-neighbor removals do not yet reuse `is_ground_support_plant`;
+queued parity nits: bucket ray vs grass OUTLINE, chest trapped/waterlogged/
+two-player/graphical, fish campfire/graphical.
+
+## Previous checkpoint: double-chest pairing (handoff issue 1, logic half)
+
+Placement pairing proven in both orders with complementary left/right types,
+equal facing, and either-half `paired_position` symmetry. Shared `opposite`
+from `mc_data::block_placement_26_1_2` replaces the local duplicate.
+Changed: `play/block_placement/chest.rs`, `chest_tests.rs` (mirror test).
+Validation: 3/3 chest planning, 22/22 block_placement, Clippy clean,
+harness `fmt` PASS (`20260910T133149-fmt-7vdqceed`), `code-health` PASS
+(`20260910T133152-code-health-r9b8pf16`); reviewer pass, no findings.
+Queued: trapped-vs-normal, waterlogged, two-player contents, graphical.
+
+## Previous checkpoint: authoritative buckets (handoff issues 5+6)
+
+Empty-bucket `UseItem` now picks up source fluid through a validated-pose
+raycast (source-only, occlusion, 4.5 range) reusing `BucketUsePlan` + the
+simulation commit transaction. Filled-bucket `UseItemOn` follows vanilla
+ordering (pickup-first, vegetation in-place replace, target reach,
+placeability incl. source refusal); every bucket-held outcome ends terminal
+via resync+ack with no double-ack, both hands. Unrelated stack moves/swaps,
+close/reopen and reconnect stay authoritative. Look math consolidated onto
+`player_look_direction` after review (no second convention).
+Queued parity nit (not a desync): the ray passes grass vanilla OUTLINE would
+stop at; confidence low, gameplay-only.
+
+Changed (uncommitted, C1 preserved): `play/bucket_interactions.rs`
+(raycast + hardened ordering + 8 tests), `play.rs` bucket branch + pose
+plumbing, `use_item_on_adapter.rs` visibility + pose arg, plus the
+flower/grass cascade below.
+
+Validation: 9 bucket module tests; neighbors bucket 19 / fluid 20 /
+use_item_on 18; `mc-net` Clippy tests clean; harness `fmt` PASS
+(`.analysis/validation/20260910T132734-fmt-k05y538m`), `code-health` PASS
+(`.analysis/validation/20260910T132738-code-health-l3s2h58o`). One read-only
+reviewer: correct with 2 P3 (look-dup fixed, grass-OUTLINE queued).
+Maturity remains `draft`; no commit/push without explicit owner authorization.
+
+## Previous checkpoint: flower/grass support cascade (handoff issues 3+4, break path)
+
+Breaking a support block authoritatively pops poppy, short grass and tall
+grass (lower + upper halves) in one transaction; every cascade edit carries a
+read precondition (unloaded neighbor chunk rejects the whole batch).
+Support-pop carries no held tool (no shears-only grass grant); the upper
+double-plant half drops nothing twice. `hanging_roots` excluded after review
+(ceiling-hung). Explosion/fluid/placement-neighbor paths still open.
+Changed: `play/block_break.rs`, `plant_rules_26_1_2.rs`,
+`play/tests/plants.rs` (4 regressions + import/sort fix),
+`play/tests/furnace.rs` Clippy borrow.
+Validation: 4/4 cascade + 101 plants/block_break; fish furnace test;
+`mc-net` Clippy clean; harness `fmt` PASS
+(`20260910T121027-fmt-rqtlu3zo`), `code-health` PASS
+(`20260910T121510-code-health-twwl4b6u`); reviewer changes (hanging_roots)
+fixed.
+
+## Previous checkpoint: owner-requested as-is handoff to main
 
 The owner stopped implementation and explicitly requested an immediate single
 commit and push to `main`, with unfinished work documented for another agent.
@@ -153,6 +407,67 @@ checkpoint stops. Evidence snapshots and validation are internal milestones,
 not permission gates or reasons to yield. Continue into the next bounded area
 unless a real blocker or material owner decision prevents progress.
 
+## Local C1 work: reapplied over updated origin/main
+
+The owner requested an upstream update and explicitly chose to reapply local
+C1 rather than park it. Core is based on `98eefb5f`; Loader and default-plugins
+already matched their current `origin/main`. Upstream field-test handoff and
+release notes above remain intact; this local work does not close those issues.
+
+C1 storage batches/scans/receipts are implemented. Compound inventory/storage
+uses one world-journal decision, with durable storage/playerdata projections
+before live publication. Recovery includes cursor and open-container inputs,
+runs without Lua, and restores checkpoint eligibility. Failed projection
+signals world fail-stop while the player inventory remains fenced.
+
+Before this upstream integration, 105 inventory tests passed, including process
+crashes and startup without Lua (`artifact://1770`). The broader correctness
+run passed formatting but failed Clippy on an unused import and unwired owned
+inventory helpers; the import was subsequently fixed. Those earlier results
+are not validation of the rebased tree.
+
+Verified pre-update backup, stash identity and synchronization evidence:
+`.analysis/codex-logs/upstream-sync-20260910T113724Z/receipt.json`.
+Prior implementation evidence:
+`.analysis/codex-logs/settlement-c1/owned-inventory-progress.json`.
+
+**C1 remains in progress.** Physical transfers/reservations still need runtime
+integration with canonical POI and resident ownership. The owner chose to allow
+destruction of containers holding reserved materials, with explicit loss
+accounting and no automatic compensation; do not make them indestructible.
+Contract: `../solaris-default-plugins/SETTLEMENT_OVERHAUL_CONTRACT.md`.
+
+## Previous checkpoint: published alpha-4 and verified installation
+
+[Solaris v0.0.4-alpha.1](https://github.com/kaiserproger/solaris/releases/tag/v0.0.4-alpha.1)
+is published from `60be6039bfc63e97a40299a378f3e66e6a7cac17`.
+[Tag workflow 34417692138](https://github.com/kaiserproger/solaris/actions/runs/34417692138)
+passed and published Linux x86_64/AArch64 archives and SHA-256 files.
+The final local correctness gate passed: 4,471 Rust tests, zero failures,
+194 ignored, plus formatter, strict Clippy and code-health. Installer and
+harness-check gates passed; the independent release review found no blockers.
+
+The pinned public installer downloaded the x86_64 release without a local
+asset override. The installed binary reports `mc-server 0.0.4-alpha.1`;
+strict configuration admission loaded all five explicitly installed standard
+packages from public package commit `2d51ae5559cdd5b7cbab32888ef2b11d931e3e6e`.
+An isolated fresh world started, accepted `status`, `save-all` and `stop`,
+then reopened its saved metadata and exited cleanly on SIGINT. Both exits
+were zero. The pipe driver required an explicit final LF; its initial wait
+timeout is retained in the receipt, not counted as a successful gate.
+
+World identity is schema 4 / worldgen revision 19. Use a fresh alpha-4 world;
+do not hand-edit older world metadata past the startup compatibility fence.
+These installation and diagnostic graphical checks are not full survival
+acceptance. The earlier no-debug survival scenario remains blocked; maturity
+remains **draft**. No local AArch64 runtime or packaged-JAR launcher-matrix
+claim is made.
+
+Evidence: `.analysis/releases/public-v0.0.4-alpha.1/receipt.json`.
+Next outcome: implement and verify C1 durable storage and inventory operations
+from `../solaris-default-plugins/SETTLEMENT_OVERHAUL_CONTRACT.md`, followed
+by the remaining owner-requested settlement contract and acceptance scenarios.
+
 ## Previous checkpoint: downloadable Loader preview
 
 [Solaris Loader v0.1.0](https://github.com/kaiserproger/solaris-loader/releases/tag/v0.1.0)
@@ -171,10 +486,6 @@ not packaged-JAR installation in every launcher; no broader claim is made.
 
 Evidence and release source/assets:
 `.analysis/releases/loader-v0.1.0/receipt.json`.
-Core remains unpublished alpha-4 work. Next outcome: publish the requested
-core alpha-4 with its compatible plugin installation workflow and verify the
-public installer, without treating diagnostic field checks as full survival
-acceptance. Settlement upstream implementation remains queued.
 
 ## Previous checkpoint: explicit plugin installation and author workflow
 

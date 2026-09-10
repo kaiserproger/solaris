@@ -1795,6 +1795,138 @@ fn hostile_candidate_scan_does_not_hold_session_registry() {
 }
 
 #[test]
+fn skeleton_projects_default_bow_in_main_hand() {
+    let registry = SessionRegistry::new();
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        114,
+        "minecraft:skeleton".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let skeleton_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:skeleton")
+        .expect("spawned skeleton")
+        .snapshot
+        .id;
+    let skeleton = registry
+        .lock_entities("project skeleton default equipment")
+        .snapshot(skeleton_id)
+        .expect("skeleton remains authoritative");
+    let projected = super::visibility::server_entity_snapshot_from(skeleton);
+    let bow = mc_data::Identifier::parse("minecraft:bow").unwrap();
+    let expected_bow_id = mc_data::items::solaris_required_items()
+        .id_of(&bow)
+        .expect("embedded item registry contains bow");
+    assert_eq!(
+        projected
+            .main_hand_item
+            .as_ref()
+            .map(|stack| (stack.item_id, stack.count)),
+        Some((expected_bow_id, 1))
+    );
+}
+#[test]
+fn skeleton_draw_pose_publishes_aggressive_on_target_acquire_and_loss() {
+    // The hostile tick evaluates aggressive every tick from the budgeted
+    // classification fetch and publishes both transitions once, then stays
+    // silent. The solo phases below run with no due hostile, pinning the
+    // early-return branch to publish as well.
+    let registry = SessionRegistry::new();
+    let alice = register_test_session(&registry, "SkeletonAggressiveAlice");
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        114,
+        "minecraft:skeleton".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let skeleton_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:skeleton")
+        .expect("spawned skeleton")
+        .snapshot
+        .id;
+    let aim_at_player = GoalState::FollowPosition {
+        target: Vec3::new(0.5, 64.0, 0.5),
+        speed: 0.25,
+    };
+    assert!(
+        registry
+            .lock_entities("aim skeleton at player")
+            .set_goal(skeleton_id, aim_at_player.clone())
+    );
+
+    fn aggressive_updates(dispatches: &[VisibilityDispatch], id: EntityId) -> Vec<bool> {
+        dispatches
+            .iter()
+            .filter_map(|dispatch| match &dispatch.command {
+                OutboundCommand::UpdateEntityData(snapshot) if snapshot.id == id => {
+                    Some(snapshot.aggressive)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    // Aggressive is evaluated every hostile tick from the same budgeted
+    // projection fetch — the very next tick publishes, no shot-cadence lag.
+    let (_, dispatches) =
+        registry.tick_hostile_attacks(&SimulationAuthority::for_test(), 1, BlockStateId(0));
+    assert_eq!(aggressive_updates(&dispatches, skeleton_id), [true]);
+    assert!(registry.lock_entities("skeleton loses player").set_goal(
+        skeleton_id,
+        GoalState::Wander {
+            speed: 0.2,
+            period_ticks: 20,
+        },
+    ));
+    let (_, dispatches) =
+        registry.tick_hostile_attacks(&SimulationAuthority::for_test(), 2, BlockStateId(0));
+    assert_eq!(aggressive_updates(&dispatches, skeleton_id), [false]);
+
+    for tick in 3..=10_u64 {
+        let (_, dispatches) =
+            registry.tick_hostile_attacks(&SimulationAuthority::for_test(), tick, BlockStateId(0));
+        assert!(
+            aggressive_updates(&dispatches, skeleton_id).is_empty(),
+            "steady aggressive state must not republish metadata"
+        );
+    }
+
+    // Pillager control: target acquisition must not flip aggressive.
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        114,
+        "minecraft:pillager".to_owned(),
+        Vec3::new(2.5, 64.0, 6.5),
+    );
+    let pillager_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:pillager")
+        .expect("spawned pillager")
+        .snapshot
+        .id;
+    assert!(
+        registry
+            .lock_entities("aim pillager at player")
+            .set_goal(pillager_id, aim_at_player)
+    );
+    for tick in 11..=20_u64 {
+        let (_, dispatches) =
+            registry.tick_hostile_attacks(&SimulationAuthority::for_test(), tick, BlockStateId(0));
+        assert!(
+            aggressive_updates(&dispatches, pillager_id)
+                .iter()
+                .all(|seen| !seen),
+            "aiming pillager must never publish aggressive"
+        );
+    }
+}
+
+#[test]
 fn pillager_crossbow_charges_then_spawns_one_owned_arrow() {
     let registry = SessionRegistry::new();
     registry.configure_arrow_kill_rewards(

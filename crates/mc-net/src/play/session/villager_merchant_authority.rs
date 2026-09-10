@@ -66,7 +66,8 @@ impl SessionRegistry {
             wait_started,
             guard,
         );
-        if player_state.game_mode == GameMode::Spectator
+        if player_state.inventory_recovery_required
+            || player_state.game_mode == GameMode::Spectator
             || player_state.survival.is_dead()
             || player_state.inventory.slots != plan.expected_inventory.slots
             || player_state.carried_item != plan.expected_carried_item

@@ -1192,7 +1192,7 @@ fn embedded_recipes_cook_fish_in_furnace_and_smoker() {
         .iter()
         .enumerate()
         .map(|(index, name)| ItemReport {
-            id: Identifier::parse(&format!("minecraft:{name}")).unwrap(),
+            id: Identifier::parse(format!("minecraft:{name}")).unwrap(),
             protocol_id: index as u32 + 1,
         })
         .collect::<Vec<_>>();

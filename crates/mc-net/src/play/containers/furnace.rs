@@ -129,8 +129,8 @@ pub(in crate::play) fn furnace_slot_to_stack(slot: &FurnaceSlot) -> ItemStack {
             item_id: slot.item_id,
             damage: slot.damage,
             enchantments: slot.enchantments.clone(),
-            custom_name: None,
-            item_model: None,
+            custom_name: slot.custom_name.clone(),
+            item_model: slot.item_model.clone(),
         }
     }
 }
@@ -144,6 +144,8 @@ pub(in crate::play) fn stack_to_furnace_slot(stack: &ItemStack) -> FurnaceSlot {
             item_id: stack.item_id,
             damage: stack.damage,
             enchantments: stack.enchantments.clone(),
+            custom_name: stack.custom_name.clone(),
+            item_model: stack.item_model.clone(),
         }
     }
 }

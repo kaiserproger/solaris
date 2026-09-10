@@ -1,3 +1,5 @@
+use super::super::simulation::{SurvivalBlockBreakPlan, SurvivalBreakHeldItem};
+use super::super::survival::BlockMutationSnapshot;
 use super::{
     BlockChangedAck, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition, BlockReport,
     BlockStateId, BlockUpdate, Chunk, ChunkPos, ClientboundContainerSetSlot, Compression,
@@ -9,10 +11,11 @@ use super::{
     farmland_trample_pos, fluid_test_facts, fluid_test_registry, handle_block_item_placement,
     insert_fluid_test_chunk, interaction_state_for_blocks, interaction_state_for_items,
     maybe_trample_farmland, next_crop_growth_state, pack_block_pos, plan_break_block_edits,
-    plan_hoe_tilling, plan_loaded_bonemeal_growth, plan_loaded_plant_harvest,
-    plan_place_block_edits, player_pose_collides_with_solid, prop_schema, random_tick_edit,
-    random_tick_edit_seeded, register_ticketed_button_session, simple_block, simulation_channel,
-    state, sweet_berry_harvest, test_use_item_on, unpack_block_pos,
+    plan_break_edit_preconditions, plan_hoe_tilling, plan_loaded_bonemeal_growth,
+    plan_loaded_plant_harvest, plan_place_block_edits, plan_survival_break_drops,
+    player_pose_collides_with_solid, prop_schema, random_tick_edit, random_tick_edit_seeded,
+    register_ticketed_button_session, simple_block, simulation_channel, state, sweet_berry_harvest,
+    test_use_item_on, unpack_block_pos,
 };
 use mc_protocol::Packet;
 use std::sync::Arc;
@@ -873,6 +876,269 @@ fn cactus_column_cascades_when_support_breaks() {
                 new_state: BlockStateId(0),
             },
         ]
+    );
+}
+
+fn ground_plant_test_registry() -> Arc<mc_world::BlockRegistry> {
+    Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:dirt"),
+            simple_block(2, "minecraft:poppy"),
+            simple_block(3, "minecraft:short_grass"),
+            BlockReport {
+                id: Identifier::parse("minecraft:tall_grass").unwrap(),
+                properties: prop_schema(&[("half", &["lower", "upper"])]),
+                states: vec![
+                    state(4, true, &[("half", "lower")]),
+                    state(5, false, &[("half", "upper")]),
+                ],
+            },
+            simple_block(6, "minecraft:stone"),
+        ])
+        .unwrap(),
+    )
+}
+
+fn ground_plant_world(registry: &Arc<mc_world::BlockRegistry>) -> mc_world::WorldStorage {
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    world
+}
+
+#[test]
+fn flowers_and_grass_pop_when_support_breaks() {
+    let registry = ground_plant_test_registry();
+    let blocks = registry.as_ref();
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let plant = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    for (plant_state, label) in [(BlockStateId(2), "poppy"), (BlockStateId(3), "short_grass")] {
+        let mut world = ground_plant_world(&registry);
+        world.set_block_at(support, BlockStateId(1)).unwrap();
+        world.set_block_at(plant, plant_state).unwrap();
+
+        let edits = plan_break_block_edits(
+            blocks,
+            &world,
+            support,
+            BlockStateId(1),
+            BlockStateId(0),
+            BlockStateId(0),
+        );
+
+        assert_eq!(
+            edits,
+            vec![
+                BlockEdit {
+                    pos: support,
+                    new_state: BlockStateId(0),
+                },
+                BlockEdit {
+                    pos: plant,
+                    new_state: BlockStateId(0),
+                },
+            ],
+            "{label} must pop with its support in one authoritative transaction"
+        );
+    }
+
+    let mut world = ground_plant_world(&registry);
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(plant, BlockStateId(6)).unwrap();
+    let edits = plan_break_block_edits(
+        blocks,
+        &world,
+        support,
+        BlockStateId(1),
+        BlockStateId(0),
+        BlockStateId(0),
+    );
+    assert_eq!(
+        edits,
+        vec![BlockEdit {
+            pos: support,
+            new_state: BlockStateId(0),
+        }],
+        "a non-plant neighbour must not pop"
+    );
+}
+
+#[test]
+fn double_plant_pops_both_halves_when_support_breaks() {
+    let registry = ground_plant_test_registry();
+    let blocks = registry.as_ref();
+    let mut world = ground_plant_world(&registry);
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let lower = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let upper = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(lower, BlockStateId(4)).unwrap();
+    world.set_block_at(upper, BlockStateId(5)).unwrap();
+
+    let edits = plan_break_block_edits(
+        blocks,
+        &world,
+        support,
+        BlockStateId(1),
+        BlockStateId(0),
+        BlockStateId(0),
+    );
+
+    assert_eq!(
+        edits,
+        vec![
+            BlockEdit {
+                pos: support,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: lower,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: upper,
+                new_state: BlockStateId(0),
+            },
+        ]
+    );
+}
+
+#[test]
+fn breaking_double_plant_lower_half_directly_pops_the_upper_half() {
+    let registry = ground_plant_test_registry();
+    let blocks = registry.as_ref();
+    let mut world = ground_plant_world(&registry);
+    let lower = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let upper = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(lower, BlockStateId(4)).unwrap();
+    world.set_block_at(upper, BlockStateId(5)).unwrap();
+
+    let edits = plan_break_block_edits(
+        blocks,
+        &world,
+        lower,
+        BlockStateId(4),
+        BlockStateId(0),
+        BlockStateId(0),
+    );
+
+    assert_eq!(
+        edits,
+        vec![
+            BlockEdit {
+                pos: lower,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: upper,
+                new_state: BlockStateId(0),
+            },
+        ]
+    );
+}
+
+#[test]
+fn support_pop_drops_once_per_double_plant_and_skips_the_upper_half() {
+    let registry = ground_plant_test_registry();
+    let blocks = registry.as_ref();
+    let mut world = ground_plant_world(&registry);
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let lower = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let upper = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(lower, BlockStateId(4)).unwrap();
+    world.set_block_at(upper, BlockStateId(5)).unwrap();
+    let expected_root = BlockMutationSnapshot {
+        state: BlockStateId(1),
+        token: world.block_mutation_token(support).unwrap(),
+    };
+    let edits = plan_break_block_edits(
+        blocks,
+        &world,
+        support,
+        BlockStateId(1),
+        BlockStateId(0),
+        BlockStateId(0),
+    );
+    let preconditions =
+        plan_break_edit_preconditions(blocks, &world, &edits, support, expected_root).unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: Identifier::parse("minecraft:dirt").unwrap(),
+            protocol_id: 1,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:tall_grass").unwrap(),
+            protocol_id: 2,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:shears").unwrap(),
+            protocol_id: 9,
+        },
+    ]));
+    let loot = Arc::new(mc_data::loot::LootTables::from_drop_maps(
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::from([
+            (
+                Identifier::parse("minecraft:dirt").unwrap(),
+                mc_data::loot::LootDrop::single(Identifier::parse("minecraft:dirt").unwrap()),
+            ),
+            (
+                Identifier::parse("minecraft:tall_grass").unwrap(),
+                mc_data::loot::LootDrop::single(Identifier::parse("minecraft:tall_grass").unwrap()),
+            ),
+        ]),
+    ));
+    let request = SurvivalBlockBreakPlan {
+        position: support,
+        expected_target: expected_root,
+        blocks: Arc::clone(&registry),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        water: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        loot,
+        item_entity_type_id: Some(7),
+        falling_block_entity_type_id: None,
+        loader_block_drop: None,
+        held: SurvivalBreakHeldItem {
+            hotbar_slot: 0,
+            expected: ItemStack::new(9, 1),
+            max_damage: None,
+        },
+        drop_items: true,
+    };
+
+    let drops = plan_survival_break_drops(&request, &edits, &preconditions, BlockStateId(0));
+
+    let mut seen = drops
+        .iter()
+        .map(|drop| (drop.position, drop.stack.item_id))
+        .collect::<Vec<_>>();
+    seen.sort_by(|a, b| {
+        a.0.y
+            .partial_cmp(&b.0.y)
+            .unwrap()
+            .then_with(|| a.0.x.partial_cmp(&b.0.x).unwrap())
+            .then_with(|| a.0.z.partial_cmp(&b.0.z).unwrap())
+    });
+    assert_eq!(
+        seen,
+        vec![
+            (mc_entity::Vec3::new(4.5, 64.5, 4.5), 1),
+            (mc_entity::Vec3::new(4.5, 65.5, 4.5), 2),
+        ],
+        "support and lower half drop once; the upper half drops nothing even with shears held"
     );
 }
 

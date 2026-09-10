@@ -53,6 +53,7 @@ fn entity_snapshot(type_id: i32, type_name: &str) -> ServerEntitySnapshot {
         crossbow_charging: false,
         blaze_charged: false,
         guardian_attack_target_entity_id: 0,
+        aggressive: false,
     }
 }
 

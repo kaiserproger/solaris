@@ -315,7 +315,7 @@ impl ShutdownHandle {
         self.wait_requested().await;
     }
 
-    fn save_coordinator(&self) -> Arc<Mutex<()>> {
+    pub(crate) fn save_coordinator(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.save_coordinator)
     }
 
@@ -4023,20 +4023,6 @@ async fn bind_internal(
             Vec::new(),
         )
     };
-    let script_storage = match (scripts.as_ref(), entity_world_root.as_deref()) {
-        (Some(scripts), Some(root)) => Some(
-            PluginStorageHandle::start(
-                root,
-                scripts.clone(),
-                config.shutdown.clone(),
-                Arc::clone(&sessions),
-                Arc::clone(&config.items),
-                Arc::clone(&config.item_facts),
-            )
-            .map_err(plugin_storage_bind_error)?,
-        ),
-        _ => None,
-    };
     if let (Some(root), Some(world)) = (entity_world_root.as_deref(), config.world.as_ref()) {
         let (journal, pending) = play::world_journal::WorldChunkJournal::open(
             root,
@@ -4075,6 +4061,40 @@ async fn bind_internal(
         }
         sessions.install_world_chunk_journal(journal);
     }
+    let inventory_storage = if let Some(root) = entity_world_root.as_deref()
+        && (scripts.is_some()
+            || sessions
+                .world_chunk_journal()
+                .is_some_and(|journal| journal.has_inventory_decisions()))
+    {
+        let mut storage =
+            crate::script::storage::PluginStorage::open(root).map_err(plugin_storage_bind_error)?;
+        let inventory = crate::script::storage::world_inventory::InventoryRuntime::new(
+            Some(root),
+            &config.shutdown,
+            Arc::clone(&sessions),
+            Arc::clone(&config.items),
+            Arc::clone(&config.item_facts),
+        );
+        inventory
+            .recover(&mut storage)
+            .map_err(plugin_storage_bind_error)?;
+        Some((storage, inventory))
+    } else {
+        None
+    };
+    let script_storage =
+        scripts
+            .as_ref()
+            .zip(inventory_storage)
+            .map(|(scripts, (storage, inventory))| {
+                PluginStorageHandle::start(
+                    storage,
+                    inventory,
+                    scripts.clone(),
+                    config.shutdown.clone(),
+                )
+            });
     let (simulation, mut simulation_owner) =
         play::simulation_channel_with_explosion_seed(config.random_tick.seed as i64);
     play::configure_session_arrow_kill_rewards(&sessions, &config);
@@ -4885,7 +4905,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 mod server_collision_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use mc_data::blocks::{BlockReport, BlockStateReport};
     use mc_script::{
@@ -7992,7 +8012,7 @@ mod tests {
         drop(bound);
     }
 
-    fn save_all_test_config(
+    pub(crate) fn save_all_test_config(
         tmp: &std::path::Path,
         blocks: Arc<BlockRegistry>,
         items: Arc<mc_data::items::ItemRegistry>,

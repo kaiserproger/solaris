@@ -92,7 +92,7 @@ enum RegionalMutationJob {
         position: BlockPos,
         expected_state_id: i32,
         expected: FurnaceBlockEntity,
-        updated: FurnaceBlockEntity,
+        updated: Box<FurnaceBlockEntity>,
         player: Box<ContainerPlayerPlan>,
     },
     OpaqueBlockEntity {

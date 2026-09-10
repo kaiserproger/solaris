@@ -31,7 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 md-5 = { workspace = true }
 crc32fast = { workspace = true }
 aes = { workspace = true }

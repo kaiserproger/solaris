@@ -6,8 +6,10 @@ use mc_data::items::ItemRegistry;
 use mc_script::ScriptInventoryStorageTransaction;
 
 use crate::lock_policy::{lock_authoritative_mutex, resolve_authoritative_lock};
+use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::play::script_inventory_transaction::{
-    ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare, plan_script_inventory_transaction,
+    ScriptStorageCommitError, ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
+    plan_script_inventory_transaction,
 };
 
 use super::SessionRegistry;
@@ -150,7 +152,7 @@ impl SessionRegistry {
         let Some(_transaction_guard) = transaction_gate.begin_compound(player_id) else {
             return Ok(false);
         };
-        let (player_state, recipient) = {
+        let (player_state, recipient, player_uuid) = {
             let inner = self.lock_inner("capture compound inventory transaction owner");
             let Some(session) = inner.sessions.get(&player_id) else {
                 return Ok(false);
@@ -166,7 +168,11 @@ impl SessionRegistry {
             let Some(player_state) = inner.player_persistence.get(&player_id).cloned() else {
                 return Ok(false);
             };
-            (player_state, ordered_session_recipient(player_id, session))
+            (
+                player_state,
+                ordered_session_recipient(player_id, session),
+                session.uuid,
+            )
         };
 
         let wait_started = Instant::now();
@@ -177,6 +183,9 @@ impl SessionRegistry {
             wait_started,
             guard,
         );
+        if player_state.inventory_recovery_required {
+            return Ok(false);
+        }
         let plan = match plan_script_inventory_transaction(
             transaction,
             &player_state.inventory,
@@ -186,12 +195,22 @@ impl SessionRegistry {
             Ok(plan) => plan,
             Err(_) => return Ok(false),
         };
-        let prepared = match storage.prepare(plugin_id, transaction.storage())? {
+        let recovery = PlayerInventoryRecovery::capture(player_uuid, &player_state, &plan, items)
+            .map_err(std::io::Error::other)?;
+        let prepared = match storage.prepare(plugin_id, transaction.storage(), recovery)? {
             ScriptStoragePrepareOutcome::Prepared(prepared) => prepared,
             ScriptStoragePrepareOutcome::Rejected => return Ok(false),
         };
-        storage.commit(prepared)?;
+        let revision = match storage.commit(prepared) {
+            Ok(revision) => revision,
+            Err(ScriptStorageCommitError::NotCommitted(error)) => return Err(error),
+            Err(ScriptStorageCommitError::DurabilityUnknown(error)) => {
+                player_state.inventory_recovery_required = true;
+                return Err(error);
+            }
+        };
         player_state.replace_inventory(plan.clone());
+        player_state.inventory_operation_revision = revision;
         let carried_item = player_state.carried_item.clone();
         drop(player_state);
 

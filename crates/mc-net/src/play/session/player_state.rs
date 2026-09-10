@@ -121,7 +121,8 @@ impl SessionRegistry {
         if player_state
             .inventory
             .try_update(|inventory| {
-                if inventory.slots != player.expected_inventory.slots
+                if player_state.inventory_recovery_required
+                    || inventory.slots != player.expected_inventory.slots
                     || player_state.carried_item != player.expected_carried_item
                     || player
                         .crafting_table_input
@@ -375,7 +376,8 @@ pub(super) fn player_survival_plan_matches(
     state: &PlayerPersistedState,
     plan: &PlayerSurvivalPlan,
 ) -> bool {
-    state.survival == plan.expected_survival
+    !state.inventory_recovery_required
+        && state.survival == plan.expected_survival
         && state.inventory.slots == plan.expected_inventory.slots
         && state.carried_item == plan.expected_carried_item
         && state.xp == plan.expected_xp
@@ -389,7 +391,8 @@ pub(super) fn player_attack_cost_plan_matches(
     state: &PlayerPersistedState,
     plan: &PlayerSurvivalPlan,
 ) -> bool {
-    state.survival.food == plan.expected_survival.food
+    !state.inventory_recovery_required
+        && state.survival.food == plan.expected_survival.food
         && state.survival.saturation == plan.expected_survival.saturation
         && state.survival.exhaustion == plan.expected_survival.exhaustion
         && state.inventory.slots == plan.expected_inventory.slots

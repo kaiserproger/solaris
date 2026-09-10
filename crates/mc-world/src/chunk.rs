@@ -327,6 +327,8 @@ pub struct FurnaceSlot {
     pub item_id: u32,
     pub damage: Option<i32>,
     pub enchantments: Vec<mc_data::ItemEnchantment>,
+    pub custom_name: Option<String>,
+    pub item_model: Option<Arc<Identifier>>,
 }
 
 impl FurnaceSlot {
@@ -335,6 +337,8 @@ impl FurnaceSlot {
         item_id: 0,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
 
     #[must_use]

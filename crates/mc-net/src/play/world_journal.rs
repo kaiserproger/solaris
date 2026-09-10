@@ -12,6 +12,10 @@ use thiserror::Error;
 
 use crate::lock_policy::lock_authoritative_mutex;
 
+#[path = "world_inventory_journal.rs"]
+mod inventory;
+use inventory::{INVENTORY_FRAME_MAGIC, InventoryDecision};
+
 const SOLARIS_DIRECTORY: &str = "solaris";
 const JOURNAL_FILE: &str = "world-chunk-journal.bin";
 const JOURNAL_LOCK_FILE: &str = "world-chunk-journal.lock";
@@ -53,6 +57,7 @@ pub(crate) struct WorldChunkDecision {
     id: u64,
     current_tick: u64,
     images: Vec<WorldChunkImage>,
+    inventory: Option<InventoryDecision>,
 }
 
 impl WorldChunkDecision {
@@ -96,6 +101,15 @@ pub(crate) enum WorldChunkJournalError {
     UnsupportedVersion(u32),
     #[error("world chunk journal is corrupt at byte {offset}: {reason}")]
     Corrupt { offset: u64, reason: String },
+    #[error("invalid world inventory decision: {0}")]
+    InventoryDecision(String),
+    #[error("world inventory decision encoding failed: {0}")]
+    InventoryEncoding(#[source] crate::script::storage::PluginStorageMutationError),
+    #[error("world inventory decision sync outcome is unknown: {source}")]
+    InventorySyncOutcomeUnknown {
+        #[source]
+        source: Box<WorldChunkJournalError>,
+    },
     #[error("world chunk journal frame is too large: {0} bytes")]
     FrameTooLarge(u64),
     #[error("world chunk journal file is too large: {0} bytes")]
@@ -172,6 +186,7 @@ impl WorldChunkJournalError {
             Self::CheckpointOutcomeUnknown { .. }
                 | Self::CheckpointCompletionLost
                 | Self::PoisonedOutcomeUnknown
+                | Self::InventorySyncOutcomeUnknown { .. }
         )
     }
 }
@@ -398,6 +413,7 @@ impl WorldChunkJournal {
             id,
             current_tick,
             images,
+            inventory: None,
         };
         if let Err(error) = append_decisions(&mut state, vec![decision]) {
             drop(state);
@@ -453,6 +469,7 @@ impl WorldChunkJournal {
                 id,
                 current_tick,
                 images: self.encode_images(current_tick, snapshots)?,
+                inventory: None,
             });
         }
 
@@ -542,6 +559,8 @@ impl WorldChunkJournal {
         self.shared
             .lock_state()
             .pending
+            .iter()
+            .take_while(|decision| decision.checkpoint_ready())
             .last()
             .map(WorldChunkDecision::id)
     }
@@ -558,7 +577,9 @@ impl WorldChunkJournal {
         }
         let first_retained = state
             .pending
-            .partition_point(|decision| decision.id <= watermark);
+            .iter()
+            .take_while(|decision| decision.id <= watermark && decision.checkpoint_ready())
+            .count();
         if first_retained == 0 {
             return Ok(());
         }
@@ -1122,7 +1143,8 @@ fn decode_frame_at(
 ) -> Result<(WorldChunkDecision, usize), FrameDecodeError> {
     let remaining = &bytes[offset..];
     if remaining.len() < FRAME_MAGIC.len() {
-        return if FRAME_MAGIC.starts_with(remaining) {
+        return if FRAME_MAGIC.starts_with(remaining) || INVENTORY_FRAME_MAGIC.starts_with(remaining)
+        {
             Err(FrameDecodeError::Incomplete(
                 "incomplete frame magic".to_owned(),
             ))
@@ -1136,7 +1158,8 @@ fn decode_frame_at(
     let prefix = bytes
         .get(offset..prefix_end)
         .ok_or_else(|| FrameDecodeError::Incomplete("incomplete frame prefix".to_owned()))?;
-    if &prefix[..FRAME_MAGIC.len()] != FRAME_MAGIC {
+    let has_inventory = &prefix[..FRAME_MAGIC.len()] == INVENTORY_FRAME_MAGIC;
+    if !has_inventory && &prefix[..FRAME_MAGIC.len()] != FRAME_MAGIC {
         return Err(FrameDecodeError::Corrupt("invalid frame magic".to_owned()));
     }
     let payload_len = u64::from_le_bytes(
@@ -1174,7 +1197,8 @@ fn decode_frame_at(
             "frame checksum mismatch: stored {stored_crc:#010x}, computed {actual_crc:#010x}"
         )));
     }
-    let decision = decode_decision_payload(payload).map_err(FrameDecodeError::Corrupt)?;
+    let decision =
+        decode_decision_payload(payload, has_inventory).map_err(FrameDecodeError::Corrupt)?;
     Ok((decision, frame_end))
 }
 
@@ -1185,7 +1209,7 @@ fn has_valid_frame_after(bytes: &[u8], start: usize) -> bool {
     bytes[start..]
         .windows(FRAME_MAGIC.len())
         .enumerate()
-        .filter(|(_, candidate)| *candidate == FRAME_MAGIC)
+        .filter(|(_, candidate)| *candidate == FRAME_MAGIC || *candidate == INVENTORY_FRAME_MAGIC)
         .any(|(relative, _)| decode_frame_at(bytes, start + relative).is_ok())
 }
 
@@ -1227,7 +1251,11 @@ fn encode_frame(decision: &WorldChunkDecision) -> Result<Vec<u8>, WorldChunkJour
     frame
         .try_reserve_exact(frame_len)
         .map_err(|_| WorldChunkJournalError::AllocationFailed(frame_len))?;
-    frame.extend_from_slice(FRAME_MAGIC);
+    frame.extend_from_slice(if decision.inventory.is_some() {
+        INVENTORY_FRAME_MAGIC
+    } else {
+        FRAME_MAGIC
+    });
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&payload);
     frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
@@ -1287,6 +1315,12 @@ fn encode_decision_payload(
         bytes.extend_from_slice(&nbt_len.to_le_bytes());
         bytes.extend_from_slice(&image.nbt);
     }
+    if let Some(inventory) = &decision.inventory {
+        let length = u32::try_from(inventory.payload.len())
+            .map_err(|_| WorldChunkJournalError::FrameTooLarge(u64::MAX))?;
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.extend_from_slice(&inventory.payload);
+    }
     Ok(bytes)
 }
 
@@ -1307,6 +1341,20 @@ fn decision_payload_len(decision: &WorldChunkDecision) -> Result<usize, WorldChu
             .and_then(|len| len.checked_add(image.nbt.len()))
             .ok_or(WorldChunkJournalError::FrameTooLarge(u64::MAX))?;
     }
+    if let Some(inventory) = &decision.inventory {
+        if inventory.payload.is_empty()
+            || inventory.payload.len()
+                > crate::script::storage::PreparedStorageBatch::MAX_ENCODED_BYTES
+        {
+            return Err(WorldChunkJournalError::InventoryDecision(
+                "inventory payload size".to_owned(),
+            ));
+        }
+        payload_len = payload_len
+            .checked_add(size_of::<u32>())
+            .and_then(|len| len.checked_add(inventory.payload.len()))
+            .ok_or(WorldChunkJournalError::FrameTooLarge(u64::MAX))?;
+    }
     let payload_len_u64 = u64::try_from(payload_len).expect("usize always fits u64");
     if payload_len_u64 > MAX_FRAME_BYTES {
         return Err(WorldChunkJournalError::FrameTooLarge(payload_len_u64));
@@ -1314,7 +1362,10 @@ fn decision_payload_len(decision: &WorldChunkDecision) -> Result<usize, WorldChu
     Ok(payload_len)
 }
 
-fn decode_decision_payload(payload: &[u8]) -> Result<WorldChunkDecision, String> {
+fn decode_decision_payload(
+    payload: &[u8],
+    has_inventory: bool,
+) -> Result<WorldChunkDecision, String> {
     let mut reader = PayloadReader::new(payload);
     let id = reader.u64("record id")?;
     if id == 0 {
@@ -1350,6 +1401,19 @@ fn decode_decision_payload(payload: &[u8]) -> Result<WorldChunkDecision, String>
         let nbt = reader.bytes(nbt_len, "NBT payload")?.to_vec();
         images.push(WorldChunkImage { position, nbt });
     }
+    let inventory = if has_inventory {
+        let length = usize::try_from(reader.u32("inventory payload length")?)
+            .map_err(|_| "inventory payload length does not fit this platform".to_owned())?;
+        if length == 0 || length > crate::script::storage::PreparedStorageBatch::MAX_ENCODED_BYTES {
+            return Err("invalid inventory payload size".to_owned());
+        }
+        Some(InventoryDecision {
+            payload: reader.bytes(length, "inventory payload")?.to_vec(),
+            projected: false,
+        })
+    } else {
+        None
+    };
     if !reader.remaining().is_empty() {
         return Err("record payload has trailing bytes".to_owned());
     }
@@ -1357,6 +1421,7 @@ fn decode_decision_payload(payload: &[u8]) -> Result<WorldChunkDecision, String>
         id,
         current_tick,
         images,
+        inventory,
     })
 }
 

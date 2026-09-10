@@ -8,7 +8,6 @@ use tokio::sync::mpsc;
 
 use super::*;
 use crate::login::LoggedInProfile;
-
 fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
     let profile = LoggedInProfile {
         uuid: crate::login::offline_uuid(name),

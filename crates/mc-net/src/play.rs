@@ -140,6 +140,14 @@ mod merchant_adapter;
 mod movement;
 #[cfg(test)]
 mod movement_tests;
+// Transitional: only owned_inventory tests use the planner until C1 wires
+// canonical POI/resident endpoints into the runtime.
+#[cfg(test)]
+mod owned_inventory;
+#[cfg(test)]
+mod owned_inventory_request_tests;
+#[cfg(test)]
+mod owned_inventory_tests;
 pub(crate) mod persistence;
 mod player_breathing;
 #[cfg(test)]
@@ -166,7 +174,7 @@ use merchant_adapter::{handle_select_trade, open_merchant_container};
 use player_breathing::{PlayerBreathingState, player_can_drown};
 mod script_inventory_transaction;
 pub(crate) use script_inventory_transaction::{
-    ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
+    ScriptStorageCommitError, ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
 };
 #[cfg(test)]
 mod script_inventory_transaction_tests;
@@ -299,6 +307,7 @@ use block_wire::{
 };
 #[cfg(test)]
 use block_wire::{BlockDeltaPacket, plan_block_delta_packets};
+use bucket_interactions::handle_bucket_use;
 #[cfg(test)]
 use bucket_interactions::plan_bucket_replacement;
 #[cfg(test)]
@@ -11669,6 +11678,7 @@ async fn handle_use_item<W>(
     writer: &mut W,
     game_mode: GameMode,
     survival_state: &mut SurvivalState,
+    player_pose: PlayerPose,
     action: ServerboundUseItem,
 ) -> Result<(), ConnectionError>
 where
@@ -11704,6 +11714,10 @@ where
             kind: UseKind::Bow,
         });
         return write_block_ack(writer, state.compression, action.sequence).await;
+    }
+
+    if handle_bucket_use(state, writer, game_mode, player_pose, action).await? {
+        return Ok(());
     }
 
     if survival_state.food >= mc_entity::player_survival_26_1_2::MAX_FOOD {
@@ -12280,7 +12294,15 @@ where
         ServerboundUseItem::ID => {
             let use_item = ServerboundUseItem::decode(&mut body)?;
             if let Some(state) = interaction.as_deref_mut() {
-                handle_use_item(state, writer, game_mode, survival_state, use_item).await?;
+                handle_use_item(
+                    state,
+                    writer,
+                    game_mode,
+                    survival_state,
+                    player_pose,
+                    use_item,
+                )
+                .await?;
             } else {
                 debug!(
                     sequence = use_item.sequence,

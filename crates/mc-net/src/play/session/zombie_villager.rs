@@ -60,7 +60,8 @@ impl SessionRegistry {
         if plan.held_slot != selected_slot && plan.held_slot != PlayerInventory::OFFHAND_SLOT {
             return None;
         }
-        if player_state.inventory.slots[plan.held_slot] != plan.expected_held
+        if player_state.inventory_recovery_required
+            || player_state.inventory.slots[plan.held_slot] != plan.expected_held
             || plan.expected_held.is_empty()
             || plan.expected_held.item_id != plan.golden_apple_item_id
         {

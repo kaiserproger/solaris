@@ -17,6 +17,8 @@ fn hopper_rejects_non_flammable_wood_without_mutating_the_furnace() {
         item_id: 44,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
     };
     let mut furnace = FurnaceBlockEntity::default();
 

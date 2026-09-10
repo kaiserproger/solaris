@@ -1,3 +1,7 @@
+mod inventory;
+#[cfg(test)]
+mod inventory_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
@@ -99,10 +103,10 @@ pub(crate) struct ResidentCrossRegionBlockEditPlan<'a> {
     pub leaf_trigger_tick: Option<u64>,
 }
 
-/// Staged block changes with source-fenced, all-or-nothing publication.
+/// Staged chunk changes with source-fenced, all-or-nothing publication.
 /// The transaction retains source snapshots until commit; [`Self::commit_durably`]
 /// additionally requires persistence to succeed before publication.
-pub struct ResidentCrossRegionScheduledBlockTickTransaction {
+pub struct ResidentChunkTransaction {
     resident: ResidentChunkStore,
     chunks: Vec<ResidentCrossRegionStagedChunk>,
     applied: Vec<ResidentAppliedBlockEdit>,
@@ -118,7 +122,7 @@ struct ResidentCrossRegionStagedChunk {
 }
 
 pub enum ResidentCrossRegionScheduledBlockTickPrepareResult {
-    Prepared(ResidentCrossRegionScheduledBlockTickTransaction),
+    Prepared(ResidentChunkTransaction),
     Missing,
     Stale,
 }
@@ -170,7 +174,7 @@ pub enum ResidentChestCommitResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResidentFurnaceCommitResult {
     Applied,
-    Rejected(FurnaceBlockEntity),
+    Rejected(Box<FurnaceBlockEntity>),
     Missing,
 }
 
@@ -1370,7 +1374,7 @@ impl WorldMutationView {
         if authoritative.slots != expected.slots
             || authoritative.recipes_used != expected.recipes_used
         {
-            return ResidentFurnaceCommitResult::Rejected(authoritative);
+            return ResidentFurnaceCommitResult::Rejected(Box::new(authoritative));
         }
         let mut merged = authoritative;
         merged.slots = updated.slots.clone();
@@ -1678,9 +1682,8 @@ impl WorldMutationView {
 
     /// Prepare a cross-region scheduled block tick without mutating a resident
     /// store or publishing a world snapshot. Callers must persist
-    /// [`ResidentCrossRegionScheduledBlockTickTransaction::journal_snapshots`]
-    /// through
-    /// [`ResidentCrossRegionScheduledBlockTickTransaction::commit_durably`].
+    /// [`ResidentChunkTransaction::journal_snapshots`] through
+    /// [`ResidentChunkTransaction::commit_durably`].
     pub fn prepare_cross_region_scheduled_block_tick_transaction(
         &self,
         decision_id: Option<u64>,
@@ -2006,16 +2009,14 @@ impl WorldMutationView {
 
         let mut touched = touched.into_iter().collect::<Vec<_>>();
         touched.sort_unstable_by_key(|position| (position.x, position.z));
-        ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(
-            ResidentCrossRegionScheduledBlockTickTransaction {
-                resident: self.resident.clone(),
-                chunks,
-                applied,
-                touched,
-                #[cfg(test)]
-                publish_hook: None,
-            },
-        )
+        ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(ResidentChunkTransaction {
+            resident: self.resident.clone(),
+            chunks,
+            applied,
+            touched,
+            #[cfg(test)]
+            publish_hook: None,
+        })
     }
 
     fn apply_block_edits_conditionally_inner(
@@ -2477,7 +2478,7 @@ impl WorldMutationView {
     }
 }
 
-impl ResidentCrossRegionScheduledBlockTickTransaction {
+impl ResidentChunkTransaction {
     #[cfg(test)]
     fn set_publish_hook(&mut self, hook: Arc<dyn Fn(ChunkPos) + Send + Sync>) {
         self.publish_hook = Some(hook);
@@ -2510,6 +2511,16 @@ impl ResidentCrossRegionScheduledBlockTickTransaction {
         self,
         persist: impl FnOnce(Vec<ChunkSnapshot>) -> Result<(), E>,
     ) -> ResidentCrossRegionScheduledBlockTickCommitResult<E> {
+        self.commit_durably_classified(persist, |_| false)
+    }
+
+    /// Uses the existing publication fail-stop when persistence may have
+    /// committed. A known rejection leaves every source usable and unchanged.
+    pub fn commit_durably_classified<E>(
+        self,
+        persist: impl FnOnce(Vec<ChunkSnapshot>) -> Result<(), E>,
+        outcome_unknown: impl FnOnce(&E) -> bool,
+    ) -> ResidentCrossRegionScheduledBlockTickCommitResult<E> {
         let publication = self.resident.read_view.publication_state();
         let transaction = publication.transaction();
         if let Some(result) = self.verify_sources() {
@@ -2525,6 +2536,9 @@ impl ResidentCrossRegionScheduledBlockTickTransaction {
             };
         }
         if let Err(error) = persist(self.journal_snapshots()) {
+            if outcome_unknown(&error) {
+                drop(publication.begin_publish(transaction));
+            }
             return ResidentCrossRegionScheduledBlockTickCommitResult::DurabilityFailed(error);
         }
         let applied = self.publish(&publication, transaction);
