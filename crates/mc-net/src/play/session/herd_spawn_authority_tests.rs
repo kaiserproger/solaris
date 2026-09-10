@@ -253,7 +253,7 @@ fn periodic_scheduler_is_bounded_rotating_and_intervals_are_independent() {
 }
 
 #[test]
-fn periodic_spawning_has_no_population_cap_and_preserves_collision_admission() {
+fn periodic_spawning_caps_population_and_refills_only_vacant_capacity() {
     let chunks = (2..6)
         .flat_map(|x| (-2..2).map(move |z| (x, z)))
         .collect::<HashSet<_>>();
@@ -288,15 +288,15 @@ fn periodic_spawning_has_no_population_cap_and_preserves_collision_admission() {
         tick_input(400, 400, 0, 20, Some(&world_read), Some(&materials)),
     );
     assert_eq!(initial.friendly.chunks_sampled, 16);
-    assert_eq!(initial.friendly.committed, 128);
-    assert_eq!(registry.persisted_entity_records().len(), 128);
+    assert_eq!(initial.friendly.committed, 10);
+    assert_eq!(registry.persisted_entity_records().len(), 10);
 
     let (at_cap, _) = registry.tick_periodic_natural_spawning(
         &mut scheduler,
         tick_input(800, 400, 0, 20, Some(&world_read), Some(&materials)),
     );
     assert_eq!(at_cap.friendly.committed, 0);
-    assert_eq!(registry.persisted_entity_records().len(), 128);
+    assert_eq!(registry.persisted_entity_records().len(), 10);
 
     let removed_id = registry.persisted_entity_records()[0].snapshot.id;
     {
@@ -308,7 +308,7 @@ fn periodic_spawning_has_no_population_cap_and_preserves_collision_admission() {
         tick_input(1_200, 400, 0, 20, Some(&world_read), Some(&materials)),
     );
     assert_eq!(refill.friendly.committed, 1);
-    assert_eq!(registry.persisted_entity_records().len(), 128);
+    assert_eq!(registry.persisted_entity_records().len(), 10);
 }
 
 #[test]
@@ -332,45 +332,44 @@ fn overlapping_players_do_not_duplicate_active_spawn_chunks() {
 
     assert_eq!(report.friendly.chunks_sampled, 1);
     assert_eq!(report.friendly.templates_considered, 6);
-    assert_eq!(report.friendly.committed, 6);
-    assert_eq!(registry.persisted_entity_records().len(), 6);
+    assert_eq!(report.friendly.committed, 2);
+    assert_eq!(registry.persisted_entity_records().len(), 2);
 }
 
 #[test]
-fn simulation_distance_filters_active_spawn_chunks_before_planning() {
-    let far_chunk = (5, 0);
-    let (world_read, materials) = spawn_world_chunks([far_chunk], SpawnTerrain::Ground, 0);
-    let registry = SessionRegistry::new();
-    let (_player, _receiver) = register_player(
-        &registry,
-        "SimulationDistance",
-        HashSet::from([far_chunk]),
-        1,
-    );
-    assert!(registry.register_natural_spawn_templates(
-        far_chunk,
-        vec![template_in_chunk(
+fn aquatic_spawning_uses_loaded_view_beyond_ai_distance_but_keeps_128_block_limit() {
+    for (far_chunk, expected) in [((5, 0), 1), ((9, 0), 0)] {
+        let (world_read, materials) = spawn_world_chunks([far_chunk], SpawnTerrain::Water, 0);
+        let registry = SessionRegistry::new();
+        let (_player, _receiver) = register_player(
+            &registry,
+            "SimulationDistance",
+            HashSet::from([far_chunk]),
+            1,
+        );
+        assert!(registry.register_natural_spawn_templates(
             far_chunk,
-            TEST_Y,
-            0,
-            11,
-            "minecraft:cow",
-            8,
-            8,
-            false
-        )],
-    ));
-
-    let mut input = tick_input(1, 1, 0, 1, Some(&world_read), Some(&materials));
-    input.policy.friendly_spawn_chunk_budget = 64;
-    let (report, _) =
-        registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
-
-    assert_eq!(report.friendly.attempts, 1);
-    assert_eq!(report.friendly.chunks_sampled, 0);
-    assert_eq!(report.friendly.templates_considered, 0);
-    assert_eq!(report.friendly.committed, 0);
-    assert!(registry.persisted_entity_records().is_empty());
+            vec![template_in_chunk(
+                far_chunk,
+                TEST_Y,
+                0,
+                18,
+                "minecraft:cod",
+                8,
+                8,
+                false
+            )],
+        ));
+        let mut input = tick_input(1, 1, 0, 1, Some(&world_read), Some(&materials));
+        input.policy.friendly_spawn_chunk_budget = 64;
+        let (report, _) =
+            registry.tick_periodic_natural_spawning(&mut NaturalSpawnScheduler::default(), input);
+        assert_eq!(
+            report.friendly.committed, expected,
+            "chunk {far_chunk:?}: {report:?}"
+        );
+        assert_eq!(registry.persisted_entity_records().len(), expected as usize);
+    }
 }
 
 #[test]
@@ -414,8 +413,8 @@ fn periodic_ground_spawns_obey_per_chunk_cap_and_support() {
         &mut scheduler,
         tick_input(1, 1, 0, 4, Some(&world_read), Some(&materials)),
     );
-    assert_eq!(report.friendly.committed, 7);
-    assert_eq!(registry.persisted_entity_records().len(), 7);
+    assert_eq!(report.friendly.committed, 2);
+    assert_eq!(registry.persisted_entity_records().len(), 2);
 
     let (unsupported_world, unsupported_materials) = spawn_world(SpawnTerrain::Unsupported, 0);
     let unsupported_registry = SessionRegistry::new();

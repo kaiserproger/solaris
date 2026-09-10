@@ -672,10 +672,20 @@ impl WorldStorage {
         let (prev, removed_furnace) = self
             .resident
             .mutate(cpos, |chunk| {
+                let same_block_type = chunk
+                    .get_block(local_x, pos.y, local_z)
+                    .is_some_and(|previous| registry.same_block_type(previous, state));
                 let prev = if clear_baked_light {
-                    chunk.set_block_and_update(local_x, pos.y, local_z, state, air)
+                    chunk.set_block_and_update(local_x, pos.y, local_z, state, air, same_block_type)
                 } else {
-                    chunk.set_block_and_update_preserving_light(local_x, pos.y, local_z, state, air)
+                    chunk.set_block_and_update_preserving_light(
+                        local_x,
+                        pos.y,
+                        local_z,
+                        state,
+                        air,
+                        same_block_type,
+                    )
                 };
                 let removed_furnace = prev.is_some_and(|prev| prev != state)
                     && prune_incompatible_block_entities(chunk, pos, &registry, state);

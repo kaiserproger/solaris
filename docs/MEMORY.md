@@ -1,6 +1,47 @@
 # Solaris current cursor
 
-## Active owner request
+## Current checkpoint: v0.0.5 release
+
+The owner explicitly requested `v0.0.5` with a changelog, authorizing the release
+commit, push, tag and GitHub publication. Version and installer pins are `0.0.5`;
+the GitHub release is preliminary and maturity remains `draft`. Do not turn
+native checks into graphical acceptance or remove the recorded owner gaps.
+
+Changelog: [releases/v0.0.5.md](releases/v0.0.5.md), also packaged as
+`CHANGELOG.md` in both Linux archives. The field-fix implementation and earlier
+evidence remain recorded in `.analysis/codex-logs/field-bugs/receipt.json`.
+
+The fresh release-candidate workspace test run passed 4,475 tests with 194
+ignored. Formatter, strict Clippy, code-health, installer and harness checks
+passed. One independent release reviewer passed version consistency, packaging
+and the draft-prerelease publication plan without running validation.
+
+Earlier Lua gameplay-event integration timeouts remain unexplained. Call-site
+diagnostics were added; assertions and timeouts were not relaxed. Ten bounded
+direct diagnostic runs and the fresh complete native test gate passed, but this
+does not establish a deterministic root-cause fix.
+
+Graphical owner acceptance, external online-login acceptance, vanilla recapture
+and gameplay RSS/performance comparisons remain unperformed. The owner-requested
+feet-and-eyes breathing policy is intentional, and public offline listening
+retains the documented impersonation risk. Existing animals are not culled.
+
+```yaml
+base_tree: 60be6039bfc63e97a40299a378f3e66e6a7cac17
+release_tag: v0.0.5
+publication_evidence: .analysis/releases/public-v0.0.5/receipt.json
+field_evidence: .analysis/codex-logs/field-bugs/receipt.json
+resume:
+  next: Owner exercises the reported field scenarios on v0.0.5 and records client/server evidence for any remaining failure.
+```
+
+The release receipt records actual publication status, commit, hosted gates,
+asset checksums and downloaded-artifact smoke evidence. Its publication status
+must be checked rather than inferred from this preparation cursor. Sibling
+Loader/plugin checkouts were restored for native fixtures only; they were not
+edited or published in this checkpoint.
+
+## Standing architecture objective
 
 Full core redesign: fewer mechanisms and lines, more reuse and clarity, preserved
 performance and vanilla invariants. One broad, uniform, stable addon API must
@@ -57,7 +98,7 @@ checkpoint stops. Evidence snapshots and validation are internal milestones,
 not permission gates or reasons to yield. Continue into the next bounded area
 unless a real blocker or material owner decision prevents progress.
 
-## Current checkpoint: downloadable Loader preview
+## Previous checkpoint: downloadable Loader preview
 
 [Solaris Loader v0.1.0](https://github.com/kaiserproger/solaris-loader/releases/tag/v0.1.0)
 is published as a prerelease from

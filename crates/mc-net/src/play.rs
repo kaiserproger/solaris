@@ -10972,7 +10972,7 @@ async fn refresh_player_water_state(state: Option<&InteractionState>, pose: &mut
         pose.in_water = false;
         pose.eye_in_water = false;
     }
-    pose.swimming = pose.in_water && pose.sprinting && (pose.input.forward || pose.eye_in_water);
+    pose.swimming = pose.sprinting && pose.in_water && (pose.swimming || pose.eye_in_water);
 }
 
 fn publish_player_air_supply(
@@ -12061,10 +12061,11 @@ where
                 player_pose,
                 ..
             } = context;
+            let old_pose = *player_pose;
             player_pose.yaw = movement.yaw;
             player_pose.pitch = movement.pitch;
             player_pose.flags = movement.flags;
-            commit_authoritative_player_pose(simulation, *player_pose).await?;
+            commit_authoritative_player_pose(simulation, player_pose, old_pose).await?;
             let center = player_pose.chunk_pos();
             replan_after_movement(
                 writer,
@@ -12084,8 +12085,9 @@ where
                 player_pose,
                 ..
             } = context;
+            let old_pose = *player_pose;
             player_pose.flags = movement.flags;
-            commit_authoritative_player_pose(simulation, *player_pose).await
+            commit_authoritative_player_pose(simulation, player_pose, old_pose).await
         }
         _ => unreachable!("movement helper only accepts movement packet ids"),
     }
@@ -12162,6 +12164,7 @@ where
         }
         ServerboundPlayerCommand::ID => {
             let command = ServerboundPlayerCommand::decode(&mut body)?;
+            let old_pose = *player_pose;
             match command.action {
                 PlayerCommandAction::StartSprinting => player_pose.sprinting = true,
                 PlayerCommandAction::StopSprinting => player_pose.sprinting = false,
@@ -12186,19 +12189,21 @@ where
                         )
                         .await?;
                     }
+                    return Ok(());
                 }
                 _ => {}
             }
             refresh_player_water_state(interaction.as_deref(), player_pose).await;
-            commit_authoritative_player_pose(simulation, *player_pose).await?;
+            commit_authoritative_player_pose(simulation, player_pose, old_pose).await?;
         }
         ServerboundPlayerInput::ID => {
             let input = ServerboundPlayerInput::decode(&mut body)?.input;
+            let old_pose = *player_pose;
             player_pose.input = input;
             player_pose.sprinting = input.sprint;
             player_pose.shifting = input.shift;
             refresh_player_water_state(interaction.as_deref(), player_pose).await;
-            commit_authoritative_player_pose(simulation, *player_pose).await?;
+            commit_authoritative_player_pose(simulation, player_pose, old_pose).await?;
         }
         _ => unreachable!("player state helper only accepts player-state packet ids"),
     }
@@ -12620,8 +12625,6 @@ where
             }
             if was_dead && !survival_state.is_dead() {
                 commit_authoritative_player_teleport(simulation, *player_pose).await?;
-            } else {
-                commit_authoritative_player_pose(simulation, *player_pose).await?;
             }
         }
         ServerboundChangeGameMode::ID => {
@@ -13016,12 +13019,21 @@ where
 
 async fn commit_authoritative_player_pose(
     simulation: &SimulationHandle,
-    pose: PlayerPose,
+    pose: &mut PlayerPose,
+    old_pose: PlayerPose,
 ) -> Result<(), ConnectionError> {
-    commit_authoritative_player_movement(simulation, pose, 0.0)
-        .await
-        .map(drop)
-        .map_err(simulation_pose_commit_error)
+    match commit_authoritative_player_movement(simulation, *pose, 0.0).await {
+        Ok(_) => Ok(()),
+        Err(SimulationRequestError::PlayerMovementRejected(reason)) => {
+            *pose = old_pose;
+            debug!(
+                ?reason,
+                "player state update rejected; retaining authoritative pose"
+            );
+            Ok(())
+        }
+        Err(error) => Err(simulation_pose_commit_error(error)),
+    }
 }
 
 async fn commit_authoritative_player_teleport(
@@ -14034,7 +14046,7 @@ where
         );
     }
     let (next_breathing, breathing_tick) = breathing_state.tick(
-        player_pose.eye_in_water,
+        player_damage_adapter::player_is_submerged(interaction.as_deref(), player_pose),
         player_can_drown(game_mode, survival_state.is_dead()),
     );
     let client_has_loaded = client_load.has_loaded();

@@ -1259,7 +1259,12 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("item craft inventory and Lua wire response");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "item craft response: input={saw_input_commit}, output={saw_output_commit}, \
+                 event={saw_craft_event}: {error}"
+                )
+            });
         if frame.id == ClientboundContainerSetSlot::ID {
             let slot = ClientboundContainerSetSlot::decode(&mut frame.body)
                 .expect("decode item craft inventory commit");
@@ -2561,12 +2566,14 @@ async fn client_receives_continuing_world_time_updates() {
     );
 }
 
-async fn next_system_chat_text(client: &mut Client) -> String {
-    next_system_chat_text_with_limits(client, LATENCY_SENSITIVE_FRAME_WAIT_LIMITS).await
+#[track_caller]
+fn next_system_chat_text(client: &mut Client) -> impl Future<Output = String> + '_ {
+    next_system_chat_text_with_limits(client, LATENCY_SENSITIVE_FRAME_WAIT_LIMITS)
 }
 
-async fn next_lua_transaction_system_chat_text(client: &mut Client) -> String {
-    next_system_chat_text_with_limits(client, LUA_TRANSACTION_FRAME_WAIT_LIMITS).await
+#[track_caller]
+fn next_lua_transaction_system_chat_text(client: &mut Client) -> impl Future<Output = String> + '_ {
+    next_system_chat_text_with_limits(client, LUA_TRANSACTION_FRAME_WAIT_LIMITS)
 }
 
 async fn wait_for_lua_transaction_result(client: &mut Client, expected: &str) {
@@ -2624,18 +2631,25 @@ fn assert_no_lua_transaction_leak(message: &str) {
     );
 }
 
-async fn next_system_chat_text_with_limits(client: &mut Client, limits: FrameWaitLimits) -> String {
-    let outcome = client
-        .wait_for_frame_id_with_timeout_and_limits(
-            ClientboundSystemChat::ID,
-            Duration::from_secs(5),
-            limits,
-        )
-        .await
-        .expect("system chat frame");
-    let packet =
-        ClientboundSystemChat::decode(&mut outcome.frame.body.clone()).expect("decode SystemChat");
-    text_component_text(&packet)
+#[track_caller]
+fn next_system_chat_text_with_limits(
+    client: &mut Client,
+    limits: FrameWaitLimits,
+) -> impl Future<Output = String> + '_ {
+    let caller = std::panic::Location::caller();
+    async move {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundSystemChat::ID,
+                Duration::from_secs(5),
+                limits,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("system chat requested at {caller}: {error}"));
+        let packet = ClientboundSystemChat::decode(&mut outcome.frame.body.clone())
+            .expect("decode SystemChat");
+        text_component_text(&packet)
+    }
 }
 
 fn text_component_text(packet: &ClientboundSystemChat) -> String {

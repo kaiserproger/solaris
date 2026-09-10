@@ -41,11 +41,13 @@ online_mode = true
 prevent_proxy_connections = true # include the connecting IP in hasJoined
 ```
 
-Solaris rejects a public bind when `online_mode = false`. Offline mode derives
-identities without Mojang session authentication, so names can be impersonated;
-it is only appropriate for isolated loopback/private field tests with a trusted
-network. Run `--check` and treat public-bind warnings as security failures, not
-noise.
+Both authentication modes permit public binds. Offline mode derives identities
+without Mojang authentication, so player and operator names can be impersonated.
+An offline public bind emits a warning rather than preventing startup. Restrict
+access to trusted players or an authenticated proxy. `allow_local_dev_operators`
+remains forbidden on public binds. Authentication does not change the listener:
+`127.0.0.1` is local-only even with `online_mode = true`; use `0.0.0.0` or the
+appropriate interface for remote clients.
 
 ## Authentication and access control
 
@@ -172,20 +174,26 @@ Natural spawning is controlled independently from random block ticks:
 [simulation]
 friendly_spawn_interval_ticks = 400
 hostile_spawn_interval_ticks = 20
-friendly_spawn_cap = 32
-aquatic_spawn_cap = 20
-hostile_spawn_cap = 70
 friendly_spawn_chunk_budget = 48
 hostile_spawn_chunk_budget = 4
 ```
 
-The three caps are **global server caps for natural mobs in each category**, not per-player multipliers. Multiple players expand the union of eligible simulation chunks, but overlapping players do not duplicate a chunk or create extra cap capacity. A cap of `0` keeps the category at zero natural population. An interval of `0` disables attempts for that category entirely.
+Natural admission is bounded globally: 10 ground animals, 20 aquatic mobs, and
+70 hostiles. At most five of the aquatic population may be water creatures such
+as squid; fish can use the remaining capacity. Ground admission permits at most
+two animals in a chunk, spreading new animals across several chunks. These are
+native limits, not configuration keys. Existing animals are not deleted.
 
-A chunk budget is the maximum number of active chunks sampled on one due attempt. It changes refill speed and spatial coverage only: biome/species selection, loaded-simulation-chunk residency, support/fluid checks, hostile light rules, player-distance exclusion and entity collision remain mandatory. Friendly and aquatic mobs share the friendly attempt cadence; their caps remain separate.
+Chunk budgets limit work per attempt, not the population. Spawning considers
+the union of loaded client chunks within 128 blocks, even when the AI simulation
+distance is smaller. Overlapping players do not multiply capacity. Support,
+fluid, light, player-distance and collision checks remain in effect. An interval
+of zero disables that category's attempts. Ground wander pauses are short;
+injured animals preserve the initial impulse, then run for up to five seconds.
 
-Increasing simulation distance can expose more eligible chunks, but it does not raise the global caps. Despawn and movement can free capacity; later due attempts refill toward the configured ceilings. `--check` prints the normalized simulation values, and `periodic natural spawn metrics` logs cumulative sampled/committed/rejection counters for tuning.
-
-The alpha-3 starter profile uses friendly budget `48`: on the measured seed `712816` it produced materially more visible daytime fauna than the former sparse baseline while retaining bounded attempts. Treat population tuning as workload tuning and measure tick latency/RSS before raising caps or budgets further.
+After a successful save, clean chunks outside retained client views are trimmed
+to a 64-chunk warm cache. Loaded and dirty chunks are never discarded by this
+trim. Old natural populations are preserved, but cannot keep growing past caps.
 
 ## Autoscale
 
@@ -284,9 +292,11 @@ validates the endpoint and the loopback rule.
 
 ## Current operator boundaries
 
-The alpha has no remote operator API or interactive server console. Operator
-changes use the local `operator` CLI workflow above and take effect on the
-next server start; the optional dashboard is read-only. Do not expose an
-unrelated service expecting Solaris to secure it. Runtime diagnostics are
-logs, in-game operator commands, the optional dashboard, and the validated
-effective configuration.
+The local console provides `help`, `status`, `profile`, `list`, world controls,
+`save-all` and `stop`. `--no-console` retains plain stdin commands without the TUI.
+Runtime logs are written to `logs/latest.log` and `logs/debug.log`, not to the
+console. Files start fresh on launch; `RUST_LOG` filters the debug file.
+`profile` exports current measured tick-stage latency distributions, RSS and
+population/chunk/network counters to `logs/profile.json`; it is not a flamegraph
+or allocation trace. Operator-file changes still take effect on restart.
+The optional remote dashboard is read-only and unauthenticated.

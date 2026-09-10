@@ -52,7 +52,7 @@ struct Cli {
     #[arg(long)]
     check: bool,
 
-    /// Keep plain text logs instead of the interactive terminal console.
+    /// Use plain stdin commands instead of the interactive terminal console.
     #[arg(long)]
     no_console: bool,
 
@@ -413,7 +413,7 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
     if !config.auth.online_mode {
         warnings.push(OperatorWarning {
             code: "public_bind_offline_mode",
-            message: "offline-mode Solaris authentication cannot be used on a public bind address; serve will fail",
+            message: "offline-mode public server: player names and operator identities are not authenticated",
         });
     }
     warnings
@@ -1689,9 +1689,12 @@ fn ensure_world_region_root(world_dir: &Path) -> Result<()> {
         .with_context(|| format!("creating empty world region directory {}", legacy.display()))
 }
 
-fn init_tracing(output: console::ConsoleOutput) -> Arc<mc_server::dashboard_stats::WarningRing> {
+fn init_tracing() -> Result<Arc<mc_server::dashboard_stats::WarningRing>> {
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::prelude::*;
+    std::fs::create_dir_all("logs").context("creating logs directory")?;
+    let latest = std::fs::File::create("logs/latest.log").context("opening logs/latest.log")?;
+    let debug = std::fs::File::create("logs/debug.log").context("opening logs/debug.log")?;
 
     let ring = mc_server::dashboard_stats::warning_ring();
     let ring_layer = tracing_subscriber::fmt::layer()
@@ -1700,19 +1703,34 @@ fn init_tracing(output: console::ConsoleOutput) -> Arc<mc_server::dashboard_stat
         )))
         .with_ansi(false);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .compact()
                 .with_target(false)
                 .with_ansi(false)
-                .with_writer(output),
+                .with_writer(std::sync::Mutex::new(latest))
+                .with_filter(LevelFilter::INFO),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(debug))
+                .with_filter(filter),
+        )
+        .with(
+            (std::env::var("SOLARIS_HARNESS_LOG_STDOUT").as_deref() == Ok("1")).then(|| {
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_filter(LevelFilter::INFO)
+            }),
         )
         .with(ring_layer.with_filter(LevelFilter::WARN))
-        .with(filter)
         .init();
-    ring
+    Ok(ring)
 }
 
 fn manage_operators(config_path: &Path, command: OperatorCommand) -> Result<()> {
@@ -1764,10 +1782,12 @@ async fn main() -> ExitCode {
             !cli.no_console && console::ConsoleOutput::supported(),
         )
     });
-    let warning_ring = init_tracing(output);
     let result = match (cli.check, cli.command) {
         (true, None) => check_config(&cli.config),
-        (false, None) => serve(&cli.config, warning_ring, terminal_console).await,
+        (false, None) => match init_tracing() {
+            Ok(warning_ring) => serve(&cli.config, warning_ring, terminal_console).await,
+            Err(error) => Err(error),
+        },
         (false, Some(Command::Operator { command })) => manage_operators(&cli.config, command),
         (true, Some(_)) => Err(anyhow::anyhow!(
             "--check cannot be combined with the operator subcommand"

@@ -281,11 +281,7 @@ where
             .block
             .applied
             .iter()
-            .find(|edit| {
-                edit.pos == pos
-                    && edit.previous == expected_target.state
-                    && edit.previous != edit.new_state
-            })
+            .find(|edit| edit.pos == pos && edit.previous != edit.new_state)
             .map(|edit| edit.previous);
         if !committed.block.applied.is_empty() {
             dispatch_visibility_commands(

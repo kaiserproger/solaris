@@ -658,6 +658,7 @@ pub(super) fn attack_server_entity_locked(
         });
     }
     let mut dispatches = health_dispatches;
+    dispatches.extend(entity_event_dispatches_locked(inner, entity_id, 2));
     dispatches.extend(knockback_origin.map_or_else(Vec::new, |origin| {
         apply_player_melee_knockback_locked(inner, entity_id, origin)
     }));

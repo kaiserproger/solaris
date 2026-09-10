@@ -1,9 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -30,14 +27,12 @@ use commands::{CommandHandler, ConsoleCommand, ConsoleReply};
 
 #[derive(Clone)]
 pub(super) struct ConsoleOutput {
-    active: Arc<AtomicBool>,
     lines: Arc<WarningRing>,
 }
 
 impl ConsoleOutput {
     pub fn new() -> Self {
         Self {
-            active: Arc::new(AtomicBool::new(false)),
             lines: Arc::new(WarningRing::new(128)),
         }
     }
@@ -53,38 +48,12 @@ impl ConsoleOutput {
     }
 }
 
-impl Write for ConsoleOutput {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.active.load(Ordering::Acquire) {
-            WarningRingSink(Arc::clone(&self.lines)).write(bytes)
-        } else {
-            io::stdout().lock().write(bytes)
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.active.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            io::stdout().lock().flush()
-        }
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ConsoleOutput {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self {
-        self.clone()
-    }
-}
-
-struct ScreenGuard(ConsoleOutput);
+struct ScreenGuard;
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         let _ = disable_raw_mode();
-        self.0.active.store(false, Ordering::Release);
     }
 }
 
@@ -101,10 +70,9 @@ impl<H: CommandHandler> Console<H> {
         if !self.interactive {
             return self.run_lines().await;
         }
-        enable_raw_mode().context("enabling console input; use --no-console for plain logs")?;
-        let _guard = ScreenGuard(self.output.clone());
+        enable_raw_mode().context("enabling console input; use --no-console for plain stdin")?;
+        let _guard = ScreenGuard;
         execute!(io::stdout(), EnterAlternateScreen)?;
-        self.output.active.store(true, Ordering::Release);
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.clear()?;
         let mut events = EventStream::new();

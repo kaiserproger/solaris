@@ -190,6 +190,14 @@ pub struct SettlementVacantHomeMarker {
 pub struct BlockMutationToken {
     pub chunk_instance_id: u64,
     pub version: u64,
+    /// Revision of the most recent replacement by a different block type.
+    pub last_replacement_version: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockMutationVersion {
+    version: u64,
+    last_replacement: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -595,7 +603,7 @@ pub struct Chunk {
     pub dirty_generation: u64,
     runtime_instance_id: u64,
     light_source_generation: u64,
-    block_mutation_versions: HashMap<u32, u64>,
+    block_mutation_versions: HashMap<u32, BlockMutationVersion>,
 }
 
 fn furnace_slot_heap_bytes(slot: &FurnaceSlot) -> usize {
@@ -685,7 +693,7 @@ impl Chunk {
             .saturating_add(
                 self.block_mutation_versions
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(u32, u64)>()),
+                    .saturating_mul(std::mem::size_of::<(u32, BlockMutationVersion)>()),
             );
         bytes = bytes.saturating_add(
             self.heightmaps
@@ -1051,9 +1059,15 @@ impl Chunk {
     #[must_use]
     pub fn block_mutation_token(&self, x: u8, y: i32, z: u8) -> Option<BlockMutationToken> {
         let key = block_mutation_key(self.geometry, x, y, z)?;
+        let revision = self
+            .block_mutation_versions
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         Some(BlockMutationToken {
             chunk_instance_id: self.runtime_instance_id,
-            version: self.block_mutation_versions.get(&key).copied().unwrap_or(0),
+            version: revision.version,
+            last_replacement_version: revision.last_replacement,
         })
     }
 
@@ -1197,8 +1211,17 @@ impl Chunk {
         z: u8,
         state: BlockStateId,
         air: BlockStateId,
+        same_block_type: bool,
     ) -> Option<BlockStateId> {
-        self.set_block_and_update_inner(x, y, z, state, air, BlockLightMutation::Invalidate)
+        self.set_block_and_update_inner(
+            x,
+            y,
+            z,
+            state,
+            air,
+            BlockLightMutation::Invalidate,
+            same_block_type,
+        )
     }
 
     /// Mutate a block without discarding baked light. The caller must prove
@@ -1210,8 +1233,17 @@ impl Chunk {
         z: u8,
         state: BlockStateId,
         air: BlockStateId,
+        same_block_type: bool,
     ) -> Option<BlockStateId> {
-        self.set_block_and_update_inner(x, y, z, state, air, BlockLightMutation::PreserveInert)
+        self.set_block_and_update_inner(
+            x,
+            y,
+            z,
+            state,
+            air,
+            BlockLightMutation::PreserveInert,
+            same_block_type,
+        )
     }
 
     /// Retain the old baked light as input for an immediate incremental relight.
@@ -1223,10 +1255,20 @@ impl Chunk {
         z: u8,
         state: BlockStateId,
         air: BlockStateId,
+        same_block_type: bool,
     ) -> Option<BlockStateId> {
-        self.set_block_and_update_inner(x, y, z, state, air, BlockLightMutation::RetainForRelight)
+        self.set_block_and_update_inner(
+            x,
+            y,
+            z,
+            state,
+            air,
+            BlockLightMutation::RetainForRelight,
+            same_block_type,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_block_and_update_inner(
         &mut self,
         x: u8,
@@ -1235,6 +1277,7 @@ impl Chunk {
         state: BlockStateId,
         air: BlockStateId,
         light_mutation: BlockLightMutation,
+        same_block_type: bool,
     ) -> Option<BlockStateId> {
         let prev = if light_mutation != BlockLightMutation::PreserveInert {
             self.set_block(x, y, z, state)?
@@ -1246,9 +1289,13 @@ impl Chunk {
         }
         let key = block_mutation_key(self.geometry, x, y, z).expect("validated block coordinates");
         let version = self.block_mutation_versions.entry(key).or_default();
-        *version = version
+        version.version = version
+            .version
             .checked_add(1)
             .expect("block mutation version exhausted");
+        if !same_block_type {
+            version.last_replacement = version.version;
+        }
         self.mark_dirty();
         if light_mutation == BlockLightMutation::Invalidate {
             self.clear_baked_light();
@@ -1746,7 +1793,7 @@ mod tests {
             .heightmaps
             .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
         assert_eq!(
-            chunk.set_block_and_update(3, 200, 7, stone(), air()),
+            chunk.set_block_and_update(3, 200, 7, stone(), air(), false),
             Some(air())
         );
         assert_eq!(chunk.heightmaps["WORLD_SURFACE"].get(3, 7), 201);
@@ -1816,7 +1863,7 @@ mod tests {
             "raw construction writes must not populate runtime mutation history"
         );
         chunk
-            .set_block_and_update(3, 64, 7, air(), air())
+            .set_block_and_update(3, 64, 7, air(), air(), false)
             .expect("runtime edit");
         let edited = chunk.block_mutation_token(3, 64, 7).expect("edited token");
         assert_eq!(edited.version, 1);
@@ -1872,7 +1919,9 @@ mod tests {
 
         // Drop a stone at world Y=64. The heightmap value is
         // (Y - MIN_Y + 1) = 64 - (-64) + 1 = 129.
-        let prev = c.set_block_and_update(3, 64, 7, stone(), air()).unwrap();
+        let prev = c
+            .set_block_and_update(3, 64, 7, stone(), air(), false)
+            .unwrap();
         assert_eq!(prev, air());
         assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 129);
         assert_eq!(c.heightmaps.get("WORLD_SURFACE").unwrap().get(3, 7), 129);
@@ -1881,7 +1930,8 @@ mod tests {
         assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(0, 0), 0);
 
         // Break it back to air — heightmap returns to 0.
-        c.set_block_and_update(3, 64, 7, air(), air()).unwrap();
+        c.set_block_and_update(3, 64, 7, air(), air(), false)
+            .unwrap();
         assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 0);
     }
 
@@ -1892,11 +1942,14 @@ mod tests {
             .insert("MOTION_BLOCKING".into(), Heightmap::zeroed());
         // Stack two blocks at Y=63 and Y=64; heightmap should track
         // the higher one and fall back to the lower on break.
-        c.set_block_and_update(3, 63, 7, stone(), air()).unwrap();
-        c.set_block_and_update(3, 64, 7, stone(), air()).unwrap();
+        c.set_block_and_update(3, 63, 7, stone(), air(), false)
+            .unwrap();
+        c.set_block_and_update(3, 64, 7, stone(), air(), false)
+            .unwrap();
         assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 129);
 
-        c.set_block_and_update(3, 64, 7, air(), air()).unwrap();
+        c.set_block_and_update(3, 64, 7, air(), air(), false)
+            .unwrap();
         assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 128);
     }
 
@@ -1907,7 +1960,9 @@ mod tests {
         // must still mutate the underlying block.
         let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
         assert!(c.heightmaps.is_empty());
-        let prev = c.set_block_and_update(0, 0, 0, stone(), air()).unwrap();
+        let prev = c
+            .set_block_and_update(0, 0, 0, stone(), air(), false)
+            .unwrap();
         assert_eq!(prev, air());
         assert_eq!(c.get_block(0, 0, 0), Some(stone()));
         assert!(c.heightmaps.is_empty());
@@ -1920,7 +1975,9 @@ mod tests {
         c.section_lights[0].block = Some(vec![0x11; LIGHT_LAYER_BYTES]);
         c.section_lights[3].sky = Some(vec![0x22; LIGHT_LAYER_BYTES]);
 
-        let prev = c.set_block_and_update(0, 0, 0, stone(), air()).unwrap();
+        let prev = c
+            .set_block_and_update(0, 0, 0, stone(), air(), false)
+            .unwrap();
 
         assert_eq!(prev, air());
         assert!(
@@ -1941,7 +1998,7 @@ mod tests {
         let light_source = c.light_source_token();
 
         let prev = c
-            .set_block_and_update_preserving_light(0, 0, 0, stone(), air())
+            .set_block_and_update_preserving_light(0, 0, 0, stone(), air(), false)
             .unwrap();
 
         assert_eq!(prev, air());
@@ -1958,7 +2015,7 @@ mod tests {
         let light_source = c.light_source_token();
 
         let prev = c
-            .set_block_and_update_retaining_baked_light(0, 0, 0, stone(), air())
+            .set_block_and_update_retaining_baked_light(0, 0, 0, stone(), air(), false)
             .unwrap();
 
         assert_eq!(prev, air());

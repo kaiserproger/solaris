@@ -4,7 +4,7 @@ Solaris is an authoritative Minecraft Java Edition server written in Rust. It
 targets the vanilla **Minecraft Java Edition 26.1.2** protocol and also supports
 optional client content through Solaris Loader.
 
-> **Development status:** this is the **`v0.0.4-alpha.1`** prerelease line.
+> **Development status:** **`v0.0.5`** is a preliminary release.
 > Maturity remains **draft**, not release-ready. Solaris is suitable for
 > testing, plugin development, and bounded multiplayer field tests; it is not a
 > production-safe replacement for vanilla, Paper, Fabric, Forge, or NeoForge.
@@ -15,17 +15,17 @@ Solaris ships an optional default-off read-only web dashboard
 and the `operator add|remove|list` CLI. The standard plugin pack is explicitly
 opt-in; see [plugin installation](docs/PLUGINS.md#standard-plugin-pack).
 
-## Install the released alpha (Linux)
+## Install v0.0.5 (Linux)
 
 Published archives are available for Linux x86_64 and AArch64. Pin the release
 because GitHub's `latest` alias does not resolve prereleases:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.4-alpha.1/install.sh | \
-  SOLARIS_VERSION="v0.0.4-alpha.1" bash
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.5/install.sh | \
+  SOLARIS_VERSION="v0.0.5" bash
 
 curl -fsSLo server.toml \
-  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.4-alpha.1/example.toml
+  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.5/example.toml
 solaris --check --config server.toml
 solaris --config server.toml
 ```
@@ -42,7 +42,7 @@ Use a fresh `[data].world_dir`. Do not delete or hand-edit the old world's
 contract to bypass the check. Changing an effective startup `rules.lua` plan
 also requires a fresh world directory.
 
-## Build and run the alpha-4 development tree
+## Build and run the v0.0.5 development tree
 
 Use the repository's debug profile for development:
 
@@ -73,18 +73,22 @@ lookup, and current limits — is documented in
 ### Interactive server console
 
 When attached to a terminal, the server opens a status dashboard with a separate
-command line and automatically following logs. Commands are parsed independently of the UI.
-Use `help` to list commands; examples include `status`, `list`, `save-all`,
+command line and command replies, without streaming runtime logs into the UI.
+Use `help` to list commands; examples include `status`, `profile`, `list`, `save-all`,
 `time set night`, `weather rain`, `gamerule doDaylightCycle false`, and
 `operator list`. Use `stop` for the normal save-and-drain shutdown.
 
 Enter submits a command; Up/Down recall command history; Backspace deletes the
 last character; Ctrl+U clears the line. Ctrl+C/Ctrl+D also request shutdown.
 
-Pass `--no-console` for ordinary log output and stdin commands, including
-supervised or redirected deployments. The foreground server owns the console;
-do not run a second stdin reader alongside it. High-frequency profiling details
-are under the `solaris::profile` debug tracing target rather than normal logs.
+Pass `--no-console` for plain stdin commands without the dashboard. The foreground
+server owns stdin; do not run a second reader alongside it.
+Runtime events go to `logs/latest.log` (INFO/WARN/ERROR) and `logs/debug.log`
+(DEBUG and above; `RUST_LOG` controls this file). Both files start fresh on launch.
+The `profile` console command writes `logs/profile.json`: measured tick-stage
+latencies, process memory, chunks, populations and network counters. This is a
+runtime metrics profile, not a CPU stack-sampling or heap-allocation trace.
+`--check` and the `operator` subcommands leave existing server logs untouched.
 
 ## Network address and port
 
@@ -101,16 +105,17 @@ port = 25565
 
 Clients connect to `host:port` (for example, `192.168.1.20:25570`). To accept
 remote connections, choose an appropriate interface address, configure the
-host firewall/NAT for the same TCP port, and enable online authentication.
-Solaris rejects a public bind in offline mode; do not expose an offline-mode
-server to an untrusted network. Detailed examples are in
+host firewall/NAT for the same TCP port, and preferably enable online authentication.
+The starter configuration listens on `0.0.0.0`. Both authentication modes permit
+public listening; offline-mode player and operator names can be impersonated.
+Detailed examples are in
 [`docs/OPERATING.md`](docs/OPERATING.md#network-bind-and-port).
 
 ## Configuration essentials
 
 - **Authentication:** `[auth].online_mode = true` uses Mojang session
-  authentication. Offline mode is for trusted loopback/private testing only and
-  does not prove a player's identity.
+  authentication. Offline mode permits public hosting but does not prove a
+  player's identity; restrict access to trusted players or an authenticated proxy.
 - **World:** `[data].world_dir` is required. A missing directory is created as a
   fresh Solaris world. Solaris persists a world contract covering generation
   revision, seed, mode, geometry, and plugin worldgen profiles; incompatible
@@ -202,7 +207,7 @@ launching a graphical or twenty-minute profile.
 ## More documentation
 
 - [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — design and compatibility scope
-- [Current alpha release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.4-alpha.1) — binaries, checksums and release notes
+- [Current preliminary release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.5) — binaries and checksums; [changelog](docs/releases/v0.0.5.md)
 - [`docs/MEMORY.md`](docs/MEMORY.md) — current work and evidence cursor
 - [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) — replacement-readiness limits
 - [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — recorded evidence

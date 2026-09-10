@@ -1,17 +1,15 @@
 use std::sync::mpsc::{Receiver, SyncSender};
 
+use mc_entity::Vec3;
 use mc_entity::natural_spawn_26_1_2::build_herd_spawn_candidates;
-use mc_entity::{SpawnEntity, Vec3};
 use tracing::debug;
 
 use crate::play::simulation::SimulationAuthority;
-use crate::play::{
-    HerdSpawn, MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, is_hostile_entity, world_time_is_night,
-};
+use crate::play::{HerdSpawn, MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, world_time_is_night};
 
-use super::super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::super::{SessionRegistry, SessionRegistryInner};
 use super::commit::install_committed_herd_spawns_locked;
+use super::limit_natural_candidates;
 use super::{
     HerdSpawnOutcome, VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP,
     VANILLA_WATER_CREATURE_MOB_CAP,
@@ -294,37 +292,6 @@ pub(in crate::play::session) fn claim_loaded_pending_hostiles_locked(
         aquatic_capacity: VANILLA_WATER_CREATURE_MOB_CAP
             .saturating_sub(inner.natural_aquatic_mobs.len()),
     }
-}
-
-fn limit_natural_candidates(
-    candidates: Vec<SpawnEntity>,
-    (hostile_capacity, ground_capacity, aquatic_capacity): (usize, usize, usize),
-) -> Vec<SpawnEntity> {
-    let mut accepted_hostiles = 0;
-    let mut accepted_ground = 0;
-    let mut accepted_aquatic = 0;
-    candidates
-        .into_iter()
-        .filter(|candidate| {
-            if is_hostile_entity(&candidate.type_name) {
-                if accepted_hostiles >= hostile_capacity {
-                    return false;
-                }
-                accepted_hostiles += 1;
-            } else if entity_type_uses_aquatic_physics(&candidate.type_name) {
-                if accepted_aquatic >= aquatic_capacity {
-                    return false;
-                }
-                accepted_aquatic += 1;
-            } else {
-                if accepted_ground >= ground_capacity {
-                    return false;
-                }
-                accepted_ground += 1;
-            }
-            true
-        })
-        .collect()
 }
 
 fn restore_chunk_herd_claims_locked(inner: &mut SessionRegistryInner, claims: Vec<ChunkHerdClaim>) {

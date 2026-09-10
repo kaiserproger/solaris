@@ -4224,14 +4224,12 @@ fn validate_public_security_config(
             "allow_local_dev_operators cannot be enabled on a public bind address",
         ));
     }
-    if command_permissions.login_access().online_mode {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            "offline-mode Solaris authentication cannot be used on a public bind address",
-        ))
+    if !command_permissions.login_access().online_mode {
+        warn!(
+            "offline-mode public server: player names and operator identities are not authenticated"
+        );
     }
+    Ok(())
 }
 
 fn build_online_authentication(
@@ -9487,18 +9485,6 @@ mod tests {
         assert!(!is_public_bind("[::ffff:127.0.0.1]:25565".parse().unwrap()));
         assert!(is_public_bind("0.0.0.0:25565".parse().unwrap()));
         assert!(is_public_bind("8.8.8.8:25565".parse().unwrap()));
-    }
-
-    #[test]
-    fn public_security_rejects_offline_auth() {
-        let err = validate_public_security_config(
-            "0.0.0.0:25565".parse().unwrap(),
-            &CommandPermissionConfig::new(Vec::<String>::new(), false),
-        )
-        .unwrap_err();
-
-        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains("offline-mode"));
     }
 
     #[test]

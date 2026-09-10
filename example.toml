@@ -5,14 +5,14 @@ view_distance = 8
 simulation_distance = 8
 
 [network]
-# Listener IP and TCP port. Use 127.0.0.1 for same-machine testing; remote
-# clients connect to host:port. Public binds require online_mode = true.
-bind_address = "127.0.0.1"
+# Listener IP and TCP port. 0.0.0.0 accepts remote IPv4 connections.
+# Use 127.0.0.1 to restrict the server to this machine.
+bind_address = "0.0.0.0"
 port = 25565
 
 [auth]
 # Set true for Mojang session authentication and encrypted public play.
-# Keep offline mode bound to private/local addresses.
+# Offline mode permits public hosting but cannot authenticate player or operator names.
 online_mode = false
 # When online mode is enabled, include the connecting IP in Mojang's
 # hasJoined verification to reject proxying an authenticated session.
@@ -85,8 +85,9 @@ friendly_spawn_interval_ticks = 400
 # Natural hostile-mob attempts: 20 ticks = once per second. Set to 0 to
 # disable only hostile natural spawning.
 hostile_spawn_interval_ticks = 20
-# No population ceilings. Frequency above controls attempts; chunk budgets below
-# bound work per attempt, not the total number of living entities.
+# Natural population caps: 10 ground animals, 20 aquatic mobs (at most 5 water
+# creatures such as squid), and 70 hostiles. Ground admission allows two per chunk.
+# Spawning considers loaded chunks within 128 blocks, independently of the AI radius.
 # Chunks sampled per due attempt. Friendly sampling is intentionally broader
 # than hostile sampling so ordinary fauna fills in without multiplying the
 # once-per-second hostile workload.

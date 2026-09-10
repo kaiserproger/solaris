@@ -683,7 +683,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         &mut writer,
         None,
         GameMode::Survival,
-        PlayerPose::new(1.5, 64.0, 1.5),
+        PlayerPose::new(2.5, 64.0, 1.5),
         clicked_pos,
         &action,
         (clicked_pos.x, clicked_pos.y, clicked_pos.z),

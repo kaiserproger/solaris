@@ -871,6 +871,11 @@ where
             )
             .await?;
             if let Some(stream) = chunk_stream.as_mut() {
+                stream.replan_center(
+                    respawn_pose.chunk_pos().0,
+                    respawn_pose.chunk_pos().1,
+                    respawn_pose.yaw,
+                );
                 stream.replay_current_view(respawn_pose.yaw);
             }
             let teleport_id = next_player_teleport_id(next_teleport_id);

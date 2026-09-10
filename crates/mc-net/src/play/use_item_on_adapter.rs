@@ -1565,7 +1565,7 @@ pub(super) async fn plan_place_block_edits(
     let snapshot_positions = placement_snapshot_positions(&state.blocks, placed_state, pos)?;
     let snapshot =
         (!snapshot_positions.is_empty()).then(|| loaded_block_snapshot(state, &snapshot_positions));
-    plan_block_placement(
+    let plan = plan_block_placement(
         &state.blocks,
         placed_state,
         snapshot.as_ref(),
@@ -1574,7 +1574,21 @@ pub(super) async fn plan_place_block_edits(
         direction,
         target_relative_hit_y,
         air_state_id(&state.blocks),
-    )
+    )?;
+    if plan.edits.iter().any(|edit| {
+        super::movement::player_collision_state_intersects(
+            &state.block_facts,
+            &state.blocks,
+            mc_data::collision_shapes::vanilla_collision_shapes(),
+            edit.new_state,
+            edit.pos,
+            player_pose,
+            super::movement::PlayerCollisionContext::from_pose(player_pose, false),
+        )
+    }) {
+        return None;
+    }
+    Some(plan)
 }
 
 pub(super) fn cursor_y_relative_to_target(clicked_y: i32, target_y: i32, cursor_y: f32) -> f32 {

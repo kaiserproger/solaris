@@ -49,6 +49,9 @@ mod natural_spawn_26_1_2_tests;
 #[path = "entity_vehicle_tests.rs"]
 mod entity_vehicle_tests;
 
+#[cfg(test)]
+mod animal_panic_tests;
+
 pub use entity_projections::{EntityDespawnProjection, EntitySimulationProjection};
 pub use entity_scale_26_1_2::{EntityScale26_1_2, EntityScaleError};
 pub use lock_policy::{
@@ -3079,8 +3082,8 @@ fn wander_pathing_target(
 }
 
 fn wander_pause_ticks(id: EntityId, epoch: u64, period_ticks: u32) -> u64 {
-    let period = u64::from(period_ticks.max(1));
-    let minimum = (period / 2).max(10);
+    let period = u64::from(period_ticks.clamp(1, 20));
+    let minimum = (period / 4).max(1);
     minimum.saturating_add(
         splitmix64((id.0 as u32 as u64) ^ epoch.wrapping_mul(0x94d0_49bb_1331_11eb)) % period,
     )

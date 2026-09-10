@@ -20,9 +20,23 @@ use super::{
     InteractionState, PlayerPose, PlayerSurvivalUpdateOutcome, clear_shield_use,
     commit_player_survival_update, commit_player_survival_update_with_shield,
     finish_committed_shield_damage, plan_active_shield_damage, player_body_block_snapshot,
-    player_pose_collides_with_solid, refresh_shield_use_state, shield_blocks_current_damage,
-    survival_damage_after_equipment,
+    refresh_shield_use_state, shield_blocks_current_damage, survival_damage_after_equipment,
 };
+
+pub(super) fn player_is_submerged(state: Option<&InteractionState>, pose: PlayerPose) -> bool {
+    pose.eye_in_water
+        && state.is_some_and(|state| {
+            state
+                .world_read
+                .get_cached_block(BlockPos {
+                    x: pose.x.floor() as i32,
+                    y: pose.y.floor() as i32,
+                    z: pose.z.floor() as i32,
+                })
+                .and_then(|block| state.block_facts.fluid(block.0))
+                .is_some_and(|fluid| fluid.kind == FluidKind::Water)
+        })
+}
 
 pub(super) async fn apply_fall_damage<W>(
     state: Option<&mut InteractionState>,
@@ -121,12 +135,28 @@ pub(super) async fn contact_block_damage(
     state: &InteractionState,
     player_pose: PlayerPose,
 ) -> Option<(f32, PlayerDamageKind)> {
-    if player_pose_collides_with_solid(Some(state), player_pose).await {
-        return Some((1.0, PlayerDamageKind::Suffocation));
-    }
-
     let half_width = 0.301;
     let snapshot = player_body_block_snapshot(state, player_pose, half_width);
+    let eye = BlockPos {
+        x: player_pose.x.floor() as i32,
+        y: (player_pose.y + player_pose.eye_height()).floor() as i32,
+        z: player_pose.z.floor() as i32,
+    };
+    let feet = BlockPos {
+        y: player_pose.y.floor() as i32,
+        ..eye
+    };
+    if [feet, eye].into_iter().all(|position| {
+        snapshot.get_cached_block(position).is_some_and(|block| {
+            state
+                .block_light
+                .as_ref()
+                .and_then(|facts| facts.suffocating(block.0))
+                .unwrap_or(false)
+        })
+    }) {
+        return Some((1.0, PlayerDamageKind::Suffocation));
+    }
     let min_x = (player_pose.x - half_width).floor() as i32;
     let max_x = (player_pose.x + half_width).floor() as i32;
     let min_y = player_pose.y.floor() as i32;

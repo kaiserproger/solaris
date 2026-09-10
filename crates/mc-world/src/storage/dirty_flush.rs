@@ -605,6 +605,24 @@ impl WorldStorage {
                 .collect::<Vec<_>>();
             cleaned_chunks += self.resident.finalize_region_flush(planned);
         }
+        // Keep a small warm tail, not every chunk visited since startup.
+        // Loaded views and dirty/journal-pending chunks remain non-evictable.
+        let clean_unretained = self
+            .lru
+            .iter()
+            .filter(|position| {
+                !self.read_view.chunk_is_retained(**position)
+                    && self
+                        .resident
+                        .snapshot(**position)
+                        .is_some_and(|chunk| !chunk.dirty)
+            })
+            .count();
+        for _ in 64..clean_unretained {
+            if !self.evict_clean_chunk() {
+                break;
+            }
+        }
         DirtyFlushFinalize {
             installed_chunks: synced.installed_chunks,
             cleaned_chunks,

@@ -23,6 +23,12 @@ pub(crate) struct NaturalSpawnTickInput<'a> {
     pub(crate) materials: Option<&'a BlockMaterialIds>,
 }
 
+fn is_water_creature(type_name: &str) -> bool {
+    mc_entity::natural_spawn_26_1_2::entity_type_facts(type_name).is_some_and(|facts| {
+        facts.mob_category == Some(mc_data::entity_types::MobCategory::WaterCreature)
+    })
+}
+
 impl SessionRegistry {
     pub(in crate::play) fn register_natural_spawn_templates(
         &self,
@@ -83,10 +89,9 @@ impl SessionRegistry {
             return (report, Vec::new());
         }
 
-        let simulation_distance = policy
-            .simulation_distance
-            .clamp(crate::MIN_VIEW_DISTANCE, crate::MAX_VIEW_DISTANCE)
-            as u32;
+        // Spawning uses the loaded view, not the smaller AI simulation radius.
+        // The active-chunk set and 128-block distance fence still bound admission.
+        let spawn_radius = 8;
         let player_chunks = player_positions
             .iter()
             .map(|position| chunk_pos_from_coords(position.x, position.z))
@@ -101,8 +106,8 @@ impl SessionRegistry {
                 .any(|(position, player)| {
                     let dx = f64::from(chunk.0) * 16.0 + 8.0 - position.x;
                     let dz = f64::from(chunk.1) * 16.0 + 8.0 - position.z;
-                    chunk.0.abs_diff(player.0) <= simulation_distance
-                        && chunk.1.abs_diff(player.1) <= simulation_distance
+                    chunk.0.abs_diff(player.0) <= spawn_radius
+                        && chunk.1.abs_diff(player.1) <= spawn_radius
                         && dx * dx + dz * dz < 128.0 * 128.0
                 })
         };
@@ -111,7 +116,7 @@ impl SessionRegistry {
                 NaturalSpawnCategory::Friendly,
                 &active_chunks,
                 &player_chunks,
-                simulation_distance.min(8),
+                spawn_radius,
                 policy.friendly_spawn_chunk_budget,
                 eligible,
             )
@@ -123,7 +128,7 @@ impl SessionRegistry {
                 NaturalSpawnCategory::Hostile,
                 &active_chunks,
                 &player_chunks,
-                simulation_distance.min(8),
+                spawn_radius,
                 policy.hostile_spawn_chunk_budget,
                 eligible,
             )
@@ -224,6 +229,61 @@ impl SessionRegistry {
                 candidate.position.z,
             ))
         });
+        let (capacities, mut ground_chunks, mut water_creature_capacity) = {
+            let inner = self.lock_inner("limit periodic natural population");
+            let mut ground_chunks = HashMap::<(i32, i32), usize>::new();
+            for id in &inner.natural_ground_mobs {
+                if let Some(entity) = inner.published_entity_snapshots.get(id) {
+                    *ground_chunks
+                        .entry(chunk_pos_from_coords(entity.position.x, entity.position.z))
+                        .or_default() += 1;
+                }
+            }
+            let water_creatures = inner
+                .natural_aquatic_mobs
+                .iter()
+                .filter_map(|id| inner.published_entity_snapshots.get(id))
+                .filter(|entity| is_water_creature(&entity.type_name))
+                .count();
+            (
+                (
+                    super::VANILLA_HOSTILE_MOB_CAP.saturating_sub(inner.hostile_entities.len()),
+                    super::VANILLA_CREATURE_MOB_CAP.saturating_sub(inner.natural_ground_mobs.len()),
+                    super::VANILLA_WATER_CREATURE_MOB_CAP
+                        .saturating_sub(inner.natural_aquatic_mobs.len()),
+                ),
+                ground_chunks,
+                5_usize.saturating_sub(water_creatures),
+            )
+        };
+        planned.retain(|candidate| {
+            if is_hostile_entity(&candidate.type_name) {
+                return true;
+            }
+            if mc_entity::natural_spawn_26_1_2::entity_type_uses_aquatic_physics(
+                &candidate.type_name,
+            ) {
+                if is_water_creature(&candidate.type_name) {
+                    if water_creature_capacity == 0 {
+                        return false;
+                    }
+                    water_creature_capacity -= 1;
+                }
+                return true;
+            }
+            let count = ground_chunks
+                .entry(chunk_pos_from_coords(
+                    candidate.position.x,
+                    candidate.position.z,
+                ))
+                .or_default();
+            if *count >= 2 {
+                return false;
+            }
+            *count += 1;
+            true
+        });
+        let planned = super::limit_natural_candidates(planned, capacities);
         let planned_friendly = planned
             .iter()
             .filter(|candidate| !is_hostile_entity(&candidate.type_name))

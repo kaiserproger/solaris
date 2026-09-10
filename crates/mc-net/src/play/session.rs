@@ -2316,8 +2316,8 @@ fn entity_kill_drop_stacks(
     drops
 }
 
-const PLAYER_MELEE_KNOCKBACK_HORIZONTAL: f64 = 0.45;
-const PLAYER_MELEE_KNOCKBACK_VERTICAL: f64 = 0.20;
+const PLAYER_MELEE_KNOCKBACK_HORIZONTAL: f64 = 0.45 / mc_physics::TICK_SECONDS;
+const PLAYER_MELEE_KNOCKBACK_VERTICAL: f64 = 0.20 / mc_physics::TICK_SECONDS;
 
 fn apply_player_melee_knockback_locked(
     inner: &mut SessionEntityGuards<'_>,

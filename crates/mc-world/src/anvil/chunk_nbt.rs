@@ -2086,7 +2086,7 @@ mod tests {
         let current = chunk.get_block(0, edit_y, 0).expect("edit cell present");
         let new_state = if current == stone { dirt } else { stone };
         let prev = chunk
-            .set_block_and_update(0, edit_y, 0, new_state, air)
+            .set_block_and_update(0, edit_y, 0, new_state, air, false)
             .expect("y in range");
         assert_ne!(
             prev, new_state,

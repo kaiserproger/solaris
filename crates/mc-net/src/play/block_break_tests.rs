@@ -32,6 +32,7 @@ fn target(state: u32) -> BlockMutationSnapshot {
         token: mc_world::BlockMutationToken {
             chunk_instance_id: 7,
             version: 11,
+            last_replacement_version: 0,
         },
     }
 }

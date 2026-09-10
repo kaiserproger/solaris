@@ -216,9 +216,10 @@ jobs:
           mkdir -p "$package_dir"
           install -m 0755 "target/${TARGET}/release/mc-server" "$package_dir/solaris"
           install -m 0644 README.md example.toml LICENSE-APACHE LICENSE-MIT "$package_dir/"
+          install -m 0644 "docs/releases/${GITHUB_REF_NAME}.md" "$package_dir/CHANGELOG.md"
           printf '%s\n' "$GITHUB_REF_NAME" > "$package_dir/VERSION"
           tar -C "$package_dir" -czf "dist/${asset}" \
-            solaris README.md example.toml LICENSE-APACHE LICENSE-MIT VERSION
+            solaris README.md CHANGELOG.md example.toml LICENSE-APACHE LICENSE-MIT VERSION
           (
             cd dist
             sha256sum "$asset" > "${asset}.sha256"

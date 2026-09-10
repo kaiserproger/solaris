@@ -91,7 +91,7 @@ async fn placement_harness_with(
     *state.inventory.held_mut(0).unwrap() = held;
     insert_fluid_test_chunk(&state).await;
 
-    let pose = PlayerPose::new(4.5, 64.0, 4.5);
+    let pose = PlayerPose::new(2.5, 64.0, 4.5);
     let profile = LoggedInProfile {
         uuid: crate::login::offline_uuid("PlacementAdapter"),
         name: "PlacementAdapter".to_owned(),

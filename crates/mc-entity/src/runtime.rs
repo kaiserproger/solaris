@@ -1376,6 +1376,11 @@ impl EntityRuntime {
             }
 
             let gameplay = entity.get::<GameplayDecisionState>();
+            let panic_since = entity.get::<AnimalState>().and_then(|_| {
+                gameplay
+                    .and_then(|state| state.last_damage_tick)
+                    .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
+            });
             if inputs.terrain_pathing_entities.contains(&id) {
                 pathing_aabbs.push((
                     id,
@@ -1409,7 +1414,8 @@ impl EntityRuntime {
                 false
             };
             let goal_eligible = entity_type.name.as_ref() != "minecraft:ender_dragon"
-                && gameplay.is_none_or(|state| state.sheep_grazing_ticks.is_none());
+                && gameplay.is_none_or(|state| state.sheep_grazing_ticks.is_none())
+                && panic_since.is_none_or(|damage_tick| tick.saturating_sub(damage_tick) >= 5);
             let overridden_goal = goal_overrides.get(&id);
             let selected_goal = overridden_goal.unwrap_or(&goal.0);
             let goal_overridden = overridden_goal.is_some();
@@ -1426,11 +1432,19 @@ impl EntityRuntime {
                 passive_decisions += 1;
             }
             let pathing_requested = goal_active
-                && goal_pathing_request(identity, transform, motion, selected_goal, path, tick)
-                    .is_some_and(|request| {
-                        pathing_requests.push(request);
-                        true
-                    });
+                && goal_pathing_request(
+                    identity,
+                    transform,
+                    motion,
+                    selected_goal,
+                    path,
+                    tick,
+                    panic_since,
+                )
+                .is_some_and(|request| {
+                    pathing_requests.push(request);
+                    true
+                });
             if !pathing_requested
                 && (goal_active || goal_overridden)
                 && let Some(checkpoint) = entity_goal_checkpoint_from_entity(&entity)
@@ -1481,6 +1495,8 @@ impl EntityRuntime {
             &LifecycleState,
             &AiGoalState,
             &AiPathState,
+            Option<&AnimalState>,
+            Option<&GameplayDecisionState>,
         ), (
             Without<ItemStackState>,
             Without<ExperienceState>,
@@ -1490,14 +1506,21 @@ impl EntityRuntime {
         )>();
         let mut requests = query
             .iter(&self.world)
-            .filter(|(_, _, _, lifecycle, _, _)| lifecycle.0 == EntityLifecycle::Alive)
-            .filter(|(identity, _, _, _, _, _)| {
+            .filter(|(_, _, _, lifecycle, _, _, _, _)| lifecycle.0 == EntityLifecycle::Alive)
+            .filter(|(identity, _, _, _, _, _, _, _)| {
                 active_filter.is_none_or(|active_ids| active_ids.contains(&identity.id))
             })
-            .filter_map(|(identity, transform, motion, _, goal, path)| {
-                let goal = goal_overrides.get(&identity.id).unwrap_or(&goal.0);
-                goal_pathing_request(identity, transform, motion, goal, path, tick)
-            })
+            .filter_map(
+                |(identity, transform, motion, _, goal, path, animal, gameplay)| {
+                    let goal = goal_overrides.get(&identity.id).unwrap_or(&goal.0);
+                    let panic_since = animal.and_then(|_| {
+                        gameplay
+                            .and_then(|state| state.last_damage_tick)
+                            .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
+                    });
+                    goal_pathing_request(identity, transform, motion, goal, path, tick, panic_since)
+                },
+            )
             .collect::<Vec<_>>();
         requests.sort_unstable_by_key(|request| request.id);
         requests
@@ -1525,6 +1548,12 @@ impl EntityRuntime {
         let motion = entity.get::<MotionState>()?;
         let goal = entity.get::<AiGoalState>()?;
         let path = entity.get::<AiPathState>()?;
+        let panic_since = entity.get::<AnimalState>().and_then(|_| {
+            entity
+                .get::<GameplayDecisionState>()
+                .and_then(|state| state.last_damage_tick)
+                .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
+        });
         goal_pathing_request(
             identity,
             transform,
@@ -1532,6 +1561,7 @@ impl EntityRuntime {
             goal_override.unwrap_or(&goal.0),
             path,
             tick,
+            panic_since,
         )
     }
 
@@ -1796,6 +1826,7 @@ fn goal_pathing_request(
     goal: &GoalState,
     path: &AiPathState,
     tick: u64,
+    panic_since: Option<u64>,
 ) -> Option<GoalPathingRequest> {
     let (target, target_epoch, speed) = match goal {
         GoalState::FollowPosition { target, speed } if *speed != 0.0 => (*target, None, *speed),
@@ -1803,14 +1834,40 @@ fn goal_pathing_request(
             speed,
             period_ticks,
         } => {
-            let (target, epoch) = crate::wander_pathing_target(
-                identity.id,
-                transform.position,
-                path.0,
-                tick,
-                *period_ticks,
-            );
-            (target, Some(epoch), *speed)
+            if let Some(damage_tick) = panic_since {
+                let epoch = damage_tick + tick.saturating_sub(damage_tick) / 20;
+                let target = if path.0.has_target && path.0.target_epoch == Some(epoch) {
+                    path.0.target
+                } else {
+                    let horizontal = motion.velocity.x.hypot(motion.velocity.z);
+                    if horizontal > f64::EPSILON {
+                        Vec3::new(
+                            transform.position.x + motion.velocity.x / horizontal * 8.0,
+                            transform.position.y,
+                            transform.position.z + motion.velocity.z / horizontal * 8.0,
+                        )
+                    } else {
+                        crate::wander_pathing_target(
+                            identity.id,
+                            transform.position,
+                            path.0,
+                            tick,
+                            *period_ticks,
+                        )
+                        .0
+                    }
+                };
+                (target, Some(epoch), *speed * 2.0)
+            } else {
+                let (target, epoch) = crate::wander_pathing_target(
+                    identity.id,
+                    transform.position,
+                    path.0,
+                    tick,
+                    *period_ticks,
+                );
+                (target, Some(epoch), *speed)
+            }
         }
         _ => return None,
     };
@@ -3871,6 +3928,9 @@ fn apply_goal_to_entity(
                     z: angle.sin(),
                 }
             };
+            let speed = pathing_result
+                .and_then(|result| result.request.as_ref())
+                .map_or(*speed, |planned| planned.speed);
             motion.velocity.x = direction.x * speed;
             motion.velocity.z = direction.z * speed;
             face_horizontal_motion(&mut transform.rotation, motion.velocity);

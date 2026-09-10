@@ -9,6 +9,97 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[test]
+fn mining_accepts_leaf_distance_updates_but_rejects_replaced_blocks() {
+    let mut leaves = block_report("minecraft:oak_leaves", 1);
+    leaves
+        .properties
+        .insert("distance".into(), vec!["1".into(), "2".into()]);
+    leaves.states[0]
+        .properties
+        .insert("distance".into(), "1".into());
+    leaves.states.push(BlockStateReport {
+        id: 2,
+        default: false,
+        properties: BTreeMap::from([("distance".into(), "2".into())]),
+    });
+    let reports = vec![
+        block_report("minecraft:air", 0),
+        leaves,
+        block_report("minecraft:stone", 3),
+    ];
+    let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+    let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let pos = BlockPos { x: 1, y: 64, z: 1 };
+    storage.set_block_at(pos, BlockStateId(1)).unwrap();
+    let request = SurvivalBlockBreakPlan {
+        position: pos,
+        expected_target: BlockMutationSnapshot {
+            state: BlockStateId(1),
+            token: storage.block_mutation_token(pos).unwrap(),
+        },
+        blocks,
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &reports,
+        )),
+        water: None,
+        items: Arc::new(ItemRegistry::from_report(&[])),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        item_entity_type_id: None,
+        falling_block_entity_type_id: None,
+        loader_block_drop: None,
+        held: SurvivalBreakHeldItem {
+            hotbar_slot: 0,
+            expected: ItemStack::EMPTY,
+            max_damage: None,
+        },
+        drop_items: false,
+    };
+    storage.set_block_at(pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(pos, BlockStateId(1)).unwrap();
+    storage.set_block_at(pos, BlockStateId(2)).unwrap();
+    let plan =
+        prepare_survival_block_break_plan(&storage, &request).expect("updated leaves are mineable");
+    assert!(
+        plan.edits
+            .iter()
+            .any(|edit| edit.pos == pos && edit.new_state == BlockStateId(0))
+    );
+    storage.set_block_at(pos, BlockStateId(1)).unwrap();
+    assert!(
+        prepare_survival_block_break_plan(&storage, &request).is_none(),
+        "equal-state ABA must restart mining"
+    );
+    storage.set_block_at(pos, BlockStateId(3)).unwrap();
+    assert!(
+        prepare_survival_block_break_plan(&storage, &request).is_none(),
+        "different block must restart mining"
+    );
+    storage.set_block_at(pos, BlockStateId(2)).unwrap();
+    assert!(
+        prepare_survival_block_break_plan(&storage, &request).is_none(),
+        "leaves replaced through stone must not inherit the original mining request"
+    );
+    storage.set_block_at(pos, BlockStateId(0)).unwrap();
+    storage.set_block_at(pos, BlockStateId(2)).unwrap();
+    assert!(
+        prepare_survival_block_break_plan(&storage, &request).is_none(),
+        "newly placed leaves must not inherit the original mining request"
+    );
+}
+
 fn block_report(id: &str, state_id: u32) -> BlockReport {
     BlockReport {
         id: Identifier::parse(id).unwrap(),
@@ -638,6 +729,7 @@ async fn block_drop_missing_resident_chunk_rejects_without_publication() {
             BlockMutationToken {
                 chunk_instance_id: 1,
                 version: 0,
+                last_replacement_version: 0,
             },
             vec![test_drop(Vec3::new(17.5, 64.5, 1.5))],
         ))

@@ -77,6 +77,67 @@ async fn swimming_pose_submerges_eyes_in_one_block_of_water() {
 }
 
 #[tokio::test]
+async fn sprinting_in_shallow_water_does_not_start_swimming_or_consume_air() {
+    let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    state.block_facts = Arc::new(fluid_test_facts());
+    insert_fluid_test_chunk(&state).await;
+    state
+        .world
+        .lock()
+        .await
+        .set_block_at(BlockPos { x: 0, y: 64, z: 0 }, BlockStateId(2))
+        .unwrap();
+    let mut pose = PlayerPose::new(0.5, 64.0, 0.5);
+    pose.sprinting = true;
+    pose.input.forward = true;
+    for _ in 0..3 {
+        super::refresh_player_water_state(Some(&state), &mut pose).await;
+        assert!(pose.in_water);
+        assert!(!pose.swimming);
+        assert!(!pose.eye_in_water);
+    }
+}
+
+#[tokio::test]
+async fn breathing_requires_water_at_both_feet_and_eyes() {
+    let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    state.block_facts = Arc::new(fluid_test_facts());
+    insert_fluid_test_chunk(&state).await;
+    for (feet_water, head_water, expected_damage) in
+        [(true, false, 0.0), (false, true, 0.0), (true, true, 2.0)]
+    {
+        {
+            let mut world = state.world.lock().await;
+            for (y, water) in [(64, feet_water), (65, head_water)] {
+                world
+                    .set_block_at(
+                        BlockPos { x: 0, y, z: 0 },
+                        BlockStateId(if water { 2 } else { 0 }),
+                    )
+                    .unwrap();
+            }
+        }
+        let mut pose = PlayerPose::new(0.5, 64.0, 0.5);
+        super::refresh_player_water_state(Some(&state), &mut pose).await;
+        let mut breathing = super::PlayerBreathingState::default();
+        let mut damage = 0.0;
+        for _ in 0..320 {
+            let (next, tick) = breathing.tick(
+                super::player_damage_adapter::player_is_submerged(Some(&state), pose),
+                true,
+            );
+            breathing = next;
+            damage += tick.drowning_damage;
+        }
+        assert_eq!(damage, expected_damage);
+        assert_eq!(
+            breathing.air_supply(),
+            if expected_damage > 0.0 { 0 } else { 300 }
+        );
+    }
+}
+
+#[tokio::test]
 async fn representative_player_geometry_boundary_matrix() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&solaris_required_blocks_report())

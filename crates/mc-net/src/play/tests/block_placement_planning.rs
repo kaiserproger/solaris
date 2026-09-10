@@ -17,7 +17,7 @@ async fn block_placement_planning_does_not_wait_for_world_writer() {
         &state,
         position,
         BlockStateId(1),
-        PlayerPose::new(1.5, 64.0, 1.5),
+        PlayerPose::new(2.5, 64.0, 1.5),
         Direction::Up,
         0.5,
     ));
@@ -40,4 +40,23 @@ async fn block_placement_planning_does_not_wait_for_world_writer() {
     .await;
 
     drop(world_writer);
+}
+
+#[tokio::test]
+async fn placement_rejects_player_overlap_but_allows_adjacent_block() {
+    let state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    insert_fluid_test_chunk(&state).await;
+    let pose = PlayerPose::new(1.5, 64.0, 1.5);
+    for (y, expected) in [(63, true), (64, false), (65, false), (66, true)] {
+        let plan = plan_place_block_edits(
+            &state,
+            mc_world::BlockPos { x: 1, y, z: 1 },
+            BlockStateId(1),
+            pose,
+            Direction::Up,
+            0.5,
+        )
+        .await;
+        assert_eq!(plan.is_some(), expected, "placement at y={y}");
+    }
 }

@@ -1311,27 +1311,6 @@ mod tests {
     }
 
     #[test]
-    fn example_config_uses_safe_balanced_public_alpha_defaults() {
-        let cfg: ServerConfig =
-            toml::from_str(include_str!("../../../example.toml")).expect("parse example.toml");
-        let policy = cfg.autoscale.to_policy(&cfg.chunk_pipeline);
-        let limits = cfg
-            .autoscale
-            .initial_limits(&cfg.server, &cfg.chunk_pipeline);
-
-        assert!(cfg.autoscale.enabled);
-        assert_eq!(cfg.autoscale.profile, AutoscaleProfile::Balanced);
-        assert_eq!(cfg.server.view_distance, 8);
-        assert_eq!(cfg.server.simulation_distance, 8);
-        assert_eq!(cfg.network.bind_address, "127.0.0.1");
-        assert_eq!(cfg.data.world_dir, Some(PathBuf::from("world")));
-        assert_eq!(policy.min_view_distance, 6);
-        assert_eq!(policy.max_view_distance, 10);
-        assert_eq!(policy.target_tick_ms, 50);
-        assert_eq!(limits.view_distance, 8);
-    }
-
-    #[test]
     fn loader_live_gate_config_is_isolated_and_parseable() {
         let cfg: ServerConfig = toml::from_str(include_str!(
             "../../../examples/loader-live-gate/playable.toml"

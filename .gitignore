@@ -23,9 +23,9 @@
 /data/vanilla/version.json
 /data/vanilla/reports/
 
-# Side-effect of running vanilla-server-derived helpers and client launchers.
+# Runtime output, including server subprocesses launched from crate directories.
 # Local-only runtime state must never enter source control.
-/logs/
+logs/
 /world/
 
 # Local Claude / session-scratch dirs (per-session prompt drafts,

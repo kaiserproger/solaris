@@ -254,6 +254,9 @@ def cmd_list() -> int:
 
 def cmd_run(argv: list[str]) -> int:
     from . import profiles as catalog
+    # The harness captures stdout into per-run server.log and observes readiness
+    # there. Ordinary server launches keep tracing exclusively in log files.
+    os.environ["SOLARIS_HARNESS_LOG_STDOUT"] = "1"
 
     parser = argparse.ArgumentParser(prog="python3 -m tools.harness run")
     parser.add_argument("profile")

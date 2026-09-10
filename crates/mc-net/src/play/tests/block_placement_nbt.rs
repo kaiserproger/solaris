@@ -444,6 +444,7 @@ fn sign_placement_sets_wall_facing_and_floor_rotation() {
                     mc_world::BlockMutationToken {
                         chunk_instance_id: 7,
                         version: 11,
+                        last_replacement_version: 0,
                     },
                 )]),
                 ..BlockEditBatchOutcome::default()
@@ -455,6 +456,7 @@ fn sign_placement_sets_wall_facing_and_floor_rotation() {
             token: mc_world::BlockMutationToken {
                 chunk_instance_id: 7,
                 version: 11,
+                last_replacement_version: 0,
             },
             is_front_text: true,
         })

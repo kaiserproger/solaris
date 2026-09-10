@@ -72,6 +72,24 @@ connection's committed client baseline is retained for stale-transaction checks;
 it is not overwritten with speculative candidates. Other menu handlers remain
 outside this cutover.
 
+Placement planning rejects collision shapes intersecting the placing player.
+Rejected non-positional player-pose commits restore the last accepted pose rather
+than tearing down the connection. Respawn chunk replay first switches its center
+to the accepted respawn pose. Mining permits a changed state of the same block
+within the same chunk instance and uninterrupted block identity, but captures the
+current state/token for owner commit. Sparse per-block revisions also retain the
+last different-type replacement revision, so leaves→air/stone→leaves cannot
+inherit an older mining request; equal-state ABA remains rejected.
+Breathing and suffocation require water/solid contact at both feet and eyes.
+Sprinting into shallow water does not start the swimming stance unless the eyes
+are already submerged.
+
+Natural admission has global category caps plus per-chunk ground distribution and
+a water-creature subcap. Spawn candidates use loaded views within 128 blocks,
+independently of the smaller AI simulation radius. After successful persistence,
+the storage owner evicts excess clean, unretained chunks, keeping a warm tail of
+64. Retained views and dirty chunks remain outside that eviction policy.
+
 Current dragon flight commits its pose through the regional entity owner.
 Because flight and the dying rise bypass generic physics, the dragon authority
 also refreshes chunk visibility and publishes the accepted pose through the

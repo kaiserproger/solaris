@@ -182,6 +182,12 @@ impl BlockRegistry {
         self.by_id.get(id.0 as usize).map(Arc::as_ref)
     }
 
+    pub(crate) fn same_block_type(&self, first: BlockStateId, second: BlockStateId) -> bool {
+        self.by_id(first)
+            .zip(self.by_id(second))
+            .is_some_and(|(first, second)| first.block.id == second.block.id)
+    }
+
     #[must_use]
     pub fn block(&self, name: &Identifier) -> Option<&Block> {
         self.by_name.get(name).map(Arc::as_ref)

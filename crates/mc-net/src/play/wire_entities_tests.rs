@@ -497,6 +497,11 @@ async fn accepted_effect_heal_mutates_owner_and_publishes_clamped_health() {
         outbound.try_recv(),
         Ok(OutboundCommand::UpdateEntityHealth(snapshot)) if snapshot.health == Some(6.0)
     ));
+    assert!(matches!(
+        outbound.try_recv(),
+        Ok(OutboundCommand::EntityEvent { entity_id: hurt_id, event_id: 2 })
+            if hurt_id == entity_id.0
+    ));
     assert!(outbound.try_recv().is_err());
     let expected = current_entity_snapshot(&registry, entity_id);
     let max_health = expected

@@ -31,6 +31,12 @@ python3 -m tools.harness client [--check] [--platform fabric|neoforge|forge]
 python3 -m tools.harness mcp [--server-address host:port] [--exercise-input] [--disconnect]
 ```
 
+Normal server runs write tracing events only to `logs/latest.log` and
+`logs/debug.log`. The canonical `run` entrypoint sets
+`SOLARIS_HARNESS_LOG_STDOUT=1` for its subprocesses, adding an INFO stdout layer
+so existing readiness events and per-run captured server logs remain available.
+Do not enable this variable for ordinary operator launches.
+
 ### Prerequisites
 
 - Repository root as cwd; `python3`, `cargo`, and (for client profiles) Java 25

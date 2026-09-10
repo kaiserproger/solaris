@@ -1131,6 +1131,9 @@ impl WorldMutationView {
                             local_z,
                             updated_state,
                             air,
+                            self.resident
+                                .registry
+                                .same_block_type(expected_state, updated_state),
                         )
                         .expect("validated furnace position remains in chunk");
                     changed |= previous != updated_state;
@@ -1891,6 +1894,7 @@ impl WorldMutationView {
                 None
             };
             let changes_light = previous != edit.new_state && !preserve_light;
+            let same_block_type = registry.same_block_type(previous, edit.new_state);
             let chunk = Arc::make_mut(chunk.staged.as_mut().expect("required staged chunk"));
             let previous = if preserve_light {
                 chunk.set_block_and_update_preserving_light(
@@ -1899,9 +1903,17 @@ impl WorldMutationView {
                     local_z,
                     edit.new_state,
                     air,
+                    same_block_type,
                 )
             } else {
-                chunk.set_block_and_update(local_x, edit.pos.y, local_z, edit.new_state, air)
+                chunk.set_block_and_update(
+                    local_x,
+                    edit.pos.y,
+                    local_z,
+                    edit.new_state,
+                    air,
+                    same_block_type,
+                )
             }
             .expect("preflighted block position");
             if previous != edit.new_state {
@@ -2207,6 +2219,10 @@ impl WorldMutationView {
                 None
             };
             let changes_light = previous != edit.new_state && !preserve_light;
+            let same_block_type = self
+                .resident
+                .registry
+                .same_block_type(previous, edit.new_state);
             let mutation = self
                 .resident
                 .read_view
@@ -2218,6 +2234,7 @@ impl WorldMutationView {
                             local_z,
                             edit.new_state,
                             air,
+                            same_block_type,
                         )
                     } else {
                         chunk.set_block_and_update(
@@ -2226,6 +2243,7 @@ impl WorldMutationView {
                             local_z,
                             edit.new_state,
                             air,
+                            same_block_type,
                         )
                     }
                     .expect("preflighted block position");
@@ -2429,12 +2447,25 @@ impl WorldMutationView {
                 {
                     return ResidentBlockMutation::Stale;
                 }
+                let same_block_type = registry.same_block_type(expected_state, state);
                 let previous = if preserve_light {
                     chunk.set_block_and_update_preserving_light(
-                        local_x, position.y, local_z, state, air,
+                        local_x,
+                        position.y,
+                        local_z,
+                        state,
+                        air,
+                        same_block_type,
                     )
                 } else {
-                    chunk.set_block_and_update(local_x, position.y, local_z, state, air)
+                    chunk.set_block_and_update(
+                        local_x,
+                        position.y,
+                        local_z,
+                        state,
+                        air,
+                        same_block_type,
+                    )
                 }
                 .expect("validated block position remains in chunk");
                 if previous != state {

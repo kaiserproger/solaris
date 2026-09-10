@@ -6426,8 +6426,14 @@ fn prepare_survival_block_break_plan(
     request: &SurvivalBlockBreakPlan,
 ) -> Option<SurvivalBreakPlan> {
     let previous = storage.get_cached_block(request.position)?;
-    if previous != request.expected_target.state
-        || storage.block_mutation_token(request.position) != Some(request.expected_target.token)
+    let token = storage.block_mutation_token(request.position)?;
+    let expected = request.expected_target;
+    let same_block_state_change = previous != expected.state
+        && token.chunk_instance_id == expected.token.chunk_instance_id
+        && token.last_replacement_version == expected.token.last_replacement_version
+        && request.blocks.by_id(previous)?.block.id
+            == request.blocks.by_id(expected.state)?.block.id;
+    if (!same_block_state_change && (previous != expected.state || token != expected.token))
         || super::block_break_is_denied(&request.blocks, previous)
     {
         return None;
@@ -6455,7 +6461,10 @@ fn prepare_survival_block_break_plan(
         storage,
         &edits,
         request.position,
-        request.expected_target,
+        BlockMutationSnapshot {
+            state: previous,
+            token,
+        },
     )?;
     let drops = if request.drop_items {
         super::plan_survival_break_drops(request, &edits, &preconditions, air)
@@ -10916,6 +10925,7 @@ mod tests {
         let token = BlockMutationToken {
             chunk_instance_id: 1,
             version: 2,
+            last_replacement_version: 0,
         };
         let command = |precondition_pos, tick_pos| SimulationCommand::ApplyBlockEdits {
             actor_session: Some(1),

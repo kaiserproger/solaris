@@ -571,7 +571,7 @@ fn emit_player_collision_boxes(
     }
 }
 
-fn player_collision_state_intersects(
+pub(super) fn player_collision_state_intersects(
     facts: &BlockFactsTable,
     blocks: &BlockRegistry,
     collision_shapes: &CollisionShapeTable,

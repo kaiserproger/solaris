@@ -22,6 +22,8 @@ pub(crate) enum ConsoleCommand {
     Help,
     /// Show current server performance and world seed.
     Status,
+    /// Write measured tick phases, memory and population counters to logs/profile.json.
+    Profile,
     /// List connected players.
     List,
     /// List loaded plugins.

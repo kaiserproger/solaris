@@ -653,6 +653,37 @@ fn bounded_dirty_flush_plan_commits_one_batch_and_leaves_remainder() {
 }
 
 #[test]
+fn saved_travel_chunks_are_evicted_but_loaded_views_and_disk_data_survive() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("region")).unwrap();
+    let registry = air_stone_registry();
+    let mut world = WorldStorage::open_with_capacity(temp.path(), registry, 96).unwrap();
+    let biome = Identifier::parse("minecraft:plains").unwrap();
+    let retained = ChunkPos { x: 0, z: 0 };
+    for x in 0..80 {
+        let pos = ChunkPos { x, z: 0 };
+        let mut chunk = Chunk::empty(pos, BlockStateId(0), biome.clone());
+        chunk.set_block(0, 64, 0, BlockStateId(1)).unwrap();
+        world.insert_generated_chunk(pos, chunk).unwrap();
+    }
+    let view = world.read_view();
+    view.retain_chunk(retained);
+    assert_eq!(world.flush_dirty().unwrap(), 80);
+    assert_eq!(world.stats().chunk_cache_len, 65);
+    assert!(world.cached_chunk_snapshot(retained).is_some());
+    let evicted = ChunkPos { x: 1, z: 0 };
+    assert!(world.cached_chunk_snapshot(evicted).is_none());
+    assert_eq!(
+        world
+            .get_chunk(evicted)
+            .unwrap()
+            .unwrap()
+            .get_block(0, 64, 0),
+        Some(BlockStateId(1)),
+    );
+}
+
+#[test]
 fn bounded_dirty_flush_persists_every_chunk_under_continuous_mutation() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();

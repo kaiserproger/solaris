@@ -19,6 +19,18 @@ impl CommandHandler for ServerCommands {
     async fn execute(&self, command: ConsoleCommand) -> Result<ConsoleReply> {
         let message = match command {
             ConsoleCommand::Help => ConsoleCommand::help(),
+            ConsoleCommand::Profile => {
+                let snapshot = self.stats.stats();
+                tokio::fs::create_dir_all("logs").await?;
+                let report = serde_json::to_vec_pretty(&snapshot)?;
+                tokio::fs::write("logs/profile.json", report).await?;
+                format!(
+                    "Profile saved: logs/profile.json ({} tick samples, p95 {} us, memory {} MiB)",
+                    snapshot.tick.total.samples,
+                    snapshot.tick.total.p95_us,
+                    snapshot.memory.used_mb,
+                )
+            }
             ConsoleCommand::Status => {
                 let stats = self.stats.stats();
                 format!(
