@@ -18,8 +18,9 @@ printf 'solaris-installer-fixture\n'
 EOF
 chmod 0755 "$package/solaris"
 printf '[server]\nname = "installer-fixture"\n' > "$package/example.toml"
+printf 'Solaris installer fixture changelog\n' > "$package/CHANGELOG.md"
 
-tar -C "$package" -czf "$assets/$asset" solaris example.toml
+tar -C "$package" -czf "$assets/$asset" solaris example.toml CHANGELOG.md
 (
   cd "$assets"
   sha256sum "$asset" > "${asset}.sha256"
