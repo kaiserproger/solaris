@@ -181,6 +181,7 @@ struct GameplayDecisionState {
     primed_tnt: Option<crate::EntityPrimedTntState>,
     pending_explosion: Option<crate::EntityPendingExplosionState>,
     crossbow_attack: Option<crate::EntityCrossbowAttackState>,
+    bow_attack: Option<crate::EntityBowAttackState>,
     blaze_attack: Option<crate::EntityBlazeAttackState>,
     ghast_attack: Option<crate::EntityGhastAttackState>,
     breeze_attack: Option<crate::EntityBreezeAttackState>,
@@ -1900,7 +1901,11 @@ fn goal_pathing_request(
                         .0
                     }
                 };
-                (target, Some(epoch), *speed * 2.0)
+                (
+                    target,
+                    Some(epoch),
+                    *speed * crate::natural_spawn_26_1_2::panic_speed_multiplier_26_1_2(type_name),
+                )
             } else {
                 let (target, epoch) = crate::wander_pathing_target(
                     identity.id,
@@ -2093,6 +2098,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         primed_tnt,
         pending_explosion,
         crossbow_attack,
+        bow_attack,
         blaze_attack,
         ghast_attack,
         breeze_attack,
@@ -2164,6 +2170,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             primed_tnt,
             pending_explosion,
             crossbow_attack,
+            bow_attack,
             blaze_attack,
             ghast_attack,
             breeze_attack,
@@ -2299,6 +2306,7 @@ fn restore_snapshot_in_world(
         primed_tnt,
         pending_explosion,
         crossbow_attack,
+        bow_attack,
         blaze_attack,
         ghast_attack,
         breeze_attack,
@@ -2366,6 +2374,7 @@ fn restore_snapshot_in_world(
                 primed_tnt,
                 pending_explosion,
                 crossbow_attack,
+                bow_attack,
                 blaze_attack,
                 ghast_attack,
                 breeze_attack,
@@ -2498,6 +2507,7 @@ fn snapshot_from_entity(entity: &EntityRef<'_>) -> Option<EntitySnapshot> {
             primed_tnt: gameplay.primed_tnt,
             pending_explosion: gameplay.pending_explosion,
             crossbow_attack: gameplay.crossbow_attack,
+            bow_attack: gameplay.bow_attack,
 
             blaze_attack: gameplay.blaze_attack,
             ghast_attack: gameplay.ghast_attack,
@@ -3399,6 +3409,7 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             primed_tnt: gameplay.primed_tnt,
             pending_explosion: gameplay.pending_explosion,
             crossbow_attack: gameplay.crossbow_attack,
+            bow_attack: gameplay.bow_attack,
             blaze_attack: gameplay.blaze_attack,
             ghast_attack: gameplay.ghast_attack,
             breeze_attack: gameplay.breeze_attack,

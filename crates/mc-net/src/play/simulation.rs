@@ -1628,6 +1628,15 @@ pub(super) struct FoodUsePlan {
     pub(super) expected_survival: SurvivalState,
     pub(super) food: i32,
     pub(super) saturation: f32,
+    pub(super) can_always_eat: bool,
+    pub(super) remainder: Option<FoodUseRemainder>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct FoodUseRemainder {
+    pub(super) stack: ItemStack,
+    pub(super) max_stack: i32,
+    pub(super) entity_type_id: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -1641,6 +1650,7 @@ pub(super) struct CommittedFoodUse {
     pub(super) inventory: PlayerInventory,
     pub(super) survival: SurvivalState,
     pub(super) changed_slots: Vec<(usize, ItemStack)>,
+    pub(super) dispatches: Vec<VisibilityDispatch>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5164,7 +5174,10 @@ impl SimulationOwner {
         let result = if valid_food_use_plan(&command.plan) {
             Ok(sessions
                 .commit_food_use(&self.authority, command.actor_session, &command.plan)
-                .map(Box::new))
+                .map(|mut committed| {
+                    dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                    Box::new(committed)
+                }))
         } else {
             Err(SimulationRequestError::InvalidCommand)
         };
@@ -6667,6 +6680,10 @@ fn valid_food_use_plan(plan: &FoodUsePlan) -> bool {
         && plan.food > 0
         && plan.saturation.is_finite()
         && plan.saturation >= 0.0
+        && plan
+            .remainder
+            .as_ref()
+            .is_none_or(|remainder| remainder.stack.count == 1 && remainder.max_stack > 0)
 }
 
 fn valid_animal_feed_plan(plan: &AnimalFeedPlan) -> bool {
@@ -6836,7 +6853,7 @@ mod explosion_load_tests;
 mod tests {
     use super::super::{
         EntityPhysicsStep, GameMode, HOSTILE_MELEE_PERIOD_TICKS, ITEM_PICKUP_DELAY_TICKS,
-        PlayerPose, SKELETON_SHOT_PERIOD_TICKS, SessionRegistry, SurvivalState,
+        PlayerPose, SKELETON_BOW_DRAW_TICKS, SessionRegistry, SurvivalState,
     };
     use super::*;
     use crate::login::LoggedInProfile;
@@ -8249,6 +8266,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         storage
             .set_chest_block_entity(position, chest.clone())
@@ -8284,6 +8302,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         storage
             .set_furnace_block_entity(position, furnace.clone())
@@ -10366,6 +10385,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         assert!(registry.replace_item_stack_after_pickup_plan_for_test(item, replacement.clone()));
         resume_tx.send(()).expect("release pickup CAS");
@@ -12548,6 +12568,8 @@ mod tests {
             expected_survival,
             food: 4,
             saturation: 2.4,
+            can_always_eat: false,
+            remainder: None,
         }));
         assert_request_enqueued(request.as_mut(), &handle).await;
 
@@ -13002,7 +13024,7 @@ mod tests {
         let (session, mut outbound) =
             register_test_session_with_outbound(&registry, "SkeletonTarget");
         assert!(registry.mark_loaded(session, (0, 0)).is_empty());
-        let entity_id = publish_entity_spawns(
+        publish_entity_spawns(
             registry.spawn_command_entity(
                 &SimulationAuthority::for_test(),
                 4,
@@ -13010,17 +13032,19 @@ mod tests {
                 Vec3::new(0.5, 64.0, 6.5),
             ),
             &mut outbound,
-        )[0];
+        );
         let (_, owner) = simulation_channel();
-        let phase = u64::from(entity_id.0.unsigned_abs()) % SKELETON_SHOT_PERIOD_TICKS;
-        let due_tick = if phase == 0 {
-            SKELETON_SHOT_PERIOD_TICKS
-        } else {
-            SKELETON_SHOT_PERIOD_TICKS - phase
-        };
-
+        let draw_tick = 11;
         assert_eq!(
-            owner.tick_hostile_attacks(&registry, due_tick, BlockStateId(0)),
+            owner.tick_hostile_attacks(&registry, draw_tick, BlockStateId(0)),
+            0
+        );
+        assert_eq!(
+            owner.tick_hostile_attacks(
+                &registry,
+                draw_tick + SKELETON_BOW_DRAW_TICKS,
+                BlockStateId(0)
+            ),
             1
         );
 
@@ -13073,6 +13097,8 @@ mod tests {
                         expected_survival,
                         food: 4,
                         saturation: 2.4,
+                        can_always_eat: false,
+                        remainder: None,
                     },
                 }))
                 .unwrap();
@@ -13111,6 +13137,8 @@ mod tests {
                     expected_survival,
                     food: 4,
                     saturation: 2.4,
+                    can_always_eat: false,
+                    remainder: None,
                 },
             }))
             .unwrap();
@@ -13150,6 +13178,8 @@ mod tests {
                     expected_survival,
                     food: 4,
                     saturation: 2.4,
+                    can_always_eat: false,
+                    remainder: None,
                 },
             }))
             .unwrap();
@@ -13532,6 +13562,7 @@ mod tests {
                     enchantments: Vec::new(),
                     custom_name: None,
                     item_model: None,
+                    stew_effects: Vec::new(),
                 },
                 EntityItemStack::new(43, 4),
                 EntityItemStack::new(44, 2),
@@ -13641,6 +13672,7 @@ mod tests {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }]
         );
     }
@@ -15665,6 +15697,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -15719,6 +15752,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -15805,6 +15839,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -15880,6 +15915,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut first_update = initial.clone();
         first_update.slots[0].count = 1;
@@ -15987,6 +16023,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut updated = initial.clone();
         updated.slots[0].count = 1;
@@ -16088,6 +16125,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut first_update = initial.clone();
         first_update.slots[0].count = 1;
@@ -16229,6 +16267,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut updated = initial.clone();
         updated.slots[1].count = 1;
@@ -16297,6 +16336,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut updated = initial.clone();
         updated.slots[1].count = 1;
@@ -16366,6 +16406,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         initial
             .recipes_used
@@ -16454,6 +16495,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let mut current = expected.clone();
         current.burn_remaining = 9;
@@ -16525,6 +16567,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         let (mut storage, pos) = test_container_storage();
         storage

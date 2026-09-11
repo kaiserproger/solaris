@@ -23,7 +23,7 @@ use super::outbound::{
     OutboundCommand, ServerEntityMove, ServerEntitySnapshot, VisibilityDispatch,
 };
 use super::visibility::{
-    entity_event_dispatches_locked, initialize_entity_wire_state_locked, ordered_session_recipient,
+    entity_hurt_dispatches_locked, initialize_entity_wire_state_locked, ordered_session_recipient,
     publish_server_entity_snapshot_locked, remove_entity_visibility_locked,
     spawn_entity_visibility_locked, visible_entity_observers_locked,
 };
@@ -303,11 +303,8 @@ impl SessionRegistry {
                     }
 
                     let mut impact_dispatches = health_dispatches;
-                    impact_dispatches.extend(entity_event_dispatches_locked(
-                        &inner,
-                        impact.entity_id,
-                        2,
-                    ));
+                    impact_dispatches
+                        .extend(entity_hurt_dispatches_locked(&inner, impact.entity_id));
                     impact_dispatches.extend(apply_explosion_knockback_locked(
                         &mut inner,
                         impact.entity_id,

@@ -425,8 +425,26 @@ fn independently_sourced_attributes_and_loot(
             },
             static_id(&format!("minecraft:entities/{}", id.path())),
         ),
+        "minecraft:squid" | "minecraft:glow_squid" => (
+            EntityAttributeFacts {
+                // 26.1.2 Squid.createAttributes (also inherited by GlowSquid).
+                max_health: Some(10.0),
+                ..EntityAttributeFacts::default()
+            },
+            static_id(&format!("minecraft:entities/{}", id.path())),
+        ),
         _ => (EntityAttributeFacts::default(), None),
     }
+}
+
+/// 26.1.2 base `MOVEMENT_SPEED` attribute by entity name, where independently sourced.
+#[must_use]
+pub fn movement_speed_26_1_2(name: &str) -> Option<f64> {
+    Identifier::parse(name).ok().and_then(|id| {
+        independently_sourced_attributes_and_loot(&id)
+            .0
+            .movement_speed
+    })
 }
 
 fn static_id(value: &str) -> Option<Identifier> {

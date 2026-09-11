@@ -1,0 +1,24 @@
+2026-09-10T03:54:14.647472Z  INFO registry index loaded registries=28 entries=382 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.733258Z  INFO block-light table loaded version=blocks-report-conservative states=29873 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.733329Z  INFO block-mining table loaded states=0 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.799726Z  INFO server block registry loaded blocks=1168 states=29873
+2026-09-10T03:54:14.799791Z  INFO block-explosion table loaded states=0 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.801794Z  INFO embedded item registry loaded entries=1506
+2026-09-10T03:54:14.801899Z  INFO item component facts loaded entries=27 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.803345Z  INFO tags loaded tags=117 entries=1027 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.803786Z  INFO recipe registry loaded entries=81 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.803852Z  INFO survival loot tables loaded drops=45 source="embedded_solaris_fallback"
+2026-09-10T03:54:14.804211Z  INFO block simulation facts built from blocks report states=29873 random_tick_states=1069
+2026-09-10T03:54:14.805427Z  INFO embedded entity type registry loaded entries=157
+2026-09-10T03:54:14.805482Z  INFO embedded biome spawn rules loaded biomes=8
+2026-09-10T03:54:14.826875Z  INFO world spawn centre resolved block_x=256 block_z=-256 chunk_x=16 chunk_z=-16 source=SolarisGenerated
+2026-09-10T03:54:14.826927Z  INFO startup spawn preparation policy resolved configured_view_distance=16 startup_view_distance=6 cache_view_distance=16 autoscale_enabled=true
+2026-09-10T03:54:14.986170Z  INFO existing world startup spawn window warmed path=world chunks=225 baked=0 flushed=0 dirty=0 configured_view_distance=16 startup_view_distance=6
+2026-09-10T03:54:14.986250Z  INFO world storage opened with worldgen baseline path=world block_count=29873 region_files=4 seed=1098211577239795 source=SolarisGenerated
+2026-09-10T03:54:14.986528Z  INFO Solaris starting version="0.0.5" protocol=775 target="26.1.2"
+2026-09-10T03:54:14.986925Z  INFO Luau plugin host started plugin_directory=Some("plugins") loaded=0
+2026-09-10T03:54:14.986949Z  WARN offline-mode public server: player names and operator identities are not authenticated
+2026-09-10T03:54:14.988005Z  INFO loaded world metadata world_time=4016 daylight_cycle_enabled=true weather=WeatherState { kind: Clear, rain_level_bits: 0, thunder_level_bits: 0 } players_sleeping_percentage=100 keep_inventory=false
+2026-09-10T03:54:14.993795Z  INFO loaded persisted entities restored=18
+2026-09-10T03:54:15.166101Z  INFO Solaris is listening addr=0.0.0.0:25565 registries=28 entries=382 pathing_states=29873 physics_states=29873 physics_warm_us=93788
+2026-09-10T03:54:15.166232Z  INFO bounded concurrent connection tasks connection_task_limit=56 pre_auth_connection_limit=28 pre_auth_per_ip_limit=4

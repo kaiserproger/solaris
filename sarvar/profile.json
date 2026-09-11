@@ -1,0 +1,211 @@
+{
+  "version": "Solaris 0.0.5 (MC 26.1.2)",
+  "uptime_secs": 159,
+  "world": {
+    "name": "solaris-alpha",
+    "motd": "Solaris public alpha",
+    "seed": 1098211577239795,
+    "mode": "TellusLike",
+    "online_mode": false,
+    "view_distance": 16,
+    "simulation_distance": 16,
+    "max_players": 20
+  },
+  "players": {
+    "count": 0,
+    "max": 20,
+    "names": []
+  },
+  "tps": 19.466987193985094,
+  "tick": {
+    "total": {
+      "samples": 1200,
+      "p50_us": 2285,
+      "p95_us": 6477,
+      "p99_us": 10316,
+      "max_us": 14957
+    },
+    "stages": {
+      "animal_breeding": {
+        "samples": 1200,
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 1,
+        "max_us": 3
+      },
+      "block_tick": {
+        "samples": 1200,
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "max_us": 1120
+      },
+      "campfire_tick": {
+        "samples": 1200,
+        "p50_us": 2,
+        "p95_us": 2,
+        "p99_us": 3,
+        "max_us": 70
+      },
+      "entity_dispatch": {
+        "samples": 1200,
+        "p50_us": 97,
+        "p95_us": 187,
+        "p99_us": 307,
+        "max_us": 969
+      },
+      "entity_goals": {
+        "samples": 1200,
+        "p50_us": 512,
+        "p95_us": 731,
+        "p99_us": 3628,
+        "max_us": 6488
+      },
+      "entity_physics": {
+        "samples": 1200,
+        "p50_us": 170,
+        "p95_us": 329,
+        "p99_us": 3176,
+        "max_us": 4140
+      },
+      "entity_save": {
+        "samples": 1200,
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "max_us": 0
+      },
+      "fluid_tick": {
+        "samples": 1200,
+        "p50_us": 17,
+        "p95_us": 24,
+        "p99_us": 64,
+        "max_us": 120
+      },
+      "hostile_attacks": {
+        "samples": 1200,
+        "p50_us": 2,
+        "p95_us": 3,
+        "p99_us": 10,
+        "max_us": 91
+      },
+      "inhabited_time": {
+        "samples": 1200,
+        "p50_us": 31,
+        "p95_us": 142,
+        "p99_us": 2590,
+        "max_us": 7860
+      },
+      "random_tick": {
+        "samples": 1200,
+        "p50_us": 625,
+        "p95_us": 971,
+        "p99_us": 1107,
+        "max_us": 4977
+      },
+      "sheep_grazing": {
+        "samples": 1200,
+        "p50_us": 124,
+        "p95_us": 626,
+        "p99_us": 3692,
+        "max_us": 6784
+      },
+      "world_time": {
+        "samples": 1200,
+        "p50_us": 108,
+        "p95_us": 1286,
+        "p99_us": 4584,
+        "max_us": 11762
+      }
+    }
+  },
+  "memory": {
+    "used_mb": 482,
+    "limit_mb": 3922,
+    "available_mb": 3440
+  },
+  "autoscale": {
+    "enabled": true,
+    "profile": "Balanced",
+    "view_distance": 10,
+    "chunk_send_rate": 16,
+    "chunk_load_rate": 64,
+    "chunk_generate_rate": 32,
+    "scale_up_decisions": 30,
+    "scale_down_decisions": 28,
+    "draining": false
+  },
+  "chunks": {
+    "ticketed": 0,
+    "prepared": 64,
+    "loaded_total": 24,
+    "generated_total": 2,
+    "streamed_total": 1736
+  },
+  "entities": {
+    "total": 18,
+    "categories": {
+      "area_effect_cloud": 0,
+      "ender_dragon": 0,
+      "evoker_fang": 0,
+      "hostile": 0,
+      "iron_golem": 0,
+      "natural_aquatic": 8,
+      "natural_ground": 10,
+      "natural_hostile": 0,
+      "sheep": 8,
+      "villager": 0
+    }
+  },
+  "spawn": {
+    "friendly": {
+      "attempts": 6,
+      "chunks_sampled": 39,
+      "templates_considered": 185,
+      "committed": 51,
+      "rejected_unloaded": 0,
+      "rejected_time": 0,
+      "rejected_player_distance": 0,
+      "rejected_block_or_fluid": 0,
+      "rejected_darkness": 0,
+      "rejected_collision": 0,
+      "rejected_duplicate": 0
+    },
+    "hostile": {
+      "attempts": 12,
+      "chunks_sampled": 32,
+      "templates_considered": 14,
+      "committed": 0,
+      "rejected_unloaded": 0,
+      "rejected_time": 7,
+      "rejected_player_distance": 0,
+      "rejected_block_or_fluid": 0,
+      "rejected_darkness": 7,
+      "rejected_collision": 0,
+      "rejected_duplicate": 0
+    }
+  },
+  "save": {
+    "age_secs": 5,
+    "players_saved": 1,
+    "entities_saved": 18,
+    "chunks_flushed": 263,
+    "world_metadata_saved": true,
+    "elapsed_ms": 365,
+    "errors": []
+  },
+  "network": {
+    "bytes_written": 5337301,
+    "reliable_drops": 0,
+    "reliable_retries": 0,
+    "slow_client_sheds": 0,
+    "best_effort_animation_drops": 0
+  },
+  "plugins": {
+    "loaded": [],
+    "disabled": []
+  },
+  "warnings": [
+    "2026-09-10T03:50:50.657392Z  WARN mc_net::server: offline-mode public server: player names and operator identities are not authenticated"
+  ]
+}

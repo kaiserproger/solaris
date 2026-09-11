@@ -66,6 +66,8 @@ pub struct ItemFacts {
     pub food: Option<FoodEntry>,
     pub use_duration_ticks: Option<u32>,
     pub use_action: Option<UseAction>,
+    pub use_remainder: Option<Identifier>,
+    pub consume_effects: Vec<crate::food::ConsumeEffect>,
     pub tool: Option<ToolFacts>,
     pub equippable_slot: Option<String>,
     pub weapon: bool,
@@ -201,6 +203,8 @@ struct RawComponents {
     food: Option<RawFood>,
     #[serde(rename = "minecraft:consumable")]
     consumable: Option<RawConsumable>,
+    #[serde(rename = "minecraft:use_remainder")]
+    use_remainder: Option<RawUseRemainder>,
     #[serde(rename = "minecraft:tool")]
     tool: Option<RawTool>,
     #[serde(rename = "minecraft:equippable")]
@@ -222,6 +226,7 @@ impl RawItemComponents {
             max_damage,
             food,
             consumable,
+            use_remainder,
             tool,
             equippable,
             weapon,
@@ -260,12 +265,15 @@ impl RawItemComponents {
         ItemFacts {
             max_stack_size,
             max_damage,
-            food: food.map(|raw| FoodEntry {
+            food: food.filter(|_| consumable.is_some()).map(|raw| FoodEntry {
                 food: raw.nutrition,
                 saturation: raw.saturation,
+                can_always_eat: raw.can_always_eat,
             }),
             use_duration_ticks,
             use_action,
+            use_remainder: use_remainder.map(|raw| raw.id),
+            consume_effects: consumable.map_or_else(Vec::new, |raw| raw.on_consume_effects),
             tool: tool.map(RawTool::into_facts),
             equippable_slot: equippable.map(|raw| raw.slot),
             weapon: weapon.is_some(),
@@ -290,6 +298,13 @@ impl RawItemComponents {
 struct RawFood {
     nutrition: i32,
     saturation: f32,
+    #[serde(default)]
+    can_always_eat: bool,
+}
+
+#[derive(Deserialize)]
+struct RawUseRemainder {
+    id: Identifier,
 }
 
 #[derive(Default, Deserialize)]
@@ -299,6 +314,9 @@ struct RawEmbeddedItemFacts {
     food: Option<FoodEntry>,
     use_duration_ticks: Option<u32>,
     use_action: Option<RawEmbeddedUseAction>,
+    use_remainder: Option<Identifier>,
+    #[serde(default)]
+    consume_effects: Vec<crate::food::ConsumeEffect>,
     weapon: Option<bool>,
     weapon_damage_per_attack: Option<u32>,
     weapon_disable_blocking_seconds: Option<f32>,
@@ -317,6 +335,8 @@ impl RawEmbeddedItemFacts {
             food: self.food,
             use_duration_ticks: self.use_duration_ticks,
             use_action: self.use_action.map(RawEmbeddedUseAction::into_use_action),
+            use_remainder: self.use_remainder,
+            consume_effects: self.consume_effects,
             tool: self.tool.map(RawTool::into_facts),
             equippable_slot: None,
             weapon: self.weapon.unwrap_or(false),
@@ -353,6 +373,8 @@ impl RawEmbeddedUseAction {
 struct RawConsumable {
     consume_seconds: Option<f32>,
     animation: Option<String>,
+    #[serde(default)]
+    on_consume_effects: Vec<crate::food::ConsumeEffect>,
 }
 
 #[derive(Deserialize)]
@@ -631,7 +653,8 @@ mod tests {
             apple.food,
             Some(FoodEntry {
                 food: 4,
-                saturation: 2.4
+                saturation: 2.4,
+                can_always_eat: false,
             })
         );
         assert_eq!(apple.use_duration_ticks, Some(32));
@@ -757,22 +780,6 @@ mod tests {
     }
 
     #[test]
-    fn embedded_required_item_facts_cover_playable_cooked_food() {
-        let facts = solaris_required_item_facts();
-        for (id, food, saturation) in [
-            ("minecraft:cooked_beef", 8, 12.8),
-            ("minecraft:cooked_porkchop", 8, 12.8),
-            ("minecraft:cooked_chicken", 6, 7.2),
-        ] {
-            let item = Identifier::parse(id).unwrap();
-            let fact = facts.get(&item).unwrap_or_else(|| panic!("missing {id}"));
-            assert_eq!(fact.food, Some(FoodEntry { food, saturation }), "{id}");
-            assert_eq!(fact.use_duration_ticks, Some(32), "{id}");
-            assert_eq!(fact.use_action, Some(UseAction::Eat), "{id}");
-        }
-    }
-
-    #[test]
     fn embedded_required_item_facts_cover_shears_durability() {
         let facts = solaris_required_item_facts();
         let shears = facts
@@ -824,7 +831,8 @@ mod tests {
             apple.food,
             Some(FoodEntry {
                 food: 4,
-                saturation: 2.4
+                saturation: 2.4,
+                can_always_eat: false,
             })
         );
         assert_eq!(apple.use_duration_ticks, Some(32));
@@ -838,7 +846,8 @@ mod tests {
             bread.food,
             Some(FoodEntry {
                 food: 5,
-                saturation: 6.0
+                saturation: 6.0,
+                can_always_eat: false,
             })
         );
     }

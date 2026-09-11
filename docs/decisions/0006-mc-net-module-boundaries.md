@@ -43,6 +43,29 @@ commands. An outbound queue or socket never decides whether gameplay committed.
 - `mc-entity` owns entity ECS behavior and transaction semantics;
   `mc-physics` owns collision/movement kernels; `mc-world` owns world storage and
   immutable read snapshots; `mc-data` owns registry-derived gameplay facts.
+- Embedded contextual block-drop facts are normalized in `mc-data::loot::embedded`
+  and evaluated by the same `BlockLootContext` path as loaded loot. Tool-preserved
+  drops and Fortune probability tables belong there, not in packet handlers.
+  The manual-break adapter supplies the held tool, enchantments and action seed;
+  an empty evaluated drop list is a valid result, not a missing-rule fallback.
+- `play/random_ticks.rs` owns random-tick candidate sampling. It reads one
+  immutable snapshot of the budgeted chunks, skips inert sections before
+  generating positions, and retains original chunk/section seed offsets and
+  candidate order. `play.rs` still coordinates existing planning and fenced
+  commits; there is no candidate cache or new mutation authority.
+- Accepted living-entity damage publishes the semantic `EntityHurt` command;
+  `wire_entities.rs` resolves the configured damage registry and writes the
+  26.1.2 damage packet. It does not translate damage back into legacy event 2.
+- Crafting-table state-id lag requests authoritative resynchronization rather
+  than discarding an otherwise valid queued click. Inventory/input expected-state
+  fences remain in the simulation owner; client-reported slots are not authority.
+- Food-use eligibility travels with the resolved food rule through pending use
+  and `FoodUsePlan`; connection start/completion and owner commit all honor
+  `can_always_eat`. It never bypasses death, held-stack or expected-state fences.
+- Consumption remainders share the food owner transaction: replace the consumed
+  final held item, merge stacked-food remainders through canonical inventory
+  insertion, or create and publish one overflow item. The connection never
+  separately grants the remainder after consumption.
 - `mc-server::startup_data::StartupData` owns startup source selection,
   gameplay-table validation and immutable data assembly. The CLI receives one
   bundle before terrain/world preparation. Derived block facts and existing

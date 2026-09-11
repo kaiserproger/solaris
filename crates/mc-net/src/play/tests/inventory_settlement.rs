@@ -685,6 +685,7 @@ async fn stale_crafting_click_rebuilds_grid_from_owner_projection() {
         result: RecipeResult {
             item: output,
             count: 1,
+            stew_effects: Vec::new(),
         },
     });
     let mut local_window = CraftingTableWindow::new(7);
@@ -810,6 +811,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
         result: RecipeResult {
             item: output,
             count: 4,
+            stew_effects: Vec::new(),
         },
     });
     let mut window = CraftingTableWindow::new(7);
@@ -977,6 +979,7 @@ async fn inventory_result_paths_publish_only_after_owner_commit() {
         result: RecipeResult {
             item: output,
             count: 4,
+            stew_effects: Vec::new(),
         },
     });
     state.inventory.slots[1] = ItemStack::new(1, 1);

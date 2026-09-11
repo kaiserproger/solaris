@@ -1438,10 +1438,7 @@ fn clientbound_recipe_book_packets_match_local_vanilla_2612() {
             display_id: 2,
             display: RecipeBookDisplay::Shapeless {
                 ingredients: vec![RecipeBookSlotDisplay::Tag(birch_logs.clone())],
-                result: RecipeBookSlotDisplay::ItemStack {
-                    item_id: 5,
-                    count: 4,
-                },
+                result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(5, 4)),
                 crafting_station: RecipeBookSlotDisplay::Item { item_id: 6 },
             },
             group: None,
@@ -1482,10 +1479,7 @@ fn clientbound_recipe_book_round_trips_supported_display_variants() {
                         RecipeBookSlotDisplay::Item { item_id: 1 },
                         RecipeBookSlotDisplay::Empty,
                     ],
-                    result: RecipeBookSlotDisplay::ItemStack {
-                        item_id: 2,
-                        count: 3,
-                    },
+                    result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(2, 3)),
                     crafting_station: RecipeBookSlotDisplay::Item { item_id: 4 },
                 },
                 group: Some(3),
@@ -1501,10 +1495,7 @@ fn clientbound_recipe_book_round_trips_supported_display_variants() {
                         RecipeBookSlotDisplay::Tag(sample_identifier("minecraft:logs")),
                     ]),
                     fuel: RecipeBookSlotDisplay::AnyFuel,
-                    result: RecipeBookSlotDisplay::ItemStack {
-                        item_id: 10,
-                        count: 1,
-                    },
+                    result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(10, 1)),
                     crafting_station: RecipeBookSlotDisplay::Item { item_id: 11 },
                     duration: 200,
                     experience: 0.35,
@@ -1531,10 +1522,7 @@ fn clientbound_shaped_recipe_display_writes_ingredient_list_length() {
                     RecipeBookSlotDisplay::Item { item_id: 1 },
                     RecipeBookSlotDisplay::Empty,
                 ],
-                result: RecipeBookSlotDisplay::ItemStack {
-                    item_id: 2,
-                    count: 3,
-                },
+                result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(2, 3)),
                 crafting_station: RecipeBookSlotDisplay::Item { item_id: 4 },
             },
             group: Some(3),

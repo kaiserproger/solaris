@@ -137,6 +137,7 @@ where
         enchantments: held.enchantments.clone(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     let expected = state.sessions.campfire_cooking_state(position);
     let mut cooking = expected.clone();

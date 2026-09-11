@@ -116,6 +116,16 @@ impl MobBehaviorTable {
                     }
                 };
                 let (combat, special_attack) = combat_policy(contract.name, hostile);
+                // 26.1.2 melee pursuit and idle stroll both run at the base
+                // attribute (e.g. `ZombieAttackGoal(this, 1.0, ...)` over 0.23):
+                // Solaris speed units are attribute x10 (blocks/sec).
+                let hostile_speed = if hostile
+                    && matches!(movement, MobMovementPolicy::HostilePursuit)
+                {
+                    super::entity_types::movement_speed_26_1_2(contract.name).unwrap_or(0.2) * 10.0
+                } else {
+                    0.0
+                };
                 let profile =
                     MobBehaviorProfile {
                         movement,
@@ -127,9 +137,17 @@ impl MobBehaviorTable {
                             | MobMovementPolicy::VillagerSchedule => 0.0,
                             MobMovementPolicy::AquaticWander
                             | MobMovementPolicy::AmphibiousWander => 0.8,
-                            MobMovementPolicy::HostilePursuit => 1.25,
+                            MobMovementPolicy::HostilePursuit => hostile_speed,
                         },
-                        pursuit_speed: if hostile { 1.25 } else { 0.8 },
+                        pursuit_speed: if hostile
+                            && matches!(movement, MobMovementPolicy::HostilePursuit)
+                        {
+                            hostile_speed
+                        } else if hostile {
+                            1.25
+                        } else {
+                            0.8
+                        },
                         wander_period_ticks: match movement {
                             MobMovementPolicy::AquaticWander
                             | MobMovementPolicy::AmphibiousWander => 45,
@@ -247,6 +265,10 @@ mod tests {
             table.get_by_name("minecraft:zombie").unwrap().combat,
             MobCombatPolicy::Melee
         );
+        // 26.1.2 `ZombieAttackGoal(this, 1.0, ...)` over attribute 0.23.
+        let zombie = table.get_by_name("minecraft:zombie").unwrap();
+        assert!((zombie.wander_speed - 2.3).abs() < 1.0e-9);
+        assert!((zombie.pursuit_speed - 2.3).abs() < 1.0e-9);
         assert_eq!(
             table.get_by_name("minecraft:skeleton").unwrap().combat,
             MobCombatPolicy::Arrow

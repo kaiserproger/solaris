@@ -701,6 +701,30 @@ pub(super) fn held_food_use(
     Some((held.item_id, rule, duration))
 }
 
+pub(super) fn food_use_remainder(
+    state: &InteractionState,
+    item_id: u32,
+) -> Result<Option<super::simulation::FoodUseRemainder>, &'static str> {
+    let Some(remainder) = state
+        .items
+        .name_of(item_id)
+        .and_then(|item| state.item_facts.get(item))
+        .and_then(|facts| facts.use_remainder.as_ref())
+    else {
+        return Ok(None);
+    };
+    let item_id = state
+        .items
+        .id_of(remainder)
+        .ok_or("missing consumption remainder item")?;
+    let stack = ItemStack::new(item_id, 1);
+    Ok(Some(super::simulation::FoodUseRemainder {
+        max_stack: item_max_stack(&state.item_facts, &state.items, &stack),
+        stack,
+        entity_type_id: item_entity_type_id(&state.entity_types),
+    }))
+}
+
 pub(super) fn is_bow_item(state: &InteractionState, held_slot: usize) -> bool {
     let Some(held) = state.inventory.slots.get(held_slot) else {
         return false;
@@ -798,6 +822,7 @@ pub(super) fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
         enchantments: stack.enchantments,
         custom_name: stack.custom_name.map(Box::new),
         item_model: stack.item_model.as_deref().cloned().map(Box::new),
+        stew_effects: stack.stew_effects,
     }
 }
 

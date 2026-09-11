@@ -1114,6 +1114,24 @@ pub(super) fn entity_event_dispatches_locked(
         .collect()
 }
 
+pub(super) fn entity_hurt_dispatches_locked(
+    inner: &SessionRegistryInner,
+    entity_id: EntityId,
+) -> Vec<VisibilityDispatch> {
+    visible_entity_observers_locked(inner, entity_id)
+        .into_iter()
+        .filter_map(|observer_id| {
+            let observer = inner.sessions.get(&observer_id)?;
+            Some(VisibilityDispatch {
+                recipient: ordered_session_recipient(observer_id, observer),
+                command: OutboundCommand::EntityHurt {
+                    entity_id: entity_id.0,
+                },
+            })
+        })
+        .collect()
+}
+
 pub(super) fn clear_entity_publication_state_locked(
     inner: &mut SessionRegistryInner,
     entity_id: EntityId,

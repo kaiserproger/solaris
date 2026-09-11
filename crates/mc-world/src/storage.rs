@@ -2325,6 +2325,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         furnace.cook_progress = 11;
 
@@ -2717,6 +2718,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
 
         assert!(world.set_hopper_block_entity(pos, hopper.clone()).unwrap());
@@ -2925,6 +2927,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         furnace.slots[1] = crate::chunk::FurnaceSlot {
             count: 3,
@@ -2933,6 +2936,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         world
             .set_furnace_block_entity(pos, furnace.clone())
@@ -2968,6 +2972,10 @@ mod tests {
                 id: mc_data::Identifier::parse("minecraft:apple").unwrap(),
                 protocol_id: 11,
             },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:suspicious_stew").unwrap(),
+                protocol_id: 12,
+            },
         ]));
         let cpos = ChunkPos { x: 0, z: 0 };
         let pos = BlockPos { x: 1, y: 2, z: 3 };
@@ -2988,6 +2996,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         chest.slots[26] = crate::chunk::FurnaceSlot {
             count: 3,
@@ -2996,11 +3005,21 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         chest.slots[0].custom_name = Some("Reserved supplies".to_owned());
         chest.slots[0].item_model = Some(Arc::new(
             mc_data::Identifier::parse("solaris:stored_supplies").unwrap(),
         ));
+        chest.slots[1] = crate::chunk::FurnaceSlot {
+            item_id: 12,
+            count: 1,
+            stew_effects: vec![mc_data::item_stack::StewEffect {
+                id: mc_data::Identifier::parse("minecraft:poison").unwrap(),
+                duration: 220,
+            }],
+            ..crate::chunk::FurnaceSlot::EMPTY
+        };
         world.set_chest_block_entity(pos, chest.clone()).unwrap();
         assert_eq!(world.flush_dirty().unwrap(), 1);
 
@@ -3048,6 +3067,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         hopper.slots[4] = crate::chunk::FurnaceSlot {
             count: 3,
@@ -3056,6 +3076,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         world.set_hopper_block_entity(pos, hopper.clone()).unwrap();
         assert_eq!(world.flush_dirty().unwrap(), 1);
@@ -3085,6 +3106,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         world.set_chest_block_entity(pos, chest).unwrap();
 
@@ -3113,6 +3135,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         world.set_hopper_block_entity(pos, hopper).unwrap();
 

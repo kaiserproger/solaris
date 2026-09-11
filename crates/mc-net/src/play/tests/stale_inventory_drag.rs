@@ -139,3 +139,78 @@ async fn stale_inventory_drag_resyncs_exact_owner_state_without_loss_or_publicat
     assert!(outbound.try_recv().is_err());
     assert!(state.sessions.persisted_entity_records().is_empty());
 }
+
+#[tokio::test]
+async fn stale_crafting_drag_keeps_all_three_selected_slots() {
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:dirt").unwrap(),
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(items);
+    state.carried_item = ItemStack::new(10, 9);
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("QueuedCraftingDrag"),
+        name: "QueuedCraftingDrag".into(),
+    };
+    let (tx, _outbound) = mpsc::channel(32);
+    let (session_id, _) = state
+        .sessions
+        .register(&profile, (0, 0), 0, HashSet::new(), tx, pose);
+    let mut saved = PlayerPersistedState::new_default(pose);
+    saved.carried_item = state.carried_item.clone();
+    state
+        .sessions
+        .register_player_persistence(session_id, Arc::new(Mutex::new(saved)));
+    state.session_id = session_id;
+    let sessions = Arc::clone(&state.sessions);
+    let (simulation, mut owner) = simulation_channel();
+    state.simulation = simulation.for_session(session_id);
+    let mut window = Box::new(super::CraftingTableWindow::new(7));
+    window.state_id = 2;
+    let mut writer = Vec::new();
+    for (button_num, slot_num) in [(0, -999), (1, 1), (1, 2), (1, 3), (2, -999)] {
+        let carried_item = mc_protocol::packets::play::HashedStack::Actual {
+            item_id: 10,
+            count: 8,
+            components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+        };
+        let mut request = Box::pin(super::handle_crafting_container_click(
+            &mut state,
+            &mut writer,
+            window,
+            None,
+            GameMode::Survival,
+            pose,
+            ServerboundContainerClick {
+                container_id: 7,
+                state_id: 1,
+                slot_num,
+                button_num,
+                container_input: ContainerInput::QuickCraft,
+                changed_slots: Vec::new(),
+                carried_item,
+            },
+        ));
+        window = loop {
+            match std::future::poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx))).await {
+                Poll::Ready(result) => break result.unwrap(),
+                Poll::Pending => assert!(owner.process_tick(&sessions, 32).processed > 0),
+            }
+        };
+    }
+    assert_eq!(
+        &window.input[..3],
+        &[
+            ItemStack::new(10, 3),
+            ItemStack::new(10, 3),
+            ItemStack::new(10, 3)
+        ]
+    );
+    assert!(window.input[3..].iter().all(ItemStack::is_empty));
+    assert!(state.carried_item.is_empty());
+    let packets = decode_container_set_content_packets(&writer);
+    let last = packets.last().expect("authoritative resync");
+    assert_eq!(&last.items[1..4], &window.input[..3]);
+    assert!(last.carried_item.is_empty());
+}

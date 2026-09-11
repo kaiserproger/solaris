@@ -173,6 +173,8 @@ pub struct EntityItemStack {
     pub custom_name: Option<Box<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_model: Option<Box<mc_data::Identifier>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stew_effects: Vec<mc_data::item_stack::StewEffect>,
 }
 
 impl EntityItemStack {
@@ -185,6 +187,7 @@ impl EntityItemStack {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         }
     }
 
@@ -505,6 +508,9 @@ pub struct EntityRetainedState {
     pub pending_explosion: Option<EntityPendingExplosionState>,
     #[serde(default)]
     pub crossbow_attack: Option<EntityCrossbowAttackState>,
+    /// Runtime-only RangedBowAttackGoal draw/cooldown. Vanilla does not persist goal-local timers.
+    #[serde(skip)]
+    pub bow_attack: Option<EntityBowAttackState>,
     /// Runtime-only BlazeAttackGoal step/deadline. Vanilla does not persist goal-local timers.
     #[serde(skip)]
     pub blaze_attack: Option<EntityBlazeAttackState>,
@@ -580,6 +586,33 @@ impl EntityCrossbowAttackState {
     #[must_use]
     pub const fn is_charging(self) -> bool {
         matches!(self.phase, EntityCrossbowAttackPhase::Charging)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityBowAttackPhase {
+    Drawing,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityBowAttackState {
+    pub phase: EntityBowAttackPhase,
+    pub deadline_tick: u64,
+}
+
+impl EntityBowAttackState {
+    #[must_use]
+    pub const fn new(phase: EntityBowAttackPhase, deadline_tick: u64) -> Self {
+        Self {
+            phase,
+            deadline_tick,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_drawing(self) -> bool {
+        matches!(self.phase, EntityBowAttackPhase::Drawing)
     }
 }
 

@@ -61,6 +61,7 @@ pub mod item_stack;
 pub mod items;
 pub mod loot;
 pub mod mob_behavior_26_1_2;
+pub mod mob_effects_26_1_2;
 pub mod recipes;
 pub mod resource_path;
 mod sidecar;

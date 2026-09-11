@@ -42,6 +42,7 @@ pub(super) fn stonecutter_test_recipe() -> mc_data::recipes::Recipe {
         result: RecipeResult {
             item: Identifier::parse("minecraft:cobblestone_slab").unwrap(),
             count: 2,
+            stew_effects: Vec::new(),
         },
     }
 }

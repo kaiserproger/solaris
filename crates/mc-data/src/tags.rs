@@ -1278,6 +1278,7 @@ pub fn solaris_required_client_tags(
     add_required_client_fallback_tags(&mut tags);
     add_required_fluid_tags(&mut tags);
     add_required_block_tags(&mut tags, blocks);
+    add_required_timeline_tags(&mut tags);
     tags
 }
 
@@ -1289,6 +1290,41 @@ fn add_required_client_fallback_tags(tags: &mut TagsData) {
             let tag_id = Identifier::parse(*required_tag).expect("static tag id is valid");
             registry_tags.entry(tag_id).or_default();
         }
+    }
+}
+
+fn add_required_timeline_tags(tags: &mut TagsData) {
+    let entries = &crate::required_registry_entries()["timeline"];
+    let timeline_tags = tags
+        .registries
+        .entry(Identifier::parse("minecraft:timeline").expect("static registry id"))
+        .or_default();
+    // 26.1.2 dimension types reference these tags, not individual timelines.
+    // Empty bindings disable sky animation even when SetTime is correct.
+    for (tag, members) in [
+        ("minecraft:universal", &["minecraft:villager_schedule"][..]),
+        ("minecraft:in_end", &["minecraft:villager_schedule"][..]),
+        ("minecraft:in_nether", &["minecraft:villager_schedule"][..]),
+        (
+            "minecraft:in_overworld",
+            &[
+                "minecraft:villager_schedule",
+                "minecraft:day",
+                "minecraft:moon",
+                "minecraft:early_game",
+            ][..],
+        ),
+    ] {
+        let ids = members
+            .iter()
+            .map(|name| {
+                entries
+                    .iter()
+                    .position(|entry| entry.as_str() == *name)
+                    .expect("required timeline is in the embedded registry") as i32
+            })
+            .collect();
+        timeline_tags.insert(Identifier::parse(tag).expect("static timeline tag"), ids);
     }
 }
 

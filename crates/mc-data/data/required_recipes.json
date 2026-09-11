@@ -377,27 +377,6 @@
     },
     "result": { "id": "minecraft:campfire", "count": 1 }
   },
-  "minecraft:zz_playable_zz_campfire_cooked_beef": {
-    "type": "minecraft:campfire_cooking",
-    "ingredient": "minecraft:beef",
-    "result": { "id": "minecraft:cooked_beef", "count": 1 },
-    "experience": 0.35,
-    "cookingtime": 600
-  },
-  "minecraft:zz_playable_zz_campfire_cooked_chicken": {
-    "type": "minecraft:campfire_cooking",
-    "ingredient": "minecraft:chicken",
-    "result": { "id": "minecraft:cooked_chicken", "count": 1 },
-    "experience": 0.35,
-    "cookingtime": 600
-  },
-  "minecraft:zz_playable_zz_campfire_cooked_porkchop": {
-    "type": "minecraft:campfire_cooking",
-    "ingredient": "minecraft:porkchop",
-    "result": { "id": "minecraft:cooked_porkchop", "count": 1 },
-    "experience": 0.35,
-    "cookingtime": 600
-  },
   "minecraft:zz_playable_zz_iron_sword": {
     "type": "minecraft:crafting_shaped",
     "pattern": ["#", "#", "X"],
@@ -419,7 +398,7 @@
     "key": { "#": "minecraft:iron_ingot" },
     "result": { "id": "minecraft:iron_chestplate", "count": 1 }
   },
-  "minecraft:zz_playable_zzzz_bread": {
+  "minecraft:bread": {
     "type": "minecraft:crafting_shaped",
     "pattern": ["###"],
     "key": { "#": "minecraft:wheat" },
@@ -538,5 +517,629 @@
     "pattern": [" #", "# "],
     "key": { "#": "minecraft:iron_ingot" },
     "result": { "id": "minecraft:shears", "count": 1 }
+  },
+  "minecraft:baked_potato_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "cookingtime": 600,
+    "experience": 0.35,
+    "ingredient": "minecraft:potato",
+    "result": {
+      "id": "minecraft:baked_potato"
+    }
+  },
+  "minecraft:baked_potato_from_smoking": {
+    "type": "minecraft:smoking",
+    "cookingtime": 100,
+    "experience": 0.35,
+    "ingredient": "minecraft:potato",
+    "result": {
+      "id": "minecraft:baked_potato"
+    }
+  },
+  "minecraft:beetroot_soup": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:beetroot",
+      "minecraft:beetroot",
+      "minecraft:beetroot",
+      "minecraft:beetroot",
+      "minecraft:beetroot",
+      "minecraft:beetroot"
+    ],
+    "result": {
+      "id": "minecraft:beetroot_soup"
+    }
+  },
+  "minecraft:cooked_beef_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "cookingtime": 600,
+    "experience": 0.35,
+    "ingredient": "minecraft:beef",
+    "result": {
+      "id": "minecraft:cooked_beef"
+    }
+  },
+  "minecraft:cooked_beef_from_smoking": {
+    "type": "minecraft:smoking",
+    "cookingtime": 100,
+    "experience": 0.35,
+    "ingredient": "minecraft:beef",
+    "result": {
+      "id": "minecraft:cooked_beef"
+    }
+  },
+  "minecraft:cooked_chicken_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "cookingtime": 600,
+    "experience": 0.35,
+    "ingredient": "minecraft:chicken",
+    "result": {
+      "id": "minecraft:cooked_chicken"
+    }
+  },
+  "minecraft:cooked_chicken_from_smoking": {
+    "type": "minecraft:smoking",
+    "cookingtime": 100,
+    "experience": 0.35,
+    "ingredient": "minecraft:chicken",
+    "result": {
+      "id": "minecraft:cooked_chicken"
+    }
+  },
+  "minecraft:cooked_mutton": {
+    "type": "minecraft:smelting",
+    "cookingtime": 200,
+    "experience": 0.35,
+    "ingredient": "minecraft:mutton",
+    "result": {
+      "id": "minecraft:cooked_mutton"
+    }
+  },
+  "minecraft:cooked_mutton_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "cookingtime": 600,
+    "experience": 0.35,
+    "ingredient": "minecraft:mutton",
+    "result": {
+      "id": "minecraft:cooked_mutton"
+    }
+  },
+  "minecraft:cooked_mutton_from_smoking": {
+    "type": "minecraft:smoking",
+    "cookingtime": 100,
+    "experience": 0.35,
+    "ingredient": "minecraft:mutton",
+    "result": {
+      "id": "minecraft:cooked_mutton"
+    }
+  },
+  "minecraft:cooked_porkchop_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "cookingtime": 600,
+    "experience": 0.35,
+    "ingredient": "minecraft:porkchop",
+    "result": {
+      "id": "minecraft:cooked_porkchop"
+    }
+  },
+  "minecraft:cooked_porkchop_from_smoking": {
+    "type": "minecraft:smoking",
+    "cookingtime": 100,
+    "experience": 0.35,
+    "ingredient": "minecraft:porkchop",
+    "result": {
+      "id": "minecraft:cooked_porkchop"
+    }
+  },
+  "minecraft:cooked_rabbit": {
+    "type": "minecraft:smelting",
+    "cookingtime": 200,
+    "experience": 0.35,
+    "ingredient": "minecraft:rabbit",
+    "result": {
+      "id": "minecraft:cooked_rabbit"
+    }
+  },
+  "minecraft:cooked_rabbit_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "cookingtime": 600,
+    "experience": 0.35,
+    "ingredient": "minecraft:rabbit",
+    "result": {
+      "id": "minecraft:cooked_rabbit"
+    }
+  },
+  "minecraft:cooked_rabbit_from_smoking": {
+    "type": "minecraft:smoking",
+    "cookingtime": 100,
+    "experience": 0.35,
+    "ingredient": "minecraft:rabbit",
+    "result": {
+      "id": "minecraft:cooked_rabbit"
+    }
+  },
+  "minecraft:cookie": {
+    "type": "minecraft:crafting_shaped",
+    "key": {
+      "#": "minecraft:wheat",
+      "X": "minecraft:cocoa_beans"
+    },
+    "pattern": [
+      "#X#"
+    ],
+    "result": {
+      "count": 8,
+      "id": "minecraft:cookie"
+    }
+  },
+  "minecraft:dried_kelp": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:dried_kelp_block"
+    ],
+    "result": {
+      "count": 9,
+      "id": "minecraft:dried_kelp"
+    }
+  },
+  "minecraft:dried_kelp_from_campfire_cooking": {
+    "type": "minecraft:campfire_cooking",
+    "cookingtime": 600,
+    "experience": 0.1,
+    "ingredient": "minecraft:kelp",
+    "result": {
+      "id": "minecraft:dried_kelp"
+    }
+  },
+  "minecraft:dried_kelp_from_smelting": {
+    "type": "minecraft:smelting",
+    "cookingtime": 200,
+    "experience": 0.1,
+    "ingredient": "minecraft:kelp",
+    "result": {
+      "id": "minecraft:dried_kelp"
+    }
+  },
+  "minecraft:dried_kelp_from_smoking": {
+    "type": "minecraft:smoking",
+    "cookingtime": 100,
+    "experience": 0.1,
+    "ingredient": "minecraft:kelp",
+    "result": {
+      "id": "minecraft:dried_kelp"
+    }
+  },
+  "minecraft:golden_apple": {
+    "type": "minecraft:crafting_shaped",
+    "key": {
+      "#": "minecraft:gold_ingot",
+      "X": "minecraft:apple"
+    },
+    "pattern": [
+      "###",
+      "#X#",
+      "###"
+    ],
+    "result": {
+      "id": "minecraft:golden_apple"
+    }
+  },
+  "minecraft:golden_carrot": {
+    "type": "minecraft:crafting_shaped",
+    "key": {
+      "#": "minecraft:gold_nugget",
+      "X": "minecraft:carrot"
+    },
+    "pattern": [
+      "###",
+      "#X#",
+      "###"
+    ],
+    "result": {
+      "id": "minecraft:golden_carrot"
+    }
+  },
+  "minecraft:honey_bottle": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:honey_block",
+      "minecraft:glass_bottle",
+      "minecraft:glass_bottle",
+      "minecraft:glass_bottle",
+      "minecraft:glass_bottle"
+    ],
+    "result": {
+      "count": 4,
+      "id": "minecraft:honey_bottle"
+    }
+  },
+  "minecraft:mushroom_stew": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:bowl"
+    ],
+    "result": {
+      "id": "minecraft:mushroom_stew"
+    }
+  },
+  "minecraft:pumpkin_pie": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:pumpkin",
+      "minecraft:sugar",
+      "#minecraft:eggs"
+    ],
+    "result": {
+      "id": "minecraft:pumpkin_pie"
+    }
+  },
+  "minecraft:rabbit_stew_from_brown_mushroom": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:baked_potato",
+      "minecraft:cooked_rabbit",
+      "minecraft:bowl",
+      "minecraft:carrot",
+      "minecraft:brown_mushroom"
+    ],
+    "result": {
+      "id": "minecraft:rabbit_stew"
+    }
+  },
+  "minecraft:rabbit_stew_from_red_mushroom": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:baked_potato",
+      "minecraft:cooked_rabbit",
+      "minecraft:bowl",
+      "minecraft:carrot",
+      "minecraft:red_mushroom"
+    ],
+    "result": {
+      "id": "minecraft:rabbit_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_allium": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:allium"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 60,
+            "id": "minecraft:fire_resistance"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_azure_bluet": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:azure_bluet"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 220,
+            "id": "minecraft:blindness"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_blue_orchid": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:blue_orchid"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 7,
+            "id": "minecraft:saturation"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_closed_eyeblossom": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:closed_eyeblossom"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 140,
+            "id": "minecraft:nausea"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_cornflower": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:cornflower"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 100,
+            "id": "minecraft:jump_boost"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_dandelion": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:dandelion"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 7,
+            "id": "minecraft:saturation"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_golden_dandelion": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:golden_dandelion"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 7,
+            "id": "minecraft:saturation"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_lily_of_the_valley": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:lily_of_the_valley"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 220,
+            "id": "minecraft:poison"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_open_eyeblossom": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:open_eyeblossom"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 220,
+            "id": "minecraft:blindness"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_orange_tulip": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:orange_tulip"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 140,
+            "id": "minecraft:weakness"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_oxeye_daisy": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:oxeye_daisy"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 140,
+            "id": "minecraft:regeneration"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_pink_tulip": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:pink_tulip"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 140,
+            "id": "minecraft:weakness"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_poppy": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:poppy"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 100,
+            "id": "minecraft:night_vision"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_red_tulip": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:red_tulip"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 140,
+            "id": "minecraft:weakness"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_torchflower": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:torchflower"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 100,
+            "id": "minecraft:night_vision"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_white_tulip": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:white_tulip"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 140,
+            "id": "minecraft:weakness"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
+  },
+  "minecraft:suspicious_stew_from_wither_rose": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [
+      "minecraft:bowl",
+      "minecraft:brown_mushroom",
+      "minecraft:red_mushroom",
+      "minecraft:wither_rose"
+    ],
+    "result": {
+      "components": {
+        "minecraft:suspicious_stew_effects": [
+          {
+            "duration": 140,
+            "id": "minecraft:wither"
+          }
+        ]
+      },
+      "id": "minecraft:suspicious_stew"
+    }
   }
 }

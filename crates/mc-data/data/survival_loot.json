@@ -24,7 +24,50 @@
   "blocks": {
     "minecraft:coal_ore": "minecraft:coal",
     "minecraft:copper_ore": "minecraft:raw_copper",
-    "minecraft:dark_oak_leaves": "minecraft:apple",
+    "minecraft:dark_oak_leaves": {
+      "sequence": "minecraft:blocks/dark_oak_leaves",
+      "silk_touch": "minecraft:dark_oak_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:dark_oak_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:dark_oak_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        },
+        {
+          "item": "minecraft:apple",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.005,
+            0.0055555557,
+            0.00625,
+            0.008333334,
+            0.025
+          ]
+        }
+      ]
+    },
     "minecraft:deepslate_coal_ore": "minecraft:coal",
     "minecraft:deepslate_copper_ore": "minecraft:raw_copper",
     "minecraft:deepslate_diamond_ore": "minecraft:diamond",
@@ -44,12 +87,357 @@
     "minecraft:iron_ore": "minecraft:raw_iron",
     "minecraft:jungle_log": "minecraft:jungle_log",
     "minecraft:lapis_ore": "minecraft:lapis_lazuli",
-    "minecraft:oak_leaves": "minecraft:apple",
+    "minecraft:oak_leaves": {
+      "sequence": "minecraft:blocks/oak_leaves",
+      "silk_touch": "minecraft:oak_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:oak_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:oak_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        },
+        {
+          "item": "minecraft:apple",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.005,
+            0.0055555557,
+            0.00625,
+            0.008333334,
+            0.025
+          ]
+        }
+      ]
+    },
     "minecraft:oak_log": "minecraft:oak_log",
     "minecraft:podzol": "minecraft:dirt",
     "minecraft:redstone_ore": "minecraft:redstone",
-    "minecraft:short_grass": "minecraft:wheat_seeds",
+    "minecraft:short_grass": {
+      "sequence": "minecraft:blocks/short_grass",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:short_grass"
+      },
+      "drops": [
+        {
+          "item": "minecraft:wheat_seeds",
+          "chance": 0.125,
+          "fortune_multiplier": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
     "minecraft:spruce_log": "minecraft:spruce_log",
-    "minecraft:stone": "minecraft:cobblestone"
+    "minecraft:stone": "minecraft:cobblestone",
+    "minecraft:acacia_leaves": {
+      "sequence": "minecraft:blocks/acacia_leaves",
+      "silk_touch": "minecraft:acacia_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:acacia_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:acacia_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:azalea_leaves": {
+      "sequence": "minecraft:blocks/azalea_leaves",
+      "silk_touch": "minecraft:azalea_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:azalea_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:azalea",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:birch_leaves": {
+      "sequence": "minecraft:blocks/birch_leaves",
+      "silk_touch": "minecraft:birch_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:birch_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:birch_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:cherry_leaves": {
+      "sequence": "minecraft:blocks/cherry_leaves",
+      "silk_touch": "minecraft:cherry_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:cherry_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:cherry_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:flowering_azalea_leaves": {
+      "sequence": "minecraft:blocks/flowering_azalea_leaves",
+      "silk_touch": "minecraft:flowering_azalea_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:flowering_azalea_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:flowering_azalea",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:jungle_leaves": {
+      "sequence": "minecraft:blocks/jungle_leaves",
+      "silk_touch": "minecraft:jungle_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:jungle_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:jungle_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.025,
+            0.027777778,
+            0.03125,
+            0.041666668,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:mangrove_leaves": {
+      "sequence": "minecraft:blocks/mangrove_leaves",
+      "silk_touch": "minecraft:mangrove_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:mangrove_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:pale_oak_leaves": {
+      "sequence": "minecraft:blocks/pale_oak_leaves",
+      "silk_touch": "minecraft:pale_oak_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:pale_oak_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:pale_oak_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    },
+    "minecraft:spruce_leaves": {
+      "sequence": "minecraft:blocks/spruce_leaves",
+      "silk_touch": "minecraft:spruce_leaves",
+      "tool": {
+        "item": "minecraft:shears",
+        "drop": "minecraft:spruce_leaves"
+      },
+      "drops": [
+        {
+          "item": "minecraft:spruce_sapling",
+          "survives_explosion": true,
+          "fortune_chances": [
+            0.05,
+            0.0625,
+            0.083333336,
+            0.1
+          ]
+        },
+        {
+          "item": "minecraft:stick",
+          "fortune_chances": [
+            0.02,
+            0.022222223,
+            0.025,
+            0.033333335,
+            0.1
+          ],
+          "min": 1,
+          "max": 2,
+          "explosion_decay": true
+        }
+      ]
+    }
   }
 }

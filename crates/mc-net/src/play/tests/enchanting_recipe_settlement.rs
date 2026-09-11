@@ -148,7 +148,11 @@ fn use_max_recipe_is_bounded_when_output_recreates_ingredient() {
                 alternatives: vec![IngredientAlternative::Item(item.clone())],
             }],
         }),
-        result: RecipeResult { item, count: 1 },
+        result: RecipeResult {
+            item,
+            count: 1,
+            stew_effects: Vec::new(),
+        },
     };
 
     let (inventory, outcome) = craft_recipe(&state, &recipe, true).expect("one bounded craft");
@@ -203,6 +207,7 @@ fn use_max_recipe_reports_large_aggregate_without_partial_mutation_failure() {
         result: RecipeResult {
             item: output,
             count: 1_500_000_000,
+            stew_effects: Vec::new(),
         },
     };
 
@@ -250,6 +255,7 @@ async fn placed_recipe_commits_inventory_and_publishes_aggregate_craft() {
         result: RecipeResult {
             item: output,
             count: 1,
+            stew_effects: Vec::new(),
         },
     });
     let session_id = register_interaction_player(&mut state, "RecipeOwner");

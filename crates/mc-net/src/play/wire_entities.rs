@@ -132,10 +132,72 @@ fn entity_position(entity: &ServerEntitySnapshot) -> PositionMoveRotation {
     }
 }
 
+pub(super) async fn send_player_effect_command<W>(
+    writer: &mut W,
+    compression: Compression,
+    command: OutboundCommand,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (entity_id, effect_id, update) = match command {
+        OutboundCommand::ApplyPlayerEffect {
+            entity_id,
+            effect_id,
+            amplifier,
+            duration_ticks,
+            flags,
+        } => (
+            entity_id,
+            effect_id,
+            Some((amplifier, duration_ticks, flags)),
+        ),
+        OutboundCommand::RemovePlayerEffect {
+            entity_id,
+            effect_id,
+        } => (entity_id, effect_id, None),
+        _ => unreachable!("player-effect sender requires an effect publication"),
+    };
+    let effect_id = mc_protocol::packets::play::MobEffectId::new(
+        u32::try_from(effect_id).expect("validated non-negative effect id"),
+    )
+    .expect("embedded effect id fits protocol registry range");
+    if let Some((amplifier, duration_ticks, flags)) = update {
+        write_packet(
+            writer,
+            &mc_protocol::packets::play::ClientboundUpdateEntityEffect {
+                entity_id,
+                effect_id,
+                amplifier,
+                duration_ticks,
+                flags: mc_protocol::packets::play::EntityEffectFlags {
+                    ambient: flags.ambient,
+                    visible: flags.visible,
+                    show_icon: flags.show_icon,
+                    blend: false,
+                },
+            },
+            compression,
+        )
+        .await
+    } else {
+        write_packet(
+            writer,
+            &mc_protocol::packets::play::ClientboundRemoveEntityEffect {
+                entity_id,
+                effect_id,
+            },
+            compression,
+        )
+        .await
+    }
+}
+
 pub(super) async fn send_player_spawn<W>(
     writer: &mut W,
     compression: Compression,
     player: &PlayerEntitySnapshot,
+    effects: &[mc_entity::effects_26_1_2::EffectInstance],
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -174,7 +236,28 @@ where
     )
     .await?;
     send_player_data(writer, compression, player).await?;
+    for effect in effects {
+        send_player_effect_command(
+            writer,
+            compression,
+            session::player_effects::player_effect_command(player.entity_id, *effect),
+        )
+        .await?;
+    }
     send_player_move(writer, compression, player).await
+}
+
+pub(super) async fn send_player_spawn_synced<W>(
+    writer: &mut W,
+    compression: Compression,
+    sessions: &SessionRegistry,
+    player: &PlayerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let effects = sessions.player_effect_snapshot(player.session_id);
+    send_player_spawn(writer, compression, player, &effects).await
 }
 
 pub(super) async fn send_player_move<W>(
@@ -334,6 +417,7 @@ fn wire_entity_item_stack(stack: &EntityItemStack) -> ItemStack {
         enchantments: stack.enchantments.clone(),
         custom_name: stack.custom_name.as_deref().cloned(),
         item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+        stew_effects: stack.stew_effects.clone(),
     }
 }
 
@@ -356,6 +440,7 @@ where
                 enchantments: stack.enchantments.clone(),
                 custom_name: stack.custom_name.as_deref().cloned(),
                 item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+                stew_effects: stack.stew_effects.clone(),
             },
         });
     }
@@ -450,6 +535,7 @@ where
                 enchantments: stack.enchantments.clone(),
                 custom_name: stack.custom_name.as_deref().cloned(),
                 item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+                stew_effects: stack.stew_effects.clone(),
             },
         });
     }
@@ -733,6 +819,38 @@ where
         &EntityAnimation {
             entity_id,
             action: EntityAnimationAction::SwingMainHand,
+        },
+        compression,
+    )
+    .await
+}
+
+pub(super) async fn send_entity_hurt<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity_id: i32,
+    data: &mc_data::VanillaData,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let source_type_id =
+        data.registry("damage_type")
+            .and_then(|registry| {
+                registry
+                    .entries
+                    .iter()
+                    .position(|id| id.as_str() == "minecraft:generic")
+            })
+            .ok_or(CodecError::NotSupported("generic damage type is missing"))? as i32;
+    write_packet(
+        writer,
+        &mc_protocol::packets::play::ClientboundDamageEvent {
+            entity_id,
+            source_type_id,
+            source_cause_id: -1,
+            source_direct_id: -1,
+            source_position: None,
         },
         compression,
     )

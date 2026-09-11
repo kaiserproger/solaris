@@ -24,9 +24,11 @@ use crate::codec::{
 use crate::error::CodecError;
 use crate::packets::login::GameProfileProperty;
 
+mod damage_event;
 mod entity_sync_26_1_2;
 mod merchant;
 
+pub use damage_event::ClientboundDamageEvent;
 pub use entity_sync_26_1_2::{
     AttributeId, AttributeModifierOperation, ClientboundRemoveEntityEffect,
     ClientboundSetEntityEquipment, ClientboundSetEntityLeash, ClientboundUpdateEntityAttributes,
@@ -126,6 +128,8 @@ pub const DATA_COMPONENT_CUSTOM_NAME_ID: i32 = 6;
 /// `minecraft:data_component_type` registry report.
 pub const DATA_COMPONENT_ITEM_MODEL_ID: i32 = 10;
 pub const DATA_COMPONENT_ENCHANTMENTS_ID: i32 = 13;
+/// `minecraft:suspicious_stew_effects` in the local 26.1.2 component registry.
+pub const DATA_COMPONENT_SUSPICIOUS_STEW_EFFECTS_ID: i32 = 53;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
     if longs.len() > MAX_LONG_ARRAY_LEN {
@@ -4454,6 +4458,9 @@ pub use mc_data::item_stack::ItemStack;
 pub(super) trait ItemStackWireCodec: Sized {
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError>;
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError>;
+    fn encode_components<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError>;
+    fn decode_components<B: Buf>(buf: &mut B, item_id: u32, count: i32)
+    -> Result<Self, CodecError>;
 }
 
 impl ItemStackWireCodec for ItemStack {
@@ -4464,10 +4471,15 @@ impl ItemStackWireCodec for ItemStack {
         }
         buf.write_varint(self.count);
         buf.write_varint(self.item_id as i32);
+        self.encode_components(buf)
+    }
+
+    fn encode_components<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         let component_count = i32::from(self.damage.is_some())
             + i32::from(self.custom_name.is_some())
             + i32::from(self.item_model.is_some())
-            + i32::from(!self.enchantments.is_empty());
+            + i32::from(!self.enchantments.is_empty())
+            + i32::from(!self.stew_effects.is_empty());
         buf.write_varint(component_count);
         buf.write_varint(0);
         if let Some(damage) = self.damage {
@@ -4497,6 +4509,16 @@ impl ItemStackWireCodec for ItemStack {
                 buf.write_varint(enchantment.level);
             }
         }
+        if !self.stew_effects.is_empty() {
+            buf.write_varint(DATA_COMPONENT_SUSPICIOUS_STEW_EFFECTS_ID);
+            write_count(buf, self.stew_effects.len())?;
+            for effect in &self.stew_effects {
+                let id = mc_data::mob_effects_26_1_2::MobEffect::from_name(effect.id.as_str())
+                    .ok_or(CodecError::NotSupported("unknown stew effect"))?;
+                buf.write_varint(id as i32);
+                buf.write_varint(effect.duration);
+            }
+        }
         Ok(())
     }
 
@@ -4509,12 +4531,20 @@ impl ItemStackWireCodec for ItemStack {
             return Ok(Self::EMPTY);
         }
         let item_id = buf.read_varint()? as u32;
+        Self::decode_components(buf, item_id, count)
+    }
+
+    fn decode_components<B: Buf>(
+        buf: &mut B,
+        item_id: u32,
+        count: i32,
+    ) -> Result<Self, CodecError> {
         let n_add = buf.read_varint()?;
         let n_remove = buf.read_varint()?;
         if n_add < 0 || n_remove < 0 {
             return Err(CodecError::NegativeLength(n_add.min(n_remove)));
         }
-        if n_add > 4 || n_remove != 0 {
+        if n_add > 5 || n_remove != 0 {
             return Err(CodecError::NotSupported(
                 "ItemStack with unsupported DataComponentPatch shape",
             ));
@@ -4523,6 +4553,7 @@ impl ItemStackWireCodec for ItemStack {
         let mut custom_name = None;
         let mut item_model = None;
         let mut enchantments = Vec::new();
+        let mut stew_effects = None;
         for _ in 0..n_add {
             let component_id = buf.read_varint()?;
             match component_id {
@@ -4563,6 +4594,19 @@ impl ItemStackWireCodec for ItemStack {
                         ));
                     }
                 }
+                DATA_COMPONENT_SUSPICIOUS_STEW_EFFECTS_ID if stew_effects.is_none() => {
+                    stew_effects = Some(read_bounded_vec(buf, 256, 2, |buf| {
+                        let raw = buf.read_varint()?;
+                        let name = u32::try_from(raw)
+                            .ok()
+                            .and_then(mc_data::mob_effects_26_1_2::name_for_id)
+                            .ok_or(CodecError::NotSupported("unknown stew effect"))?;
+                        Ok(mc_data::item_stack::StewEffect {
+                            id: Identifier::parse(name).expect("canonical effect identifier"),
+                            duration: buf.read_varint()?,
+                        })
+                    })?);
+                }
                 _ => {
                     return Err(CodecError::NotSupported(
                         "ItemStack with unsupported DataComponentPatch component",
@@ -4577,6 +4621,7 @@ impl ItemStackWireCodec for ItemStack {
             enchantments,
             custom_name,
             item_model,
+            stew_effects: stew_effects.unwrap_or_default(),
         })
     }
 }
@@ -5263,7 +5308,7 @@ pub enum RecipeBookSlotDisplay {
     Empty,
     AnyFuel,
     Item { item_id: i32 },
-    ItemStack { item_id: i32, count: i32 },
+    ItemStack(ItemStack),
     Tag(Identifier),
     Composite(Vec<RecipeBookSlotDisplay>),
 }
@@ -5291,16 +5336,14 @@ impl RecipeBookSlotDisplay {
                 buf.write_varint(4);
                 buf.write_varint(*item_id);
             }
-            Self::ItemStack { item_id, count } => {
-                if *item_id < 0 || *count <= 0 {
+            Self::ItemStack(stack) => {
+                if stack.item_id > i32::MAX as u32 || stack.count <= 0 {
                     return Err(CodecError::NotSupported("invalid recipe-book item stack"));
                 }
                 buf.write_varint(5);
-                buf.write_varint(*item_id);
-                buf.write_varint(*count);
-                // Recipe displays only need the default item component patch.
-                buf.write_varint(0);
-                buf.write_varint(0);
+                buf.write_varint(stack.item_id as i32);
+                buf.write_varint(stack.count);
+                stack.encode_components(buf)?;
             }
             Self::Tag(tag) => {
                 buf.write_varint(6);
@@ -5345,14 +5388,11 @@ impl RecipeBookSlotDisplay {
                 if item_id < 0 || count <= 0 {
                     return Err(CodecError::NotSupported("invalid recipe-book item stack"));
                 }
-                let components_to_add = buf.read_varint()?;
-                let components_to_remove = buf.read_varint()?;
-                if components_to_add != 0 || components_to_remove != 0 {
-                    return Err(CodecError::NotSupported(
-                        "recipe-book item stack with component patch",
-                    ));
-                }
-                Ok(Self::ItemStack { item_id, count })
+                Ok(Self::ItemStack(ItemStack::decode_components(
+                    buf,
+                    item_id as u32,
+                    count,
+                )?))
             }
             6 => Ok(Self::Tag(buf.read_identifier()?)),
             10 => {

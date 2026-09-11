@@ -110,10 +110,8 @@ impl SessionRegistry {
         actor_session: SessionId,
         plan: &FoodUsePlan,
     ) -> Option<CommittedFoodUse> {
-        let inner = self.lock_inner("commit food use");
-        if !inner.sessions.contains_key(&actor_session) {
-            return None;
-        }
+        let mut inner = self.lock_session_entities("commit food use");
+        let pose = inner.sessions.get(&actor_session)?.pose;
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
         let guard =
@@ -129,33 +127,87 @@ impl SessionRegistry {
         if player_state.inventory_recovery_required
             || (plan.held_slot != PlayerInventory::OFFHAND_SLOT && plan.held_slot != selected_slot)
             || player_state.survival != plan.expected_survival
-            || !mc_entity::player_survival_26_1_2::can_eat(
-                player_state.survival.health,
-                player_state.survival.food,
-            )
+            || player_state.survival.is_dead()
+            || (!plan.can_always_eat
+                && !mc_entity::player_survival_26_1_2::can_eat(
+                    player_state.survival.health,
+                    player_state.survival.food,
+                ))
         {
             return None;
         }
         if player_state.inventory.slots[plan.held_slot] != plan.expected_held {
             return None;
         }
+        let effects = plan
+            .expected_held
+            .stew_effects
+            .iter()
+            .map(|effect| {
+                let kind = mc_data::mob_effects_26_1_2::MobEffect::from_name(effect.id.as_str())?;
+                Some(mc_entity::effects_26_1_2::EffectInstance::new(
+                    mc_entity::effects_26_1_2::EffectId::new(kind as u32),
+                    super::player_effects::effect_kind(kind),
+                    effect.duration,
+                    0,
+                    mc_entity::effects_26_1_2::EffectFlags::default(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
 
         let mut inventory = player_state.inventory.clone();
         let held = &mut inventory.slots[plan.held_slot];
         held.count = held.count.saturating_sub(1);
         if held.count <= 0 {
-            *held = ItemStack::EMPTY;
+            *held = plan
+                .remainder
+                .as_ref()
+                .map_or(ItemStack::EMPTY, |r| r.stack.clone());
         }
-        let changed_slots = vec![(plan.held_slot, held.clone())];
+        let mut changed_slots = vec![(plan.held_slot, held.clone())];
+        let mut overflow = None;
+        if plan.expected_held.count > 1
+            && let Some(remainder) = &plan.remainder
+        {
+            let (leftover, changed) = inventory.merge_pickup_stack(
+                remainder.stack.clone(),
+                remainder.max_stack,
+                player_state.selected_hotbar_slot,
+            )?;
+            changed_slots.extend(changed);
+            if !leftover.is_empty() {
+                overflow = Some((remainder.entity_type_id?, leftover));
+            }
+        }
         let mut survival = player_state.survival;
         survival.add_food(plan.food, plan.saturation);
+        let mut dispatches = Vec::new();
+        if let Some((type_id, stack)) = overflow {
+            let entity_id = spawn_item_drop_entity_locked(
+                &mut inner,
+                type_id,
+                Vec3::new(pose.x, pose.y, pose.z),
+                crate::play::survival::entity_item_stack(stack),
+            )?;
+            block_item_pickup_for_owner_locked(&mut inner, entity_id, actor_session);
+            dispatches.extend(spawn_entity_visibility_locked(&mut inner, entity_id));
+        }
 
         player_state.replace_inventory(inventory.clone());
         player_state.survival = survival;
+        for effect in effects {
+            dispatches.extend(super::player_effects::apply_player_effect_to_state_locked(
+                &mut inner,
+                actor_session,
+                &mut player_state,
+                effect,
+            ));
+        }
         Some(CommittedFoodUse {
             inventory,
             survival,
             changed_slots,
+            dispatches,
         })
     }
 
@@ -265,6 +317,7 @@ impl SessionRegistry {
             enchantments: held.enchantments.clone(),
             custom_name: held.custom_name.clone().map(Box::new),
             item_model: held.item_model.as_deref().cloned().map(Box::new),
+            stew_effects: held.stew_effects.clone(),
         };
         held.count -= plan.drop_count;
         if held.count <= 0 {

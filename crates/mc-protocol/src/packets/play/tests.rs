@@ -1216,10 +1216,7 @@ fn update_recipes_stonecutter_id_and_layout_match_local_vanilla_sources() {
         }],
         stonecutter_recipes: vec![StonecutterRecipeEntry {
             input: RecipeBookIngredient::Items(vec![14, 15]),
-            result: RecipeBookSlotDisplay::ItemStack {
-                item_id: 16,
-                count: 2,
-            },
+            result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(16, 2)),
         }],
     };
 

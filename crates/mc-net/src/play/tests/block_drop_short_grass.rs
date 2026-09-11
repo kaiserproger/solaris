@@ -1,9 +1,8 @@
-use super::{
-    Identifier, ItemRegistry, ItemReport, ItemStack, block_drop_stacks_from, simple_block,
-};
+use super::*;
+use crate::play::survival::block_drop_stacks_with_tool_and_facts_from_seeded;
 
 #[test]
-fn block_drop_builtin_short_grass_returns_wheat_seeds() {
+fn short_grass_fallback_resolves_empty_and_seed_drops_from_context() {
     let blocks = mc_world::BlockRegistry::from_report(&[
         simple_block(0, "minecraft:air"),
         simple_block(1, "minecraft:short_grass"),
@@ -13,17 +12,25 @@ fn block_drop_builtin_short_grass_returns_wheat_seeds() {
         id: Identifier::parse("minecraft:wheat_seeds").unwrap(),
         protocol_id: 51,
     }]);
-    let short_grass = blocks
+    let grass = blocks
         .block(&Identifier::parse("minecraft:short_grass").unwrap())
         .unwrap()
         .default;
-
-    let drops = block_drop_stacks_from(
-        &mc_data::loot::LootTables::default(),
-        &items,
-        &blocks,
-        short_grass,
-    );
-
-    assert_eq!(drops, vec![ItemStack::new(51, 1)]);
+    let mut hits = 0;
+    for seed in 0..1024 {
+        let drops = block_drop_stacks_with_tool_and_facts_from_seeded(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &mc_data::item_components::ItemFactsTable::default(),
+            &blocks,
+            grass,
+            None,
+            seed,
+        );
+        if !drops.is_empty() {
+            assert_eq!(drops, [ItemStack::new(51, 1)]);
+            hits += 1;
+        }
+    }
+    assert!((90..=165).contains(&hits), "seed-producing breaks: {hits}");
 }

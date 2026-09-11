@@ -127,20 +127,28 @@ impl SessionRegistry {
         id: SessionId,
         values: Vec<EntityDataValue>,
     ) -> Vec<VisibilityDispatch> {
-        let (entity_id, recipients) = {
-            let inner = self.lock_inner("broadcast player entity data including self");
-            let Some(session) = inner.sessions.get(&id) else {
-                return Vec::new();
-            };
-            let entity_id = session.entity_id;
-            let mut recipient_ids = visible_observers_locked(&inner, id);
-            recipient_ids.insert(id);
-            let recipients = session_recipients(&inner, recipient_ids);
-            (entity_id, recipients)
-        };
-        visibility_dispatches(recipients, || OutboundCommand::PlayerEntityData {
-            entity_id,
-            values: values.clone(),
+        let inner = self.lock_inner("broadcast player entity data including self");
+        player_publication_including_self_locked(&inner, id, |entity_id| {
+            OutboundCommand::PlayerEntityData {
+                entity_id,
+                values: values.clone(),
+            }
         })
     }
+}
+
+pub(super) fn player_publication_including_self_locked(
+    inner: &super::SessionRegistryInner,
+    id: SessionId,
+    command: impl Fn(i32) -> OutboundCommand,
+) -> Vec<VisibilityDispatch> {
+    let Some(session) = inner.sessions.get(&id) else {
+        return Vec::new();
+    };
+    let entity_id = session.entity_id;
+    let mut recipient_ids = visible_observers_locked(inner, id);
+    recipient_ids.insert(id);
+    visibility_dispatches(session_recipients(inner, recipient_ids), || {
+        command(entity_id)
+    })
 }

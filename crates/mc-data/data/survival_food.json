@@ -4,9 +4,166 @@
       "food": 4,
       "saturation": 2.4
     },
+    "minecraft:baked_potato": {
+      "food": 5,
+      "saturation": 6.0
+    },
+    "minecraft:beef": {
+      "food": 3,
+      "saturation": 1.8000001
+    },
+    "minecraft:beetroot": {
+      "food": 1,
+      "saturation": 1.2
+    },
+    "minecraft:beetroot_soup": {
+      "food": 6,
+      "saturation": 7.2000003
+    },
     "minecraft:bread": {
       "food": 5,
       "saturation": 6.0
+    },
+    "minecraft:carrot": {
+      "food": 3,
+      "saturation": 3.6000001
+    },
+    "minecraft:chicken": {
+      "food": 2,
+      "saturation": 1.2
+    },
+    "minecraft:chorus_fruit": {
+      "food": 4,
+      "saturation": 2.4,
+      "can_always_eat": true
+    },
+    "minecraft:cod": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "minecraft:cooked_beef": {
+      "food": 8,
+      "saturation": 12.8
+    },
+    "minecraft:cooked_chicken": {
+      "food": 6,
+      "saturation": 7.2000003
+    },
+    "minecraft:cooked_cod": {
+      "food": 5,
+      "saturation": 6.0
+    },
+    "minecraft:cooked_mutton": {
+      "food": 6,
+      "saturation": 9.6
+    },
+    "minecraft:cooked_porkchop": {
+      "food": 8,
+      "saturation": 12.8
+    },
+    "minecraft:cooked_rabbit": {
+      "food": 5,
+      "saturation": 6.0
+    },
+    "minecraft:cooked_salmon": {
+      "food": 6,
+      "saturation": 9.6
+    },
+    "minecraft:cookie": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "minecraft:dried_kelp": {
+      "food": 1,
+      "saturation": 0.6
+    },
+    "minecraft:enchanted_golden_apple": {
+      "food": 4,
+      "saturation": 9.6,
+      "can_always_eat": true
+    },
+    "minecraft:glow_berries": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "minecraft:golden_apple": {
+      "food": 4,
+      "saturation": 9.6,
+      "can_always_eat": true
+    },
+    "minecraft:golden_carrot": {
+      "food": 6,
+      "saturation": 14.400001
+    },
+    "minecraft:honey_bottle": {
+      "food": 6,
+      "saturation": 1.2,
+      "can_always_eat": true
+    },
+    "minecraft:melon_slice": {
+      "food": 2,
+      "saturation": 1.2
+    },
+    "minecraft:mushroom_stew": {
+      "food": 6,
+      "saturation": 7.2000003
+    },
+    "minecraft:mutton": {
+      "food": 2,
+      "saturation": 1.2
+    },
+    "minecraft:poisonous_potato": {
+      "food": 2,
+      "saturation": 1.2
+    },
+    "minecraft:porkchop": {
+      "food": 3,
+      "saturation": 1.8000001
+    },
+    "minecraft:potato": {
+      "food": 1,
+      "saturation": 0.6
+    },
+    "minecraft:pufferfish": {
+      "food": 1,
+      "saturation": 0.2
+    },
+    "minecraft:pumpkin_pie": {
+      "food": 8,
+      "saturation": 4.8
+    },
+    "minecraft:rabbit": {
+      "food": 3,
+      "saturation": 1.8000001
+    },
+    "minecraft:rabbit_stew": {
+      "food": 10,
+      "saturation": 12.0
+    },
+    "minecraft:rotten_flesh": {
+      "food": 4,
+      "saturation": 0.8
+    },
+    "minecraft:salmon": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "minecraft:spider_eye": {
+      "food": 2,
+      "saturation": 3.2
+    },
+    "minecraft:suspicious_stew": {
+      "food": 6,
+      "saturation": 7.2000003,
+      "can_always_eat": true
+    },
+    "minecraft:sweet_berries": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "minecraft:tropical_fish": {
+      "food": 1,
+      "saturation": 0.2
     }
   }
 }

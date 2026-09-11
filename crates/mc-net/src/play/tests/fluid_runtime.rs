@@ -55,6 +55,7 @@ fn bucket_replacement_updates_single_held_stack_only() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             },
         )
         .unwrap();
@@ -79,6 +80,7 @@ fn bucket_replacement_updates_single_held_stack_only() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             },
         )
         .unwrap();
@@ -113,6 +115,7 @@ fn bucket_replacement_updates_single_held_stack_only() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     let (next, changed) = plan_bucket_replacement(&inventory, 45, 61, 1).unwrap();
     assert_eq!(next.slots[45].item_id, 61);

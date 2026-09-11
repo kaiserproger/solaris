@@ -5,7 +5,7 @@ use super::outbound::{
     VisibilityDispatch,
 };
 use super::player_effects::{
-    LEVITATION_EFFECT_ID, apply_player_effect_locked, caller_owned_effect,
+    LEVITATION_EFFECT_ID, apply_player_effect_to_state_locked, caller_owned_effect,
 };
 use super::player_state::{
     apply_player_survival_plan_locked, player_attack_cost_plan_matches,
@@ -405,9 +405,8 @@ impl SessionRegistry {
                     .into_iter()
                     .map(|recipient| VisibilityDispatch {
                         recipient,
-                        command: OutboundCommand::EntityEvent {
+                        command: OutboundCommand::EntityHurt {
                             entity_id: hurt_entity_id,
-                            event_id: 2,
                         },
                     }),
             );
@@ -755,10 +754,16 @@ pub(super) fn prepare_projectile_player_damage_locked(
         else {
             return ProjectilePlayerDamagePreview::Rejected(None);
         };
-        let armor_damage =
-            inventory_damage_after_armor(items, &target_state.inventory, resolved_damage);
-        let applied_damage =
-            inventory_damage_after_protection(items, &target_state.inventory, armor_damage);
+        let armor_damage = if damage.kind.uses_armor() {
+            inventory_damage_after_armor(items, &target_state.inventory, resolved_damage)
+        } else {
+            resolved_damage
+        };
+        let applied_damage = if damage.kind.uses_protection() {
+            inventory_damage_after_protection(items, &target_state.inventory, armor_damage)
+        } else {
+            armor_damage
+        };
         if applied_damage <= 0.0 {
             return ProjectilePlayerDamagePreview::Rejected(None);
         }
@@ -942,9 +947,10 @@ pub(super) fn commit_projectile_player_damage_locked(
         },
     });
     if damage_applied && kind == PlayerDamageKind::ShulkerBullet {
-        damage_dispatches.extend(apply_player_effect_locked(
+        damage_dispatches.extend(apply_player_effect_to_state_locked(
             inner,
             target_session,
+            &mut target_state,
             caller_owned_effect(LEVITATION_EFFECT_ID, SHULKER_BULLET_LEVITATION_TICKS, 0),
         ));
     }
@@ -954,9 +960,8 @@ pub(super) fn commit_projectile_player_damage_locked(
                 .into_iter()
                 .map(|recipient| VisibilityDispatch {
                     recipient,
-                    command: OutboundCommand::EntityEvent {
+                    command: OutboundCommand::EntityHurt {
                         entity_id: target_entity_id,
-                        event_id: 2,
                     },
                 }),
         );

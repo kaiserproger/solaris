@@ -329,6 +329,7 @@ pub struct FurnaceSlot {
     pub enchantments: Vec<mc_data::ItemEnchantment>,
     pub custom_name: Option<String>,
     pub item_model: Option<Arc<Identifier>>,
+    pub stew_effects: Vec<mc_data::item_stack::StewEffect>,
 }
 
 impl FurnaceSlot {
@@ -339,6 +340,7 @@ impl FurnaceSlot {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
 
     #[must_use]

@@ -30,16 +30,13 @@ pub(super) fn stonecutter_recipe_entry(
     if recipe.result.item.as_str() == "minecraft:air" {
         return None;
     }
-    let result_item_id = items.id_of(&recipe.result.item)?;
-    let item_id = i32::try_from(result_item_id).ok()?;
-    let count = i32::try_from(recipe.result.count).ok()?;
-    let result = ItemStack::new(result_item_id, count);
-    if count <= 0 || count > item_max_stack(item_facts, items, &result) {
+    let result = recipe.result.to_stack(items)?;
+    if result.count > item_max_stack(item_facts, items, &result) {
         return None;
     }
     Some(StonecutterRecipeEntry {
         input: recipe_book_requirement(&stonecutting.ingredient, items)?,
-        result: RecipeBookSlotDisplay::ItemStack { item_id, count },
+        result: RecipeBookSlotDisplay::ItemStack(result),
     })
 }
 
@@ -64,15 +61,7 @@ fn recipe_book_entry(
     items: &ItemRegistry,
 ) -> Option<RecipeBookEntry> {
     let display_id = i32::try_from(display_id).ok()?;
-    let result_item_id = i32::try_from(items.id_of(&recipe.result.item)?).ok()?;
-    let result_count = i32::try_from(recipe.result.count).ok()?;
-    if result_count <= 0 {
-        return None;
-    }
-    let result = RecipeBookSlotDisplay::ItemStack {
-        item_id: result_item_id,
-        count: result_count,
-    };
+    let result = RecipeBookSlotDisplay::ItemStack(recipe.result.to_stack(items)?);
 
     let (display, category_id, crafting_requirements) = match &recipe.kind {
         mc_data::recipes::RecipeKind::Shapeless(shapeless) => {
@@ -320,21 +309,15 @@ pub(super) fn ingredient_accepts_item(
 fn inventory_has_room_for_output(
     state: &InteractionState,
     inventory: &PlayerInventory,
-    item_id: u32,
-    count: i32,
+    output: &ItemStack,
 ) -> bool {
-    let mut remaining = count;
-    let max_stack = item_max_stack(
-        &state.item_facts,
-        &state.items,
-        &ItemStack::new(item_id, count),
-    );
+    let mut remaining = output.count;
+    let max_stack = item_max_stack(&state.item_facts, &state.items, output);
     for slot in 9..=44 {
         let current = &inventory.slots[slot];
         if current.is_empty() {
             remaining -= remaining.min(max_stack);
-        } else if current.item_id == item_id
-            && current.damage.is_none()
+        } else if mc_data::inventory_semantics_26_1_2::can_stack(current, output)
             && current.count < max_stack
         {
             remaining -= remaining.min(max_stack - current.count);
@@ -355,11 +338,8 @@ fn craft_recipe_once(
     if ingredients.is_empty() {
         return None;
     }
-    let output_item_id = state.items.id_of(&recipe.result.item)?;
-    let output_count = i32::try_from(recipe.result.count).ok()?;
-    if output_count <= 0
-        || !inventory_has_room_for_output(state, inventory, output_item_id, output_count)
-    {
+    let output = recipe.result.to_stack(&state.items)?;
+    if !inventory_has_room_for_output(state, inventory, &output) {
         return None;
     }
 
@@ -381,7 +361,6 @@ fn craft_recipe_once(
         changed.insert(slot, current.clone());
     }
 
-    let output = ItemStack::new(output_item_id, output_count);
     let max_stack = item_max_stack(&state.item_facts, &state.items, &output);
     let (remaining, output_changed) = inventory.merge_stack(output, max_stack);
     if !remaining.is_empty() {
@@ -517,6 +496,7 @@ mod tests {
             result: RecipeResult {
                 item: id(result),
                 count,
+                stew_effects: Vec::new(),
             },
         };
         let recipes = vec![
@@ -558,10 +538,7 @@ mod tests {
             packet.stonecutter_recipes,
             vec![StonecutterRecipeEntry {
                 input: RecipeBookIngredient::Items(vec![14]),
-                result: RecipeBookSlotDisplay::ItemStack {
-                    item_id: 16,
-                    count: 2,
-                },
+                result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(16, 2)),
             }]
         );
     }
@@ -591,6 +568,7 @@ mod tests {
                 result: RecipeResult {
                     item: id("minecraft:birch_planks"),
                     count: 4,
+                    stew_effects: Vec::new(),
                 },
             },
             Recipe {
@@ -603,6 +581,7 @@ mod tests {
                 result: RecipeResult {
                     item: id("minecraft:not_registered"),
                     count: 1,
+                    stew_effects: Vec::new(),
                 },
             },
             Recipe {
@@ -623,6 +602,7 @@ mod tests {
                 result: RecipeResult {
                     item: id("minecraft:stick"),
                     count: 4,
+                    stew_effects: Vec::new(),
                 },
             },
             Recipe {
@@ -639,6 +619,7 @@ mod tests {
                 result: RecipeResult {
                     item: id("minecraft:stone"),
                     count: 1,
+                    stew_effects: Vec::new(),
                 },
             },
         ];
@@ -663,10 +644,7 @@ mod tests {
             packet.entries[0].display,
             RecipeBookDisplay::Shapeless {
                 ingredients: vec![RecipeBookSlotDisplay::Tag(id("minecraft:birch_logs"))],
-                result: RecipeBookSlotDisplay::ItemStack {
-                    item_id: 2,
-                    count: 4,
-                },
+                result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(2, 4)),
                 crafting_station: RecipeBookSlotDisplay::Item { item_id: 6 },
             }
         );
@@ -681,10 +659,7 @@ mod tests {
                     RecipeBookSlotDisplay::Empty,
                     RecipeBookSlotDisplay::Item { item_id: 2 },
                 ],
-                result: RecipeBookSlotDisplay::ItemStack {
-                    item_id: 3,
-                    count: 4,
-                },
+                result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(3, 4)),
                 crafting_station: RecipeBookSlotDisplay::Item { item_id: 6 },
             }
         );
@@ -701,10 +676,7 @@ mod tests {
             RecipeBookDisplay::Furnace {
                 ingredient: RecipeBookSlotDisplay::Item { item_id: 4 },
                 fuel: RecipeBookSlotDisplay::AnyFuel,
-                result: RecipeBookSlotDisplay::ItemStack {
-                    item_id: 5,
-                    count: 1,
-                },
+                result: RecipeBookSlotDisplay::ItemStack(ItemStack::new(5, 1)),
                 crafting_station: RecipeBookSlotDisplay::Item { item_id: 7 },
                 duration: 200,
                 experience: 0.0,

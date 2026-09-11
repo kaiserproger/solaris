@@ -2733,6 +2733,7 @@ fn sapling_bonemeal_advances_stage_before_growing_a_varied_oak_tree() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             },
         )
         .unwrap();
@@ -3174,6 +3175,7 @@ fn stage_zero_sapling_advances_even_when_tree_space_is_blocked() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             },
         )
         .unwrap();
@@ -3220,6 +3222,7 @@ fn bonemeal_consumes_exactly_one_item_only_after_successful_growth() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             },
         )
         .unwrap();
@@ -3244,6 +3247,7 @@ fn bonemeal_consumes_exactly_one_item_only_after_successful_growth() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             },
         )
         .unwrap();

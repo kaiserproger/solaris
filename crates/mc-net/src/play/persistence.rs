@@ -18,7 +18,9 @@ use thiserror::Error;
 
 use super::*;
 
+mod effects;
 pub(crate) mod inventory_recovery;
+mod stew_effects;
 
 use inventory_recovery::INVENTORY_OPERATION_REVISION_FIELD;
 
@@ -1102,6 +1104,7 @@ pub(crate) struct PlayerPersistedState {
     pub(super) pose: PlayerPose,
     pub(super) game_mode: GameMode,
     pub(super) survival: SurvivalState,
+    pub(super) effects: Option<super::session::player_effects::PlayerEffectsState>,
     pub(super) inventory: PlayerInventory,
     pub(super) inventory_operation_revision: u64,
     /// A journal append may have committed. Freeze inventory effects until
@@ -1123,6 +1126,7 @@ impl PlayerPersistedState {
             pose: spawn,
             game_mode: GameMode::Survival,
             survival: SurvivalState::FULL,
+            effects: None,
             inventory: PlayerInventory::empty(),
             inventory_operation_revision: 0,
             inventory_recovery_required: false,
@@ -1337,6 +1341,14 @@ pub(super) fn load_player_state(
     if let Some(health) = float_field(&fields, "Health") {
         state.survival.health = health.clamp(0.0, mc_entity::player_survival_26_1_2::MAX_HEALTH);
     }
+    state.effects = field(&fields, "active_effects")
+        .map(effects::load)
+        .transpose()
+        .map_err(|_| PlayerPersistenceError::InvalidValue {
+            path: path.clone(),
+            field: "active_effects",
+        })?
+        .flatten();
     if let Some(food) = int_field(&fields, "foodLevel") {
         state.survival.food = food.clamp(0, mc_entity::player_survival_26_1_2::MAX_FOOD);
     }
@@ -1442,6 +1454,16 @@ pub(crate) fn save_player_state(
         Tag::Int(state.game_mode.id()),
     );
     set_field(&mut fields, "Health", Tag::Float(state.survival.health));
+    set_field(
+        &mut fields,
+        "active_effects",
+        effects::save(state.effects.as_ref()).map_err(|_| {
+            PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: "active_effects",
+            }
+        })?,
+    );
     set_field(&mut fields, "foodLevel", Tag::Int(state.survival.food));
     set_field(
         &mut fields,
@@ -2418,6 +2440,7 @@ pub(super) fn entity_item_stack_tag(
     if !stack.enchantments.is_empty() {
         set_enchantments_component(&mut fields, &stack.enchantments);
     }
+    stew_effects::save(&mut fields, &stack.stew_effects);
     Ok(Tag::Compound(fields))
 }
 
@@ -2444,6 +2467,7 @@ pub(super) fn read_entity_item_stack(
             .as_deref()
             .cloned()
             .map(Box::new),
+        stew_effects: stew_effects::load(fields)?,
     }))
 }
 
@@ -2857,6 +2881,7 @@ fn item_stack_from_fields(
         enchantments: enchantments_component(fields)?,
         custom_name: custom_name_component(fields),
         item_model: item_model_component(fields)?,
+        stew_effects: stew_effects::load(fields)?,
     }))
 }
 
@@ -2942,6 +2967,7 @@ fn set_item_stack_fields(fields: &mut Vec<(String, Tag)>, name: &Identifier, sta
     if !stack.enchantments.is_empty() {
         set_enchantments_component(fields, &stack.enchantments);
     }
+    stew_effects::save(fields, &stack.stew_effects);
 }
 
 fn damage_component(fields: &[(String, Tag)]) -> Option<i32> {

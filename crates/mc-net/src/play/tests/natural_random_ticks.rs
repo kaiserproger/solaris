@@ -7,6 +7,80 @@ use super::{
 use std::sync::Arc;
 
 #[test]
+fn random_tick_filter_preserves_rolls_across_inert_and_missing_chunks() {
+    let reports = [
+        simple_block(0, "minecraft:air"),
+        simple_block(1, "minecraft:grass_block"),
+    ];
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&reports).unwrap());
+    let facts = mc_data::block_facts::BlockFactsTable::from_blocks_report(&reports);
+    let mut world = mc_world::WorldStorage::in_memory(blocks);
+    let chunks = [(-2, 1), (-1, 1), (0, 1), (1, 1)];
+    let policy = super::RandomTickPolicy {
+        random_tick_speed: 5,
+        chunk_budget: 3,
+        seed: 80566456455891250,
+        ..super::RandomTickPolicy::default()
+    };
+    for (x, z) in [chunks[0], chunks[2]] {
+        let position = ChunkPos { x, z };
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+    for sample in super::sample_random_tick_positions(policy, 0, &chunks) {
+        if (0..32).contains(&sample.pos.y) && world.get_cached_block(sample.pos).is_some() {
+            world.set_block_at(sample.pos, BlockStateId(1)).unwrap();
+        }
+    }
+    let view = world.read_view();
+    let positions = chunks.map(|(x, z)| ChunkPos { x, z });
+    let snapshot = view.snapshot_chunks(&positions);
+    let mut candidates_seen = 0;
+    for tick in [0, 1, 3, 4, 59] {
+        let mut expected_sampled = 0;
+        let mut expected = Vec::new();
+        for sample in super::sample_random_tick_positions(policy, tick, &chunks) {
+            let Some(chunk) = snapshot.chunk(ChunkPos {
+                x: sample.chunk.0,
+                z: sample.chunk.1,
+            }) else {
+                continue;
+            };
+            let section = (sample.pos.y - mc_world::MIN_Y) as usize / mc_world::SECTION_DIM;
+            if !super::section_may_random_tick(&chunk.sections[section], &facts) {
+                continue;
+            }
+            expected_sampled += 1;
+            let state = snapshot.get_cached_block(sample.pos).unwrap();
+            if facts.random_tick_family(state.0).is_some() {
+                expected.push((sample, state));
+            }
+        }
+        let (sampled, candidates) =
+            super::random_tick_candidates(&view, &facts, policy, tick, &chunks);
+        let actual = candidates
+            .iter()
+            .map(|candidate| (candidate.sample, candidate.state))
+            .collect::<Vec<_>>();
+        assert_eq!(sampled, expected_sampled, "tick {tick}");
+        assert_eq!(actual, expected, "tick {tick}");
+        candidates_seen += candidates.len();
+    }
+    assert!(
+        candidates_seen > 0,
+        "the fixture must exercise eligible rolls"
+    );
+}
+
+#[test]
 fn natural_random_tick_helpers_cover_leaves_grass_and_fire() {
     let blocks = mc_world::BlockRegistry::from_report(&[
         simple_block(0, "minecraft:air"),

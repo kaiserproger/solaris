@@ -2509,13 +2509,14 @@ fn hostile_commit_releases_both_locks_before_arrow_publication() {
         "minecraft:skeleton".to_owned(),
         Vec3::new(0.5, 64.0, 6.5),
     );
-    let entity_id = registry.persisted_entity_records()[0].snapshot.id;
-    let phase = u64::from(entity_id.0.unsigned_abs()) % SKELETON_SHOT_PERIOD_TICKS;
-    let due_tick = if phase == 0 {
-        SKELETON_SHOT_PERIOD_TICKS
-    } else {
-        SKELETON_SHOT_PERIOD_TICKS - phase
-    };
+    let draw_tick = 7;
+    let (draw_attacks, _) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        draw_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(draw_attacks, 0);
+    let release_tick = draw_tick + SKELETON_BOW_DRAW_TICKS;
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     *registry
@@ -2530,7 +2531,7 @@ fn hostile_commit_releases_both_locks_before_arrow_publication() {
     let commit = std::thread::spawn(move || {
         commit_registry.tick_hostile_attacks(
             &SimulationAuthority::for_test(),
-            due_tick,
+            release_tick,
             mc_world::BlockStateId(0),
         )
     });
@@ -2572,8 +2573,7 @@ fn skeleton_volley_uses_constant_owner_requests() {
         "minecraft:skeleton".to_owned(),
         Vec3::new(0.5, 64.0, 6.5),
     );
-    let first_id = registry.persisted_entity_records()[0].snapshot.id;
-    for filler in 1..SKELETON_SHOT_PERIOD_TICKS {
+    for filler in 1..40 {
         registry.spawn_command_entity(
             &SimulationAuthority::for_test(),
             1,
@@ -2587,22 +2587,25 @@ fn skeleton_volley_uses_constant_owner_requests() {
         "minecraft:skeleton".to_owned(),
         Vec3::new(2.5, 64.0, 6.5),
     );
-    let phase = u64::from(first_id.0.unsigned_abs()) % SKELETON_SHOT_PERIOD_TICKS;
-    let due_tick = if phase == 0 {
-        SKELETON_SHOT_PERIOD_TICKS
-    } else {
-        SKELETON_SHOT_PERIOD_TICKS - phase
-    };
+    let draw_tick = 3;
+    let (draw_attacks, _) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        draw_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(draw_attacks, 0);
     registry.entities.reset_owner_requests_for_test();
 
     let (attacks, _) = registry.tick_hostile_attacks(
         &SimulationAuthority::for_test(),
-        due_tick,
+        draw_tick + SKELETON_BOW_DRAW_TICKS,
         mc_world::BlockStateId(0),
     );
 
     assert_eq!(attacks, 2);
-    assert_eq!(registry.entities.owner_requests_for_test(), 5);
+    // One batched bow-commit lock (lock + prefetch + snapshot + replace) on
+    // top of the old volley path; still O(1) in skeleton count.
+    assert_eq!(registry.entities.owner_requests_for_test(), 9);
 }
 
 #[test]
@@ -7662,11 +7665,8 @@ fn moving_arrow_hit_damages_entity_and_despawns_arrow() {
     let mut saw_arrow_despawn = false;
     while let Ok(command) = rx.try_recv() {
         match command {
-            OutboundCommand::EntityEvent {
-                entity_id,
-                event_id,
-            } => {
-                saw_hurt |= entity_id == cow_id.0 && event_id == 2;
+            OutboundCommand::EntityHurt { entity_id } => {
+                saw_hurt |= entity_id == cow_id.0;
             }
             OutboundCommand::MoveEntityRelative(movement) => {
                 saw_knockback |=
@@ -8608,10 +8608,7 @@ fn explosion_entity_impacts_publish_hurt_before_exact_velocity_delta() {
         .position(|dispatch| {
             matches!(
                 dispatch.command,
-                OutboundCommand::EntityEvent {
-                    entity_id,
-                    event_id: 2,
-                } if entity_id == chicken_id.0
+                OutboundCommand::EntityHurt { entity_id } if entity_id == chicken_id.0
             )
         })
         .expect("surviving chicken hurt event");
@@ -10334,6 +10331,7 @@ async fn profile_properties_reach_observer_player_info_wire_packet() {
         &mut server_io,
         Compression::Disabled,
         &snapshot,
+        &[],
     )
     .await
     .unwrap();
@@ -14909,4 +14907,57 @@ fn bed_rest_prevention_uses_vanilla_cuboid() {
             z: 32,
         })
     );
+}
+
+#[test]
+fn squid_first_melee_hit_damages_and_notifies_observers() {
+    for type_name in ["minecraft:squid", "minecraft:glow_squid"] {
+        let registry = SessionRegistry::new();
+        let session_id = register_test_session(&registry, "SquidFirstHit");
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        let target_id = match &registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            5,
+            type_name.to_owned(),
+            Vec3::new(0.5, 64.0, 1.5),
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected {type_name} spawn, got {other:?}"),
+        };
+        let PlayerAttackResult::Damaged(outcome) = registry.player_attack_server_entity(
+            &SimulationAuthority::for_test(),
+            ServerEntityPlayerAttack {
+                entity_id: target_id,
+                amount: 1.0,
+                game_mode: GameMode::Survival,
+                player_pose: PlayerPose::new(0.5, 64.0, 0.5),
+                attacker: None,
+            },
+        ) else {
+            panic!("first melee hit must damage {type_name}");
+        };
+        let EntityAttackOutcome::Damaged {
+            damage, dispatches, ..
+        } = *outcome
+        else {
+            panic!("first melee hit must not kill a full-health {type_name}");
+        };
+        assert_eq!(damage.snapshot.health, 9.0, "{type_name}");
+        assert!(
+            dispatches.iter().any(|dispatch| matches!(
+                dispatch.command,
+                OutboundCommand::EntityHurt { entity_id } if entity_id == target_id.0
+            )),
+            "{type_name} first hit must notify observers of the hurt"
+        );
+        assert!(
+            dispatches.iter().any(|dispatch| matches!(
+                &dispatch.command,
+                OutboundCommand::UpdateEntityHealth(entity) if entity.health == Some(9.0)
+            )),
+            "{type_name} first hit must publish updated health"
+        );
+    }
 }

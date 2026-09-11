@@ -6,6 +6,7 @@ use mc_entity::Vec3;
 use mc_world::BlockStateId;
 use tokio::sync::mpsc;
 
+use super::hostile_authority::{HostileAttackKind, HostileAttackTickEntity, plan_bow_transition};
 use super::*;
 use crate::login::LoggedInProfile;
 fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
@@ -1602,4 +1603,94 @@ fn blaze_close_melee_preserves_ranged_attack_step() {
         Some(mc_entity::EntityBlazeAttackState::new(3, 120)),
         "close melee reuses attackTime without resetting attackStep/charged"
     );
+}
+
+#[test]
+fn skeleton_bow_draw_cycle_holds_full_pull_then_cools_down() {
+    let registry = SessionRegistry::new();
+    registry.configure_arrow_kill_rewards(
+        Some(2),
+        Some(3),
+        Some(77),
+        Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        Arc::new(mc_data::loot::LootTables::default()),
+    );
+    let player = register_test_session(&registry, "BowCycleTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:skeleton".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let bow_state = || {
+        registry.persisted_entity_records()[0]
+            .snapshot
+            .retained
+            .bow_attack
+    };
+    let tick = |tick| {
+        registry.tick_hostile_attacks(&SimulationAuthority::for_test(), tick, BlockStateId(0))
+    };
+
+    let draw_tick = 5;
+    assert_eq!(tick(draw_tick).0, 0);
+    assert_eq!(
+        bow_state(),
+        Some(mc_entity::EntityBowAttackState::new(
+            mc_entity::EntityBowAttackPhase::Drawing,
+            draw_tick + SKELETON_BOW_DRAW_TICKS,
+        ))
+    );
+    assert_eq!(tick(draw_tick + SKELETON_BOW_DRAW_TICKS - 1).0, 0);
+    assert!(
+        bow_state().is_some_and(|state| state.phase == mc_entity::EntityBowAttackPhase::Drawing)
+    );
+    let release_tick = draw_tick + SKELETON_BOW_DRAW_TICKS;
+    assert_eq!(tick(release_tick).0, 1);
+    assert_eq!(
+        bow_state(),
+        Some(mc_entity::EntityBowAttackState::new(
+            mc_entity::EntityBowAttackPhase::Cooldown,
+            release_tick + SKELETON_BOW_COOLDOWN_TICKS,
+        ))
+    );
+    assert_eq!(tick(release_tick + SKELETON_BOW_COOLDOWN_TICKS - 1).0, 0);
+    assert_eq!(tick(release_tick + SKELETON_BOW_COOLDOWN_TICKS).0, 0);
+    assert!(
+        bow_state().is_some_and(|state| state.phase == mc_entity::EntityBowAttackPhase::Drawing)
+    );
+    registry.mark_player_dead_for_test(player);
+    assert_eq!(tick(release_tick + SKELETON_BOW_COOLDOWN_TICKS + 1).0, 0);
+
+    // Losing the target cancels a live draw instead of releasing it.
+    let hostile = HostileAttackTickEntity {
+        id: registry.persisted_entity_records()[0].snapshot.id,
+        kind: HostileAttackKind::Skeleton,
+        position: Vec3::new(0.5, 64.0, 6.5),
+        rotation: Rotation {
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+        },
+        goal: GoalState::Idle,
+        crossbow_attack: None,
+        bow_attack: Some(mc_entity::EntityBowAttackState::new(
+            mc_entity::EntityBowAttackPhase::Drawing,
+            65,
+        )),
+        blaze_attack: None,
+        ghast_attack: None,
+        breeze_attack: None,
+        witch_attack: None,
+        guardian_beam: None,
+        warden_sonic_boom: None,
+        shulker_attack: None,
+        evoker_attack: None,
+    };
+    let transition =
+        plan_bow_transition(&hostile, None, Some(77), 66).expect("lost target cancels the draw");
+    assert_eq!(transition.next, None);
+    assert!(transition.shot.is_none());
 }

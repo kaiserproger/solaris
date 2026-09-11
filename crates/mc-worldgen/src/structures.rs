@@ -647,6 +647,7 @@ fn playable_ruin_slot(
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     })
 }
 

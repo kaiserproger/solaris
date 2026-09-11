@@ -888,6 +888,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         chunk.chests.insert(pos, chest);
 

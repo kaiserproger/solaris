@@ -91,6 +91,7 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -219,6 +220,7 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }
         );
         assert!(
@@ -335,6 +337,7 @@ async fn scheduled_hopper_ejection_schedules_comparator_tick_for_target_chest() 
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage
@@ -385,6 +388,7 @@ async fn scheduled_hopper_ejection_schedules_comparator_tick_for_target_chest() 
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }
         );
         assert_eq!(
@@ -460,6 +464,7 @@ async fn scheduled_hopper_transfer_across_region_boundary_uses_atomic_resident_c
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage
@@ -560,6 +565,7 @@ fn comparator_container_signal_uses_vanilla_discrete_fullness_formula() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_chest_block_entity(chest_pos, chest).unwrap();
     assert_eq!(
@@ -576,6 +582,7 @@ fn comparator_container_signal_uses_vanilla_discrete_fullness_formula() {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
     }
     storage.set_chest_block_entity(chest_pos, chest).unwrap();
@@ -762,6 +769,7 @@ async fn scheduled_block_pass_backfills_loaded_hopper_missing_initial_tick() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -836,6 +844,7 @@ async fn scheduled_block_pass_backfills_loaded_hopper_missing_initial_tick() {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         }
     );
     assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
@@ -1152,6 +1161,7 @@ fn scheduled_hopper_container_dispatch_does_not_hold_world_writer() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage
@@ -1244,6 +1254,7 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
         result: RecipeResult {
             item: iron_ingot,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
     let cpos = ChunkPos { x: 0, z: 0 };
@@ -1272,6 +1283,7 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -1369,6 +1381,7 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }
         );
         assert!(furnace.slots[1].is_empty());
@@ -1462,6 +1475,7 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -1561,6 +1575,7 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }
         );
         assert!(furnace.slots[2].is_empty());
@@ -1653,6 +1668,7 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage
         .set_furnace_block_entity(furnace_pos, furnace)
@@ -1754,6 +1770,7 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }
         );
         let scheduled = storage
@@ -1845,6 +1862,7 @@ async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
         result: RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
     let cpos = ChunkPos { x: 0, z: 0 };
@@ -1873,6 +1891,7 @@ async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -2029,6 +2048,7 @@ fn hopper_campfire_persistence_failure_does_not_publish_cooking_state() {
         result: RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }];
     let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
@@ -2060,6 +2080,7 @@ fn hopper_campfire_persistence_failure_does_not_publish_cooking_state() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
 
     assert!(
@@ -2129,6 +2150,7 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage
         .set_chest_block_entity(source_right_pos, source_right)
@@ -2199,6 +2221,7 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         }
     );
     assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
@@ -2289,6 +2312,7 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_chest_block_entity(source_pos, source).unwrap();
     storage
@@ -2303,6 +2327,7 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
     }
     storage
@@ -2379,6 +2404,7 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                     enchantments: Vec::new(),
                     custom_name: None,
                     item_model: None,
+                    stew_effects: Vec::new(),
                 }
         }));
         assert_eq!(
@@ -2390,6 +2416,7 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }
         );
         assert_eq!(
@@ -2570,6 +2597,7 @@ fn scheduled_hopper_transfer_preserves_enchantments_when_merging_matching_stacks
         enchantments: vec![efficiency.clone()],
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     let mut target = mc_world::ChestBlockEntity::default();
     target.slots[0] = mc_world::FurnaceSlot {
@@ -2579,6 +2607,7 @@ fn scheduled_hopper_transfer_preserves_enchantments_when_merging_matching_stacks
         enchantments: vec![efficiency.clone()],
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage.set_chest_block_entity(target_pos, target).unwrap();
@@ -2617,6 +2646,7 @@ fn scheduled_hopper_transfer_preserves_enchantments_when_merging_matching_stacks
             enchantments: vec![efficiency],
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         }
     );
 }
@@ -2666,6 +2696,7 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     let mut target = mc_world::ChestBlockEntity::default();
     for slot in &mut target.slots {
@@ -2676,6 +2707,7 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
     }
     storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
@@ -2713,6 +2745,7 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         }
     );
     assert_eq!(hopper.transfer_cooldown, 0);
@@ -2725,6 +2758,7 @@ fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
                 enchantments: Vec::new(),
                 custom_name: None,
                 item_model: None,
+                stew_effects: Vec::new(),
             }
     }));
 }

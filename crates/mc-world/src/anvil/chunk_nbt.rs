@@ -1340,6 +1340,18 @@ fn decode_container_stack(
         enchantments,
         custom_name,
         item_model,
+        stew_effects: components
+            .and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|(name, _)| name == mc_data::item_stack::STEW_EFFECTS_COMPONENT)
+            })
+            .map(|(_, tag)| {
+                mc_data::item_stack::decode_stew_effects(tag)
+                    .map_err(|reason| ChunkNbtError::InvalidIdentifier(reason.into()))
+            })
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -1357,6 +1369,12 @@ fn encode_container_stack(
         ("count".into(), Tag::Int(stack.count)),
     ];
     let mut components = Vec::new();
+    if !stack.stew_effects.is_empty() {
+        components.push((
+            mc_data::item_stack::STEW_EFFECTS_COMPONENT.into(),
+            mc_data::item_stack::encode_stew_effects(&stack.stew_effects),
+        ));
+    }
     if let Some(damage) = stack.damage {
         components.push((DAMAGE_COMPONENT.into(), Tag::Int(damage)));
     }
@@ -1904,6 +1922,7 @@ mod tests {
             }],
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         hopper.slots[4] = FurnaceSlot {
             count: 3,
@@ -1912,6 +1931,7 @@ mod tests {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         };
         chunk.hoppers.insert(pos, hopper.clone());
 

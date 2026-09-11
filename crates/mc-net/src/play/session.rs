@@ -79,7 +79,7 @@ mod passive_mobs;
 mod pathing;
 mod pickups;
 mod player_combat;
-mod player_effects;
+pub(super) mod player_effects;
 mod player_item_action_authority;
 mod player_pose_adapter;
 mod player_pose_authority;
@@ -276,7 +276,7 @@ pub(super) use transactions::*;
 use visibility::EntityPositionUpdate;
 pub(super) use visibility::server_entity_snapshot_from;
 use visibility::{
-    entity_event_dispatches_locked, entity_velocity_changed,
+    entity_event_dispatches_locked, entity_hurt_dispatches_locked, entity_velocity_changed,
     initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
     ordered_session_recipient, packed_rotation_changed, plan_entity_position_update,
     publish_server_entity_snapshot_locked, session_recipients,
@@ -466,7 +466,7 @@ struct SessionRegistryInner {
     primed_tnt_deadline_by_id: HashMap<EntityId, u64>,
     last_primed_tnt_claim_tick: Option<u64>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
-    player_effects: HashMap<SessionId, player_effects::PlayerEffectsState>,
+    player_effect_sessions: HashSet<SessionId>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
     active_shields: HashMap<SessionId, ActiveShield>,
     shield_disabled_until: HashMap<SessionId, u64>,

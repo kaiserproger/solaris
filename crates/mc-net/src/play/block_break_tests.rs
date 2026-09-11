@@ -754,6 +754,115 @@ async fn start_tick_is_captured_before_owner_snapshot_queue_latency() {
     );
 }
 
+#[tokio::test]
+async fn hand_broken_leaves_publish_drop_during_client_stop_without_delayed_ticks() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block_report(0, "minecraft:air"),
+            simple_block_report(1, "minecraft:oak_leaves"),
+        ])
+        .unwrap(),
+    );
+    let mut state = interaction_state_for_blocks(blocks);
+    state.items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+        mc_data::items::ItemReport {
+            id: Identifier::parse("minecraft:oak_leaves").unwrap(),
+            protocol_id: 10,
+        },
+    ]));
+    insert_fluid_test_chunk(&state).await;
+    let target = mc_world::BlockPos { x: 0, y: 64, z: 0 };
+    let loot_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        loot_file.path(),
+        r#"{"blocks":{"minecraft:oak_leaves":"minecraft:oak_leaves"}}"#,
+    )
+    .unwrap();
+    state.loot = Arc::new(mc_data::loot::load(loot_file.path()).unwrap());
+    state
+        .world
+        .lock()
+        .await
+        .set_block_at(target, mc_world::BlockStateId(1))
+        .unwrap();
+    let mut pose = PlayerPose::new(0.5, 64.0, 0.5);
+    pose.flags = mc_protocol::packets::play::MovePlayerFlags::new(true, false);
+    let profile = LoggedInProfile {
+        uuid: offline_uuid("LeafDropTiming"),
+        name: "LeafDropTiming".to_owned(),
+    };
+    let (outbound, _outbound_rx) = mpsc::channel(32);
+    let (session_id, _) =
+        state
+            .sessions
+            .register(&profile, (0, 0), 0, HashSet::new(), outbound, pose);
+    state.session_id = session_id;
+    state
+        .sessions
+        .register_player_persistence(session_id, Arc::clone(&state.player_persistence));
+    let (simulation, mut owner) = simulation_channel();
+    state.simulation = simulation.for_session(session_id);
+    let sessions = Arc::clone(&state.sessions);
+    let world = Arc::clone(&state.world);
+    let mut writer = Vec::new();
+    let mut survival = SurvivalState::FULL;
+    let mut xp = XpState::default();
+    for (action, sequence) in [
+        (PlayerActionKind::StartDestroyBlock, 1),
+        (PlayerActionKind::StopDestroyBlock, 2),
+    ] {
+        let mut request = Box::pin(handle_block_destroy_action(
+            &mut state,
+            &mut writer,
+            None,
+            GameMode::Survival,
+            &mut survival,
+            &mut xp,
+            pose,
+            ServerboundPlayerAction {
+                action,
+                position: pack_block_pos(target.x, target.y, target.z),
+                direction: Direction::Up,
+                sequence,
+            },
+        ));
+        loop {
+            match std::future::poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx))).await {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    break;
+                }
+                Poll::Pending => {
+                    assert!(
+                        owner
+                            .process_commands_with_world(&sessions, Some(&world), None, 32,)
+                            .await
+                            .processed
+                            > 0
+                    );
+                }
+            }
+        }
+        if sequence == 1 {
+            sessions.advance_world_time(5);
+        }
+    }
+    assert_eq!(sessions.simulation_tick(), 5);
+    assert!(state.delayed_break.is_none());
+    assert_eq!(
+        world.lock().await.get_cached_block(target),
+        Some(mc_world::BlockStateId(0))
+    );
+    // This fixture uses a deterministic block-item drop; loot probability is
+    // independent of whether an accepted STOP publishes its drop immediately.
+    assert!(
+        sessions
+            .persisted_entity_records()
+            .iter()
+            .any(|record| { record.snapshot.item_stack == Some(EntityItemStack::new(10, 1)) })
+    );
+}
+
 #[test]
 fn stop_at_vanilla_threshold_completes_immediately() {
     let mut active = Some(pending(12, 40));

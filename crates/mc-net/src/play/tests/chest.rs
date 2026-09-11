@@ -161,6 +161,7 @@ async fn chest_commit_snapshot_pairs_world_contents_with_viewer_state_id() {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
     {
         let mut storage = state.world.lock().await;

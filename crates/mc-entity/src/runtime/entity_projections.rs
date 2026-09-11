@@ -70,6 +70,7 @@ impl EntityRuntime {
 
             sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
             crossbow_attack: gameplay.crossbow_attack,
+            bow_attack: gameplay.bow_attack,
             blaze_attack: gameplay.blaze_attack,
             ghast_attack: gameplay.ghast_attack,
             breeze_attack: gameplay.breeze_attack,

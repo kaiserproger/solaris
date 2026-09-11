@@ -1,11 +1,11 @@
 use mc_data::block_facts::{BlockFactsTable, RandomTickFamily};
+#[cfg(test)]
+use mc_world::SECTION_COUNT;
 use mc_world::plant_rules_26_1_2::{
     PlantBlockEdit, PlantBlockRead, bamboo_sapling_growth_edits, next_crop_growth_state,
     sapling_tree_edits, stem_fruit_edits, vertical_plant_growth_edits,
 };
-use mc_world::{
-    BlockPos, BlockRegistry, BlockStateId, ChunkSection, MAX_Y, MIN_Y, SECTION_COUNT, SECTION_DIM,
-};
+use mc_world::{BlockPos, BlockRegistry, BlockStateId, ChunkSection, MAX_Y, MIN_Y, SECTION_DIM};
 
 use super::{
     BlockEdit, BlockPlanningRead, Identifier, ItemRegistry, ItemStack, RandomTickPolicy,
@@ -459,6 +459,71 @@ pub(super) fn farmland_has_nearby_water(
     false
 }
 
+/// Sample only sections that can tick, retaining the original chunk/section
+/// indices in the seed so skipping inert terrain cannot change gameplay rolls.
+pub(super) fn random_tick_candidates(
+    world_read: &mc_world::WorldReadView,
+    facts: &BlockFactsTable,
+    policy: RandomTickPolicy,
+    world_tick: u64,
+    chunks: &[(i32, i32)],
+) -> (usize, Vec<super::RandomTickCandidate>) {
+    let policy = policy.normalized();
+    if !policy.is_enabled() || chunks.is_empty() {
+        return (0, Vec::new());
+    }
+    let budget = policy.chunk_budget.min(chunks.len());
+    let start = world_tick as usize % chunks.len();
+    let positions = (0..budget)
+        .map(|offset| {
+            let (x, z) = chunks[(start + offset) % chunks.len()];
+            mc_world::ChunkPos { x, z }
+        })
+        .collect::<Vec<_>>();
+    let snapshot = world_read.snapshot_chunks(&positions);
+    let mut sampled = 0;
+    let mut candidates = Vec::new();
+    for (offset, &position) in positions.iter().enumerate() {
+        let Some(chunk) = snapshot.chunk(position) else {
+            continue;
+        };
+        let chunk_seed = policy.seed
+            ^ world_tick
+            ^ ((position.x as i64 as u64) << 32)
+            ^ (position.z as i64 as u64)
+            ^ ((offset as u64) << 48);
+        for (section_idx, section) in chunk.sections.iter().enumerate() {
+            if !section_may_random_tick(section, facts) {
+                continue;
+            }
+            for sample_idx in 0..policy.random_tick_speed {
+                let section_sample = ((section_idx as u64) << 32) | u64::from(sample_idx);
+                let hash = splitmix64(chunk_seed ^ splitmix64(section_sample));
+                let x = (hash & 0xF) as u8;
+                let z = ((hash >> 4) & 0xF) as u8;
+                let y = ((hash >> 8) & 0xF) as u8;
+                let state = section.get(x, y, z);
+                sampled += 1;
+                if facts.random_tick_family(state.0).is_some() {
+                    candidates.push(super::RandomTickCandidate {
+                        sample: RandomTickSample {
+                            chunk: (position.x, position.z),
+                            pos: BlockPos {
+                                x: position.x * SECTION_DIM as i32 + i32::from(x),
+                                y: MIN_Y + section_idx as i32 * SECTION_DIM as i32 + i32::from(y),
+                                z: position.z * SECTION_DIM as i32 + i32::from(z),
+                            },
+                        },
+                        state,
+                    });
+                }
+            }
+        }
+    }
+    (sampled, candidates)
+}
+
+#[cfg(test)]
 pub(super) fn sample_random_tick_positions(
     policy: RandomTickPolicy,
     world_tick: u64,

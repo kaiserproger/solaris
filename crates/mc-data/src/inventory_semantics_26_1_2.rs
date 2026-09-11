@@ -22,6 +22,7 @@ pub fn can_stack(left: &ItemStack, right: &ItemStack) -> bool {
         && left.damage == right.damage
         && left.custom_name == right.custom_name
         && left.item_model == right.item_model
+        && left.stew_effects == right.stew_effects
         && enchantments_equal_in_canonical_order(&left.enchantments, &right.enchantments)
 }
 

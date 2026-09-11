@@ -61,6 +61,8 @@ mod falling_blocks;
 mod farmland_fallback_collision;
 mod fence_deflation_boundary;
 mod fluid_runtime;
+mod food_consumption;
+mod food_recipe_effects;
 mod furnace;
 mod gamemode_commands;
 mod held_sharpness_damage;

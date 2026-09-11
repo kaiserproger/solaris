@@ -95,6 +95,8 @@ pub fn fallback_mining_facts(block_path: &str) -> BlockMiningFacts {
         "grass_block" | "gravel" | "clay" => (0.6, false),
         "crafting_table" | "chest" | "trapped_chest" => (2.5, false),
         "furnace" | "blast_furnace" | "smoker" => (3.5, true),
+        // 26.1.2 Blocks.leavesProperties: strength 0.2, hand-harvestable.
+        path if path.ends_with("_leaves") => (0.2, false),
         path if path.starts_with("deepslate_") && path.ends_with("_ore") => (4.5, true),
         path if path.ends_with("_ore") => (3.0, true),
         path if path.ends_with("_log")

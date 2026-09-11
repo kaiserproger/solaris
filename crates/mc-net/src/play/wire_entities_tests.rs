@@ -32,6 +32,27 @@ use super::wire_entities::{
     send_entity_relative_move,
 };
 
+#[tokio::test]
+async fn hurt_wire_uses_damage_packet_and_configured_registry_index() {
+    let data = mc_data::VanillaData::from_registries(
+        "",
+        vec![mc_data::Registry {
+            id: Identifier::parse("minecraft:damage_type").unwrap(),
+            entries: vec![
+                Identifier::parse("minecraft:arrow").unwrap(),
+                Identifier::parse("minecraft:generic").unwrap(),
+            ],
+        }],
+    );
+    let mut wire = Vec::new();
+    super::wire_entities::send_entity_hurt(&mut wire, Compression::Disabled, 42, &data)
+        .await
+        .unwrap();
+    // 26.1.2: frame length, damage packet id, entity, damage registry index,
+    // absent cause/direct entities (offset +1), no source position.
+    assert_eq!(wire, [6, 0x19, 42, 1, 0, 0, 0]);
+}
+
 fn entity_snapshot(type_id: i32, type_name: &str) -> ServerEntitySnapshot {
     ServerEntitySnapshot {
         id: EntityId(42),
@@ -500,7 +521,7 @@ async fn accepted_effect_heal_mutates_owner_and_publishes_clamped_health() {
     ));
     assert!(matches!(
         outbound.try_recv(),
-        Ok(OutboundCommand::EntityEvent { entity_id: hurt_id, event_id: 2 })
+        Ok(OutboundCommand::EntityHurt { entity_id: hurt_id })
             if hurt_id == entity_id.0
     ));
     assert!(outbound.try_recv().is_err());

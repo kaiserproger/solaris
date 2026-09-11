@@ -101,6 +101,9 @@ pub(in crate::play) enum OutboundCommand {
         entity_id: i32,
         event_id: i8,
     },
+    EntityHurt {
+        entity_id: i32,
+    },
     LevelEvent(LevelEvent),
     DamagePlayer {
         damage: PlayerDamageRequest,
@@ -110,6 +113,14 @@ pub(in crate::play) enum OutboundCommand {
         effect_id: i32,
         amplifier: i32,
         duration_ticks: i32,
+        flags: mc_entity::effects_26_1_2::EffectFlags,
+    },
+    RemovePlayerEffect {
+        entity_id: i32,
+        effect_id: i32,
+    },
+    PlayerSurvivalChanged {
+        survival: crate::play::survival::SurvivalState,
     },
     PlayerDamageCommitted {
         publication: Box<PlayerDamagePublication>,
@@ -244,9 +255,12 @@ impl OutboundCommand {
             | Self::BlockDeltas(_)
             | Self::LightUpdates(_)
             | Self::EntityEvent { .. }
+            | Self::EntityHurt { .. }
             | Self::LevelEvent(_)
             | Self::DamagePlayer { .. }
             | Self::ApplyPlayerEffect { .. }
+            | Self::RemovePlayerEffect { .. }
+            | Self::PlayerSurvivalChanged { .. }
             | Self::PlayerDamageCommitted { .. }
             | Self::TakeItemEntity { .. }
             | Self::PickupCandidates(_)

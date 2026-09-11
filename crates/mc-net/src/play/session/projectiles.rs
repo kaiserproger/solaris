@@ -41,7 +41,7 @@ use super::player_effects::{
     poison_effect,
 };
 use super::visibility::{
-    entity_event_dispatches_locked, initialize_entity_wire_state_locked, ordered_session_recipient,
+    entity_hurt_dispatches_locked, initialize_entity_wire_state_locked, ordered_session_recipient,
     publish_server_entity_snapshot_locked, spawn_entity_visibility_locked,
     visible_entity_observers_locked,
 };
@@ -1005,7 +1005,7 @@ fn commit_small_fireball_entity_hit_locked(
             let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
             dispatches.extend(death_dispatches);
         } else {
-            dispatches.extend(entity_event_dispatches_locked(inner, damage.snapshot.id, 2));
+            dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
         }
     }
     true
@@ -1045,7 +1045,7 @@ fn commit_shulker_bullet_entity_hit_locked(
             let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
             dispatches.extend(death_dispatches);
         } else {
-            dispatches.extend(entity_event_dispatches_locked(inner, damage.snapshot.id, 2));
+            dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
             let _ = inner.entities.apply_effect_if_current(
                 damage.snapshot.clone(),
                 mc_entity::EntityEffectRequest {
@@ -1104,7 +1104,7 @@ fn commit_plain_hurting_projectile_entity_hit_locked(
             let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
             dispatches.extend(death_dispatches);
         } else {
-            dispatches.extend(entity_event_dispatches_locked(inner, damage.snapshot.id, 2));
+            dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
         }
     }
     true
@@ -2221,7 +2221,7 @@ fn publish_committed_arrow_targets_locked(
             dispatches.extend(target_dispatches);
         } else {
             publish_arrow_knockback_locked(inner, &damage.snapshot, dispatches);
-            dispatches.extend(entity_event_dispatches_locked(inner, damage.snapshot.id, 2));
+            dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
         }
     }
 }

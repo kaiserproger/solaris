@@ -678,6 +678,7 @@ fn target_hopper_inventory_slot(
                 && slot.enchantments == moving.enchantments
                 && slot.custom_name == moving.custom_name
                 && slot.item_model == moving.item_model
+                && slot.stew_effects == moving.stew_effects
                 && slot.count < HOPPER_TRANSFER_MAX_STACK)
     })
 }
@@ -690,11 +691,14 @@ fn insert_one_into_furnace_slot(target: &mut FurnaceSlot, moving: FurnaceSlot) {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(super) enum HopperTransferUpdate {
     Chest {
         position: mc_world::BlockPos,
         slots: Vec<ItemStack>,
     },
+    // `Furnace` holds 3 inline stacks (~300B) in a short-lived per-tick `Vec`;
+    // a stack memcpy here is cheaper than a heap alloc/free per hopper move.
     Furnace {
         position: mc_world::BlockPos,
         slots: [ItemStack; 3],
@@ -899,6 +903,7 @@ fn target_hopper_insert_slot(target: &ChestView, moving: &FurnaceSlot) -> Option
                             && slot.enchantments == moving.enchantments
                             && slot.custom_name == moving.custom_name
                             && slot.item_model == moving.item_model
+                            && slot.stew_effects == moving.stew_effects
                             && slot.count < HOPPER_TRANSFER_MAX_STACK)
                 })
                 .map(|slot| (chest, slot))
@@ -931,6 +936,7 @@ fn insert_hopper_input_into_furnace(
         && target.enchantments == moving.enchantments
         && target.custom_name == moving.custom_name
         && target.item_model == moving.item_model
+        && target.stew_effects == moving.stew_effects
         && target.count < HOPPER_TRANSFER_MAX_STACK
     {
         target.count += 1;
@@ -963,6 +969,7 @@ pub(super) fn insert_hopper_stack_into_campfire(
         enchantments: moving.enchantments.clone(),
         custom_name: moving.custom_name.clone(),
         item_model: moving.item_model.clone(),
+        stew_effects: moving.stew_effects.clone(),
     };
     context.sessions.commit_campfire_cooking_insert(
         position,
@@ -1070,6 +1077,7 @@ fn insert_hopper_fuel_into_furnace(
         && target.enchantments == moving.enchantments
         && target.custom_name == moving.custom_name
         && target.item_model == moving.item_model
+        && target.stew_effects == moving.stew_effects
         && target.count < HOPPER_TRANSFER_MAX_STACK
     {
         target.count += 1;

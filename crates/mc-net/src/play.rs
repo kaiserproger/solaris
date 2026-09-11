@@ -420,8 +420,10 @@ use player_teleport::apply_script_player_teleport;
 use random_ticks::{LeafDecayDropRolls, next_fire_state, next_leaf_decay_state, random_tick_edit};
 use random_ticks::{
     leaf_decay_drop_rolls, natural_leaf_decay_drops, random_tick_candidate_seed,
-    random_tick_edit_seeded, sample_random_tick_positions, section_may_random_tick,
+    random_tick_candidates, random_tick_edit_seeded,
 };
+#[cfg(test)]
+use random_ticks::{sample_random_tick_positions, section_may_random_tick};
 #[cfg(test)]
 use recipes::ingredient_accepts_item;
 use recipes::{
@@ -481,9 +483,9 @@ use use_item_on_adapter::{
 };
 use use_item_on_adapter::{ack_use_item_noop, handle_sign_update, handle_use_item_on};
 use wire_entities::{
-    send_entities_despawn, send_entity_data, send_entity_health, send_entity_relative_move,
-    send_entity_spawn, send_player_animation, send_player_despawn, send_player_move,
-    send_player_spawn, send_take_item_entity,
+    send_entities_despawn, send_entity_data, send_entity_health, send_entity_hurt,
+    send_entity_relative_move, send_entity_spawn, send_player_animation, send_player_despawn,
+    send_player_effect_command, send_player_move, send_player_spawn_synced, send_take_item_entity,
 };
 
 #[cfg(test)]
@@ -863,7 +865,10 @@ const CREEPER_FUSE_TICKS: u64 = 30;
 const CREEPER_TRIGGER_RANGE: f64 = 3.0;
 const CREEPER_CANCEL_RANGE: f64 = 7.0;
 const CREEPER_EXPLOSION_POWER: f32 = 3.0;
-const SKELETON_SHOT_PERIOD_TICKS: u64 = 40;
+// 26.1.2 `RangedBowAttackGoal(this, 1.0, attackIntervalMin 20, 15.0F)`:
+// 20-tick bow pull to full power, then `attackIntervalMin` cooldown.
+const SKELETON_BOW_DRAW_TICKS: u64 = 20;
+const SKELETON_BOW_COOLDOWN_TICKS: u64 = 20;
 const SKELETON_SHOT_RANGE: f64 = 16.0;
 const SKELETON_ARROW_SPEED: f64 = 1.6;
 #[cfg(test)]
@@ -2037,6 +2042,7 @@ where
     let player_simulation = simulation.for_session(session_id);
     let player_save_state = Arc::new(Mutex::new(player_state.clone()));
     sessions.register_player_persistence(session_id, Arc::clone(&player_save_state));
+    dispatch_visibility_commands(sessions.broadcast_player_effects(session_id));
     let mut player_inventory_settled = true;
     let result = async {
         if let Some(stream) = chunk_stream.as_mut() {
@@ -2619,10 +2625,9 @@ async fn handle_crafting_container_click<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    if packet.state_id != window.state_id {
-        write_crafting_content(state, writer, &window).await?;
-        return Ok(window);
-    }
+    // Vanilla applies queued clicks to authoritative slots even when the
+    // client's state id lags; the mismatch requests a full resync, not a veto.
+    let stale_state = packet.state_id != window.state_id;
     let action = classify_container_click(&packet);
     if !matches!(action, ContainerClickAction::QuickCraft(_)) {
         window.quickcraft.reset();
@@ -2718,7 +2723,10 @@ where
         );
     }
     if quickcraft_outcome == Some(QuickCraftOutcome::Pending) {
-        if client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+        if stale_state || client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+            if stale_state {
+                write_crafting_content(state, writer, &window).await?;
+            }
             return Ok(window);
         }
         state.inventory = before_inventory;
@@ -2728,7 +2736,7 @@ where
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
-    if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+    if !stale_state && !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
         state.inventory = before_inventory;
         state.carried_item = before_carried_item;
         window = before_window;
@@ -6314,6 +6322,7 @@ where
             enchantments: stack.enchantments.clone(),
             custom_name: stack.custom_name.as_deref().cloned(),
             item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+            stew_effects: stack.stew_effects.clone(),
         };
         let max_stack = item_max_stack(&state.item_facts, &state.items, &probe);
         let credited = match state
@@ -6964,15 +6973,6 @@ where
                 .await?;
             }
             dispatch_visibility_commands(dispatches);
-            write_packet(
-                writer,
-                &EntityEvent {
-                    entity_id: packet.entity_id,
-                    event_id: 2,
-                },
-                state.compression,
-            )
-            .await?;
             debug!(
                 entity_id = packet.entity_id,
                 health = damage.snapshot.health,
@@ -8011,8 +8011,7 @@ async fn run_random_ticks_owned(
     if loaded_chunks.is_empty() {
         return RandomTickReport::default();
     }
-    let samples = sample_random_tick_positions(policy, world_tick, &loaded_chunks);
-    if samples.is_empty() {
+    if !policy.is_enabled() {
         return RandomTickReport::default();
     }
 
@@ -8024,7 +8023,13 @@ async fn run_random_ticks_owned(
     let world_read = world_read
         .or(owned_world_read.as_ref())
         .expect("world-backed random ticks have a read view");
-    let (sampled, candidates) = random_tick_candidates(world_read, &config.block_facts, &samples);
+    let (sampled, candidates) = random_tick_candidates(
+        world_read,
+        &config.block_facts,
+        policy,
+        world_tick,
+        &loaded_chunks,
+    );
     if candidates.is_empty() {
         return RandomTickReport {
             sampled,
@@ -9328,65 +9333,6 @@ fn snapshot_read_preconditions_are_current(
         storage.get_cached_block(precondition.pos) == precondition.expected_state
             && storage.block_mutation_token(precondition.pos) == precondition.expected_token
     })
-}
-
-fn random_tick_candidates(
-    world_read: &mc_world::WorldReadView,
-    facts: &mc_data::block_facts::BlockFactsTable,
-    samples: &[RandomTickSample],
-) -> (usize, Vec<RandomTickCandidate>) {
-    let mut chunk_positions = samples
-        .iter()
-        .map(|sample| ChunkPos {
-            x: sample.chunk.0,
-            z: sample.chunk.1,
-        })
-        .collect::<Vec<_>>();
-    chunk_positions.sort_unstable_by_key(|pos| (pos.x, pos.z));
-    chunk_positions.dedup();
-    let snapshot = world_read.snapshot_chunks(&chunk_positions);
-    let active_sections = chunk_positions
-        .into_iter()
-        .map(|position| {
-            let sections = snapshot
-                .chunk(position)
-                .map(|chunk| {
-                    std::array::from_fn(|section| {
-                        section_may_random_tick(&chunk.sections[section], facts)
-                    })
-                })
-                .unwrap_or([false; mc_world::SECTION_COUNT]);
-            ((position.x, position.z), sections)
-        })
-        .collect::<HashMap<_, _>>();
-
-    let mut sampled = 0usize;
-    let mut candidates = Vec::new();
-    for &sample in samples {
-        let Some(section) = sample
-            .pos
-            .y
-            .checked_sub(mc_world::MIN_Y)
-            .map(|y| y as usize / mc_world::SECTION_DIM)
-            .filter(|section| *section < mc_world::SECTION_COUNT)
-        else {
-            continue;
-        };
-        if !active_sections
-            .get(&sample.chunk)
-            .is_some_and(|sections| sections[section])
-        {
-            continue;
-        }
-        let Some(state) = snapshot.get_cached_block(sample.pos) else {
-            continue;
-        };
-        sampled += 1;
-        if facts.random_tick_family(state.0).is_some() {
-            candidates.push(RandomTickCandidate { sample, state });
-        }
-    }
-    (sampled, candidates)
 }
 
 async fn run_scheduled_fluid_ticks_owned(
@@ -11720,10 +11666,6 @@ where
         return Ok(());
     }
 
-    if survival_state.food >= mc_entity::player_survival_26_1_2::MAX_FOOD {
-        return ack_use_item_noop(writer, state.compression, action.sequence, "full_food").await;
-    }
-
     let Some((held_item_id, rule, required_time)) = held_food_use(state, held_slot) else {
         return ack_use_item_noop(
             writer,
@@ -11733,6 +11675,9 @@ where
         )
         .await;
     };
+    if !rule.can_always_eat && survival_state.food >= mc_entity::player_survival_26_1_2::MAX_FOOD {
+        return ack_use_item_noop(writer, state.compression, action.sequence, "full_food").await;
+    }
 
     state.pending_break = None;
     state.pending_use = Some(PendingUse {
@@ -11755,15 +11700,23 @@ async fn complete_food_use<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    let UseKind::Food(food_rule) = &pending.kind else {
+        return Ok(());
+    };
     if survival_state.is_dead()
-        || survival_state.food >= mc_entity::player_survival_26_1_2::MAX_FOOD
+        || (!food_rule.can_always_eat
+            && survival_state.food >= mc_entity::player_survival_26_1_2::MAX_FOOD)
         || !pending_use_matches(state, &pending)
     {
         return Ok(());
     }
 
-    let UseKind::Food(food_rule) = &pending.kind else {
-        return Ok(());
+    let remainder = match survival::food_use_remainder(state, pending.held_item_id) {
+        Ok(remainder) => remainder,
+        Err(reason) => {
+            debug!(reason, "food use remainder cannot be resolved");
+            return Ok(());
+        }
     };
     let committed = match state
         .simulation
@@ -11773,6 +11726,8 @@ where
             expected_survival: *survival_state,
             food: food_rule.food,
             saturation: food_rule.saturation,
+            can_always_eat: food_rule.can_always_eat,
+            remainder,
         })
         .await
     {
@@ -13467,44 +13422,23 @@ where
     .await
 }
 
-async fn send_player_effect_command<W>(
+/// Applies an authoritative survival snapshot to the connection state,
+/// forwarding to the client only when the visible health packet changes.
+async fn sync_survival<W>(
     writer: &mut W,
     compression: Compression,
-    command: OutboundCommand,
+    survival_state: &mut SurvivalState,
+    survival: SurvivalState,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let OutboundCommand::ApplyPlayerEffect {
-        entity_id,
-        effect_id,
-        amplifier,
-        duration_ticks,
-    } = command
-    else {
-        unreachable!("player-effect sender requires ApplyPlayerEffect")
-    };
-    let effect_id = mc_protocol::packets::play::MobEffectId::new(
-        u32::try_from(effect_id).expect("validated non-negative effect id"),
-    )
-    .expect("embedded effect id fits protocol registry range");
-    write_packet(
-        writer,
-        &mc_protocol::packets::play::ClientboundUpdateEntityEffect {
-            entity_id,
-            effect_id,
-            amplifier,
-            duration_ticks,
-            flags: mc_protocol::packets::play::EntityEffectFlags {
-                ambient: false,
-                visible: true,
-                show_icon: true,
-                blend: false,
-            },
-        },
-        compression,
-    )
-    .await
+    let health_changed = survival_state.as_packet() != survival.as_packet();
+    *survival_state = survival;
+    if health_changed {
+        write_packet(writer, &survival_state.as_packet(), compression).await?;
+    }
+    Ok(())
 }
 
 async fn send_explosion_command<W>(
@@ -13912,6 +13846,7 @@ struct CommittedPlayerDamageProjection<'a, W> {
     session_id: SessionId,
     survival_state: &'a mut SurvivalState,
     xp_state: &'a mut XpState,
+    data: &'a mc_data::VanillaData,
 }
 
 async fn publish_committed_player_damage<W>(
@@ -13929,6 +13864,7 @@ where
         session_id,
         survival_state,
         xp_state,
+        data,
     } = projection;
     let applied = apply_player_damage_publication(
         interaction.as_deref_mut(),
@@ -13972,15 +13908,7 @@ where
         .await?;
     }
     if applied.fresh_hurt {
-        write_packet(
-            writer,
-            &EntityEvent {
-                entity_id: hurt_event_entity_id,
-                event_id: 2,
-            },
-            compression,
-        )
-        .await?;
+        send_entity_hurt(writer, compression, hurt_event_entity_id, data).await?;
     }
     Ok(())
 }
@@ -14325,7 +14253,7 @@ where
                         }
                     }
                     Some(OutboundCommand::SpawnPlayer(player)) => {
-                        send_player_spawn(writer, compression, &player).await?;
+                        send_player_spawn_synced(writer, compression, &sessions, &player).await?;
                     }
                     Some(OutboundCommand::MovePlayer(player)) => {
                         send_player_move(writer, compression, &player).await?;
@@ -14365,6 +14293,9 @@ where
                         write_packet(writer, &EntityEvent { entity_id, event_id }, compression)
                             .await?;
                     }
+                    Some(OutboundCommand::EntityHurt { entity_id }) => {
+                        send_entity_hurt(writer, compression, entity_id, &config.data).await?;
+                    }
                     Some(OutboundCommand::LevelEvent(event)) => {
                         write_packet(writer, &event, compression).await?;
                     }
@@ -14385,18 +14316,20 @@ where
                             .await?;
                         }
                     }
-                    Some(command @ OutboundCommand::ApplyPlayerEffect { .. }) => {
+                    Some(command @ (OutboundCommand::ApplyPlayerEffect { .. }
+                        | OutboundCommand::RemovePlayerEffect { .. })) => {
                         send_player_effect_command(writer, compression, command).await?;
                     }
-                    Some(OutboundCommand::PlayerDamageCommitted {
-                        publication,
-                        hurt_event,
-                    }) => {
+                    Some(OutboundCommand::PlayerSurvivalChanged { survival }) => {
+                        sync_survival(writer, compression, &mut survival_state, survival).await?;
+                    }
+                    Some(OutboundCommand::PlayerDamageCommitted { publication, hurt_event }) => {
                         publish_committed_player_damage(
                             CommittedPlayerDamageProjection {
                                 interaction: interaction.as_deref_mut(),
                                 writer,
                                 compression,
+                                data: &config.data,
                                 session_id,
                                 survival_state: &mut survival_state,
                                 xp_state: &mut xp_state,

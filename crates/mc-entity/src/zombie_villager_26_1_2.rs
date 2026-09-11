@@ -23,10 +23,13 @@ pub const CONVERSION_WAIT_MAX_TICKS: u32 = 6_000;
 pub const CONVERSION_WAIT_RANGE: u64 =
     (CONVERSION_WAIT_MAX_TICKS - CONVERSION_WAIT_MIN_TICKS + 1) as u64;
 
-// BuiltInRegistries.MOB_EFFECT raw ids in 26.1.2 are the historical one-based ids.
-pub const STRENGTH_EFFECT_ID: EffectId = EffectId::new(5);
-pub const NAUSEA_EFFECT_ID: EffectId = EffectId::new(9);
-pub const WEAKNESS_EFFECT_ID: EffectId = EffectId::new(18);
+// Active-effect storage and packet projection use canonical registry identities.
+pub const STRENGTH_EFFECT_ID: EffectId =
+    EffectId::new(mc_data::mob_effects_26_1_2::MobEffect::Strength as u32);
+pub const NAUSEA_EFFECT_ID: EffectId =
+    EffectId::new(mc_data::mob_effects_26_1_2::MobEffect::Nausea as u32);
+pub const WEAKNESS_EFFECT_ID: EffectId =
+    EffectId::new(mc_data::mob_effects_26_1_2::MobEffect::Weakness as u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZombieVillagerConversionState {

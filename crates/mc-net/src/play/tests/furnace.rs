@@ -110,6 +110,7 @@ fn furnace_uses_vanilla_common_fuel_times_and_returns_lava_bucket() {
         result: RecipeResult {
             item: cooked_food,
             count: 1,
+            stew_effects: Vec::new(),
         },
     };
     let tags = mc_data::tags::solaris_required_item_tags(&items);
@@ -248,6 +249,7 @@ fn furnace_cools_partial_progress_when_the_fuel_slot_is_empty() {
         result: RecipeResult {
             item: cooked_food,
             count: 1,
+            stew_effects: Vec::new(),
         },
     };
     let mut furnace = FurnaceBlockEntity {
@@ -300,6 +302,7 @@ fn completed_furnace_cook_records_the_recipe_for_experience() {
         result: RecipeResult {
             item: iron_ingot,
             count: 1,
+            stew_effects: Vec::new(),
         },
     };
     let mut furnace = FurnaceBlockEntity {
@@ -339,6 +342,7 @@ fn taking_furnace_output_awards_only_recorded_furnace_recipe_experience() {
     let result = RecipeResult {
         item: Identifier::parse("minecraft:iron_ingot").unwrap(),
         count: 1,
+        stew_effects: Vec::new(),
     };
     let furnace_recipe = Recipe {
         id: Identifier::parse("minecraft:test_furnace").unwrap(),

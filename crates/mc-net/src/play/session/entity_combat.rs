@@ -8,10 +8,10 @@ use super::{
     ENTITY_HURT_INVULNERABLE_TICKS, EntityAttackOutcome, EntityKillRewards, EntityStoreGuard,
     OutboundCommand, PlayerAttackResult, ServerEntitySnapshot, SessionEntityGuards, SessionId,
     SessionRegistry, VisibilityDispatch, apply_player_melee_knockback_locked,
-    entity_event_dispatches_locked, entity_item_stack, entity_kill_drop_stacks, mob_xp_value,
-    record_entity_dispatches_locked, server_entity_snapshot_from, session_recipients,
-    spawn_item_drop_locked, spawn_xp_orb_locked, visibility_dispatches,
-    visible_entity_observers_locked,
+    entity_event_dispatches_locked, entity_hurt_dispatches_locked, entity_item_stack,
+    entity_kill_drop_stacks, mob_xp_value, record_entity_dispatches_locked,
+    server_entity_snapshot_from, session_recipients, spawn_item_drop_locked, spawn_xp_orb_locked,
+    visibility_dispatches, visible_entity_observers_locked,
 };
 use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
@@ -269,7 +269,7 @@ fn attack_dragon_part_locked(
         killed: false,
     };
     let mut dispatches = publish_accepted_entity_health_locked(inner, &damage.snapshot);
-    dispatches.extend(entity_event_dispatches_locked(inner, damage.snapshot.id, 2));
+    dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
     Some(EntityAttackOutcome::Damaged {
         damage,
         dispatches,
@@ -658,7 +658,7 @@ pub(super) fn attack_server_entity_locked(
         });
     }
     let mut dispatches = health_dispatches;
-    dispatches.extend(entity_event_dispatches_locked(inner, entity_id, 2));
+    dispatches.extend(entity_hurt_dispatches_locked(inner, entity_id));
     dispatches.extend(knockback_origin.map_or_else(Vec::new, |origin| {
         apply_player_melee_knockback_locked(inner, entity_id, origin)
     }));

@@ -756,6 +756,7 @@ impl SessionRegistry {
             enchantments: stack.enchantments.clone(),
             custom_name: stack.custom_name.as_deref().cloned(),
             item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+            stew_effects: stack.stew_effects.clone(),
         };
         let (remaining, changed_slots) = updated_inventory.merge_pickup_stack(
             probe,
@@ -1303,6 +1304,7 @@ fn item_stack_probe(stack: &EntityItemStack) -> ItemStack {
         enchantments: stack.enchantments.clone(),
         custom_name: stack.custom_name.as_deref().cloned(),
         item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+        stew_effects: stack.stew_effects.clone(),
     }
 }
 
@@ -1680,6 +1682,7 @@ fn claim_item_entity(
         enchantments: original_stack.enchantments.clone(),
         custom_name: original_stack.custom_name.clone(),
         item_model: original_stack.item_model.clone(),
+        stew_effects: original_stack.stew_effects.clone(),
     };
     let remaining_count = original_stack.count - picked_count;
     let remaining_stack = (remaining_count > 0).then(|| {
@@ -1778,6 +1781,7 @@ fn claim_item_pickup_locked(
         enchantments: stack.enchantments.clone(),
         custom_name: stack.custom_name.clone(),
         item_model: stack.item_model.clone(),
+        stew_effects: stack.stew_effects.clone(),
     };
     stack.count -= picked_count;
 

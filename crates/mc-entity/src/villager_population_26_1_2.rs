@@ -241,6 +241,7 @@ fn same_item_and_components(left: &EntityItemStack, right: &EntityItemStack) -> 
         && left.enchantments == right.enchantments
         && left.custom_name == right.custom_name
         && left.item_model == right.item_model
+        && left.stew_effects == right.stew_effects
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

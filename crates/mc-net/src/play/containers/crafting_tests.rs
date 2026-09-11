@@ -199,6 +199,7 @@ fn result_quick_move_crafts_every_matching_item_into_the_vanilla_reverse_range()
         result: RecipeResult {
             item: output,
             count: 4,
+            stew_effects: Vec::new(),
         },
     }];
     let item_facts = ItemFactsTable::default();
@@ -255,6 +256,7 @@ fn crafting_table_max_craft_respects_whole_output_batch_capacity() {
         result: RecipeResult {
             item: output,
             count: 4,
+            stew_effects: Vec::new(),
         },
     }];
     let item_facts = ItemFactsTable::default();

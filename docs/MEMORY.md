@@ -1,5 +1,80 @@
 # Solaris current cursor
 
+## Owner field follow-up — 2026-09-11 (uncommitted)
+
+Latest priority: delayed leaf drops and expensive random ticks. Leaf fallback
+hardness now matches 0.2; the packet-to-owner regression confirms STOP at tick 5
+commits both air and a deterministic configured drop without delayed ticks.
+Random candidate selection moved into `play/random_ticks.rs`: snapshot only the
+budgeted chunks and generate samples only in eligible sections, retaining seed
+offsets and order. Copied owner-region benchmark and exhaustive parity receipt:
+`.analysis/codex-logs/field-followup-20260911/random-tick-receipt.json`.
+This is candidate-stage evidence, not a new live-server p95 measurement.
+
+Related fixes in this working tree: actual 26.1.2 damage packet instead of legacy
+entity event 2, squid max health 10, pig passive behavior initialization,
+Overworld timeline tags, and queued crafting clicks processed despite stale
+state ids. Independent read-only review found stale carried predictions still
+vetoed crafting actions; that veto is removed for stale packets and the
+three-slot regression now supplies an incorrect nonempty cursor prediction.
+Owner inventory fences remain authoritative.
+
+Food recipe completeness and special edible-item effects remain open.
+Basic food metadata now covers
+all 40 consumable foods from local vanilla 26.1.2 reports: nutrition, saturation,
+duration, animation and stack limits. Cooked cod/salmon/mutton now pass a server
+use-item-to-commit regression (timing, debit, hunger and persisted state).
+Source receipt: `.analysis/codex-logs/field-followup-20260911/food-data-receipt.json`.
+This source change is not installed and has not had owner/client acceptance.
+The `food.can_always_eat` flag now crosses start, completion and owner commit:
+golden apples/chorus fruit consume at full hunger, ordinary food still cannot.
+Real report loading excludes food holders without a consumable component.
+Container remainders now commit with food: replace the final portion in hand,
+otherwise use canonical inventory insertion, then publish one overflow entity.
+Four consumption regressions cover hunger/timing and hand/merge/full-inventory
+conservation; four owner food-transaction regressions and six item-component
+tests pass. Strict affected-crate Clippy passes; `mc-net --lib` reports
+2076 passed, 8 ignored. Independent remainder review found no defect.
+Food eligibility is closed as the 40-item eating contract, not full special-item
+parity. Consumption-effect execution and recipe-specific stew components remain
+open with the food-recipe work. Do not reopen combat/absorption while closing
+food eligibility.
+Player status effects now use the persisted active-effect store. A save/load
+regression covers unsorted effect input, hidden-effect restoration, actual
+health/food mutations, and decoded packets for owner, tracker and late tracker.
+The focused regression passes. No new graphical acceptance or binary install.
+Manual leaf/grass loot now uses contextual probability rules: 11 leaf variants,
+shears/Silk Touch preservation, Fortune tables, and short grass seed chance 1/8.
+An empty roll stays empty instead of falling through to the block item.
+Pre-fix: grass dropped seeds on 65,536/65,536 breaks and shears returned apples.
+Post-fix: three deterministic distribution/tool regressions and the network
+fallback regression pass; affected `mc-net --lib` 2074 passed / 8 ignored,
+strict affected-crate Clippy and harness code-health passed.
+Receipt: `.analysis/codex-logs/field-followup-20260911/plant-loot-receipt.json`.
+These loot changes are source-only; no graphical acceptance or binary install.
+The previously built debug binary remains installed at `~/.local/bin/solaris`;
+SHA-256 `e0ce9ccf7fb25bb77deb524fee27c26711e406ec6da343d924374bad671c532a`.
+Installation receipt:
+`.analysis/codex-logs/installation-20260911T023358Z/receipt.json`.
+The owner then verified time and crafting-table interaction as fixed.
+Eating fish failed in the installed binary; the source-only regression above
+does not replace owner/client acceptance. Hurt reactions mostly work, but squid
+first-hit damage still fails; the 10-HP data regression is not acceptance.
+Animals flee more slowly than vanilla, zombies move more slowly, and skeletons
+hold bows without a visible string/arrow draw cycle. Those observations remain
+open owner failures. Future fixes must address shared consumption, damage,
+movement and bow-use paths, including newly added archer mobs, not type-name
+exceptions. No owner process, configuration or world was changed by the agent.
+Maturity remains draft; the above graphical observations are owner-run. Base tree:
+`c9f3fba3087af9fd0b7510e1e55c160e21e5d209`. Evidence and validation closeout:
+`.analysis/codex-logs/field-followup-20260911/checkpoint.json`.
+Final affected scope: `mc-net --lib` 2073 passed / 8 ignored; field runtime
+facts 3 passed; harness fmt, code-health and strict workspace Clippy passed.
+Full workspace tests are not green: the retry stalled in
+`mc-script::lua::loader_tests::shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable`
+and was interrupted; its log path and the earlier corrected failures are in
+the checkpoint receipt. No change to that unrelated fixture was made.
+
 ## Current checkpoint: skeleton ranged slice (handoff issues 11-equip + 12)
 
 Skeleton arrows now carry vanilla spread: normalize → per-axis triangular
@@ -1270,3 +1345,20 @@ Do not restore population caps or reduce selected simulation work to hide costs.
 Broader core ownership, integration finalization and full gameplay/load acceptance
 remain open. The old frozen load matrix and missing owner terrain acceptance
 remain unresolved. Do not return to Loader feature development.
+
+## Owner followup 2026-09-11 (evening, pushed unverified — internet cutoff)
+
+Done and tested: squid first-hit regression
+(`squid_first_melee_hit_damages_and_notifies_observers`), panic multipliers
+from decompiled 26.1.2 (cow 2.0, sheep/pig 1.25, chicken 1.4), zombie pursuit
+from attribute (`ZombieAttackGoal 1.0` over 0.23 → 2.3).
+schedule removed. New `skeleton_bow_draw_cycle` passes; `hostile_commit_releases`
+and `skeleton_shoots_a_real_arrow` pass. `skeleton_volley` FAILS on the owner-request
+count (9 vs old 5: gameplay `attacks == 2` passes, only the lock-count expectation
+UNVERIFIED: `skeleton_volley` owner-request count re-baselined 5 → 9 without
+a green run (no time before disconnect). First act on reconnect: run the four
+bow tests + `cargo fmt --all` + full `mc-net`/`mc-entity`/`mc-data` lib suites,
+then L2 `correctness`. `SKELETON_SHOT_PERIOD_TICKS` const removed; do not
+re-add. `.analysis/server.jar` (official Mojang download, ignored) + vineflower
+decomp under /tmp/decomp (Cow/Sheep/Pig/Chicken/PanicGoal/Zombie/Skeleton/
+AbstractSkeleton/RangedBowAttackGoal) back further vanilla checks.

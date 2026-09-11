@@ -26,11 +26,23 @@ impl SessionRegistry {
         state: Arc<Mutex<PlayerPersistedState>>,
     ) {
         let mut inner = self.lock_inner("register player persistence");
-        let (game_mode, dead) = {
+        let (game_mode, dead, has_effects) = {
             let state = lock_authoritative_mutex(&state, "play.player_persistence");
-            (state.game_mode, state.survival.is_dead())
+            (
+                state.game_mode,
+                state.survival.is_dead(),
+                state
+                    .effects
+                    .as_ref()
+                    .is_some_and(|effects| !effects.is_empty()),
+            )
         };
         inner.player_persistence.insert(id, state);
+        if has_effects && !dead {
+            inner.player_effect_sessions.insert(id);
+        } else {
+            inner.player_effect_sessions.remove(&id);
+        }
         if let Some(uuid) = inner.sessions.get(&id).map(|session| session.uuid) {
             inner.disconnected_player_persistence.remove(&uuid);
         }
@@ -429,6 +441,7 @@ pub(super) fn apply_player_survival_plan_locked(
                     enchantments: stack.enchantments,
                     custom_name: stack.custom_name.map(Box::new),
                     item_model: stack.item_model.as_deref().cloned().map(Box::new),
+                    stew_effects: stack.stew_effects,
                 });
             }
         }
@@ -440,6 +453,7 @@ pub(super) fn apply_player_survival_plan_locked(
                 enchantments: carried_item.enchantments.clone(),
                 custom_name: carried_item.custom_name.clone().map(Box::new),
                 item_model: carried_item.item_model.as_deref().cloned().map(Box::new),
+                stew_effects: carried_item.stew_effects.clone(),
             });
             carried_item = ItemStack::EMPTY;
         }

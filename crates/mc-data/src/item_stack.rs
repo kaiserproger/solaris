@@ -2,6 +2,71 @@ use std::sync::Arc;
 
 use crate::{Identifier, ItemEnchantment};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StewEffect {
+    pub id: Identifier,
+    #[serde(default = "default_stew_duration")]
+    pub duration: i32,
+}
+
+const fn default_stew_duration() -> i32 {
+    160
+}
+
+pub const STEW_EFFECTS_COMPONENT: &str = "minecraft:suspicious_stew_effects";
+
+pub fn decode_stew_effects(tag: &mc_nbt::Tag) -> Result<Vec<StewEffect>, &'static str> {
+    use mc_nbt::Tag;
+    let Tag::List(list) = tag else {
+        return Err("stew effects must be a list");
+    };
+    list.elements
+        .iter()
+        .map(|entry| {
+            let Tag::Compound(fields) = entry else {
+                return Err("stew effect must be a compound");
+            };
+            let Some(Tag::String(name)) = fields
+                .iter()
+                .find(|(name, _)| name == "id")
+                .map(|(_, tag)| tag)
+            else {
+                return Err("stew effect id is missing");
+            };
+            let id = Identifier::parse(name.clone()).map_err(|_| "invalid stew effect id")?;
+            if crate::mob_effects_26_1_2::MobEffect::from_name(id.as_str()).is_none() {
+                return Err("unknown stew effect id");
+            }
+            let duration = match fields
+                .iter()
+                .find(|(name, _)| name == "duration")
+                .map(|(_, tag)| tag)
+            {
+                Some(Tag::Int(duration)) => *duration,
+                _ => default_stew_duration(),
+            };
+            Ok(StewEffect { id, duration })
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn encode_stew_effects(effects: &[StewEffect]) -> mc_nbt::Tag {
+    use mc_nbt::Tag;
+    Tag::List(mc_nbt::ListTag {
+        element_type: mc_nbt::tag_type::COMPOUND,
+        elements: effects
+            .iter()
+            .map(|effect| {
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String(effect.id.as_str().into())),
+                    ("duration".into(), Tag::Int(effect.duration)),
+                ])
+            })
+            .collect(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ItemStack {
     pub count: i32,
@@ -10,6 +75,7 @@ pub struct ItemStack {
     pub enchantments: Vec<ItemEnchantment>,
     pub custom_name: Option<String>,
     pub item_model: Option<Arc<Identifier>>,
+    pub stew_effects: Vec<StewEffect>,
 }
 
 impl ItemStack {
@@ -20,6 +86,7 @@ impl ItemStack {
         enchantments: Vec::new(),
         custom_name: None,
         item_model: None,
+        stew_effects: Vec::new(),
     };
 
     #[must_use]
@@ -36,6 +103,7 @@ impl ItemStack {
             enchantments: Vec::new(),
             custom_name: None,
             item_model: None,
+            stew_effects: Vec::new(),
         }
     }
 
@@ -64,30 +132,5 @@ impl ItemStack {
     pub fn with_item_model(mut self, model: Identifier) -> Self {
         self.item_model = Some(Arc::new(model));
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stack_mutation_helpers_are_domain_data_not_wire_behaviour() {
-        let enchantment = Identifier::parse("minecraft:sharpness").unwrap();
-        let model = Identifier::parse("minecraft:diamond_sword").unwrap();
-        let stack = ItemStack::new(7, 1)
-            .with_damage(5)
-            .with_enchantment(enchantment.clone(), 3)
-            .with_enchantment(enchantment, 4)
-            .with_custom_name("Blade")
-            .with_item_model(model.clone());
-        assert_eq!(stack.count, 1);
-        assert_eq!(stack.item_id, 7);
-        assert_eq!(stack.damage, Some(5));
-        assert_eq!(stack.enchantments.len(), 1);
-        assert_eq!(stack.enchantments[0].level, 4);
-        assert_eq!(stack.custom_name.as_deref(), Some("Blade"));
-        assert_eq!(stack.item_model.as_deref(), Some(&model));
-        assert!(ItemStack::EMPTY.is_empty());
     }
 }

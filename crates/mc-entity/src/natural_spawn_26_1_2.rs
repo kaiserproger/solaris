@@ -363,7 +363,7 @@ pub fn apply_entity_facts(entity: &mut SpawnEntity) {
         "minecraft:sheep" => {
             entity.animal = Some(AnimalBreedingState::adult_sheep(SheepColor::White));
         }
-        "minecraft:cow" | "minecraft:chicken" => {
+        "minecraft:cow" | "minecraft:chicken" | "minecraft:pig" => {
             entity.animal = Some(AnimalBreedingState::adult());
         }
         "minecraft:ender_dragon" => {
@@ -431,4 +431,15 @@ pub fn passive_ground_wander_speed(entity: &SpawnEntity) -> f64 {
         .base(&AttributeKind::MovementSpeed)
         .unwrap_or(0.2)
         * 10.0
+}
+
+/// 26.1.2 `PanicGoal` speed multiplier from decompiled `registerGoals`:
+/// cow 2.0, sheep and pig 1.25, chicken 1.4. 2.0 is the common default.
+#[must_use]
+pub fn panic_speed_multiplier_26_1_2(type_name: &str) -> f64 {
+    match type_name {
+        "minecraft:sheep" | "minecraft:pig" => 1.25,
+        "minecraft:chicken" => 1.4,
+        _ => 2.0,
+    }
 }

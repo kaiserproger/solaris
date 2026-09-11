@@ -101,6 +101,7 @@ fn wire_item_stack(stack: &mc_entity::EntityItemStack) -> ItemStack {
             .as_deref()
             .cloned()
             .map(std::sync::Arc::new),
+        stew_effects: stack.stew_effects.clone(),
     }
 }
 

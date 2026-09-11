@@ -4,7 +4,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    AnimalBreedingState, EntityBlazeAttackState, EntityBreezeAttackState,
+    AnimalBreedingState, EntityBlazeAttackState, EntityBowAttackState, EntityBreezeAttackState,
     EntityCrossbowAttackState, EntityEvokerAttackState, EntityGhastAttackState,
     EntityGuardianBeamState, EntityId, EntityLifecycle, EntityRuntime, EntityShulkerAttackState,
     EntityStore, EntityWardenSonicBoomState, EntityWitchAttackState, GoalState, Rotation, Vec3,
@@ -43,6 +43,7 @@ pub struct EntitySimulationProjection {
     pub shulker_bullet_target_entity_id: Option<i32>,
     pub sheep_grazing_ticks: Option<u8>,
     pub crossbow_attack: Option<EntityCrossbowAttackState>,
+    pub bow_attack: Option<EntityBowAttackState>,
     pub blaze_attack: Option<EntityBlazeAttackState>,
     pub ghast_attack: Option<EntityGhastAttackState>,
     pub breeze_attack: Option<EntityBreezeAttackState>,

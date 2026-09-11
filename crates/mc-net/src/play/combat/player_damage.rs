@@ -16,6 +16,8 @@ pub(in crate::play) enum PlayerDamageKind {
     ShulkerBullet,
     WindCharge,
     SonicBoom,
+    Magic,
+    Wither,
     IndirectMagic,
     Fall,
     Campfire,
@@ -52,6 +54,10 @@ impl PlayerDamageKind {
             Self::SonicBoom => DamageSource::with_flags(
                 DamageSourceKind::Generic,
                 DamageFlags::BYPASSES_ARMOR.union(DamageFlags::BYPASSES_ENCHANTMENTS),
+            ),
+            Self::Magic | Self::Wither => DamageSource::with_flags(
+                DamageSourceKind::Generic,
+                DamageFlags::BYPASSES_ARMOR.union(DamageFlags::NO_KNOCKBACK),
             ),
             Self::IndirectMagic => DamageSource::vanilla(DamageSourceKind::IndirectMagic),
             Self::Fall => DamageSource::vanilla(DamageSourceKind::Fall),

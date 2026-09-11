@@ -76,7 +76,11 @@ fn furnace_like_recipe_lookup_uses_matching_cooking_category() {
         cooking_time,
         experience_milli: 0,
     };
-    let result = |item: Identifier| RecipeResult { item, count: 1 };
+    let result = |item: Identifier| RecipeResult {
+        item,
+        count: 1,
+        stew_effects: Vec::new(),
+    };
     let recipes = vec![
         Recipe {
             id: Identifier::parse("minecraft:test_smelting").unwrap(),
@@ -168,7 +172,11 @@ fn campfire_recipe_lookup_uses_campfire_category() {
         cooking_time,
         experience_milli: 0,
     };
-    let result = |item: Identifier| RecipeResult { item, count: 1 };
+    let result = |item: Identifier| RecipeResult {
+        item,
+        count: 1,
+        stew_effects: Vec::new(),
+    };
     let recipes = vec![
         Recipe {
             id: Identifier::parse("minecraft:test_smoking").unwrap(),
@@ -258,6 +266,7 @@ async fn full_campfire_consumes_valid_food_interaction_without_debit() {
         result: RecipeResult {
             item: cooked,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }];
     state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(13, 5);
@@ -351,6 +360,7 @@ fn campfire_persistent_nbt_uses_vanilla_cooking_arrays_and_reads_legacy() {
         result: RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }];
     let tags = TagsData::default();
@@ -456,6 +466,7 @@ async fn campfire_startup_hydration_only_reads_resident_chunks() {
         result: RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
     let pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
@@ -599,6 +610,7 @@ async fn campfire_tick_does_not_load_cold_chunks_and_is_durable_when_resident() 
             result: RecipeResult {
                 item: cooked_porkchop,
                 count: 1,
+                stew_effects: Vec::new(),
             },
         }]),
         ..play_loop_slow_client_test_config()

@@ -4,12 +4,13 @@ use std::sync::atomic::Ordering;
 
 use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobCombatPolicy};
 use mc_entity::{
-    AttributeKind, EntityBlazeAttackState, EntityBreezeAttackPhase, EntityBreezeAttackState,
-    EntityCrossbowAttackPhase, EntityCrossbowAttackState, EntityEvokerAttackPhase,
-    EntityEvokerAttackState, EntityEvokerFangState, EntityExplosionInteraction,
-    EntityGhastAttackState, EntityGuardianBeamPhase, EntityGuardianBeamState, EntityId,
-    EntityLifecycle, EntityPendingExplosionState, EntityPrimedTntState, EntityShulkerAttackState,
-    EntitySnapshot, EntityWardenSonicBoomPhase, EntityWardenSonicBoomState, EntityWitchAttackState,
+    AttributeKind, EntityBlazeAttackState, EntityBowAttackPhase, EntityBowAttackState,
+    EntityBreezeAttackPhase, EntityBreezeAttackState, EntityCrossbowAttackPhase,
+    EntityCrossbowAttackState, EntityEvokerAttackPhase, EntityEvokerAttackState,
+    EntityEvokerFangState, EntityExplosionInteraction, EntityGhastAttackState,
+    EntityGuardianBeamPhase, EntityGuardianBeamState, EntityId, EntityLifecycle,
+    EntityPendingExplosionState, EntityPrimedTntState, EntityShulkerAttackState, EntitySnapshot,
+    EntityWardenSonicBoomPhase, EntityWardenSonicBoomState, EntityWitchAttackState,
     EntityWitchPotionKind, GoalState, Rotation, SpawnEntity, Vec3,
 };
 use mc_world::BlockStateId;
@@ -21,7 +22,7 @@ use crate::play::simulation::SimulationAuthority;
 use crate::play::{
     CREEPER_CANCEL_RANGE, CREEPER_FUSE_TICKS, CREEPER_TRIGGER_RANGE, HOSTILE_MELEE_PERIOD_TICKS,
     HOSTILE_MELEE_RANGE, HOSTILE_MELEE_VERTICAL_REACH, SKELETON_ARROW_SPEED,
-    SKELETON_SHOT_PERIOD_TICKS, SKELETON_SHOT_RANGE,
+    SKELETON_BOW_COOLDOWN_TICKS, SKELETON_BOW_DRAW_TICKS, SKELETON_SHOT_RANGE,
 };
 
 #[cfg(test)]
@@ -34,7 +35,7 @@ use super::explosion_authority::schedule_primed_tnt_deadline_locked;
 use super::interaction_geometry::{distance_sq, entity_aabb};
 #[cfg(test)]
 use super::outbound::ServerEntitySnapshot;
-use super::outbound::{OutboundCommand, VisibilityDispatch};
+use super::outbound::{OutboundCommand, VisibilityDispatch, is_bow_skeleton_type_26_1_2};
 use super::player_effects::PlayerEffectFacts;
 use super::projectiles::{
     HurtingProjectileMotionProfile, initial_arrow_state, initial_hurting_projectile_state,
@@ -124,21 +125,22 @@ const SHULKER_SHOT_DELAY_STEPS: u64 = 10;
 const SHULKER_SHOT_DELAY_VARIANTS: u64 = 10;
 const SHULKER_ATTACK_RANGE_SQ: f64 = 400.0;
 
-struct HostileAttackTickEntity {
-    id: EntityId,
-    kind: HostileAttackKind,
-    position: Vec3,
-    rotation: Rotation,
-    goal: GoalState,
-    crossbow_attack: Option<EntityCrossbowAttackState>,
-    blaze_attack: Option<EntityBlazeAttackState>,
-    ghast_attack: Option<EntityGhastAttackState>,
-    breeze_attack: Option<EntityBreezeAttackState>,
-    witch_attack: Option<EntityWitchAttackState>,
-    guardian_beam: Option<EntityGuardianBeamState>,
-    warden_sonic_boom: Option<EntityWardenSonicBoomState>,
-    shulker_attack: Option<EntityShulkerAttackState>,
-    evoker_attack: Option<EntityEvokerAttackState>,
+pub(super) struct HostileAttackTickEntity {
+    pub(super) id: EntityId,
+    pub(super) kind: HostileAttackKind,
+    pub(super) position: Vec3,
+    pub(super) rotation: Rotation,
+    pub(super) goal: GoalState,
+    pub(super) crossbow_attack: Option<EntityCrossbowAttackState>,
+    pub(super) bow_attack: Option<EntityBowAttackState>,
+    pub(super) blaze_attack: Option<EntityBlazeAttackState>,
+    pub(super) ghast_attack: Option<EntityGhastAttackState>,
+    pub(super) breeze_attack: Option<EntityBreezeAttackState>,
+    pub(super) witch_attack: Option<EntityWitchAttackState>,
+    pub(super) guardian_beam: Option<EntityGuardianBeamState>,
+    pub(super) warden_sonic_boom: Option<EntityWardenSonicBoomState>,
+    pub(super) shulker_attack: Option<EntityShulkerAttackState>,
+    pub(super) evoker_attack: Option<EntityEvokerAttackState>,
 }
 
 struct HostileTargetTickSession {
@@ -155,7 +157,7 @@ struct PlannedCreeperFuse {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum HostileAttackKind {
+pub(super) enum HostileAttackKind {
     Creeper,
     Skeleton,
     Crossbow,
@@ -181,7 +183,7 @@ enum HostileAttackKind {
 }
 
 #[derive(Debug, Clone)]
-struct PlannedArrowAttack {
+pub(super) struct PlannedArrowAttack {
     hostile_id: EntityId,
     arrow_entity_type_id: i32,
     position: Vec3,
@@ -275,6 +277,12 @@ struct PlannedCrossbowTransition {
     shot: Option<PlannedArrowAttack>,
 }
 
+pub(super) struct PlannedBowTransition {
+    pub(super) hostile_id: EntityId,
+    pub(super) expected: Option<EntityBowAttackState>,
+    pub(super) next: Option<EntityBowAttackState>,
+    pub(super) shot: Option<PlannedArrowAttack>,
+}
 struct PlannedGuardianBeamTransition {
     hostile_id: EntityId,
     expected: Option<EntityGuardianBeamState>,
@@ -1169,6 +1177,72 @@ fn plan_crossbow_transition(
     })
 }
 
+/// 26.1.2 `RangedBowAttackGoal` draw cycle shared by bow skeletons
+/// (skeleton/stray/bogged): start the 20-tick pull when a target is in
+/// range, release at full pull, then cool down for `attackIntervalMin`.
+/// Losing the target cancels the cycle like `stopUsingItem` on `stop()`.
+pub(super) fn plan_bow_transition(
+    hostile: &HostileAttackTickEntity,
+    target: Option<(f64, Vec3)>,
+    arrow_entity_type_id: Option<i32>,
+    tick: u64,
+) -> Option<PlannedBowTransition> {
+    let expected = hostile.bow_attack;
+    let in_attack_range =
+        target.is_some_and(|(distance, _)| distance <= SKELETON_SHOT_RANGE.powi(2));
+    let (next, shot) = match expected {
+        None if in_attack_range => (
+            Some(EntityBowAttackState::new(
+                EntityBowAttackPhase::Drawing,
+                tick.saturating_add(SKELETON_BOW_DRAW_TICKS),
+            )),
+            None,
+        ),
+        None => return None,
+        Some(_) if target.is_none() => (None, None),
+        Some(state) if state.phase == EntityBowAttackPhase::Drawing => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            let arrow_entity_type_id = arrow_entity_type_id?;
+            let (_, target_position) = target?;
+            let shot = plan_hostile_arrow(
+                hostile,
+                target_position,
+                arrow_entity_type_id,
+                false,
+                tick,
+                SKELETON_ARROW_DIVERGENCE,
+            )?;
+            (
+                Some(EntityBowAttackState::new(
+                    EntityBowAttackPhase::Cooldown,
+                    tick.saturating_add(SKELETON_BOW_COOLDOWN_TICKS),
+                )),
+                Some(shot),
+            )
+        }
+        Some(state) => {
+            if tick < state.deadline_tick || !in_attack_range {
+                return None;
+            }
+            (
+                Some(EntityBowAttackState::new(
+                    EntityBowAttackPhase::Drawing,
+                    tick.saturating_add(SKELETON_BOW_DRAW_TICKS),
+                )),
+                None,
+            )
+        }
+    };
+    Some(PlannedBowTransition {
+        hostile_id: hostile.id,
+        expected,
+        next,
+        shot,
+    })
+}
+
 fn plan_warden_sonic_transition(
     hostile: &HostileAttackTickEntity,
     targets: &[HostileTargetTickSession],
@@ -1779,7 +1853,7 @@ impl SessionRegistry {
                 | HostileAttackKind::WindCharge
                 | HostileAttackKind::ThrownPotion => 1,
                 HostileAttackKind::WitherSkull => WITHER_SKULL_SHOT_PERIOD_TICKS,
-                HostileAttackKind::Skeleton => SKELETON_SHOT_PERIOD_TICKS,
+                HostileAttackKind::Skeleton => 1,
                 HostileAttackKind::Melee { .. } => HOSTILE_MELEE_PERIOD_TICKS,
             };
             let phase = u64::from(entity.id.0.unsigned_abs());
@@ -1793,6 +1867,7 @@ impl SessionRegistry {
                 rotation: entity.rotation,
                 goal: entity.goal,
                 crossbow_attack: entity.crossbow_attack,
+                bow_attack: entity.bow_attack,
                 blaze_attack: entity.blaze_attack,
                 ghast_attack: entity.ghast_attack,
                 breeze_attack: entity.breeze_attack,
@@ -1892,6 +1967,7 @@ impl SessionRegistry {
         let mut breeze_transitions = Vec::new();
         let mut witch_transitions = Vec::new();
         let mut crossbow_transitions = Vec::new();
+        let mut bow_transitions = Vec::new();
         let mut guardian_beam_transitions = Vec::new();
         let mut warden_sonic_transitions = Vec::new();
         let mut shulker_transitions = Vec::new();
@@ -1911,9 +1987,6 @@ impl SessionRegistry {
                     });
                 }
                 HostileAttackKind::Skeleton => {
-                    let Some(arrow_entity_type_id) = arrow_entity_type_id else {
-                        continue;
-                    };
                     let max_distance_sq = SKELETON_SHOT_RANGE * SKELETON_SHOT_RANGE;
                     let target = targets
                         .iter()
@@ -1925,18 +1998,10 @@ impl SessionRegistry {
                             (distance <= max_distance_sq).then_some((distance, target.position))
                         })
                         .min_by(|left, right| left.0.total_cmp(&right.0));
-                    let Some((_, target_position)) = target else {
-                        continue;
-                    };
-                    if let Some(attack) = plan_hostile_arrow(
-                        &hostile,
-                        target_position,
-                        arrow_entity_type_id,
-                        false,
-                        tick,
-                        SKELETON_ARROW_DIVERGENCE,
-                    ) {
-                        arrow_attacks.push(attack);
+                    if let Some(transition) =
+                        plan_bow_transition(&hostile, target, arrow_entity_type_id, tick)
+                    {
+                        bow_transitions.push(transition);
                     }
                 }
                 HostileAttackKind::Crossbow => {
@@ -2199,6 +2264,38 @@ impl SessionRegistry {
                 (updates, attacks)
             };
         arrow_attacks.extend(committed_crossbow_attacks);
+        let committed_bow_attacks = if bow_transitions.is_empty() {
+            Vec::new()
+        } else {
+            let bow_ids = bow_transitions
+                .iter()
+                .map(|transition| transition.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile bow attack states");
+            entities.prefetch(&bow_ids);
+            let mut attacks = Vec::new();
+            for transition in bow_transitions {
+                let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                    continue;
+                };
+                if expected.lifecycle != EntityLifecycle::Alive
+                    || !is_bow_skeleton_type_26_1_2(&expected.type_name)
+                    || expected.retained.bow_attack != transition.expected
+                {
+                    continue;
+                }
+                let mut next = expected.clone();
+                next.retained.bow_attack = transition.next;
+                if !entities.replace_snapshot_if_current(expected, next) {
+                    continue;
+                }
+                if let Some(attack) = transition.shot {
+                    attacks.push(attack);
+                }
+            }
+            attacks
+        };
+        arrow_attacks.extend(committed_bow_attacks);
 
         let (blaze_state_updates, committed_small_fireballs, committed_blaze_melee) =
             if blaze_transitions.is_empty() {
@@ -3651,6 +3748,7 @@ mod arrow_spread_tests {
             },
             goal: GoalState::Idle,
             crossbow_attack: None,
+            bow_attack: None,
             blaze_attack: None,
             ghast_attack: None,
             breeze_attack: None,

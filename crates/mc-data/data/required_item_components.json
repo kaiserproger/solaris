@@ -52,73 +52,520 @@
     "attack_speed_modifier": -2.0
   },
   "minecraft:beef": {
-    "food": { "food": 3, "saturation": 1.8 },
+    "food": {
+      "food": 3,
+      "saturation": 1.8000001
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:cooked_beef": {
-    "food": { "food": 8, "saturation": 12.8 },
+    "food": {
+      "food": 8,
+      "saturation": 12.8
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:porkchop": {
-    "food": { "food": 3, "saturation": 1.8 },
+    "food": {
+      "food": 3,
+      "saturation": 1.8000001
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:cooked_porkchop": {
-    "food": { "food": 8, "saturation": 12.8 },
+    "food": {
+      "food": 8,
+      "saturation": 12.8
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:chicken": {
-    "food": { "food": 2, "saturation": 1.2 },
+    "consume_effects": [
+      {
+        "type": "minecraft:apply_effects",
+        "effects": [{ "id": "minecraft:hunger", "duration": 600, "show_icon": true }],
+        "probability": 0.3
+      }
+    ],
+    "food": {
+      "food": 2,
+      "saturation": 1.2
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:cooked_chicken": {
-    "food": { "food": 6, "saturation": 7.2 },
+    "food": {
+      "food": 6,
+      "saturation": 7.2000003
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:potato": {
-    "food": { "food": 1, "saturation": 0.6 },
+    "food": {
+      "food": 1,
+      "saturation": 0.6
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:baked_potato": {
-    "food": { "food": 5, "saturation": 6.0 },
+    "food": {
+      "food": 5,
+      "saturation": 6.0
+    },
     "use_duration_ticks": 32,
-    "use_action": "eat"
+    "use_action": "eat",
+    "max_stack_size": 64
   },
   "minecraft:shears": {
     "max_damage": 238,
     "max_stack_size": 1
   },
   "minecraft:wooden_spear": {
-    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+    "attack_range": {
+      "min_reach": 2.0,
+      "max_reach": 4.5,
+      "min_creative_reach": 2.0,
+      "max_creative_reach": 6.5,
+      "hitbox_margin": 0.125,
+      "mob_factor": 0.5
+    }
   },
   "minecraft:stone_spear": {
-    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+    "attack_range": {
+      "min_reach": 2.0,
+      "max_reach": 4.5,
+      "min_creative_reach": 2.0,
+      "max_creative_reach": 6.5,
+      "hitbox_margin": 0.125,
+      "mob_factor": 0.5
+    }
   },
   "minecraft:copper_spear": {
-    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+    "attack_range": {
+      "min_reach": 2.0,
+      "max_reach": 4.5,
+      "min_creative_reach": 2.0,
+      "max_creative_reach": 6.5,
+      "hitbox_margin": 0.125,
+      "mob_factor": 0.5
+    }
   },
   "minecraft:iron_spear": {
-    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+    "attack_range": {
+      "min_reach": 2.0,
+      "max_reach": 4.5,
+      "min_creative_reach": 2.0,
+      "max_creative_reach": 6.5,
+      "hitbox_margin": 0.125,
+      "mob_factor": 0.5
+    }
   },
   "minecraft:golden_spear": {
-    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+    "attack_range": {
+      "min_reach": 2.0,
+      "max_reach": 4.5,
+      "min_creative_reach": 2.0,
+      "max_creative_reach": 6.5,
+      "hitbox_margin": 0.125,
+      "mob_factor": 0.5
+    }
   },
   "minecraft:diamond_spear": {
-    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+    "attack_range": {
+      "min_reach": 2.0,
+      "max_reach": 4.5,
+      "min_creative_reach": 2.0,
+      "max_creative_reach": 6.5,
+      "hitbox_margin": 0.125,
+      "mob_factor": 0.5
+    }
   },
   "minecraft:netherite_spear": {
-    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+    "attack_range": {
+      "min_reach": 2.0,
+      "max_reach": 4.5,
+      "min_creative_reach": 2.0,
+      "max_creative_reach": 6.5,
+      "hitbox_margin": 0.125,
+      "mob_factor": 0.5
+    }
   },
   "minecraft:shield": {
     "max_stack_size": 1,
     "max_damage": 336,
     "blocks_attacks_disable_cooldown_scale": 1.0
+  },
+  "minecraft:pufferfish": {
+    "consume_effects": [
+      {
+        "type": "minecraft:apply_effects",
+        "effects": [
+          { "id": "minecraft:poison", "amplifier": 1, "duration": 1200, "show_icon": true },
+          { "id": "minecraft:hunger", "amplifier": 2, "duration": 300, "show_icon": true },
+          { "id": "minecraft:nausea", "duration": 300, "show_icon": true }
+        ]
+      }
+    ],
+    "food": {
+      "food": 1,
+      "saturation": 0.2
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:golden_carrot": {
+    "food": {
+      "food": 6,
+      "saturation": 14.400001
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:sweet_berries": {
+    "food": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:enchanted_golden_apple": {
+    "consume_effects": [
+      {
+        "type": "minecraft:apply_effects",
+        "effects": [
+          { "id": "minecraft:regeneration", "amplifier": 1, "duration": 400, "show_icon": true },
+          { "id": "minecraft:resistance", "duration": 6000, "show_icon": true },
+          { "id": "minecraft:fire_resistance", "duration": 6000, "show_icon": true },
+          { "id": "minecraft:absorption", "amplifier": 3, "duration": 2400, "show_icon": true }
+        ]
+      }
+    ],
+    "food": {
+      "food": 4,
+      "saturation": 9.6,
+      "can_always_eat": true
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:rabbit_stew": {
+    "food": {
+      "food": 10,
+      "saturation": 12.0
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 1,
+    "use_remainder": "minecraft:bowl"
+  },
+  "minecraft:chorus_fruit": {
+    "consume_effects": [{ "type": "minecraft:teleport_randomly" }],
+    "food": {
+      "food": 4,
+      "saturation": 2.4,
+      "can_always_eat": true
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:rotten_flesh": {
+    "consume_effects": [
+      {
+        "type": "minecraft:apply_effects",
+        "effects": [{ "id": "minecraft:hunger", "duration": 600, "show_icon": true }],
+        "probability": 0.8
+      }
+    ],
+    "food": {
+      "food": 4,
+      "saturation": 0.8
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:tropical_fish": {
+    "food": {
+      "food": 1,
+      "saturation": 0.2
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:poisonous_potato": {
+    "consume_effects": [
+      {
+        "type": "minecraft:apply_effects",
+        "effects": [{ "id": "minecraft:poison", "duration": 100, "show_icon": true }],
+        "probability": 0.6
+      }
+    ],
+    "food": {
+      "food": 2,
+      "saturation": 1.2
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:cooked_mutton": {
+    "food": {
+      "food": 6,
+      "saturation": 9.6
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:dried_kelp": {
+    "food": {
+      "food": 1,
+      "saturation": 0.6
+    },
+    "use_duration_ticks": 16,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:melon_slice": {
+    "food": {
+      "food": 2,
+      "saturation": 1.2
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:beetroot_soup": {
+    "food": {
+      "food": 6,
+      "saturation": 7.2000003
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 1,
+    "use_remainder": "minecraft:bowl"
+  },
+  "minecraft:glow_berries": {
+    "food": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:bread": {
+    "food": {
+      "food": 5,
+      "saturation": 6.0
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:salmon": {
+    "food": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:suspicious_stew": {
+    "food": {
+      "food": 6,
+      "saturation": 7.2000003,
+      "can_always_eat": true
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 1,
+    "use_remainder": "minecraft:bowl"
+  },
+  "minecraft:honey_bottle": {
+    "consume_effects": [
+      { "type": "minecraft:remove_effects", "effects": "minecraft:poison" }
+    ],
+    "food": {
+      "food": 6,
+      "saturation": 1.2,
+      "can_always_eat": true
+    },
+    "use_duration_ticks": 40,
+    "use_action": "drink",
+    "max_stack_size": 16,
+    "use_remainder": "minecraft:glass_bottle"
+  },
+  "minecraft:spider_eye": {
+    "consume_effects": [
+      {
+        "type": "minecraft:apply_effects",
+        "effects": [{ "id": "minecraft:poison", "duration": 100, "show_icon": true }]
+      }
+    ],
+    "food": {
+      "food": 2,
+      "saturation": 3.2
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:golden_apple": {
+    "consume_effects": [
+      {
+        "type": "minecraft:apply_effects",
+        "effects": [
+          { "id": "minecraft:regeneration", "amplifier": 1, "duration": 100, "show_icon": true },
+          { "id": "minecraft:absorption", "duration": 2400, "show_icon": true }
+        ]
+      }
+    ],
+    "food": {
+      "food": 4,
+      "saturation": 9.6,
+      "can_always_eat": true
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:cooked_salmon": {
+    "food": {
+      "food": 6,
+      "saturation": 9.6
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:cooked_cod": {
+    "food": {
+      "food": 5,
+      "saturation": 6.0
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:pumpkin_pie": {
+    "food": {
+      "food": 8,
+      "saturation": 4.8
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:mutton": {
+    "food": {
+      "food": 2,
+      "saturation": 1.2
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:cooked_rabbit": {
+    "food": {
+      "food": 5,
+      "saturation": 6.0
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:cod": {
+    "food": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:cookie": {
+    "food": {
+      "food": 2,
+      "saturation": 0.4
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:mushroom_stew": {
+    "food": {
+      "food": 6,
+      "saturation": 7.2000003
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 1,
+    "use_remainder": "minecraft:bowl"
+  },
+  "minecraft:beetroot": {
+    "food": {
+      "food": 1,
+      "saturation": 1.2
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:apple": {
+    "food": {
+      "food": 4,
+      "saturation": 2.4
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:carrot": {
+    "food": {
+      "food": 3,
+      "saturation": 3.6000001
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:rabbit": {
+    "food": {
+      "food": 3,
+      "saturation": 1.8000001
+    },
+    "use_duration_ticks": 32,
+    "use_action": "eat",
+    "max_stack_size": 64
+  },
+  "minecraft:milk_bucket": {
+    "use_duration_ticks": 32,
+    "use_action": "drink",
+    "max_stack_size": 1,
+    "use_remainder": "minecraft:bucket",
+    "consume_effects": [{ "type": "minecraft:clear_all_effects" }]
   }
 }

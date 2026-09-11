@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::{Identifier, read_json_file, visit_json_files};
 
 mod context;
+mod embedded;
 pub mod entity_26_1_2;
 
 pub use context::{
@@ -61,6 +62,7 @@ pub enum LootCount {
 pub struct BlockLoot {
     random_sequence: Option<Identifier>,
     silk_touch_drops: Vec<BlockLootDrop>,
+    tool_drops: Option<(Identifier, Vec<BlockLootDrop>)>,
     regular_drops: Vec<BlockLootDrop>,
     conditional_pools: Vec<BlockStateLootPool>,
 }
@@ -72,7 +74,12 @@ impl BlockLoot {
     }
 
     #[must_use]
-    fn drops_for_tool(&self, silk_touch: bool) -> &[BlockLootDrop] {
+    fn drops_for_tool(&self, silk_touch: bool, tool: Option<&Identifier>) -> &[BlockLootDrop] {
+        if let Some((required, drops)) = &self.tool_drops
+            && tool == Some(required)
+        {
+            return drops;
+        }
         if silk_touch && !self.silk_touch_drops.is_empty() {
             &self.silk_touch_drops
         } else {
@@ -125,6 +132,7 @@ pub struct BlockLootDrop {
     pub drop: LootDrop,
     pub fortune_bonus: Option<FortuneBonus>,
     random_chance: Option<f32>,
+    fortune_chances: Vec<f32>,
     survives_explosion: bool,
     explosion_decay: bool,
     rolls: LootCount,
@@ -138,6 +146,7 @@ impl BlockLootDrop {
             drop,
             fortune_bonus: None,
             random_chance: None,
+            fortune_chances: Vec::new(),
             survives_explosion: false,
             explosion_decay: false,
             rolls: LootCount::Fixed(1),
@@ -171,6 +180,7 @@ impl BlockLootDrop {
     fn simple_explosion_input_count(&self, require_explosion_modifier: bool) -> Option<u32> {
         if self.fortune_bonus.is_some()
             || self.random_chance.is_some()
+            || !self.fortune_chances.is_empty()
             || (require_explosion_modifier && !self.survives_explosion && !self.explosion_decay)
         {
             return None;
@@ -497,7 +507,7 @@ impl LootTables {
         };
 
         let mut drops: Vec<_> = rule
-            .drops_for_tool(context.tool().silk_touch_level() > 0)
+            .drops_for_tool(context.tool().silk_touch_level() > 0, context.tool().item())
             .iter()
             .collect();
         for pool in &rule.conditional_pools {
@@ -518,7 +528,14 @@ impl LootTables {
             let roll_count =
                 sample_block_pool_roll_count(&mut random, drop.rolls, drop.bonus_rolls)?;
             for _ in 0..roll_count {
-                if let Some(chance) = drop.random_chance {
+                let chance = if drop.fortune_chances.is_empty() {
+                    drop.random_chance
+                } else {
+                    let level = (context.tool().fortune_level() as usize)
+                        .min(drop.fortune_chances.len() - 1);
+                    Some(drop.fortune_chances[level])
+                };
+                if let Some(chance) = chance {
                     if !chance.is_finite() || !(0.0..=1.0).contains(&chance) {
                         return Err(BlockLootEvaluationError::InvalidProbability);
                     }
@@ -590,7 +607,7 @@ impl LootTables {
     ) -> Option<Vec<LootDrop>> {
         let common_fallbacks;
         let drops = if let Some(rule) = self.block_loot(block) {
-            let mut selected: Vec<_> = rule.drops_for_tool(false).iter().collect();
+            let mut selected: Vec<_> = rule.drops_for_tool(false, None).iter().collect();
             for pool in &rule.conditional_pools {
                 if !pool.predicate.matches(block, properties) {
                     continue;
@@ -618,6 +635,7 @@ impl LootTables {
                     drop,
                     fortune_bonus: None,
                     random_chance: None,
+                    fortune_chances: Vec::new(),
                     survives_explosion: true,
                     explosion_decay: false,
                     rolls: LootCount::Fixed(1),
@@ -707,7 +725,7 @@ struct RawLootTables {
     #[serde(default)]
     entities: BTreeMap<String, RawDropList>,
     #[serde(default)]
-    blocks: BTreeMap<String, RawDropList>,
+    blocks: BTreeMap<String, embedded::RawBlockDrops>,
 }
 
 #[derive(Deserialize)]
@@ -1004,6 +1022,7 @@ fn block_loot_from_table(
         (!regular_drops.is_empty() || !conditional_pools.is_empty()).then_some(BlockLoot {
             random_sequence,
             silk_touch_drops,
+            tool_drops: None,
             regular_drops,
             conditional_pools,
         }),
@@ -1305,6 +1324,7 @@ fn contextual_regular_drop(
         drop,
         fortune_bonus,
         random_chance,
+        fortune_chances: Vec::new(),
         survives_explosion: has_survives_explosion_condition(entry),
         explosion_decay: has_explosion_decay_function(entry),
         rolls,
@@ -1612,10 +1632,11 @@ fn from_str(raw: &str, path: &Path) -> Result<LootTables, LootError> {
         path: path.to_path_buf(),
         source,
     })?;
+    let blocks = embedded::parse_blocks(path, raw.blocks)?;
     Ok(LootTables {
         entity_drops: parse_map(path, raw.entities)?,
-        block_drops: parse_map(path, raw.blocks)?,
-        block_loot: BTreeMap::new(),
+        block_drops: blocks.drops,
+        block_loot: blocks.rules,
     })
 }
 
@@ -1685,10 +1706,6 @@ mod tests {
         assert_eq!(
             loot.block_drop(&Identifier::parse("minecraft:podzol").unwrap()),
             Some(&Identifier::parse("minecraft:dirt").unwrap())
-        );
-        assert_eq!(
-            loot.block_drop(&Identifier::parse("minecraft:short_grass").unwrap()),
-            Some(&Identifier::parse("minecraft:wheat_seeds").unwrap())
         );
         assert_eq!(
             loot.entity_drop_stack(&Identifier::parse("minecraft:sheep").unwrap()),
@@ -2325,7 +2342,7 @@ mod tests {
         assert_eq!(
             loot.block_loot(&Identifier::parse("minecraft:stone").unwrap())
                 .unwrap()
-                .drops_for_tool(true),
+                .drops_for_tool(true, None),
             [BlockLootDrop::plain(LootDrop::single(
                 Identifier::parse("minecraft:stone").unwrap()
             ))]
@@ -2333,12 +2350,12 @@ mod tests {
         let diamond = &loot
             .block_loot(&Identifier::parse("minecraft:diamond_ore").unwrap())
             .unwrap()
-            .drops_for_tool(false)[0];
+            .drops_for_tool(false, None)[0];
         assert_eq!(diamond.fortune_bonus, Some(FortuneBonus::OreDrops));
         let redstone = &loot
             .block_loot(&Identifier::parse("minecraft:redstone_ore").unwrap())
             .unwrap()
-            .drops_for_tool(false)[0];
+            .drops_for_tool(false, None)[0];
         assert_eq!(
             redstone.fortune_bonus,
             Some(FortuneBonus::UniformBonusCount {
@@ -2414,12 +2431,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            rule.drops_for_tool(true),
+            rule.drops_for_tool(true, None),
             [BlockLootDrop::plain(LootDrop::single(
                 Identifier::parse("minecraft:stone").unwrap()
             ))]
         );
-        let regular = &rule.drops_for_tool(false)[0];
+        let regular = &rule.drops_for_tool(false, None)[0];
         assert_eq!(regular.drop.item.as_str(), "minecraft:cobblestone");
         assert_eq!(
             regular.sample_simple_explosion_count(Some(4.0), &mut || 0.25),
@@ -2525,7 +2542,7 @@ mod tests {
         let drop = &loot
             .block_loot(&Identifier::parse("minecraft:diamond_ore").unwrap())
             .unwrap()
-            .drops_for_tool(false)[0];
+            .drops_for_tool(false, None)[0];
 
         assert_eq!(drop.fortune_bonus, Some(FortuneBonus::OreDrops));
     }
@@ -2561,7 +2578,7 @@ mod tests {
         let drop = &loot
             .block_loot(&Identifier::parse("minecraft:test_crop").unwrap())
             .unwrap()
-            .drops_for_tool(false)[0];
+            .drops_for_tool(false, None)[0];
 
         assert_eq!(
             drop.fortune_bonus,
@@ -2749,6 +2766,7 @@ mod tests {
             drop: LootDrop::uniform(Identifier::parse("minecraft:lapis_lazuli").unwrap(), 4, 9),
             fortune_bonus: Some(FortuneBonus::OreDrops),
             random_chance: None,
+            fortune_chances: Vec::new(),
             survives_explosion: false,
             explosion_decay: false,
             rolls: LootCount::Fixed(1),

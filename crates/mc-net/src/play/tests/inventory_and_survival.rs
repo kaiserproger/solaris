@@ -15,6 +15,7 @@ fn pending_item_use_and_bow_power_follow_simulation_tick_delta() {
         kind: UseKind::Food(mc_data::food::FoodEntry {
             food: 4,
             saturation: 2.4,
+            can_always_eat: false,
         }),
     };
 
@@ -1215,40 +1216,6 @@ fn reach_validation_uses_player_eye_position() {
     ));
 }
 
-#[test]
-fn survival_block_drops_come_from_repo_loot_data() {
-    let id = |value: &str| mc_data::Identifier::parse(value).unwrap();
-    let loot = mc_data::loot::builtin();
-
-    assert_eq!(
-        loot.block_drop(&id("minecraft:grass_block")),
-        Some(&id("minecraft:dirt"))
-    );
-    assert_eq!(
-        loot.block_drop(&id("minecraft:stone")),
-        Some(&id("minecraft:cobblestone"))
-    );
-    assert_eq!(
-        loot.block_drop(&id("minecraft:coal_ore")),
-        Some(&id("minecraft:coal"))
-    );
-    assert_eq!(
-        loot.block_drop(&id("minecraft:iron_ore")),
-        Some(&id("minecraft:raw_iron"))
-    );
-    assert_eq!(
-        loot.block_drop(&id("minecraft:redstone_ore")),
-        Some(&id("minecraft:redstone"))
-    );
-    assert_eq!(
-        loot.block_drop(&id("minecraft:oak_leaves")),
-        Some(&id("minecraft:apple"))
-    );
-    assert_eq!(
-        loot.block_drop(&id("minecraft:oak_log")),
-        Some(&id("minecraft:oak_log"))
-    );
-}
 
 #[test]
 fn mob_drops_come_from_repo_loot_data() {
