@@ -14,8 +14,8 @@ use mc_test_harness::client::Client;
 mod combat_world;
 
 const VIEW_DISTANCE: i32 = 2;
-const SLOWNESS_EFFECT_ID_26_1_2: u32 = 2;
-const POISON_EFFECT_ID_26_1_2: u32 = 19;
+const SLOWNESS_EFFECT_ID_26_1_2: u32 = 1;
+const POISON_EFFECT_ID_26_1_2: u32 = 18;
 
 #[tokio::test]
 async fn embedded_witch_throws_status_potion_that_splashes_and_discards_over_tcp() {
