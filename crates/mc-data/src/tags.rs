@@ -1894,6 +1894,72 @@ mod tests {
     }
 
     #[test]
+    fn recipe_book_tag_references_resolve_in_required_item_tags() {
+        use crate::recipes::{Ingredient, Recipe, RecipeKind};
+
+        fn ingredient_tags(recipe_id: &str, ingredient: &Ingredient) -> Vec<String> {
+            ingredient
+                .alternatives
+                .iter()
+                .filter_map(|alternative| match alternative {
+                    crate::recipes::IngredientAlternative::Tag(tag) => {
+                        Some(format!("{recipe_id} -> {}", tag.as_str()))
+                    }
+                    crate::recipes::IngredientAlternative::Item(_) => None,
+                })
+                .collect()
+        }
+
+        fn recipe_tags(recipe: &Recipe) -> Vec<String> {
+            let id = recipe.id.as_str();
+            let ingredients: Vec<&Ingredient> = match &recipe.kind {
+                RecipeKind::Shaped(shaped) => shaped.key.values().collect(),
+                RecipeKind::Shapeless(shapeless) => shapeless.ingredients.iter().collect(),
+                RecipeKind::Smelting(cooking)
+                | RecipeKind::Blasting(cooking)
+                | RecipeKind::Smoking(cooking)
+                | RecipeKind::CampfireCooking(cooking) => vec![&cooking.ingredient],
+                RecipeKind::Stonecutting(stonecutting) => vec![&stonecutting.ingredient],
+            };
+            ingredients
+                .into_iter()
+                .flat_map(|ingredient| ingredient_tags(id, ingredient))
+                .collect()
+        }
+
+        let items = crate::items::solaris_required_items();
+        let tags = solaris_required_item_tags(&items);
+        let item_tags = tags
+            .registries
+            .get(&Identifier::parse("minecraft:item").unwrap())
+            .expect("item tag registry present");
+        // Embedded baseline always resolves; the full sidecar set additionally
+        // resolves whenever the local vanilla checkout is present. A missing
+        // tag kicks real clients in recipe_book_add (vanilla HolderSet tag
+        // lookup throws on unknown tags).
+        let mut recipes = crate::recipes::solaris_required_recipes();
+        let sidecar = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/vanilla/data/minecraft/recipe");
+        if sidecar.is_dir() {
+            recipes.extend(crate::recipes::load_recipes(&sidecar).expect("sidecar recipes load"));
+        }
+        let mut missing = Vec::new();
+        for recipe in &recipes {
+            for reference in recipe_tags(recipe) {
+                let tag = reference.split(" -> ").nth(1).expect("reference shape");
+                let key = Identifier::parse(tag.to_string()).expect("valid tag id");
+                if !item_tags.contains_key(&key) {
+                    missing.push(reference);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "recipe tags missing from UpdateTags (kicks clients): {missing:?}"
+        );
+    }
+
+    #[test]
     fn embedded_fuel_snapshot_covers_canonical_vanilla_2612_set() {
         let items = crate::items::solaris_required_items();
         let tags = solaris_required_item_tags(&items).with_vanilla_fuel_values(&items);
