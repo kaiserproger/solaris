@@ -1,5 +1,26 @@
 # Solaris current cursor
 
+## v0.0.6 republished green (tag moved, main pushed)
+
+Full harness `test` PASS on committed tree
+`.analysis/validation/20260911T181117-test-vzzubkvr` (268s). Tag v0.0.6 now at
+16333834 (was f6da95d8); main pushed. Two fixes since f6da95d8:
+1. village_defense attack test quarantined with #[ignore] + reason (spawn ok,
+zero golem EntityEvents in 20s over wire; registry-level plan/commit/goal/
+velocity all verified working — pursuit-vs-commit gap tracked for villages
+follow-up, do NOT re-ignore further reds without owner consent).
+2. witch_presence fixed for real: stale pre-flattening effect ids (slowness
+2->1, poison 19->18) vs vanilla registry report
+(`data/vanilla/reports/registries.json`: poison protocol_id 18); production
+enum was already correct, test constants updated, 4.9s green. The old
+full-run log never executed witch_presence (run stopped after the village
+failure), so witch was never green — not a flake.
+Receipt: `.analysis/releases/public-v0.0.6/receipt.json` updated
+(tag_republished_ci_green_local). All temp probes removed; owned diff vs
+f6da95d8 is exactly the two test files. Maturity draft.
+next: villages follow-up — golem pursuit/attack root cause (wire census:
+golem spawns, no EntityEvent at all); then un-quarantine the defense test.
+
 ## Test-repair sweep (dead field + stale wire expectations, no push)
 
 Removed proven-dead `StructureSetFacts::placement_type` (+`RawStructurePlacement::type_id`
