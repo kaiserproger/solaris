@@ -296,7 +296,7 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots_inner() {
         .expect("seed furnace block")
         .expect("furnace chunk exists");
     let mut furnace = mc_world::FurnaceBlockEntity::default();
-    furnace.slots[0] = mc_world::FurnaceSlot { item_id: raw_iron_id, count: 3, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
+    furnace.slots[0] = mc_world::FurnaceSlot { item_id: raw_iron_id, count: 3, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None, stew_effects: Vec::new() };
     storage
         .set_furnace_block_entity(furnace_pos, furnace)
         .expect("seed furnace entity");
@@ -513,6 +513,7 @@ async fn survival_furnace_container_smelts_input_with_fuel_inner() {
         result: mc_data::recipes::RecipeResult {
             item: iron_ingot,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
     let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());

@@ -1,5 +1,50 @@
 # Solaris current cursor
 
+## Test-repair sweep (dead field + stale wire expectations, no push)
+
+Removed proven-dead `StructureSetFacts::placement_type` (+`RawStructurePlacement::type_id`
+parsing, no consumer; `grep placement_type` empty). Backfilled `stew_effects:
+Vec::new()` into 17 stale `FurnaceSlot`/`RecipeResult` test constructors.
+Aligned stale zombie fixtures to HEAD 2.3 (`HOSTILE_FOLLOW_SPEED`, regional goal
+test now pins target + 2.3 speed). Moved one heavy pickup integration test onto
+the existing 4MiB-thread pattern (stack overflow fix, no behavior change).
+Fixed two obsolete hurt-event expectations to 26.1.2 `ClientboundDamageEvent`
+(PVP helpers + `player_entity_killed_lua` nonlethal fence; production untouched).
+Rewrote the flaky short-grass seed wire test into a deterministic single-break
+update+ack transaction (1/8 seed probability stays covered by
+`mc-data/tests/plant_loot.rs`; prior form failed ~7/8 plus a 2026-08-30 known-flake
+record). `SimulationAuthority` kept as capability token per review.
+Validation: mc-data 261, mc-worldgen 137, mc-entity 635, mc-server 76, mc-net
+2085, block_edit 36/0/70ignored, fmt + code-health PASS, one read-only reviewer
+pass (pre-lua/grass deltas). L2 `correctness` red on
+`village_defense_spawns_golem_and_attacks_hostile_over_tcp` (golem spawns,
+no attack in 20s; fails isolated too; zero overlap with owned files —
+pre-existing, needs its own vanilla-evidenced slice, not fixed here).
+Ignored `mob_presence` helper holds the same obsolete EntityEvent-2 shape;
+untouched (needs sidecars, unverifiable here) — follow-up with the defense slice.
+base_tree: 961ed9ecb596b363d40360c2ce37605c78b7bf7a
+diff_hash: 366c88566bcfb750b87814ce106ae6d1a44feb5c1df8ec423779bceb7901b38b
+changed_files (13 owned, uncommitted): worldgen_structures.rs, regional.rs
+(test only), play.rs (cfg-test const), startup_data_tests.rs,
+block_edit.rs (DamageEvent import), campfire.rs, chests_and_hoppers.rs,
+furnaces.rs, pvp.rs, survival_lifecycle.rs, survival_pickup_overflow.rs,
+wheat_seed_source.rs, player_entity_killed_lua.rs. No commit/push. Maturity draft.
+next: village-defense golem-attack slice with vanilla evidence (spawn ok,
+attack never arrives); then re-run L2 green.
+
+
+## Combined commit 961ed9ec (owner-authorized, no push)
+
+One local commit with all 6 slices (owned 18 files only, path-limited):
+ender emission, fluid wash, nether gen, end gen, structure loot, chest-loot
+wiring. Validation per slice as recorded above; tree was fingerprinted stable
+across the final gate. Known reds documented in the message. Left dirty and
+unstaged: WATCHDOG.yml model swap, worldgen_structures placement removal,
+regional.rs (also caught my earlier blanket `cargo fmt --all` — content-neutral
+reformat of a stranger file, not staged), startup_data_tests + harness stew
+fixes, .analysis deletions, bench json. No foreign session reachable via hub
+(all peers are own subagents) — authorship of those edits undetermined.
+
 ## Old questions closed (owner decision 2026-09-11)
 
 1. Stale-baked-light repair: NO automatic repair. Rationale: per-edit

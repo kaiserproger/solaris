@@ -563,7 +563,7 @@ async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots_inne
         .expect("seed chest block")
         .expect("chest chunk exists");
     let mut chest = mc_world::ChestBlockEntity::default();
-    chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 5, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
+    chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 5, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None, stew_effects: Vec::new() };
     storage
         .set_chest_block_entity(chest_pos, chest)
         .expect("seed chest entity");
@@ -800,8 +800,8 @@ async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_par
         .expect("seed chest block")
         .expect("chest chunk exists");
     let mut chest = mc_world::ChestBlockEntity::default();
-    chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 5, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
-    chest.slots[1] = mc_world::FurnaceSlot { item_id: dirt_id, count: 63, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
+    chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 5, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None, stew_effects: Vec::new() };
+    chest.slots[1] = mc_world::FurnaceSlot { item_id: dirt_id, count: 63, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None, stew_effects: Vec::new() };
     storage
         .set_chest_block_entity(chest_pos, chest)
         .expect("seed chest entity");
@@ -1042,7 +1042,7 @@ async fn unsupported_chest_click_modes_resync_without_trusting_client_slots_inne
         .expect("seed chest block")
         .expect("chest chunk exists");
     let mut chest = mc_world::ChestBlockEntity::default();
-    chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 3, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
+    chest.slots[0] = mc_world::FurnaceSlot { item_id: dirt_id, count: 3, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None, stew_effects: Vec::new() };
     storage
         .set_chest_block_entity(chest_pos, chest)
         .expect("seed chest entity");
@@ -1167,8 +1167,8 @@ async fn chest_rejects_overstack_predictions_and_recovers_with_exact_item_limits
         .expect("seed chest limit block")
         .expect("replace chest limit target");
     let mut chest = mc_world::ChestBlockEntity::default();
-    chest.slots[0] = mc_world::FurnaceSlot { item_id: bucket_id, count: 1, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
-    chest.slots[1] = mc_world::FurnaceSlot { item_id: snowball_id, count: 16, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None };
+    chest.slots[0] = mc_world::FurnaceSlot { item_id: bucket_id, count: 1, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None, stew_effects: Vec::new() };
+    chest.slots[1] = mc_world::FurnaceSlot { item_id: snowball_id, count: 16, damage: None, enchantments: Vec::new(), custom_name: None, item_model: None, stew_effects: Vec::new() };
     world
         .set_chest_block_entity(chest_pos, chest)
         .expect("seed chest limit entity");

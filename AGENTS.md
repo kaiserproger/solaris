@@ -264,12 +264,12 @@ close, not after each micro-edit. One closed checkpoint produces one local,
 revertible Conventional Commit when authorized. Never push, merge to `main`, or
 tag unless explicitly instructed. Do not skip hooks/signing flags.
 
-Workspace version is `0.0.5`; the release target is `v0.0.5`.
-Its publication evidence belongs under `.analysis/releases/public-v0.0.5/`;
+Workspace version is `0.0.6`; the release target is `v0.0.6`.
+Its publication evidence belongs under `.analysis/releases/public-v0.0.6/`;
 maturity remains draft and the GitHub release is preliminary. Previous
-`v0.0.4-alpha.1` evidence stays under `.analysis/releases/public-v0.0.4-alpha.1/`.
-The previous public `v0.0.3-alpha.1` evidence under
-`.analysis/releases/public-v0.0.3-alpha.1/` belongs to tag commit `571f5383`.
+`v0.0.5` evidence stays under `.analysis/releases/public-v0.0.5/`.
+The previous public `v0.0.4-alpha.1` evidence under
+`.analysis/releases/public-v0.0.4-alpha.1/` belongs to tag commit `571f5383`.
 The older local field-test archive under `.analysis/releases/v0.0.3-alpha.1/` is frozen
 before repository separation; do not overwrite it with later source builds.
 Its isolated startup passed, not full survival acceptance.

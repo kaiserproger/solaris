@@ -35,7 +35,6 @@ pub enum StructureDataError {
 pub struct StructureSetFacts {
     pub id: Identifier,
     pub structures: Vec<Identifier>,
-    pub placement_type: Option<Identifier>,
     pub spacing: Option<i32>,
     pub separation: Option<i32>,
     pub salt: Option<u64>,
@@ -69,16 +68,10 @@ fn load_one_structure_set_fact(path: PathBuf) -> Result<StructureSetFacts, Struc
         .into_iter()
         .map(|entry| parse_id(&path, entry.structure()))
         .collect::<Result<Vec<_>, _>>()?;
-    let placement_type = raw
-        .placement
-        .type_id
-        .map(|value| parse_id(&path, value))
-        .transpose()?;
 
     Ok(StructureSetFacts {
         id,
         structures,
-        placement_type,
         spacing: raw.placement.spacing,
         separation: raw.placement.separation,
         salt: raw.placement.salt,
@@ -110,8 +103,6 @@ impl RawStructureEntry {
 
 #[derive(Default, Deserialize)]
 struct RawStructurePlacement {
-    #[serde(rename = "type")]
-    type_id: Option<String>,
     spacing: Option<i32>,
     separation: Option<i32>,
     salt: Option<u64>,
@@ -171,10 +162,6 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].id.as_str(), "minecraft:villages");
         assert_eq!(facts[0].structures[0].as_str(), "minecraft:village_plains");
-        assert_eq!(
-            facts[0].placement_type.as_ref().map(Identifier::as_str),
-            Some("minecraft:random_spread")
-        );
         assert_eq!(facts[0].spacing, Some(34));
         assert_eq!(facts[0].separation, Some(8));
         assert_eq!(facts[0].salt, Some(10_387_312));

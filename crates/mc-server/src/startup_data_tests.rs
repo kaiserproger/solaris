@@ -617,7 +617,11 @@ fn recipe_result_stack_validation_rejects_known_item_overflow() {
                 alternatives: vec![mc_data::recipes::IngredientAlternative::Item(item.clone())],
             }],
         }),
-        result: mc_data::recipes::RecipeResult { item, count: 17 },
+        result: mc_data::recipes::RecipeResult {
+            item,
+            count: 17,
+            stew_effects: Vec::new(),
+        },
     };
 
     let error = validate_recipe_result_stacks(&[recipe], &facts).unwrap_err();

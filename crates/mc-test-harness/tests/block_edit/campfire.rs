@@ -95,6 +95,7 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
 
@@ -314,6 +315,7 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
 
@@ -536,6 +538,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
 
@@ -750,6 +753,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
 
@@ -987,6 +991,7 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
 
@@ -1169,6 +1174,7 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
             count: 1,
+            stew_effects: Vec::new(),
         },
     }]);
 

@@ -328,10 +328,11 @@ async fn wait_for_fresh_pvp_target_outcome(client: &mut Client, target_entity_id
                 packet.movement
             );
             saw_motion = true;
-        } else if frame.id == EntityEvent::ID {
+        } else if frame.id == ClientboundDamageEvent::ID {
             let mut body = frame.body;
-            let packet = EntityEvent::decode(&mut body).expect("decode target PvP hurt event");
-            saw_hurt_event |= packet.entity_id == target_entity_id && packet.event_id == 2;
+            let packet = ClientboundDamageEvent::decode(&mut body)
+                .expect("decode target PvP damage event");
+            saw_hurt_event |= packet.entity_id == target_entity_id;
         }
     }
     health.expect("target health observed")
@@ -407,12 +408,13 @@ async fn wait_for_rejected_pvp_hit_without_health_or_hurt_until_second_attack_an
                 "weaker same-window PvP hit reduced health before the later attack-action fence; health={}",
                 packet.health
             );
-        } else if frame.id == EntityEvent::ID {
+        } else if frame.id == ClientboundDamageEvent::ID {
             let mut body = frame.body;
-            let packet = EntityEvent::decode(&mut body).expect("decode rejected-hit hurt event");
-            if packet.entity_id == target_entity_id && packet.event_id == 2 {
+            let packet = ClientboundDamageEvent::decode(&mut body)
+                .expect("decode rejected-hit damage event");
+            if packet.entity_id == target_entity_id {
                 panic!(
-                    "weaker same-window PvP hit emitted a hurt event before the later attack-action fence"
+                    "weaker same-window PvP hit emitted a damage event before the later attack-action fence"
                 );
             }
         } else if frame.id == SetEntityMotion::ID {
@@ -457,13 +459,13 @@ async fn wait_for_rejected_pvp_attacker_fence_without_hurt(
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
-        if frame.id == EntityEvent::ID {
+        if frame.id == ClientboundDamageEvent::ID {
             let mut body = frame.body;
-            let packet =
-                EntityEvent::decode(&mut body).expect("decode rejected-hit observer event");
-            assert!(
-                packet.entity_id != target_entity_id || packet.event_id != 2,
-                "weaker same-window PvP hit must not publish a hurt event to observers"
+            let packet = ClientboundDamageEvent::decode(&mut body)
+                .expect("decode rejected-hit observer damage event");
+            assert_ne!(
+                packet.entity_id, target_entity_id,
+                "weaker same-window PvP hit must not publish a damage event to observers"
             );
         } else if frame.id == ClientboundSetHealth::ID {
             let mut body = frame.body;
@@ -508,10 +510,11 @@ async fn wait_for_pvp_hurt_and_attacker_health_fence(
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
-        if frame.id == EntityEvent::ID {
+        if frame.id == ClientboundDamageEvent::ID {
             let mut body = frame.body;
-            let packet = EntityEvent::decode(&mut body).expect("decode PvP hurt event");
-            saw_target_hurt |= packet.entity_id == target_entity_id && packet.event_id == 2;
+            let packet = ClientboundDamageEvent::decode(&mut body)
+                .expect("decode PvP damage event");
+            saw_target_hurt |= packet.entity_id == target_entity_id;
         } else if frame.id == ClientboundSetHealth::ID {
             let mut body = frame.body;
             let packet =

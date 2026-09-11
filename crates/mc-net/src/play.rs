@@ -872,7 +872,7 @@ const SKELETON_BOW_COOLDOWN_TICKS: u64 = 20;
 const SKELETON_SHOT_RANGE: f64 = 16.0;
 const SKELETON_ARROW_SPEED: f64 = 1.6;
 #[cfg(test)]
-const HOSTILE_FOLLOW_SPEED: f64 = 1.25;
+const HOSTILE_FOLLOW_SPEED: f64 = 2.3;
 fn world_time_is_night(world_time: u64) -> bool {
     world_time % DAY_LENGTH_TICKS >= NIGHT_START_TICK
 }

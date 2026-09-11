@@ -1,9 +1,12 @@
 #[tokio::test]
-async fn embedded_short_grass_break_delivers_wheat_seeds_over_wire() {
+async fn embedded_short_grass_break_round_trips_update_ack_over_wire() {
+    // P24 seed probability (1/8 per break) is covered deterministically by the
+    // fixed-seed corpus in mc-data/tests/plant_loot.rs. Asserting a seed drop
+    // here would fail ~7/8 runs (pre-existing flake, see 2026-08-30 evidence);
+    // this wire test pins the deterministic break transaction instead.
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let short_grass_state = embedded_block_state(&data, "minecraft:short_grass");
-    let wheat_seeds_id = embedded_item_id(&data, "minecraft:wheat_seeds");
 
     let mut world = embedded_world(&data);
     let spawn_surface_y =
@@ -11,11 +14,7 @@ async fn embedded_short_grass_break_delivers_wheat_seeds_over_wire() {
     let target = (1, spawn_surface_y + 1, 1);
     world
         .set_block_at(
-            mc_world::BlockPos {
-                x: target.0,
-                y: target.1,
-                z: target.2,
-            },
+            mc_world::BlockPos { x: target.0, y: target.1, z: target.2 },
             short_grass_state,
         )
         .expect("seed short grass target");
@@ -51,7 +50,32 @@ async fn embedded_short_grass_break_delivers_wheat_seeds_over_wire() {
         .await
         .expect("start breaking short grass");
 
-    wait_for_slot_stack(&mut client, wheat_seeds_id, 1).await;
+    let mut saw_break = false;
+    let mut saw_ack = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_break && saw_ack) {
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .expect("short grass break update and ack");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode grass BlockUpdate");
+            if unpack_block_pos(pkt.position) == target {
+                assert_eq!(pkt.state_id, air_state.0 as i32, "grass broke to air");
+                saw_break = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode grass break ack");
+            if pkt.sequence == 701 {
+                saw_ack = true;
+            }
+        }
+    }
 
     drop(client);
     shutdown.request();

@@ -4,7 +4,7 @@ Solaris is an authoritative Minecraft Java Edition server written in Rust. It
 targets the vanilla **Minecraft Java Edition 26.1.2** protocol and also supports
 optional client content through Solaris Loader.
 
-> **Development status:** **`v0.0.5`** is a preliminary release.
+> **Development status:** **`v0.0.6`** is a preliminary release.
 > Maturity remains **draft**, not release-ready. Solaris is suitable for
 > testing, plugin development, and bounded multiplayer field tests; it is not a
 > production-safe replacement for vanilla, Paper, Fabric, Forge, or NeoForge.
@@ -15,17 +15,17 @@ Solaris ships an optional default-off read-only web dashboard
 and the `operator add|remove|list` CLI. The standard plugin pack is explicitly
 opt-in; see [plugin installation](docs/PLUGINS.md#standard-plugin-pack).
 
-## Install v0.0.5 (Linux)
+## Install v0.0.6 (Linux)
 
 Published archives are available for Linux x86_64 and AArch64. Pin the release
 because GitHub's `latest` alias does not resolve prereleases:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.5/install.sh | \
-  SOLARIS_VERSION="v0.0.5" bash
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.6/install.sh | \
+  SOLARIS_VERSION="v0.0.6" bash
 
 curl -fsSLo server.toml \
-  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.5/example.toml
+  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.6/example.toml
 solaris --check --config server.toml
 solaris --config server.toml
 ```
@@ -42,7 +42,7 @@ Use a fresh `[data].world_dir`. Do not delete or hand-edit the old world's
 contract to bypass the check. Changing an effective startup `rules.lua` plan
 also requires a fresh world directory.
 
-## Build and run the v0.0.5 development tree
+## Build and run the v0.0.6 development tree
 
 Use the repository's debug profile for development:
 
@@ -212,7 +212,7 @@ launching a graphical or twenty-minute profile.
 ## More documentation
 
 - [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — design and compatibility scope
-- [Current preliminary release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.5) — binaries and checksums; [changelog](docs/releases/v0.0.5.md)
+- [Current preliminary release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.6) — binaries and checksums; [changelog](docs/releases/v0.0.6.md)
 - [`docs/MEMORY.md`](docs/MEMORY.md) — current work and evidence cursor
 - [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) — replacement-readiness limits
 - [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — recorded evidence

@@ -16046,17 +16046,19 @@ mod tests {
             .expect("apply explicit hostile selection")
             .expect("fresh explicit goal apply");
         assert_eq!(results.len(), 1);
-        assert_eq!(
-            handle
-                .snapshot(zombie)
-                .expect("zombie read")
-                .expect("zombie")
-                .goal,
-            GoalState::FollowPosition {
-                target,
-                speed: 1.25,
-            },
-        );
+        let GoalState::FollowPosition {
+            target: selected_target,
+            speed,
+        } = handle
+            .snapshot(zombie)
+            .expect("zombie read")
+            .expect("zombie")
+            .goal
+        else {
+            panic!("explicit hostile selection must install a follow goal");
+        };
+        assert_eq!(selected_target, target);
+        assert!((speed - 2.3).abs() < 1.0e-9);
 
         drop(handle);
         runtime.shutdown().expect("runtime shutdown");

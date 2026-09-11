@@ -4,9 +4,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundContainerSetSlot, ClientboundKeepAlive,
-    ClientboundSystemChat, ConfirmTeleportation, EntityEvent, MovePlayerFlags, ServerboundAttack,
-    ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    AddEntity, ClientboundCommands, ClientboundContainerSetSlot, ClientboundDamageEvent,
+    ClientboundKeepAlive, ClientboundSystemChat, ConfirmTeleportation, MovePlayerFlags,
+    ServerboundAttack, ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
     SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
@@ -280,9 +280,10 @@ async fn wait_for_entity_hurt_without_chat(client: &mut Client, entity_id: i32) 
                 "kill event preceded the lethal commit: {}",
                 system_chat_text(&packet)
             );
-        } else if frame.id == EntityEvent::ID {
-            let packet = EntityEvent::decode(&mut frame.body.clone()).expect("decode EntityEvent");
-            if packet.entity_id == entity_id && packet.event_id == 2 {
+        } else if frame.id == ClientboundDamageEvent::ID {
+            let packet = ClientboundDamageEvent::decode(&mut frame.body.clone())
+                .expect("decode DamageEvent");
+            if packet.entity_id == entity_id {
                 return;
             }
         }

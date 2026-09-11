@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity() {
+#[test]
+fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity() {
+    let test = std::thread::Builder::new()
+        .name("near_full_inventory_partially_picks_up_and_preserves_remainder_identity".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build partial pickup integration runtime")
+                .block_on(near_full_inventory_partially_picks_up_and_preserves_remainder_identity_inner());
+        })
+        .expect("spawn partial pickup integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity_inner() {
     let data = embedded_play_data();
     let dirt_id = embedded_item_id(&data, "minecraft:dirt");
     let cobblestone_id = embedded_item_id(&data, "minecraft:cobblestone");
