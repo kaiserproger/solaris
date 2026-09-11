@@ -7,7 +7,8 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, ClientboundCommands, ClientboundInitializeBorder, ClientboundKeepAlive,
     ClientboundSetTime, ConfirmTeleportation, EntityEvent, GameEvent, LevelChunkWithLight,
-    ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    ServerboundChatCommand, ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition,
+    SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 
@@ -18,7 +19,6 @@ const VIEW_DISTANCE: i32 = 2;
 const GOLEM_ATTACK_EVENT_26_1_2: i8 = 4;
 
 #[tokio::test]
-#[ignore = "village golem never emits attack event over wire (spawn ok, no EntityEvent in 20s); tracked for villages follow-up"]
 async fn embedded_village_defense_spawns_golem_and_attacks_hostile_over_tcp() {
     let data = Arc::new(mc_data::solaris_required_data());
     let blocks_report = mc_data::blocks::solaris_required_blocks_report();
@@ -72,6 +72,14 @@ async fn embedded_village_defense_spawns_golem_and_attacks_hostile_over_tcp() {
 
     let (mut client, spawn) = connect_to_play(addr, "VillageDefTcp").await;
     drain_until_chunk(&mut client, (0, 0)).await;
+    // The observer must survive the ravager: a dead session clears the active
+    // simulation selection and freezes the pursuit before the golem arrives.
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".to_string(),
+        })
+        .await
+        .expect("switch observer to creative");
 
     let village_origin = Vec3::new(spawn.x + 5.0, spawn.y, spawn.z + 5.0);
     let villagers = [

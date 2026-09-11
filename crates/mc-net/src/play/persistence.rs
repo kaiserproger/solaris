@@ -732,6 +732,13 @@ impl RegionalDecisionJournal for FileRegionalDecisionJournal {
             self.pending.truncate(previous_len);
             return Err(RegionalDecisionJournalError::SAFE);
         }
+        // Fail closed when the background writer already reported death: the
+        // channel send below can still succeed while the worker is tearing
+        // down, which would accept a commit that is never persisted.
+        if self.writer.failed.load(Ordering::Acquire) {
+            self.pending.truncate(previous_len);
+            return Err(RegionalDecisionJournalError::OUTCOME_UNKNOWN);
+        }
         if self
             .writer
             .requests
