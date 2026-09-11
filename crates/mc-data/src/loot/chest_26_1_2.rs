@@ -701,15 +701,13 @@ mod tests {
     #[test]
     fn loads_real_vanilla_chest_tables_when_present() {
         let root = workspace_path("data/vanilla/data");
+        if !root.join("minecraft/loot_table/chests").is_dir() {
+            return;
+        }
         for table in [
             "minecraft:chests/village/village_toolsmith",
             "minecraft:chests/simple_dungeon",
         ] {
-            assert!(
-                root.join("minecraft/loot_table/chests").is_dir(),
-                "requires extracted vanilla data at {}",
-                root.display()
-            );
             let catalog = ChestLootCatalog::load_vanilla_tables(&root, &[id(table)])
                 .expect("real table loads");
             let compiled = catalog.get(&id(table)).expect("catalog holds the table");
