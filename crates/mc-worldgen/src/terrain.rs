@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use mc_data::Identifier;
+use mc_data::items::ItemRegistry;
+use mc_data::loot::chest_26_1_2::ChestLootCatalog;
 use mc_world::chunk::{Chunk, ChunkGeometry, ChunkPos, Heightmap, OVERWORLD_GEOMETRY};
 use mc_world::{
     BIOME_DIM, BIOME_VOLUME, BiomeSection, BlockRegistry, BlockStateId, ChunkGenerator,
@@ -25,7 +27,7 @@ use mc_world::{
 };
 
 use crate::noise::fbm_2d;
-use crate::structures::{StructureRules, StructureTemplate};
+use crate::structures::{StructureLoot, StructureRules, StructureTemplate};
 
 mod biome_routing;
 mod biome_rules;
@@ -216,6 +218,11 @@ pub struct TerrainGenerator {
     geological_ores: Option<GeologicalOreRules>,
     ore_generation_profile: &'static str,
     structures: StructureRules,
+    /// Compiled vanilla chest tables rolled at structure paste time. Empty
+    /// by default, in which case structure chests paste fixed contents.
+    chest_loot: ChestLootCatalog,
+    /// Item registry resolving rolled chest stacks to protocol ids.
+    chest_loot_items: ItemRegistry,
     decorations: DecorationBlocks,
     tree_rules: HashMap<Identifier, TreeRule>,
     clay_rule: ClayRule,
@@ -674,6 +681,8 @@ impl TerrainGenerator {
             geological_ores: None,
             ore_generation_profile: "vanilla",
             structures: StructureRules::none(),
+            chest_loot: ChestLootCatalog::new(),
+            chest_loot_items: ItemRegistry::default(),
             decorations: DecorationBlocks::new(registry.as_ref()),
             tree_rules: HashMap::new(),
             clay_rule: ClayRule::default(),
@@ -685,6 +694,17 @@ impl TerrainGenerator {
     #[must_use]
     pub fn with_structures(mut self, structures: StructureRules) -> Self {
         self.structures = structures;
+        self
+    }
+
+    /// Wire compiled vanilla chest tables plus the item registry that
+    /// resolves rolled stacks, so structure chests roll loot at paste time
+    /// instead of pasting fixed contents. Deterministic in
+    /// `(seed, structure position, chest index)`.
+    #[must_use]
+    pub fn with_chest_loot(mut self, catalog: ChestLootCatalog, items: ItemRegistry) -> Self {
+        self.chest_loot = catalog;
+        self.chest_loot_items = items;
         self
     }
 
@@ -1992,7 +2012,14 @@ impl TerrainGenerator {
             return;
         };
         let origin_z = center_z - size[2] / 2;
-        paste_template(chunk, template, origin_x, origin_y, origin_z, touched);
+        let loot = StructureLoot {
+            seed: self.seed,
+            catalog: &self.chest_loot,
+            items: &self.chest_loot_items,
+        };
+        paste_template(
+            chunk, template, origin_x, origin_y, origin_z, touched, &loot,
+        );
         let mut inhabitants = chunk.settlement_inhabitants();
         inhabitants.extend(
             self.structures
@@ -2254,6 +2281,7 @@ fn paste_template(
     origin_y: i32,
     origin_z: i32,
     touched: &mut [bool; 256],
+    loot: &StructureLoot<'_>,
 ) {
     let min_x = world_block_coordinate(chunk.pos.x, 0);
     let min_z = world_block_coordinate(chunk.pos.z, 0);
@@ -2278,7 +2306,7 @@ fn paste_template(
             touched[lz as usize * 16 + lx as usize] = true;
         }
     }
-    for template_chest in template.chests() {
+    for (chest_index, template_chest) in template.chests().iter().enumerate() {
         let x = origin_x + template_chest.pos[0];
         let Some(y) = origin_y.checked_add(template_chest.pos[1]) else {
             continue;
@@ -2305,9 +2333,10 @@ fn paste_template(
         if chunk.get_block(lx, y, lz) != Some(expected_state) {
             continue;
         }
+        let contents = template_chest.resolve_contents(loot, [x, y, z], chest_index);
         chunk
             .chests
-            .insert(mc_world::BlockPos { x, y, z }, template_chest.chest.clone());
+            .insert(mc_world::BlockPos { x, y, z }, contents);
     }
 }
 

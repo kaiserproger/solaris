@@ -357,6 +357,10 @@ fn conservative_emission(path: &str, props: &std::collections::BTreeMap<String, 
             .and_then(|v| v.parse::<u8>().ok())
             .map_or(3, |n| n.saturating_mul(3).min(12));
     }
+    // Vanilla 26.1.2 report: every ender_chest state emits 7.
+    if path == "ender_chest" {
+        return 7;
+    }
     0
 }
 
@@ -621,6 +625,26 @@ mod tests {
         assert!(!table.suffocating[1]);
     }
     #[test]
+    fn conservative_ender_chest_emission_is_seven() {
+        let state = |id: u32, waterlogged: &str| BlockStateReport {
+            id,
+            default: waterlogged == "false",
+            properties: BTreeMap::from([("waterlogged".to_string(), waterlogged.to_string())]),
+        };
+        let report = vec![BlockReport {
+            id: Identifier::parse("minecraft:ender_chest").unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![state(0, "false"), state(1, "true")],
+        }];
+        let table = BlockLightTable::conservative_from_blocks_report(&report);
+        // Vanilla 26.1.2 block_light.json: every ender_chest state is [7, ..].
+        assert_eq!(table.emission[0], 7);
+        assert_eq!(table.emission[1], 7);
+        // Opacity still follows the chest waterlogged rule, not 15.
+        assert_eq!(table.opacity[0], 0);
+        assert_eq!(table.opacity[1], 1);
+    }
+    #[test]
     fn loads_synthetic_table() {
         let dir = TempDir::new().unwrap();
         let path = write_json(
@@ -820,6 +844,9 @@ mod tests {
         let soul_lantern = default_state("minecraft:soul_lantern");
         assert_eq!(table.emission(soul_lantern), Some(10));
 
+        // ender_chest: 7 in 26.1.2 (vanilla-known; anchors the conservative fallback).
+        let ender_chest = default_state("minecraft:ender_chest");
+        assert_eq!(table.emission(ender_chest), Some(7));
         // water: opacity 1 (soft attenuator), no emission, sky still
         // passes through (water doesn't fully block sky-light).
         let water = default_state("minecraft:water");

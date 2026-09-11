@@ -5,6 +5,8 @@ use std::path::Path;
 use flate2::bufread::GzDecoder;
 use mc_data::Identifier;
 use mc_data::items::ItemRegistry;
+use mc_data::loot::LootCount;
+use mc_data::loot::chest_26_1_2::{CHEST_SLOT_COUNT, ChestLootCatalog, ChestRng};
 use mc_data::worldgen_structures::{
     StructureDataError, StructureSetFacts, load_structure_set_facts,
 };
@@ -56,6 +58,8 @@ pub enum StructureError {
         "plains village templates expose {available} villager slots for {requested} planned inhabitants"
     )]
     MissingVillagerSlots { requested: usize, available: usize },
+    #[error("plains toolsmith template cell {pos:?} is not air for the Solaris loot chest")]
+    ToolsmithChestObstructed { pos: [i32; 3] },
     #[error(transparent)]
     StructureData(#[from] StructureDataError),
 }
@@ -78,6 +82,97 @@ pub struct TemplateBlock {
 pub struct TemplateChest {
     pub pos: [i32; 3],
     pub chest: ChestBlockEntity,
+    /// Vanilla chest table rolled at paste time. When `None`, or when the
+    /// paste-time catalog lacks the table, the fixed `chest` contents above
+    /// are pasted unchanged.
+    pub loot_table: Option<Identifier>,
+}
+
+impl TemplateChest {
+    /// Resolve the pasted contents: roll `loot_table` from the catalog with
+    /// a seed derived from `(seed, world_pos, index)`, scattering stacks
+    /// into random slots (vanilla overwrite semantics). Falls back to the
+    /// fixed `chest` contents when no table is configured or the catalog
+    /// lacks it; rolled stacks whose items the registry cannot resolve are
+    /// skipped.
+    #[must_use]
+    pub fn resolve_contents(
+        &self,
+        loot: &StructureLoot<'_>,
+        world_pos: [i32; 3],
+        index: usize,
+    ) -> ChestBlockEntity {
+        let table = self.loot_table.as_ref().and_then(|id| loot.catalog.get(id));
+        let Some(table) = table else {
+            return self.chest.clone();
+        };
+        let mut rng = ChestRng::new(chest_loot_seed(loot.seed, world_pos, index));
+        let mut out = ChestBlockEntity::default();
+        for drop in table.roll(&mut rng) {
+            let Some(item_id) = loot.items.id_of(&drop.item) else {
+                continue;
+            };
+            let count = match drop.count {
+                LootCount::Fixed(count) => count,
+                LootCount::UniformInclusive { min, .. } => min,
+            };
+            let Ok(count) = i32::try_from(count) else {
+                continue;
+            };
+            let slot = rng.next_bounded(CHEST_SLOT_COUNT) as usize;
+            out.slots[slot] = FurnaceSlot {
+                item_id,
+                count,
+                damage: None,
+                enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
+                stew_effects: Vec::new(),
+            };
+        }
+        out
+    }
+}
+
+/// Vanilla chest table rolled for the toolsmith house of the Solaris plains
+/// village prototype. The 26.1.2 toolsmith NBT shell contains no chest block;
+/// vanilla places the chest in piece code, so Solaris owns the chest position
+/// (an interior floor cell of the toolsmith part) and rolls the real table.
+pub const VILLAGE_TOOLSMITH_LOOT_TABLE: &str = "minecraft:chests/village/village_toolsmith";
+/// Vanilla chest table rolled for the seed-zero Solaris playable ruin.
+pub const SOLARIS_RUIN_LOOT_TABLE: &str = "minecraft:chests/simple_dungeon";
+
+/// Loot context threaded through structure pasting: the world seed plus the
+/// compiled chest tables and the item registry that resolves rolled stacks.
+/// A chest whose table id is absent from the catalog pastes its fixed
+/// contents instead, so generators without wired loot keep legacy output.
+#[derive(Debug)]
+pub struct StructureLoot<'a> {
+    pub seed: i64,
+    pub catalog: &'a ChestLootCatalog,
+    pub items: &'a ItemRegistry,
+}
+
+/// Salt distinguishing chest-loot seeds from terrain feature hashes.
+const CHEST_LOOT_SALT: u64 = 0xC4E5_57A1_1007;
+
+/// Deterministic per-chest loot seed from the world seed, the chest's pasted
+/// world position, and its index in the template. Same seed and position
+/// roll the same contents; distinct chests differ.
+#[must_use]
+pub fn chest_loot_seed(seed: i64, world_pos: [i32; 3], index: usize) -> u64 {
+    let mut hash = seed as u64 ^ CHEST_LOOT_SALT;
+    for word in [
+        world_pos[0] as i64 as u64,
+        world_pos[1] as i64 as u64,
+        world_pos[2] as i64 as u64,
+        index as u64,
+    ] {
+        hash ^= word.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        hash = hash.rotate_left(17).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        hash ^= hash >> 29;
+    }
+    hash
 }
 
 enum BoundedLength {
@@ -454,6 +549,9 @@ impl StructureRules {
     ) -> Result<Self, StructureError> {
         let vanilla_data_dir = vanilla_data_dir.as_ref();
         let structure_root = vanilla_data_dir.join("data/minecraft/structure");
+        let toolsmith_offset = parts
+            .contains(&PlainsVillagePrototypePart::Toolsmith)
+            .then(|| PlainsVillagePrototypePart::Toolsmith.source().1);
         let parts = parts
             .iter()
             .copied()
@@ -463,11 +561,12 @@ impl StructureRules {
                     .map(|template| (template, offset))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut combined = StructureTemplate::combine(parts);
+        if let Some(offset) = toolsmith_offset {
+            attach_toolsmith_loot_chest(&mut combined, blocks, offset)?;
+        }
         let facts = load_structure_set_facts(vanilla_data_dir.join("data/minecraft/worldgen"))?;
-        Ok(
-            Self::plains_village_markers(vec![StructureTemplate::combine(parts)])
-                .with_structure_set_facts(&facts),
-        )
+        Ok(Self::plains_village_markers(vec![combined]).with_structure_set_facts(&facts))
     }
 
     pub fn plains_village_prototype_with_plan(
@@ -539,7 +638,12 @@ impl StructureRules {
         let template =
             StructureTemplate::new([5, 4, 5], ruin_blocks).with_chests(vec![TemplateChest {
                 pos: [2, 1, 2],
+                // Fixed contents stay as the paste-time fallback when the
+                // generator has no chest-loot catalog wired.
                 chest,
+                loot_table: Some(
+                    Identifier::parse(SOLARIS_RUIN_LOOT_TABLE).expect("static ruin loot table"),
+                ),
             }]);
         Ok(Self {
             templates: vec![template],
@@ -649,6 +753,61 @@ fn playable_ruin_slot(
         item_model: None,
         stew_effects: Vec::new(),
     })
+}
+
+/// Toolsmith-part-local cell for the Solaris village loot chest: interior air
+/// on the cobblestone floor, clear of the smithing table, door, and walls
+/// (verified against the 26.1.2 `plains_tool_smith_1` shell).
+const TOOLSMITH_CHEST_LOCAL: [i32; 3] = [5, 1, 4];
+
+/// Place the village toolsmith loot chest into a combined prototype. The
+/// vanilla toolsmith shell ships no chest block, so Solaris adds one shell
+/// chest block plus a loot-table chest entity; the fixed contents stay empty
+/// as the paste-time fallback when no catalog is wired.
+fn attach_toolsmith_loot_chest(
+    template: &mut StructureTemplate,
+    blocks: &BlockRegistry,
+    toolsmith_offset: [i32; 3],
+) -> Result<(), StructureError> {
+    let chest_id = Identifier::parse("minecraft:chest").expect("static chest identifier");
+    let chest_state =
+        blocks
+            .block(&chest_id)
+            .map(|entry| entry.default)
+            .ok_or(StructureError::UnknownBlock {
+                path: "plains village toolsmith chest".to_string(),
+                block: chest_id.clone(),
+            })?;
+    let air_id = Identifier::parse("minecraft:air").expect("static air identifier");
+    let pos = [
+        toolsmith_offset[0] + TOOLSMITH_CHEST_LOCAL[0],
+        toolsmith_offset[1] + TOOLSMITH_CHEST_LOCAL[1],
+        toolsmith_offset[2] + TOOLSMITH_CHEST_LOCAL[2],
+    ];
+    match template.blocks.iter().position(|block| block.pos == pos) {
+        Some(index) => {
+            let incumbent = template.blocks[index].state;
+            let is_air = blocks
+                .by_id(incumbent)
+                .is_some_and(|state| state.block.id == air_id);
+            if !is_air {
+                return Err(StructureError::ToolsmithChestObstructed { pos });
+            }
+            template.blocks[index].state = chest_state;
+        }
+        None => template.blocks.push(TemplateBlock {
+            pos,
+            state: chest_state,
+        }),
+    }
+    template.chests.push(TemplateChest {
+        pos,
+        chest: ChestBlockEntity::default(),
+        loot_table: Some(
+            Identifier::parse(VILLAGE_TOOLSMITH_LOOT_TABLE).expect("static toolsmith loot table"),
+        ),
+    });
+    Ok(())
 }
 
 impl Default for StructureRules {
@@ -1148,7 +1307,6 @@ mod tests {
         let facts = vec![StructureSetFacts {
             id: Identifier::parse("minecraft:villages").unwrap(),
             structures: vec![Identifier::parse("minecraft:village_plains").unwrap()],
-            placement_type: Some(Identifier::parse("minecraft:random_spread").unwrap()),
             spacing: Some(20),
             separation: Some(5),
             salt: Some(1234),

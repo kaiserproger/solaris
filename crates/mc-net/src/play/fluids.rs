@@ -268,21 +268,59 @@ fn fluid_spread_edits(
         y: pos.y - 1,
         ..pos
     };
+    let mut targets = Vec::new();
     if can_flow_into(blocks, facts, world, below, fluid.kind, next_level) {
-        return vec![BlockEdit {
-            pos: below,
-            new_state: next_state,
-        }];
+        targets.push(below);
+    } else {
+        targets.extend(
+            horizontal_fluid_neighbours(pos)
+                .into_iter()
+                .filter(|&target| {
+                    can_flow_into(blocks, facts, world, target, fluid.kind, next_level)
+                }),
+        );
     }
-
-    horizontal_fluid_neighbours(pos)
-        .into_iter()
-        .filter(|&target| can_flow_into(blocks, facts, world, target, fluid.kind, next_level))
-        .map(|target| BlockEdit {
+    let mut edits: Vec<BlockEdit> = targets
+        .iter()
+        .map(|&target| BlockEdit {
             pos: target,
             new_state: next_state,
         })
-        .collect()
+        .collect();
+    // A washed plant stops supporting whatever stood on it (upper double
+    // halves, column segments): pop those with air, same rule as the
+    // break-path cascade. Drops resolve at commit from the previous states.
+    if fluid.kind == FluidKind::Water {
+        let air = air_state_id(blocks);
+        for &target in &targets {
+            if world
+                .get_cached_block(target)
+                .is_some_and(|state| is_water_washable_plant(blocks, state))
+            {
+                super::block_break::append_vertical_support_cascade(
+                    blocks, world, &mut edits, target, air,
+                );
+            }
+        }
+    }
+    edits
+}
+
+/// Plants flowing water displaces in vanilla, breaking them with drops:
+/// the shared ground-support set plus the shared column set. The single
+/// water-specific rule is seagrass, which lives submerged, so water coexists
+/// with it. Lava keeps the old stop-at-plant behavior (queued separately,
+/// not a desync).
+pub(super) fn is_water_washable_plant(blocks: &BlockRegistry, state: BlockStateId) -> bool {
+    let Some(resolved) = blocks.by_id(state) else {
+        return false;
+    };
+    let path = resolved.block.id.path();
+    if matches!(path, "seagrass" | "tall_seagrass") {
+        return false;
+    }
+    mc_world::plant_rules_26_1_2::is_ground_support_plant(path)
+        || super::block_break::is_vertical_support_cascade_block(path)
 }
 
 fn can_flow_into(
@@ -297,6 +335,9 @@ fn can_flow_into(
         return false;
     };
     if state == air_state_id(blocks) {
+        return true;
+    }
+    if kind == FluidKind::Water && is_water_washable_plant(blocks, state) {
         return true;
     }
     facts
@@ -396,4 +437,49 @@ pub(super) fn fluid_state_with_level(
         &fluid_identifier(kind),
         &[("level".to_string(), level.to_string())],
     )
+}
+
+/// Drops for plants a fluid tick washed away, resolved from the replaced
+/// previous states. Upper double halves yield nothing (the lower half owns
+/// the loot), matching survival semantics. Called once per committed fluid
+/// outcome, so every listed edit is fluid-driven by construction.
+pub(super) fn fluid_wash_drops(
+    blocks: &BlockRegistry,
+    loot: &mc_data::loot::LootTables,
+    items: &mc_data::items::ItemRegistry,
+    item_facts: &mc_data::item_components::ItemFactsTable,
+    applied: &[AppliedBlockEdit],
+    loot_seed: u64,
+) -> Vec<(BlockPos, mc_entity::EntityItemStack)> {
+    let mut drops = Vec::new();
+    for edit in applied {
+        if !is_water_washable_plant(blocks, edit.previous) {
+            continue;
+        }
+        let Some(resolved) = blocks.by_id(edit.previous) else {
+            continue;
+        };
+        if super::block_state_property(resolved, "half") == Some("upper") {
+            continue;
+        }
+        let seed = loot_seed
+            .wrapping_add(edit.pos.x as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add((edit.pos.y as u64) << 32 | (edit.pos.z as u64 & 0xffff_ffff));
+        for stack in super::survival::block_drop_stacks_with_tool_and_facts_from_seeded(
+            loot,
+            items,
+            item_facts,
+            blocks,
+            edit.previous,
+            None,
+            seed,
+        ) {
+            drops.push((
+                edit.pos,
+                mc_entity::EntityItemStack::new(stack.item_id, stack.count),
+            ));
+        }
+    }
+    drops
 }

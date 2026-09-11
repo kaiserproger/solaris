@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::{Identifier, read_json_file, visit_json_files};
 
+pub mod chest_26_1_2;
 mod context;
 mod embedded;
 pub mod entity_26_1_2;

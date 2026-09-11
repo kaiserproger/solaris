@@ -4,6 +4,41 @@ use mc_data::worldgen_structures::StructureSetFacts;
 use mc_world::chunk::{MAX_Y, MIN_Y, OVERWORLD_GEOMETRY};
 use std::collections::{BTreeMap, HashSet};
 
+/// Owned holder for paste-time loot fixtures: [`StructureLoot`] borrows the
+/// catalog and item registry, so tests keep both alive through this handle.
+struct TestLoot {
+    catalog: mc_data::loot::chest_26_1_2::ChestLootCatalog,
+    items: mc_data::items::ItemRegistry,
+}
+
+impl TestLoot {
+    fn empty() -> Self {
+        Self {
+            catalog: mc_data::loot::chest_26_1_2::ChestLootCatalog::new(),
+            items: mc_data::items::ItemRegistry::default(),
+        }
+    }
+
+    fn loot(&self, seed: i64) -> crate::structures::StructureLoot<'_> {
+        crate::structures::StructureLoot {
+            seed,
+            catalog: &self.catalog,
+            items: &self.items,
+        }
+    }
+
+    fn with_items_and_table(table_id: &str, raw: &str) -> Self {
+        let id = Identifier::parse(table_id).unwrap();
+        let table =
+            mc_data::loot::chest_26_1_2::ChestLootTable::compile(id, raw).expect("fixture table");
+        let mut catalog = mc_data::loot::chest_26_1_2::ChestLootCatalog::new();
+        catalog.insert(table);
+        Self {
+            catalog,
+            items: mc_data::items::solaris_required_items(),
+        }
+    }
+}
 pub(in crate::terrain) fn tiny_registry() -> Arc<BlockRegistry> {
     use mc_data::blocks::{BlockReport, BlockStateReport};
     let report = vec![
@@ -421,7 +456,6 @@ fn dense_plains_village_rules(templates: Vec<StructureTemplate>) -> StructureRul
         StructureSetFacts {
             id: Identifier::parse("minecraft:test_villages").unwrap(),
             structures: vec![Identifier::parse("minecraft:village_plains").unwrap()],
-            placement_type: None,
             spacing: Some(1),
             separation: Some(0),
             salt: None,
@@ -3322,6 +3356,7 @@ fn structure_paste_clips_blocks_and_chests_to_chunk_geometry() {
             .map(|pos| crate::structures::TemplateChest {
                 pos,
                 chest: mc_world::ChestBlockEntity::default(),
+                loot_table: None,
             })
             .collect(),
     );
@@ -3332,8 +3367,10 @@ fn structure_paste_clips_blocks_and_chests_to_chunk_geometry() {
         geometry,
     );
     let mut touched = [false; 256];
+    let held = TestLoot::empty();
+    let loot = held.loot(0);
 
-    paste_template(&mut chunk, &template, 0, 1, 0, &mut touched);
+    paste_template(&mut chunk, &template, 0, 1, 0, &mut touched, &loot);
 
     assert_eq!(chunk.get_block(0, geometry.min_y(), 0), Some(marker));
     assert_eq!(chunk.get_block(0, geometry.max_y() - 1, 0), Some(marker));
@@ -3369,6 +3406,7 @@ fn structure_paste_ignores_overflowing_vertical_offsets() {
             .map(|pos| crate::structures::TemplateChest {
                 pos,
                 chest: mc_world::ChestBlockEntity::default(),
+                loot_table: None,
             })
             .collect(),
     );
@@ -3379,8 +3417,10 @@ fn structure_paste_ignores_overflowing_vertical_offsets() {
         geometry,
     );
     let mut touched = [false; 256];
+    let held = TestLoot::empty();
+    let loot = held.loot(0);
 
-    paste_template(&mut chunk, &template, 0, 1, 0, &mut touched);
+    paste_template(&mut chunk, &template, 0, 1, 0, &mut touched, &loot);
 
     assert!(chunk.chests.is_empty());
     assert!(!touched.into_iter().any(|column| column));
@@ -3757,4 +3797,255 @@ fn generated_spawn_window_debug_budget_reports_throughput() {
         elapsed_ms = elapsed.as_millis()
     );
     assert!(elapsed < std::time::Duration::from_secs(10));
+}
+
+fn workspace_path(rel: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join(rel)
+}
+
+const DETERMINISTIC_LOOT_TABLE: &str = "minecraft:chests/test_deterministic";
+const DETERMINISTIC_LOOT_JSON: &str = r#"{"type":"minecraft:chest","pools":[
+    {"rolls":{"type":"minecraft:uniform","min":2.0,"max":5.0},"entries":[
+        {"type":"minecraft:item","name":"minecraft:diamond","weight":1},
+        {"type":"minecraft:item","name":"minecraft:bread","weight":3,
+         "functions":[{"add":false,"count":{"type":"minecraft:uniform","min":1.0,"max":3.0},
+         "function":"minecraft:set_count"}]},
+        {"type":"minecraft:item","name":"minecraft:stick","weight":2}
+    ]}
+]}"#;
+
+fn two_loot_chest_template(marker: BlockStateId, table: Option<Identifier>) -> StructureTemplate {
+    StructureTemplate::new(
+        [3, 1, 1],
+        vec![
+            crate::structures::TemplateBlock {
+                pos: [0, 0, 0],
+                state: marker,
+            },
+            crate::structures::TemplateBlock {
+                pos: [2, 0, 0],
+                state: marker,
+            },
+        ],
+    )
+    .with_chests(vec![
+        crate::structures::TemplateChest {
+            pos: [0, 0, 0],
+            chest: mc_world::ChestBlockEntity::default(),
+            loot_table: table.clone(),
+        },
+        crate::structures::TemplateChest {
+            pos: [2, 0, 0],
+            chest: mc_world::ChestBlockEntity::default(),
+            loot_table: table,
+        },
+    ])
+}
+
+fn paste_two_chests(
+    template: &StructureTemplate,
+    loot: &crate::structures::StructureLoot<'_>,
+) -> Chunk {
+    let geometry = mc_world::ChunkGeometry::new(0, 16).expect("one section");
+    let mut chunk = Chunk::empty_with_geometry(
+        ChunkPos { x: 0, z: 0 },
+        BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+        geometry,
+    );
+    let mut touched = [false; 256];
+    paste_template(&mut chunk, template, 0, 1, 0, &mut touched, loot);
+    chunk
+}
+
+#[test]
+fn loot_chest_rolls_are_deterministic_per_seed_pos_and_index() {
+    let held = TestLoot::with_items_and_table(DETERMINISTIC_LOOT_TABLE, DETERMINISTIC_LOOT_JSON);
+    let table = Some(Identifier::parse(DETERMINISTIC_LOOT_TABLE).unwrap());
+    let template = two_loot_chest_template(BlockStateId(25), table);
+
+    let first = paste_two_chests(&template, &held.loot(0));
+    let second = paste_two_chests(&template, &held.loot(0));
+    assert_eq!(first.chests, second.chests);
+
+    let left = &first.chests[&mc_world::BlockPos { x: 0, y: 1, z: 0 }];
+    let right = &first.chests[&mc_world::BlockPos { x: 2, y: 1, z: 0 }];
+    assert!(
+        left.slots.iter().any(|slot| !slot.is_empty()),
+        "rolled chests must hold loot"
+    );
+    assert_ne!(
+        left, right,
+        "distinct chest positions/indices must roll different contents"
+    );
+
+    let reseeded = paste_two_chests(&template, &held.loot(0x5EED));
+    assert_ne!(
+        &reseeded.chests[&mc_world::BlockPos { x: 0, y: 1, z: 0 }],
+        left,
+        "a different world seed must roll different contents"
+    );
+}
+
+#[test]
+fn absent_loot_table_pastes_fixed_contents() {
+    let mut fixed = mc_world::ChestBlockEntity::default();
+    fixed.slots[1] = mc_world::FurnaceSlot {
+        item_id: 7,
+        count: 3,
+        damage: None,
+        enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
+        stew_effects: Vec::new(),
+    };
+    let marker = BlockStateId(25);
+    let template = StructureTemplate::new(
+        [2, 1, 1],
+        vec![crate::structures::TemplateBlock {
+            pos: [0, 0, 0],
+            state: marker,
+        }],
+    )
+    .with_chests(vec![
+        crate::structures::TemplateChest {
+            pos: [0, 0, 0],
+            chest: fixed.clone(),
+            loot_table: Some(Identifier::parse("minecraft:chests/no_such_table").unwrap()),
+        },
+        crate::structures::TemplateChest {
+            pos: [0, 0, 0],
+            chest: fixed.clone(),
+            loot_table: None,
+        },
+    ]);
+    // The second entry overwrites the first at the same position; both must
+    // resolve to the fixed contents when no catalog entry exists.
+    let held = TestLoot::empty();
+    let chunk = paste_two_chests(&template, &held.loot(0));
+    assert_eq!(
+        chunk.chests[&mc_world::BlockPos { x: 0, y: 1, z: 0 }],
+        fixed
+    );
+}
+
+#[test]
+fn seed_zero_ruin_rolls_real_simple_dungeon_table_when_wired() {
+    let data_root = workspace_path("data/vanilla/data");
+    let table_path = data_root.join("minecraft/loot_table/chests/simple_dungeon.json");
+    assert!(
+        table_path.is_file(),
+        "requires extracted vanilla data at {}",
+        table_path.display()
+    );
+    let registry = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+            .expect("embedded block registry"),
+    );
+    let items = mc_data::items::solaris_required_items();
+    let structures =
+        StructureRules::solaris_playable_ruin(registry.as_ref(), &items).expect("playable ruin");
+    let table_id = Identifier::parse(crate::structures::SOLARIS_RUIN_LOOT_TABLE).unwrap();
+    let catalog = mc_data::loot::chest_26_1_2::ChestLootCatalog::load_vanilla_tables(
+        &data_root,
+        std::slice::from_ref(&table_id),
+    )
+    .expect("real dungeon table loads");
+    let table = catalog.get(&table_id).expect("catalog holds the table");
+    let mut table_items = std::collections::HashSet::new();
+    for pool in table.pools() {
+        for entry in &pool.entries {
+            if let mc_data::loot::chest_26_1_2::ChestLootEntry::Item { item, .. } = entry {
+                table_items.insert(item.clone());
+            }
+        }
+    }
+
+    let generator = TerrainGenerator::new(0, Arc::clone(&registry))
+        .with_structures(structures.clone())
+        .with_chest_loot(catalog, items.clone());
+    let first = generator.generate(ChunkPos { x: 4, z: 0 });
+    let second = generator.generate(ChunkPos { x: 4, z: 0 });
+    assert_eq!(first.chests, second.chests);
+    let (_, chest) = first.chests.iter().next().expect("seed-zero ruin chest");
+    let filled: Vec<_> = chest.slots.iter().filter(|slot| !slot.is_empty()).collect();
+    assert!(!filled.is_empty(), "rolled ruin chest must hold loot");
+    for slot in filled {
+        let name = items.name_of(slot.item_id).expect("rolled item resolves");
+        assert!(
+            table_items.contains(name),
+            "rolled {name} is outside the simple-dungeon table"
+        );
+    }
+
+    let fallback = TerrainGenerator::new(0, Arc::clone(&registry)).with_structures(structures);
+    let legacy = fallback.generate(ChunkPos { x: 4, z: 0 });
+    let (_, legacy_chest) = legacy.chests.iter().next().expect("fallback ruin chest");
+    assert_ne!(
+        chest, legacy_chest,
+        "rolled loot must replace the fixed fallback"
+    );
+}
+
+#[test]
+fn village_toolsmith_chest_rolls_real_table() {
+    let vanilla = workspace_path("data/vanilla");
+    let blocks_path = vanilla.join("reports/blocks.json");
+    let toolsmith_path =
+        vanilla.join("data/minecraft/structure/village/plains/houses/plains_tool_smith_1.nbt");
+    for path in [&blocks_path, &toolsmith_path] {
+        assert!(
+            path.is_file(),
+            "requires extracted vanilla data at {}",
+            path.display()
+        );
+    }
+    let report = mc_data::blocks::load_blocks_report(&blocks_path).expect("blocks report");
+    let registry = BlockRegistry::from_report(&report).expect("full block registry");
+    let rules =
+        StructureRules::plains_village_prototype(&vanilla, &registry).expect("village prototype");
+    let template = &rules.templates()[0];
+    let toolsmith_id = Identifier::parse(crate::structures::VILLAGE_TOOLSMITH_LOOT_TABLE).unwrap();
+    let chest = template
+        .chests()
+        .iter()
+        .find(|chest| chest.loot_table.as_ref() == Some(&toolsmith_id))
+        .expect("prototype carries a toolsmith loot chest");
+    // Toolsmith part offset [0, 0, 12] plus the interior floor cell [5, 1, 4].
+    assert_eq!(chest.pos, [5, 1, 16]);
+    let chest_state = template
+        .blocks()
+        .iter()
+        .find(|block| block.pos == chest.pos)
+        .map(|block| block.state)
+        .expect("toolsmith chest block");
+    assert_eq!(
+        registry
+            .by_id(chest_state)
+            .map(|state| state.block.id.as_str()),
+        Some("minecraft:chest")
+    );
+
+    let catalog = mc_data::loot::chest_26_1_2::ChestLootCatalog::load_vanilla_tables(
+        vanilla.join("data"),
+        std::slice::from_ref(&toolsmith_id),
+    )
+    .expect("real toolsmith table loads");
+    let items = mc_data::items::solaris_required_items();
+    let loot = crate::structures::StructureLoot {
+        seed: 0,
+        catalog: &catalog,
+        items: &items,
+    };
+    let first = chest.resolve_contents(&loot, [100, 64, -40], 0);
+    let second = chest.resolve_contents(&loot, [100, 64, -40], 0);
+    assert_eq!(first, second);
+    assert!(
+        first.slots.iter().any(|slot| !slot.is_empty()),
+        "seed-0 toolsmith roll must yield loot"
+    );
 }

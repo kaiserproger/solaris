@@ -528,6 +528,17 @@ fn fluid_test_reports() -> Vec<BlockReport> {
         simple_block(19, "minecraft:cactus"),
         simple_block(20, "minecraft:bamboo"),
         simple_block(21, "minecraft:sugar_cane"),
+        simple_block(22, "minecraft:poppy"),
+        simple_block(23, "minecraft:short_grass"),
+        BlockReport {
+            id: Identifier::parse("minecraft:tall_grass").unwrap(),
+            properties: prop_schema(&[("half", &["lower", "upper"])]),
+            states: vec![
+                state(24, true, &[("half", "lower")]),
+                state(25, false, &[("half", "upper")]),
+            ],
+        },
+        simple_block(26, "minecraft:seagrass"),
     ]
 }
 

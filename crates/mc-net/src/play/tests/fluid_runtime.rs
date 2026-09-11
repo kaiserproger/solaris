@@ -5,7 +5,7 @@ use super::{
     AppliedBlockEdit, BlockEdit, BlockEditBatchOutcome, BlockStateId, Chunk, ChunkPos, FluidKind,
     Identifier, ItemRegistry, ItemReport, ItemStack, ItemToBlockTable, PlayerInventory,
     WATER_FLOW_DELAY_TICKS, apply_block_edit_to_storage, fluid_test_facts, fluid_test_registry,
-    fluid_tick_edits, insert_fluid_test_chunk, interaction_state_for_blocks,
+    fluid_tick_edits, fluid_wash_drops, insert_fluid_test_chunk, interaction_state_for_blocks,
     plan_bucket_replacement, published_block_precondition, schedule_fluid_ticks_for_interaction,
     schedule_fluid_ticks_near_applied, simulation_channel,
 };
@@ -523,4 +523,179 @@ fn water_lava_interactions_make_solid_blocks() {
             new_state: BlockStateId(1),
         }]
     );
+}
+
+fn wash_test_world() -> (
+    Arc<mc_world::BlockRegistry>,
+    mc_data::block_facts::BlockFactsTable,
+    mc_world::WorldStorage,
+) {
+    let registry = Arc::new(fluid_test_registry());
+    let facts = fluid_test_facts();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    (registry, facts, world)
+}
+
+#[test]
+fn water_washes_poppy_sideways() {
+    let (registry, facts, mut world) = wash_test_world();
+    let blocks = registry.as_ref();
+    let source = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(source, BlockStateId(2)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..source }, BlockStateId(1))
+        .unwrap();
+    let poppy = mc_world::BlockPos { x: 5, y: 64, z: 4 };
+    world.set_block_at(poppy, BlockStateId(22)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..poppy }, BlockStateId(1))
+        .unwrap();
+
+    let edits = fluid_tick_edits(
+        blocks,
+        &facts,
+        &world,
+        source,
+        BlockStateId(2),
+        facts.fluid(2).unwrap(),
+    );
+
+    assert!(edits.contains(&BlockEdit {
+        pos: poppy,
+        new_state: BlockStateId(3),
+    }));
+}
+
+#[test]
+fn water_wash_pops_tall_grass_upper_half() {
+    let (registry, facts, mut world) = wash_test_world();
+    let blocks = registry.as_ref();
+    let source = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(source, BlockStateId(2)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..source }, BlockStateId(1))
+        .unwrap();
+    let lower = mc_world::BlockPos { x: 5, y: 64, z: 4 };
+    let upper = mc_world::BlockPos { x: 5, y: 65, z: 4 };
+    world.set_block_at(lower, BlockStateId(24)).unwrap();
+    world.set_block_at(upper, BlockStateId(25)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..lower }, BlockStateId(1))
+        .unwrap();
+
+    let edits = fluid_tick_edits(
+        blocks,
+        &facts,
+        &world,
+        source,
+        BlockStateId(2),
+        facts.fluid(2).unwrap(),
+    );
+
+    assert!(edits.contains(&BlockEdit {
+        pos: lower,
+        new_state: BlockStateId(3),
+    }));
+    assert!(edits.contains(&BlockEdit {
+        pos: upper,
+        new_state: BlockStateId(0),
+    }));
+}
+
+#[test]
+fn water_coexists_with_seagrass() {
+    let (registry, facts, mut world) = wash_test_world();
+    let blocks = registry.as_ref();
+    let source = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(source, BlockStateId(2)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..source }, BlockStateId(1))
+        .unwrap();
+    let grass = mc_world::BlockPos { x: 5, y: 64, z: 4 };
+    world.set_block_at(grass, BlockStateId(26)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..grass }, BlockStateId(1))
+        .unwrap();
+
+    let edits = fluid_tick_edits(
+        blocks,
+        &facts,
+        &world,
+        source,
+        BlockStateId(2),
+        facts.fluid(2).unwrap(),
+    );
+
+    assert!(!edits.iter().any(|edit| edit.pos == grass));
+}
+
+#[test]
+fn lava_keeps_stop_at_plant_behavior() {
+    let (registry, facts, mut world) = wash_test_world();
+    let blocks = registry.as_ref();
+    let source = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(source, BlockStateId(10)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..source }, BlockStateId(1))
+        .unwrap();
+    let poppy = mc_world::BlockPos { x: 5, y: 64, z: 4 };
+    world.set_block_at(poppy, BlockStateId(22)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { y: 63, ..poppy }, BlockStateId(1))
+        .unwrap();
+
+    let edits = fluid_tick_edits(
+        blocks,
+        &facts,
+        &world,
+        source,
+        BlockStateId(10),
+        facts.fluid(10).unwrap(),
+    );
+
+    assert!(!edits.iter().any(|edit| edit.pos == poppy));
+}
+
+#[test]
+fn fluid_wash_drops_resolve_poppy_item_and_skip_upper_half() {
+    let blocks = fluid_test_registry();
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:poppy").unwrap(),
+        protocol_id: 70,
+    }]);
+    let pos = mc_world::BlockPos { x: 5, y: 64, z: 4 };
+    let applied = vec![
+        AppliedBlockEdit {
+            pos,
+            previous: BlockStateId(22),
+            new_state: BlockStateId(3),
+        },
+        AppliedBlockEdit {
+            pos: mc_world::BlockPos { y: 65, ..pos },
+            previous: BlockStateId(25),
+            new_state: BlockStateId(3),
+        },
+    ];
+
+    let drops = fluid_wash_drops(
+        &blocks,
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &mc_data::item_components::ItemFactsTable::default(),
+        &applied,
+        1234,
+    );
+
+    assert_eq!(drops, vec![(pos, mc_entity::EntityItemStack::new(70, 1))]);
 }

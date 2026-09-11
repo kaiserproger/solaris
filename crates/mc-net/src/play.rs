@@ -374,7 +374,7 @@ use containers::{
     merchant_protocol_offers, merchant_wire_items, select_merchant_offer,
 };
 #[cfg(test)]
-use fluids::{WATER_FLOW_DELAY_TICKS, fluid_tick_edits, supported_flow_state};
+use fluids::{WATER_FLOW_DELAY_TICKS, fluid_tick_edits, fluid_wash_drops, supported_flow_state};
 use fluids::{
     fluid_state_with_level, plan_fluid_ticks_near_applied, scheduled_fluid_planning_chunks,
 };
@@ -9336,7 +9336,7 @@ fn snapshot_read_preconditions_are_current(
 }
 
 async fn run_scheduled_fluid_ticks_owned(
-    _authority: &simulation::SimulationAuthority,
+    authority: &simulation::SimulationAuthority,
     config: &ServerConfig,
     sessions: &SessionRegistry,
     world_read: Option<&mc_world::WorldReadView>,
@@ -9449,6 +9449,7 @@ async fn run_scheduled_fluid_ticks_owned(
     }
 
     if !outcome.applied.is_empty() {
+        spawn_fluid_wash_drops(config, sessions, authority, world_tick, &outcome);
         sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
         broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
         if let Some(table) = table
@@ -9559,6 +9560,45 @@ fn requeue_stale_scheduled_fluid_ticks(
             warn!(%error, pos = ?tick.pos, "stale scheduled fluid tick requeue failed");
         }
     }
+}
+/// Spawn item drops for plants a committed fluid tick washed away. Loot
+/// resolves from the replaced previous states (same rules as survival
+/// breaks, no tool); upper double halves yield nothing.
+fn spawn_fluid_wash_drops(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    authority: &simulation::SimulationAuthority,
+    world_tick: u64,
+    outcome: &BlockEditBatchOutcome,
+) {
+    let Some(entity_type_id) = survival::item_entity_type_id(&config.entity_types) else {
+        return;
+    };
+    let drops = fluids::fluid_wash_drops(
+        &config.blocks,
+        &config.loot,
+        &config.items,
+        &config.item_facts,
+        &outcome.applied,
+        world_tick,
+    );
+    if drops.is_empty() {
+        return;
+    }
+    dispatch_visibility_commands(sessions.spawn_item_drop_batch_owned(
+        authority,
+        drops.into_iter().map(|(pos, stack)| {
+            (
+                entity_type_id,
+                Vec3::new(
+                    f64::from(pos.x) + 0.5,
+                    f64::from(pos.y) + 0.5,
+                    f64::from(pos.z) + 0.5,
+                ),
+                stack,
+            )
+        }),
+    ));
 }
 
 fn commit_scheduled_fluid_tick_plan(

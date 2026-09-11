@@ -1,5 +1,195 @@
 # Solaris current cursor
 
+## Old questions closed (owner decision 2026-09-11)
+
+1. Stale-baked-light repair: NO automatic repair. Rationale: per-edit
+invalidation already covers live changes; a validity bit is new persisted
+state (vanilla-shaped but invasive) and a force-relight-all is unmeasured
+work. Worlds baked pre-fix keep old light until retouched — same wart vanilla
+carries across its own light fixes. Reopen only with a measured complaint.
+2. Lava wash: KEEP stop-at-plant. Rationale: no vanilla evidence for
+lava-vs-plant displacement or drop-burning semantics; changing it would be
+invented behavior. Water wash stands alone as the reported gameplay case.
+
+## Chest-loot startup wiring: done
+
+Startup loads `simple_dungeon` + `village_toolsmith` tables from
+`<vanilla_data_dir>/data` into `TerrainGenerator::with_chest_loot`; missing
+dir/tables warn + keep fixed loot (hermetic fallback test). 8-arg Clippy lint
+fixed by bundling into one `Option<(catalog, items)>` tuple (7 args), not
+suppressed. Validation: server bin 40 passed; strict bin Clippy clean
+(lib-test `stew_effects` initializer is a pre-existing HEAD breakage, left
+alone); fmt + code-health PASS. Covered by the same independent reviewer as
+End (disjoint paths). Nothing staged/committed/pushed.
+
+## End generator foundation: done
+
+`EndGenerator` worker slice (mirrors nether): end-stone island with void rim,
+obsidian pillar ring + bedrock caps, single `the_end` biome, order-free
+overlay, 4 tests green. Validation: worldgen lib 137 passed (nether 4 + end 4
+included); strict Clippy clean; fmt + code-health PASS. Independent reviewer:
+correct, no findings. Portals/travel/multi-world stay queued (needs server
+coordination, Main-owned). Nothing staged/committed/pushed.
+
+## Settlement plugin worker: P1-a done (sibling repo)
+
+`SettlementPlugin` closed `solaris-settlements` P1-a: settlement domain ledger
+(contract 3.1/3.2/3.3-roles/7-records) on API 0.6.0, storage-only. Validation:
+STRICT-OK (real loader discovery+typecheck, fail-closed on unknown capability
+and stray entries) and BEHAVIOR-OK 40/40 (lifecycle, gates, roles,
+conflict-retry, restart recovery, abandon, orphan-free). Receipt:
+`../solaris-default-plugins/server/evidence/solaris-settlements-p1a/receipt.md`.
+Next slice: P1-b intent ledger; most value after core C1 `storage_batch_cas`
+lands. No core files touched; nothing staged/committed/pushed.
+
+## Nether review fixes (same slice)
+
+Reviewer verdict was `incorrect` on tests only (production code held):
+(1) buried-lava assert was inverted — replaced with per-column lava-xor-rock
+exclusion; (2) ceiling-band interior 123..126 unasserted — now pinned to
+bedrock-or-netherrack; (3) determinism never exercised order independence —
+now interleaves neighbors + a second same-seed generator and compares full
+columns. Advisor also caught a real generator bug: buried lava under high
+columns + hollow air to the roof. Fixed to solid body (land = netherrack to
+field, lakes = lava to sea level). Lake frequency retuned (field mean 52,
+range [22,82]) after proving zero lakes across 256 chunks. Constants 32/127
+labeled vanilla, [22,82] labeled Solaris tuning. Revalidated: full
+`mc-worldgen --lib` 133 passed, Clippy/fmt/code-health green. No second
+reviewer (findings fixed per policy). structures `pub use` re-export
+accidentally dropped by a lib.rs edit — restored.
+
+## Structure loot worker: done
+
+`StructLootRolls` closed chest loot rolls at paste time: `TemplateChest` gains
+`loot_table`, rolls are SplitMix64-deterministic per (seed, pos, chest index)
+with vanilla overwrite-into-random-slots semantics, fixed contents stay as
+fallback. New `mc-data/src/loot/chest_26_1_2.rs` compiles the exact JSON
+surface of `simple_dungeon` + `village_toolsmith` and fails closed otherwise.
+Validation (worker): worldgen lib green, 4 new loot tests + 7 chest tests pass,
+Clippy/fmt/code-health green. Queued next: production wiring
+(`ChestLootCatalog::load_vanilla_tables` at startup via `with_chest_loot`;
+live servers still paste fixed loot until then).
+
+## Current checkpoint: nether generator foundation (dimensions slice 1)
+
+New `mc-worldgen/src/nether.rs` (`NetherGenerator`, `ChunkGenerator` impl):
+bedrock floor y=0, fbm height field [26,92], lava sea below 32, netherrack
+body, rough bedrock ceiling cap at 127 (4-deep hashed band), air above to
+256, single `nether_wastes` biome. Deterministic per seed+chunk, order-free.
+Generation-only: no server wiring, no portals/travel/respawn (single-dimension
+architecture queued as its own slice). Multi-biome regions, ores, glowstone,
+fortresses queued.
+
+Changed (new files): `nether.rs` + `nether/tests.rs`; `lib.rs` module export.
+Validation: 4 nether tests (floor/ceiling, body invariants over 16 chunks,
+determinism, missing-block startup error); full `mc-worldgen --lib` 129 passed;
+strict Clippy clean; fmt + code-health PASS. Independent review pending a free
+agent slot (cap 2/2 busy: plugin + structure-loot workers). Maturity `draft`.
+
+Next: End generator (same pattern), structure-loot worker result, portal/
+multi-world architecture, graphical gates.
+
+## Current checkpoint: stale baked light repro (handoff issue 7, migration half)
+
+Headless repro proven (throwaway, removed after green): all-zero block light
+baked over an emission-15 cell is served verbatim at stream with zero compute;
+the same chunk without baked light recomputes nonzero. So chunks baked under
+the old opacity-15/no-ender-7 metadata keep serving darkness after a fixed
+binary is installed, until a light-changing edit retouches them. Per-edit
+invalidation cannot repair them — nothing re-touches them.
+Vanilla precedent (decompiled server-26.1.2.jar, `javap -c`): Anvil stores
+`isLightOn` + light arrays; load applies `setLightCorrect(isLightOn)` and
+false chunks relight through the engine. We have no such bit; baked light is
+trusted unconditionally. Repair choice queued for owner (below) — nothing
+automatic built.
+
+Changed: none kept (throwaway reverted; receipt in subagent history
+`history://StaleLightRepro`). No commit/push. Maturity `draft`.
+
+## Current checkpoint: fluid wash (plant follow-up, water half)
+
+Flowing water now displaces ground-support plants and columns
+(`is_water_washable_plant`: shared ground set + shared column set, minus
+seagrass/tall_seagrass which live submerged). The wash edit carries the
+same read preconditions as any fluid edit; cells above a washed plant pop to
+air through the reused break-path cascade; drops resolve at commit from the
+previous states with survival loot rules (no tool) and a deterministic
+tick+pos seed — upper double halves yield nothing. Lava keeps stop-at-plant
+(queued, not a desync). Block-delta broadcast and light publication order at
+the fluid commit are untouched (one advisor-caught near-miss restored before
+validation).
+
+Follow-up: column match deduped onto shared
+`block_break::is_vertical_support_cascade_block` (no forked list; seagrass
+exclusion stays the single documented water-specific rule, pinned by test).
+Revalidated: fluid_runtime 15/15, `mc-net` Clippy clean, fmt + code-health PASS.
+Lava wash deliberately untouched (no vanilla evidence for lava-vs-plant;
+stays queued, current stop-at-plant is no regression).
+
+Changed: `play/fluids.rs` (predicate + flow arm + cascade + `fluid_wash_drops`),
+`play.rs` (`spawn_fluid_wash_drops` wired into `run_scheduled_fluid_ticks_owned`),
+`play/tests.rs` (fixture +poppy/short_grass/tall_grass-halves/seagrass, old ids
+stable), `play/tests/fluid_runtime.rs` (5 regressions: poppy wash, tall-grass
+cascade, seagrass coexistence, lava stop, poppy-drop/upper-skip loot).
+
+Validation: fluid_runtime 15/15; plants 80; session::tests 283; strict `mc-net`
+Clippy clean; harness `fmt` PASS (`20260911T145709-fmt-p5798_17`), `code-health`
+PASS. Full `mc-net --lib`: 2084 passed, 1 failed —
+`hostile_pathing_keeps_full_speed` ALSO fails on clean HEAD 7518c29d
+(HEAD zombie-speed slice leftover, pin still expects 1.25 vs attribute 2.3);
+left for the slice owner, not re-pinned here. One read-only reviewer: correct,
+no findings. Maturity `draft`; no commit/push without authorization.
+
+Next: bucket OUTLINE nit (low confidence), stale-baked-light migration question,
+all graphical gates. Lava wash queued.
+
+## Current checkpoint: light publication trace (handoff issue 7, ordering half)
+
+Traced immediate, deferred-mutation and deferred-storage relight paths with
+no server-side ordering bug found. Deferred-mutation publishes through
+`publish_computed_light_updates` (conditional publish, recompute fallback);
+deferred-storage checks `incremental_light_sources_are_current` with a full
+`collect_full_light_updates_for_current_world` fallback; the initial stream
+serves baked light when present else computes. `block_edit_changes_light`
+compares emission/opacity/sky, so the chest opacity fix correctly silences
+ordinary-chest relight while the new ender emission 7 correctly triggers it.
+The dark→correct→dark intermittency is not explainable by static metadata
+and was not reproduced headless; it stays open pending the graphical gate
+(client-side staleness vs stream ordering still unverified).
+
+Changed: none (investigation only). No fake resends or forced brightness.
+Validation: focused `mc-net --lib light` 29 passed (covers relight fencing,
+baked publish, prepared-chunk invalidation). Maturity `draft`.
+
+Next: fluid wash (needs drop plumbing in fluid-tick plans), bucket OUTLINE
+nit (low confidence), all graphical gates.
+
+## Current checkpoint: ender chest emission (handoff issue 7, emission half)
+
+Conservative fallback gave every ender_chest state emission 0; vanilla 26.1.2
+`block_light.json` rows for all 8 ender states are `[7, ..]` (ordinary/trapped
+chests are 0). Fix: `conservative_emission` returns 7 for `ender_chest`,
+after the candle branch, before the 0 fallback — reachable, shadow-free
+(no earlier `contains` arm matches). This is the production path: the owner
+server loads `blocks-report-conservative`, not the sidecar report.
+Opacity still follows the chest waterlogged rule (0/1, never 15).
+
+Changed: `mc-data/src/block_light.rs` (branch + `conservative_ender_chest_
+emission_is_seven` regression + ender pin in ignored `real_table_matches_
+known_blocks`, verified passing against local reports).
+
+Validation: `mc-data` full 254+4+2+11+3 passed, strict `mc-data` Clippy clean,
+harness `fmt` PASS (`20260911T142843-fmt-bj5g1rjg`), `code-health` PASS
+(`20260911T142847-code-health-jotfj1vl`). One read-only reviewer: correct,
+no findings. Maturity `draft`; no commit/push without authorization.
+Intermittent dark-chest behavior itself still needs the publication-ordering
+half + graphical gate.
+
+Next: light publication ordering, then fluid wash (needs drop plumbing in
+fluid-tick plans — not a one-line `can_flow_into` widening, which would
+destroy plants without drops). Queued: all graphical gates, bucket OUTLINE
+nit (low confidence, gameplay-only).
+
 ## Owner field follow-up — 2026-09-11 (uncommitted)
 
 Latest priority: delayed leaf drops and expensive random ticks. Leaf fallback

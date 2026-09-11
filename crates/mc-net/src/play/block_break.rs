@@ -640,7 +640,7 @@ pub(super) fn append_vertical_support_cascade(
     }
 }
 
-fn is_vertical_support_cascade_block(path: &str) -> bool {
+pub(super) fn is_vertical_support_cascade_block(path: &str) -> bool {
     matches!(path, "sugar_cane" | "cactus" | "bamboo")
 }
 

@@ -670,6 +670,8 @@ async fn serve(
         plugin_settlement_plan.as_ref(),
     )?;
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
+    let chest_loot = chest_loot_catalog_for_startup(cfg.data.vanilla_data_dir.as_deref())
+        .map(|catalog| (catalog, (*items).clone()));
     let mut terrain_generator = build_terrain_generator(
         cfg.data.seed,
         worldgen_mode,
@@ -677,6 +679,7 @@ async fn serve(
         Arc::clone(&blocks),
         structure_rules,
         plugin_ore_profile,
+        chest_loot,
     )?;
     let gameplay_rules = prepared_plugins
         .as_ref()
@@ -1120,6 +1123,31 @@ async fn join_lua_host(host: mc_script::LuaHost) -> Result<()> {
     Ok(())
 }
 
+fn chest_loot_catalog_for_startup(
+    vanilla_data_dir: Option<&Path>,
+) -> Option<mc_data::loot::chest_26_1_2::ChestLootCatalog> {
+    let dir = vanilla_data_dir?;
+    let tables = [
+        mc_worldgen::structures::VILLAGE_TOOLSMITH_LOOT_TABLE,
+        mc_worldgen::structures::SOLARIS_RUIN_LOOT_TABLE,
+    ];
+    let ids = tables
+        .iter()
+        .map(|table| mc_data::Identifier::parse(*table).expect("static chest loot table"))
+        .collect::<Vec<_>>();
+    match mc_data::loot::chest_26_1_2::ChestLootCatalog::load_vanilla_tables(dir.join("data"), &ids)
+    {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "structure chest loot tables unavailable; pasting fixed chest contents"
+            );
+            None
+        }
+    }
+}
+
 fn build_terrain_generator(
     seed: i64,
     worldgen_mode: mc_worldgen::WorldgenMode,
@@ -1127,6 +1155,10 @@ fn build_terrain_generator(
     blocks: Arc<mc_world::BlockRegistry>,
     structure_rules: mc_worldgen::StructureRules,
     ore_profile: Option<mc_script::LuaWorldgenOreProfile>,
+    chest_loot: Option<(
+        mc_data::loot::chest_26_1_2::ChestLootCatalog,
+        mc_data::items::ItemRegistry,
+    )>,
 ) -> Result<Arc<mc_worldgen::TerrainGenerator>> {
     let biomes = mc_worldgen::BiomeRules::vanilla_overworld();
     let mut generator =
@@ -1135,6 +1167,9 @@ fn build_terrain_generator(
             .with_geometry(geometry)
             .with_mode(worldgen_mode)
             .with_structures(structure_rules);
+    if let Some((catalog, items)) = chest_loot {
+        generator = generator.with_chest_loot(catalog, items);
+    }
     if matches!(
         ore_profile,
         Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits)
@@ -1143,7 +1178,6 @@ fn build_terrain_generator(
     }
     Ok(Arc::new(generator))
 }
-
 fn structure_rules_for_startup(
     seed: i64,
     worldgen_mode: mc_server::WorldgenMode,
@@ -2646,15 +2680,24 @@ mod tests {
     }
 
     #[test]
+    fn chest_loot_catalog_for_startup_falls_back_without_data_dir() {
+        assert!(chest_loot_catalog_for_startup(None).is_none());
+        assert!(
+            chest_loot_catalog_for_startup(Some(std::path::Path::new("/nonexistent-data-dir")))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn build_terrain_generator_rejects_missing_required_block() {
         let blocks = terrain_registry_missing_grass_block();
-
         let err = match build_terrain_generator(
             42,
             mc_worldgen::WorldgenMode::VanillaLike,
             mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
+            None,
             None,
         ) {
             Ok(_) => panic!("missing required terrain block must fail"),
@@ -2689,6 +2732,7 @@ mod tests {
             blocks,
             mc_worldgen::StructureRules::none(),
             None,
+            None,
         )
         .unwrap();
 
@@ -2717,6 +2761,7 @@ mod tests {
             blocks,
             mc_worldgen::StructureRules::none(),
             Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits),
+            None,
         )
         .unwrap();
 
@@ -2860,6 +2905,7 @@ mod tests {
             Arc::clone(&blocks),
             rules.clone(),
             None,
+            None,
         )
         .unwrap();
         let second = build_terrain_generator(
@@ -2869,6 +2915,7 @@ mod tests {
             Arc::clone(&blocks),
             rules,
             None,
+            None,
         )
         .unwrap();
         let baseline = build_terrain_generator(
@@ -2877,6 +2924,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
+            None,
             None,
         )
         .unwrap();
@@ -3079,6 +3127,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             Arc::clone(&blocks),
             mc_worldgen::StructureRules::none(),
+            None,
             None,
         )
         .expect("build production Tellus generator");
