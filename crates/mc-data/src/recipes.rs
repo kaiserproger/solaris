@@ -1345,11 +1345,10 @@ mod tests {
     fn embedded_required_recipes_cover_playable_white_bed() {
         let recipes = solaris_required_recipes();
 
-        let white_bed_display_id = recipes
+        let recipe = recipes
             .iter()
-            .position(|recipe| recipe.result.item.as_str() == "minecraft:white_bed")
+            .find(|recipe| recipe.id.as_str() == "minecraft:zz_playable_white_bed")
             .expect("white bed fallback recipe");
-        let recipe = &recipes[white_bed_display_id];
         assert_eq!(recipe.result.count, 1);
 
         let RecipeKind::Shaped(shaped) = &recipe.kind else {
