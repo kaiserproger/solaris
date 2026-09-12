@@ -684,4 +684,25 @@ mod tests {
         );
         assert!(packet.entries[2].crafting_requirements.is_none());
     }
+
+    #[test]
+    fn initial_recipe_book_round_trips_full_embedded_baseline() {
+        use mc_protocol::packets::{Packet, play::ClientboundRecipeBookAdd};
+
+        let recipes = mc_data::recipes::solaris_required_recipes();
+        let items = mc_data::items::solaris_required_items();
+        let packet = initial_recipe_book(&recipes, &items);
+        // Stonecutting has no book display; everything else must survive.
+        let unsupported = recipes
+            .iter()
+            .filter(|recipe| matches!(recipe.kind, RecipeKind::Stonecutting(_)))
+            .count();
+        assert!(!packet.entries.is_empty());
+        assert_eq!(packet.entries.len(), recipes.len() - unsupported);
+        let mut wire = Vec::new();
+        packet.encode(&mut wire).expect("full baseline encodes");
+        let back = ClientboundRecipeBookAdd::decode(&mut wire.as_slice())
+            .expect("full baseline round-trips");
+        assert_eq!(back, packet);
+    }
 }
