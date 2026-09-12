@@ -33,7 +33,7 @@ fn state_with(
     blocks.by_name_and_props(&state.block.id, &properties)
 }
 
-fn facing_name(direction: Direction) -> &'static str {
+pub(super) fn facing_name(direction: Direction) -> &'static str {
     match direction {
         Direction::North => "north",
         Direction::East => "east",

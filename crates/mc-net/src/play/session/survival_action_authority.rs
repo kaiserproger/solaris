@@ -64,6 +64,36 @@ fn rollback_survival_break(
     }
     Ok(())
 }
+fn broken_furnace_contents(
+    storage: &mut mc_world::WorldStorage,
+    blocks: &mc_world::BlockRegistry,
+    edits: &[BlockEdit],
+) -> Result<Vec<(mc_world::BlockPos, mc_world::FurnaceBlockEntity)>, SimulationRequestError> {
+    let mut contents = Vec::new();
+    for edit in edits {
+        let Some(previous) = storage.get_cached_block(edit.pos) else {
+            continue;
+        };
+        let Some(state) = blocks.by_id(previous) else {
+            continue;
+        };
+        if !matches!(
+            state.block.id.path(),
+            "furnace" | "blast_furnace" | "smoker"
+        ) {
+            continue;
+        }
+        match storage.furnace_block_entity(edit.pos) {
+            Ok(Some(furnace)) => contents.push((edit.pos, furnace)),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(pos = ?edit.pos, ?error, "furnace break cannot read container contents");
+                return Err(SimulationRequestError::WorldMutationFailed);
+            }
+        }
+    }
+    Ok(contents)
+}
 
 impl SessionRegistry {
     pub(in crate::play) fn commit_survival_break(
@@ -119,7 +149,7 @@ impl SessionRegistry {
             };
             (expected_inventory, updated_inventory, changed_slots)
         };
-
+        let furnace_contents = broken_furnace_contents(storage, &plan.blocks, &plan.edits)?;
         let Some(block) = apply_block_edit_batch_to_storage_conditionally(
             storage,
             block_light,
@@ -172,14 +202,42 @@ impl SessionRegistry {
         };
         if !inventory_committed {
             rollback_survival_break(storage, block_light, &block)?;
+            for (pos, furnace) in &furnace_contents {
+                if !storage
+                    .set_furnace_block_entity(*pos, furnace.clone())
+                    .unwrap_or(false)
+                {
+                    return Err(SimulationRequestError::WorldMutationFailed);
+                }
+            }
             return Ok(None);
         }
         let inventory = updated_inventory;
+        let mut furnace_drops = Vec::new();
+        if let Some(entity_type_id) = plan.drops.first().map(|drop| drop.entity_type_id) {
+            for (pos, furnace) in &furnace_contents {
+                for stack in crate::play::scheduled_blocks::furnace_slot_stacks(furnace) {
+                    if stack.is_empty() {
+                        continue;
+                    }
+                    furnace_drops.push((
+                        entity_type_id,
+                        mc_entity::Vec3::new(
+                            f64::from(pos.x) + 0.5,
+                            f64::from(pos.y) + 0.5,
+                            f64::from(pos.z) + 0.5,
+                        ),
+                        super::super::survival::entity_item_stack(stack),
+                    ));
+                }
+            }
+        }
         let dispatches = self.spawn_item_drops_owned(
             authority,
             plan.drops
                 .iter()
-                .map(|drop| (drop.entity_type_id, drop.position, drop.stack.clone())),
+                .map(|drop| (drop.entity_type_id, drop.position, drop.stack.clone()))
+                .chain(furnace_drops),
         );
         Ok(Some(CommittedSurvivalBreak {
             block,

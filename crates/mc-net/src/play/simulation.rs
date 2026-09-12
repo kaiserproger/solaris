@@ -14717,6 +14717,113 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn survival_break_ejects_furnace_fuel_as_item_drops() {
+        let report = mc_data::blocks::solaris_required_blocks_report();
+        let blocks = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let air = blocks
+            .block(&Identifier::parse("minecraft:air").unwrap())
+            .unwrap()
+            .default;
+        let furnace_id = blocks
+            .block(&Identifier::parse("minecraft:furnace").unwrap())
+            .unwrap()
+            .default;
+        let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
+        let pos = BlockPos { x: 1, y: 64, z: 1 };
+        storage
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(
+                    ChunkPos { x: 0, z: 0 },
+                    air,
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage
+            .set_block_at(pos, furnace_id)
+            .expect("place furnace");
+        let token = storage
+            .block_mutation_token(pos)
+            .expect("furnace mutation token");
+        let coal = mc_data::items::solaris_required_items()
+            .id_of(&Identifier::parse("minecraft:coal").unwrap())
+            .expect("coal in item registry");
+        let mut furnace = mc_world::FurnaceBlockEntity::default();
+        furnace.slots[1] = mc_world::FurnaceSlot {
+            item_id: coal,
+            count: 15,
+            ..Default::default()
+        };
+        assert!(
+            storage
+                .set_furnace_block_entity(pos, furnace)
+                .expect("fuel the furnace")
+        );
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let registry = SessionRegistry::new();
+        let session = register_test_session(&registry, "FurnaceBreakMiner");
+        register_test_player_state(&registry, session, PlayerInventory::empty());
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let plan = SurvivalBreakPlan {
+            edits: vec![BlockEdit {
+                pos,
+                new_state: air,
+            }],
+            preconditions: vec![BlockEditPrecondition {
+                pos,
+                expected_state: furnace_id,
+                expected_token: token,
+            }],
+            blocks: Arc::clone(&blocks),
+            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+                &report,
+            )),
+            falling_block_entity_type_id: None,
+            held: SurvivalBreakHeldItem {
+                hotbar_slot: 0,
+                expected: ItemStack::EMPTY,
+                max_damage: None,
+            },
+            drops: vec![SurvivalBreakDrop {
+                entity_type_id: 7,
+                position: Vec3::new(1.5, 64.5, 1.5),
+                stack: EntityItemStack::new(42, 1),
+            }],
+        };
+        let response = handle
+            .for_session(session)
+            .enqueue_player_command(SimulationCommand::CommitSurvivalBreak(Box::new(
+                SurvivalBreakCommand {
+                    actor_session: session,
+                    request: SurvivalBreakRequest::Prepared(plan),
+                },
+            )))
+            .unwrap();
+        assert_eq!(
+            owner
+                .process_tick_with_world(&registry, Some(&world), None, 1)
+                .processed,
+            1
+        );
+        assert!(matches!(
+            response.await.unwrap().unwrap(),
+            SimulationResponse::SurvivalBreak(Ok(Some(_)))
+        ));
+        let dropped: Vec<_> = registry
+            .persisted_entity_records()
+            .into_iter()
+            .filter_map(|record| record.snapshot.item_stack)
+            .collect();
+        assert!(
+            dropped
+                .iter()
+                .any(|stack| *stack == EntityItemStack::new(coal, 15)),
+            "furnace fuel must drop on break, got {dropped:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn survival_break_transaction_survives_requester_loss_after_apply() {
         let (mut storage, pos, token) = test_block_storage();
         let water = BlockPos {

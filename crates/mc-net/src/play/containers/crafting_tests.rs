@@ -467,3 +467,31 @@ fn inventory_quick_move_does_not_auto_equip_unsupported_component_slot() {
     assert_eq!(inventory.slots[36], ItemStack::new(5, 1));
     assert!(inventory.slots[5..=8].iter().all(ItemStack::is_empty));
 }
+
+#[test]
+fn embedded_baseline_crafts_oak_boat_from_plank_u_shape() {
+    let items = mc_data::items::solaris_required_items();
+    let planks = items
+        .id_of(&Identifier::parse("minecraft:oak_planks").unwrap())
+        .unwrap();
+    let boat = items
+        .id_of(&Identifier::parse("minecraft:oak_boat").unwrap())
+        .unwrap();
+    let recipes: Vec<Recipe> = mc_data::recipes::solaris_required_recipes()
+        .into_iter()
+        .filter(|recipe| recipe.id.as_str() == "minecraft:oak_boat")
+        .collect();
+    assert_eq!(
+        recipes.len(),
+        1,
+        "embedded baseline must ship the oak boat recipe"
+    );
+    let item_facts = ItemFactsTable::default();
+    let tags = mc_data::tags::solaris_required_item_tags(&items);
+    let mut window = CraftingTableWindow::new(7);
+    for slot in [0, 2, 3, 4, 5] {
+        window.input[slot] = ItemStack::new(planks, 1);
+    }
+    super::refresh_crafting_result(&items, &item_facts, &tags, &recipes, &mut window);
+    assert_eq!(window.result, ItemStack::new(boat, 1));
+}

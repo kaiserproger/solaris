@@ -109,8 +109,25 @@ pub(super) fn plan_block_placement(
 
     let snapshot = snapshot?;
     let target_state = snapshot.get_cached_block(pos)?;
-    let placed_state = merge_or_waterlogged(blocks, target_state, placed_state)?;
-    let placed = blocks.by_id(placed_state)?;
+    let mut placed_state = merge_or_waterlogged(blocks, target_state, placed_state)?;
+    let mut placed = blocks.by_id(placed_state)?;
+    if placed.block.id.namespace() == "minecraft"
+        && matches!(
+            placed.block.id.path(),
+            "furnace" | "blast_furnace" | "smoker"
+        )
+    {
+        if let Some(direction) =
+            horizontal_direction(horizontal_facing_from_yaw(player_pose.yaw)).map(opposite)
+        {
+            let mut properties = placed.properties.clone();
+            set_prop_if_present(&mut properties, "facing", chest::facing_name(direction));
+            if let Some(oriented) = blocks.by_name_and_props(&placed.block.id, &properties) {
+                placed_state = oriented;
+                placed = blocks.by_id(placed_state)?;
+            }
+        }
+    }
     if chest::is_chest(placed) {
         return append_stair_transition_to_placement(
             blocks,

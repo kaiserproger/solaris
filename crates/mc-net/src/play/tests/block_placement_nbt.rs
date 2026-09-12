@@ -292,6 +292,31 @@ fn slab_placement_uses_clicked_face_and_cursor_height() {
 }
 
 #[test]
+fn furnace_family_placement_faces_the_placing_player() {
+    let blocks = oriented_placement_test_registry();
+    for block in [
+        "minecraft:furnace",
+        "minecraft:blast_furnace",
+        "minecraft:smoker",
+    ] {
+        let held = blocks
+            .block(&Identifier::parse(block).unwrap())
+            .unwrap()
+            .default;
+        assert_eq!(
+            plan_oriented_test_placement(
+                Arc::clone(&blocks),
+                held,
+                180.0,
+                mc_protocol::packets::play::Direction::East,
+                0.5,
+            ),
+            oriented_placement_state(&blocks, block, &[("facing", "south"), ("lit", "false")]),
+        );
+    }
+}
+
+#[test]
 fn torch_placement_uses_the_clicked_horizontal_face_for_wall_facing() {
     let blocks = torch_placement_test_registry();
 

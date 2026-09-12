@@ -1,5 +1,52 @@
 # Solaris current cursor
 
+## GitHub release v0.0.6 republished with current binary
+
+Built exactly per CI release-build (locked, x86_64 target), packaged,
+smoked (VERSION/version/--check), uploaded with --clobber over the old
+assets, installer verified end-to-end into a temp dir. aarch64 asset
+still comes from CI tag runs only.
+
+## v0.0.6 at d8ec969e — journal race test deterministic
+
+CI failed the journal test twice despite the fail-closed record_commits
+flag check: the test asserted post-mortem timing and could win against
+worker teardown. Test now subscribes to the worker's own failure_reporter
+watch channel (plus post-subscribe flag re-check), tokio::test with a
+5s fail-closed timeout — push, not pull, no Instant polling. 30/30 local.
+Production record path unchanged since 881461ca.
+next: watch CI d8ec969e; owner retests recipe book on real client.
+
+## v0.0.6 at 5f72864d — recipe_book_add client kick fixed
+
+Symptom: real 26.1.2 client (NeoForge) kicked at login with
+`Failed to decode packet clientbound/minecraft:recipe_book_add`,
+`NoSuchElementException` inside ingredient decode. Decompiled vanilla
+client.jar + NeoForge universal: vanilla HolderSet tag branch does
+`registry.get(tagKey).orElseThrow`. We shipped 16 item tags in UpdateTags
+but recipes reference 40 (e.g. `minecraft:coals` for torches) — first
+unknown tag kills the client. Fix (5f72864d): added the 27 missing tags
+with vanilla member lists (all members resolve in our ItemRegistry);
+new regression test fails pre-fix naming the tags, green post-fix.
+Reviewer verdict pass (0.9). CI on the tag in flight; real-client retest
+pending with owner.
+
+## v0.0.6 at 881461ca — all known reds fixed, quarantine lifted
+
+Tag v0.0.6 = 881461ca (main pushed). Since 68549c44:
+1. Journal race (CI-only): `record_commits` now checks the writer death flag
+before enqueue — buffered send could succeed mid-teardown, accepting a commit
+never persisted. 30/30 stress green; mc-net lib 2085/0.
+2. Village defense un-quarantined and green (15.4s): root cause was the
+ravager killing the observing player ~tick 230 (live=0 clears active chunks,
+simulation freezes with golem ~3 blocks short). Observer now goes creative;
+no production behavior change. Spawn ~tick 100 (villagers join projections
+only each 100th tick — by design), pursuit ~1 block/s, attack lands ~260.
+Full local L2-equivalent: mc-net lib green + defense file green; CI run on
+the tag is the remaining gate.
+next: watch CI 881461ca; villages gameplay follow-up (golem tuning only with
+vanilla evidence).
+
 ## v0.0.6 republished green (tag moved, main pushed)
 
 Full harness `test` PASS on committed tree
