@@ -3798,8 +3798,8 @@ mod tests {
         assert_eq!(pending, decisions);
     }
 
-    #[test]
-    fn regional_decision_journal_retains_accepted_tail_after_writer_failure() {
+    #[tokio::test]
+    async fn regional_decision_journal_retains_accepted_tail_after_writer_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut journal, _) = FileRegionalDecisionJournal::open(
             tmp.path(),
@@ -3811,6 +3811,24 @@ mod tests {
             RegionalCommitDecision::from_parts(RegionPhase(1), 1, Vec::new(), Vec::new()).unwrap();
         journal.record_commit(&decision).unwrap();
         assert!(journal.writer.flush().is_err());
+        // The background worker dies on the sabotaged path and pushes its
+        // death through the failure reporter. Wait on that push (no polling)
+        // before asserting post-mortem record behavior below.
+        let (death_tx, mut death_rx) =
+            tokio::sync::watch::channel(journal.writer.failed.load(Ordering::Acquire));
+        *journal
+            .writer
+            .failure_reporter
+            .lock()
+            .expect("journal failure reporter") = Some(death_tx);
+        // Re-check after subscribing: the worker may have died while no
+        // reporter was installed (its push was then skipped by design).
+        if !journal.writer.failed.load(Ordering::Acquire) && !*death_rx.borrow() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), death_rx.changed())
+                .await
+                .expect("journal worker reports its own death")
+                .expect("journal worker reports its own death");
+        }
         let later =
             RegionalCommitDecision::from_parts(RegionPhase(2), 2, Vec::new(), Vec::new()).unwrap();
         assert!(journal.record_commit(&later).unwrap_err().outcome_unknown());
