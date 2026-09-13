@@ -109,6 +109,7 @@ pub(super) async fn start_wall_torch_wire_fixture(
         .expect("torch item");
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "wall torch wire fixture".into(),
         max_players: 8,

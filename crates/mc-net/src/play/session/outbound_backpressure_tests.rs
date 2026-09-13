@@ -245,6 +245,7 @@ async fn interleaved_player_and_entity_movements_coalesce_without_disconnect() {
             name: "moving-player".to_owned(),
             properties: Vec::new(),
             pose: PlayerPose::new(f64::from(tick), 64.0, 0.5),
+            game_mode: mc_domain::GameMode::Survival,
         })
     };
 

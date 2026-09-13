@@ -24,13 +24,13 @@ use mc_net::WorldHandle;
 use mc_world::BlockRegistry;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+mod access_control_file_tests;
 pub mod dashboard;
 pub mod dashboard_stats;
 #[cfg(test)]
 #[path = "dashboard_tests.rs"]
 mod dashboard_tests;
-#[cfg(test)]
-mod operator_file_tests;
 pub mod profile;
 pub mod startup_data;
 
@@ -62,6 +62,8 @@ pub struct ServerConfig {
     pub plugins: PluginSection,
     #[serde(default)]
     pub dashboard: DashboardSection,
+    #[serde(default)]
+    pub tab_list: TabListSection,
 }
 
 /// Identity-level server settings.
@@ -132,9 +134,41 @@ impl DashboardSection {
     }
 }
 
+/// Optional player-list (tab menu) header and footer. Both default to
+/// empty, which is the vanilla default (no header/footer lines shown).
+/// TOML basic strings support `\n` escapes for multi-line text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TabListSection {
+    pub header: String,
+    pub footer: String,
+}
+
 /// `world_dir` is the on-disk world save the server reads chunks from
 /// at runtime. The library keeps it optional for synthetic network tests,
 /// but the `mc-server` binary requires it for both `--check` and `serve`.
+/// Built-in settlement profile applied when no plugin deploys a settlement plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementProfile {
+    /// No settlement rules: the stock world generates no villages.
+    #[default]
+    Vanilla,
+    /// Vanilla plains village sections around vanilla village spacing.
+    PlainsVillagePrototype,
+}
+
+impl SettlementProfile {
+    /// Stable name recorded in the persisted world identity.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Vanilla => "vanilla",
+            Self::PlainsVillagePrototype => "plains_village_prototype",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataSection {
@@ -154,6 +188,11 @@ pub struct DataSection {
     pub seed: i64,
     #[serde(default)]
     pub worldgen_mode: WorldgenMode,
+    /// Built-in settlement profile used when no deployed plugin supplies a
+    /// settlement plan. `plains_village_prototype` places vanilla plains
+    /// village sections and needs `vanilla_data_dir`.
+    #[serde(default)]
+    pub settlement_profile: SettlementProfile,
     /// Lowest generated world Y, inclusive.
     #[serde(default = "default_dimension_min_y")]
     pub min_y: i32,
@@ -169,6 +208,7 @@ impl Default for DataSection {
             vanilla_data_dir: None,
             seed: 0,
             worldgen_mode: WorldgenMode::default(),
+            settlement_profile: SettlementProfile::default(),
             min_y: default_dimension_min_y(),
             height: default_dimension_height(),
         }
@@ -329,10 +369,11 @@ impl ServerConfig {
     /// Merge optional file-backed access-control profiles into the inline TOML policy.
     ///
     /// Relative paths are resolved from the directory containing `config_path`.
-    /// When `admin.operators_file` is omitted, an existing `ops.json` beside the
-    /// config is used for the operator profile. File entries use vanilla-style
-    /// JSON objects with `name` and/or `uuid`; extra fields such as operator level
-    /// or ban metadata are ignored deliberately.
+    /// When `admin.operators_file` or `auth.whitelist_file` is omitted, an
+    /// existing `ops.json` or `whitelist.json` beside the config is used, so
+    /// entries written by the console survive a restart. File entries use
+    /// vanilla-style JSON objects with `name` and/or `uuid`; extra fields such as
+    /// operator level or ban metadata are ignored deliberately.
     pub fn load_access_control_files(
         &mut self,
         config_path: &Path,
@@ -351,7 +392,13 @@ impl ServerConfig {
             report.operator_identities = entries.len();
             self.admin.operators.extend(entries);
         }
-        if let Some(path) = self.auth.whitelist_file.clone() {
+        let whitelist_file = self.auth.whitelist_file.clone().or_else(|| {
+            let default = Path::new("whitelist.json");
+            resolve_config_relative_path(config_path, default)
+                .is_file()
+                .then(|| default.to_path_buf())
+        });
+        if let Some(path) = whitelist_file {
             let entries = load_access_control_file(config_path, &path, "auth.whitelist_file")?;
             report.files_loaded += 1;
             report.whitelist_identities = entries.len();
@@ -371,20 +418,62 @@ impl ServerConfig {
     ///
     /// When `admin.operators_file` is absent, the management caller may supply
     /// the default `ops.json` path in memory; startup auto-loads that file when
-    /// it exists beside the selected config. Add/remove preserve unknown profile
-    /// metadata and normalize identities while writing deterministic JSON.
-    /// Removal revokes the complete profile and any overlapping aliases. Mutations
-    /// use a persistent `.lock` sidecar and durable same-directory replacement.
-    /// Management refuses symlink and multiply linked targets rather than silently
-    /// changing which file an existing link updates.
+    /// it exists beside the selected config.
     pub fn manage_operator_file(
         &self,
         config_path: &Path,
         operation: OperatorFileOperation,
     ) -> anyhow::Result<OperatorFileResult> {
-        let configured_path = self.admin.operators_file.as_deref().ok_or_else(|| {
+        self.manage_access_file(config_path, AccessControlTarget::Operators, operation)
+    }
+
+    /// Add an identity to the configured whitelist file.
+    ///
+    /// The console supplies the default `whitelist.json` path in memory when
+    /// `auth.whitelist_file` is unset; startup auto-loads that file when it
+    /// exists beside the selected config.
+    pub fn add_whitelist_identity(&self, config_path: &Path, identity: &str) -> anyhow::Result<()> {
+        self.manage_access_file(
+            config_path,
+            AccessControlTarget::Whitelist,
+            OperatorFileOperation::Add(identity.to_owned()),
+        )?;
+        Ok(())
+    }
+
+    /// Remove an identity from the configured whitelist file.
+    pub fn remove_whitelist_identity(
+        &self,
+        config_path: &Path,
+        identity: &str,
+    ) -> anyhow::Result<()> {
+        self.manage_access_file(
+            config_path,
+            AccessControlTarget::Whitelist,
+            OperatorFileOperation::Remove(identity.to_owned()),
+        )?;
+        Ok(())
+    }
+
+    /// Add, remove, or list identities in one vanilla-style access-control file.
+    ///
+    /// Add/remove preserve unknown profile metadata and normalize identities
+    /// while writing deterministic JSON. Removal revokes the complete profile
+    /// and any overlapping aliases. Mutations use a persistent `.lock` sidecar
+    /// and durable same-directory replacement. Management refuses symlink and
+    /// multiply linked targets rather than silently changing which file an
+    /// existing link updates.
+    fn manage_access_file(
+        &self,
+        config_path: &Path,
+        target: AccessControlTarget,
+        operation: OperatorFileOperation,
+    ) -> anyhow::Result<OperatorFileResult> {
+        let configured_path = target.configured_path(self).ok_or_else(|| {
             anyhow::anyhow!(
-                "operator management requires admin.operators_file in {}",
+                "{} management requires {} in {}",
+                target.subject(),
+                target.field(),
                 config_path.display()
             )
         })?;
@@ -395,16 +484,20 @@ impl ServerConfig {
             .unwrap_or_else(|| Path::new("."))
             .canonicalize()
             .with_context(|| {
-                format!("resolving operator file directory {}", configured.display())
+                format!(
+                    "resolving {} file directory {}",
+                    target.subject(),
+                    configured.display()
+                )
             })?;
         let path = parent.join(
             configured
                 .file_name()
-                .context("operator file path must have a file name")?,
+                .context("access-control file path must have a file name")?,
         );
         let requested_identity = match &operation {
             OperatorFileOperation::Add(raw) | OperatorFileOperation::Remove(raw) => {
-                Some(normalize_operator_identity(raw)?)
+                Some(normalize_access_identity(raw)?)
             }
             OperatorFileOperation::List => None,
         };
@@ -413,16 +506,16 @@ impl ServerConfig {
         let _lock = if matches!(&operation, OperatorFileOperation::List) {
             None
         } else {
-            Some(lock_operator_file(&path)?)
+            Some(lock_access_file(&path)?)
         };
-        let metadata = operator_file_metadata(&path)?;
+        let metadata = access_file_metadata(&path)?;
         let values = if metadata.is_none() && matches!(&operation, OperatorFileOperation::Add(_)) {
             Vec::new()
         } else {
-            read_access_control_values(config_path, &path, "admin.operators_file")?.1
+            read_access_control_values(config_path, &path, target.field())?.1
         };
         let (mut values, mut identities) =
-            canonicalize_operator_profiles(values, "admin.operators_file", &path)?;
+            canonicalize_operator_profiles(values, target.field(), &path)?;
 
         match operation {
             OperatorFileOperation::List => {
@@ -467,7 +560,7 @@ impl ServerConfig {
                 loop {
                     let previous_len = values.len();
                     values.retain(|value| {
-                        let profile = value.as_object().expect("validated operator profile");
+                        let profile = value.as_object().expect("validated access-control profile");
                         let matches = ["name", "uuid"].iter().any(|key| {
                             profile
                                 .get(*key)
@@ -500,11 +593,43 @@ impl ServerConfig {
             }
         }
 
-        write_operator_profiles(&path, &values, metadata.as_ref())?;
+        write_access_profiles(&path, &values, metadata.as_ref())?;
         Ok(OperatorFileResult {
             changed: true,
             identities: identities.into_iter().collect(),
         })
+    }
+}
+
+/// File-backed access-control target for [`ServerConfig::manage_access_file`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessControlTarget {
+    Operators,
+    Whitelist,
+}
+
+impl AccessControlTarget {
+    fn configured_path(self, config: &ServerConfig) -> Option<&Path> {
+        match self {
+            Self::Operators => config.admin.operators_file.as_deref(),
+            Self::Whitelist => config.auth.whitelist_file.as_deref(),
+        }
+    }
+
+    /// Config field named in diagnostics.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Operators => "admin.operators_file",
+            Self::Whitelist => "auth.whitelist_file",
+        }
+    }
+
+    /// Human-readable subject used in diagnostics.
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Operators => "operator",
+            Self::Whitelist => "whitelist",
+        }
     }
 }
 
@@ -674,7 +799,7 @@ fn normalize_profile_identity(key: &str, raw: &str) -> Result<String, String> {
     Ok(name.to_ascii_lowercase())
 }
 
-fn normalize_operator_identity(raw: &str) -> anyhow::Result<String> {
+fn normalize_access_identity(raw: &str) -> anyhow::Result<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         bail!("operator identity cannot be empty; provide a Minecraft username or UUID");
@@ -686,7 +811,7 @@ fn normalize_operator_identity(raw: &str) -> anyhow::Result<String> {
         .map_err(|message| anyhow::anyhow!("invalid operator identity `{raw}`: {message}"))
 }
 
-fn write_operator_profiles(
+fn write_access_profiles(
     path: &Path,
     values: &[serde_json::Value],
     metadata: Option<&std::fs::Metadata>,
@@ -741,7 +866,7 @@ fn write_operator_profiles(
         .with_context(|| format!("replacing and syncing operator file {}", path.display()))
 }
 
-fn operator_file_metadata(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
+fn access_file_metadata(path: &Path) -> anyhow::Result<Option<std::fs::Metadata>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -768,14 +893,14 @@ fn operator_file_metadata(path: &Path) -> anyhow::Result<Option<std::fs::Metadat
     Ok(Some(metadata))
 }
 
-fn lock_operator_file(path: &Path) -> anyhow::Result<std::fs::File> {
+fn lock_access_file(path: &Path) -> anyhow::Result<std::fs::File> {
     let mut name = path
         .file_name()
         .context("operator file path must have a file name")?
         .to_os_string();
     name.push(".lock");
     let lock_path = path.with_file_name(name);
-    operator_file_metadata(&lock_path)?;
+    access_file_metadata(&lock_path)?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1126,6 +1251,10 @@ impl ServerConfig {
             bind_address: SocketAddr::new(ip, self.network.port),
             motd: self.server.motd.clone(),
             max_players: self.server.max_players,
+            tab_list: mc_net::TabListConfig {
+                header: self.tab_list.header.clone(),
+                footer: self.tab_list.footer.clone(),
+            },
             view_distance: self
                 .server
                 .view_distance
@@ -1195,6 +1324,45 @@ fn validate_loaded_chunk_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_profile_defaults_to_vanilla_and_parses_the_builtin() {
+        let default: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            name = "Settlement"
+            motd = "Settlement"
+            [network]
+            bind_address = "127.0.0.1"
+            port = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(default.data.settlement_profile, SettlementProfile::Vanilla);
+        assert_eq!(default.data.settlement_profile.name(), "vanilla");
+
+        let configured: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            name = "Settlement"
+            motd = "Settlement"
+            [network]
+            bind_address = "127.0.0.1"
+            port = 0
+            [data]
+            settlement_profile = "plains_village_prototype"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.data.settlement_profile,
+            SettlementProfile::PlainsVillagePrototype
+        );
+        assert_eq!(
+            configured.data.settlement_profile.name(),
+            "plains_village_prototype"
+        );
+    }
 
     #[test]
     fn dashboard_section_is_default_off_loopback_and_optional() {

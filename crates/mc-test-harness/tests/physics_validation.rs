@@ -1016,6 +1016,7 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
             .expect("entity type report is the exact 26.1.2 registry");
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M43 physics validation".into(),
         max_players: 4,

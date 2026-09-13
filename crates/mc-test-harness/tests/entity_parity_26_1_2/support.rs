@@ -181,6 +181,7 @@ impl SolarisServer {
         let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
         let items = Arc::new(mc_data::items::solaris_required_items());
         let cfg = mc_net::ServerConfig {
+            tab_list: mc_net::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse()?,
             motd: "W07 entity differential harness".into(),
             max_players: 8,

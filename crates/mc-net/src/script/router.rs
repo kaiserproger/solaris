@@ -11,7 +11,6 @@ use super::inventory::{InventoryAdapterError, PluginInventoryAdapter};
 use super::player_query::{PlayerQueryAdapterError, PluginPlayerQueryAdapter};
 use super::storage::{PluginStorageHandle, storage_failure_event};
 use super::teleport::{PluginTeleportAdapter, TeleportAdapterError};
-use super::villager::{PluginVillagerAdapter, VillagerAdapterError};
 use super::zone::PluginZoneAdapter;
 use crate::play;
 use crate::server::{ScriptEventSink, ServerConfig, ShutdownHandle, resolve_script_entity_type};
@@ -35,7 +34,6 @@ pub(crate) struct ScriptRouter {
     inventories: PluginInventoryAdapter,
     storage: Option<PluginStorageHandle>,
     zones: PluginZoneAdapter,
-    villagers: PluginVillagerAdapter,
     teleports: PluginTeleportAdapter,
     player_queries: PluginPlayerQueryAdapter,
 }
@@ -53,7 +51,6 @@ impl ScriptRouter {
         zones: PluginZoneAdapter,
     ) -> Self {
         let inventories = PluginInventoryAdapter::new(scripts.clone());
-        let villagers = PluginVillagerAdapter::new(scripts.clone());
         let teleports = PluginTeleportAdapter::new(scripts.clone());
         let player_queries = PluginPlayerQueryAdapter::new(scripts.clone());
         Self {
@@ -61,7 +58,6 @@ impl ScriptRouter {
             inventories,
             storage,
             zones,
-            villagers,
             teleports,
             player_queries,
         }
@@ -132,9 +128,6 @@ impl ScriptRouter {
             | ScriptCommand::GrantLoaderBlockItem { .. }
             | ScriptCommand::UpsertZone { .. }
             | ScriptCommand::RemoveZone { .. }
-            | ScriptCommand::RequestVillagerBinding { .. }
-            | ScriptCommand::SetVillagerGoal { .. }
-            | ScriptCommand::ReleaseVillagerBinding { .. }
             | ScriptCommand::TeleportPlayer { .. }
             | ScriptCommand::SetWorldTime { .. }
             | ScriptCommand::SetWorldBlock { .. }
@@ -221,12 +214,50 @@ impl ScriptRouter {
                 }
                 ScriptRouterExit::Continue
             }
-            ScriptCommand::PresentClientUi { .. } => {
-                if let Err(error) = context.sessions.route_script_client_ui_command(
+            ScriptCommand::OpenClientView { .. } => {
+                match context.sessions.route_script_open_client_view(
                     admitted,
                     context.config.loader_manifest.as_deref(),
                 ) {
-                    debug!(?error, "admitted client screen command rejected");
+                    Ok(result) => self.scripts.enqueue_event(result.event),
+                    Err(error) => debug!(?error, "admitted client view open rejected"),
+                }
+                ScriptRouterExit::Continue
+            }
+            ScriptCommand::PresentClientView { .. } => {
+                if let Err(error) = context.sessions.route_script_present_client_view(
+                    admitted,
+                    context.config.loader_manifest.as_deref(),
+                ) {
+                    debug!(?error, "admitted client view present rejected");
+                }
+                ScriptRouterExit::Continue
+            }
+            ScriptCommand::CloseClientView { .. } => {
+                if let Err(error) = context.sessions.route_script_close_client_view(
+                    admitted,
+                    context.config.loader_manifest.as_deref(),
+                ) {
+                    debug!(?error, "admitted client view close rejected");
+                }
+                ScriptRouterExit::Continue
+            }
+            ScriptCommand::BeginClientSelection { .. } => {
+                match context.sessions.route_script_begin_client_selection(
+                    admitted,
+                    context.config.loader_manifest.as_deref(),
+                ) {
+                    Ok(result) => self.scripts.enqueue_event(result.event),
+                    Err(error) => debug!(?error, "admitted client selection begin rejected"),
+                }
+                ScriptRouterExit::Continue
+            }
+            ScriptCommand::CancelClientSelection { .. } => {
+                if let Err(error) = context.sessions.route_script_cancel_client_selection(
+                    admitted,
+                    context.config.loader_manifest.as_deref(),
+                ) {
+                    debug!(?error, "admitted client selection cancel rejected");
                 }
                 ScriptRouterExit::Continue
             }
@@ -270,12 +301,6 @@ impl ScriptRouter {
                     Err(error) => warn!(?error, "admitted script zone command rejected"),
                 }
                 ScriptRouterExit::Continue
-            }
-            ScriptCommand::RequestVillagerBinding { .. }
-            | ScriptCommand::SetVillagerGoal { .. }
-            | ScriptCommand::ReleaseVillagerBinding { .. } => {
-                self.route_villager_admitted(admitted, context.sessions)
-                    .await
             }
             ScriptCommand::TeleportPlayer { .. } => {
                 match self
@@ -578,42 +603,6 @@ impl ScriptRouter {
         }
     }
 
-    pub(super) async fn route_villager_admitted(
-        &self,
-        admitted: AdmittedScriptCommand,
-        sessions: &play::SessionRegistry,
-    ) -> ScriptRouterExit {
-        let result = match admitted.request() {
-            ScriptCommand::RequestVillagerBinding { .. } => {
-                self.villagers
-                    .route_binding_admitted(admitted, sessions)
-                    .await
-            }
-            ScriptCommand::SetVillagerGoal { .. } => {
-                self.villagers.route_goal_admitted(admitted, sessions).await
-            }
-            ScriptCommand::ReleaseVillagerBinding { .. } => {
-                self.villagers
-                    .route_release_admitted(admitted, sessions)
-                    .await
-            }
-            _ => Err(VillagerAdapterError::WrongCommand),
-        };
-        match result {
-            Ok(_) => ScriptRouterExit::Continue,
-            Err(
-                VillagerAdapterError::PublicationClosed
-                | VillagerAdapterError::BindingOwner(_)
-                | VillagerAdapterError::TokenUnavailable
-                | VillagerAdapterError::InvalidResult(_),
-            ) => ScriptRouterExit::Stop,
-            Err(error) => {
-                warn!(?error, "admitted villager command rejected");
-                ScriptRouterExit::Continue
-            }
-        }
-    }
-
     pub(super) async fn route_storage_admitted(
         &self,
         admitted: AdmittedScriptCommand,
@@ -859,6 +848,7 @@ mod loader_mutation_tests {
         blocks: Arc<mc_world::BlockRegistry>,
     ) -> ServerConfig {
         ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "loader mutation plugin test".to_owned(),
             max_players: 4,
@@ -1108,6 +1098,7 @@ mod entity_damage_tests {
 
     fn combat_test_config() -> ServerConfig {
         ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "entity combat plugin test".to_owned(),
             max_players: 4,
@@ -1336,6 +1327,7 @@ mod entity_spawn_tests {
 
     fn spawn_test_config() -> ServerConfig {
         ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "entity spawn plugin test".to_owned(),
             max_players: 4,

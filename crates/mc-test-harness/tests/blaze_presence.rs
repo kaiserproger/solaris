@@ -30,6 +30,7 @@ async fn embedded_blaze_fires_small_fireball_and_damages_player_over_tcp() {
     let small_fireball_type_id = entity_type_id(&entity_types, "minecraft:small_fireball");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 blaze TCP".into(),
         max_players: 2,

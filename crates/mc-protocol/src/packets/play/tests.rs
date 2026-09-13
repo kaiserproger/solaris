@@ -430,6 +430,7 @@ fn player_visible_packet_ids_match_javap() {
     assert_eq!(RotateHead::ID, 0x53);
     assert_eq!(ClientboundSetEntityData::ID, 0x63);
     assert_eq!(ClientboundTakeItemEntity::ID, 0x7C);
+    assert_eq!(ClientboundTabList::ID, 0x7A);
 }
 
 #[test]

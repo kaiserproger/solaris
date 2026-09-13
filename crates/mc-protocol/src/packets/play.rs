@@ -3452,6 +3452,41 @@ impl Packet for ClientboundSystemChat {
         })
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundTabList {
+    /// Pre-serialised trusted-`Component` NBT for the header line block.
+    pub header_nbt: Vec<u8>,
+    /// Pre-serialised trusted-`Component` NBT for the footer line block.
+    pub footer_nbt: Vec<u8>,
+}
+
+impl Packet for ClientboundTabList {
+    // Verified against the local vanilla 26.1.2 jars: `GameProtocols`
+    // registers CLIENTBOUND_TAB_LIST at clientbound index 122 = wire id
+    // 0x7A (between CLIENTBOUND_SYSTEM_CHAT at 0x79 and
+    // CLIENTBOUND_TAG_QUERY), and `ClientboundTabListPacket` is a
+    // record of two `Component`s written with the trusted NBT stream codec.
+    const ID: i32 = 0x7A;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.put_slice(&self.header_nbt);
+        buf.put_slice(&self.footer_nbt);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let header = mc_nbt::read_network(buf)?;
+        let footer = mc_nbt::read_network(buf)?;
+        let mut header_nbt = Vec::new();
+        mc_nbt::write_network(&mut header_nbt, &header)?;
+        let mut footer_nbt = Vec::new();
+        mc_nbt::write_network(&mut footer_nbt, &footer)?;
+        Ok(Self {
+            header_nbt,
+            footer_nbt,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerboundChatAck {

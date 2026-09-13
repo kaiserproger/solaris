@@ -68,6 +68,7 @@ async fn incremental_relight_wire_matches_full_recompute() {
         Arc::new(mc_data::block_light::load(&block_light_path).expect("block_light loads"));
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M9.d incremental relight".into(),
         max_players: 8,

@@ -30,6 +30,7 @@ async fn embedded_breeze_wind_charge_damages_triggers_knockback_and_discards_ove
     let wind_charge_type_id = entity_type_id(&entity_types, "minecraft:breeze_wind_charge");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 breeze TCP".into(),
         max_players: 2,

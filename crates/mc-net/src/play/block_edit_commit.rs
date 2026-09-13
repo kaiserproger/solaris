@@ -20,6 +20,8 @@ use super::block_wire::{
 };
 use super::campfire::{CampfireCookingState, is_campfire_block};
 use super::lighting::collect_incremental_light_updates_for_applied_edits;
+#[cfg(test)]
+use super::scheduled_blocks::redstone::schedule_redstone_ticks_near_applied;
 use super::{
     AppliedBlockEdit, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition, InteractionState,
     dispatch_campfire_block_entity_update,
@@ -41,6 +43,13 @@ async fn apply_block_edit_batch_to_world_conditionally(
         preconditions,
         scheduled_block_ticks,
     );
+    if let Some(outcome) = outcome.as_ref() {
+        schedule_redstone_ticks_near_applied(
+            &mut storage,
+            state.sessions.simulation_tick(),
+            &outcome.applied,
+        );
+    }
     drop(storage);
     outcome
 }

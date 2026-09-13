@@ -260,6 +260,7 @@ pub(super) fn session_snapshot(id: SessionId, session: &PlaySession) -> PlayerEn
         name: session.name.clone(),
         properties: session.properties.clone(),
         pose: session.pose,
+        game_mode: session.game_mode,
     }
 }
 

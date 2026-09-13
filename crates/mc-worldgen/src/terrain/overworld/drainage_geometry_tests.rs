@@ -1,4 +1,6 @@
-use super::{DrainageCell, DrainageSample, cell_at, cell_blocks, evaluate_segment, sample};
+use super::{
+    ChannelGeometry, DrainageCell, DrainageSample, cell_at, cell_blocks, evaluate_segment, sample,
+};
 
 #[test]
 fn sampling_matches_complete_reaches_at_cell_boundaries() {
@@ -27,13 +29,16 @@ fn sampling_matches_complete_reaches_at_cell_boundaries() {
                                     },
                                     f64::from(x),
                                     f64::from(z),
-                                    size,
-                                    minimum_bank_width,
+                                    ChannelGeometry {
+                                        cell_blocks: size,
+                                        minimum_bank_width,
+                                        taper_headwaters: false,
+                                    },
                                     &mut expected,
                                 );
                             }
                         }
-                        let actual = sample(seed, x, z, scale, minimum_bank_width);
+                        let actual = sample(seed, x, z, scale, minimum_bank_width, false);
                         assert_eq!(
                             (
                                 actual.channel_weight,

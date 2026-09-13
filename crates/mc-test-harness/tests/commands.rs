@@ -41,6 +41,7 @@ async fn start_server_with_shutdown_and_chunk_pipeline(
     chunk_pipeline: mc_net::ChunkPipelinePolicy,
 ) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M35 commands".into(),
         max_players: 4,
@@ -97,6 +98,7 @@ async fn start_server_with_runtime_control_and_shutdown(
         ..mc_net::ChunkPipelinePolicy::default()
     };
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M100 runtime status".into(),
         max_players: 4,
@@ -281,6 +283,7 @@ async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
 
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua player command wire test".into(),
         max_players: 1,
@@ -493,6 +496,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         .with_generator(generator);
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua block break event wire test".into(),
         max_players: 2,
@@ -1484,6 +1488,7 @@ async fn lua_zone_membership_events_reach_only_the_owner_from_normal_player_move
 
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua zone wire test".into(),
         max_players: 1,
@@ -1600,54 +1605,50 @@ async fn lua_zone_membership_events_reach_only_the_owner_from_normal_player_move
 }
 
 #[tokio::test]
-async fn lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_result() {
+async fn lua_resident_operation_reaches_the_regional_owner_and_returns_targeted_result() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
-    let plugin = plugins.path().join("colony-orders");
+    let plugin = plugins.path().join("colony-residents");
     std::fs::create_dir(&plugin).expect("create plugin directory");
     std::fs::write(
         plugin.join("plugin.toml"),
         r#"
-            id = "villager-goals"
-            name = "Villager Goals"
+            id = "resident-orders"
+            name = "Resident Orders"
             version = "0.1.0"
             api = "0.6.0"
             events = ["player.joined"]
-            capabilities = ["villagers"]
-            spawn_entities = ["minecraft:villager"]
+            capabilities = ["persistent_residents"]
+            required_features = ["persistent_residents"]
         "#,
     )
     .expect("write plugin manifest");
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            local joined_player = nil
+            local joined_player: number = 0
 
             function on_player_joined(event: any)
                 joined_player = event.player_id
-                solaris.spawn_entity("spawn", event.player_id, "minecraft:villager", 1, -59, 1)
+                solaris.query_residents("resident-page", {}, nil)
             end
 
-            function on_entity_spawn_result(event: any)
-                if not event.spawned then
-                    solaris.send_message(joined_player, "villager-spawn:" .. tostring(event.failure))
-                    return
+            function on_operation_result(event: any)
+                if event.request_id == "resident-page" then
+                    solaris.send_message(
+                        joined_player,
+                        "resident-page:"
+                            .. event.state
+                            .. ":" .. event.payload.kind
+                            .. ":" .. event.payload.result.kind
+                            .. ":" .. tostring(#event.payload.result.residents)
+                    )
+                    solaris.release_resident("resident-release", "release-missing", "resident-handle", 0)
+                elseif event.request_id == "resident-release" then
+                    solaris.send_message(
+                        joined_player,
+                        "resident-release:" .. event.state .. ":" .. tostring(event.failure)
+                    )
                 end
-                solaris.bind_nearest_villager("bind", 0, -59, 0, 16)
-            end
-
-            function on_villager_binding_result(event: any)
-                if event.binding_token == nil then
-                    solaris.send_message(joined_player, "villager-binding:" .. tostring(event.failure))
-                    return
-                end
-                solaris.move_villager_to("move", event.binding_token, 8, -59, 2, 0.3)
-            end
-
-            function on_villager_goal_result(event: any)
-                solaris.send_message(
-                    joined_player,
-                    "villager-goal:" .. event.request_id .. ":" .. event.goal .. ":" .. tostring(event.accepted)
-                )
             end
         "#,
     )
@@ -1656,24 +1657,40 @@ async fn lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_resul
         .expect("start Lua host");
     assert_eq!(host.loaded_plugins(), 1);
 
+    let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
+            .expect("open disk-backed world")
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator);
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "Lua villager goal wire test".into(),
+        motd: "Lua resident operation wire test".into(),
         max_players: 1,
-        view_distance: 2,
-        data: Arc::new(mc_data::testing::stub()),
-        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
-        world: None,
-        tags: Arc::new(mc_data::tags::TagsData::default()),
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
+        view_distance: 1,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
         block_light: None,
-        items: Arc::new(mc_data::items::ItemRegistry::default()),
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
         entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
@@ -1688,7 +1705,7 @@ async fn lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_resul
 
     let mut client = Client::connect(addr).await.expect("client connect");
     let _ = client
-        .drive_login(addr, "VillagerGoal")
+        .drive_login(addr, "ResidentOrder")
         .await
         .expect("login");
     client.drive_configuration().await.expect("configuration");
@@ -1696,8 +1713,12 @@ async fn lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_resul
     let _: ClientboundCommands = client.read_typed().await.expect("Commands");
     let _: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     assert_eq!(
-        next_system_chat_text(&mut client).await,
-        "villager-goal:move:follow_position:true"
+        next_system_chat_text_with_limits(&mut client, LUA_TRANSACTION_FRAME_WAIT_LIMITS).await,
+        "resident-page:committed:resident:page:0"
+    );
+    assert_eq!(
+        next_system_chat_text_with_limits(&mut client, LUA_TRANSACTION_FRAME_WAIT_LIMITS).await,
+        "resident-release:rejected:not_found"
     );
 
     drop(client);
@@ -1794,6 +1815,7 @@ async fn lua_inventory_menu_opens_on_the_client_and_routes_click_to_its_owner() 
         .with_item_registry(Arc::clone(&items))
         .with_generator(generator);
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua inventory menu wire test".into(),
         max_players: 1,
@@ -2073,6 +2095,7 @@ async fn lua_inventory_storage_transaction_commits_and_rejects_stale_storage_ato
             .with_generator(generator);
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua inventory storage transaction wire test".into(),
         max_players: 1,
@@ -2285,6 +2308,7 @@ async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operat
 
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua operator command wire test".into(),
         max_players: 2,

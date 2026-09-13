@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,17 +12,20 @@ use mc_nbt::{ListTag, Tag};
 use mc_protocol::packets::play::{BlockChangedAck, GameMode, InteractionHand, ItemStack};
 use mc_protocol::{Compression, Packet};
 use mc_world::{BlockStateId, Chunk, ChunkPos};
+use tokio::sync::mpsc;
 
+use crate::login::LoggedInProfile;
 use crate::play::world_journal::WorldChunkJournal;
 use crate::server::ServerConfig;
 
 use super::{
-    CAMPFIRE_COOKING_SLOT_COUNT, CAMPFIRE_NBT_COOKING_TIMES, CAMPFIRE_NBT_COOKING_TOTAL_TIMES,
-    CampfireCookingState, CampfireCookingTickReport, FurnaceKind, ItemToBlockTable,
-    LEGACY_CAMPFIRE_NBT_REMAINING, LEGACY_CAMPFIRE_NBT_TOTAL, PlayerInventory, SessionRegistry,
+    BlockDelta, BlockEdit, CAMPFIRE_COOKING_SLOT_COUNT, CAMPFIRE_NBT_COOKING_TIMES,
+    CAMPFIRE_NBT_COOKING_TOTAL_TIMES, CampfireCookingState, CampfireCookingTickReport, FurnaceKind,
+    ItemToBlockTable, LEGACY_CAMPFIRE_NBT_REMAINING, LEGACY_CAMPFIRE_NBT_TOTAL, OutboundCommand,
+    PlayerInventory, PlayerPose, SessionRegistry, SimulationRequestError,
     campfire_block_entity_persistent_bytes, campfire_block_entity_persistent_nbt,
     campfire_cooking_state_from_persistent_nbt, campfire_test_interaction_state,
-    compound_int_array_field, containers, handle_campfire_use_on,
+    compound_int_array_field, containers, dispatch_and_clear_setup_packets, handle_campfire_use_on,
     hydrate_persisted_campfire_cooking, play_loop_slow_client_test_config, prop_schema,
     simple_block, simulation_channel, state,
 };
@@ -703,4 +708,355 @@ async fn campfire_tick_does_not_load_cold_chunks_and_is_durable_when_resident() 
         assert_eq!(cooking.slots[0].as_ref().unwrap().ticks_remaining, 1);
     }
     drop(writer);
+}
+
+/// Server-owned batches (settlement structure placement) must reach the
+/// authoritative world through the simulation pipeline: one command carries the
+/// whole batch, the cross-region edits commit, and a replaced campfire's cooking
+/// state is evicted because no writer session runs the visible-edit finalize
+/// pass.
+#[tokio::test]
+async fn server_owned_block_edits_commit_one_batch_and_evict_replaced_campfire_cooking() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:campfire"),
+            simple_block(2, "minecraft:oak_planks"),
+        ])
+        .unwrap(),
+    );
+    let campfire_pos = mc_world::BlockPos { x: 3, y: 70, z: 4 };
+    let planks_pos = mc_world::BlockPos {
+        x: 131,
+        y: 70,
+        z: 4,
+    };
+    let world = Arc::new(tokio::sync::Mutex::new({
+        let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+        for chunk in [ChunkPos { x: 0, z: 0 }, ChunkPos { x: 8, z: 0 }] {
+            storage
+                .insert_generated_chunk(
+                    chunk,
+                    Chunk::empty(
+                        chunk,
+                        BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+        storage.set_block_at(campfire_pos, BlockStateId(1)).unwrap();
+        storage
+    }));
+    let sessions = SessionRegistry::new();
+    let mut cooking = CampfireCookingState::default();
+    assert!(cooking.insert(ItemStack::new(13, 1), ItemStack::new(22, 1), 100));
+    assert!(sessions.restore_campfire_cooking(campfire_pos, cooking));
+    assert!(!sessions.campfire_cooking_state(campfire_pos).is_empty());
+
+    let (handle, mut owner) = simulation_channel();
+    let mut request = Box::pin(handle.apply_server_owned_block_edits(vec![
+        BlockEdit {
+            pos: campfire_pos,
+            new_state: BlockStateId(2),
+        },
+        BlockEdit {
+            pos: planks_pos,
+            new_state: BlockStateId(2),
+        },
+    ]));
+    std::future::poll_fn(|cx| {
+        assert!(
+            Future::poll(request.as_mut(), cx).is_pending(),
+            "request must wait for the simulation owner response"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(handle.snapshot().depth, 1, "request must be enqueued");
+
+    assert_eq!(
+        owner
+            .process_commands_with_world(&sessions, Some(&world), None, 1)
+            .await
+            .processed,
+        1,
+        "the whole server-owned portion is one command"
+    );
+
+    let outcome = request
+        .await
+        .expect("server-owned batch response")
+        .expect("server-owned batch applied");
+    assert_eq!(outcome.applied.len(), 2);
+    let world = world.lock().await;
+    assert_eq!(
+        world.get_cached_block(campfire_pos),
+        Some(BlockStateId(2)),
+        "the replaced campfire is committed"
+    );
+    assert_eq!(
+        world.get_cached_block(planks_pos),
+        Some(BlockStateId(2)),
+        "the same batch commits its cross-region edit"
+    );
+    assert!(
+        sessions.campfire_cooking_state(campfire_pos).is_empty(),
+        "a replaced campfire must not keep cooking state"
+    );
+}
+
+/// A session-fenced handle must be refused before anything is enqueued, so a
+/// fenced caller cannot mutate the world or evict cooking state.
+#[tokio::test]
+async fn server_owned_block_edits_reject_fenced_handle_without_mutation() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:campfire"),
+            simple_block(2, "minecraft:oak_planks"),
+        ])
+        .unwrap(),
+    );
+    let campfire_pos = mc_world::BlockPos { x: 3, y: 70, z: 4 };
+    let world = Arc::new(tokio::sync::Mutex::new({
+        let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+        let chunk = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage.set_block_at(campfire_pos, BlockStateId(1)).unwrap();
+        storage
+    }));
+    let sessions = SessionRegistry::new();
+    let mut cooking = CampfireCookingState::default();
+    assert!(cooking.insert(ItemStack::new(13, 1), ItemStack::new(22, 1), 100));
+    assert!(sessions.restore_campfire_cooking(campfire_pos, cooking));
+
+    let (handle, mut owner) = simulation_channel();
+    let fenced = handle.for_session(1);
+    assert_eq!(
+        fenced
+            .apply_server_owned_block_edits(vec![BlockEdit {
+                pos: campfire_pos,
+                new_state: BlockStateId(2),
+            }])
+            .await
+            .unwrap_err(),
+        SimulationRequestError::InvalidCommand
+    );
+    assert_eq!(handle.snapshot().depth, 0, "nothing may be enqueued");
+    assert_eq!(
+        owner
+            .process_commands_with_world(&sessions, Some(&world), None, 1)
+            .await
+            .processed,
+        0
+    );
+    assert_eq!(
+        world.lock().await.get_cached_block(campfire_pos),
+        Some(BlockStateId(1)),
+        "the world must be unchanged"
+    );
+    assert!(
+        !sessions.campfire_cooking_state(campfire_pos).is_empty(),
+        "cooking state must survive a refused request"
+    );
+}
+
+/// A single-region, fully cached server-owned batch must take the same staged
+/// path as a cross-region one: a session fast lane skips the eviction a
+/// server-owned batch owes, so a replaced campfire would keep cooking state.
+#[tokio::test]
+async fn server_owned_block_edits_evict_cooking_on_a_single_region_batch() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:campfire"),
+            simple_block(2, "minecraft:oak_planks"),
+        ])
+        .unwrap(),
+    );
+    let campfire_pos = mc_world::BlockPos { x: 3, y: 70, z: 4 };
+    let world = Arc::new(tokio::sync::Mutex::new({
+        let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+        let chunk = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage.set_block_at(campfire_pos, BlockStateId(1)).unwrap();
+        storage
+    }));
+    let sessions = SessionRegistry::new();
+    let mut cooking = CampfireCookingState::default();
+    assert!(cooking.insert(ItemStack::new(13, 1), ItemStack::new(22, 1), 100));
+    assert!(sessions.restore_campfire_cooking(campfire_pos, cooking));
+    assert!(!sessions.campfire_cooking_state(campfire_pos).is_empty());
+
+    let (handle, mut owner) = simulation_channel();
+    let mut request = Box::pin(handle.apply_server_owned_block_edits(vec![BlockEdit {
+        pos: campfire_pos,
+        new_state: BlockStateId(2),
+    }]));
+    std::future::poll_fn(|cx| {
+        assert!(
+            Future::poll(request.as_mut(), cx).is_pending(),
+            "request must wait for the simulation owner response"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(handle.snapshot().depth, 1, "request must be enqueued");
+
+    assert_eq!(
+        owner
+            .process_commands_with_world(&sessions, Some(&world), None, 1)
+            .await
+            .processed,
+        1,
+        "a single-region server-owned batch is still one command"
+    );
+
+    let outcome = request
+        .await
+        .expect("server-owned batch response")
+        .expect("server-owned batch applied");
+    assert_eq!(outcome.applied.len(), 1);
+    assert_eq!(
+        world.lock().await.get_cached_block(campfire_pos),
+        Some(BlockStateId(2)),
+        "the replaced campfire is committed"
+    );
+    assert!(
+        sessions.campfire_cooking_state(campfire_pos).is_empty(),
+        "a single-region server-owned batch must evict replaced campfire cooking"
+    );
+}
+
+/// A committed server-owned batch must also be *published*: the simulation
+/// pipeline's post-commit fanout is the only path that turns settlement
+/// structure placement into a client-visible `BlockDeltas` packet, so a loaded
+/// session in the edited chunk has to observe the delta, not just storage.
+#[tokio::test]
+async fn server_owned_block_edits_publish_deltas_to_a_loaded_session() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:campfire"),
+            simple_block(2, "minecraft:oak_planks"),
+        ])
+        .unwrap(),
+    );
+    let target = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    // A same-chunk position the batch never names: the negative half of the
+    // assertion below proves the receiver sees exactly the enqueued edit, not
+    // a blanket chunk update.
+    let never_enqueued = mc_world::BlockPos { x: 2, y: 64, z: 2 };
+    let world = Arc::new(tokio::sync::Mutex::new({
+        let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+        let chunk = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage.set_block_at(target, BlockStateId(0)).unwrap();
+        storage
+            .set_block_at(never_enqueued, BlockStateId(0))
+            .unwrap();
+        storage
+    }));
+
+    let sessions = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(0x5042),
+        name: "ServerOwnedPublication".to_owned(),
+    };
+    let (tx, mut rx) = mpsc::channel(16);
+    let (session_id, _) = sessions.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    dispatch_and_clear_setup_packets(sessions.mark_loaded(session_id, (0, 0)), &mut [&mut rx]);
+
+    let (handle, mut owner) = simulation_channel();
+    let mut request = Box::pin(handle.apply_server_owned_block_edits(vec![BlockEdit {
+        pos: target,
+        new_state: BlockStateId(2),
+    }]));
+    std::future::poll_fn(|cx| {
+        assert!(
+            Future::poll(request.as_mut(), cx).is_pending(),
+            "request must wait for the simulation owner response"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(handle.snapshot().depth, 1, "request must be enqueued");
+
+    assert_eq!(
+        owner
+            .process_commands_with_world(&sessions, Some(&world), None, 1)
+            .await
+            .processed,
+        1,
+        "the whole server-owned portion is one command"
+    );
+
+    let outcome = request
+        .await
+        .expect("server-owned batch response")
+        .expect("server-owned batch applied");
+    assert_eq!(outcome.applied.len(), 1, "the batch must be committed");
+    assert_eq!(
+        world.lock().await.get_cached_block(target),
+        Some(BlockStateId(2)),
+        "the enqueued edit is committed to storage"
+    );
+
+    let commands = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let deltas = commands
+        .iter()
+        .filter_map(|command| match command {
+            OutboundCommand::BlockDeltas(deltas) => Some(deltas.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<&BlockDelta>>();
+    assert!(
+        deltas.iter().any(|delta| delta.x == target.x
+            && delta.y == target.y
+            && delta.z == target.z
+            && delta.state_id == BlockStateId(2)),
+        "the loaded session must observe the committed edit, got {commands:?}"
+    );
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| (delta.x, delta.y, delta.z) == (target.x, target.y, target.z)),
+        "no delta may name a position the batch never enqueued ({never_enqueued:?}), got {commands:?}"
+    );
 }

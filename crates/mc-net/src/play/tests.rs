@@ -107,6 +107,7 @@ mod stale_inventory_drag;
 mod stone_full_cube_collision;
 mod stonecutter;
 mod synthetic_slab_identity_collision;
+mod tab_list;
 mod tall_narrow_fence_collision;
 mod teleport_command_pending_confirmation;
 mod teleport_id_allocator;
@@ -272,6 +273,7 @@ impl AsyncWrite for AllowThenStallWriter {
 
 fn play_loop_slow_client_test_config() -> crate::server::ServerConfig {
     crate::server::ServerConfig {
+        tab_list: crate::server::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "slow-client-test".into(),
         max_players: 1,

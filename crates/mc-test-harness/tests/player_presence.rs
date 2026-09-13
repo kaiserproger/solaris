@@ -94,6 +94,7 @@ async fn start_presence_server(max_players: u32) -> Option<std::net::SocketAddr>
         .map(Arc::new);
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M36 player presence".into(),
         max_players,

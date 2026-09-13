@@ -52,6 +52,7 @@ async fn start_server_with_data_and_loader(
     loader_manifest: Option<std::sync::Arc<mc_net::LoaderManifest>>,
 ) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.e config".into(),
         max_players: 8,
@@ -99,8 +100,8 @@ fn loader_manifest() -> mc_net::LoaderManifest {
                 mc_net::LoaderPlatform::NeoForge,
                 mc_net::LoaderPlatform::Forge,
             ],
-            content: vec![mc_net::LoaderContentKind::Ui],
-            permissions: vec![mc_net::LoaderPermission::PresentUi],
+            content: vec![mc_net::LoaderContentKind::Views],
+            permissions: vec![mc_net::LoaderPermission::PresentViews],
             cache_key: format!("example:screen/1/{}", "a".repeat(64)),
             source_path: None,
             artifact_bytes: None,
@@ -150,6 +151,7 @@ fn script_channel_manifest() -> ValidatedScriptPluginManifest {
 
 async fn start_server_with_script_payloads() -> (SocketAddr, ScriptHostEndpoint) {
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M100 configuration script payloads".into(),
         max_players: 8,
@@ -551,7 +553,7 @@ async fn configuration_loader_manifest_requires_valid_ack_before_play() {
         protocol: mc_net::LOADER_PROTOCOL_VERSION,
         platform: mc_net::LoaderPlatform::NeoForge,
         loader_version: "0.1.0".to_owned(),
-        accepted_permissions: vec![mc_net::LoaderPermission::PresentUi],
+        accepted_permissions: vec![mc_net::LoaderPermission::PresentViews],
         cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
         carrier_block_state_ids: std::collections::BTreeMap::new(),
     };
@@ -686,7 +688,7 @@ async fn configuration_loader_streams_only_the_exact_requested_artifact() {
         protocol: mc_net::LOADER_PROTOCOL_VERSION,
         platform: mc_net::LoaderPlatform::Fabric,
         loader_version: "0.1.0".to_owned(),
-        accepted_permissions: vec![mc_net::LoaderPermission::PresentUi],
+        accepted_permissions: vec![mc_net::LoaderPermission::PresentViews],
         cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
         carrier_block_state_ids: std::collections::BTreeMap::new(),
     };

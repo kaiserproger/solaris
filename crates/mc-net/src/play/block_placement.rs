@@ -116,16 +116,14 @@ pub(super) fn plan_block_placement(
             placed.block.id.path(),
             "furnace" | "blast_furnace" | "smoker"
         )
-    {
-        if let Some(direction) =
+        && let Some(direction) =
             horizontal_direction(horizontal_facing_from_yaw(player_pose.yaw)).map(opposite)
-        {
-            let mut properties = placed.properties.clone();
-            set_prop_if_present(&mut properties, "facing", chest::facing_name(direction));
-            if let Some(oriented) = blocks.by_name_and_props(&placed.block.id, &properties) {
-                placed_state = oriented;
-                placed = blocks.by_id(placed_state)?;
-            }
+    {
+        let mut properties = placed.properties.clone();
+        set_prop_if_present(&mut properties, "facing", chest::facing_name(direction));
+        if let Some(oriented) = blocks.by_name_and_props(&placed.block.id, &properties) {
+            placed_state = oriented;
+            placed = blocks.by_id(placed_state)?;
         }
     }
     if chest::is_chest(placed) {

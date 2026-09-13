@@ -75,6 +75,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
 
     let policy = mc_net::ChunkPipelinePolicy::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M3.g chunk stream".into(),
         max_players: 8,
@@ -310,6 +311,7 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
     };
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M14 movement chunk stream".into(),
         max_players: 8,
@@ -493,6 +495,7 @@ async fn reconnect_during_chunk_prepare_receives_only_the_new_exact_view() {
         ..mc_net::ChunkPipelinePolicy::default()
     };
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "T02 chunk prepare reconnect".into(),
         max_players: 8,

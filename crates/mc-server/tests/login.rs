@@ -50,6 +50,7 @@ async fn start_server_with_policy_and_permissions(
     command_permissions: mc_net::CommandPermissionConfig,
 ) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.d login".into(),
         max_players: 8,

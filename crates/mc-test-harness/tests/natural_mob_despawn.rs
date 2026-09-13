@@ -44,6 +44,7 @@ async fn distant_natural_hostile_hard_despawns_for_nearby_spectator_and_stays_ab
     let zombie_type_id = entity_type_id(&entity_types, "minecraft:zombie");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 natural mob despawn TCP".into(),
         max_players: 4,

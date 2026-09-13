@@ -50,7 +50,9 @@ pub(crate) struct LoginOutcome {
 pub struct LoginAccessConfig {
     pub online_mode: bool,
     pub whitelist_enabled: bool,
-    pub whitelist: std::collections::BTreeSet<String>,
+    /// Live whitelist identities (lowercase name or UUID). Shared with the
+    /// console so entries added at runtime apply to the next login attempt.
+    pub whitelist: Arc<arc_swap::ArcSwap<std::collections::BTreeSet<String>>>,
     pub banned_players: std::collections::BTreeSet<String>,
     session_verifier: Option<Arc<dyn SessionVerifier>>,
     prevent_proxy_connections: bool,
@@ -78,7 +80,9 @@ impl LoginAccessConfig {
         Self {
             online_mode,
             whitelist_enabled,
-            whitelist: normalize_access_set(whitelist),
+            whitelist: Arc::new(arc_swap::ArcSwap::from_pointee(normalize_access_set(
+                whitelist,
+            ))),
             banned_players: normalize_access_set(banned_players),
             session_verifier: None,
             prevent_proxy_connections: false,
@@ -379,11 +383,11 @@ pub(crate) fn access_rejection(
     if access.banned_players.contains(&name) || access.banned_players.contains(&uuid) {
         return Some(LoginRejection::Banned);
     }
-    if access.whitelist_enabled
-        && !access.whitelist.contains(&name)
-        && !access.whitelist.contains(&uuid)
-    {
-        return Some(LoginRejection::Whitelist);
+    if access.whitelist_enabled {
+        let whitelist = access.whitelist.load();
+        if !whitelist.contains(&name) && !whitelist.contains(&uuid) {
+            return Some(LoginRejection::Whitelist);
+        }
     }
     None
 }

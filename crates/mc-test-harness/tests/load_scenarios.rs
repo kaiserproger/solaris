@@ -4532,6 +4532,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
     }
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M37 load scenarios".into(),
         max_players: u32::try_from(options.max_players).expect("load max_players fits u32"),

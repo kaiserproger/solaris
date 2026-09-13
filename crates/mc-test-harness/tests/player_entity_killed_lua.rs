@@ -112,6 +112,7 @@ async fn player_entity_killed_reaches_lua_once_after_the_lethal_melee_commit() {
         .with_generator(generator);
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua entity kill wire test".into(),
         max_players: 1,

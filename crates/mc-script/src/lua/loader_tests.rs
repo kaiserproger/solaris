@@ -42,7 +42,7 @@ fn client_bundle_manifest_covers_all_loader_content_and_cache_fences() {
         &root,
         r#"
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "rich-content"
@@ -51,13 +51,13 @@ artifact = "client/rich-content.zip"
 sha256 = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
 size_bytes = 1
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "ui", "assets", "interactions"]
+content = ["blocks", "items", "views", "view_actions", "assets"]
 permissions = [
   "register_blocks",
   "register_items",
-  "present_ui",
+  "present_views",
+  "send_view_actions",
   "load_assets",
-  "send_interactions",
 ]
 "#,
     );
@@ -75,10 +75,10 @@ permissions = [
         plugin.permissions(),
         &[
             "load_assets",
-            "present_ui",
+            "present_views",
             "register_blocks",
             "register_items",
-            "send_interactions"
+            "send_view_actions"
         ]
     );
     assert_eq!(plugin.total_artifact_bytes(), 1);
@@ -96,7 +96,7 @@ permissions = [
     );
     assert_eq!(
         plugin.client_bundles()[0].content(),
-        &["blocks", "items", "ui", "assets", "interactions"]
+        &["blocks", "items", "views", "view_actions", "assets"]
     );
     assert_eq!(bundle.id(), "rich-content");
     assert_eq!(
@@ -112,9 +112,9 @@ permissions = [
         &[
             LuaClientContentKind::Blocks,
             LuaClientContentKind::Items,
-            LuaClientContentKind::Ui,
+            LuaClientContentKind::Views,
+            LuaClientContentKind::ViewActions,
             LuaClientContentKind::Assets,
-            LuaClientContentKind::Interactions,
         ]
     );
     assert_eq!(
@@ -158,7 +158,7 @@ fn client_bundle_rejects_artifact_bytes_that_do_not_match_the_manifest() {
         &root,
         r#"
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "assets"
@@ -190,7 +190,7 @@ fn client_bundle_missing_content_permission_fails_startup() {
         &root,
         r#"
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "screen"
@@ -199,7 +199,7 @@ artifact = "client/screen.zip"
 sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 size_bytes = 32
 loaders = ["fabric"]
-content = ["ui"]
+content = ["views"]
 permissions = ["load_assets"]
 "#,
     );
@@ -221,7 +221,7 @@ fn client_bundle_rejects_traversal_and_noncanonical_hashes() {
         &root,
         r#"
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "assets"
@@ -252,7 +252,7 @@ fn client_bundle_rejects_cache_path_segments() {
         &root,
         r#"
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "assets"
@@ -332,38 +332,36 @@ async fn shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable() {
                 if provenance.plugin_id() == owner
                     && matches!(
                         request.as_ref(),
-                        ScriptCommand::PresentClientUi {
-                            player_id: target,
-                            presentation,
-                        } if *target == player_id
-                            && presentation.ui_id() == ui_id
-                            && presentation.mode() == crate::ScriptClientUiMode::Screen
+                        ScriptCommand::OpenClientView { request }
+                            if request.player_id() == player_id
+                                && request.owned_view_id() == ui_id
                     )
         ));
     }
 
-    for (owner, interaction_id, payload, expected_message) in [
+    for (owner, action_id, expected_message) in [
         (
             "ruby-live",
             "ruby-live:confirm",
-            "ruby-confirmed",
-            "Ruby Loader interaction reached ruby-live.",
+            "Ruby Loader view action reached ruby-live.",
         ),
         (
             "sapphire-live",
             "sapphire-live:confirm",
-            "sapphire-confirmed",
-            "Sapphire Loader interaction reached sapphire-live.",
+            "Sapphire Loader view action reached sapphire-live.",
         ),
     ] {
         boundary
             .enqueue_targeted_event(
-                ScriptEvent::loader_interaction(
+                ScriptEvent::loader_view_action(
                     owner,
                     player_id,
-                    interaction_id,
-                    crate::ScriptLoaderInteractionPhase::Trigger,
-                    payload,
+                    format!("{owner}:instance-1"),
+                    1,
+                    action_id,
+                    1,
+                    Vec::new(),
+                    None,
                 )
                 .unwrap(),
             )

@@ -18,6 +18,8 @@ use super::{
 use crate::login::LoggedInProfile;
 #[cfg(test)]
 use crate::play::PlayerPose;
+#[cfg(test)]
+use mc_domain::GameMode;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -48,6 +50,7 @@ impl SessionRegistry {
             desired,
             tx,
             pose,
+            game_mode: GameMode::Survival,
             max_sessions: usize::MAX,
             script_operator: false,
             dimension: "minecraft:overworld",
@@ -119,6 +122,7 @@ impl SessionRegistry {
                 properties: registration.properties.to_vec(),
                 entity_id,
                 pose: registration.pose,
+                game_mode: registration.game_mode,
                 center: registration.center,
                 view_distance: registration.view_distance,
                 desired: registration.desired,
@@ -289,6 +293,7 @@ impl SessionRegistry {
             inner.spectator_sessions.remove(&id);
             inner.dead_sessions.remove(&id);
             inner.client_unloaded_sessions.remove(&id);
+            inner.loader_views.disconnect(id);
             inner.player_hurt_resistance.remove(&id);
             inner.active_shields.remove(&id);
             inner.shield_disabled_until.remove(&id);

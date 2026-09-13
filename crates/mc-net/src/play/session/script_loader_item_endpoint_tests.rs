@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use mc_data::Identifier;
+use mc_domain::GameMode;
 use mc_protocol::packets::play::ItemStack;
 use mc_script::ScriptPlayerInventoryFailure;
 use tokio::sync::mpsc;
@@ -81,6 +82,7 @@ fn register_loader_player(
             desired: HashSet::new(),
             tx,
             pose: PlayerPose::new(0.5, 64.0, 0.5),
+            game_mode: GameMode::Survival,
             max_sessions: usize::MAX,
             script_operator: false,
             dimension: "minecraft:overworld",

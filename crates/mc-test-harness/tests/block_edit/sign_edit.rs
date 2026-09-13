@@ -31,29 +31,27 @@ async fn survival_places_sign_and_updates_plain_text() {
         .id_of(&mc_data::Identifier::parse("minecraft:oak_sign").unwrap())
         .expect("oak sign item");
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M74 sign edit".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks,
-        world,
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "M74 sign edit".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks,
+    world,
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy::default(),
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -246,29 +244,27 @@ async fn survival_sign_text_survives_flush_and_reopen() {
         .id_of(&mc_data::Identifier::parse("minecraft:oak_sign").unwrap())
         .expect("oak sign item");
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M100 sign restart persistence".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::clone(&world)),
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "M100 sign restart persistence".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::clone(&world)),
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy::default(),
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {

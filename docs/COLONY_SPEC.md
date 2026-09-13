@@ -1,5 +1,13 @@
 # Colony Plugin Spec (draft for owner approval)
 
+> **Superseded.** The `colony-villager-scaffold` package was removed by the §9
+> clean cutover and replaced by the single server-side
+> `../solaris-default-plugins/solaris-settlements` package, whose settlement,
+> resident, work and order APIs are documented in `docs/PLUGINS.md`. The Rust
+> `villagers` capability this spec references (`bind_nearest_villager`,
+> `move_villager_to`, `set_villager_idle`) was removed by C3. This file is kept
+> as history; do not resurrect the old package.
+
 Scope: server-only Luau plugin `colony-villager-scaffold`, API `0.6.0`, vanilla
 26.1.2 client. Colony identity, roles, orders, and durable intent stay in
 Luau/plugin storage. Rust exposes only generic villager binding and

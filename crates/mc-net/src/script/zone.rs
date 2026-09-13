@@ -233,6 +233,20 @@ impl ZoneRegistry {
             .all(|protection| protection.allows_actor(actor_uuid, operator))
     }
 
+    fn foreign_zone_overlaps(
+        &self,
+        plugin_id: &str,
+        dimension: &str,
+        min: [i32; 3],
+        max: [i32; 3],
+    ) -> bool {
+        self.zones.iter().any(|(key, registered)| {
+            key.plugin_id != plugin_id
+                && registered.zone.dimension() == dimension
+                && zone_overlaps_bounds(&registered.zone, min, max)
+        })
+    }
+
     fn protection_snapshot(&self) -> ZoneProtectionSnapshot {
         let zones = self
             .zones
@@ -551,6 +565,37 @@ impl PluginZoneAdapter {
             .close();
         Ok(())
     }
+
+    /// Whether any zone owned by a plugin other than `plugin_id` intersects
+    /// `bounds` in `dimension`.
+    ///
+    /// Used by the settlement runtime before it reserves a footprint: a foreign
+    /// protected zone must block the placement, exactly like the point query
+    /// does for a single block edit. Fails closed — a poisoned registry reports
+    /// an overlap rather than silently authorising a foreign build.
+    pub(crate) fn foreign_zone_overlaps(
+        &self,
+        plugin_id: &str,
+        dimension: &str,
+        min: [i32; 3],
+        max: [i32; 3],
+    ) -> bool {
+        match self.registry.lock() {
+            Ok(registry) => registry.foreign_zone_overlaps(plugin_id, dimension, min, max),
+            Err(_) => true,
+        }
+    }
+}
+
+fn zone_overlaps_bounds(zone: &ScriptAxisAlignedZone, min: [i32; 3], max: [i32; 3]) -> bool {
+    let zone_min = zone.minimum();
+    let zone_max = zone.maximum();
+    zone_min.x() <= f64::from(max[0])
+        && zone_max.x() >= f64::from(min[0])
+        && zone_min.y() <= f64::from(max[1])
+        && zone_max.y() >= f64::from(min[1])
+        && zone_min.z() <= f64::from(max[2])
+        && zone_max.z() >= f64::from(min[2])
 }
 
 fn zone_contains_block(

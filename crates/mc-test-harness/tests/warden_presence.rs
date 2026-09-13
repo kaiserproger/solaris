@@ -35,6 +35,7 @@ async fn embedded_warden_sonic_boom_charges_and_damages_player_over_tcp() {
         .expect("warden entity type");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 warden TCP".into(),
         max_players: 2,

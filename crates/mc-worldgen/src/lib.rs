@@ -10,11 +10,17 @@ pub mod end;
 pub mod mosaic;
 pub mod nether;
 pub mod noise;
+pub mod settlement_catalog;
+pub mod settlement_sites;
 pub mod structures;
 pub mod terrain;
 
 #[cfg(test)]
 mod mosaic_tests;
+#[cfg(test)]
+mod settlement_catalog_tests;
+#[cfg(test)]
+mod settlement_sites_tests;
 
 pub use end::{
     END_HEIGHT, END_ISLAND_AMPLITUDE, END_ISLAND_BASE_Y, END_ISLAND_FALLOFF, END_ISLAND_RADIUS,
@@ -25,6 +31,20 @@ pub use mosaic::{MosaicConfig, MosaicError, MosaicImages, render_mosaic, write_m
 pub use nether::{
     NETHER_CEILING_Y, NETHER_HEIGHT, NETHER_LAVA_LEVEL, NETHER_MIN_Y, NetherGenerator,
     NetherGeneratorError, nether_geometry,
+};
+pub use settlement_catalog::{
+    BlockEntitySeed, BlockEntitySeedKind, Blueprint, BlueprintBlock, BlueprintCatalog,
+    BlueprintError, BlueprintInstance, BlueprintPoi, BlueprintStage, Cardinal, CatalogError,
+    MAX_BLOCK_ENTITIES_PER_BLUEPRINT, MAX_BLOCKS_PER_BLUEPRINT, MAX_BLUEPRINTS,
+    MAX_CATALOG_DECODED_BYTES, MAX_FOOTPRINT_AXIS, MAX_PALETTE_ENTRIES,
+    MAX_PLACEMENTS_PER_SETTLEMENT, MAX_POI_PER_BLUEPRINT, MAX_SETTLEMENT_VARIANTS,
+    MAX_STAGES_PER_BLUEPRINT, MAX_STREET_CONNECTIONS_PER_BLUEPRINT, PaletteEntry, PlacedBlock,
+    PlacedBlockEntity, PlacedPoi, PoiKind, QuarterTurn, StreetConnection, rotate_block_state,
+};
+pub use settlement_sites::{
+    MAX_ROAD_RADIUS_BLOCKS, MAX_ROAD_WAYPOINTS, MAX_SITES_PER_PAGE, ROAD_NEIGHBOUR_CELLS, RoadEdge,
+    SITE_CELL_BLOCKS, SettlementSelector, SiteCandidate, SiteError, SiteLayout, SitePlacement,
+    SitePoi, SiteVariant,
 };
 pub use structures::{
     PlainsVillagePrototypePart, StructureError, StructureInhabitant, StructureRules,
@@ -37,7 +57,7 @@ pub use terrain::{
 };
 
 /// Changes whenever Solaris intentionally changes newly generated terrain.
-pub const WORLDGEN_REVISION: u32 = 20;
+pub const WORLDGEN_REVISION: u32 = 21;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

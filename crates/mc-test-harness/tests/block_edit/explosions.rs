@@ -584,6 +584,24 @@ async fn survival_tnt_explosion_damages_mob_over_wire() {
     let mut cfg = embedded_playable_config(&data, world, "TNT mob damage wire");
     cfg.block_facts = Arc::new(block_facts);
     let bound = mc_net::bind(cfg).await.expect("bind");
+    // The mob must still be inside the blast when the fuse ends. Its wander is
+    // deliberate and long-range, so pin this one chicken instead of racing it.
+    let mut behavior = mc_data::mob_behavior_26_1_2::MobBehaviorTable::vanilla_26_1_2();
+    let mut chicken_profile = behavior
+        .get_by_name("minecraft:chicken")
+        .expect("vanilla chicken profile")
+        .clone();
+    chicken_profile.movement = mc_data::mob_behavior_26_1_2::MobMovementPolicy::Immobile;
+    behavior
+        .insert_override(
+            mc_data::Identifier::parse("minecraft:chicken").expect("chicken identifier"),
+            chicken_profile,
+        )
+        .expect("immobile chicken profile");
+    bound
+        .entity_behavior_handle()
+        .configure_mob_behavior_table(behavior)
+        .expect("configure the chicken behavior table");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
         let _ = bound.serve().await;

@@ -1,11 +1,25 @@
 {
-  "schema": 1,
-  "ui": [{
+  "schema": 2,
+  "screens": [{
     "id": "sapphire-live:showcase",
+    "kind": "settlement",
     "title": "Sapphire Loader Fixture",
-    "body": "Owner sapphire-live: custom item, block carrier, asset pack, and interaction.",
     "item_id": "sapphire-live:sapphire",
-    "block_id": "sapphire-live:sapphire_block"
+    "block_id": "sapphire-live:sapphire_block",
+    "widgets": [{
+      "type": "paged_table",
+      "id": "roster",
+      "columns": [{"id": "name", "label": "Name", "align": "left", "width_bucket": 2}]
+    }, {
+      "type": "resource_panel",
+      "id": "cost",
+      "label": "Cost",
+      "entries": [{"id": "sapphire", "label": "Sapphire"}]
+    }, {
+      "type": "action_button",
+      "action_id": "confirm",
+      "label": "Confirm Sapphire"
+    }]
   }],
   "blocks": [{
     "id": "sapphire-live:sapphire_block",
@@ -27,22 +41,5 @@
     "path": "assets/sapphire-live/models/block/sapphire_block.json",
     "sha256": "@BLOCK_SHA256@",
     "size_bytes": @BLOCK_SIZE@
-  }, {
-    "id": "sapphire-live:tone_audio",
-    "path": "assets/sapphire-live/sounds/tone.ogg",
-    "sha256": "@SOUND_SHA256@",
-    "size_bytes": @SOUND_SIZE@
-  }],
-  "sounds": [{"id": "sapphire-live:tone"}],
-  "interactions": [{
-    "id": "sapphire-live:confirm",
-    "ui_id": "sapphire-live:showcase",
-    "label": "Confirm Sapphire",
-    "payload": "sapphire-confirmed"
-  }, {
-    "id": "sapphire-live:key",
-    "key": "key.keyboard.g",
-    "label": "Sapphire action",
-    "payload": "sapphire-key"
   }]
 }

@@ -5,21 +5,20 @@ api = "0.6.0"
 player_commands = ["loader_ruby"]
 
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "rich-content"
 version = "1"
 artifact = "client/rich-content.zip"
-sha256 = "8530c181143bc3f1bc4590b95738fae72fd6bf0eae38aac98ea1a3ee2e652158"
-size_bytes = 7697
+sha256 = "cb8358bc94832395b55aa5950195798d43bbe4e3471c6ff07081bef8ef1bf5c4"
+size_bytes = 1073
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "ui", "assets", "interactions", "sounds"]
+content = ["blocks", "items", "views", "view_actions", "assets"]
 permissions = [
   "register_blocks",
   "register_items",
-  "present_ui",
+  "present_views",
+  "send_view_actions",
   "load_assets",
-  "send_interactions",
-  "play_sounds",
 ]

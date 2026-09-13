@@ -35,6 +35,7 @@ async fn lua_player_inventory_transactions_are_atomic_authoritative_and_targeted
             .with_generator(generator);
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua player inventory wire test".into(),
         max_players: 1,
@@ -149,6 +150,7 @@ async fn worldless_runtime_rejects_player_inventory_before_mutation() {
     let items = Arc::new(mc_data::items::solaris_required_items());
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Worldless inventory rejection test".into(),
         max_players: 1,

@@ -12,8 +12,10 @@ optional client content through Solaris Loader.
 
 Solaris ships an optional default-off read-only web dashboard
 (`[dashboard]` in the config, see [`docs/OPERATING.md`](docs/OPERATING.md))
-and the `operator add|remove|list` CLI. The standard plugin pack is explicitly
-opt-in; see [plugin installation](docs/PLUGINS.md#standard-plugin-pack).
+and the `operator add|remove|list` CLI, plus a `pregenerate` subcommand that
+generates and stores a bounded block-coordinate region before startup. The
+standard plugin pack is explicitly opt-in; see
+[plugin installation](docs/PLUGINS.md#standard-plugin-pack).
 
 ## Install v0.0.6 (Linux)
 

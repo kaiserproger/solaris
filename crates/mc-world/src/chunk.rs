@@ -810,6 +810,17 @@ pub trait ChunkGenerator: Send + Sync {
     /// running the generator on every miss would be a perf
     /// regression on a world the player has already touched.
     fn generate(&self, pos: ChunkPos) -> Chunk;
+
+    /// Topmost solid terrain row at an absolute column, before any edit.
+    ///
+    /// Settlement layout grounds its buildings on the same generator the world
+    /// generates from, so the terrain that decides a site's base row is the
+    /// terrain the players will stand on. Generators that cannot answer from an
+    /// analytic height field return `None`, and grounding then fails closed
+    /// instead of inventing a level.
+    fn surface_height(&self, _world_x: i32, _world_z: i32) -> Option<i32> {
+        None
+    }
 }
 
 impl Chunk {

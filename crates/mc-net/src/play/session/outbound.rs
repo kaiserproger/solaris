@@ -3,10 +3,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mc_data::ItemStack;
+use mc_domain::GameMode;
 use mc_entity::{EntityId, EntityItemStack, Rotation, Vec3};
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::{ClientboundExplode, EntityDataValue, LevelEvent, LightData};
+use mc_protocol::packets::play::{
+    ClientboundExplode, EntityDataValue, LevelEvent, LightData, PlayerInfoRemove, PlayerInfoUpdate,
+};
 use mc_world::ChunkPos;
 use mc_world::light::ChunkLight;
 use tokio::sync::mpsc;
@@ -34,6 +37,7 @@ pub(in crate::play) struct PlayerEntitySnapshot {
     pub(in crate::play) name: String,
     pub(in crate::play) properties: Vec<mc_protocol::packets::login::GameProfileProperty>,
     pub(in crate::play) pose: PlayerPose,
+    pub(in crate::play) game_mode: GameMode,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +171,8 @@ pub(in crate::play) enum OutboundCommand {
     SystemChat {
         message: String,
     },
+    PlayerInfo(PlayerInfoUpdate),
+    PlayerInfoRemove(PlayerInfoRemove),
     WorldTime {
         world_time: u64,
         rate: f32,
@@ -274,6 +280,8 @@ impl OutboundCommand {
             | Self::CustomPayload { .. }
             | Self::SystemChat { .. }
             | Self::WorldTime { .. }
+            | Self::PlayerInfo(_)
+            | Self::PlayerInfoRemove(_)
             | Self::Weather(_)
             | Self::WakeFromBed { .. }
             | Self::DisconnectPlayer { .. }

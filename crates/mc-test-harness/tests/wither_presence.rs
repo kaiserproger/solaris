@@ -30,6 +30,7 @@ async fn embedded_wither_fires_skull_that_damages_explodes_and_discards_over_tcp
     let skull_type_id = entity_type_id(&entity_types, "minecraft:wither_skull");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 wither TCP".into(),
         max_players: 2,

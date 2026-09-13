@@ -24,7 +24,7 @@ This reference describes current API `0.6.0`, not the unimplemented replacement.
 
 `mc-net` currently provides plugin storage, zones, server-owned inventory menus,
 inventory/storage and player-inventory transactions, same-dimension teleports,
-connected-player queries, generic villager binding/goals, bounded world/entity
+connected-player queries, durable resident handles, bounded world/entity
 mutations, and committed gameplay events. Domain policy remains in Luau. For
 example, colony identities, roles, orders, and persistence are plugin-owned;
 plugins do not receive Rust world, entity, region, lock, socket, or scheduler
@@ -223,18 +223,24 @@ are not additional callable host functions.
 | Entity mutations | `spawn_entity`, `damage_entity` | [Commands](#commands) |
 | Storage | `storage_get`, `storage_cas`, `storage_delete` | [Commands](#commands) |
 | Durable batch storage | `storage_batch_cas`, `storage_scan`, `operation_status` | [Commands](#commands) |
+| Owned inventory | `query_owned_inventory`, `transfer_owned_items`, `reserve_inventory_items`, `inventory_reservation_status`, `release_inventory_reservation` | [Owned item transfers and reservations](#owned-item-transfers-and-reservations) |
 | Menus | `open_inventory_menu`, `close_inventory_menu` | [Commands](#commands) |
 | Inventory | `inventory_transaction`, `inventory_storage_transaction` | [Commands](#commands) |
 | World and players | `set_world_time`, `set_block`, `list_online_players` | [Commands](#commands) |
 | Zones and teleport | `upsert_zone`, `upsert_protected_zone`, `remove_zone`, `teleport_player` | [Gameplay adapters](#shipped-economy-and-claims) |
-| Villager bindings | `bind_nearest_villager`, `set_villager_idle`, `move_villager_to`, `release_villager_binding` | [Gameplay adapters](#shipped-economy-and-claims) |
-| Loader presentation | `present_client_ui`, `play_client_sound`, `stop_client_sound` | [Client content](#client-content-manifest) |
+| Persistent residents | `claim_resident`, `spawn_resident`, `query_residents`, `release_resident`, `set_resident_pois` | [Durable residents](#durable-residents) |
+| Resident work and orders | `assign_resident_work`, `cancel_resident_work`, `issue_resident_order`, `cancel_resident_order`, `demobilize_resident` | [Resident work and squad orders](#resident-work-and-squad-orders) |
+| Settlement sites | `list_settlement_sites`, `query_settlement_site`, `reserve_resident_site`, `release_resident_site`, `survey_site` | [Settlement sites and staged construction](#settlement-sites-and-staged-construction) |
+| Staged construction | `prepare_structure`, `advance_structure`, `pause_structure`, `cancel_structure`, `structure_status`, `bind_warehouse` | [Settlement sites and staged construction](#settlement-sites-and-staged-construction) |
+| Loader views | `open_client_view`, `present_client_view`, `close_client_view`, `begin_client_selection`, `cancel_client_selection` | [Declarative views](#declarative-views-view-actions-and-world-selection) |
+| Loader presentation | `play_client_sound`, `stop_client_sound` | [Client content](#client-content-manifest) |
 | Loader blocks | `place_loader_block`, `grant_loader_block_item` | [Commands](#commands) |
 
 `rules.lua` is a separate startup data contract, not another runtime host
-namespace. No durable resident handle, physical worker/order API, schema-2
-declarative view API, or settlement-contract operation is available merely
-because it appears in a proposal.
+namespace. No durable resident handle, physical worker/order API or
+settlement-contract operation is available merely because it appears in a
+proposal; the schema-2 declarative view API exists but no shipped package
+declares `[client]`, so it stays unused.
 
 ## Package And Manifest
 
@@ -289,11 +295,10 @@ exists for the Fabric/NeoForge/Forge compatibility matrix.
 | Example | Deployment |
 | --- | --- |
 | `basic-economy` | **Server-only** |
-| `colony-villager-scaffold` | **Server-only** |
 | `geological-mines` | **Server-only** |
 | `land-claims` | **Server-only** |
 | `online-roster` | **Server-only** |
-| `settlement-prototype` | **Server-only** |
+| `solaris-settlements` | **Server-only** (v1; Loader views deferred) |
 | `loader-live-gate` | **Requires Solaris Loader on client** |
 
 ```toml
@@ -335,18 +340,22 @@ disables the vanilla ore pass for that world. Without a declaration the ore
 profile remains `vanilla`. Manifests must use the canonical `realistic_deposits`
 name; changing the ore profile changes the persisted world contract.
 
-Installing `../solaris-default-plugins/settlement-prototype` selects one bounded plains
-village prototype. Solaris loads the vanilla fountain, small-house, and
-toolsmith NBT templates from `data.vanilla_data_dir`, combines the declared
-building templates at stable offsets, and uses the extracted vanilla village
-spacing/separation/salt. Omitting `settlement_buildings` selects all three
-prototype parts. Seed zero fixes the prototype near spawn; other seeds use
-deterministic grassland placement. Missing template data fails startup instead
-of substituting a Solaris-authored building.
+The `colony-villager-scaffold` and `settlement-prototype` packages were removed
+by the §9 clean cutover; `../solaris-default-plugins/solaris-settlements`
+replaces both with one server-side package. It deliberately declares **no**
+`[worldgen]` selector (v1 is server-side only), so installing it does not change
+the ore or settlement world contract. Instead it opts into the catalogue-driven
+runtime by declaring both `world_sites` and `structure_operations` in
+`required_features` **and** shipping an authored `structures/` directory next to
+its manifest — see
+[Blueprint authoring reference](#blueprint-authoring-reference). Startup refuses
+a deployed set in which two packages claim that profile. The legacy
+config-driven `[worldgen] settlement_profile = "plains_village_prototype"`
+declaration below remains the fallback selection for a deployed set that ships
+no catalogue package.
 
-
-Settlement descriptors are startup-only, immutable, and owned by the plugin
-that declares the settlement profile. A plan has at most three uniquely
+The legacy prototype declaration is startup-only, immutable, and owned by the
+plugin that declares it. A plan has at most three uniquely
 selected building templates, 16 named inhabitants, and 16 extension records;
 all ids are lowercase bounded literals. Inhabitants and extensions must
 reference a declared building. Extension ids are materialized as
@@ -445,7 +454,7 @@ A plugin may declare startup-only Solaris Loader bundles in `plugin.toml`:
 
 ```toml
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "rich-content"
@@ -454,29 +463,34 @@ artifact = "client/rich-content.zip"
 sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 size_bytes = 4096
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "ui", "assets", "interactions", "sounds"]
+content = ["blocks", "items", "views", "view_actions", "assets"]
 permissions = [
   "register_blocks",
   "register_items",
-  "present_ui",
+  "present_views",
+  "send_view_actions",
   "load_assets",
-  "send_interactions",
-  "play_sounds",
 ]
 ```
 
-Schema 1 is closed and shared by all three loaders. Each content kind requires
-its matching permission. A plugin may declare at most eight bundles; each
-artifact is capped at 64 MiB, uses a relative canonical path, and carries a
-lowercase 64-character SHA-256. The cache identity is
+Schema **2** is closed and shared by all three loaders; schema-1 bundles fail
+closed and no parallel schema-1 decoder exists. Each content kind requires its
+matching permission pair: `blocks`/`register_blocks`, `items`/`register_items`,
+`views`/`present_views`, `view_actions`/`send_view_actions`,
+`assets`/`load_assets`, `world_previews`/`present_world_previews`,
+`world_selection`/`send_world_selection` and `sounds`/`play_sounds`.
+`entity_presentations`/`present_entities` stay unimplemented and unadvertised
+until a vanilla renderer gap is proven. A plugin may declare at most eight
+bundles; each artifact is capped at 64 MiB, uses a relative canonical path, and
+carries a lowercase 64-character SHA-256. The cache identity is
 `plugin-id:bundle-id/version/sha256`, so changing bytes requires a new identity
 even if an operator reuses a display version.
 
 When at least one bundle is declared, Solaris sends the combined manifest
-during Configuration. The client must acknowledge Loader protocol 2, its exact
-platform and loader version, all required permissions, and every cache identity
-before the server accepts `AcknowledgeFinishConfiguration`. A server with no
-client bundles sends no Solaris Loader payload and preserves the vanilla
+during Configuration. The client must acknowledge Loader wire protocol **3**,
+its exact platform and loader version, all required permissions, and every cache
+identity before the server accepts `AcknowledgeFinishConfiguration`. A server
+with no client bundles sends no Solaris Loader payload and preserves the vanilla
 configuration path.
 
 `solaris --check` and startup discovery logs derive deployment requirements from
@@ -510,114 +524,110 @@ artifact.
 
 A denial emits no artifact request, creates no staging file, and disconnects
 without acknowledgement. Once every cache file is verified, the client reads a
-closed `solaris-client.json` index from the first ZIP entry. The implemented
-index schema accepts owned `ui` (`id`, `title`, `body`, optional
-`item_id`/`block_id`), one owned `blocks` entry (`id`, `model`, `name`), up to 128
-owned `items` (`id`, `base_item`, `name`), and `assets`
-(`id`, canonical `assets/...` path, exact SHA-256, and exact byte size), rejects
-all undeclared archive entries, and bounds the activated registry to 64 UI definitions,
-one block, 128 items, 128 assets, and 64 MiB of asset bytes. A block requires
-`register_blocks` and its exact verified owner model under
-`assets/<namespace>/models/<path>.json`. Every item requires
-`register_items`, a known `minecraft:*` base item, and its exact verified
-`assets/<namespace>/items/<path>.json` definition. It also accepts up to 64 owned
-`interactions` with required `id`, `label`, and static `payload`, plus optional
-`ui_id` and `key`. At least one source is required; both may be supplied.
-`ui_id` must reference UI declared by the same bundle; one screen-mode view has
-at most eight actions. Labels are at most 64 UTF-8 bytes, payloads at most
-4 KiB, and ids at most 128 bytes. A key-only bundle needs `interactions` and
-`send_interactions`, not dummy UI or `present_ui`.
-The index also accepts up to 64 owned `sounds` entries, each containing only
-`id`. A sound requires `sounds`/`play_sounds` and a same-bundle verified asset at
-`assets/<owner>/sounds/<id-path>.ogg`, under the existing `assets`/`load_assets`
-contract and byte limits. The shared Minecraft adapter checks mono OGG Vorbis
-headers and initial decoded audio, then generates `assets/<owner>/sounds.json`;
-an asset may not overwrite that generated index.
+closed `solaris-client.json` index (schema 2) from the first ZIP entry. The
+index is a closed object of `screens`, `world_previews`, `blocks`, `items`,
+`assets` and `sounds`; unknown fields, unknown widget types and out-of-bound
+geometry fail activation. The implemented widget set is `paged_table`, `tabs`,
+`input_number`, `input_text`, `select_enum`, `resource_panel`, `action_button`
+and `world_marker`; there is no HTML/JS, arbitrary Java, filesystem access or
+client-side scripting. Screens declare one of the six kinds `settlement`,
+`construction`, `economy`, `garrison`, `army` or `hud`. The index accepts one
+owned `blocks` entry (`id`, `model`, `name`), up to 128 owned `items` (`id`,
+`base_item`, `name`), up to 64 `world_previews` (`id`, `blueprint_id`, 64-hex
+`content_hash`, one quarter-turn `rotation`, `size_x/y/z` at most 64, and at
+most 65,536 local `blocks`), and `assets` (`id`, canonical `assets/...` path,
+exact SHA-256, exact byte size). It rejects all undeclared archive entries and
+bounds the activated registry to 64 screens, 64 previews, one block per bundle
+(eight total), 128 items, 128 assets, 64 sounds and 64 MiB of asset bytes. A
+block requires `register_blocks` and its exact verified owner model under
+`assets/<namespace>/models/<path>.json`; every item requires `register_items`
+and its exact verified `assets/<namespace>/items/<path>.json` definition. Up to
+64 owned `sounds` entries contain only `id` and require `sounds`/`play_sounds`
+plus a same-bundle verified `assets/<owner>/sounds/<id-path>.ogg`.
+
 Fabric, NeoForge, and Forge publish the same immutable registry before
 acknowledgement and retain it into Play. Denied, malformed, or unverified
-bundles never publish content. A plugin whose bundle declares `ui` plus
-`present_ui` uses one presentation API:
+bundles never publish content. Every verified asset path under
+`assets/<namespace>/...` is also published as that exact Minecraft resource id
+through one transient required pack. The client sends the Loader
+acknowledgement only after the pack reload exposes the exact verified bytes. A
+close event from that same Configuration connection removes the pack and
+reloads resources; a stale close cannot remove a newer connection's pack.
+
+### Declarative views, view actions and world selection
+
+A plugin whose bundle declares `views` plus `present_views` owns a bounded,
+server-authoritative view instance per player:
 
 ```lua
-solaris.present_client_ui(player_id, "plugin-id:status", {
-    mode = "hud", -- "screen", "hud", or "hidden"; required
-    title = "Status", -- optional
-    body = "Ready", -- optional
-})
+solaris.open_client_view(request_id, player_id, "plugin-id:showcase", model)
+solaris.present_client_view(player_id, view_instance_id, expected_revision, model)
+solaris.close_client_view(player_id, view_instance_id)
+solaris.begin_client_selection(request_id, player_id, view_instance_id,
+    view_revision, "plugin-id:place", constraints)
+solaris.cancel_client_selection(player_id, selection_context_id)
 ```
 
-`screen` opens a modal view with its declared item/block display and interaction
-buttons. `hud` shows or replaces a non-interactive title/body panel without
-taking input focus; it closes only a modal view of that same UI id. `hidden`
-removes that id's HUD or modal view without closing another owner's UI.
-Omitted text uses the verified bundle definition, not a previous dynamic value;
-an empty string is an explicit empty override. UI ids and titles are bounded to
-128 UTF-8 bytes each, bodies to 8 KiB. HUD panels use at most eight rows and 256
-GUI pixels of width, stay within the viewport, and respect Minecraft's hide-GUI
-setting. They are not an arbitrary layout or client-scripting API.
+`model` is a closed table of `page`, `page_count`, at most 64 `rows`
+(`cells`), at most 16 typed `fields` (exactly one of `number`/`text`/`selected`
+each), at most 16 `actions` (`action_id`, `enabled`, optional `label` and
+`deny_reason`), at most 16 `tabs`, at most 16 `resource_entries`
+(`id`/`have`/`need`), at most 16 `markers` (`marker_id`, optional
+`selection_token`, `action_id`, `formation`, `radius`) and an optional `reason`.
+Every string has an explicit byte bound, every number must be finite, and the
+encoded message is at most 64 KiB. `open_client_view` mints an opaque instance
+id and revision bound to the exact live session, the plugin owner, the verified
+view definition, the action whitelist and the presented typed field schema.
+`present_client_view` CAS-replaces the model and revision and invalidates prior
+actions and selection contexts. `close_client_view` from either side deletes the
+instance and its contexts; delivery into a closed instance is refused. The
+plugin learns the instance id and revision from `on_client_view_opened(event)`,
+and selection context ids from `on_client_selection_started(event)`.
 
-Solaris routes `solaris:loader/ui` only to the exact player session that
-completed Loader acknowledgement; vanilla, disconnected, closed, and unknown
-sessions are rejected. The payload is big-endian protocol `u16`, mode `u8`
-(`0=screen`, `1=hud`, `2=hidden`), then `u16`-length-prefixed id, title and body.
-An optional text length of `0xffff` means use the bundle value; the maximum
-payload is 8,457 bytes. Invalid modes, UTF-8, lengths and trailing bytes are
-rejected. All three adapters resolve only an activated id from the packet's
-exact originating connection and use the shared Minecraft presenter.
-Activation/logout clears HUD state before another connection can reuse it.
-Every verified asset path under `assets/<namespace>/...` is also published as
-that exact Minecraft resource id through one transient required pack. The
-client sends the Loader acknowledgement only after the pack reload exposes the
-exact verified bytes. A close event from that same Configuration connection
-removes the pack and reloads resources; a stale close cannot remove a newer
-connection's pack.
+Server-to-client wire **3** messages travel on `solaris:loader/view`:
+`open_view { view_instance_id, revision, view_id, title, model }`,
+`present_view { view_instance_id, revision, model }` and
+`close_view { view_instance_id }`. Client-to-server messages travel on
+`solaris:loader/view_action`: `view_action { view_instance_id, view_revision,
+action_id, action_sequence, fields[], selection_token? }`,
+`cancel_selection { selection_context_id }` and the key-driven
+`view_request { request_kind }` with `request_kind` in `{settlement, army}`.
+`view_request` is admitted only by the authenticated session, the plugin that
+owns that player's declared view of that kind and its `present_views` grant; no
+owner, no permission or no declared view of that kind opens nothing and
+publishes no event. The owner receives `on_loader_view_request(event)`.
 
-### Declared keyboard actions and UI interactions
+A `view_action` is admitted only after the server re-reads the instance,
+revision, the owner's granted `view_actions`/`send_view_actions` pair and the
+presented typed field schema: a stale revision, a closed instance, a foreign
+owner, a disabled action, a substituted field id/type or a client-minted
+price/quantity/actor is refused. `action_sequence` dedup is scoped to
+(session, view instance) and is not an operation id; a plugin that needs
+exactly-once creates its own durable operation id. The owner receives
+`on_loader_view_action(event)` with the instance id, revision, action id,
+sequence, typed fields and echoed selection token.
 
-An activated screen renders its `ui_id` interactions as buttons. Keyboard
-actions use canonical Minecraft names, for example:
+A world selection is armed by the server, never requested by the client for
+itself. `begin_client_selection` issues an opaque context bound to the exact
+session, owner, instance, revision, action, constraints and a simulation-tick
+expiry. The context id reaches the client only through a marker's
+`selection_token` of the next presented model; `begin_client_selection` also
+requires `world_selection`/`send_world_selection`. One accepted point consumes
+the context, and re-sending a consumed context returns the same admission
+result with no new effect. View replacement, close, disconnect and permission
+revocation invalidate contexts. The derived target/position proof is produced
+server-side from the validated fields after the client's point is checked
+against authoritative pose, line of sight, range, claims and affiliation. A
+marker whose `preview_id` does not resolve to a verified `world_previews` entry
+of the same bundle blocks preview/confirm instead of approximating.
 
-```json
-{"id":"my-plugin:ability","key":"key.keyboard.g","label":"Ability","payload":"activate"}
-```
+**No shipped package declares `[client]` today.** The whole view surface is
+implemented and unit-tested in core but unused: nothing Loader-facing becomes
+enabled for a package until a package opts in. The corresponding Loader side is
+`solaris-loader` (wire 3, schema 2); there is no server-only fallback for a
+package that requires it.
 
-Letters, digits, F1–F25, keypad and named special keys are supported.
-Unknown keys, `key.keyboard.unknown`, and mouse names are rejected. These are
-fixed bundle declarations, not rebinding, chords, mouse/scroll/gamepad support
-or arbitrary client scripting.
-
-Both sources use `solaris:loader/interaction` while the exact definition and
-originating connection remain current. Solaris accepts it only from that
-player's Loader-acknowledged Play session, requires the owner's `interactions`
-and `send_interactions`, and targets only that owner's
-`on_loader_interaction(event)` handler:
-
-```lua
-function on_loader_interaction(event)
-    -- event.player_id, event.interaction_id, event.payload
-    -- event.phase: "trigger" for a UI button, "press" or "release" for a key
-end
-```
-
-Held state is bounded by declared actions; autorepeat produces no extra edges.
-Two owners may bind the same key and each receives its own action. Menu,
-overlay, or window-focus loss releases held actions; a fresh press is required
-after suppression. All three adapters observe the start of the native keyboard
-callback without cancelling vanilla handling. A menu-closing Escape remains
-menu input; screenshot, fullscreen, inventory and movement remain vanilla.
-Activation/disconnect discards old bindings and cannot address a new session.
-
-Loader wire protocol **2** encodes big-endian `u16 protocol`, `u8 phase`
-(`0=trigger`, `1=press`, `2=release`), then `u16`-length-prefixed UTF-8 id and
-payload, at most 4,231 bytes. Unknown versions/phases, invalid UTF-8 or lengths,
-truncation and trailing bytes are rejected. There is no protocol-1 decoder;
-build Loader and server from the same source revision. Plugin API stays `0.6.0`.
-
-Client phases and payloads remain untrusted input, not proof of a physical
-device or authority to mutate gameplay. The server does not track physical held
-keys; plugins own their mechanic state and player-disconnect cleanup. The
-namespace/session fences only authorize delivery to the owning plugin.
-
+A plugin can play or stop its activated owner sound for one player:
 A plugin can play or stop its activated owner sound for one player:
 
 ```lua
@@ -639,7 +649,7 @@ completion events. Disconnect stops Loader playback; reconnect does not resume i
 Both commands pass through `ScriptBoundary`, require the caller's namespace and
 declared `sounds`/`play_sounds`, and route only to a live acknowledged Loader
 session. The client independently requires that exact connection and activated
-sound definition. The Play channel `solaris:loader/sound` uses protocol **2**:
+sound definition. The Play channel `solaris:loader/sound` uses protocol **3**:
 big-endian `u16 protocol`, `u8 mode` (`0=stop`, `1=personal`, `2=positioned`),
 `u16` byte length and UTF-8 sound id (at most 128 bytes); play adds `f32 volume`
 and `f32 pitch`; positioned play adds `f64 x`, `y`, `z`. The total is at most
@@ -751,11 +761,16 @@ fail synchronously; an unknown capability rejects discovery.
 | --- | --- |
 | `storage` | `storage_get`, `storage_cas`, `storage_delete` |
 | `storage_batches` | `storage_batch_cas`, `storage_scan`, `operation_status`; also requires `required_features = ["storage_batches"]` |
+| `inventory_transfers` | `query_owned_inventory`, `transfer_owned_items`, `reserve_inventory_items`, `inventory_reservation_status`, `release_inventory_reservation`; also requires `required_features = ["inventory_transfers"]` |
 | `inventory_menus` | `open_inventory_menu`, `close_inventory_menu` |
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
 | `player_inventory` | `inventory_transaction` |
 | `zones` | `upsert_zone`, `upsert_protected_zone`, `remove_zone`, owned zone entry/exit events |
-| `villagers` | `bind_nearest_villager`, `set_villager_idle`, `move_villager_to`, `release_villager_binding` |
+| `persistent_residents` | `claim_resident`, `spawn_resident`, `query_residents`, `release_resident`, `set_resident_pois`; also requires `required_features = ["persistent_residents"]` |
+| `resident_work` | `assign_resident_work`, `cancel_resident_work`; also requires `required_features = ["resident_work"]` |
+| `resident_orders` | `issue_resident_order`, `cancel_resident_order`, `demobilize_resident`; also requires `required_features = ["resident_orders"]` |
+| `world_sites` | `list_settlement_sites`, `query_settlement_site`, `reserve_resident_site`, `release_resident_site`, `survey_site`; also requires `required_features = ["world_sites"]` |
+| `structure_operations` | `prepare_structure`, `advance_structure`, `pause_structure`, `cancel_structure`, `structure_status`, `bind_warehouse`; also requires `required_features = ["structure_operations"]` |
 | `player_teleport` | `teleport_player` |
 | `player_queries` | `list_online_players` |
 | `entity_damage` | `damage_entity` |
@@ -861,9 +876,6 @@ targeted event does not need a broad subscription to reach its owner.
 | `entity.spawn_result` | `on_entity_spawn_result` | `request_id`, `player_id`, `entity_type`, `x`, `y`, `z`, `spawned`, `failure` |
 | `entity.damage_result` | `on_entity_damage_result` | `request_id`, `entity_id`, `amount`, `damaged`, `health`, `killed`, `failure` |
 | `player.online_result` | `on_player_online_result` | `request_id`, `players`, `truncated` |
-| `villager.binding_result` | `on_villager_binding_result` | `request_id`, `binding_token`, `binding_expires_at_tick`, `failure` |
-| `villager.goal_result` | `on_villager_goal_result` | `request_id`, `goal`, `accepted`, `failure`, optional `x`, `y`, `z`, `speed` |
-| `villager.release_result` | `on_villager_release_result` | `request_id`, `accepted`, `failure` |
 
 `player.custom_payload` is targeted like `player.command`: the host routes it
 only to the plugin that owns `channel`, never broadcasts it. A handler must
@@ -1211,6 +1223,463 @@ and 64 MiB of charged snapshot data including cursor/key overhead. Snapshot
 creation scans only the bounded owner namespace, not the world or other plugins.
 Retained immutable records share their values with live storage; quota accounting
 still charges the full retained value size.
+
+**Durable residents**
+
+These calls require both `capabilities = ["persistent_residents"]` and
+`required_features = ["persistent_residents"]`. As with durable batch storage, an
+unknown required feature, or this capability without its required feature, fails
+package admission.
+
+```luau
+solaris.claim_resident(request_id, operation_id, actor_id, entity_uuid, expected_entity_revision)
+solaris.spawn_resident(request_id, operation_id, spawn_site_token, profile)
+solaris.query_residents(request_id, handles, cursor)
+solaris.release_resident(request_id, operation_id, handle, expected_revision)
+solaris.set_resident_pois(request_id, operation_id, handle, home_poi, work_poi, meeting_poi, expected_revision)
+```
+
+A resident `handle` is an opaque owner-scoped string, not an entity id or a
+pointer. It addresses the same NPC after restart, unload/reload and region
+migration; a handle stolen by another plugin yields `forbidden`, and a UUID or a
+coordinate supplied by the caller never grants authority. Owner comes from the
+admitted plugin, actor from the authenticated session.
+
+`claim_resident` adopts a live adult villager: the entity must be a loaded
+`minecraft:villager` with no other owner, inside `MAX_RESIDENT_CLAIM_DISTANCE`
+of the actor's authenticated pose in the simulated dimension.
+`expected_entity_revision` is core's durable record revision for that entity, or
+`0` when the entity has no resident record yet. A plugin that already owns the
+NPC gets its existing handle back and never re-claims. `spawn_resident` consumes
+one core-issued `spawn_site_token`; a consumed, released, or foreign token is
+refused, and repeating the same `operation_id` with the same fingerprint returns
+the stored outcome instead of a second resident. `set_resident_pois` binds the
+same resident to owner-scoped POI handles; `nil` clears one binding.
+
+`query_residents` takes at most 64 handles, or a cursor over the plugin's own
+resident pages (64 records per page, `cursor_expired` for an unknown cursor), and
+returns per handle: entity UUID, lifecycle, revision, generation id, POIs, and
+live pose/health/carried items while the chunk is loaded.
+
+Lifecycle states are `alive_loaded`, `alive_unloaded`, `dead`, `released`.
+`unloaded` is not `dead` and never justifies replacing a fighter with the nearest
+villager. A dead or converted entity leaves a heavy tombstone that keeps the
+handle bound (blocking a silent rebind) but frees living capacity; `release`
+drops ownership explicitly, keeps the NPC in the world and frees living capacity
+too. Session disconnect neither dismisses a garrison nor drops ownership, and
+unloading a plugin never transfers NPCs to another owner.
+
+Failures are typed: `invalid_request`, `forbidden`, `not_found`, `unloaded`,
+`stale_revision`, `capacity`, `operation_conflict`, `cursor_expired`,
+`runtime_unavailable`. A plugin may hold at most 64 living residents and 256
+resident records including tombstones.
+
+Settlement sites, owned `spawn_site_token` issuance and staged construction are
+documented under [Settlement sites and staged construction](#settlement-sites-and-staged-construction).
+Resident work orders, squad orders, equipment and demobilisation are
+documented under [Resident work and squad orders](#resident-work-and-squad-orders).
+`set_resident_pois` stores core-validated owner-scoped POI handles; physical POI
+existence and capacity are checked against the site catalog.
+
+**Resident work and squad orders**
+
+Work orders require `capabilities = ["resident_work"]` and
+`required_features = ["resident_work"]`; squad orders, combat policy and
+demobilisation require `capabilities = ["resident_orders"]` and
+`required_features = ["resident_orders"]`.
+
+```luau
+solaris.assign_resident_work(request_id, operation_id, handle, work_order, work_units, expected_revision)
+solaris.cancel_resident_work(request_id, operation_id, handle, expected_revision)
+solaris.issue_resident_order(request_id, operation_id, handles, expected_order_revisions, order)
+solaris.cancel_resident_order(request_id, operation_id, handles, expected_order_revisions)
+solaris.demobilize_resident(request_id, operation_id, handle, expected_revision)
+```
+
+`work_order` is a closed tagged union: `harvest`, `replant`, `cut_tree`, `mine`,
+`haul`, `craft`, `fish`, `tend_livestock`, `construct`. Each names a concrete
+bounded `area` (dimension, min/max block corners, at most 16 per axis), the
+required tool/feed/recipe (a namespaced item id or recipe id), and the endpoint
+that receives the produce. `haul` moves items between two of the plugin's own
+resident endpoints. `construct` names a prepared `structure_id`, one authored
+`stage` and the expected structure revision, and drives that stage through the
+structure's committed reservation. A job is executed through the existing
+gathering, recipe, inventory and movement mechanics — not a passive resource
+generator — so a missing tool, missing input, protected plot, unloaded chunk or
+blocked route pauses the job with a typed reason (`missing_tool`, `missing_input`,
+`protected`, `unloaded`, `blocked_route`, `no_storage`, `unsupported`) and
+reports zero committed work. The result carries only the work units and
+inventory deltas that were actually committed.
+
+`order` is a closed tagged union: `follow` (an authenticated player id),
+`move` (dimension, anchor, heading, formation), `hold` (anchor, heading,
+formation, engagement radius), `patrol` (2–16 waypoints, engagement radius),
+`garrison` (approved post handles, engagement radius), `attack` (server-issued
+target refs plus a bounded `policy` with a revision) and `retreat` (safe anchor,
+formation). Formation is `line`, `column`, `wedge` or `square` with a spacing in
+half-blocks; slot positions are computed by the engine, stable across updates,
+account for entity footprint and obstacles, and an impossible formation reports
+`blocked_route` instead of stacking members on one coordinate. A `garrison` post
+handle is a completed guard point of interest of a C2 site snapshot; core
+resolves the approved posts from that committed layout, assigns each member a
+free slot with an engine-computed, stable position, persists the occupancy with
+the order, and reconstructs the same post goal after a restart. A later garrison
+order never double-books an occupied slot, and a member with no reachable free
+post reports `blocked_route` and receives no goal. At most 64 handles are
+accepted per order (gameplay squads up to 32); every member fence is checked
+before any order is replaced, and a partially unavailable batch is refused as a
+whole with a per-member reason. `attack` uses real range, line of sight, cooldown
+and ammunition through the engine damage path, never repeated `damage_entity`
+calls from Luau; the committed `combat` list on the order result carries
+attacker/victim correlation and an event id so experience is awarded exactly
+once. Engagement policy lists allied affiliations (≤64) and permitted hostile
+categories; owned residents and allies are never targeted by proximity, and
+player targets are off unless the policy explicitly permits them, with server PvP
+rules applied on top.
+
+`demobilize_resident` cancels the military order, returns equipment through the
+canonical transfer path and moves `military → demobilizing → civilian`. It keeps
+the same resident handle, home and plugin ownership; when a warehouse is
+unreachable the resident stays `demobilizing` with the reason and keeps every
+item — an NPC is never killed by a hidden debt timer. `release_resident` remains
+the full ownership drop, not an ordinary dismissal.
+
+Notifications for `resident.work_changed`, `resident.order_changed` and
+`resident.combat_committed` are not implemented yet; state is read from the
+operation result and `query_residents`. Loader-driven client views, world
+preview, target selection and entity presentation for these orders are disabled
+in v1 and must not be required or declared by a server-side package.
+
+**Settlement sites and staged construction**
+
+Site discovery and survey require both `capabilities = ["world_sites"]` and
+`required_features = ["world_sites"]`; staged construction requires
+`capabilities = ["structure_operations"]` and
+`required_features = ["structure_operations"]`. An unknown required feature, or
+either capability without its required feature, fails package admission.
+
+```luau
+solaris.list_settlement_sites(request_id, cursor, limit)
+solaris.query_settlement_site(request_id, site_id, cursor, limit)
+solaris.reserve_resident_site(request_id, operation_id, site_id, poi_id, expected_site_revision)
+solaris.release_resident_site(request_id, operation_id, spawn_site_token)
+solaris.survey_site(request_id, dimension, bounds, purpose)
+solaris.prepare_structure(request_id, operation_id, blueprint_id, anchor, rotation, survey_token, expected_site_revision)
+solaris.advance_structure(request_id, operation_id, structure_id, stage, reservation_ref, expected_revision, work_units)
+solaris.pause_structure(request_id, operation_id, structure_id, expected_revision)
+solaris.cancel_structure(request_id, operation_id, structure_id, expected_revision)
+solaris.structure_status(request_id, structure_id)
+solaris.bind_warehouse(request_id, operation_id, structure_id, container_id)
+```
+
+Candidates are a pure function of `(seed, profile revision, coordinates)`: the
+same world always yields identical site ids, footprints, buildings, POIs, roads
+and inhabitant generation ids regardless of chunk generation order or how often
+discovery runs. `list_settlement_sites` pages over deterministic candidates in
+scan order (1–64 records, an opaque owner-scoped cursor); `query_settlement_site`
+returns one site, or a bounded POI page, by deterministic site id. `forbidden`
+covers a foreign cursor or site id, `cursor_expired` an unknown cursor, and
+`not_found` a site id that does not resolve. **Discovery never invents a plan in
+Luau and never downgrades a large variant that does not fit** — a candidate that
+cannot be laid out from the authored catalog is rejected, not silently shrunk.
+
+A site snapshot carries the deterministic site id, the variant (`hamlet`,
+`village`, `town`), the site revision, the footprint origin/size, the placed
+buildings (`blueprint_id`, origin, rotation), the POIs (`poi_id`, kind
+`home`/`work`/`meeting`/`guard`, position, capacity, state
+`free`/`reserved`/`occupied`) and the inhabitant generation ids. Generation ids
+derive from the world identity, the site id and the inhabitant slot, so
+re-generating or reinstalling a chunk never yields a second inhabitant for the
+same slot. A generation id is a fixed-width hash, so it stays bounded for any
+world directory depth and does not depend on the server's directory path length.
+
+`survey_site` takes a `bounds` record `{ min = {x, y, z}, max = {x, y, z} }` and
+a `purpose` (`settlement`, `expansion`, `restoration`) and returns a bounded
+snapshot: per-column heights, water depth and slope, usable plots, water and
+biome/resource tags, intersecting claims and existing structures, chunk
+availability (`loaded` or `unloaded`), a revision and a short-lived owner-scoped
+`survey_token`. At most 128×128 columns are surveyed per call; larger sites are
+surveyed as linked plots. An unsurveyed region reports `unloaded` rather than
+loading an unbounded area. A token is bound to the owner, the bounds and the
+revision it saw; if a player changes a block inside the footprint, the token no
+longer authorises `prepare_structure` and the site must be re-surveyed
+(`stale_revision`), never overwritten.
+
+`prepare_structure` validates the blueprint, rotation, geometry, overlaps,
+rights and the entrance/street connection against the survey, then reserves the
+footprint and returns a persistent `structure_id`, the stage plan, the resource
+plan hash and revisions. It builds nothing and spends nothing. Construction
+mutations each carry their own `operation_id`; repeating an id with the same
+fingerprint returns the stored outcome and a different one returns
+`operation_conflict`. `advance_structure` links the next stage to a
+`reservation_ref` from `reserve_inventory_items` and the immutable
+`resource_plan_hash`; each world-commit portion is at most 512 blocks with
+dependent groups committed together and produces a monotonic receipt carrying the
+exact consumed materials, work units and revision — world edits, consumption and
+the receipt commit through one recoverable protocol, so a crash cannot leave
+blocks without cost or cost without work. A crash/replay between the reservation
+and a stage commit neither double-consumes nor builds twice. `pause_structure`
+and `cancel_structure` serialise against the active portion and return a final
+receipt watermark plus per-resource `consumed`, `returned` and `remaining`, where
+`reserved = consumed + returned + remaining`; only the returned remainder is
+ever credited. Already-built blocks stay in the world on pause or cancel, and a
+player block change inside the footprint pauses the operation as
+`paused/site_changed` without consuming or overwriting the player's build.
+`structure_status` returns the saved owner-scoped snapshot. A plugin may have at
+most 64 active construction operations.
+
+```luau
+-- survey a plot, prepare a house, then build it stage by stage
+local survey = solaris.survey_site("survey-1", "minecraft:overworld",
+    { min = { x = 0, y = 0, z = 0 }, max = { x = 63, y = 255, z = 63 } }, "settlement")
+-- on_operation_result: payload.survey.survey_token, payload.survey.revision
+```
+
+**Blueprint authoring reference**
+
+An authored catalog lives next to the manifest at `structures/<id>.toml`, one
+blueprint per file, with an optional `<id>.ruined.toml` ruined variant of the
+same footprint. Keys are closed; unknown keys, a blueprint id outside the
+package namespace, a stray non-`.toml` file, an out-of-range or undeclared
+palette property and any limit violation reject the whole package before it is
+admitted. `id` is namespaced and owned by the package; `revision` is an integer;
+the content hash is derived, never authored (a deployed manifest hash that does
+not match the derived content hash is refused).
+
+```toml
+id = "solaris:house_small"
+revision = 3
+variant_of = "solaris:house_small"
+
+[footprint]
+size = [13, 9, 11]
+anchor = [6, 0, 5]
+
+[[palette]]
+index = 0
+block = "minecraft:oak_planks"
+properties = { }
+
+[[blocks]]
+x = 0
+y = 0
+z = 0
+palette = 0
+
+[[poi]]
+id = "home"
+kind = "home"
+at = [6, 1, 5]
+capacity = 2
+
+[[street_connection]]
+at = [0, 0, 5]
+facing = "west"
+
+[[stage]]
+id = "frame"
+blocks = [ { x = 0, y = 1, z = 0, palette = 1 } ]
+```
+
+`rotation` is a quarter turn (0/90/180/270); dependent properties — stairs,
+doors, beds, fences and wall connections — are rotated through the registry
+property model, never blanket-replaced, and a multi-part object is committed as
+one unit. Block entities are limited to a whitelist (empty containers and the
+data a bed or sign needs); arbitrary NBT, loot tables, commands and spawners are
+refused. Every buildable structure must declare physical entrances and POIs.
+
+Hard limits, per deployed plugin: 128 blueprints, 64 settlement variants, 128
+building placements per settlement, 65 536 blocks per blueprint, 64 blocks per
+blueprint footprint axis, 16 MiB decoded catalog (checked outside the Lua VM),
+512 blocks per world commit portion and 64 concurrent construction operations. A
+settlement **site** footprint is territory, not a building: 128×128 (hamlet),
+192×192 (village) or 256×256 (town), reported verbatim in the site snapshot and
+bounded separately at 256 per axis. Each building placed inside it still uses a
+blueprint bounded at 64 per axis, so the two limits must not be conflated. A
+whole town is never packed into one mega-template or one Lua callback.
+
+Construction execution (this section) is landed and tested. `advance_structure`
+consumes the materials the plugin reserved and records a receipt; linking actual
+builders to a stage is `solaris.assign_resident_work` with a `construct` work
+order, or `solaris.advance_structure` when the plugin drives the portion itself.
+
+**Package discovery and startup validation**
+
+Core discovers the settlement profile during server startup, before the plugin
+storage actor starts. A package owns the profile when its manifest declares both
+`required_features = ["world_sites", "structure_operations"]` and it ships a
+`structures/` directory next to `plugin.toml`. Blueprint ids must be namespaced;
+the namespace is read from the authored catalog itself (the shipped
+`solaris-settlements` package authors `solaris:*` ids), and every file in one
+catalog must agree on it. Discovery reads every `structures/*.toml` in
+deterministic file order, validates it through the frozen loader, and derives the
+profile revision from each blueprint's owned id, revision and derived content
+hash. Selection, layout and inhabitant generation ids are therefore a pure
+function of `(seed, profile revision, coordinates)` and do not depend on chunk
+generation order.
+
+A violation fails startup by name — never a degraded empty catalog:
+
+- a foreign or mixed id namespace, a duplicate id, an out-of-range or undeclared
+  palette property, and any frozen-limit breach (128 blueprints, 64 variants, 64
+  footprint axis, 65 536 blocks, 16 MiB decoded catalog);
+- a stray catalog entry: any non-`.toml` file or subdirectory under `structures/`;
+- a deployment-recorded content hash that does not match the derived one;
+- two deployed packages claiming the profile, or a claim with no catalog.
+
+When no package claims the profile, the config-driven `[data] settlement_profile`
+prototype path in `crates/mc-server` stays the default and every settlement call
+answers the typed `runtime_unavailable`; nothing panics and no empty catalog is
+installed. No part of discovery requires the Solaris Loader: the shipped
+server-side package declares no client bundle, and a Loader-required package is
+not needed for the profile.
+
+**Committed structure bounds**
+
+`advance_structure` applies each portion through the same conditional world
+storage kernel a player edit uses: at most 512 blocks per portion, dependent
+groups atomic, restricted to the structure's own reserved footprint, and refused
+(never partially applied) when a target position is not loaded, a precondition
+changed, or the batch crosses a region. A committed portion marks its chunks
+dirty and reaches `.mca` through the server's dirty-flush owner, so a committed
+stage is visible to players and survives a world reopen; re-opening the plugin
+ledger replays the structure, its consumption and its reservation without
+building a second portion. Footprint change detection is localized through the
+world chunk journal watermark, so a player edit inside the reserved footprint
+pauses the structure as `paused/site_changed` while unrelated edits elsewhere do
+not. A protected zone owned by another plugin intersecting the footprint blocks
+`prepare_structure` (`blocked`) before anything is reserved.
+
+`solaris.assign_resident_work` with a `construct` work order drives the prepared
+stage directly: core resolves the structure's committed reservation (by the
+recorded reference, or the one whose immutable resource plan hash matches before
+the first advance), consumes exactly the reserved portion for the committed
+cells, commits those blocks through the same world kernel, and reports the
+receipt's work units. A repeated portion replays its receipt instead of spending
+the reservation or building the blocks a second time. Nothing in this path
+depends on the Loader or a client bundle.
+
+**Owned item transfers and reservations**
+
+These calls require both `capabilities = ["inventory_transfers"]` and
+`required_features = ["inventory_transfers"]`. As with durable batch storage, an
+unknown required feature, or this capability without its required feature, fails
+package admission.
+
+```luau
+solaris.query_owned_inventory(request_id, endpoint, expected_revision)
+solaris.transfer_owned_items(request_id, operation_id, actor_id, transfers, expected_revisions)
+solaris.reserve_inventory_items(request_id, operation_id, endpoint, resource_plan, expected_revision)
+solaris.inventory_reservation_status(request_id, reservation_ref)
+solaris.release_inventory_reservation(request_id, operation_id, reservation_ref, expected_revision)
+```
+
+An `endpoint` is a closed tagged union. `{ kind = "player_inventory",
+player_id = 512 }` addresses the canonical main-inventory and hotbar window
+(slots 9–44) of one connected player. `{ kind = "warehouse", handle = "..." }`
+addresses a placed container whose handle is minted by core for a verified
+loaded container; a plugin never chooses a container by coordinates.
+`solaris.bind_warehouse` issues a handle for one authored `empty_container`
+seed of a placed structure the caller owns: the plugin names its durable
+`structure_id` and the container's authored ordinal (`container_id`, in
+blueprint order). A structure is placed while it is prepared, running, paused or
+committed — a completed structure keeps its ground and its containers, so a
+handle minted during construction survives completion — and only `cancelled`
+(removed) stops being a warehouse, with `blocked`. For a request core has not
+already recorded, core verifies ownership (`forbidden` for a foreign owner or
+container), that the structure exists (`not_found`), that the ordinal names an
+authored container of that blueprint and the blueprint still matches the
+prepared content hash (`not_found`/`stale_revision`), and that the placed
+position is a loaded container (`unloaded`/`not_found`); a replayed or repeated
+request returns the recorded binding first, without re-running those checks.
+The binding is durable and idempotent, returns `{ handle, structure_id,
+container_id, revision }`, and every accepted request records a receipt
+recoverable through `operation_status`; a repeat keeps the original binding and
+its revision. The handle is a predictable, non-secret string of the form
+`warehouse:<plugin>:<structure>:<container>`, bounded to 128 bytes. A
+`warehouse` endpoint then reads through `query_owned_inventory` as the
+container's canonical snapshot, fenced by the binding revision; a foreign,
+unknown, cancelled, unloaded or non-container handle fails closed with
+`forbidden`, `not_found`, `blocked` or `unloaded` and never reads as an empty
+container. The write/transfer path for a warehouse endpoint is not enabled yet
+and still fails closed.
+
+```luau
+local inventory = solaris.query_owned_inventory("q", { kind = "player_inventory", player_id = 512 })
+solaris.transfer_owned_items("t", "haul-1", 512, {
+    { source = { kind = "player_inventory", player_id = 512 }, source_slot = 9,
+      destination = { kind = "player_inventory", player_id = 512 }, destination_slot = 10,
+      count = 8 },
+}, {
+    { endpoint = { kind = "player_inventory", player_id = 512 },
+      fence = { revision = 41, snapshot_hash = "…64 hex…" } },
+})
+```
+
+A snapshot result is `kind = "owned_inventory"` with `result.kind = "snapshot"`:
+the endpoint, a `fence` (`revision` plus derived canonical `snapshot_hash`), and
+`slots`, a bounded array of `{ slot, item }`. An item summary carries
+`resource_id`, `count`, optional `damage`, `enchanted` components, optional
+`custom_name` and optional `item_model`; there is no arbitrary NBT. `slot` is
+bounded by the endpoint (54 owned slots), and a query for a disconnected player
+returns `not_found`.
+
+Bounds: a request moves at most 16 transfers and at most 4096 items in total,
+one resource plan covers at most 16 resource types and 512 work portions, and a
+snapshot is at most 54 slots. Exceeding a bound fails DTO validation before any
+effect.
+
+`transfer_owned_items` checks the actor session, endpoint ownership, slot
+validity, counts and every participant's expected revision before one
+recoverable commit. The actor must be one of the participant player endpoints;
+a foreign endpoint returns `forbidden`. Any `fence` mismatch returns
+`stale_revision`; a destination that cannot accept the stack returns
+`capacity`; a source that does not hold the count returns `insufficient_items`.
+Item components and durability move with the stack. A successful transfer
+returns `result.kind = "transfer"` with the participant endpoints and their new
+`fences`. All participant state changes are appended as one world-inventory
+decision, so after a crash a stack is never in two places and a replay never
+moves it twice. When a commit's durability is unknown the operation is
+recoverable rather than rejected: the handler stops, and `operation_status`
+returns the journaled outcome after recovery.
+
+Reservations are durable and block the reserved quantities from being consumed
+by another transfer. `reserve_inventory_items` validates the endpoint fence,
+sums the plan per resource, and fails `insufficient_items` when the endpoint
+does not hold the requested quantity beyond quantities already reserved by the
+same or another owner. It returns `reservation_ref` (opaque), the canonical
+`resource_plan_hash`, and per-resource `{ resource_id, reserved, consumed,
+returned, remaining }` with `reserved = consumed + returned + remaining` and
+`receipt_watermark`. `inventory_reservation_status` returns the owner-scoped
+saved snapshot; an unknown reference returns `not_found`.
+`release_inventory_reservation` is serialized with consumption, CASes the
+reservation revision, and returns the reservation with `released = true`,
+`remaining = 0` and every un-consumed unit folded into `returned`; releasing an
+already released or stale reservation returns `stale_revision`. Consumption of
+a reservation happens only through committed receipts with a monotonic receipt
+sequence and an exact consumed-material vector; that receipt path is consumed
+by the world/work operation, not by a separate Lua call.
+
+Every mutation is idempotent by `operation_id` and a canonical fingerprint:
+repeating the same operation returns its stored result, and reusing the id with
+different content returns `operation_conflict` with no effect. Results are
+targeted `on_operation_result` events with `state = "committed"`/`"rejected"`,
+an integer `revision` and an explicit `failure` (`forbidden`,
+`stale_revision`, `not_found`, `unloaded`, `insufficient_items`, `capacity`,
+`operation_conflict`, `runtime_unavailable`).
+
+The `resident_equipment` and `resident_carry` endpoint kinds address one
+durable resident handle's canonical 6 equipment slots and 8 carry slots. They
+are part of the closed endpoint union and share the player endpoint's rules: the
+actor session must be live, the resident must be owned by the calling plugin
+(an absent resident returns `not_found`, a foreign one `forbidden`), every
+participant fence is checked before the single recoverable commit, and the
+transfer preserves durability and every component. A resident endpoint's fence
+revision is its durable gear record revision, which advances on each commit and
+also fences the resident's order/work assignments, so a concurrent order or a
+stale transfer can never produce a second copy of gear an active order holds.
+Both resident and player endpoints participate in the same world-inventory
+decision, so a crash never leaves an item at two endpoints.
 
 The inventory adapter owns menus after admission. Plugins describe fixed
 display slots but do not receive container, slot-stack, NBT, or click-packet

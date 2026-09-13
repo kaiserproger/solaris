@@ -170,6 +170,7 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
             block_z,
             scale,
             bank_relief * 15.0 / 16.0,
+            settings.is_some(),
         )
     } else {
         drainage::DrainageSample::default()

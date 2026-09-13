@@ -38,6 +38,9 @@ mod runtime_tick_metrics;
 mod script;
 mod server;
 mod session_auth;
+mod settlement;
+#[cfg(test)]
+mod settlement_tests;
 mod status;
 
 pub use autoscale_soak::{
@@ -61,7 +64,7 @@ pub use loader::{
     LOADER_ARTIFACT_CHUNK_BYTES, LOADER_PROTOCOL_VERSION, LoaderArtifactRequest, LoaderBundle,
     LoaderClientAck, LoaderContentKind, LoaderHandshakeError, LoaderManifest, LoaderPermission,
     LoaderPlatform, LoaderSession, loader_ack_channel, loader_artifact_channel,
-    loader_manifest_channel, loader_request_channel, loader_ui_channel,
+    loader_manifest_channel, loader_request_channel,
 };
 #[cfg(feature = "load-bench")]
 pub use lock_metrics::reset_lock_pressure_metrics;
@@ -83,7 +86,7 @@ pub use server::{
     BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OperatorControlHandle,
     OperatorFactsHandle, OperatorWeather, OutboundPressureHandle, OutboundPressureSnapshot,
     RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle,
-    ServerConfig, ShutdownHandle, WorldHandle, bind, bind_with_scripts, run,
+    ServerConfig, ShutdownHandle, TabListConfig, WorldHandle, bind, bind_with_scripts, run,
 };
 #[cfg(feature = "load-bench")]
 pub use server::{

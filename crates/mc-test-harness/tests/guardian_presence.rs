@@ -36,6 +36,7 @@ async fn embedded_guardian_beam_publishes_target_damages_player_and_resets() {
         .expect("guardian entity type");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 guardian TCP".into(),
         max_players: 2,

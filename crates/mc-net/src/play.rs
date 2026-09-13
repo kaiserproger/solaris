@@ -53,27 +53,27 @@ use mc_protocol::packets::play::{
     ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundKeepAlive,
     ClientboundMerchantOffers, ClientboundOpenScreen, ClientboundRecipeBookSettings,
     ClientboundRespawn, ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation,
-    ContainerInput, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation,
-    EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose, EntityPositionSync,
-    EntityVec3, ForgetLevelChunk, GameEvent, HashedStack, ITEM_ENTITY_DATA_ITEM_INDEX,
-    LIVING_ENTITY_DATA_FLAGS_INDEX, LevelChunkWithLight, LevelEvent, LightData, LightUpdate,
-    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
-    PlayerCommandAction, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
-    PlayerInput, PositionMoveRotation, RemoveEntities, RotateHead, SHEEP_ENTITY_DATA_WOOL_INDEX,
-    SectionBlockChange, SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode,
-    ServerboundChat, ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
-    ServerboundClientCommand, ServerboundClientInformation, ServerboundClientTickEnd,
-    ServerboundCommandSuggestion, ServerboundContainerButtonClick, ServerboundContainerClick,
-    ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
-    ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
-    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
-    ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
-    ServerboundSelectTrade, ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundSwing,
-    ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition,
-    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
-    unpack_block_pos,
+    ClientboundSetHeldSlot, ClientboundSystemChat, ClientboundTabList, ClientboundTakeItemEntity,
+    ConfirmTeleportation, ContainerInput, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX,
+    EntityAnimation, EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose,
+    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, HashedStack,
+    ITEM_ENTITY_DATA_ITEM_INDEX, LIVING_ENTITY_DATA_FLAGS_INDEX, LevelChunkWithLight, LevelEvent,
+    LightData, LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect,
+    PlayerActionKind, PlayerCommandAction, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove,
+    PlayerInfoUpdate, PlayerInput, PositionMoveRotation, RemoveEntities, RotateHead,
+    SHEEP_ENTITY_DATA_WOOL_INDEX, SectionBlockChange, SectionBlocksUpdate, ServerboundAttack,
+    ServerboundChangeGameMode, ServerboundChat, ServerboundChatAck, ServerboundChatCommand,
+    ServerboundChunkBatchReceived, ServerboundClientCommand, ServerboundClientInformation,
+    ServerboundClientTickEnd, ServerboundCommandSuggestion, ServerboundContainerButtonClick,
+    ServerboundContainerClick, ServerboundContainerClose, ServerboundCustomPayload,
+    ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundPlayerCommand,
+    ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundRecipeBookChangeSettings,
+    ServerboundRecipeBookSeenRecipe, ServerboundResourcePack, ServerboundSelectTrade,
+    ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundSwing, ServerboundUseItem,
+    ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition, SetEntityMotion,
+    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{
@@ -97,7 +97,7 @@ use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::configuration::ConfigurationCustomPayload;
 use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
-use crate::loader::loader_interaction_channel;
+use crate::loader::loader_view_action_channel;
 use crate::login::LoggedInProfile;
 use crate::play::scheduled_blocks::ScheduledBlockRegionPlan;
 use crate::script::PluginZoneAdapter;
@@ -113,7 +113,7 @@ mod block_break;
 mod block_break_tests;
 mod block_edit_commit;
 mod block_placement;
-mod block_wire;
+pub(crate) mod block_wire;
 mod bucket_interactions;
 mod campfire;
 mod campfire_adapter;
@@ -140,10 +140,7 @@ mod merchant_adapter;
 mod movement;
 #[cfg(test)]
 mod movement_tests;
-// Transitional: only owned_inventory tests use the planner until C1 wires
-// canonical POI/resident endpoints into the runtime.
-#[cfg(test)]
-mod owned_inventory;
+pub(crate) mod owned_inventory;
 #[cfg(test)]
 mod owned_inventory_request_tests;
 #[cfg(test)]
@@ -158,6 +155,8 @@ mod player_teleport;
 mod player_teleport_tests;
 mod random_ticks;
 mod recipes;
+pub(crate) mod resident_work;
+pub(crate) use session::resident_orders::{ResidentAttack, ResidentGoal};
 mod scheduled_blocks;
 mod script_gameplay_events;
 #[cfg(test)]
@@ -829,10 +828,14 @@ impl RegisteredSessionCleanup {
             return;
         }
         self.active = false;
+        let player_info_remove = self.sessions.player_info_remove_for(self.session_id);
         dispatch_visibility_commands(
             self.sessions
                 .unregister_preserving_player_state(self.session_id),
         );
+        if let Some(remove) = player_info_remove {
+            dispatch_visibility_commands(self.sessions.broadcast_player_info_remove(remove));
+        }
         if let Some(scripts) = self.scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::player_left(
                 ScriptPlayerId::new(self.session_id),
@@ -1077,6 +1080,14 @@ pub(crate) struct EntityProjectilePhysicsFacts {
 pub(super) struct BlockEdit {
     pos: mc_world::BlockPos,
     new_state: mc_world::BlockStateId,
+}
+
+impl BlockEdit {
+    /// Build one server-owned edit for a caller outside the `play` modules
+    /// (the settlement structure pipeline), which cannot name private fields.
+    pub(crate) const fn new(pos: mc_world::BlockPos, new_state: mc_world::BlockStateId) -> Self {
+        Self { pos, new_state }
+    }
 }
 
 impl From<mc_world::plant_rules_26_1_2::PlantBlockEdit> for BlockEdit {
@@ -1729,6 +1740,7 @@ where
         desired: initial_desired,
         tx: outbound_tx,
         pose: initial_pose,
+        game_mode: player_state.game_mode,
         max_sessions: config.max_players as usize,
         script_operator: permissions.op,
         dimension: dim_name.as_str(),
@@ -2125,6 +2137,12 @@ where
         )
         .await?;
 
+        // Player list: the joiner's entry goes to every session already online,
+        // while the newcomer receives the full online roster plus the configured
+        // header/footer. Sent after the inventory burst so the documented login
+        // sequence (recipes -> inventory) stays adjacent.
+        write_tab_list_burst(writer, compression, &sessions, session_id, config).await?;
+
         // 7. Play loop. Runs until the connection drops or the client
         //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`. The
         //    interaction state passes the M5.d/M5.e/M6.f break/place
@@ -2291,7 +2309,7 @@ impl ClientPreferences {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlayCustomPayloadAction {
     Brand(String),
-    LoaderInteraction(Bytes),
+    LoaderView(Bytes),
     Unknown { channel: String, payload: Bytes },
     Oversized { len: usize },
 }
@@ -2310,8 +2328,8 @@ fn classify_play_custom_payload(
     }
 
     let payload = body.copy_to_bytes(body.remaining());
-    if channel == *loader_interaction_channel() {
-        return Ok(PlayCustomPayloadAction::LoaderInteraction(payload));
+    if channel == *loader_view_action_channel() {
+        return Ok(PlayCustomPayloadAction::LoaderView(payload));
     }
     Ok(PlayCustomPayloadAction::Unknown {
         channel: channel.as_str().to_string(),
@@ -12657,6 +12675,15 @@ where
                 permissions,
             )
             .await?;
+            sessions.update_player_game_mode(session_id, *game_mode);
+            if let Some(entry) = sessions.tab_list_entry(session_id) {
+                dispatch_visibility_commands(sessions.broadcast_player_info_update(
+                    PlayerInfoUpdate {
+                        actions: PlayerInfoActions::UPDATE_GAME_MODE,
+                        entries: vec![entry],
+                    },
+                ));
+            }
         }
         _ => unreachable!("player control helper only accepts player-control packet ids"),
     }
@@ -12785,9 +12812,10 @@ where
                 }
                 *client_brand = Some(brand);
             }
-            PlayCustomPayloadAction::LoaderInteraction(payload) => {
-                if let Err(error) = session::route_client_loader_interaction(
+            PlayCustomPayloadAction::LoaderView(payload) => {
+                if let Err(error) = session::route_client_loader_view_request(
                     scripts,
+                    sessions,
                     session_id,
                     loader_eligible,
                     config.loader_manifest.as_deref(),
@@ -12798,7 +12826,7 @@ where
                     debug!(
                         ?error,
                         player_id = session_id,
-                        "Loader interaction rejected"
+                        "Loader view request rejected"
                     );
                 }
             }
@@ -12888,6 +12916,39 @@ fn is_serverbound_chat_command_packet(id: i32) -> bool {
     )
 }
 
+/// Re-resolve live operator authority for a connected player.
+///
+/// The console can grant or revoke operator status while a player is online;
+/// the refreshed command tree keeps client suggestions in step.
+async fn refresh_live_permissions<W>(
+    writer: &mut W,
+    compression: Compression,
+    scripts: Option<&ScriptEventSink>,
+    config: &ServerConfig,
+    player_uuid: &str,
+    player_name: &str,
+    login_resolved: CommandPermissions,
+) -> Result<CommandPermissions, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let live =
+        config
+            .command_permissions
+            .live_permissions_for(player_name, player_uuid, login_resolved);
+    if live != login_resolved {
+        let plugin_roots = scripts.map_or_else(Vec::new, ScriptEventSink::player_command_roots);
+        let operator_roots = scripts.map_or_else(Vec::new, ScriptEventSink::operator_command_roots);
+        write_packet(
+            writer,
+            &command_tree_packet_with_plugin_roots(live, &plugin_roots, &operator_roots),
+            compression,
+        )
+        .await?;
+    }
+    Ok(live)
+}
+
 async fn handle_serverbound_chat_command<W>(
     context: ChatCommandIngressContext<'_, W>,
     frame: mc_protocol::RawFrame,
@@ -12917,6 +12978,16 @@ where
         next_teleport_id,
         pending_teleport,
     } = context;
+    let permissions = refresh_live_permissions(
+        writer,
+        compression,
+        scripts,
+        config,
+        player_uuid,
+        player_name,
+        permissions,
+    )
+    .await?;
     let mut body = frame.body;
     match frame.id {
         ServerboundCommandSuggestion::ID => {
@@ -14585,6 +14656,7 @@ where
                     Some(command @ OutboundCommand::Explosion(_)) => {
                         send_explosion_command(writer, compression, game_mode, command).await?;
                     }
+                    Some(cmd) => write_player_info(writer, compression, cmd).await?,
                     None => close_session = true,
                     }
                     Ok(())
@@ -14891,6 +14963,77 @@ fn text_component_nbt(text: &str) -> Result<Vec<u8>, mc_protocol::CodecError> {
     Ok(out)
 }
 
+/// Render the configured tab-list header/footer. Empty strings on both
+/// sides are the vanilla default (no header/footer lines shown), so no
+/// packet is produced in that case.
+fn tab_list_packet(
+    config: &ServerConfig,
+) -> Result<Option<ClientboundTabList>, mc_protocol::CodecError> {
+    if config.tab_list.header.is_empty() && config.tab_list.footer.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ClientboundTabList {
+        header_nbt: text_component_nbt(&config.tab_list.header)?,
+        footer_nbt: text_component_nbt(&config.tab_list.footer)?,
+    }))
+}
+
+/// Login-burst player list: the joiner's entry goes to every session already
+/// online, while the newcomer receives the full online roster plus the
+/// configured header/footer (skipped when both are empty, the vanilla
+/// default).
+async fn write_tab_list_burst<W>(
+    writer: &mut W,
+    compression: Compression,
+    sessions: &SessionRegistry,
+    session_id: SessionId,
+    config: &ServerConfig,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(entry) = sessions.tab_list_entry(session_id) {
+        dispatch_visibility_commands(sessions.broadcast_player_info_update(PlayerInfoUpdate {
+            actions: PlayerInfoActions::minimal_add_player(),
+            entries: vec![entry],
+        }));
+    }
+    write_packet(
+        writer,
+        &PlayerInfoUpdate {
+            actions: PlayerInfoActions::minimal_add_player(),
+            entries: sessions.tab_list_roster(),
+        },
+        compression,
+    )
+    .await?;
+    if let Some(tab_list) = tab_list_packet(config)? {
+        write_packet(writer, &tab_list, compression).await?;
+    }
+    Ok(())
+}
+
+/// Write a roster delta (join/leave/game-mode). The dispatch above routes
+/// only player-info commands here (every other `Some` variant is matched
+/// explicitly first), so anything else is a programming error and fails
+/// loud instead of skipping the update silently.
+async fn write_player_info<W>(
+    writer: &mut W,
+    compression: Compression,
+    command: OutboundCommand,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    match command {
+        OutboundCommand::PlayerInfo(update) => write_packet(writer, &update, compression).await,
+        OutboundCommand::PlayerInfoRemove(remove) => {
+            write_packet(writer, &remove, compression).await
+        }
+        unexpected => unreachable!("roster dispatch misrouted {unexpected:?}"),
+    }
+}
+
 fn session_admission_message(error: &SessionAdmissionError) -> &'static str {
     match error {
         SessionAdmissionError::ServerFull { .. } => "Server is full",
@@ -14948,6 +15091,7 @@ mod campfire_output_recovery_tests {
     ) -> Arc<ServerConfig> {
         let _ = root;
         Arc::new(ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "campfire recovery test".into(),
             max_players: 1,

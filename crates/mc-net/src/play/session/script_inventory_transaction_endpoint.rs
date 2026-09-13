@@ -67,7 +67,10 @@ impl ScriptInventoryTransactionGate {
         ))
     }
 
-    fn begin_compound(&self, player_id: u64) -> Option<ScriptInventoryTransactionGuard<'_>> {
+    pub(super) fn begin_compound(
+        &self,
+        player_id: u64,
+    ) -> Option<ScriptInventoryTransactionGuard<'_>> {
         let mut state = self.lock("begin compound inventory transaction", Some(player_id));
         while state.active && state.pending_owner_transactions != 0 {
             state = resolve_authoritative_lock(

@@ -64,6 +64,7 @@ mod interaction_geometry;
 mod interaction_geometry_tests;
 #[cfg(feature = "load-bench")]
 mod load_bench;
+mod loader_views;
 mod movement_publication;
 #[cfg(test)]
 mod natural_mob_despawn_tests;
@@ -95,15 +96,12 @@ mod projectiles_tests;
 mod script_client_sound_endpoint;
 #[cfg(test)]
 mod script_client_sound_endpoint_tests;
-mod script_client_ui_endpoint;
+mod script_client_view_endpoint;
 #[cfg(test)]
-mod script_client_ui_endpoint_tests;
-mod script_loader_interaction_endpoint;
-#[cfg(test)]
-mod script_loader_interaction_endpoint_tests;
+mod script_client_view_endpoint_tests;
 #[cfg(test)]
 mod sheep_grazing_tests;
-pub(super) use script_loader_interaction_endpoint::route_client_loader_interaction;
+pub(super) use script_client_view_endpoint::route_client_loader_view_request;
 mod script_commit_events;
 #[cfg(test)]
 use mc_script::ScriptCommitEnqueueError;
@@ -111,6 +109,10 @@ use mc_script::{
     ScriptCommitEventMonitor, ScriptCommitEventOutbox, ScriptCommitEventOutboxSnapshot,
     ScriptCommitEventReceiver,
 };
+mod owned_inventory_endpoint;
+#[cfg(test)]
+mod owned_inventory_endpoint_tests;
+pub(crate) mod resident_orders;
 mod script_entity_interaction;
 #[cfg(test)]
 mod script_entity_interaction_tests;
@@ -129,10 +131,10 @@ mod script_player_inventory_endpoint_tests;
 mod script_player_query_endpoint;
 #[cfg(test)]
 mod script_player_query_endpoint_tests;
+mod script_resident_endpoint;
 mod script_teleport_endpoint;
 #[cfg(test)]
 mod script_teleport_endpoint_tests;
-mod script_villager_endpoint;
 mod session_lifecycle;
 mod settlement_authority;
 pub(super) use settlement_authority::toolsmith_merchant_state;
@@ -385,6 +387,7 @@ pub(super) struct SessionRegistration<'a> {
     pub(super) desired: HashSet<(i32, i32)>,
     pub(super) tx: mpsc::Sender<OutboundCommand>,
     pub(super) pose: PlayerPose,
+    pub(super) game_mode: GameMode,
     pub(super) max_sessions: usize,
     pub(super) script_operator: bool,
     pub(super) dimension: &'a str,
@@ -398,6 +401,7 @@ struct PlaySession {
     properties: Vec<mc_protocol::packets::login::GameProfileProperty>,
     entity_id: i32,
     pose: PlayerPose,
+    game_mode: GameMode,
     center: (i32, i32),
     view_distance: i32,
     desired: HashSet<(i32, i32)>,
@@ -425,6 +429,7 @@ struct DisconnectedPlayerPersistence {
 #[derive(Debug, Default)]
 struct SessionRegistryInner {
     next_id: SessionId,
+    loader_views: loader_views::LoaderViewRegistry,
     sessions: HashMap<SessionId, PlaySession>,
     loaded_chunk_refcounts: HashMap<(i32, i32), usize>,
     tickets: HashMap<(i32, i32), HashSet<SessionId>>,
@@ -1074,17 +1079,6 @@ impl SessionRegistry {
 
     fn mob_behavior_table(&self) -> Arc<mc_data::mob_behavior_26_1_2::MobBehaviorTable> {
         self.mob_behavior_table.load_full()
-    }
-
-    fn track_villager_override(&self, entity: EntityId) {
-        self.overridden_villager_entities.rcu(|current| {
-            if current.contains(&entity) {
-                return Arc::clone(current);
-            }
-            let mut next = (**current).clone();
-            next.insert(entity);
-            Arc::new(next)
-        });
     }
 
     fn clear_villager_overrides(&self, entities: &[EntityId]) {

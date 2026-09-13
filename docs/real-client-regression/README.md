@@ -195,6 +195,26 @@ solid/drop/pickup, and visible passive-entity probes into the named M40/M41
 route. It intentionally returns `blocked`, not `passed`, until swim feel, sugar
 cane support/cascade/drop, the owner frozen-world route, and full TPS/lock
 performance evidence have dedicated real-client or manual gates.
+`m94-09-settlement-chain` installs the six default server-only packages
+(`solaris-permissions`, `solaris-essentials`, `solaris-economy`,
+`solaris-towns`, `solaris-audit`, `solaris-settlements`) into the run
+directory's `plugins/` with `strict = true`, serves them on a free per-run
+loopback port with a fresh seeded world, and drives one real client through
+`/settlement create`, `/settlement site`, `/settlement adopt`,
+`/settlement survey`, `/settlement project`, `/give`, `/settlement fund`,
+`/settlement build`, `/settlement info`, and `/settlement populate`. It asserts
+only observed chat plus a client block scan around the build anchor: the
+committed `solaris:house_small` must be visible as its authored blocks,
+`/settlement info` must report `houses>=1`, and the persistent-resident API must
+settle one resident (`pop>=1`). It needs operator setup (`/gamemode`, `/tp`,
+`/give`), so its manifest entry declares `no_debug_commands: false`.
+
+Every manifest entry declares `no_debug_commands`. `false` means the scenario's
+own steps legitimately use an operator or debug command, so the runner lists the
+launched Gradle usernames in `[admin].operators`; `true` means the scenario must
+prove itself with no operator privileges at all and the runner writes
+`operators = []`. A missing or non-boolean value fails `--check`/`--run` before
+anything starts.
 
 The approved runner grants its own launched profiles debug-command access in
 the per-run config. Manual runs outside the runner still need a local test

@@ -38,9 +38,8 @@ use crate::{
     ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
     ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition,
     ScriptReloadCommitError, ScriptRouteRegistrationError, ScriptRuntime, ScriptStorageMutation,
-    ScriptVillagerBindingRequest, ScriptVillagerGoal, ScriptVillagerGoalRequest,
-    ScriptVillagerReleaseRequest, ScriptWorldBlockSetRequest, ScriptWorldTimeSetRequest,
-    ScriptZoneProtection, ValidatedScriptPluginManifest, script_boundary_pair,
+    ScriptWorldBlockSetRequest, ScriptWorldTimeSetRequest, ScriptZoneProtection,
+    ValidatedScriptPluginManifest, script_boundary_pair,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 1_024;
@@ -64,7 +63,7 @@ const MAX_SETTLEMENT_BUILDINGS: usize = 3;
 const MAX_SETTLEMENT_INHABITANTS: usize = 16;
 const MAX_SETTLEMENT_EXTENSIONS: usize = 16;
 const MAX_SETTLEMENT_DESCRIPTOR_ID_BYTES: usize = 48;
-const CLIENT_MANIFEST_SCHEMA: u16 = 1;
+const CLIENT_MANIFEST_SCHEMA: u16 = 2;
 const MAX_CLIENT_BUNDLES_PER_PLUGIN: usize = 8;
 const MAX_CLIENT_BUNDLE_ID_BYTES: usize = 48;
 const MAX_CLIENT_BUNDLE_VERSION_BYTES: usize = 32;
@@ -536,9 +535,11 @@ impl LuaClientLoader {
 pub enum LuaClientContentKind {
     Blocks,
     Items,
-    Ui,
+    Views,
+    ViewActions,
     Assets,
-    Interactions,
+    WorldPreviews,
+    WorldSelection,
     Sounds,
 }
 
@@ -548,9 +549,11 @@ impl LuaClientContentKind {
         match self {
             Self::Blocks => "blocks",
             Self::Items => "items",
-            Self::Ui => "ui",
+            Self::Views => "views",
+            Self::ViewActions => "view_actions",
             Self::Assets => "assets",
-            Self::Interactions => "interactions",
+            Self::WorldPreviews => "world_previews",
+            Self::WorldSelection => "world_selection",
             Self::Sounds => "sounds",
         }
     }
@@ -559,9 +562,11 @@ impl LuaClientContentKind {
         match self {
             Self::Blocks => LuaClientPermission::RegisterBlocks,
             Self::Items => LuaClientPermission::RegisterItems,
-            Self::Ui => LuaClientPermission::PresentUi,
+            Self::Views => LuaClientPermission::PresentViews,
+            Self::ViewActions => LuaClientPermission::SendViewActions,
             Self::Assets => LuaClientPermission::LoadAssets,
-            Self::Interactions => LuaClientPermission::SendInteractions,
+            Self::WorldPreviews => LuaClientPermission::PresentWorldPreviews,
+            Self::WorldSelection => LuaClientPermission::SendWorldSelection,
             Self::Sounds => LuaClientPermission::PlaySounds,
         }
     }
@@ -572,9 +577,11 @@ impl LuaClientContentKind {
 pub enum LuaClientPermission {
     RegisterBlocks,
     RegisterItems,
-    PresentUi,
+    PresentViews,
+    SendViewActions,
     LoadAssets,
-    SendInteractions,
+    PresentWorldPreviews,
+    SendWorldSelection,
     PlaySounds,
 }
 
@@ -584,9 +591,11 @@ impl LuaClientPermission {
         match self {
             Self::RegisterBlocks => "register_blocks",
             Self::RegisterItems => "register_items",
-            Self::PresentUi => "present_ui",
+            Self::PresentViews => "present_views",
+            Self::SendViewActions => "send_view_actions",
             Self::LoadAssets => "load_assets",
-            Self::SendInteractions => "send_interactions",
+            Self::PresentWorldPreviews => "present_world_previews",
+            Self::SendWorldSelection => "send_world_selection",
             Self::PlaySounds => "play_sounds",
         }
     }
@@ -1263,10 +1272,25 @@ fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugi
 pub fn start_prepared_lua_host(
     prepared: PreparedLuaPlugins,
 ) -> Result<(ScriptBoundary, LuaHost), LuaHostError> {
-    let (boundary, endpoint) = script_boundary_pair(
+    let (mut boundary, endpoint) = script_boundary_pair(
         NonZeroUsize::new(EVENT_QUEUE_CAPACITY).expect("event queue capacity is non-zero"),
         NonZeroUsize::new(COMMAND_QUEUE_CAPACITY).expect("command queue capacity is non-zero"),
     );
+    // Authored-data discovery runs from the same startup snapshot as the host,
+    // so the list is frozen with the loaded packages; a later reload keeps the
+    // catalog core already validated.
+    boundary.deployed_packages = prepared
+        .sources
+        .iter()
+        .map(|source| {
+            crate::LuaPluginPackage::new(
+                source.manifest.plugin_id(),
+                source.package_dir.clone(),
+                source.required_features.clone(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into();
     let reload_sender = boundary.event_admission.weak_sender.clone();
     let reload_contract = LuaReloadContract::from_prepared(&prepared);
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
@@ -1305,6 +1329,10 @@ struct PluginSource {
     config: toml::Table,
     source: String,
     source_path: PathBuf,
+    /// Deployed package root (`plugin.toml`'s parent), for authored data.
+    package_dir: PathBuf,
+    /// Manifest `required_features`, already validated against capabilities.
+    required_features: Vec<String>,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_plan: Option<LuaSettlementPlan>,
     gameplay_rules: Option<Arc<LuaGameplayRules>>,
@@ -1507,9 +1535,11 @@ enum DiskClientLoader {
 enum DiskClientContentKind {
     Blocks,
     Items,
-    Ui,
+    Views,
+    ViewActions,
     Assets,
-    Interactions,
+    WorldPreviews,
+    WorldSelection,
     Sounds,
 }
 
@@ -1518,9 +1548,11 @@ enum DiskClientContentKind {
 enum DiskClientPermission {
     RegisterBlocks,
     RegisterItems,
-    PresentUi,
+    PresentViews,
+    SendViewActions,
     LoadAssets,
-    SendInteractions,
+    PresentWorldPreviews,
+    SendWorldSelection,
     PlaySounds,
 }
 
@@ -1726,6 +1758,7 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
     })?;
     operations::validate_required_features(&disk)
         .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
+    let disk_required_features = disk.required_features.clone();
     let requested_api_version = parse_api_version(&disk.api)
         .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     let (
@@ -1838,6 +1871,8 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
         config,
         source,
         source_path,
+        package_dir: directory.to_path_buf(),
+        required_features: disk_required_features,
         worldgen_ore_profile,
         worldgen_settlement_plan,
         gameplay_rules,
@@ -1912,9 +1947,11 @@ fn materialize_client_bundles(
             bundle.content.into_iter().map(|content| match content {
                 DiskClientContentKind::Blocks => LuaClientContentKind::Blocks,
                 DiskClientContentKind::Items => LuaClientContentKind::Items,
-                DiskClientContentKind::Ui => LuaClientContentKind::Ui,
+                DiskClientContentKind::Views => LuaClientContentKind::Views,
+                DiskClientContentKind::ViewActions => LuaClientContentKind::ViewActions,
                 DiskClientContentKind::Assets => LuaClientContentKind::Assets,
-                DiskClientContentKind::Interactions => LuaClientContentKind::Interactions,
+                DiskClientContentKind::WorldPreviews => LuaClientContentKind::WorldPreviews,
+                DiskClientContentKind::WorldSelection => LuaClientContentKind::WorldSelection,
                 DiskClientContentKind::Sounds => LuaClientContentKind::Sounds,
             }),
             "content",
@@ -1927,9 +1964,15 @@ fn materialize_client_bundles(
                 .map(|permission| match permission {
                     DiskClientPermission::RegisterBlocks => LuaClientPermission::RegisterBlocks,
                     DiskClientPermission::RegisterItems => LuaClientPermission::RegisterItems,
-                    DiskClientPermission::PresentUi => LuaClientPermission::PresentUi,
+                    DiskClientPermission::PresentViews => LuaClientPermission::PresentViews,
+                    DiskClientPermission::SendViewActions => LuaClientPermission::SendViewActions,
                     DiskClientPermission::LoadAssets => LuaClientPermission::LoadAssets,
-                    DiskClientPermission::SendInteractions => LuaClientPermission::SendInteractions,
+                    DiskClientPermission::PresentWorldPreviews => {
+                        LuaClientPermission::PresentWorldPreviews
+                    }
+                    DiskClientPermission::SendWorldSelection => {
+                        LuaClientPermission::SendWorldSelection
+                    }
                     DiskClientPermission::PlaySounds => LuaClientPermission::PlaySounds,
                 }),
             "permissions",
@@ -2407,11 +2450,16 @@ fn declare_disk_capability(
     match capability {
         "storage" => Ok(manifest.declare_plugin_storage()),
         "storage_batches" => Ok(manifest.declare_storage_batches()),
+        "inventory_transfers" => Ok(manifest.declare_inventory_transfers()),
+        "persistent_residents" => Ok(manifest.declare_persistent_residents()),
+        "resident_work" => Ok(manifest.declare_resident_work()),
+        "resident_orders" => Ok(manifest.declare_resident_orders()),
+        "world_sites" => Ok(manifest.declare_world_sites()),
+        "structure_operations" => Ok(manifest.declare_structure_operations()),
         "inventory_menus" => Ok(manifest.declare_inventory_menus()),
         "inventory_storage_transactions" => Ok(manifest.declare_inventory_storage_transactions()),
         "player_inventory" => Ok(manifest.declare_player_inventory()),
         "zones" => Ok(manifest.declare_zones()),
-        "villagers" => Ok(manifest.declare_villagers()),
         "player_teleport" => Ok(manifest.declare_player_teleport()),
         "player_queries" => Ok(manifest.declare_player_queries()),
         "entity_damage" => Ok(manifest.declare_entity_damage()),
@@ -3454,49 +3502,147 @@ fn install_solaris_api(
         )?,
     )?;
     let open_menu_invocation = Arc::clone(&invocation);
-    let present_client_ui_invocation = Arc::clone(&invocation);
+    let open_client_view_invocation = Arc::clone(&invocation);
     api.set(
-        "present_client_ui",
+        "open_client_view",
         lua.create_function(
-            move |_, (player_id, ui_id, options): (u64, LuaString, Table)| {
-                validate_record_shape(&options, &["mode", "title", "body"], "client UI")?;
-                let mode = match options.raw_get::<Value>("mode")? {
-                    Value::String(mode) => match mode.as_bytes().as_ref() {
-                        b"screen" => crate::ScriptClientUiMode::Screen,
-                        b"hud" => crate::ScriptClientUiMode::Hud,
-                        b"hidden" => crate::ScriptClientUiMode::Hidden,
-                        _ => return Err(lua_input_error("UI mode", "invalid")),
-                    },
-                    _ => return Err(lua_input_error("UI mode", "type")),
-                };
-                if ui_id.as_bytes().len() > crate::MAX_SCRIPT_RESOURCE_ID_BYTES {
-                    return Err(lua_input_error("ui_id", "too_long"));
-                }
-                let ui_id = ui_id
-                    .to_str()
-                    .map_err(|_| lua_input_error("ui_id", "utf8"))?;
-                let title = raw_optional_bounded_string_field(
-                    &options,
-                    "title",
-                    "UI title",
-                    crate::MAX_CLIENT_UI_TITLE_BYTES,
-                    true,
+            move |_,
+                  (request_id, player_id, owned_view_id, model): (
+                LuaString,
+                u64,
+                LuaString,
+                Table,
+            )| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let owned_view_id = bounded_lua_string(
+                    owned_view_id,
+                    "owned_view_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
                 )?;
-                let body = raw_optional_bounded_string_field(
-                    &options,
-                    "body",
-                    "UI body",
-                    crate::MAX_CLIENT_UI_BODY_BYTES,
-                    true,
-                )?;
-                let presentation =
-                    crate::ScriptClientUiPresentation::try_new(&ui_id, mode, title, body)
-                        .map_err(dto_error)?;
+                let model = parse_client_view_model(model)?;
+                let request = crate::ScriptClientViewOpen::try_new(
+                    &request_id,
+                    ScriptPlayerId::new(player_id),
+                    &owned_view_id,
+                    model,
+                )
+                .map_err(dto_error)?;
                 push_command(
-                    &present_client_ui_invocation,
-                    ScriptCommand::PresentClientUi {
+                    &open_client_view_invocation,
+                    ScriptCommand::OpenClientView { request },
+                )
+            },
+        )?,
+    )?;
+    let present_client_view_invocation = Arc::clone(&invocation);
+    api.set(
+        "present_client_view",
+        lua.create_function(
+            move |_,
+                  (player_id, view_instance_id, expected_revision, model): (
+                u64,
+                LuaString,
+                u64,
+                Table,
+            )| {
+                let view_instance_id = bounded_lua_string(
+                    view_instance_id,
+                    "view_instance_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let model = parse_client_view_model(model)?;
+                let request = crate::ScriptClientViewPresent::try_new(
+                    ScriptPlayerId::new(player_id),
+                    &view_instance_id,
+                    expected_revision,
+                    model,
+                )
+                .map_err(dto_error)?;
+                push_command(
+                    &present_client_view_invocation,
+                    ScriptCommand::PresentClientView { request },
+                )
+            },
+        )?,
+    )?;
+    let close_client_view_invocation = Arc::clone(&invocation);
+    api.set(
+        "close_client_view",
+        lua.create_function(move |_, (player_id, view_instance_id): (u64, LuaString)| {
+            let view_instance_id = bounded_lua_string(
+                view_instance_id,
+                "view_instance_id",
+                crate::MAX_CLIENT_VIEW_ID_BYTES,
+                false,
+            )?;
+            push_command(
+                &close_client_view_invocation,
+                ScriptCommand::CloseClientView {
+                    player_id: ScriptPlayerId::new(player_id),
+                    view_instance_id,
+                },
+            )
+        })?,
+    )?;
+    let begin_client_selection_invocation = Arc::clone(&invocation);
+    api.set(
+        "begin_client_selection",
+        lua.create_function(
+            move |_,
+                  (
+                request_id,
+                player_id,
+                view_instance_id,
+                view_revision,
+                action_id,
+                constraints,
+            ): (LuaString, u64, LuaString, u64, LuaString, Table)| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let view_instance_id = bounded_lua_string(
+                    view_instance_id,
+                    "view_instance_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let action_id = bounded_lua_string(
+                    action_id,
+                    "action_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let constraints = parse_selection_constraints(constraints)?;
+                push_command(
+                    &begin_client_selection_invocation,
+                    ScriptCommand::BeginClientSelection {
+                        request_id,
                         player_id: ScriptPlayerId::new(player_id),
-                        presentation,
+                        view_instance_id,
+                        view_revision,
+                        action_id,
+                        constraints,
+                    },
+                )
+            },
+        )?,
+    )?;
+    let cancel_client_selection_invocation = Arc::clone(&invocation);
+    api.set(
+        "cancel_client_selection",
+        lua.create_function(
+            move |_, (player_id, selection_context_id): (u64, LuaString)| {
+                let selection_context_id = bounded_lua_string(
+                    selection_context_id,
+                    "selection_context_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                push_command(
+                    &cancel_client_selection_invocation,
+                    ScriptCommand::CancelClientSelection {
+                        player_id: ScriptPlayerId::new(player_id),
+                        selection_context_id,
                     },
                 )
             },
@@ -3875,86 +4021,6 @@ fn install_solaris_api(
             )
         })?,
     )?;
-    let bind_villager_invocation = Arc::clone(&invocation);
-    api.set(
-        "bind_nearest_villager",
-        lua.create_function(
-            move |_, (request_id, x, y, z, radius): (LuaString, f64, f64, f64, f64)| {
-                let request_id = bounded_script_id(request_id, "request_id")?;
-                let center = ScriptPosition::try_new(x, y, z)
-                    .ok_or_else(|| lua_input_error("villager_center", "invalid"))?;
-                let request = ScriptVillagerBindingRequest::try_new(request_id, center, radius)
-                    .map_err(dto_error)?;
-                push_command(
-                    &bind_villager_invocation,
-                    ScriptCommand::RequestVillagerBinding { request },
-                )
-            },
-        )?,
-    )?;
-    let set_villager_idle_invocation = Arc::clone(&invocation);
-    api.set(
-        "set_villager_idle",
-        lua.create_function(
-            move |_, (request_id, binding_token): (LuaString, LuaString)| {
-                let request_id = bounded_script_id(request_id, "request_id")?;
-                let binding_token = bounded_script_id(binding_token, "binding_token")?;
-                let request = ScriptVillagerGoalRequest::try_new(
-                    request_id,
-                    binding_token,
-                    ScriptVillagerGoal::idle(),
-                )
-                .map_err(dto_error)?;
-                push_command(
-                    &set_villager_idle_invocation,
-                    ScriptCommand::SetVillagerGoal { request },
-                )
-            },
-        )?,
-    )?;
-    let move_villager_invocation = Arc::clone(&invocation);
-    api.set(
-        "move_villager_to",
-        lua.create_function(
-            move |_,
-                  (request_id, binding_token, x, y, z, speed): (
-                LuaString,
-                LuaString,
-                f64,
-                f64,
-                f64,
-                f64,
-            )| {
-                let request_id = bounded_script_id(request_id, "request_id")?;
-                let binding_token = bounded_script_id(binding_token, "binding_token")?;
-                let target = ScriptPosition::try_new(x, y, z)
-                    .ok_or_else(|| lua_input_error("villager_target", "invalid"))?;
-                let goal = ScriptVillagerGoal::follow_position(target, speed).map_err(dto_error)?;
-                let request = ScriptVillagerGoalRequest::try_new(request_id, binding_token, goal)
-                    .map_err(dto_error)?;
-                push_command(
-                    &move_villager_invocation,
-                    ScriptCommand::SetVillagerGoal { request },
-                )
-            },
-        )?,
-    )?;
-    let release_villager_invocation = Arc::clone(&invocation);
-    api.set(
-        "release_villager_binding",
-        lua.create_function(
-            move |_, (request_id, binding_token): (LuaString, LuaString)| {
-                let request_id = bounded_script_id(request_id, "request_id")?;
-                let binding_token = bounded_script_id(binding_token, "binding_token")?;
-                let request = ScriptVillagerReleaseRequest::try_new(request_id, binding_token)
-                    .map_err(dto_error)?;
-                push_command(
-                    &release_villager_invocation,
-                    ScriptCommand::ReleaseVillagerBinding { request },
-                )
-            },
-        )?,
-    )?;
     let send_payload_invocation = Arc::clone(&invocation);
     api.set(
         "send_custom_payload",
@@ -4166,6 +4232,388 @@ fn parse_storage_mutations(table: Table) -> mlua::Result<Vec<ScriptStorageMutati
     Ok(mutations)
 }
 
+fn raw_f64_field(table: &Table, key: &'static str, field: &'static str) -> mlua::Result<f64> {
+    match table.raw_get::<Value>(key)? {
+        Value::Integer(value) => Ok(value as f64),
+        Value::Number(value) => Ok(value),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
+fn raw_optional_f64_field(
+    table: &Table,
+    key: &'static str,
+    field: &'static str,
+) -> mlua::Result<Option<f64>> {
+    match table.raw_get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Integer(value) => Ok(Some(value as f64)),
+        Value::Number(value) => Ok(Some(value)),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
+fn raw_optional_bool_field(
+    table: &Table,
+    key: &'static str,
+    field: &'static str,
+) -> mlua::Result<Option<bool>> {
+    match table.raw_get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Boolean(value) => Ok(Some(value)),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
+fn raw_optional_table_field(
+    table: &Table,
+    key: &'static str,
+    field: &'static str,
+) -> mlua::Result<Option<Table>> {
+    match table.raw_get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Table(value) => Ok(Some(value)),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
+fn parse_view_formation(value: &str) -> mlua::Result<crate::ScriptClientViewFormation> {
+    match value {
+        "line" => Ok(crate::ScriptClientViewFormation::Line),
+        "column" => Ok(crate::ScriptClientViewFormation::Column),
+        "wedge" => Ok(crate::ScriptClientViewFormation::Wedge),
+        "square" => Ok(crate::ScriptClientViewFormation::Square),
+        _ => Err(lua_input_error("view_formation", "invalid")),
+    }
+}
+
+fn parse_client_view_rows(table: &Table) -> mlua::Result<Vec<crate::ScriptClientViewRow>> {
+    let Some(rows) = raw_optional_table_field(table, "rows", "view_rows")? else {
+        return Ok(Vec::new());
+    };
+    let len = validate_sequence_shape(&rows, crate::MAX_CLIENT_VIEW_ROWS, "view_rows")?;
+    let mut parsed = Vec::with_capacity(len);
+    for index in 1..=len {
+        let row = raw_table_entry(&rows, index, "view_row")?;
+        validate_record_shape(&row, &["cells"], "view_row")?;
+        let cells_table = raw_optional_table_field(&row, "cells", "view_row_cells")?
+            .ok_or_else(|| lua_input_error("view_row_cells", "type"))?;
+        let cell_count = validate_sequence_shape(
+            &cells_table,
+            crate::MAX_CLIENT_VIEW_FIELDS,
+            "view_row_cells",
+        )?;
+        let mut cells = Vec::with_capacity(cell_count);
+        for cell in 1..=cell_count {
+            match cells_table.raw_get::<Value>(cell)? {
+                Value::String(value) => cells.push(bounded_lua_string(
+                    value,
+                    "view_cell",
+                    crate::MAX_CLIENT_VIEW_CELL_BYTES,
+                    true,
+                )?),
+                _ => return Err(lua_input_error("view_cell", "type")),
+            }
+        }
+        parsed.push(crate::ScriptClientViewRow::try_new(cells).map_err(dto_error)?);
+    }
+    Ok(parsed)
+}
+
+fn parse_client_view_fields(table: &Table) -> mlua::Result<Vec<crate::ScriptClientViewField>> {
+    let Some(fields) = raw_optional_table_field(table, "fields", "view_fields")? else {
+        return Ok(Vec::new());
+    };
+    let len = validate_sequence_shape(&fields, crate::MAX_CLIENT_VIEW_FIELDS, "view_fields")?;
+    let mut parsed = Vec::with_capacity(len);
+    for index in 1..=len {
+        let field = raw_table_entry(&fields, index, "view_field")?;
+        validate_record_shape(&field, &["id", "number", "text", "selected"], "view_field")?;
+        let id = raw_bounded_string_field(
+            &field,
+            "id",
+            "view_field_id",
+            crate::MAX_CLIENT_VIEW_ID_BYTES,
+            false,
+        )?;
+        let number = raw_optional_f64_field(&field, "number", "view_field_number")?;
+        let text = raw_optional_bounded_string_field(
+            &field,
+            "text",
+            "view_field_text",
+            crate::MAX_CLIENT_VIEW_TEXT_BYTES,
+            true,
+        )?;
+        let selected = raw_optional_bounded_string_field(
+            &field,
+            "selected",
+            "view_field_selected",
+            crate::MAX_CLIENT_VIEW_ID_BYTES,
+            false,
+        )?;
+        let typed = [number.is_some(), text.is_some(), selected.is_some()]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+        if typed != 1 {
+            return Err(lua_input_error("view_field", "shape"));
+        }
+        let field = if let Some(number) = number {
+            crate::ScriptClientViewField::try_number(&id, number)
+        } else if let Some(text) = text {
+            crate::ScriptClientViewField::try_text(&id, text)
+        } else {
+            crate::ScriptClientViewField::try_selected(&id, selected.as_deref().unwrap_or_default())
+        };
+        parsed.push(field.map_err(dto_error)?);
+    }
+    Ok(parsed)
+}
+
+fn parse_client_view_model(table: Table) -> mlua::Result<crate::ScriptClientViewModel> {
+    validate_record_shape(
+        &table,
+        &[
+            "page",
+            "page_count",
+            "rows",
+            "fields",
+            "actions",
+            "tabs",
+            "resource_entries",
+            "markers",
+            "reason",
+        ],
+        "client_view_model",
+    )?;
+    let page = raw_u32_field(&table, "page", "view_page")?;
+    let page_count = raw_u32_field(&table, "page_count", "view_page_count")?;
+    let rows = parse_client_view_rows(&table)?;
+    let fields = parse_client_view_fields(&table)?;
+    let actions = match raw_optional_table_field(&table, "actions", "view_actions")? {
+        None => Vec::new(),
+        Some(actions) => {
+            let len =
+                validate_sequence_shape(&actions, crate::MAX_CLIENT_VIEW_ACTIONS, "view_actions")?;
+            let mut parsed = Vec::with_capacity(len);
+            for index in 1..=len {
+                let action = raw_table_entry(&actions, index, "view_action")?;
+                validate_record_shape(
+                    &action,
+                    &["action_id", "enabled", "label", "deny_reason"],
+                    "view_action",
+                )?;
+                let action_id = raw_bounded_string_field(
+                    &action,
+                    "action_id",
+                    "view_action_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let enabled = raw_optional_bool_field(&action, "enabled", "view_action_enabled")?
+                    .unwrap_or(false);
+                let label = raw_optional_bounded_string_field(
+                    &action,
+                    "label",
+                    "view_action_label",
+                    crate::MAX_CLIENT_VIEW_TITLE_BYTES,
+                    true,
+                )?;
+                let deny_reason = raw_optional_bounded_string_field(
+                    &action,
+                    "deny_reason",
+                    "view_action_deny_reason",
+                    crate::MAX_CLIENT_VIEW_DENY_REASON_BYTES,
+                    true,
+                )?;
+                parsed.push(
+                    crate::ScriptClientViewAction::try_new(&action_id, enabled, label, deny_reason)
+                        .map_err(dto_error)?,
+                );
+            }
+            parsed
+        }
+    };
+    let tabs = match raw_optional_table_field(&table, "tabs", "view_tabs")? {
+        None => Vec::new(),
+        Some(tabs) => {
+            let len = validate_sequence_shape(&tabs, crate::MAX_CLIENT_VIEW_TABS, "view_tabs")?;
+            let mut parsed = Vec::with_capacity(len);
+            for index in 1..=len {
+                let tab = raw_table_entry(&tabs, index, "view_tab")?;
+                validate_record_shape(&tab, &["id", "label"], "view_tab")?;
+                let id = raw_bounded_string_field(
+                    &tab,
+                    "id",
+                    "view_tab_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let label = raw_bounded_string_field(
+                    &tab,
+                    "label",
+                    "view_tab_label",
+                    crate::MAX_CLIENT_VIEW_CELL_BYTES,
+                    true,
+                )?;
+                parsed.push(crate::ScriptClientViewTab::try_new(&id, &label).map_err(dto_error)?);
+            }
+            parsed
+        }
+    };
+    let resource_entries =
+        match raw_optional_table_field(&table, "resource_entries", "view_resources")? {
+            None => Vec::new(),
+            Some(resources) => {
+                let len = validate_sequence_shape(
+                    &resources,
+                    crate::MAX_CLIENT_VIEW_RESOURCES,
+                    "view_resources",
+                )?;
+                let mut parsed = Vec::with_capacity(len);
+                for index in 1..=len {
+                    let resource = raw_table_entry(&resources, index, "view_resource")?;
+                    validate_record_shape(&resource, &["id", "have", "need"], "view_resource")?;
+                    let id = raw_bounded_string_field(
+                        &resource,
+                        "id",
+                        "view_resource_id",
+                        crate::MAX_CLIENT_VIEW_ID_BYTES,
+                        false,
+                    )?;
+                    let have = raw_f64_field(&resource, "have", "view_resource_have")?;
+                    let need = raw_f64_field(&resource, "need", "view_resource_need")?;
+                    parsed.push(
+                        crate::ScriptClientViewResourceEntry::try_new(&id, have, need)
+                            .map_err(dto_error)?,
+                    );
+                }
+                parsed
+            }
+        };
+    let markers = match raw_optional_table_field(&table, "markers", "view_markers")? {
+        None => Vec::new(),
+        Some(markers) => {
+            let len =
+                validate_sequence_shape(&markers, crate::MAX_CLIENT_VIEW_MARKERS, "view_markers")?;
+            let mut parsed = Vec::with_capacity(len);
+            for index in 1..=len {
+                let marker = raw_table_entry(&markers, index, "view_marker")?;
+                validate_record_shape(
+                    &marker,
+                    &[
+                        "marker_id",
+                        "selection_token",
+                        "action_id",
+                        "formation",
+                        "radius",
+                    ],
+                    "view_marker",
+                )?;
+                let marker_id = raw_bounded_string_field(
+                    &marker,
+                    "marker_id",
+                    "view_marker_id",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let selection_token = raw_optional_bounded_string_field(
+                    &marker,
+                    "selection_token",
+                    "view_selection_token",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let action_id = raw_optional_bounded_string_field(
+                    &marker,
+                    "action_id",
+                    "view_marker_action",
+                    crate::MAX_CLIENT_VIEW_ID_BYTES,
+                    false,
+                )?;
+                let formation = raw_optional_bounded_string_field(
+                    &marker,
+                    "formation",
+                    "view_marker_formation",
+                    32,
+                    false,
+                )?
+                .map(|formation| parse_view_formation(&formation))
+                .transpose()?;
+                let radius = raw_optional_f64_field(&marker, "radius", "view_marker_radius")?;
+                parsed.push(
+                    crate::ScriptClientViewMarker::try_new(
+                        &marker_id,
+                        selection_token,
+                        action_id,
+                        formation,
+                        radius,
+                    )
+                    .map_err(dto_error)?,
+                );
+            }
+            parsed
+        }
+    };
+    let reason = raw_optional_bounded_string_field(
+        &table,
+        "reason",
+        "view_reason",
+        crate::MAX_CLIENT_VIEW_REASON_BYTES,
+        true,
+    )?;
+    crate::ScriptClientViewModel::try_new(
+        page,
+        page_count,
+        rows,
+        fields,
+        actions,
+        tabs,
+        resource_entries,
+        markers,
+        reason,
+    )
+    .map_err(dto_error)
+}
+
+fn parse_selection_constraints(
+    table: Table,
+) -> mlua::Result<crate::ScriptClientSelectionConstraints> {
+    validate_record_shape(
+        &table,
+        &[
+            "dimension",
+            "range_limit",
+            "ttl_ticks",
+            "formation",
+            "radius",
+        ],
+        "selection_constraints",
+    )?;
+    let dimension = raw_bounded_string_field(
+        &table,
+        "dimension",
+        "selection_dimension",
+        crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+        false,
+    )?;
+    let range_limit = raw_u32_field(&table, "range_limit", "selection_range_limit")?;
+    let ttl_ticks = raw_u64_field(&table, "ttl_ticks", "selection_ttl_ticks")?;
+    let formation =
+        raw_optional_bounded_string_field(&table, "formation", "selection_formation", 32, false)?
+            .map(|formation| parse_view_formation(&formation))
+            .transpose()?;
+    let radius = raw_optional_f64_field(&table, "radius", "selection_radius")?;
+    crate::ScriptClientSelectionConstraints::try_new(
+        &dimension,
+        range_limit,
+        ttl_ticks,
+        formation,
+        radius,
+    )
+    .map_err(dto_error)
+}
+
 fn validate_sequence_shape(table: &Table, max: usize, field: &'static str) -> mlua::Result<usize> {
     let raw_len = table.raw_len();
     if raw_len > max {
@@ -4265,9 +4713,37 @@ fn raw_u8_field(table: &Table, key: &'static str, field: &'static str) -> mlua::
     }
 }
 
+fn raw_u16_field(table: &Table, key: &'static str, field: &'static str) -> mlua::Result<u16> {
+    match table.raw_get::<Value>(key)? {
+        Value::Integer(value) => u16::try_from(value).map_err(|_| lua_input_error(field, "range")),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
+fn raw_u32_field(table: &Table, key: &'static str, field: &'static str) -> mlua::Result<u32> {
+    match table.raw_get::<Value>(key)? {
+        Value::Integer(value) => u32::try_from(value).map_err(|_| lua_input_error(field, "range")),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
+fn raw_u64_field(table: &Table, key: &'static str, field: &'static str) -> mlua::Result<u64> {
+    match table.raw_get::<Value>(key)? {
+        Value::Integer(value) => u64::try_from(value).map_err(|_| lua_input_error(field, "range")),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
 fn raw_i16_field(table: &Table, key: &'static str, field: &'static str) -> mlua::Result<i16> {
     match table.raw_get::<Value>(key)? {
         Value::Integer(value) => i16::try_from(value).map_err(|_| lua_input_error(field, "range")),
+        _ => Err(lua_input_error(field, "type")),
+    }
+}
+
+fn raw_i32_field(table: &Table, key: &'static str, field: &'static str) -> mlua::Result<i32> {
+    match table.raw_get::<Value>(key)? {
+        Value::Integer(value) => i32::try_from(value).map_err(|_| lua_input_error(field, "range")),
         _ => Err(lua_input_error(field, "type")),
     }
 }
@@ -4767,58 +5243,61 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             }
             table.set("players", snapshots)?;
         }
-        ScriptEventKind::VillagerBindingResult {
-            request_id,
-            binding,
-            failure,
-        } => {
-            table.set("request_id", request_id.as_str())?;
-            match binding {
-                Some(binding) => {
-                    table.set("binding_token", binding.token())?;
-                    table.set("binding_expires_at_tick", binding.expires_at_tick())?;
-                }
-                None => {
-                    table.set("binding_token", mlua::Value::Nil)?;
-                    table.set("binding_expires_at_tick", mlua::Value::Nil)?;
-                }
-            }
-            table.set("failure", failure.map(|failure| failure.as_str()))?;
-        }
-        ScriptEventKind::VillagerGoalResult {
-            request_id,
-            goal,
-            failure,
-        } => {
-            table.set("request_id", request_id.as_str())?;
-            table.set("goal", goal.kind())?;
-            table.set("accepted", failure.is_none())?;
-            table.set("failure", failure.map(|failure| failure.as_str()))?;
-            if let Some(target) = goal.target() {
-                table.set("x", target.x())?;
-                table.set("y", target.y())?;
-                table.set("z", target.z())?;
-            }
-            table.set("speed", goal.speed())?;
-        }
-        ScriptEventKind::VillagerReleaseResult {
-            request_id,
-            failure,
-        } => {
-            table.set("request_id", request_id.as_str())?;
-            table.set("accepted", failure.is_none())?;
-            table.set("failure", failure.map(|failure| failure.as_str()))?;
-        }
-        ScriptEventKind::LoaderInteraction {
+        ScriptEventKind::LoaderViewRequest {
             player_id,
-            interaction_id,
-            phase,
-            payload,
+            request_kind,
         } => {
             table.set("player_id", player_id.value())?;
-            table.set("interaction_id", interaction_id.as_str())?;
-            table.set("phase", phase.as_str())?;
-            table.set("payload", payload.as_str())?;
+            table.set("request_kind", request_kind.contract_name())?;
+        }
+        ScriptEventKind::LoaderViewAction {
+            player_id,
+            view_instance_id,
+            view_revision,
+            action_id,
+            action_sequence,
+            fields,
+            selection_token,
+        } => {
+            table.set("player_id", player_id.value())?;
+            table.set("view_instance_id", view_instance_id.as_str())?;
+            table.set("view_revision", *view_revision)?;
+            table.set("action_id", action_id.as_str())?;
+            table.set("action_sequence", *action_sequence)?;
+            let lua_fields = lua.create_table_with_capacity(fields.len(), 0)?;
+            for (index, field) in fields.iter().enumerate() {
+                lua_fields.set(index + 1, view_field_table(lua, field)?)?;
+            }
+            table.set("fields", lua_fields)?;
+            table.set("selection_token", selection_token.as_deref())?;
+        }
+        ScriptEventKind::ClientViewOpened {
+            request_id,
+            player_id,
+            view_instance_id,
+            revision,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("player_id", player_id.value())?;
+            table.set("view_instance_id", view_instance_id.as_deref())?;
+            table.set("revision", *revision)?;
+            table.set("opened", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.contract_name()))?;
+        }
+        ScriptEventKind::ClientSelectionStarted {
+            request_id,
+            player_id,
+            selection_context_id,
+            expires_at_tick,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("player_id", player_id.value())?;
+            table.set("selection_context_id", selection_context_id.as_deref())?;
+            table.set("expires_at_tick", *expires_at_tick)?;
+            table.set("started", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.contract_name()))?;
         }
         ScriptEventKind::ClientBrand { player_id, brand } => {
             table.set("player_id", player_id.value())?;
@@ -4834,6 +5313,23 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("phase", phase.as_str())?;
             table.set("channel", channel.as_str())?;
             table.set("payload", lua.create_string(payload)?)?;
+        }
+    }
+    Ok(table)
+}
+
+fn view_field_table(lua: &Lua, field: &crate::ScriptClientViewField) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("id", field.id())?;
+    match field.value() {
+        crate::ScriptClientViewFieldValue::Number(number) => {
+            table.set("number", *number)?;
+        }
+        crate::ScriptClientViewFieldValue::Text(text) => {
+            table.set("text", text.as_str())?;
+        }
+        crate::ScriptClientViewFieldValue::Selected(selected) => {
+            table.set("selected", selected.as_str())?;
         }
     }
     Ok(table)
@@ -4888,10 +5384,10 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::EntitySpawnResult { .. } => "on_entity_spawn_result",
         ScriptEventKind::EntityDamageResult { .. } => "on_entity_damage_result",
         ScriptEventKind::OnlinePlayersResult { .. } => "on_player_online_result",
-        ScriptEventKind::VillagerBindingResult { .. } => "on_villager_binding_result",
-        ScriptEventKind::VillagerGoalResult { .. } => "on_villager_goal_result",
-        ScriptEventKind::VillagerReleaseResult { .. } => "on_villager_release_result",
-        ScriptEventKind::LoaderInteraction { .. } => "on_loader_interaction",
+        ScriptEventKind::LoaderViewRequest { .. } => "on_loader_view_request",
+        ScriptEventKind::LoaderViewAction { .. } => "on_loader_view_action",
+        ScriptEventKind::ClientViewOpened { .. } => "on_client_view_opened",
+        ScriptEventKind::ClientSelectionStarted { .. } => "on_client_selection_started",
         ScriptEventKind::ClientBrand { .. } => "on_player_client_brand",
         ScriptEventKind::CustomPayload { .. } => "on_player_custom_payload",
     }
@@ -4930,8 +5426,9 @@ mod tests {
     use super::*;
     use crate::{
         MAX_SCRIPT_RESOURCE_ID_BYTES, PlayerCommandAdmission, RuntimeControls, SCRIPT_API_VERSION,
-        ScriptCommand, ScriptCraftingSource, ScriptEvent, ScriptGameMode, ScriptPlayerContext,
-        ScriptPlayerId, ScriptPluginManifest,
+        ScriptCommand, ScriptCraftingSource, ScriptEvent, ScriptGameMode, ScriptInventoryEndpoint,
+        ScriptOperation, ScriptOwnedInventoryOperation, ScriptPlayerContext, ScriptPlayerId,
+        ScriptPluginManifest,
     };
 
     static TEST_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -5021,6 +5518,8 @@ mod tests {
             config: toml::Table::new(),
             source: source.to_owned(),
             source_path: PathBuf::from(path),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -5515,57 +6014,143 @@ capabilities = ["entity_damage"]
     }
 
     #[test]
-    fn loader_input_phases_drive_plugin_state() {
+    fn loader_view_action_drives_plugin_commands() {
         let mut runtime = LuaScriptRuntime::from_source(
             manifest(&[]),
             r#"
-                local held = {}
-                function on_loader_interaction(event)
-                    if event.phase == "press" then
-                        held[event.player_id] = true
-                    elseif event.phase == "release" and held[event.player_id] then
-                        held[event.player_id] = nil
-                        solaris.send_message(event.player_id, "released")
-                    end
+                function on_loader_view_action(event)
+                    assert(event.view_instance_id == "test-plugin:instance-1")
+                    assert(event.view_revision == 3)
+                    assert(event.action_id == "test-plugin:place")
+                    assert(event.action_sequence == 1)
+                    assert(#event.fields == 2)
+                    assert(event.fields[1].id == "count")
+                    assert(event.fields[1].number == 4)
+                    assert(event.fields[2].id == "note")
+                    assert(event.fields[2].text == "hi")
+                    assert(event.selection_token == "test-plugin:ctx-1")
+                    solaris.close_client_view(event.player_id, event.view_instance_id)
                 end
             "#,
             LuaRuntimeLimits::default(),
         )
         .unwrap();
         let controls = RuntimeControls::unrestricted();
-        use crate::ScriptLoaderInteractionPhase::{Press, Release};
-        for (phase, emits_message) in [
-            (Release, false),
-            (Press, false),
-            (Release, true),
-            (Release, false),
-        ] {
-            let event = ScriptEvent::loader_interaction(
-                "test-plugin",
-                ScriptPlayerId::new(7),
-                "test-plugin:continue",
-                phase,
-                "",
+        let event = ScriptEvent::loader_view_action(
+            "test-plugin",
+            ScriptPlayerId::new(7),
+            "test-plugin:instance-1",
+            3,
+            "test-plugin:place",
+            1,
+            vec![
+                crate::ScriptClientViewField::try_number("count", 4.0).unwrap(),
+                crate::ScriptClientViewField::try_text("note", "hi".to_owned()).unwrap(),
+            ],
+            Some("test-plugin:ctx-1".to_owned()),
+        )
+        .unwrap();
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
             )
             .unwrap();
-            let batch = runtime
-                .handle_event(
-                    &event,
-                    RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
-                )
-                .unwrap();
-            if emits_message {
-                assert_eq!(
-                    batch.commands(),
-                    &[ScriptCommand::SendChatMessage {
-                        player_id: ScriptPlayerId::new(7),
-                        message: "released".to_owned(),
-                    }]
-                );
-            } else {
-                assert!(batch.commands().is_empty());
-            }
-        }
+        assert!(matches!(
+            batch.commands(),
+            [ScriptCommand::CloseClientView {
+                player_id,
+                view_instance_id,
+            }] if *player_id == ScriptPlayerId::new(7)
+                && view_instance_id == "test-plugin:instance-1"
+        ));
+    }
+
+    #[test]
+    fn lua_open_and_present_client_view_round_trip_through_handlers() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&[]),
+            r#"
+                function on_loader_view_request(event)
+                    assert(event.request_kind == "settlement")
+                    solaris.open_client_view("open-1", event.player_id, "test-plugin:showcase", {
+                        page = 0,
+                        page_count = 1,
+                        rows = { { cells = { "Hamlet" } } },
+                        fields = {
+                            { id = "count", number = 4 },
+                            { id = "bp", selected = "house" },
+                        },
+                        actions = { { action_id = "test-plugin:place", enabled = true, label = "Place" } },
+                        resource_entries = { { id = "food", have = 12, need = 4 } },
+                        markers = { { marker_id = "anchor", selection_token = "test-plugin:ctx-1",
+                                      action_id = "test-plugin:place", formation = "line", radius = 4 } },
+                    })
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::loader_view_request(
+            "test-plugin",
+            ScriptPlayerId::new(7),
+            crate::ScriptClientViewRequestKind::Settlement,
+        )
+        .unwrap();
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        let [ScriptCommand::OpenClientView { request }] = batch.commands() else {
+            panic!(
+                "expected one open_client_view command, got {:?}",
+                batch.commands()
+            );
+        };
+        assert_eq!(request.request_id(), "open-1");
+        assert_eq!(request.owned_view_id(), "test-plugin:showcase");
+        let model = request.model();
+        assert_eq!(model.page_count(), 1);
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.field_ids().len(), 2);
+        assert_eq!(model.actions()[0].action_id(), "test-plugin:place");
+        assert_eq!(
+            model.markers()[0].selection_token(),
+            Some("test-plugin:ctx-1")
+        );
+    }
+
+    #[test]
+    fn lua_client_view_model_rejects_out_of_bound_input() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&[]),
+            r#"
+                function on_loader_view_request(event)
+                    local rows = {}
+                    for index = 1, 65 do rows[index] = { cells = { "x" } } end
+                    solaris.open_client_view("open-1", event.player_id, "test-plugin:showcase", {
+                        page = 0, page_count = 1, rows = rows,
+                    })
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::loader_view_request(
+            "test-plugin",
+            ScriptPlayerId::new(7),
+            crate::ScriptClientViewRequestKind::Army,
+        )
+        .unwrap();
+        let outcome = runtime.handle_event(
+            &event,
+            RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+        );
+        assert!(outcome.is_err(), "over-limit rows must fail closed in Lua");
     }
 
     #[test]
@@ -6530,6 +7115,8 @@ capabilities = ["entity_damage"]
             config: toml::Table::new(),
             source: format!("function on_server_tick(_event) solaris.broadcast('{id}') end"),
             source_path: PathBuf::from(format!("{id}/main.lua")),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -6656,6 +7243,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("atomic/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -6894,7 +7483,6 @@ capabilities = ["entity_damage"]
                 .declare_inventory_menus()
                 .declare_inventory_storage_transactions()
                 .declare_zones()
-                .declare_villagers()
                 .validate()
                 .unwrap();
         let cases = [
@@ -7004,34 +7592,34 @@ capabilities = ["entity_damage"]
                 "zone_id:too_long",
             ),
             (
-                "bind_nearest_villager.request_id",
-                "solaris.bind_nearest_villager(string.rep('x', 65), 0, 64, 0, 16)",
+                "claim_resident.request_id",
+                "solaris.claim_resident(string.rep('x', 65), 'op-1', 7, '12345678-1234-5678-1234-567812345678', 0)",
                 "request_id:too_long",
             ),
             (
-                "set_villager_idle.request_id",
-                "solaris.set_villager_idle(string.rep('x', 65), 'binding-1')",
-                "request_id:too_long",
+                "claim_resident.uuid",
+                "solaris.claim_resident('claim', 'op-1', 7, string.rep('x', 37), 0)",
+                "resident_entity_uuid:too_long",
             ),
             (
-                "set_villager_idle.binding",
-                "solaris.set_villager_idle('idle', string.rep('x', 65))",
-                "binding_token:too_long",
+                "release_resident.handle",
+                "solaris.release_resident('release', 'op-2', string.rep('x', 65), 0)",
+                "resident_handle:too_long",
             ),
             (
-                "move_villager_to.binding",
-                "solaris.move_villager_to('move', string.rep('x', 65), 0, 64, 0, 0.3)",
-                "binding_token:too_long",
+                "set_resident_pois.poi",
+                "solaris.set_resident_pois('pois', 'op-3', 'r1', string.rep('x', 129), nil, nil, 0)",
+                "resident_home_poi:too_long",
             ),
             (
-                "release_villager_binding.request_id",
-                "solaris.release_villager_binding(string.rep('x', 65), 'binding-1')",
-                "request_id:too_long",
+                "query_residents.handle",
+                "solaris.query_residents('query', {string.rep('x', 65)}, nil)",
+                "resident_handle:too_long",
             ),
             (
-                "release_villager_binding.binding",
-                "solaris.release_villager_binding('release', string.rep('x', 65))",
-                "binding_token:too_long",
+                "spawn_resident.profile",
+                "solaris.spawn_resident('spawn', 'op-4', 'token-1', {kind='boss'})",
+                "resident_kind:invalid",
             ),
         ];
         let controls = RuntimeControls::unrestricted();
@@ -7042,7 +7630,7 @@ capabilities = ["entity_damage"]
                 manifest.clone(),
                 &source,
                 LuaRuntimeLimits {
-                    memory_bytes: NonZeroUsize::new(512 * 1024).unwrap(),
+                    memory_bytes: NonZeroUsize::new(1024 * 1024).unwrap(),
                     ..LuaRuntimeLimits::default()
                 },
             )
@@ -7130,6 +7718,177 @@ capabilities = ["entity_damage"]
     }
 
     #[test]
+    fn lua_extended_contract_emits_validated_dto_requests_and_respects_batch_capacity() {
+        let manifest = ScriptPluginManifest::new(
+            "contract-test",
+            "Contract Test",
+            "0.1.0",
+            SCRIPT_API_VERSION,
+        )
+        .subscribe_event("server.tick")
+        .declare_plugin_storage()
+        .declare_inventory_menus()
+        .declare_inventory_storage_transactions()
+        .declare_zones()
+        .declare_persistent_residents()
+        .validate()
+        .unwrap();
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest,
+            r#"
+                function on_server_tick(_event)
+                    solaris.storage_get("read", "coins:player-7")
+                    solaris.storage_cas("write", "coins:player-7", 2, "9")
+                    solaris.storage_delete("delete", "coins:obsolete", 3)
+                    solaris.open_inventory_menu(7, "catalog", "Catalog", {
+                        { slot = 0, resource = "minecraft:apple", count = 1, label = "Apple" },
+                    })
+                    solaris.inventory_storage_transaction(7, "purchase", {
+                        { resource = "minecraft:apple", delta = 1 },
+                    }, {
+                        { operation = "cas", key = "coins:player-7", expected_version = 2, value = "6" },
+                    })
+                    solaris.upsert_zone("shop", "minecraft:overworld", 0, 60, 0, 8, 80, 8)
+                    solaris.remove_zone("shop")
+                    solaris.query_residents("residents", {}, nil)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(9).unwrap()),
+            )
+            .unwrap();
+        assert!(matches!(
+            batch.commands(),
+            [
+                ScriptCommand::PluginStorageGet { .. },
+                ScriptCommand::PluginStorageCompareAndSwap { .. },
+                ScriptCommand::PluginStorageDelete { .. },
+                ScriptCommand::OpenInventoryMenu { .. },
+                ScriptCommand::InventoryStorageTransaction { .. },
+                ScriptCommand::UpsertZone { .. },
+                ScriptCommand::RemoveZone { .. },
+                ScriptCommand::Operation { .. },
+            ]
+        ));
+        let ScriptCommand::Operation { request } = &batch.commands()[7] else {
+            panic!("resident query was not routed through the durable operation envelope");
+        };
+        assert!(matches!(
+            request.operation(),
+            ScriptOperation::Resident {
+                operation: crate::ScriptResidentOperation::Query { .. }
+            }
+        ));
+
+        let mut saturated = LuaScriptRuntime::from_source(
+            ScriptPluginManifest::new("storage", "Storage", "0.1.0", SCRIPT_API_VERSION)
+                .subscribe_event("server.tick")
+                .declare_plugin_storage()
+                .validate()
+                .unwrap(),
+            r#"
+                function on_server_tick(_event)
+                    solaris.storage_get("first", "coins:player-7")
+                    solaris.storage_get("second", "coins:player-8")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let error = saturated
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Trap { message } if message.contains("command limit 1 exceeded")
+        ));
+    }
+
+    #[test]
+    fn lua_resident_api_is_required_feature_gated_and_maps_to_durable_operations() {
+        let manifest =
+            ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
+                .subscribe_event("server.tick")
+                .declare_persistent_residents()
+                .validate()
+                .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest,
+            r#"
+                function on_server_tick(_event)
+                    solaris.claim_resident("claim", "op-1", 7, "12345678-1234-5678-1234-567812345678", 0)
+                    solaris.spawn_resident("spawn", "op-2", "site-token", { kind = "villager" })
+                    solaris.query_residents("query", { "a1", "b2" }, nil)
+                    solaris.release_resident("release", "op-3", "a1", 4)
+                    solaris.set_resident_pois("pois", "op-4", "a1", "home-1", nil, "meeting-1", 5)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(5).unwrap()),
+            )
+            .unwrap();
+        let operations: Vec<&crate::ScriptResidentOperation> = batch
+            .commands()
+            .iter()
+            .map(|command| {
+                let ScriptCommand::Operation { request } = command else {
+                    panic!("resident call did not use the durable operation envelope");
+                };
+                let ScriptOperation::Resident { operation } = request.operation() else {
+                    panic!("resident call emitted a non-resident operation");
+                };
+                operation
+            })
+            .collect();
+        assert!(matches!(
+            operations.as_slice(),
+            [
+                crate::ScriptResidentOperation::Claim {
+                    operation_id,
+                    actor_id: 7,
+                    expected_entity_revision: 0,
+                    ..
+                },
+                crate::ScriptResidentOperation::Spawn { operation_id: spawn_id, .. },
+                crate::ScriptResidentOperation::Query { handles, cursor: None },
+                crate::ScriptResidentOperation::Release {
+                    operation_id: release_id,
+                    expected_revision: 4,
+                    ..
+                },
+                crate::ScriptResidentOperation::SetPois {
+                    operation_id: pois_id,
+                    home_poi,
+                    meeting_poi,
+                    expected_revision: 5,
+                    ..
+                },
+            ] if operation_id == "op-1"
+                && spawn_id == "op-2"
+                && handles == &["a1".to_owned(), "b2".to_owned()]
+                && release_id == "op-3"
+                && pois_id == "op-4"
+                && home_poi.as_deref() == Some("home-1")
+                && meeting_poi.as_deref() == Some("meeting-1")
+        ));
+    }
+
+    #[test]
     fn lua_runtime_does_not_expose_filesystem_process_or_debug_libraries() {
         let mut runtime = LuaScriptRuntime::from_source(
             manifest(&["server.tick"]),
@@ -7175,6 +7934,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7195,6 +7956,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7285,6 +8048,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("queue-closed/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7314,6 +8079,8 @@ capabilities = ["entity_damage"]
             config: toml::Table::new(),
             source: "function on_server_tick(_event) end".to_owned(),
             source_path: PathBuf::from("authority-unavailable/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7356,6 +8123,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("batch-rejection/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7422,6 +8191,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("command-admission/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7864,6 +8635,8 @@ capabilities = ["entity_damage"]
             config: toml::Table::new(),
             source: "function on_server_tick(_event) end".to_owned(),
             source_path: PathBuf::from(path),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7917,6 +8690,8 @@ capabilities = ["entity_damage"]
             config: toml::Table::new(),
             source: "function on_player_command(_event) end".to_owned(),
             source_path: PathBuf::from(path),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -7957,6 +8732,8 @@ capabilities = ["entity_damage"]
             "#
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -8013,6 +8790,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -8031,6 +8810,8 @@ capabilities = ["entity_damage"]
         "#
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -8122,232 +8903,6 @@ capabilities = ["entity_damage"]
         );
     }
 
-    #[test]
-    fn lua_extended_contract_emits_validated_dto_requests_and_respects_batch_capacity() {
-        let manifest = ScriptPluginManifest::new(
-            "contract-test",
-            "Contract Test",
-            "0.1.0",
-            SCRIPT_API_VERSION,
-        )
-        .subscribe_event("server.tick")
-        .declare_plugin_storage()
-        .declare_inventory_menus()
-        .declare_inventory_storage_transactions()
-        .declare_zones()
-        .declare_villagers()
-        .validate()
-        .unwrap();
-        let mut runtime = LuaScriptRuntime::from_source(
-            manifest,
-            r#"
-                function on_server_tick(_event)
-                    solaris.storage_get("read", "coins:player-7")
-                    solaris.storage_cas("write", "coins:player-7", 2, "9")
-                    solaris.storage_delete("delete", "coins:obsolete", 3)
-                    solaris.open_inventory_menu(7, "catalog", "Catalog", {
-                        { slot = 0, resource = "minecraft:apple", count = 1, label = "Apple" },
-                    })
-                    solaris.inventory_storage_transaction(7, "purchase", {
-                        { resource = "minecraft:apple", delta = 1 },
-                    }, {
-                        { operation = "cas", key = "coins:player-7", expected_version = 2, value = "6" },
-                    })
-                    solaris.upsert_zone("shop", "minecraft:overworld", 0, 60, 0, 8, 80, 8)
-                    solaris.remove_zone("shop")
-                    solaris.bind_nearest_villager("bind", 0, 64, 0, 16)
-                    solaris.set_villager_idle("idle", "binding-1")
-                end
-            "#,
-            LuaRuntimeLimits::default(),
-        )
-        .unwrap();
-        let controls = RuntimeControls::unrestricted();
-        let batch = runtime
-            .handle_event(
-                &ScriptEvent::server_tick(1),
-                RuntimeContext::new(&controls, NonZeroUsize::new(9).unwrap()),
-            )
-            .unwrap();
-        assert!(matches!(
-            batch.commands(),
-            [
-                ScriptCommand::PluginStorageGet { .. },
-                ScriptCommand::PluginStorageCompareAndSwap { .. },
-                ScriptCommand::PluginStorageDelete { .. },
-                ScriptCommand::OpenInventoryMenu { .. },
-                ScriptCommand::InventoryStorageTransaction { .. },
-                ScriptCommand::UpsertZone { .. },
-                ScriptCommand::RemoveZone { .. },
-                ScriptCommand::RequestVillagerBinding { .. },
-                ScriptCommand::SetVillagerGoal { .. },
-            ]
-        ));
-
-        let mut saturated = LuaScriptRuntime::from_source(
-            ScriptPluginManifest::new("storage", "Storage", "0.1.0", SCRIPT_API_VERSION)
-                .subscribe_event("server.tick")
-                .declare_plugin_storage()
-                .validate()
-                .unwrap(),
-            r#"
-                function on_server_tick(_event)
-                    solaris.storage_get("first", "coins:player-7")
-                    solaris.storage_get("second", "coins:player-8")
-                end
-            "#,
-            LuaRuntimeLimits::default(),
-        )
-        .unwrap();
-        let error = saturated
-            .handle_event(
-                &ScriptEvent::server_tick(1),
-                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            RuntimeError::Trap { message } if message.contains("command limit 1 exceeded")
-        ));
-    }
-
-    #[test]
-    fn lua_villager_goal_api_emits_only_engine_goal_commands() {
-        let manifest =
-            ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
-                .subscribe_event("server.tick")
-                .declare_villagers()
-                .validate()
-                .unwrap();
-        let controls = RuntimeControls::unrestricted();
-        let mut runtime = LuaScriptRuntime::from_source(
-            manifest,
-            r#"
-                function on_server_tick(_event)
-                    solaris.move_villager_to("move-1", "binding-1", 8.5, 64, -3.5, 0.3)
-                    solaris.set_villager_idle("idle-1", "binding-2")
-                end
-            "#,
-            LuaRuntimeLimits::default(),
-        )
-        .unwrap();
-
-        let batch = runtime
-            .handle_event(
-                &ScriptEvent::server_tick(1),
-                RuntimeContext::new(&controls, NonZeroUsize::new(2).unwrap()),
-            )
-            .unwrap();
-        assert!(matches!(
-            batch.commands(),
-            [
-                ScriptCommand::SetVillagerGoal { request: moving },
-                ScriptCommand::SetVillagerGoal { request: idle },
-            ] if moving.goal().kind() == "follow_position"
-                && moving.goal().target() == ScriptPosition::try_new(8.5, 64.0, -3.5)
-                && moving.goal().speed() == Some(0.3)
-                && idle.goal().kind() == "idle"
-                && moving.binding_token() == "binding-1"
-                && idle.binding_token() == "binding-2"
-        ));
-    }
-
-    #[test]
-    fn lua_villager_goal_rejections_are_synchronous_and_emit_no_command() {
-        let controls = RuntimeControls::unrestricted();
-        let cases = [
-            (
-                true,
-                "solaris.move_villager_to(string.rep('x', 65), 'binding-1', 0, 64, 0, 0.3)",
-            ),
-            (
-                true,
-                "solaris.move_villager_to('move', string.rep('x', 65), 0, 64, 0, 0.3)",
-            ),
-            (
-                true,
-                "solaris.move_villager_to('move', 'binding-1', 0, 64, 0, 0)",
-            ),
-            (
-                true,
-                "solaris.move_villager_to('move', 'binding-1', 0, 64, 0, 4.1)",
-            ),
-            (false, "solaris.set_villager_idle('idle', 'binding-1')"),
-        ];
-
-        for (declare_villagers, call) in cases {
-            let mut manifest =
-                ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
-                    .subscribe_event("server.tick");
-            if declare_villagers {
-                manifest = manifest.declare_villagers();
-            }
-            let source = format!(
-                "function on_server_tick(_event) local accepted = pcall(function() {call} end); assert(not accepted) end"
-            );
-            let mut runtime = LuaScriptRuntime::from_source(
-                manifest.validate().unwrap(),
-                &source,
-                LuaRuntimeLimits::default(),
-            )
-            .unwrap();
-            let batch = runtime
-                .handle_event(
-                    &ScriptEvent::server_tick(1),
-                    RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
-                )
-                .unwrap();
-            assert!(
-                batch.commands().is_empty(),
-                "rejected call emitted {batch:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn lua_villager_goal_result_uses_targeted_callback_and_exact_fields() {
-        let manifest =
-            ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
-                .subscribe_event("villager.goal_result")
-                .validate()
-                .unwrap();
-        let mut runtime = LuaScriptRuntime::from_source(
-            manifest,
-            r#"
-                function on_villager_goal_result(event)
-                    solaris.broadcast(event.request_id .. ":" .. event.goal .. ":" .. tostring(event.accepted) .. ":" .. tostring(event.failure))
-                end
-            "#,
-            LuaRuntimeLimits::default(),
-        )
-        .unwrap();
-        let request = crate::ScriptVillagerGoalRequest::try_new(
-            "goal-1",
-            "binding-1",
-            crate::ScriptVillagerGoal::idle(),
-        )
-        .unwrap();
-        let event = ScriptEvent::villager_goal_result(
-            "settlement",
-            &request,
-            Some(crate::ScriptVillagerGoalFailure::BindingUnavailable),
-        )
-        .unwrap();
-        let controls = RuntimeControls::unrestricted();
-        let batch = runtime
-            .handle_event(
-                &event,
-                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
-            )
-            .unwrap();
-        assert_eq!(
-            batch.commands(),
-            &[ScriptCommand::BroadcastChatMessage {
-                message: "goal-1:idle:false:binding_unavailable".to_owned(),
-            }]
-        );
-    }
-
     #[tokio::test]
     async fn lua_host_attaches_loaded_plugin_identity_and_isolates_targeted_result_events() {
         let source = |id: &str| PluginSource {
@@ -8365,6 +8920,8 @@ capabilities = ["entity_damage"]
             "#
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -8420,11 +8977,9 @@ capabilities = ["entity_damage"]
         let controls = RuntimeControls::unrestricted();
         for (name, expected_commands) in [
             ("basic-economy", 1_usize),
-            ("colony-villager-scaffold", 2_usize),
             ("geological-mines", 0_usize),
             ("land-claims", 1_usize),
             ("online-roster", 0_usize),
-            ("settlement-prototype", 0_usize),
         ] {
             let source = read_plugin_source(&sibling_plugin_dir(name)).unwrap();
             assert_eq!(source.manifest.requested_api_version(), SCRIPT_API_VERSION);
@@ -8590,6 +9145,8 @@ capabilities = ["entity_damage"]
             config: toml::Table::new(),
             source: "function on_server_tick(".to_owned(),
             source_path: PathBuf::from("broken/main.lua"),
+            package_dir: PathBuf::from("."),
+            required_features: Vec::new(),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
             gameplay_rules: None,
@@ -8640,5 +9197,686 @@ capabilities = ["entity_damage"]
                 RuntimeError::Trap { message } if message.contains("authority poisoned")
             ));
         }
+    }
+
+    fn operation_of(command: &ScriptCommand) -> &ScriptOperation {
+        let ScriptCommand::Operation { request } = command else {
+            panic!("expected an operation command, got {command:?}");
+        };
+        request.operation()
+    }
+
+    fn inventory_transfers_manifest(events: &[&str]) -> ValidatedScriptPluginManifest {
+        let mut manifest =
+            ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
+                .declare_inventory_transfers();
+        for event in events {
+            manifest = manifest.subscribe_event(*event);
+        }
+        manifest.validate().unwrap()
+    }
+
+    #[test]
+    fn owned_inventory_commands_emit_typed_requests() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            inventory_transfers_manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.query_owned_inventory("q", { kind = "player_inventory", player_id = 7 })
+                    solaris.transfer_owned_items(
+                        "t", "move-1", 7,
+                        { {
+                            source = { kind = "player_inventory", player_id = 7 },
+                            source_slot = 9,
+                            destination = { kind = "player_inventory", player_id = 7 },
+                            destination_slot = 10,
+                            count = 2,
+                        } },
+                        {
+                            { endpoint = { kind = "player_inventory", player_id = 7 },
+                              fence = { revision = 4, snapshot_hash = string.rep("a", 64) } },
+                        }
+                    )
+                    solaris.reserve_inventory_items(
+                        "r", "reserve-1",
+                        { kind = "warehouse", handle = "completed-container" },
+                        { portions = { { work_units = 3, materials = { { resource = "minecraft:apple", quantity = 5 } } } } },
+                        { revision = 4, snapshot_hash = string.rep("b", 64) }
+                    )
+                    solaris.inventory_reservation_status("s", "reservation-1")
+                    solaris.release_inventory_reservation("x", "release-1", "reservation-1", 5)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+
+        let commands = batch.commands();
+        assert_eq!(commands.len(), 5);
+        let query = operation_of(&commands[0]);
+        assert!(matches!(
+            query,
+            ScriptOperation::Inventory {
+                operation: ScriptOwnedInventoryOperation::Query {
+                    endpoint: ScriptInventoryEndpoint::PlayerInventory { player_id: 7 },
+                    expected_revision: None,
+                }
+            }
+        ));
+        let transfer = operation_of(&commands[1]);
+        let ScriptOperation::Inventory {
+            operation:
+                ScriptOwnedInventoryOperation::Transfer {
+                    operation_id,
+                    actor_id,
+                    transfers,
+                    expected_revisions,
+                },
+        } = transfer
+        else {
+            panic!("expected transfer request, got {transfer:?}");
+        };
+        assert_eq!(operation_id, "move-1");
+        assert_eq!(*actor_id, 7);
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].source_slot, 9);
+        assert_eq!(transfers[0].destination_slot, 10);
+        assert_eq!(transfers[0].count, 2);
+        assert_eq!(expected_revisions.len(), 1);
+        assert_eq!(expected_revisions[0].fence.revision, 4);
+        assert_eq!(expected_revisions[0].fence.snapshot_hash, "a".repeat(64));
+
+        let reserve = operation_of(&commands[2]);
+        let ScriptOperation::Inventory {
+            operation:
+                ScriptOwnedInventoryOperation::Reserve {
+                    endpoint,
+                    resource_plan,
+                    ..
+                },
+        } = reserve
+        else {
+            panic!("expected reserve request, got {reserve:?}");
+        };
+        assert_eq!(
+            endpoint,
+            &ScriptInventoryEndpoint::Warehouse {
+                handle: "completed-container".to_owned()
+            }
+        );
+        assert_eq!(resource_plan.portions.len(), 1);
+        assert_eq!(resource_plan.portions[0].work_units, 3);
+        assert_eq!(
+            resource_plan.portions[0].materials[0].resource_id,
+            "minecraft:apple"
+        );
+        assert_eq!(resource_plan.portions[0].materials[0].quantity, 5);
+
+        let status = operation_of(&commands[3]);
+        assert!(matches!(
+            status,
+            ScriptOperation::Inventory {
+                operation: ScriptOwnedInventoryOperation::ReservationStatus { reservation_ref }
+            } if reservation_ref == "reservation-1"
+        ));
+        let release = operation_of(&commands[4]);
+        assert!(matches!(
+            release,
+            ScriptOperation::Inventory {
+                operation: ScriptOwnedInventoryOperation::Release {
+                    operation_id,
+                    reservation_ref,
+                    expected_revision: 5,
+                }
+            } if operation_id == "release-1" && reservation_ref == "reservation-1"
+        ));
+    }
+
+    #[test]
+    fn owned_inventory_command_without_capability_fails_before_batch_admission() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.query_owned_inventory("q", { kind = "player_inventory", player_id = 7 })
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let error = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Trap { message } if message.contains("inventory_transfer")
+        ));
+    }
+
+    #[tokio::test]
+    async fn disk_inventory_transfers_capability_requires_its_required_feature() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("warehouse-plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "warehouse-plugin"
+name = "Warehouse Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["inventory_transfers"]
+"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("main.lua"), "").unwrap();
+        assert!(start_lua_host(LuaHostConfig::new(root.path()).strict_discovery(true)).is_err());
+
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "warehouse-plugin"
+name = "Warehouse Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["inventory_transfers"]
+required_features = ["inventory_transfers"]
+"#,
+        )
+        .unwrap();
+        let (boundary, host) =
+            start_lua_host(LuaHostConfig::new(root.path()).strict_discovery(true)).unwrap();
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disk_persistent_residents_capability_requires_its_required_feature() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("settlement-plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "settlement-plugin"
+name = "Settlement Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["persistent_residents"]
+"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("main.lua"), "").unwrap();
+        assert!(start_lua_host(LuaHostConfig::new(root.path()).strict_discovery(true)).is_err());
+
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "settlement-plugin"
+name = "Settlement Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["persistent_residents"]
+required_features = ["persistent_residents"]
+"#,
+        )
+        .unwrap();
+        let (boundary, host) =
+            start_lua_host(LuaHostConfig::new(root.path()).strict_discovery(true)).unwrap();
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    fn settlement_manifest(events: &[&str]) -> ValidatedScriptPluginManifest {
+        let mut manifest = ScriptPluginManifest::new(
+            "settlement-test",
+            "Settlement Test",
+            "0.1.0",
+            SCRIPT_API_VERSION,
+        )
+        .declare_world_sites()
+        .declare_structure_operations();
+        for event in events {
+            manifest = manifest.subscribe_event(*event);
+        }
+        manifest.validate().unwrap()
+    }
+
+    #[test]
+    fn settlement_calls_emit_typed_requests_with_split_capabilities() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            settlement_manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.list_settlement_sites("list", nil, 16)
+                    solaris.query_settlement_site("query", "site-1", "cursor-1", 8)
+                    solaris.reserve_resident_site("reserve", "reserve-1", "site-1", "home-0", 4)
+                    solaris.release_resident_site("release", "release-1", "spawn-1")
+                    solaris.survey_site(
+                        "survey",
+                        "minecraft:overworld",
+                        { min = { x = 0, y = 60, z = 0 }, max = { x = 15, y = 80, z = 15 } },
+                        "settlement"
+                    )
+                    solaris.prepare_structure(
+                        "prepare", "prepare-1", "settlement:house",
+                        { x = 8, y = 64, z = 8 }, 90, "survey-1", 4
+                    )
+                    solaris.advance_structure(
+                        "advance", "advance-1", "structure-1", "foundation", "reservation-1", 1, 32
+                    )
+                    solaris.pause_structure("pause", "pause-1", "structure-1", 2)
+                    solaris.cancel_structure("cancel", "cancel-1", "structure-1", 3)
+                    solaris.structure_status("status", "structure-1")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(10).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(batch.commands().len(), 10);
+
+        let settlement: Vec<&crate::ScriptSettlementOperation> = batch
+            .commands()
+            .iter()
+            .map(|command| {
+                let ScriptOperation::Settlement { operation } = operation_of(command) else {
+                    panic!("settlement call did not use the durable operation envelope");
+                };
+                operation
+            })
+            .collect();
+        assert!(matches!(
+            settlement.as_slice(),
+            [
+                crate::ScriptSettlementOperation::ListSites {
+                    cursor: None,
+                    limit: 16,
+                },
+                crate::ScriptSettlementOperation::QuerySite {
+                    site_id,
+                    cursor: Some(cursor),
+                    limit: 8,
+                },
+                crate::ScriptSettlementOperation::ReserveResidentSite {
+                    operation_id: reserve_id,
+                    site_id: reserve_site,
+                    poi_id,
+                    expected_site_revision: 4,
+                },
+                crate::ScriptSettlementOperation::ReleaseResidentSite {
+                    operation_id: release_id,
+                    spawn_site_token,
+                },
+                crate::ScriptSettlementOperation::Survey {
+                    dimension,
+                    bounds,
+                    purpose,
+                },
+                crate::ScriptSettlementOperation::PrepareStructure {
+                    operation_id: prepare_id,
+                    blueprint_id,
+                    anchor,
+                    rotation: 90,
+                    survey_token,
+                    expected_site_revision: 4,
+                },
+                crate::ScriptSettlementOperation::AdvanceStructure {
+                    operation_id: advance_id,
+                    structure_id: advance_structure,
+                    stage,
+                    reservation_ref,
+                    expected_revision: 1,
+                    work_units: 32,
+                },
+                crate::ScriptSettlementOperation::PauseStructure {
+                    operation_id: pause_id,
+                    expected_revision: 2,
+                    ..
+                },
+                crate::ScriptSettlementOperation::CancelStructure {
+                    operation_id: cancel_id,
+                    expected_revision: 3,
+                    ..
+                },
+                crate::ScriptSettlementOperation::Status { structure_id },
+            ] if site_id == "site-1"
+                && cursor == "cursor-1"
+                && reserve_id == "reserve-1"
+                && reserve_site == "site-1"
+                && poi_id == "home-0"
+                && release_id == "release-1"
+                && spawn_site_token == "spawn-1"
+                && dimension == "minecraft:overworld"
+                && bounds.min() == [0, 60, 0]
+                && bounds.max() == [15, 80, 15]
+                && *purpose == crate::ScriptSurveyPurpose::Settlement
+                && prepare_id == "prepare-1"
+                && blueprint_id == "settlement:house"
+                && *anchor == [8, 64, 8]
+                && survey_token == "survey-1"
+                && advance_id == "advance-1"
+                && advance_structure == "structure-1"
+                && stage == "foundation"
+                && reservation_ref == "reservation-1"
+                && pause_id == "pause-1"
+                && cancel_id == "cancel-1"
+                && structure_id == "structure-1"
+        ));
+
+        for (index, capability) in [
+            crate::ScriptCommandCapabilityKind::WorldSites,
+            crate::ScriptCommandCapabilityKind::WorldSites,
+            crate::ScriptCommandCapabilityKind::WorldSites,
+            crate::ScriptCommandCapabilityKind::WorldSites,
+            crate::ScriptCommandCapabilityKind::WorldSites,
+            crate::ScriptCommandCapabilityKind::StructureOperations,
+            crate::ScriptCommandCapabilityKind::StructureOperations,
+            crate::ScriptCommandCapabilityKind::StructureOperations,
+            crate::ScriptCommandCapabilityKind::StructureOperations,
+            crate::ScriptCommandCapabilityKind::StructureOperations,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                batch.commands()[index].required_capability_kind(),
+                Some(capability),
+                "settlement command {index} required the wrong capability"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_call_without_its_capability_fails_before_batch_admission() {
+        for (manifest, source, denied) in [
+            (
+                ScriptPluginManifest::new("sites-only", "Sites Only", "0.1.0", SCRIPT_API_VERSION)
+                    .subscribe_event("server.tick")
+                    .declare_world_sites()
+                    .validate()
+                    .unwrap(),
+                r#"
+                    function on_server_tick(_event)
+                        solaris.prepare_structure(
+                            "prepare", "prepare-1", "settlement:house",
+                            { x = 0, y = 0, z = 0 }, 0, "survey-1", 0
+                        )
+                    end
+                "#,
+                "structure_operations",
+            ),
+            (
+                ScriptPluginManifest::new(
+                    "structures-only",
+                    "Structures Only",
+                    "0.1.0",
+                    SCRIPT_API_VERSION,
+                )
+                .subscribe_event("server.tick")
+                .declare_structure_operations()
+                .validate()
+                .unwrap(),
+                r#"
+                    function on_server_tick(_event)
+                        solaris.list_settlement_sites("list", nil, 16)
+                    end
+                "#,
+                "world_sites",
+            ),
+        ] {
+            let mut runtime =
+                LuaScriptRuntime::from_source(manifest, source, LuaRuntimeLimits::default())
+                    .unwrap();
+            let controls = RuntimeControls::unrestricted();
+            let error = runtime
+                .handle_event(
+                    &ScriptEvent::server_tick(1),
+                    RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RuntimeError::Trap { message }
+                    if message.contains(&format!("command capability denied: {denied}"))
+            ));
+        }
+    }
+
+    #[test]
+    fn settlement_rejects_malformed_lua_inputs() {
+        for (source, expected) in [
+            (
+                r#"
+                    function on_server_tick(_event)
+                        solaris.list_settlement_sites("list", nil, 0)
+                    end
+                "#,
+                "solaris_input:settlement_limit:range",
+            ),
+            (
+                r#"
+                    function on_server_tick(_event)
+                        solaris.prepare_structure(
+                            "prepare", "prepare-1", "settlement:house",
+                            { x = 0, y = 0, z = 0 }, 45, "survey-1", 0
+                        )
+                    end
+                "#,
+                "solaris_input:bounds:invalid",
+            ),
+            (
+                r#"
+                    function on_server_tick(_event)
+                        solaris.prepare_structure(
+                            "prepare", "prepare-1", "settlement:house",
+                            { a = 0, b = 0, c = 0 }, 0, "survey-1", 0
+                        )
+                    end
+                "#,
+                "solaris_input:anchor:unknown_field",
+            ),
+            (
+                r#"
+                    function on_server_tick(_event)
+                        solaris.prepare_structure(
+                            "prepare", "prepare-1", "settlement:house",
+                            { x = 0, y = 0 }, 0, "survey-1", 0
+                        )
+                    end
+                "#,
+                "solaris_input:anchor:type",
+            ),
+            (
+                r#"
+                    function on_server_tick(_event)
+                        solaris.survey_site(
+                            "survey", "minecraft:overworld",
+                            { min = { x = 0, y = 0, z = 0 } }, "settlement"
+                        )
+                    end
+                "#,
+                "solaris_input:survey_bounds_max:type",
+            ),
+            (
+                r#"
+                    function on_server_tick(_event)
+                        solaris.survey_site(
+                            "survey", "minecraft:overworld",
+                            { min = { x = 0, y = 0, z = 0, w = 1 }, max = { x = 1, y = 1, z = 1 } },
+                            "settlement"
+                        )
+                    end
+                "#,
+                "solaris_input:survey_bounds_min:unknown_field",
+            ),
+            (
+                r#"
+                    function on_server_tick(_event)
+                        solaris.survey_site(
+                            "survey", "minecraft:overworld",
+                            { min = { x = 0, y = 0, z = 0 }, max = { x = 1, y = 1, z = 1 } },
+                            "mining"
+                        )
+                    end
+                "#,
+                "solaris_input:survey_purpose:invalid",
+            ),
+        ] {
+            let mut runtime = LuaScriptRuntime::from_source(
+                settlement_manifest(&["server.tick"]),
+                source,
+                LuaRuntimeLimits::default(),
+            )
+            .unwrap();
+            let controls = RuntimeControls::unrestricted();
+            let error = runtime
+                .handle_event(
+                    &ScriptEvent::server_tick(1),
+                    RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeError::Trap { message } if message.contains(expected)),
+                "expected {expected} for source {source}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_settlement_capabilities_require_their_required_features() {
+        for capability in ["world_sites", "structure_operations"] {
+            let root = tempfile::tempdir().unwrap();
+            let plugin = root.path().join("settlement-plugin");
+            fs::create_dir(&plugin).unwrap();
+            fs::write(
+                plugin.join("plugin.toml"),
+                format!(
+                    r#"id = "settlement-plugin"
+name = "Settlement Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["{capability}"]
+"#
+                ),
+            )
+            .unwrap();
+            fs::write(plugin.join("main.lua"), "").unwrap();
+            assert!(
+                start_lua_host(LuaHostConfig::new(root.path()).strict_discovery(true)).is_err(),
+                "{capability} must require its required_features entry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_plugin_with_both_settlement_capabilities_loads() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("settlement-plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "settlement-plugin"
+name = "Settlement Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["world_sites", "structure_operations"]
+required_features = ["world_sites", "structure_operations"]
+"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("main.lua"), "").unwrap();
+        let (boundary, host) =
+            start_lua_host(LuaHostConfig::new(root.path()).strict_discovery(true)).unwrap();
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A full 128x128 survey result must reach a plugin handler inside the
+    /// production event wall budget (contract 11.4). The snapshot carries
+    /// aggregate counts, so its Lua materialization is bounded by its fields,
+    /// not by the tile: a per-column record array cost ~190 ms for the same
+    /// tile and trapped the host.
+    #[test]
+    fn full_survey_result_materializes_inside_the_event_wall_budget() {
+        let outcome = crate::ScriptOperationOutcome::committed(
+            1,
+            crate::ScriptOperationPayload::Settlement {
+                result: Box::new(crate::ScriptSettlementResult::Survey {
+                    survey: Box::new(crate::ScriptSurveySnapshot::new(
+                        "minecraft:overworld".to_owned(),
+                        crate::ScriptSurveyBounds::new([0, 0, 0], [127, 31, 127]).unwrap(),
+                        1,
+                        crate::ScriptChunkAvailability::Loaded,
+                        "survey-token".to_owned(),
+                        16_000,
+                        384,
+                        false,
+                        0,
+                        vec!["minecraft:plains".to_owned()],
+                        Vec::new(),
+                    )),
+                }),
+            },
+        )
+        .unwrap();
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["operation.result"]),
+            r#"
+                function on_operation_result(event)
+                    local survey = event.payload.result.survey
+                    solaris.send_message(0, string.format(
+                        "plots=%d water=%d chunks=%s",
+                        survey.usable_plots, survey.water_columns, survey.chunk_availability
+                    ))
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let event =
+            ScriptEvent::operation_result("test-plugin", "request-1", None, outcome).unwrap();
+        let controls = RuntimeControls::unrestricted().with_timeout(HOST_EVENT_WALL_BUDGET);
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(COMMANDS_PER_EVENT).unwrap()),
+            )
+            .expect("a bounded survey result must not trap the host");
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::SendChatMessage {
+                player_id: ScriptPlayerId::new(0),
+                message: "plots=16000 water=384 chunks=loaded".to_owned(),
+            }]
+        );
     }
 }

@@ -4,7 +4,6 @@ mod player_query;
 mod router;
 pub(crate) mod storage;
 mod teleport;
-mod villager;
 mod zone;
 
 #[cfg(test)]
@@ -15,8 +14,6 @@ mod player_query_tests;
 mod storage_tests;
 #[cfg(test)]
 mod teleport_tests;
-#[cfg(test)]
-mod villager_tests;
 #[cfg(test)]
 mod zone_tests;
 

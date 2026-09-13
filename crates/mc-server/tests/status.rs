@@ -29,6 +29,7 @@ async fn start_server(motd: &str) -> SocketAddr {
         mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
     );
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: motd.to_string(),
         max_players: 17,

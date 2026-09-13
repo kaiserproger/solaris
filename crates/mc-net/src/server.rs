@@ -104,7 +104,9 @@ fn pre_auth_connection_limit(max_players: u32) -> usize {
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
-    operators: BTreeSet<String>,
+    /// Live operator identities (lowercase name or UUID). Shared with the
+    /// console so grants and revocations apply without a server restart.
+    operators: Arc<arc_swap::ArcSwap<BTreeSet<String>>>,
     allow_local_dev_operators: bool,
     login_access: login::LoginAccessConfig,
 }
@@ -117,14 +119,9 @@ impl CommandPermissionConfig {
         S: Into<String>,
     {
         Self {
-            operators: operators
-                .into_iter()
-                .filter_map(|entry| {
-                    let entry: String = entry.into();
-                    let normalized = entry.trim().to_ascii_lowercase();
-                    (!normalized.is_empty()).then_some(normalized)
-                })
-                .collect(),
+            operators: Arc::new(arc_swap::ArcSwap::from_pointee(normalize_identities(
+                operators,
+            ))),
             allow_local_dev_operators,
             login_access: login::LoginAccessConfig::offline_only(),
         }
@@ -154,20 +151,63 @@ impl CommandPermissionConfig {
         play::commands::CommandPermissions::from_op(self.is_operator(profile, peer))
     }
 
+    /// Re-resolve operator authority for an already connected player.
+    ///
+    /// The login-time loopback developer fallback stays in force only while no
+    /// operator is configured, matching what a fresh login would decide.
+    #[must_use]
+    pub(crate) fn live_permissions_for(
+        &self,
+        name: &str,
+        uuid: &str,
+        login_resolved: play::commands::CommandPermissions,
+    ) -> play::commands::CommandPermissions {
+        let operators = self.operators.load();
+        let listed = operators.contains(&name.to_ascii_lowercase())
+            || operators.contains(&uuid.to_ascii_lowercase());
+        play::commands::CommandPermissions::from_op(
+            listed || (login_resolved.is_op() && operators.is_empty()),
+        )
+    }
+
     #[must_use]
     fn is_operator(&self, profile: &login::LoggedInProfile, peer: SocketAddr) -> bool {
-        if self.operators.is_empty() && self.allow_local_dev_operators && is_loopback_peer(peer) {
+        let operators = self.operators.load();
+        if operators.is_empty() && self.allow_local_dev_operators && is_loopback_peer(peer) {
             return true;
         }
-        self.operators.contains(&profile.name.to_ascii_lowercase())
-            || self
-                .operators
-                .contains(&profile.uuid.to_string().to_ascii_lowercase())
+        operators.contains(&profile.name.to_ascii_lowercase())
+            || operators.contains(&profile.uuid.to_string().to_ascii_lowercase())
     }
 
     pub(crate) fn login_access(&self) -> &login::LoginAccessConfig {
         &self.login_access
     }
+
+    /// Shared live operator identities for runtime console mutation.
+    pub(crate) fn operator_identities(&self) -> Arc<arc_swap::ArcSwap<BTreeSet<String>>> {
+        Arc::clone(&self.operators)
+    }
+
+    /// Shared live whitelist identities for runtime console mutation.
+    pub(crate) fn whitelist_identities(&self) -> Arc<arc_swap::ArcSwap<BTreeSet<String>>> {
+        Arc::clone(&self.login_access.whitelist)
+    }
+}
+
+fn normalize_identities<I, S>(entries: I) -> BTreeSet<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    entries
+        .into_iter()
+        .map(Into::into)
+        .filter_map(|entry| {
+            let normalized = entry.trim().to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect()
 }
 
 fn is_loopback_peer(peer: SocketAddr) -> bool {
@@ -391,11 +431,22 @@ fn loaded_fluid_tick_due(
 /// `Debug` is not derived: neither `BlockRegistry` nor `WorldStorage`
 /// implements `Debug`. Connection-scope logging uses individual fields
 /// instead of `{:?}`-printing the whole config.
+/// Player-list (tab menu) header/footer text from the `[tab_list]` server
+/// config section. Both default to empty, which is the vanilla default
+/// (no header/footer lines shown); the Play handler only sends the
+/// `ClientboundTabList` packet when at least one side is non-empty.
+#[derive(Clone, Default)]
+pub struct TabListConfig {
+    pub header: String,
+    pub footer: String,
+}
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
     pub motd: String,
     pub max_players: u32,
+    pub tab_list: TabListConfig,
     pub view_distance: i32,
     pub data: Arc<VanillaData>,
     pub blocks: Arc<BlockRegistry>,
@@ -4061,6 +4112,68 @@ async fn bind_internal(
         }
         sessions.install_world_chunk_journal(journal);
     }
+    // The simulation channel exists before the settlement world because a
+    // structure portion commits as one server-owned command on it.
+    let (simulation, mut simulation_owner) =
+        play::simulation_channel_with_explosion_seed(config.random_tick.seed as i64);
+    // A deployed package that declares the settlement features and ships an
+    // authored catalog owns the profile for this world. Validation happens
+    // before the storage actor starts, so a catalog violation fails startup
+    // loudly instead of degrading to an empty runtime.
+    let settlement: Option<(
+        Arc<crate::script::storage::SettlementRuntime>,
+        Arc<dyn crate::script::storage::SettlementWorld>,
+    )> = match (scripts.as_ref(), config.world.as_ref()) {
+        (Some(scripts), Some(world)) => {
+            let deployment = crate::settlement::discover_settlement_deployment(
+                scripts.boundary().deployed_packages(),
+                config.blocks.as_ref(),
+            )
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+            match deployment {
+                Some(deployment) => {
+                    let root = entity_world_root.as_deref().ok_or_else(|| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "the settlement profile requires a persistent world directory",
+                        )
+                    })?;
+                    let world_identity = crate::settlement::settlement_world_identity(root);
+                    // Grounding samples the exact generator the world generates
+                    // from; a world without one cannot place sites honestly.
+                    let ground = world.lock().await.generator().ok_or_else(|| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "the settlement profile requires the world's terrain generator",
+                        )
+                    })?;
+                    let runtime = Arc::new(deployment.runtime(
+                        config.random_tick.seed as i64,
+                        &world_identity,
+                        [0, 0],
+                        ground,
+                    ));
+                    let read = world.lock().await.read_view();
+                    info!(
+                        plugin = deployment.plugin_id(),
+                        profile_revision = deployment.profile_revision(),
+                        blueprints = runtime.catalog().len(),
+                        "settlement blueprint catalog validated",
+                    );
+                    let adapter = crate::settlement::LiveSettlementWorld::new(
+                        read,
+                        Arc::clone(&config.blocks),
+                        script_zones.clone(),
+                        Arc::clone(&sessions),
+                        simulation.clone(),
+                    );
+                    Some((runtime, Arc::new(adapter)))
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
     let inventory_storage = if let Some(root) = entity_world_root.as_deref()
         && (scripts.is_some()
             || sessions
@@ -4069,13 +4182,35 @@ async fn bind_internal(
     {
         let mut storage =
             crate::script::storage::PluginStorage::open(root).map_err(plugin_storage_bind_error)?;
-        let inventory = crate::script::storage::world_inventory::InventoryRuntime::new(
+        let mut inventory = crate::script::storage::world_inventory::InventoryRuntime::new(
             Some(root),
             &config.shutdown,
             Arc::clone(&sessions),
             Arc::clone(&config.items),
             Arc::clone(&config.item_facts),
         );
+        if let Some((runtime, world)) = settlement.as_ref() {
+            inventory = inventory
+                .with_settlement_runtime(Arc::clone(runtime))
+                .with_settlement_world(Arc::clone(world));
+        }
+        if let Some(world) = config.world.as_ref() {
+            // Resident work, routes and combat read the same live world storage
+            // the settlement profile uses; without it every physical step fails
+            // closed as `unsupported`.
+            let read = world.lock().await.read_view();
+            inventory = inventory.with_resident_world(Arc::new(
+                crate::play::resident_work::LiveResidentWorld::new(
+                    Arc::clone(world),
+                    read,
+                    Arc::clone(&config.blocks),
+                    config.block_light.clone(),
+                    script_zones.clone(),
+                    Arc::clone(&config.items),
+                    Arc::clone(&config.item_facts),
+                ),
+            ));
+        }
         inventory
             .recover(&mut storage)
             .map_err(plugin_storage_bind_error)?;
@@ -4095,8 +4230,6 @@ async fn bind_internal(
                     config.shutdown.clone(),
                 )
             });
-    let (simulation, mut simulation_owner) =
-        play::simulation_channel_with_explosion_seed(config.random_tick.seed as i64);
     play::configure_session_arrow_kill_rewards(&sessions, &config);
     play::configure_session_player_combat(&sessions, &config);
     play::prepare_spawn_chunk(&config, chunk_pipeline_resources.clone())
@@ -5167,6 +5300,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn script_spawn_rejects_unknown_registry_identifier_without_queueing() {
         let config = ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "test".to_owned(),
             max_players: 1,
@@ -5200,6 +5334,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn console_time_set_waits_for_server_owned_simulation_turn() {
         let config = ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "test".to_owned(),
             max_players: 1,
@@ -5231,6 +5366,8 @@ pub(crate) mod tests {
             shutdown: config.shutdown.clone(),
             runtime_control: None,
             resources: chunk_pipeline_resources,
+            operators: config.command_permissions.operator_identities(),
+            whitelist: config.command_permissions.whitelist_identities(),
         };
         let mut command = Box::pin(control.set_world_time(13_000));
 
@@ -7082,6 +7219,7 @@ pub(crate) mod tests {
 
         let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
         let config = ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "poisoned-material-cache-test".into(),
             max_players: 0,
@@ -7447,6 +7585,7 @@ pub(crate) mod tests {
         let shutdown = ShutdownHandle::default();
         let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
         let config = ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "accept-failure-drain-test".into(),
             max_players: 0,
@@ -7634,6 +7773,8 @@ pub(crate) mod tests {
             shutdown: config.shutdown.clone(),
             runtime_control: Some(runtime_control.clone()),
             resources,
+            operators: config.command_permissions.operator_identities(),
+            whitelist: config.command_permissions.whitelist_identities(),
         };
         control.request_stop();
         assert!(config.shutdown.is_requested());
@@ -8024,6 +8165,7 @@ pub(crate) mod tests {
                 .with_item_registry(Arc::clone(&items)),
         ));
         ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             motd: "test".into(),
             max_players: 1,
@@ -9559,6 +9701,127 @@ pub(crate) mod tests {
             &CommandPermissionConfig::new(Vec::<String>::new(), true),
         )
         .unwrap();
+    }
+
+    /// Console-shaped control handle over one permission config.
+    fn access_control_handle(config: &CommandPermissionConfig) -> OperatorControlHandle {
+        OperatorControlHandle {
+            sessions: Arc::new(play::SessionRegistry::new()),
+            simulation: play::simulation_channel().0,
+            shutdown: ShutdownHandle::default(),
+            runtime_control: None,
+            resources: ChunkPipelineResources::with_limits(1, 1),
+            operators: config.operator_identities(),
+            whitelist: config.whitelist_identities(),
+        }
+    }
+
+    #[test]
+    fn console_operator_grant_applies_without_restart() {
+        let profile = login::LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(7),
+            name: "Builder".into(),
+        };
+        let uuid = profile.uuid.to_string();
+        let config = CommandPermissionConfig::new(Vec::<String>::new(), false);
+        let control = access_control_handle(&config);
+        let peer = "192.168.1.20:40000".parse().unwrap();
+        let denied = play::commands::CommandPermissions::from_op(false);
+
+        // A fresh login and an online session both start without authority.
+        assert!(!config.permissions_for(&profile, peer).is_op());
+        assert!(
+            !config
+                .live_permissions_for("Builder", &uuid, denied)
+                .is_op()
+        );
+
+        assert_eq!(control.set_operator(" Builder ", true), ["builder"]);
+
+        // The next login resolves through the live set, and an online session
+        // picks it up on its next command.
+        assert!(config.permissions_for(&profile, peer).is_op());
+        assert!(
+            config
+                .live_permissions_for("builder", &uuid, denied)
+                .is_op()
+        );
+        assert!(
+            config
+                .live_permissions_for("Builder", &uuid, denied)
+                .is_op()
+        );
+
+        control.set_operator("builder", false);
+        assert!(!config.permissions_for(&profile, peer).is_op());
+        assert!(
+            !config
+                .live_permissions_for("Builder", &uuid, denied)
+                .is_op()
+        );
+    }
+
+    #[test]
+    fn console_operator_grant_retires_loopback_dev_fallback() {
+        let config = CommandPermissionConfig::new(Vec::<String>::new(), true);
+        let control = access_control_handle(&config);
+        let peer = "127.0.0.1:40000".parse().unwrap();
+        let dev = login::LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(9),
+            name: "Dev".into(),
+        };
+        let uuid = dev.uuid.to_string();
+
+        assert!(config.permissions_for(&dev, peer).is_op());
+        control.set_operator("Builder", true);
+        // Configuring any operator retires the empty-list fallback, matching
+        // what a fresh login decides.
+        assert!(!config.permissions_for(&dev, peer).is_op());
+        assert!(
+            !config
+                .live_permissions_for(
+                    "Dev",
+                    &uuid,
+                    play::commands::CommandPermissions::from_op(true)
+                )
+                .is_op()
+        );
+    }
+
+    #[test]
+    fn console_whitelist_entry_applies_to_next_login() {
+        let config = CommandPermissionConfig::new(Vec::<String>::new(), false).with_login_access(
+            login::LoginAccessConfig::normalized(
+                false,
+                true,
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+            ),
+        );
+        let control = access_control_handle(&config);
+        let uuid = uuid::Uuid::from_u128(11);
+        let rejected = Some(login::LoginRejection::Whitelist);
+
+        assert_eq!(
+            login::access_rejection(config.login_access(), "Builder", uuid),
+            rejected
+        );
+
+        assert_eq!(control.set_whitelisted("Builder", true), ["builder"]);
+        assert_eq!(
+            login::access_rejection(config.login_access(), "Builder", uuid),
+            None
+        );
+        assert_eq!(
+            login::access_rejection(config.login_access(), "Stranger", uuid),
+            rejected
+        );
+
+        control.set_whitelisted("builder", false);
+        assert_eq!(
+            login::access_rejection(config.login_access(), "Builder", uuid),
+            rejected
+        );
     }
 
     #[test]

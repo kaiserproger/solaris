@@ -167,3 +167,59 @@ fn management_refuses_symlinks_and_hardlinks_without_changing_referent() {
     );
     assert_eq!(std::fs::read(&operator_path).unwrap(), before);
 }
+
+/// Config with the login whitelist enforced and no whitelist file configured.
+fn whitelist_config() -> ServerConfig {
+    toml::from_str(
+        r#"
+        [server]
+        name = "Whitelist"
+        motd = "Whitelist"
+        [network]
+        bind_address = "127.0.0.1"
+        port = 0
+        [auth]
+        online_mode = false
+        whitelist_enabled = true
+        "#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn whitelist_entries_persist_through_the_default_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.toml");
+    let whitelist_path = dir.path().join("whitelist.json");
+    let mut config = whitelist_config();
+    assert!(config.auth.whitelist_file.is_none());
+
+    // The console supplies the default path in memory when the config omits it.
+    config.auth.whitelist_file = Some(PathBuf::from("whitelist.json"));
+    config.add_whitelist_identity(&path, " Builder ").unwrap();
+    config.add_whitelist_identity(&path, "Alias").unwrap();
+    config.remove_whitelist_identity(&path, "ALIAS").unwrap();
+
+    let profiles: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&whitelist_path).unwrap()).unwrap();
+    assert_eq!(profiles, [serde_json::json!({"name": "builder"})]);
+
+    // A restart that leaves `auth.whitelist_file` unset still loads that file,
+    // so console entries survive without a config edit.
+    let mut reloaded = whitelist_config();
+    reloaded.load_access_control_files(&path).unwrap();
+    assert_eq!(reloaded.auth.whitelist, ["builder"]);
+}
+
+#[test]
+fn whitelist_management_requires_a_configured_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.toml");
+    let error = whitelist_config()
+        .add_whitelist_identity(&path, "Builder")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("auth.whitelist_file"),
+        "unexpected error: {error}"
+    );
+}

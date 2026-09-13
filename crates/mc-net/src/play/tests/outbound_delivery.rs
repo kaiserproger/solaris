@@ -8,8 +8,8 @@ async fn initial_play_sync_sends_recipe_update_once_before_recipe_book_packets()
     let sessions = Arc::new(SessionRegistry::new());
     let (simulation, _owner) = simulation_channel();
     let profile = LoggedInProfile {
-        uuid: crate::login::offline_uuid("InitialRecipeSync"),
-        name: "InitialRecipeSync".to_owned(),
+        uuid: crate::login::offline_uuid("InitialRecipe"),
+        name: "InitialRecipe".to_owned(),
     };
     let mut reader = tokio::io::empty();
     let mut writer = Vec::new();

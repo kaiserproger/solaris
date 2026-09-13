@@ -134,6 +134,7 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
 
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M6.g persistence + inventory".into(),
         max_players: 8,
@@ -443,6 +444,7 @@ async fn item_despawn_deadline_survives_restart_inner() {
             )));
     let first_shutdown = mc_net::ShutdownHandle::default();
     let first_cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "T04 item despawn save".into(),
         max_players: 8,
@@ -542,6 +544,7 @@ async fn item_despawn_deadline_survives_restart_inner() {
             )));
     let second_shutdown = mc_net::ShutdownHandle::default();
     let second_cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "T04 item despawn restart".into(),
         max_players: 8,

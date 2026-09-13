@@ -1,22 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use bytes::BufMut;
 use mc_data::{Identifier, ItemStack};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const LOADER_PROTOCOL_VERSION: u16 = 2;
-pub const MAX_LOADER_INTERACTION_ID_BYTES: usize = 128;
-pub const MAX_LOADER_INTERACTION_PAYLOAD_BYTES: usize = 4 * 1024;
+pub const LOADER_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_LOADER_MANIFEST_BYTES: usize = 32_767;
+pub const MAX_LOADER_VIEW_MESSAGE_BYTES: usize = 64 * 1024;
 pub const LOADER_ARTIFACT_CHUNK_BYTES: usize = 30 * 1024;
 const LOADER_ARTIFACT_INDEX_PATH: &str = "solaris-client.json";
 const MAX_LOADER_ARTIFACT_INDEX_BYTES: u64 = 64 * 1024;
 const MAX_LOADER_BLOCK_NAME_BYTES: usize = 128;
 const MAX_LOADER_BLOCKS: usize = 8;
+const LOADER_VIEW_CHANNEL: &str = "solaris:loader/view";
+const LOADER_VIEW_ACTION_CHANNEL: &str = "solaris:loader/view_action";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,9 +33,11 @@ pub enum LoaderPlatform {
 pub enum LoaderContentKind {
     Blocks,
     Items,
-    Ui,
+    Views,
+    ViewActions,
     Assets,
-    Interactions,
+    WorldPreviews,
+    WorldSelection,
     Sounds,
 }
 
@@ -43,9 +46,11 @@ pub enum LoaderContentKind {
 pub enum LoaderPermission {
     RegisterBlocks,
     RegisterItems,
-    PresentUi,
+    PresentViews,
+    SendViewActions,
     LoadAssets,
-    SendInteractions,
+    PresentWorldPreviews,
+    SendWorldSelection,
     PlaySounds,
 }
 
@@ -114,12 +119,18 @@ impl LoaderManifest {
                         .map(|content| match content {
                             mc_script::LuaClientContentKind::Blocks => LoaderContentKind::Blocks,
                             mc_script::LuaClientContentKind::Items => LoaderContentKind::Items,
-                            mc_script::LuaClientContentKind::Ui => LoaderContentKind::Ui,
-                            mc_script::LuaClientContentKind::Assets => LoaderContentKind::Assets,
-                            mc_script::LuaClientContentKind::Sounds => LoaderContentKind::Sounds,
-                            mc_script::LuaClientContentKind::Interactions => {
-                                LoaderContentKind::Interactions
+                            mc_script::LuaClientContentKind::Views => LoaderContentKind::Views,
+                            mc_script::LuaClientContentKind::ViewActions => {
+                                LoaderContentKind::ViewActions
                             }
+                            mc_script::LuaClientContentKind::Assets => LoaderContentKind::Assets,
+                            mc_script::LuaClientContentKind::WorldPreviews => {
+                                LoaderContentKind::WorldPreviews
+                            }
+                            mc_script::LuaClientContentKind::WorldSelection => {
+                                LoaderContentKind::WorldSelection
+                            }
+                            mc_script::LuaClientContentKind::Sounds => LoaderContentKind::Sounds,
                             _ => unreachable!("validated client content kind"),
                         })
                         .collect(),
@@ -133,14 +144,20 @@ impl LoaderManifest {
                             mc_script::LuaClientPermission::RegisterItems => {
                                 LoaderPermission::RegisterItems
                             }
-                            mc_script::LuaClientPermission::PresentUi => {
-                                LoaderPermission::PresentUi
+                            mc_script::LuaClientPermission::PresentViews => {
+                                LoaderPermission::PresentViews
+                            }
+                            mc_script::LuaClientPermission::SendViewActions => {
+                                LoaderPermission::SendViewActions
                             }
                             mc_script::LuaClientPermission::LoadAssets => {
                                 LoaderPermission::LoadAssets
                             }
-                            mc_script::LuaClientPermission::SendInteractions => {
-                                LoaderPermission::SendInteractions
+                            mc_script::LuaClientPermission::PresentWorldPreviews => {
+                                LoaderPermission::PresentWorldPreviews
+                            }
+                            mc_script::LuaClientPermission::SendWorldSelection => {
+                                LoaderPermission::SendWorldSelection
                             }
                             mc_script::LuaClientPermission::PlaySounds => {
                                 LoaderPermission::PlaySounds
@@ -611,11 +628,16 @@ impl LoaderSession {
 #[serde(deny_unknown_fields)]
 struct LoaderArtifactIndex {
     schema: u16,
-    ui: Vec<serde_json::Value>,
+    #[serde(default)]
+    screens: Vec<serde_json::Value>,
+    #[serde(default)]
+    world_previews: Vec<serde_json::Value>,
+    #[serde(default)]
     blocks: Vec<LoaderArtifactBlock>,
+    #[serde(default)]
     items: Vec<serde_json::Value>,
+    #[serde(default)]
     assets: Vec<serde_json::Value>,
-    interactions: Vec<serde_json::Value>,
     #[serde(default)]
     sounds: Vec<serde_json::Value>,
 }
@@ -708,15 +730,15 @@ fn read_block_from_artifact_bytes(
         .map_err(|error| LoaderHandshakeError::ArtifactIndex(error.to_string()))?;
     let LoaderArtifactIndex {
         schema,
-        ui,
+        screens,
+        world_previews,
         blocks,
         items,
         assets,
-        interactions,
         sounds,
     } = index;
-    let _ = (ui, items, assets, interactions, sounds);
-    if schema != 1 {
+    let _ = (screens, world_previews, items, assets, sounds);
+    if schema != 2 {
         return Err(LoaderHandshakeError::ArtifactIndex(format!(
             "unsupported Loader artifact index schema {schema}"
         )));
@@ -770,76 +792,245 @@ pub struct LoaderArtifactRequest {
     pub cache_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LoaderInteractionAction {
-    pub(crate) interaction_id: String,
-    pub(crate) phase: mc_script::ScriptLoaderInteractionPhase,
-    pub(crate) payload: String,
+/// One wire-3 view action admitted from a Loader client.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LoaderViewActionRequest {
+    pub(crate) view_instance_id: String,
+    pub(crate) view_revision: u64,
+    pub(crate) action_id: String,
+    pub(crate) action_sequence: u64,
+    pub(crate) fields: Vec<mc_script::ScriptClientViewField>,
+    pub(crate) selection_token: Option<String>,
 }
 
-impl LoaderInteractionAction {
-    pub(crate) fn decode(payload: &[u8]) -> Result<Self, LoaderHandshakeError> {
-        if payload.len() < 7 {
-            return Err(LoaderHandshakeError::Malformed(
-                "interaction payload is truncated".to_owned(),
-            ));
-        }
-        let protocol = u16::from_be_bytes([payload[0], payload[1]]);
-        if protocol != LOADER_PROTOCOL_VERSION {
-            return Err(LoaderHandshakeError::Protocol {
-                expected: LOADER_PROTOCOL_VERSION,
-                actual: protocol,
-            });
-        }
-        let phase = match payload[2] {
-            0 => mc_script::ScriptLoaderInteractionPhase::Trigger,
-            1 => mc_script::ScriptLoaderInteractionPhase::Press,
-            2 => mc_script::ScriptLoaderInteractionPhase::Release,
-            _ => {
+/// One decoded wire-3 client request from the Loader action channel.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LoaderViewClientRequest {
+    /// Explicit key-driven open request: `view_request { request_kind }`.
+    ViewRequest {
+        request_kind: mc_script::ScriptClientViewRequestKind,
+    },
+    Action(LoaderViewActionRequest),
+    CancelSelection {
+        selection_context_id: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireViewField {
+    id: String,
+    #[serde(default)]
+    number: Option<f64>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    selected: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireViewAction {
+    protocol: u16,
+    #[allow(dead_code)]
+    message: String,
+    view_instance_id: String,
+    view_revision: u64,
+    action_id: String,
+    action_sequence: u64,
+    #[serde(default)]
+    fields: Vec<WireViewField>,
+    #[serde(default)]
+    selection_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireViewRequest {
+    protocol: u16,
+    #[allow(dead_code)]
+    message: String,
+    request_kind: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireCancelSelection {
+    protocol: u16,
+    #[allow(dead_code)]
+    message: String,
+    selection_context_id: String,
+}
+
+fn decode_wire_view_field(
+    field: WireViewField,
+) -> Result<mc_script::ScriptClientViewField, LoaderHandshakeError> {
+    let typed =
+        field.number.is_some() as u8 + field.text.is_some() as u8 + field.selected.is_some() as u8;
+    if typed != 1 {
+        return Err(LoaderHandshakeError::Malformed(format!(
+            "view field {:?} must carry exactly one typed value",
+            field.id
+        )));
+    }
+    let parsed = if let Some(number) = field.number {
+        mc_script::ScriptClientViewField::try_number(&field.id, number)
+    } else if let Some(text) = field.text {
+        mc_script::ScriptClientViewField::try_text(&field.id, text)
+    } else {
+        mc_script::ScriptClientViewField::try_selected(
+            &field.id,
+            field.selected.as_deref().unwrap_or_default(),
+        )
+    };
+    parsed.map_err(|error| LoaderHandshakeError::Malformed(error.to_string()))
+}
+
+/// Decode one closed-schema wire-3 client request; unknown fields, unknown
+/// messages and a wrong protocol all fail closed.
+pub(crate) fn decode_loader_view_client_request(
+    payload: &[u8],
+) -> Result<LoaderViewClientRequest, LoaderHandshakeError> {
+    if payload.is_empty() || payload.len() > MAX_LOADER_VIEW_MESSAGE_BYTES {
+        return Err(LoaderHandshakeError::Malformed(format!(
+            "view request size is outside 1..={MAX_LOADER_VIEW_MESSAGE_BYTES}"
+        )));
+    }
+    let document: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|error| LoaderHandshakeError::Malformed(error.to_string()))?;
+    let message = document
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| LoaderHandshakeError::Malformed("view request has no message".to_owned()))?
+        .to_owned();
+    match message.as_str() {
+        "view_action" => {
+            let action: WireViewAction = serde_json::from_value(document)
+                .map_err(|error| LoaderHandshakeError::Malformed(error.to_string()))?;
+            require_view_protocol(action.protocol)?;
+            if action.fields.len() > mc_script::MAX_CLIENT_VIEW_FIELDS {
                 return Err(LoaderHandshakeError::Malformed(
-                    "invalid interaction phase".to_owned(),
+                    "view action fields exceed the limit".to_owned(),
                 ));
             }
-        };
-        let id_len = usize::from(u16::from_be_bytes([payload[3], payload[4]]));
-        if id_len == 0 || id_len > MAX_LOADER_INTERACTION_ID_BYTES {
-            return Err(LoaderHandshakeError::Malformed(
-                "interaction id length is outside its limit".to_owned(),
-            ));
+            let fields = action
+                .fields
+                .into_iter()
+                .map(decode_wire_view_field)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LoaderViewClientRequest::Action(LoaderViewActionRequest {
+                view_instance_id: action.view_instance_id,
+                view_revision: action.view_revision,
+                action_id: action.action_id,
+                action_sequence: action.action_sequence,
+                fields,
+                selection_token: action.selection_token,
+            }))
         }
-        let id_end = 5_usize.checked_add(id_len).ok_or_else(|| {
-            LoaderHandshakeError::Malformed("interaction id length overflow".to_owned())
-        })?;
-        let payload_len_end = id_end.checked_add(2).ok_or_else(|| {
-            LoaderHandshakeError::Malformed("interaction payload length overflow".to_owned())
-        })?;
-        if payload.len() < payload_len_end {
-            return Err(LoaderHandshakeError::Malformed(
-                "interaction payload is truncated".to_owned(),
-            ));
+        "cancel_selection" => {
+            let cancel: WireCancelSelection = serde_json::from_value(document)
+                .map_err(|error| LoaderHandshakeError::Malformed(error.to_string()))?;
+            require_view_protocol(cancel.protocol)?;
+            Ok(LoaderViewClientRequest::CancelSelection {
+                selection_context_id: cancel.selection_context_id,
+            })
         }
-        let body_len = usize::from(u16::from_be_bytes([payload[id_end], payload[id_end + 1]]));
-        if body_len > MAX_LOADER_INTERACTION_PAYLOAD_BYTES
-            || payload.len() != payload_len_end.saturating_add(body_len)
-        {
-            return Err(LoaderHandshakeError::Malformed(
-                "interaction body length does not match its payload".to_owned(),
-            ));
+        "view_request" => {
+            let request: WireViewRequest = serde_json::from_value(document)
+                .map_err(|error| LoaderHandshakeError::Malformed(error.to_string()))?;
+            require_view_protocol(request.protocol)?;
+            let request_kind =
+                mc_script::ScriptClientViewRequestKind::from_contract_name(&request.request_kind)
+                    .ok_or_else(|| {
+                    LoaderHandshakeError::Malformed(format!(
+                        "unknown view request kind {:?}",
+                        request.request_kind
+                    ))
+                })?;
+            Ok(LoaderViewClientRequest::ViewRequest { request_kind })
         }
-        let interaction_id = std::str::from_utf8(&payload[5..id_end])
-            .map_err(|_| LoaderHandshakeError::Malformed("interaction id is not UTF-8".to_owned()))?
-            .to_owned();
-        let body = std::str::from_utf8(&payload[payload_len_end..])
-            .map_err(|_| {
-                LoaderHandshakeError::Malformed("interaction body is not UTF-8".to_owned())
-            })?
-            .to_owned();
-        Ok(Self {
-            interaction_id,
-            phase,
-            payload: body,
-        })
+        other => Err(LoaderHandshakeError::Malformed(format!(
+            "unknown Loader view message {other:?}"
+        ))),
     }
+}
+
+fn require_view_protocol(protocol: u16) -> Result<(), LoaderHandshakeError> {
+    if protocol != LOADER_PROTOCOL_VERSION {
+        return Err(LoaderHandshakeError::Protocol {
+            expected: LOADER_PROTOCOL_VERSION,
+            actual: protocol,
+        });
+    }
+    Ok(())
+}
+
+/// One wire-3 server-to-client view message.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LoaderViewWireMessage<'a> {
+    Open {
+        view_instance_id: &'a str,
+        revision: u64,
+        view_id: &'a str,
+        title: &'a str,
+        model: &'a mc_script::ScriptClientViewModel,
+    },
+    Present {
+        view_instance_id: &'a str,
+        revision: u64,
+        model: &'a mc_script::ScriptClientViewModel,
+    },
+    Close {
+        view_instance_id: &'a str,
+    },
+}
+
+/// Encode one wire-3 message, failing closed when it exceeds the packet bound.
+pub(crate) fn encode_loader_view_message(
+    message: &LoaderViewWireMessage<'_>,
+) -> Result<Vec<u8>, LoaderHandshakeError> {
+    let document = match message {
+        LoaderViewWireMessage::Open {
+            view_instance_id,
+            revision,
+            view_id,
+            title,
+            model,
+        } => serde_json::json!({
+            "protocol": LOADER_PROTOCOL_VERSION,
+            "message": "open_view",
+            "view_instance_id": view_instance_id,
+            "revision": revision,
+            "view_id": view_id,
+            "title": title,
+            "model": model,
+        }),
+        LoaderViewWireMessage::Present {
+            view_instance_id,
+            revision,
+            model,
+        } => serde_json::json!({
+            "protocol": LOADER_PROTOCOL_VERSION,
+            "message": "present_view",
+            "view_instance_id": view_instance_id,
+            "revision": revision,
+            "model": model,
+        }),
+        LoaderViewWireMessage::Close { view_instance_id } => serde_json::json!({
+            "protocol": LOADER_PROTOCOL_VERSION,
+            "message": "close_view",
+            "view_instance_id": view_instance_id,
+        }),
+    };
+    let payload = serde_json::to_vec(&document)
+        .map_err(|error| LoaderHandshakeError::Malformed(error.to_string()))?;
+    if payload.len() > MAX_LOADER_VIEW_MESSAGE_BYTES {
+        return Err(LoaderHandshakeError::Malformed(format!(
+            "view message is {} bytes, maximum is {MAX_LOADER_VIEW_MESSAGE_BYTES}",
+            payload.len()
+        )));
+    }
+    Ok(payload)
 }
 
 impl LoaderArtifactRequest {
@@ -925,48 +1116,36 @@ pub fn loader_manifest_channel() -> &'static Identifier {
     })
 }
 
-pub fn loader_ui_channel() -> &'static Identifier {
-    static CHANNEL: OnceLock<Identifier> = OnceLock::new();
-    CHANNEL.get_or_init(|| {
-        Identifier::parse("solaris:loader/ui").expect("static Solaris Loader UI channel is valid")
-    })
+pub(crate) fn loader_view_channel() -> &'static Identifier {
+    static CHANNEL: LazyLock<Identifier> = LazyLock::new(|| {
+        Identifier::parse(LOADER_VIEW_CHANNEL).expect("static Solaris Loader view channel is valid")
+    });
+    &CHANNEL
 }
 
-pub fn loader_interaction_channel() -> &'static Identifier {
-    static CHANNEL: OnceLock<Identifier> = OnceLock::new();
-    CHANNEL.get_or_init(|| {
-        Identifier::parse("solaris:loader/interaction")
-            .expect("static Solaris Loader interaction channel is valid")
-    })
+pub(crate) fn loader_view_action_channel() -> &'static Identifier {
+    static CHANNEL: LazyLock<Identifier> = LazyLock::new(|| {
+        Identifier::parse(LOADER_VIEW_ACTION_CHANNEL)
+            .expect("static Solaris Loader view action channel is valid")
+    });
+    &CHANNEL
 }
 
-pub(crate) fn encode_loader_ui(presentation: &mc_script::ScriptClientUiPresentation) -> Vec<u8> {
-    let mode = match presentation.mode() {
-        mc_script::ScriptClientUiMode::Screen => 0,
-        mc_script::ScriptClientUiMode::Hud => 1,
-        mc_script::ScriptClientUiMode::Hidden => 2,
-        _ => unreachable!("validated client UI mode"),
-    };
-    let ui_id = presentation.ui_id();
-    let title = presentation.title();
-    let body = presentation.body();
-    let mut payload =
-        Vec::with_capacity(9 + ui_id.len() + title.map_or(0, str::len) + body.map_or(0, str::len));
-    payload.put_u16(LOADER_PROTOCOL_VERSION);
-    payload.put_u8(mode);
-    // The checked DTO bounds every string well below u16::MAX.
-    payload.put_u16(ui_id.len() as u16);
-    payload.extend_from_slice(ui_id.as_bytes());
-    for text in [title, body] {
-        match text {
-            Some(text) => {
-                payload.put_u16(text.len() as u16);
-                payload.extend_from_slice(text.as_bytes());
-            }
-            None => payload.put_u16(u16::MAX),
-        }
+impl LoaderManifest {
+    /// True when `plugin_id` owns a bundle declaring both the content kind and
+    /// its permission pair. Permission revocation re-runs this check per action.
+    pub(crate) fn plugin_grants(
+        &self,
+        plugin_id: &str,
+        content: LoaderContentKind,
+        permission: LoaderPermission,
+    ) -> bool {
+        self.bundles.iter().any(|bundle| {
+            bundle.owner == plugin_id
+                && bundle.content.contains(&content)
+                && bundle.permissions.contains(&permission)
+        })
     }
-    payload
 }
 
 #[must_use]
@@ -1016,16 +1195,16 @@ mod tests {
                 content: vec![
                     LoaderContentKind::Blocks,
                     LoaderContentKind::Items,
-                    LoaderContentKind::Ui,
+                    LoaderContentKind::Views,
                     LoaderContentKind::Assets,
-                    LoaderContentKind::Interactions,
+                    LoaderContentKind::ViewActions,
                 ],
                 permissions: vec![
                     LoaderPermission::RegisterBlocks,
                     LoaderPermission::RegisterItems,
-                    LoaderPermission::PresentUi,
+                    LoaderPermission::PresentViews,
                     LoaderPermission::LoadAssets,
-                    LoaderPermission::SendInteractions,
+                    LoaderPermission::SendViewActions,
                 ],
                 cache_key: format!("example:rich-content/1/{}", "a".repeat(64)),
                 source_path: None,
@@ -1275,7 +1454,7 @@ mod tests {
             .unwrap();
         archive
             .write_all(
-                br#"{"schema":1,"ui":[],"blocks":[{"id":"example:ruby_block","model":"example:block/ruby_block","name":"Ruby Block"}],"items":[],"assets":[],"interactions":[]}"#,
+                br#"{"schema":2,"screens":[{"id":"example:showcase","kind":"settlement","title":"Showcase","widgets":[]}],"blocks":[{"id":"example:ruby_block","model":"example:block/ruby_block","name":"Ruby Block"}],"items":[],"assets":[]}"#,
             )
             .unwrap();
         archive.finish().unwrap();
@@ -1345,39 +1524,84 @@ mod tests {
     }
 
     #[test]
-    fn interaction_action_decoding_is_bounded_exact_and_big_endian() {
-        let id = b"example:continue";
-        let body = b"accepted";
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&LOADER_PROTOCOL_VERSION.to_be_bytes());
-        payload.push(0);
-        payload.extend_from_slice(&(id.len() as u16).to_be_bytes());
-        payload.extend_from_slice(id);
-        payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
-        payload.extend_from_slice(body);
+    fn view_request_decoding_is_closed_and_protocol_fenced() {
+        let action = br#"{"protocol":3,"message":"view_action","view_instance_id":"solaris:view-1","view_revision":2,"action_id":"example:place","action_sequence":1,"fields":[{"id":"count","number":4}],"selection_token":"example:ctx-1"}"#;
+        let decoded = decode_loader_view_client_request(action).unwrap();
+        let LoaderViewClientRequest::Action(action) = decoded else {
+            panic!("expected a view action");
+        };
+        assert_eq!(action.view_instance_id, "solaris:view-1");
+        assert_eq!(action.view_revision, 2);
+        assert_eq!(action.action_sequence, 1);
+        assert_eq!(action.selection_token.as_deref(), Some("example:ctx-1"));
+        assert_eq!(action.fields.len(), 1);
 
+        let unknown = br#"{"protocol":3,"message":"view_action","view_instance_id":"a:b","view_revision":1,"action_id":"a:b","action_sequence":1,"price":9}"#;
+        assert!(decode_loader_view_client_request(unknown).is_err());
+        let wrong_protocol =
+            br#"{"protocol":2,"message":"view_request","request_kind":"settlement"}"#;
+        assert!(matches!(
+            decode_loader_view_client_request(wrong_protocol),
+            Err(LoaderHandshakeError::Protocol { .. })
+        ));
+        let request = br#"{"protocol":3,"message":"view_request","request_kind":"army"}"#;
         assert_eq!(
-            LoaderInteractionAction::decode(&payload).unwrap(),
-            LoaderInteractionAction {
-                interaction_id: "example:continue".to_owned(),
-                phase: mc_script::ScriptLoaderInteractionPhase::Trigger,
-                payload: "accepted".to_owned(),
+            decode_loader_view_client_request(request).unwrap(),
+            LoaderViewClientRequest::ViewRequest {
+                request_kind: mc_script::ScriptClientViewRequestKind::Army,
             }
         );
-        payload.push(0);
-        assert!(LoaderInteractionAction::decode(&payload).is_err());
+        let cancel = br#"{"protocol":3,"message":"cancel_selection","selection_context_id":"example:ctx-1"}"#;
+        assert_eq!(
+            decode_loader_view_client_request(cancel).unwrap(),
+            LoaderViewClientRequest::CancelSelection {
+                selection_context_id: "example:ctx-1".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn view_message_encoding_matches_the_wire_3_model() {
+        let model = mc_script::ScriptClientViewModel::try_new(
+            0,
+            1,
+            vec![mc_script::ScriptClientViewRow::try_new(vec!["Hamlet".to_owned()]).unwrap()],
+            vec![mc_script::ScriptClientViewField::try_number("count", 4.0).unwrap()],
+            vec![
+                mc_script::ScriptClientViewAction::try_new("example:place", true, None, None)
+                    .unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            vec![
+                mc_script::ScriptClientViewMarker::try_new("anchor", None, None, None, None)
+                    .unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        let payload = encode_loader_view_message(&LoaderViewWireMessage::Open {
+            view_instance_id: "solaris:view-1",
+            revision: 1,
+            view_id: "example:showcase",
+            title: "Showcase",
+            model: &model,
+        })
+        .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(document["protocol"], 3);
+        assert_eq!(document["message"], "open_view");
+        assert_eq!(document["model"]["rows"][0]["cells"][0], "Hamlet");
+        assert_eq!(document["model"]["fields"][0]["number"], 4.0);
+        assert_eq!(
+            document["model"]["actions"][0]["action_id"],
+            "example:place"
+        );
+        assert_eq!(document["model"]["markers"][0]["marker_id"], "anchor");
         assert!(
-            LoaderInteractionAction::decode(&[
-                0,
-                LOADER_PROTOCOL_VERSION as u8,
-                0,
-                0,
-                1,
-                b'x',
-                0x10,
-                0x01,
-            ])
-            .is_err()
+            document["model"]["markers"][0]
+                .get("selection_token")
+                .is_none()
         );
     }
 }

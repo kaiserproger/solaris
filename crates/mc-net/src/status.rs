@@ -132,6 +132,7 @@ mod tests {
 
     fn test_config() -> ServerConfig {
         ServerConfig {
+            tab_list: crate::server::TabListConfig::default(),
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 25565),
             motd: "Solaris test".into(),
             max_players: 20,

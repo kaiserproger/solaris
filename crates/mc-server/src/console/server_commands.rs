@@ -4,7 +4,7 @@ use anyhow::Result;
 use mc_server::{OperatorFileOperation, dashboard::DashboardStats};
 
 use super::commands::{
-    CommandHandler, ConsoleCommand, ConsoleReply, GameRule, TimeCommand, Weather,
+    CommandHandler, ConsoleCommand, ConsoleReply, GameRule, TimeCommand, Weather, WhitelistCommand,
 };
 use crate::OperatorCommand;
 
@@ -101,26 +101,89 @@ impl CommandHandler for ServerCommands {
                 ),
             },
             ConsoleCommand::Operator { command } => {
-                let operation = match command {
-                    OperatorCommand::Add { identity } => OperatorFileOperation::Add(identity),
-                    OperatorCommand::Remove { identity } => OperatorFileOperation::Remove(identity),
-                    OperatorCommand::List => OperatorFileOperation::List,
-                };
-                let path = self.config_path.clone();
-                let report = tokio::task::spawn_blocking(move || -> Result<_> {
-                    let mut config = crate::load_config(&path)?;
-                    if config.admin.operators_file.is_none() {
-                        config.admin.operators_file = Some(PathBuf::from("ops.json"));
+                let (identity, present) = match command {
+                    OperatorCommand::Add { identity } => (identity, true),
+                    OperatorCommand::Remove { identity } => (identity, false),
+                    OperatorCommand::List => {
+                        return Ok(ConsoleReply::Output(format!(
+                            "Operators: {}",
+                            self.control.operators().join(", ")
+                        )));
                     }
-                    config.manage_operator_file(&path, operation)
-                })
-                .await??;
+                };
+                persist_access_change(&self.config_path, AccessFile::Operators, &identity, present)
+                    .await?;
                 format!(
-                    "Persisted operators: {}. Changes take effect at next server start.",
-                    report.identities.join(", ")
+                    "Operators: {} (applied now)",
+                    self.control.set_operator(&identity, present).join(", ")
+                )
+            }
+            ConsoleCommand::Whitelist { command } => {
+                let (identity, present) = match command {
+                    WhitelistCommand::Add { identity } => (identity, true),
+                    WhitelistCommand::Remove { identity } => (identity, false),
+                    WhitelistCommand::List => {
+                        return Ok(ConsoleReply::Output(format!(
+                            "Whitelist: {}",
+                            self.control.whitelist().join(", ")
+                        )));
+                    }
+                };
+                persist_access_change(&self.config_path, AccessFile::Whitelist, &identity, present)
+                    .await?;
+                format!(
+                    "Whitelist: {} (applies to the next login; enforcement needs auth.whitelist_enabled)",
+                    self.control.set_whitelisted(&identity, present).join(", ")
                 )
             }
         };
         Ok(ConsoleReply::Output(message))
     }
+}
+
+/// Which access-control file a console mutation persists to.
+#[derive(Clone, Copy)]
+enum AccessFile {
+    Operators,
+    Whitelist,
+}
+
+/// Persist one identity change before the live set is updated, so a failed
+/// write never leaves the running server granting access the file lacks.
+async fn persist_access_change(
+    config_path: &std::path::Path,
+    file: AccessFile,
+    identity: &str,
+    present: bool,
+) -> Result<()> {
+    let path = config_path.to_path_buf();
+    let identity = identity.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut config = crate::load_config(&path)?;
+        match file {
+            AccessFile::Operators => {
+                if config.admin.operators_file.is_none() {
+                    config.admin.operators_file = Some(PathBuf::from("ops.json"));
+                }
+                let operation = if present {
+                    OperatorFileOperation::Add(identity)
+                } else {
+                    OperatorFileOperation::Remove(identity)
+                };
+                config.manage_operator_file(&path, operation)?;
+            }
+            AccessFile::Whitelist => {
+                if config.auth.whitelist_file.is_none() {
+                    config.auth.whitelist_file = Some(PathBuf::from("whitelist.json"));
+                }
+                if present {
+                    config.add_whitelist_identity(&path, &identity)?;
+                } else {
+                    config.remove_whitelist_identity(&path, &identity)?;
+                }
+            }
+        }
+        Ok(())
+    })
+    .await?
 }

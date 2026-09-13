@@ -4046,3 +4046,143 @@ fn village_toolsmith_chest_rolls_real_table() {
         "seed-0 toolsmith roll must yield loot"
     );
 }
+
+#[test]
+fn tellus_carved_channel_routes_river_wall_to_wall() {
+    // Seed 9700063978612627 carries a weak upland reach that used to route
+    // as a warm_ocean stripe: only the w > 0.84 core qualified as river,
+    // leaving below-sea carve shoulders as ocean with grassy savanna
+    // shallows. The whole below-sea carved profile must be river (sand bed).
+    let generator = TerrainGenerator::with_worldgen_mode(
+        9700063978612627,
+        tiny_registry(),
+        WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+    );
+    for x in [-208, -204, -200, -196] {
+        let sample = generator.diagnostic_sample(x, -2992);
+        assert!(
+            generator.biomes.is_river(&sample.biome),
+            "carved column below sea at {x} must be river, got {}",
+            sample.biome.path()
+        );
+        let (surface, _) = generator.surface_materials(&sample.biome);
+        assert_eq!(surface, generator.sand, "riverbed at {x} must be sand");
+    }
+    for x in [-216, -212, -192, -188] {
+        let sample = generator.diagnostic_sample(x, -2992);
+        assert!(
+            !generator.biomes.is_river(&sample.biome),
+            "dry bank at {x} must keep its climate biome, got {}",
+            sample.biome.path()
+        );
+    }
+}
+
+#[test]
+fn tellus_sub_sea_land_routes_shore_not_grass() {
+    // Seed 1785772562805887200: y62 plains at the waterline got water fill
+    // over grass (grass underwater). Anything below sea that is not river,
+    // swamp or ocean must be shoreline (sand bed).
+    let generator = TerrainGenerator::with_worldgen_mode(
+        1785772562805887200,
+        tiny_registry(),
+        WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+    );
+    for z in [1812, 1816, 1820, 1824, 1828, 1832] {
+        let sample = generator.diagnostic_sample(1283, z);
+        assert!(
+            generator.biomes.is_beach_or_shore(&sample.biome),
+            "sub-sea column at (1283, {z}) must be shore, got {}",
+            sample.biome.path()
+        );
+        let (surface, _) = generator.surface_materials(&sample.biome);
+        assert_eq!(
+            surface, generator.sand,
+            "shore bed at (1283, {z}) must be sand"
+        );
+    }
+    let bank = generator.diagnostic_sample(1283, 1800);
+    assert_eq!(bank.surface_y, 63);
+    assert!(
+        !generator.biomes.is_beach_or_shore(&bank.biome),
+        "dry y63 bank must keep its climate biome, got {}",
+        bank.biome.path()
+    );
+}
+
+#[test]
+fn tellus_beach_never_cuts_dry_ground_inland() {
+    // Seed 1785772562805887200: a y64 flat 140 blocks from the nearest water
+    // used to be painted as beach, cutting a sand band across dry ground. A
+    // beach now requires water one probe step away, so only the true fringe
+    // stays beach while dry ground keeps its climate.
+    let generator = TerrainGenerator::with_worldgen_mode(
+        1785772562805887200,
+        tiny_registry(),
+        WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+    );
+    for (x, z) in [(890, 1388), (1044, 1388), (1760, 1260)] {
+        let dry = generator.diagnostic_sample(x, z);
+        assert!(
+            !generator.biomes.is_beach_or_shore(&dry.biome),
+            "dry ground at ({x}, {z}) y={} must keep its climate, got {}",
+            dry.surface_y,
+            dry.biome.path()
+        );
+    }
+    for (x, z) in [(1060, 1388), (1076, 1388)] {
+        let fringe = generator.diagnostic_sample(x, z);
+        assert!(
+            generator.biomes.is_beach_or_shore(&fringe.biome),
+            "water-edge fringe at ({x}, {z}) y={} must be beach, got {}",
+            fringe.surface_y,
+            fringe.biome.path()
+        );
+        let (surface, _) = generator.surface_materials(&fringe.biome);
+        assert_eq!(surface, generator.sand);
+    }
+}
+
+#[test]
+fn river_beds_carry_gravel_bars_between_sand() {
+    let generator = TerrainGenerator::with_worldgen_mode(
+        1785772562805887200,
+        tiny_registry(),
+        WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+    );
+    let mut chunks: BTreeMap<(i32, i32), mc_world::Chunk> = BTreeMap::new();
+    let (mut sand, mut gravel) = (0usize, 0usize);
+    for x in (1500..1900).step_by(8) {
+        for z in (1100..1520).step_by(8) {
+            let sample = generator.diagnostic_sample(x, z);
+            if !generator.biomes.is_river(&sample.biome) {
+                continue;
+            }
+            let pos = ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            };
+            let chunk = chunks
+                .entry((pos.x, pos.z))
+                .or_insert_with(|| generator.generate(pos));
+            let state = chunk
+                .get_block(
+                    x.rem_euclid(16) as u8,
+                    sample.surface_y,
+                    z.rem_euclid(16) as u8,
+                )
+                .expect("river bed column is inside its chunk");
+            if state == generator.gravel {
+                gravel += 1;
+            } else if state == generator.sand {
+                sand += 1;
+            } else {
+                panic!("river bed at ({x}, {z}) is neither sand nor gravel");
+            }
+        }
+    }
+    assert!(
+        gravel > 0 && sand > gravel,
+        "river beds need gravel bars over a sand majority: sand={sand} gravel={gravel}"
+    );
+}

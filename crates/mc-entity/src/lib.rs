@@ -20,6 +20,7 @@ mod entity_scale_26_1_2;
 mod entity_vehicle;
 pub mod equipment_26_1_2;
 pub mod fire_26_1_2;
+pub mod group_orders;
 pub mod living_26_1_2;
 mod lock_policy;
 pub mod mob_control_26_1_2;
@@ -55,10 +56,15 @@ mod animal_panic_tests;
 
 pub use entity_projections::{EntityDespawnProjection, EntitySimulationProjection};
 pub use entity_scale_26_1_2::{EntityScale26_1_2, EntityScaleError};
+pub use group_orders::{
+    FormationKind, FormationPlacement, FormationSlot, FormationSlots, GroupAdmission,
+    GroupAdmissionPhase, GroupAdmissionRejection, GroupApplyOutcome, GroupMemberFailure,
+    GroupMemberFence, GroupMemberObservation, GroupMemberRejection, TargetCandidate,
+    TargetCategory, TargetPolicy, select_target, select_targets,
+};
 pub use lock_policy::{
     LockPoisonMetricsSnapshot, authoritative_lock_poison_from_panic, lock_poison_metrics_snapshot,
 };
-pub use regional::VillagerBindingClaim;
 pub use regional::{
     CompactEntityKinematicsFence, ItemPickupClaimResolution, LaneCommitTimings, REGION_SIZE_CHUNKS,
     RegionEntityStoreError, RegionEpoch, RegionKey, RegionLease, RegionOwnerBatch,
@@ -1516,8 +1522,20 @@ const RETAINED_PATH_NODE_DISTANCE: f64 = 1.5;
 const RETAINED_PATH_PROGRESS_EPSILON: f64 = 1.0e-4;
 const RETAINED_PATH_NO_PROGRESS_LIMIT: u8 = 6;
 const RETAINED_PATH_RECOMPUTE_LIMIT: u8 = 4;
-const WANDER_MIN_DISTANCE: f64 = 3.0;
-const WANDER_DISTANCE_SPREAD: f64 = 4.0;
+/// Wander reach, in blocks: every rolled target sits `MIN..MIN + SPREAD` away
+/// from the agent's current position.
+///
+/// Deliberately long-range: the owner asked for a world that is visibly alive
+/// and in motion, which a vanilla-sized stroll (3..7 blocks) does not deliver.
+/// Because a target is rolled relative to the *current* position there is no
+/// home leash, so a longer reach becomes real roaming instead of a wider idle.
+/// The reach stays bounded so a stroll remains a stroll, and it costs ticks
+/// rather than work: pathing is a per-tick greedy step under `PathingBudget`,
+/// so the probe cost per tick is unchanged, and a target that turns out to be
+/// unreachable (terrain, unloaded chunk, water edge) is abandoned by the
+/// retained-path no-progress budget and re-rolled on the next epoch.
+const WANDER_MIN_DISTANCE: f64 = 6.0;
+const WANDER_DISTANCE_SPREAD: f64 = 26.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct RetainedPathState {
@@ -2881,6 +2899,12 @@ fn bounded_pathing_step(
     }
 
     let (candidates, limit) = bounded_pathing_candidates(current, direct, speed, budget);
+    // An entity already overlapping terrain cannot make target progress but must
+    // still be allowed to step out; probe its own position once for that.
+    let overlapping = matches!(
+        probes.call(entity_id, current),
+        Some(PathingProbeResult::Blocked)
+    );
     let mut best: Option<(f64, Vec3)> = None;
     let candidate_limit = if allow_detours { limit } else { limit.min(1) };
     for candidate in candidates.into_iter().take(candidate_limit).skip(1) {
@@ -2934,7 +2958,60 @@ fn bounded_pathing_step(
         }
     }
 
-    if let Some((_, velocity)) = best {
+    // A detour is only worth taking if it actually brings the entity closer to
+    // its target. Accepting the least-bad candidate when every candidate is
+    // farther away makes an unreachable target (e.g. a wander target buried in
+    // tree leaves) walk the entity away and back forever, which reads in game
+    // as spinning in place. An entity already overlapping terrain still needs
+    // its escape step, so that case keeps the least-bad candidate.
+    let current_distance = goal.horizontal_len();
+    // An entity whose body already overlaps terrain cannot make progress with
+    // half-step probes that stay inside the overlapped block. Try one full-block
+    // step toward the four cardinal directions so it can actually leave.
+    if overlapping && allow_detours && best.is_none() {
+        let side = Vec3 {
+            x: -direct.z,
+            y: 0.0,
+            z: direct.x,
+        };
+        let escapes = [
+            direct,
+            side,
+            Vec3 {
+                x: -side.x,
+                y: 0.0,
+                z: -side.z,
+            },
+            Vec3 {
+                x: -direct.x,
+                y: 0.0,
+                z: -direct.z,
+            },
+        ];
+        for escape in escapes {
+            for dy in [0.0, -1.0] {
+                let position = Vec3 {
+                    x: current.x + escape.x,
+                    y: current.y + dy,
+                    z: current.z + escape.z,
+                };
+                match probes.call(entity_id, position) {
+                    Some(PathingProbeResult::Walkable) => {
+                        best = Some((current_distance, escape));
+                        break;
+                    }
+                    Some(PathingProbeResult::Unloaded) => saw_unloaded = true,
+                    Some(PathingProbeResult::Blocked) | None => {}
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some((score, velocity)) = best
+        && (score < current_distance - RETAINED_PATH_PROGRESS_EPSILON || overlapping)
+    {
         PathingDecision {
             velocity,
             kind: PathingDecisionKind::Move,
@@ -2995,6 +3072,9 @@ fn visit_bounded_pathing_probe_positions(
         z: target.z - current.z,
     }
     .horizontal_normalized();
+    // Resolve probes the entity's own position to detect terrain overlap before
+    // accepting a non-progress escape step.
+    visitor(current);
     if direct == Vec3::ZERO {
         return;
     }
@@ -3007,6 +3087,35 @@ fn visit_bounded_pathing_probe_positions(
         };
         if stepped != candidate.position {
             visitor(stepped);
+        }
+    }
+    // Resolve may fall back to one full-block cardinal escape step when the body
+    // overlaps terrain.
+    let side = Vec3 {
+        x: -direct.z,
+        y: 0.0,
+        z: direct.x,
+    };
+    for escape in [
+        direct,
+        side,
+        Vec3 {
+            x: -side.x,
+            y: 0.0,
+            z: -side.z,
+        },
+        Vec3 {
+            x: -direct.x,
+            y: 0.0,
+            z: -direct.z,
+        },
+    ] {
+        for dy in [0.0, -1.0] {
+            visitor(Vec3 {
+                x: current.x + escape.x,
+                y: current.y + dy,
+                z: current.z + escape.z,
+            });
         }
     }
 }
@@ -4392,8 +4501,17 @@ mod tests {
         assert_eq!(
             positions,
             vec![
+                (follower, Vec3::new(15.9, 64.0, 0.5)),
                 (follower, Vec3::new(16.1, 64.0, 0.5)),
                 (follower, Vec3::new(16.1, 65.0, 0.5)),
+                (follower, Vec3::new(16.9, 64.0, 0.5)),
+                (follower, Vec3::new(16.9, 63.0, 0.5)),
+                (follower, Vec3::new(15.9, 64.0, 1.5)),
+                (follower, Vec3::new(15.9, 63.0, 1.5)),
+                (follower, Vec3::new(15.9, 64.0, -0.5)),
+                (follower, Vec3::new(15.9, 63.0, -0.5)),
+                (follower, Vec3::new(14.9, 64.0, 0.5)),
+                (follower, Vec3::new(14.9, 63.0, 0.5)),
             ]
         );
     }
@@ -4501,8 +4619,8 @@ mod tests {
 
         assert_eq!(
             probe.calls.get(),
-            3,
-            "retained flat and step probes must precede the fallback direct probe"
+            4,
+            "retained flat, step, overlap, and fallback direct probes must run in order"
         );
     }
 
@@ -4592,6 +4710,40 @@ mod tests {
         assert!(velocity.horizontal_len() <= 0.5 + 0.000_001);
     }
 
+    /// A wander target buried in tree leaves is unreachable: every walkable
+    /// detour step is farther away. Such a step must be refused instead of
+    /// walking the entity away from its target, which reads as spinning in
+    /// place when the entity then turns back.
+    #[test]
+    fn bounded_pathing_refuses_a_detour_that_moves_away_from_an_unreachable_target() {
+        struct ThinWallAheadProbe;
+
+        impl PathingProbe for ThinWallAheadProbe {
+            fn can_stand_at(&self, position: Vec3) -> PathingProbeResult {
+                if (0.02..0.1).contains(&position.z) && position.x.abs() < 0.5 {
+                    PathingProbeResult::Blocked
+                } else {
+                    PathingProbeResult::Walkable
+                }
+            }
+        }
+
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(0.0, 64.0, 4.0),
+                speed: 1.0,
+            },
+        );
+
+        let stats = store.tick_goals_with_pathing(1, &ThinWallAheadProbe, PathingBudget::DEFAULT);
+
+        assert_eq!(stats.pathing_blocked, 1);
+        assert_eq!(store.snapshot(follower).unwrap().velocity, Vec3::ZERO);
+    }
+
     struct TwoBlockWallPathingProbe;
 
     impl PathingProbe for TwoBlockWallPathingProbe {
@@ -4672,7 +4824,10 @@ mod tests {
         let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
 
         let mut reached = None;
-        for tick in 1..=80 {
+        let speed = 3.0;
+        let max_ticks =
+            (((WANDER_MIN_DISTANCE + WANDER_DISTANCE_SPREAD) / speed) * 20.0).ceil() as u64 + 80;
+        for tick in 1..=max_ticks {
             store.tick_goals_with_pathing(tick, &probe, PathingBudget::DEFAULT);
             let prepared =
                 store.prepare_goal_tick_with_pathing_for_ids(tick + 1, &HashSet::from([id]));
@@ -4730,6 +4885,24 @@ mod tests {
             );
         }
         assert_ne!(first_target, second_target);
+
+        // A vanilla-sized stroll reads as a static world, so the rolled reach
+        // must stay long-range. This samples the real roll path rather than
+        // re-stating the constants.
+        let mut shortest = f64::INFINITY;
+        let mut longest: f64 = 0.0;
+        for raw in 1..=64i32 {
+            let (target, _) =
+                wander_pathing_target(EntityId(raw), position, RetainedPathState::default(), 1, 40);
+            let distance = (target.x - position.x).hypot(target.z - position.z);
+            shortest = shortest.min(distance);
+            longest = longest.max(distance);
+        }
+        assert!(shortest >= WANDER_MIN_DISTANCE);
+        assert!(
+            longest >= 24.0,
+            "wander reach must stay long-range so the world visibly moves"
+        );
     }
 
     #[test]
@@ -4815,7 +4988,10 @@ mod tests {
         assert_eq!(stats.pathing_moves, 1);
         assert!(store.snapshot(id).unwrap().velocity.x < 0.0);
         let visited = probe.0.borrow();
-        assert!(visited[6].x < 0.0, "the seventh probe must be the retreat");
+        assert!(
+            visited[7].x < 0.0,
+            "the eighth probe must be the retreat after the overlap check"
+        );
         assert_eq!(
             visited.len(),
             PathingBudget::DEFAULT.max_candidates_per_entity

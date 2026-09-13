@@ -161,6 +161,7 @@ impl ScriptInventoryReservationQuantity {
 #[non_exhaustive]
 pub struct ScriptInventoryReservationSnapshot {
     pub reservation_ref: String,
+    pub endpoint: ScriptInventoryEndpoint,
     pub resource_plan_hash: String,
     pub quantities: Vec<ScriptInventoryReservationQuantity>,
     pub bound_to: Option<String>,
@@ -172,6 +173,7 @@ impl ScriptInventoryReservationSnapshot {
     #[must_use]
     pub fn new(
         reservation_ref: String,
+        endpoint: ScriptInventoryEndpoint,
         resource_plan_hash: String,
         quantities: Vec<ScriptInventoryReservationQuantity>,
         bound_to: Option<String>,
@@ -180,6 +182,7 @@ impl ScriptInventoryReservationSnapshot {
     ) -> Self {
         Self {
             reservation_ref,
+            endpoint,
             resource_plan_hash,
             quantities,
             bound_to,
@@ -190,6 +193,7 @@ impl ScriptInventoryReservationSnapshot {
 
     fn validate(&self) -> Result<(), ScriptDtoError> {
         super::validate_reservation_ref(&self.reservation_ref)?;
+        self.endpoint.validate()?;
         if self.resource_plan_hash.len() != 64
             || !self
                 .resource_plan_hash

@@ -64,29 +64,27 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
         .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
         .expect("dirt item");
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M87 station no-op".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks,
-        world,
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "M87 station no-op".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks,
+    world,
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy::default(),
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -377,36 +375,34 @@ async fn adjacent_stair_place_remove_recomputes_neighbor_on_wire_and_survives_re
         .expect("replace stair neighbor");
 
     let shutdown = mc_net::ShutdownHandle::default();
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "T02 stair wire persistence".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data: Arc::clone(&data),
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::new(tokio::sync::Mutex::new(storage))),
-        tags: Arc::clone(&tags),
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items: Arc::clone(&items),
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
-            &report,
-        )),
-        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            friendly_spawn_interval_ticks: 0,
-            hostile_spawn_interval_ticks: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: shutdown.clone(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "T02 stair wire persistence".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data: Arc::clone(&data),
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::new(tokio::sync::Mutex::new(storage))),
+    tags: Arc::clone(&tags),
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items: Arc::clone(&items),
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+        &report,
+    )),
+    entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        friendly_spawn_interval_ticks: 0,
+        hostile_spawn_interval_ticks: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: shutdown.clone(), };
     let bound = mc_net::bind(cfg).await.expect("bind stair wire server");
     let addr = bound.local_addr().expect("stair wire local addr");
     let serve = tokio::spawn(async move { bound.serve_and_save().await });
@@ -548,36 +544,34 @@ async fn adjacent_stair_place_remove_recomputes_neighbor_on_wire_and_survives_re
     .with_item_registry(Arc::clone(&items))
     .with_generator(second_generator);
     let second_shutdown = mc_net::ShutdownHandle::default();
-    let second_cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "T02 stair removal after restart".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data: Arc::clone(&data),
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::new(tokio::sync::Mutex::new(second_world))),
-        tags: Arc::clone(&tags),
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items: Arc::clone(&items),
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
-            &report,
-        )),
-        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            friendly_spawn_interval_ticks: 0,
-            hostile_spawn_interval_ticks: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: second_shutdown.clone(),
-    };
+    let second_cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "T02 stair removal after restart".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data: Arc::clone(&data),
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::new(tokio::sync::Mutex::new(second_world))),
+    tags: Arc::clone(&tags),
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items: Arc::clone(&items),
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+        &report,
+    )),
+    entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        friendly_spawn_interval_ticks: 0,
+        hostile_spawn_interval_ticks: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: second_shutdown.clone(), };
     let second_bound = mc_net::bind(second_cfg)
         .await
         .expect("bind restarted stair server");

@@ -66,6 +66,7 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
         ..mc_net::RandomTickPolicy::default()
     };
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.g play".into(),
         max_players,
@@ -107,6 +108,7 @@ fn script_channel_manifest(plugin_id: &str) -> ValidatedScriptPluginManifest {
 
 async fn start_server_with_script_payloads() -> (SocketAddr, ScriptHostEndpoint) {
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M100 script payloads".into(),
         max_players: 8,
@@ -166,6 +168,7 @@ async fn start_server_with_scripts() -> (SocketAddr, ScriptHostEndpoint) {
 
 fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfig {
     mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua plugin integration".into(),
         max_players: 8,
@@ -1110,6 +1113,10 @@ async fn plugin_owned_command_argument_limits_do_not_terminate_play_ingress() {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "CommandPlayer").await;
+    // Drain the login burst before waiting on server-side script events: the
+    // session task blocks writing this socket, so an unread burst would starve
+    // the command ingress this test is actually about.
+    drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
     recv_script_event(&mut endpoint, |event| {
         matches!(event.kind(), ScriptEventKind::PlayerJoined { .. })
     })

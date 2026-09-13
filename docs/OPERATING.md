@@ -101,6 +101,15 @@ mc-server --config server.toml operator add OperatorName
 mc-server --config server.toml operator remove OperatorName
 ```
 
+The whitelist is managed from the running server console instead, with the same
+`list`/`add`/`remove` shape:
+
+```
+whitelist list
+whitelist add PlayerName
+whitelist remove PlayerName
+```
+
 The same commands work through Cargo during development:
 
 ```sh
@@ -131,13 +140,18 @@ xattrs are not explicitly copied. New files use private tempfile permissions.
 
 `operators_file` is resolved relative to the selected config. If it is absent,
 the CLI uses the deterministic `ops.json` path beside the config without
-rewriting TOML; server startup auto-loads that file when it exists. The first
+rewriting TOML; server startup auto-loads that file when it exists. The same
+defaulting applies to `whitelist_file` and `whitelist.json`. The first
 `operator add` creates the file. An explicitly configured but missing file is
 an actionable error for `list` and `remove`; run `operator add` to initialize
 it. Malformed JSON, names, UUIDs, and oversized files fail closed. Invalid
-`add` identities have no file side effect. Operator changes are persisted for
-the next server start; they do not hot-reload a running process. `SIGHUP` is a
-strict-plugin reload only.
+`add` identities have no file side effect. The console commands
+(`operator add|remove|list`, `whitelist add|remove|list`) write the file first
+and then apply the change to the running process: a new operator receives the
+command tree without a restart, and the next login is checked against the live
+whitelist. The standalone CLI subcommands exit before the listener starts, so
+their change takes effect on the next server start. `SIGHUP` is a strict-plugin
+reload only.
 
 `allow_local_dev_operators = true` is a convenience for throwaway loopback
 development when no identities are configured. Leave it `false` for normal
@@ -163,11 +177,13 @@ those values requires an empty/new `world_dir`; do not delete only the contract
 file or combine region files from two contracts. Back up the complete directory
 before upgrading an alpha.
 
-Worldgen revision 20 makes rivers wider and deeper while retaining seeded width
-variation, shallow banks and varying channel beds. It is not compatible with
-revision-19 generated worlds: select a fresh `world_dir` to use the new terrain.
-Existing chunks are not retroactively reshaped, and editing `world.json` to bypass
-the revision check would mix incompatible terrain.
+Worldgen revision 21 keeps rivers wall-to-wall with seeded width variation,
+shallow banks and varying channel beds, tapers headwater rivers at their source,
+litters river beds with gravel bars, and restricts beaches to columns that
+actually touch water. Revision 21 is not compatible with earlier generated
+worlds: select a fresh `world_dir` to use the new terrain. Existing chunks are
+not retroactively reshaped, and editing `world.json` to bypass the revision
+check would mix incompatible terrain.
 
 Plugin worldgen declarations are startup-only and become part of this contract.
 An unversioned vanilla Anvil import cannot use Solaris plugin worldgen to fill
@@ -187,6 +203,32 @@ The sidecar becomes authoritative and must contain matching version metadata,
 registries, tags, block-light report, and supported recipes/loot. Generate it
 with `tools/extract-vanilla-data.sh`; remove the setting to return to embedded
 data.
+
+## Pre-generating a region
+
+Serve generates the spawn window before it accepts connections, which is a
+client-view square around spawn. To prepare a larger bounded area ahead of time
+(for example before a field test or a map render), run the `pregenerate`
+subcommand:
+
+```sh
+mc-server --config server.toml pregenerate --from -2048,-2048 --to 2048,2048
+```
+
+Both arguments are inclusive block coordinates in `x,z` form; either corner may
+come first and the rectangle is rounded outward to whole chunks. The process
+opens the configured world with the same contract, seed and worldgen baseline as
+serve, generates and stores every missing chunk of the rectangle in addition to
+the startup spawn window, flushes the dirty chunks to the region files, prints
+the requested/generated/skipped/flushed counts and exits without starting the
+listener. Chunks that are already resident or stored on disk are skipped, so
+repeating a request preserves terrain that has already been played or edited,
+and interrupting it leaves every already-flushed chunk valid. Oversized requests
+fail closed above 4,194,304 chunks (a 2048 x 2048 chunk square), before the
+world is created or opened; split larger areas into several runs. An unversioned
+vanilla Anvil import is refused, because serve treats such a world as read-only.
+Chunks written this way are ordinary chunks, so later serve startup warms the
+spawn window normally and clients stream the rest on demand.
 
 ## Natural population
 

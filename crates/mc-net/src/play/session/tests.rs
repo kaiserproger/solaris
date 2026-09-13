@@ -14,6 +14,7 @@ use crate::connection::{ConnectionReader, PRE_PLAY_READ_TIMEOUT, read_packet_wit
 
 mod aquatic_motion;
 mod entity_save_barrier;
+mod mob_spin;
 mod regional_physics;
 
 #[test]
@@ -10253,6 +10254,7 @@ fn registration<'a>(
         desired: HashSet::new(),
         tx,
         pose: PlayerPose::new(0.5, 64.0, 0.5),
+        game_mode: mc_domain::GameMode::Survival,
         max_sessions,
         script_operator: false,
         dimension: "minecraft:overworld",
@@ -10306,6 +10308,7 @@ async fn profile_properties_reach_observer_player_info_wire_packet() {
             desired: HashSet::from([chunk]),
             tx: profiled_tx,
             pose: PlayerPose::new(1.5, 64.0, 0.5),
+            game_mode: mc_domain::GameMode::Survival,
             max_sessions: usize::MAX,
             script_operator: false,
             dimension: "minecraft:overworld",
@@ -13828,6 +13831,7 @@ async fn reliable_visibility_commands_retry_when_channel_is_full() {
             name: "RetryPlayer".to_string(),
             properties: Vec::new(),
             pose: PlayerPose::new(0.5, 64.0, 0.5),
+            game_mode: GameMode::Survival,
         }),
     }]);
 
@@ -13871,6 +13875,7 @@ async fn reliable_visibility_backlog_preserves_distinct_commands_in_order() {
                 name: format!("OrderedRetry{index}"),
                 properties: Vec::new(),
                 pose: PlayerPose::new(0.5, 64.0, 0.5),
+                game_mode: GameMode::Survival,
             }),
         })
         .collect();
@@ -13976,6 +13981,7 @@ async fn reliable_visibility_retries_are_bounded_per_slow_recipient() {
                 name: format!("SlowRetry{idx}"),
                 properties: Vec::new(),
                 pose: PlayerPose::new(0.5, 64.0, 0.5),
+                game_mode: GameMode::Survival,
             }),
         })
         .collect();
@@ -14045,6 +14051,7 @@ async fn reliable_visibility_backlog_overflow_closes_session() {
                 name: format!("OverflowRetry{index}"),
                 properties: Vec::new(),
                 pose: PlayerPose::new(0.5, 64.0, 0.5),
+                game_mode: GameMode::Survival,
             }),
         })
         .collect();

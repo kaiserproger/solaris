@@ -95,6 +95,7 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
     );
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua teleport wire test".into(),
         max_players: 1,

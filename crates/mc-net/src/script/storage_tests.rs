@@ -779,6 +779,7 @@ fn storage_bind_config(root: &std::path::Path) -> ServerConfig {
         mc_world::WorldStorage::open(root, std::sync::Arc::clone(&blocks)).unwrap(),
     ));
     ServerConfig {
+        tab_list: crate::server::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "storage startup test".to_owned(),
         max_players: 1,

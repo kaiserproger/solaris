@@ -69,6 +69,7 @@ async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
         .unwrap_or_default();
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M17 mob presence".into(),
         max_players: 8,
@@ -133,6 +134,7 @@ async fn embedded_playable_seed_spawns_food_mob_in_initial_window() {
     .collect::<Vec<_>>();
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "P10 embedded passive food mob".into(),
         max_players: 8,
@@ -215,6 +217,7 @@ async fn two_clients_receive_same_server_owned_mob() {
         .unwrap_or_default();
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M32 multi-client mob visibility".into(),
         max_players: 8,
@@ -324,6 +327,7 @@ async fn survival_attack_passive_mob_uses_all_configured_drops() {
             .unwrap_or_default();
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M23 mob food".into(),
         max_players: 8,
@@ -493,6 +497,7 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
             .unwrap_or_default();
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M24 zombie pressure".into(),
         max_players: 8,
@@ -653,6 +658,7 @@ async fn survival_shield_blocks_frontal_zombie_damage() {
         .expect("shield item");
 
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M56 shield block".into(),
         max_players: 8,

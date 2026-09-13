@@ -79,32 +79,30 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
         .id_of(&mc_data::Identifier::parse("minecraft:water_bucket").unwrap())
         .expect("water bucket item");
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M100 water bucket scheduled spread".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks,
-        world,
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(block_facts.clone()),
-        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "M100 water bucket scheduled spread".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks,
+    world,
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(block_facts.clone()),
+    entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     let mut simulation_ticks = bound
@@ -281,32 +279,30 @@ async fn lava_bucket_next_to_water_solidifies_through_scheduled_fluid_tick() {
         .id_of(&mc_data::Identifier::parse("minecraft:lava_bucket").unwrap())
         .expect("lava bucket item");
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M100 lava water scheduled solidification".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks,
-        world,
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(block_facts.clone()),
-        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "M100 lava water scheduled solidification".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks,
+    world,
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(block_facts.clone()),
+    entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -445,34 +441,32 @@ async fn water_bucket_scheduled_spread_survives_save_restart_without_duplicate_t
         .expect("replace fluid restart spread");
 
     let first_shutdown = mc_net::ShutdownHandle::default();
-    let first_cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "T02 scheduled fluid restart placement".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data: Arc::clone(&data),
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::new(tokio::sync::Mutex::new(storage))),
-        tags: Arc::clone(&tags),
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items: Arc::clone(&items),
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::clone(&block_facts),
-        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            friendly_spawn_interval_ticks: 0,
-            hostile_spawn_interval_ticks: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: first_shutdown.clone(),
-    };
+    let first_cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "T02 scheduled fluid restart placement".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data: Arc::clone(&data),
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::new(tokio::sync::Mutex::new(storage))),
+    tags: Arc::clone(&tags),
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items: Arc::clone(&items),
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::clone(&block_facts),
+    entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        friendly_spawn_interval_ticks: 0,
+        hostile_spawn_interval_ticks: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: first_shutdown.clone(), };
     let first_bound = mc_net::bind(first_cfg)
         .await
         .expect("bind first fluid restart server");
@@ -573,34 +567,32 @@ async fn water_bucket_scheduled_spread_survives_save_restart_without_duplicate_t
     .with_generator(second_generator);
     let second_world = Arc::new(tokio::sync::Mutex::new(second_storage));
     let second_shutdown = mc_net::ShutdownHandle::default();
-    let second_cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "T02 scheduled fluid restart continuation".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data: Arc::clone(&data),
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::clone(&second_world)),
-        tags: Arc::clone(&tags),
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items: Arc::clone(&items),
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::clone(&block_facts),
-        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            friendly_spawn_interval_ticks: 0,
-            hostile_spawn_interval_ticks: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: second_shutdown.clone(),
-    };
+    let second_cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "T02 scheduled fluid restart continuation".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data: Arc::clone(&data),
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::clone(&second_world)),
+    tags: Arc::clone(&tags),
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items: Arc::clone(&items),
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::clone(&block_facts),
+    entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        friendly_spawn_interval_ticks: 0,
+        hostile_spawn_interval_ticks: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: second_shutdown.clone(), };
     let second_bound = mc_net::bind(second_cfg)
         .await
         .expect("bind restarted fluid server");

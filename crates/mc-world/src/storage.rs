@@ -502,6 +502,21 @@ impl WorldStorage {
         Ok(self.borrowed_chunk.as_deref())
     }
 
+    /// Report whether a chunk is resident or already stored on disk, without
+    /// loading its payload and without invoking the fallback generator.
+    pub fn chunk_is_stored(&mut self, cpos: ChunkPos) -> Result<bool, WorldError> {
+        if self.resident.contains(cpos) {
+            return Ok(true);
+        }
+        let (rx, rz) = region_of(cpos);
+        let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+        let local_z = cpos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+        match self.ensure_region(rx, rz)? {
+            Some(region) => Ok(region.has_chunk(local_x, local_z)),
+            None => Ok(false),
+        }
+    }
+
     /// Clone a chunk if it is already resident or present on disk, but do not
     /// invoke the fallback generator. Background chunk streaming uses this to
     /// keep expensive terrain generation outside the shared world mutex.

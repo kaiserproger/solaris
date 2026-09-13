@@ -32,6 +32,7 @@ async fn embedded_ghast_fires_large_fireball_that_damages_explodes_and_discards_
     let fireball_type_id = entity_type_id(&entity_types, "minecraft:fireball");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 ghast TCP".into(),
         max_players: 2,

@@ -54,6 +54,7 @@ async fn lua_timer_is_pushed_by_simulation_ticks_without_tick_subscription() {
     assert_eq!(host.loaded_plugins(), 1);
     let shutdown = mc_net::ShutdownHandle::default();
     let config = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Lua timer wire test".into(),
         max_players: 1,

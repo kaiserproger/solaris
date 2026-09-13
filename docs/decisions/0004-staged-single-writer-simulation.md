@@ -40,6 +40,15 @@ stale state/token preconditions reject the batch before any edit is published.
 Single-region execution retains its fast path; multi-region storage edits reuse
 the existing staged source fence and atomic publication boundary.
 
+Settlement structure portions are server-owned block-edit batches: one
+`ApplyBlockEdits` command with no actor session carries a whole portion and is
+awaited before the stage receipt is spent, so a stage is durable only once that
+command has committed. Server-owned batches deliberately never take the session
+fast lanes, which publish through a writer's visible-edit finalize and would
+skip eviction of a replaced campfire's cooking state; they take the staged
+storage path, which owns that eviction, reactivity, owner relighting, and the
+post-commit publication to loaded sessions.
+
 `WorldStorage::commit_opaque_block_entity_conditionally` loads the chunk, then
 checks state/token and publishes NBT under the existing resident region lock.
 The net-side check/write split and unconditional opaque storage setter are gone.

@@ -1108,8 +1108,8 @@ mod tests {
                     LoaderPlatform::NeoForge,
                     LoaderPlatform::Forge,
                 ],
-                content: vec![LoaderContentKind::Ui],
-                permissions: vec![LoaderPermission::PresentUi],
+                content: vec![LoaderContentKind::Views],
+                permissions: vec![LoaderPermission::PresentViews],
                 cache_key: format!("example:screen/1/{}", "a".repeat(64)),
                 source_path: None,
                 artifact_bytes: None,
@@ -1148,7 +1148,7 @@ mod tests {
             protocol: LOADER_PROTOCOL_VERSION,
             platform: LoaderPlatform::Fabric,
             loader_version: "0.1.0".to_owned(),
-            accepted_permissions: vec![LoaderPermission::PresentUi],
+            accepted_permissions: vec![LoaderPermission::PresentViews],
             cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
             carrier_block_state_ids: BTreeMap::new(),
         };
@@ -1183,7 +1183,7 @@ mod tests {
             protocol: LOADER_PROTOCOL_VERSION,
             platform: LoaderPlatform::Forge,
             loader_version: "0.1.0".to_owned(),
-            accepted_permissions: vec![LoaderPermission::PresentUi],
+            accepted_permissions: vec![LoaderPermission::PresentViews],
             cached_bundles: Vec::new(),
             carrier_block_state_ids: BTreeMap::new(),
         };

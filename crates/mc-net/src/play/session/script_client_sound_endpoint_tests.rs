@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
+use mc_domain::GameMode;
 use mc_script::{LuaHostConfig, ScriptEvent, start_lua_host};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -61,6 +62,7 @@ async fn sound_commands_cannot_cross_owner_permission_or_live_session_boundaries
         desired: HashSet::new(),
         tx,
         pose: PlayerPose::new(0.5, 64.0, 0.5),
+        game_mode: GameMode::Survival,
         max_sessions: usize::MAX,
         script_operator: false,
         dimension: "minecraft:overworld",

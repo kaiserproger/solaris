@@ -5,21 +5,20 @@ api = "0.6.0"
 player_commands = ["loader_sapphire"]
 
 [client]
-schema = 1
+schema = 2
 
 [[client.bundles]]
 id = "rich-content"
 version = "1"
 artifact = "client/rich-content.zip"
-sha256 = "faadec262fb69554d684b0ed6f239dfa35e3c261b5d07b486535d7cfd45a4d5b"
-size_bytes = 8709
+sha256 = "a46ba314133a1897bf5c24b570e0b024f70ea6b3cdf369badc83dcd22b1e4daf"
+size_bytes = 1109
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "ui", "assets", "interactions", "sounds"]
+content = ["blocks", "items", "views", "view_actions", "assets"]
 permissions = [
   "register_blocks",
   "register_items",
-  "present_ui",
+  "present_views",
+  "send_view_actions",
   "load_assets",
-  "send_interactions",
-  "play_sounds",
 ]

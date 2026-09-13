@@ -45,11 +45,26 @@ pub(crate) enum ConsoleCommand {
         #[command(subcommand)]
         command: GameRule,
     },
-    /// Manage persisted operators (effective at next server start).
+    /// Manage operators (applies to online players and future logins).
     Operator {
         #[command(subcommand)]
         command: OperatorCommand,
     },
+    /// Manage the login whitelist (applies to the next login attempt).
+    Whitelist {
+        #[command(subcommand)]
+        command: WhitelistCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum WhitelistCommand {
+    /// Allow an identity to log in.
+    Add { identity: String },
+    /// Remove an identity from the whitelist.
+    Remove { identity: String },
+    /// List effective whitelist identities.
+    List,
 }
 
 #[derive(Debug, Subcommand)]

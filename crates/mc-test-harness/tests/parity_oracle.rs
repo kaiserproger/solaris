@@ -368,6 +368,7 @@ async fn spawn_solaris() -> Result<(mc_net::BoundServer, std::net::SocketAddr)> 
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let items = Arc::new(mc_data::items::solaris_required_items());
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse()?,
         motd: "M51 parity oracle".into(),
         max_players: 8,
@@ -476,6 +477,7 @@ async fn spawn_solaris_with_local_vanilla_data_internal(
             .context("entity type report is the exact 26.1.2 registry")?,
     );
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse()?,
         motd: "M79 configuration parity".into(),
         max_players: 8,

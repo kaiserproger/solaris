@@ -34,6 +34,7 @@ async fn embedded_village_defense_spawns_golem_and_attacks_hostile_over_tcp() {
     let iron_golem_type_id = entity_type_id(&entity_types, "minecraft:iron_golem");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 village defence TCP".into(),
         max_players: 2,

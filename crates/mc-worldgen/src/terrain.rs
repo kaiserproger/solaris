@@ -60,6 +60,10 @@ pub enum TerrainGeneratorError {
 pub const SEA_LEVEL: i32 = 63;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
+/// Scale and coverage of gravel bars on river beds.
+const RIVER_GRAVEL_SCALE: f64 = 34.0;
+const RIVER_GRAVEL_THRESHOLD: f64 = 0.30;
+const RIVER_GRAVEL_SALT: i64 = 0x5247_5256;
 const ORE_VEIN_RADIUS: i32 = 4;
 const ORE_COLUMN_HALO: i32 = ORE_VEIN_RADIUS * 2 + 1;
 const ORE_GROWTH_ATTEMPTS: usize = 12;
@@ -906,6 +910,18 @@ impl TerrainGenerator {
         (regional * 0.72 + moisture * 0.28).clamp(-1.0, 1.0)
     }
 
+    /// Gravel bars along a river bed: a coarse two-octave field so bars read as
+    /// patches rather than per-block speckle.
+    fn river_gravel_bar(&self, world_x: i32, world_z: i32) -> bool {
+        fbm_2d(
+            f64::from(world_x) / RIVER_GRAVEL_SCALE,
+            f64::from(world_z) / RIVER_GRAVEL_SCALE,
+            self.seed ^ RIVER_GRAVEL_SALT,
+            2,
+            0.5,
+        ) > RIVER_GRAVEL_THRESHOLD
+    }
+
     fn biome_supports_land_vegetation(&self, biome: &Identifier) -> bool {
         self.biomes.grassland.contains(biome)
             || self.biomes.temperate_forest.contains(biome)
@@ -930,6 +946,12 @@ impl TerrainGenerator {
         if self.biomes.mountain.contains(&biome) && height >= sea_level + 112 {
             surface = self.snow_block;
             fill = self.stone;
+        }
+        // Vanilla river beds are sand with gravel bars; without them the bed
+        // reads as one flat sand sheet.
+        if self.biomes.is_river(&biome) && self.river_gravel_bar(wx, wz) {
+            surface = self.gravel;
+            fill = self.gravel;
         }
         let top_non_air = if water_enabled && (height < sea_level || self.biomes.is_river(&biome)) {
             let inclusive_top = checked_y_offset(self.geometry.max_y(), -1).unwrap_or(height);
@@ -2341,6 +2363,10 @@ fn paste_template(
 }
 
 impl ChunkGenerator for TerrainGenerator {
+    fn surface_height(&self, world_x: i32, world_z: i32) -> Option<i32> {
+        Some(Self::surface_height(self, world_x, world_z))
+    }
+
     fn generate(&self, pos: ChunkPos) -> Chunk {
         let mut chunk =
             Chunk::empty_with_geometry(pos, self.air, self.biomes.default.clone(), self.geometry);

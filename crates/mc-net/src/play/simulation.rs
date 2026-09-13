@@ -810,6 +810,31 @@ fn command_orders_earlier_herds(command: &SimulationCommand) -> bool {
     matches!(command, SimulationCommand::SetWorldTime { .. })
 }
 
+/// A server-owned block-edit batch has no writer session, so it never runs the
+/// writer's `finalize_visible_block_edit_outcome` pass; drop the cooking state of
+/// a campfire it replaced here. The batch's own delta replaces the block
+/// client-side, so no block-entity reset is sent for this path.
+fn clear_server_owned_campfire_cooking(
+    sessions: &SessionRegistry,
+    storage: Option<&mc_world::WorldStorage>,
+    actor_session: Option<SessionId>,
+    outcome: Option<&BlockEditBatchOutcome>,
+) {
+    let (Some(storage), Some(outcome)) = (storage, outcome) else {
+        return;
+    };
+    if actor_session.is_some() {
+        return;
+    }
+    for edit in &outcome.applied {
+        if is_campfire_block(storage.registry(), edit.previous)
+            && !is_campfire_block(storage.registry(), edit.new_state)
+        {
+            sessions.clear_campfire_cooking(edit.pos);
+        }
+    }
+}
+
 fn command_single_owner_region(command: &SimulationCommand) -> Option<RegionKey> {
     if let SimulationCommand::ApplyBlockEdits {
         edits,
@@ -951,6 +976,7 @@ fn command_can_use_resident_mutation(
             && applied.len() <= MAX_BLOCK_EDIT_COMMAND_EDITS;
     }
     let SimulationCommand::ApplyBlockEdits {
+        actor_session,
         edits,
         preconditions,
         scheduled_block_ticks,
@@ -959,6 +985,13 @@ fn command_can_use_resident_mutation(
     else {
         return false;
     };
+    // A server-owned batch has no writer session, so it never runs the writer's
+    // `finalize_visible_block_edit_outcome` pass that clears the cooking state
+    // of a campfire it replaced. Keep every such batch on the canonical staged
+    // path, which owns that eviction, instead of a session fast lane.
+    if actor_session.is_none() {
+        return false;
+    }
     let Some(world_read) = world_read else {
         return false;
     };
@@ -1153,6 +1186,20 @@ fn snapshot_region(
         })
         .collect::<Vec<_>>();
     world_read.snapshot_chunks(&chunks)
+}
+
+/// Reactivity scheduled near every applied edit: leaf distance ticks (the
+/// existing owner) plus the redstone components that must re-evaluate their
+/// neighbourhood on the next tick.
+fn schedule_reactivity_near_applied(
+    storage: &mut WorldStorage,
+    world_tick: u64,
+    applied: &[AppliedBlockEdit],
+) {
+    schedule_leaf_ticks_near_applied(storage, world_tick, applied);
+    super::scheduled_blocks::redstone::schedule_redstone_ticks_near_applied(
+        storage, world_tick, applied,
+    );
 }
 
 pub(super) fn resident_block_edit_outcome(
@@ -2280,6 +2327,38 @@ impl SimulationHandle {
             preconditions,
             scheduled_block_ticks,
         })?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::BlockEdits(Ok(outcome)))) => Ok(*outcome),
+            Ok(Ok(SimulationResponse::BlockEdits(Err(error)))) => Err(error),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
+
+    /// Commit one server-owned block-edit batch (settlement structure
+    /// placement) through the authoritative simulation pipeline.
+    ///
+    /// The whole batch is submitted as exactly one
+    /// [`SimulationCommand::ApplyBlockEdits`] with no actor session, no
+    /// preconditions and no scheduled ticks, so a portion is never split by
+    /// region: multi-region batches stay one staged commit and one publication.
+    pub(crate) async fn apply_server_owned_block_edits(
+        &self,
+        edits: Vec<BlockEdit>,
+    ) -> Result<Option<BlockEditBatchOutcome>, SimulationRequestError> {
+        if self.session_fence.is_some() {
+            return Err(SimulationRequestError::InvalidCommand);
+        }
+        let receiver = self.enqueue_with_fence(
+            None,
+            SimulationCommand::ApplyBlockEdits {
+                actor_session: None,
+                edits,
+                preconditions: Vec::new(),
+                scheduled_block_ticks: Vec::new(),
+            },
+        )?;
         match receiver.await {
             Ok(Ok(SimulationResponse::BlockEdits(Ok(outcome)))) => Ok(*outcome),
             Ok(Ok(SimulationResponse::BlockEdits(Err(error)))) => Err(error),
@@ -5786,12 +5865,18 @@ impl SimulationOwner {
                                 scheduled_block_ticks,
                             )
                         };
+                        clear_server_owned_campfire_cooking(
+                            sessions,
+                            storage.as_deref(),
+                            *actor_session,
+                            outcome.as_ref(),
+                        );
                         if let Some(outcome) = outcome.as_mut() {
                             if !regional {
                                 let storage = storage
                                     .as_deref_mut()
                                     .expect("coordinator block edit storage");
-                                schedule_leaf_ticks_near_applied(
+                                schedule_reactivity_near_applied(
                                     storage,
                                     sessions.simulation_tick(),
                                     &outcome.applied,
@@ -5985,7 +6070,7 @@ impl SimulationOwner {
                                                         .push(edit.pos);
                                                 }
                                             }
-                                            schedule_leaf_ticks_near_applied(
+                                            schedule_reactivity_near_applied(
                                                 storage,
                                                 sessions.simulation_tick(),
                                                 &committed.block.applied,
@@ -6079,7 +6164,7 @@ impl SimulationOwner {
                             )
                             .map(|committed| {
                                 committed.map(|mut committed| {
-                                    schedule_leaf_ticks_near_applied(
+                                    schedule_reactivity_near_applied(
                                         storage,
                                         sessions.simulation_tick(),
                                         &committed.block.applied,
@@ -6169,7 +6254,7 @@ impl SimulationOwner {
                             )
                             .map(|committed| {
                                 committed.map(|mut committed| {
-                                    schedule_leaf_ticks_near_applied(
+                                    schedule_reactivity_near_applied(
                                         storage,
                                         sessions.simulation_tick(),
                                         &committed.block.applied,
@@ -7934,6 +8019,46 @@ mod tests {
             SimulationResponse::BlockEdits(Ok(outcome)) if outcome.is_none()
         ));
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
+    }
+
+    /// A server-owned batch carries no writer session, so it must never take an
+    /// accelerated lane: those lanes publish through the writer's visible-edit
+    /// finalize, which is the only place a writer's replaced campfire loses its
+    /// cooking state. The routing predicate in `command_can_use_resident_mutation`
+    /// is what keeps that invariant, so assert it directly.
+    #[test]
+    fn server_owned_block_edits_never_take_a_session_fast_lane() {
+        let (storage, position, _token) = test_block_storage();
+        let read_view = storage.read_view();
+        let edit = BlockEdit {
+            pos: position,
+            new_state: BlockStateId(0),
+        };
+        let session_batch = SimulationCommand::ApplyBlockEdits {
+            actor_session: Some(0),
+            edits: vec![edit],
+            preconditions: Vec::new(),
+            scheduled_block_ticks: Vec::new(),
+        };
+        let server_owned_batch = SimulationCommand::ApplyBlockEdits {
+            actor_session: None,
+            edits: vec![edit],
+            preconditions: Vec::new(),
+            scheduled_block_ticks: Vec::new(),
+        };
+
+        assert!(
+            command_can_use_resident_mutation(&session_batch, Some(&read_view), None, false),
+            "a cached single-region session batch still qualifies for the fast lane"
+        );
+        assert!(
+            !command_can_use_resident_mutation(&server_owned_batch, Some(&read_view), None, false),
+            "a server-owned batch must take the staged path that evicts its cooking state"
+        );
+        assert!(
+            !command_can_use_regional_mutation(&server_owned_batch, Some(&read_view), None),
+            "the regional lane delegates to the same eligibility, so it is closed too"
+        );
     }
 
     #[tokio::test]

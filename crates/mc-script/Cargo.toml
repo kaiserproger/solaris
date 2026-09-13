@@ -16,7 +16,6 @@ default = []
 lua-runtime = [
     "dep:luaur",
     "dep:mlua",
-    "dep:sha2",
     "dep:tempfile",
     "dep:toml",
     "dep:tracing",
@@ -27,8 +26,13 @@ lua-runtime = [
 luaur = { git = "https://github.com/kaiserproger/luaur.git", rev = "ea648bd95d4948b47dd66e5df62074b5b7ef2ec7", optional = true }
 mlua = { workspace = true, optional = true, features = ["serialize"] }
 serde = { workspace = true }
-sha2 = { workspace = true, optional = true }
+# Deterministic resident generation ids and opaque handles are core contract
+# derivations, not Lua-runtime-only behavior.
+sha2 = { workspace = true }
 tempfile = { version = "3", optional = true }
 tokio = { workspace = true }
 toml = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

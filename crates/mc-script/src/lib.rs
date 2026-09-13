@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "lua-runtime"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,13 +18,19 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
 
-mod loader_interaction;
-pub use loader_interaction::ScriptLoaderInteractionPhase;
-
-mod client_ui;
-pub use client_ui::{
-    MAX_CLIENT_UI_BODY_BYTES, MAX_CLIENT_UI_TITLE_BYTES, ScriptClientUiMode,
-    ScriptClientUiPresentation,
+mod client_view;
+pub use client_view::{
+    MAX_CLIENT_VIEW_ACTIONS, MAX_CLIENT_VIEW_CELL_BYTES, MAX_CLIENT_VIEW_DENY_REASON_BYTES,
+    MAX_CLIENT_VIEW_EXACT_INTEGER, MAX_CLIENT_VIEW_FIELDS, MAX_CLIENT_VIEW_ID_BYTES,
+    MAX_CLIENT_VIEW_MARKER_RADIUS, MAX_CLIENT_VIEW_MARKERS, MAX_CLIENT_VIEW_PACKET_BYTES,
+    MAX_CLIENT_VIEW_RANGE_LIMIT, MAX_CLIENT_VIEW_REASON_BYTES, MAX_CLIENT_VIEW_RESOURCES,
+    MAX_CLIENT_VIEW_ROWS, MAX_CLIENT_VIEW_SELECTION_TTL_TICKS, MAX_CLIENT_VIEW_TABS,
+    MAX_CLIENT_VIEW_TEXT_BYTES, MAX_CLIENT_VIEW_TITLE_BYTES, ScriptClientSelectionBegin,
+    ScriptClientSelectionConstraints, ScriptClientViewAction, ScriptClientViewField,
+    ScriptClientViewFieldValue, ScriptClientViewFormation, ScriptClientViewMarker,
+    ScriptClientViewModel, ScriptClientViewOpen, ScriptClientViewPresent,
+    ScriptClientViewRequestKind, ScriptClientViewResourceEntry, ScriptClientViewRow,
+    ScriptClientViewScreenKind, ScriptClientViewTab,
 };
 
 mod client_sound;
@@ -37,10 +44,11 @@ pub use commit_events::{
 
 mod inventory_operations;
 pub use inventory_operations::{
-    MAX_INVENTORY_RESOURCE_TYPES, MAX_INVENTORY_WORK_PORTIONS, MAX_OWNED_INVENTORY_SLOTS,
-    MAX_OWNED_INVENTORY_TRANSFERS, ScriptInventoryEnchantment, ScriptInventoryEndpoint,
-    ScriptInventoryExpectedRevision, ScriptInventoryFence, ScriptInventoryItem,
-    ScriptInventoryMaterial, ScriptInventoryReservationQuantity,
+    MAX_INVENTORY_RESOURCE_TYPES, MAX_INVENTORY_WORK_PORTIONS, MAX_OWNED_INVENTORY_ITEM_BUDGET,
+    MAX_OWNED_INVENTORY_SLOTS, MAX_OWNED_INVENTORY_TRANSFERS, MAX_RESIDENT_CARRY_SLOTS,
+    MAX_RESIDENT_EQUIPMENT_SLOTS, MAX_WAREHOUSE_HANDLE_BYTES, ScriptInventoryEnchantment,
+    ScriptInventoryEndpoint, ScriptInventoryExpectedRevision, ScriptInventoryFence,
+    ScriptInventoryItem, ScriptInventoryMaterial, ScriptInventoryReservationQuantity,
     ScriptInventoryReservationSnapshot, ScriptInventoryResourcePlan, ScriptInventorySlot,
     ScriptInventoryWorkPortion, ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult,
     ScriptOwnedInventorySnapshot, ScriptOwnedItemTransfer,
@@ -52,6 +60,51 @@ pub use operations::{
     ScriptOperationPayload, ScriptOperationRequest, ScriptOperationState, ScriptStorageChange,
     ScriptStorageEntry,
 };
+
+mod resident_operations;
+pub use resident_operations::{
+    MAX_RESIDENT_CARRIED_ITEMS, MAX_RESIDENT_CLAIM_DISTANCE, MAX_RESIDENT_ENTITY_UUID_BYTES,
+    MAX_RESIDENT_GENERATION_ID_BYTES, MAX_RESIDENT_HANDLE_BYTES, MAX_RESIDENT_LIVE_PER_PLUGIN,
+    MAX_RESIDENT_PAGE, MAX_RESIDENT_POI_HANDLE_BYTES, MAX_RESIDENT_QUERY_HANDLES,
+    MAX_RESIDENT_RECORDS_PER_PLUGIN, MAX_RESIDENT_SPAWN_TOKEN_BYTES, ScriptResidentItemSummary,
+    ScriptResidentKind, ScriptResidentLifecycle, ScriptResidentLoadedState,
+    ScriptResidentOperation, ScriptResidentPois, ScriptResidentProfile, ScriptResidentResult,
+    ScriptResidentSnapshot, resident_entity_uuid, resident_generation_id,
+    resident_handle_for_entity, resident_handle_for_generation, resident_spawn_site_token,
+    validate_entity_uuid, validate_generation_id, validate_resident_handle, validate_resident_poi,
+    validate_spawn_site_token,
+};
+
+mod resident_order_operations;
+pub use resident_order_operations::{
+    MAX_COMBAT_EVENTS, MAX_ENGAGEMENT_RADIUS, MAX_FORMATION_SPACING, MAX_ORDER_AFFILIATIONS,
+    MAX_ORDER_TARGETS, MAX_ORDER_WAYPOINTS, MAX_RECIPE_ID_BYTES, MAX_RESIDENT_ORDER_HANDLES,
+    MAX_RESIDENT_SQUAD_MEMBERS, MAX_SCRIPT_BLOCK_COORDINATE, MAX_TARGET_REF_BYTES,
+    MAX_WORK_AREA_AXIS, MAX_WORK_UNITS, MIN_ENGAGEMENT_RADIUS, MIN_FORMATION_SPACING,
+    MIN_ORDER_WAYPOINTS, ScriptBlockPosition, ScriptCombatEvent, ScriptDemobilizeResult,
+    ScriptDemobilizeState, ScriptEngagementPolicy, ScriptFormation, ScriptFormationKind,
+    ScriptHostileCategory, ScriptItemChange, ScriptOrderMemberOutcome, ScriptOrderMemberState,
+    ScriptOrderTarget, ScriptOrderTargetRef, ScriptResidentOrder, ScriptResidentOrderOperation,
+    ScriptResidentOrderResult, ScriptResidentWorkOrder, ScriptWorkArea, ScriptWorkAssignment,
+    ScriptWorkPauseReason, ScriptWorkState, validate_recipe, validate_work_area_axis,
+    validate_work_units,
+};
+
+mod settlement_operations;
+pub use settlement_operations::{
+    MAX_BLUEPRINT_FOOTPRINT_AXIS, MAX_BLUEPRINT_ID_BYTES, MAX_SETTLEMENT_PLACEMENTS,
+    MAX_SETTLEMENT_POIS, MAX_SETTLEMENT_RESIDENTS, MAX_SETTLEMENT_SITE_AXIS,
+    MAX_SETTLEMENT_SITE_PAGE, MAX_SITE_ID_BYTES, MAX_STRUCTURE_ACTIVE_PER_PLUGIN,
+    MAX_STRUCTURE_ID_BYTES, MAX_STRUCTURE_RESOURCE_TYPES, MAX_STRUCTURE_STAGES,
+    MAX_SURVEY_BOUNDS_AXIS, MAX_SURVEY_TAGS, MAX_SURVEY_TOKEN_BYTES, MAX_WORLD_COMMIT_PORTION,
+    ScriptChunkAvailability, ScriptResidentSiteReservation, ScriptSettlementBuilding,
+    ScriptSettlementOperation, ScriptSettlementPoi, ScriptSettlementResult, ScriptSettlementSite,
+    ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteVariant,
+    ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
+    ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose,
+    ScriptSurveySnapshot, ScriptWarehouseBinding, warehouse_handle,
+};
+
 #[cfg(feature = "lua-runtime")]
 mod lua;
 
@@ -62,6 +115,8 @@ mod entity_interaction_tests;
 #[cfg(test)]
 mod entity_kill_tests;
 #[cfg(test)]
+mod inventory_operations_tests;
+#[cfg(test)]
 mod item_pickup_tests;
 #[cfg(test)]
 mod player_death_tests;
@@ -71,6 +126,12 @@ mod player_inventory_tests;
 mod player_query_tests;
 #[cfg(test)]
 mod player_teleport_tests;
+#[cfg(test)]
+mod resident_operations_tests;
+#[cfg(test)]
+mod resident_order_operations_tests;
+#[cfg(test)]
+mod settlement_operations_tests;
 #[cfg(test)]
 mod tick_delivery_tests;
 
@@ -98,7 +159,6 @@ pub const MAX_SPAWN_ENTITY_TYPES: usize = 32;
 
 /// Maximum byte length of a script-visible namespaced resource identifier.
 pub const MAX_SCRIPT_RESOURCE_ID_BYTES: usize = 128;
-pub const MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES: usize = 4_096;
 /// Largest integer Luau can represent exactly in its number type.
 pub const MAX_SCRIPT_WORLD_TIME: u64 = (1_u64 << 53) - 1;
 /// Maximum raw damage accepted by one bounded plugin combat request.
@@ -144,12 +204,6 @@ pub const MAX_INVENTORY_RESOURCE_DELTA: i16 = 64;
 
 /// Maximum byte length of a server-rendered inventory menu title.
 pub const MAX_INVENTORY_MENU_TITLE_BYTES: usize = 128;
-
-/// Maximum search radius for an ephemeral villager binding request.
-pub const MAX_VILLAGER_BINDING_RADIUS: f64 = 64.0;
-
-/// Maximum movement speed exposed through a bound-villager goal request.
-pub const MAX_VILLAGER_GOAL_SPEED: f64 = 4.0;
 
 /// Maximum absolute horizontal coordinate accepted from Lua.
 pub const SCRIPT_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
@@ -1525,239 +1579,6 @@ impl ScriptPlayerInventoryFailure {
     }
 }
 
-/// Bounded request for the server to bind one nearby villager.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptVillagerBindingRequest {
-    request_id: String,
-    center: ScriptPosition,
-    radius_bits: u64,
-}
-
-impl ScriptVillagerBindingRequest {
-    pub fn try_new(
-        request_id: impl AsRef<str>,
-        center: ScriptPosition,
-        radius: f64,
-    ) -> Result<Self, ScriptDtoError> {
-        if !radius.is_finite() || radius <= 0.0 || radius > MAX_VILLAGER_BINDING_RADIUS {
-            return Err(ScriptDtoError::InvalidBounds);
-        }
-        Ok(Self {
-            request_id: validate_script_id(request_id.as_ref())?,
-            center,
-            radius_bits: radius.to_bits(),
-        })
-    }
-
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    pub const fn center(&self) -> ScriptPosition {
-        self.center
-    }
-
-    pub fn radius(&self) -> f64 {
-        f64::from_bits(self.radius_bits)
-    }
-}
-
-/// Ephemeral server-issued villager binding token. It is not an entity handle or pointer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptVillagerBinding {
-    token: String,
-    expires_at_tick: u64,
-}
-
-impl ScriptVillagerBinding {
-    pub fn try_new(token: impl AsRef<str>, expires_at_tick: u64) -> Result<Self, ScriptDtoError> {
-        Ok(Self {
-            token: validate_script_id(token.as_ref())?,
-            expires_at_tick,
-        })
-    }
-
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
-    pub const fn expires_at_tick(&self) -> u64 {
-        self.expires_at_tick
-    }
-}
-
-/// Exact engine goal requested for an opaque bound villager.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ScriptVillagerGoal {
-    Idle,
-    FollowPosition {
-        target: ScriptPosition,
-        speed_bits: u64,
-    },
-}
-
-impl ScriptVillagerGoal {
-    pub const fn idle() -> Self {
-        Self::Idle
-    }
-
-    pub fn follow_position(target: ScriptPosition, speed: f64) -> Result<Self, ScriptDtoError> {
-        if !speed.is_finite() || speed <= 0.0 || speed > MAX_VILLAGER_GOAL_SPEED {
-            return Err(ScriptDtoError::InvalidBounds);
-        }
-        Ok(Self::FollowPosition {
-            target,
-            speed_bits: speed.to_bits(),
-        })
-    }
-
-    pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::FollowPosition { .. } => "follow_position",
-        }
-    }
-
-    pub const fn target(&self) -> Option<ScriptPosition> {
-        match self {
-            Self::Idle => None,
-            Self::FollowPosition { target, .. } => Some(*target),
-        }
-    }
-
-    pub fn speed(&self) -> Option<f64> {
-        match self {
-            Self::Idle => None,
-            Self::FollowPosition { speed_bits, .. } => Some(f64::from_bits(*speed_bits)),
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), ScriptDtoError> {
-        match self {
-            Self::Idle => Ok(()),
-            Self::FollowPosition { target, speed_bits } => {
-                let speed = f64::from_bits(*speed_bits);
-                ScriptPosition::try_new(target.x(), target.y(), target.z())
-                    .ok_or(ScriptDtoError::InvalidBounds)?;
-                if !speed.is_finite() || speed <= 0.0 || speed > MAX_VILLAGER_GOAL_SPEED {
-                    return Err(ScriptDtoError::InvalidBounds);
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Bounded request to apply one engine goal through a server-issued villager binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptVillagerGoalRequest {
-    request_id: String,
-    binding_token: String,
-    goal: ScriptVillagerGoal,
-}
-
-impl ScriptVillagerGoalRequest {
-    pub fn try_new(
-        request_id: impl AsRef<str>,
-        binding_token: impl AsRef<str>,
-        goal: ScriptVillagerGoal,
-    ) -> Result<Self, ScriptDtoError> {
-        Ok(Self {
-            request_id: validate_script_id(request_id.as_ref())?,
-            binding_token: validate_script_id(binding_token.as_ref())?,
-            goal,
-        })
-    }
-
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    pub fn binding_token(&self) -> &str {
-        &self.binding_token
-    }
-
-    pub const fn goal(&self) -> &ScriptVillagerGoal {
-        &self.goal
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ScriptVillagerBindingFailure {
-    NotFound,
-    Busy,
-}
-
-impl ScriptVillagerBindingFailure {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotFound => "not_found",
-            Self::Busy => "busy",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ScriptVillagerGoalFailure {
-    BindingUnavailable,
-    Busy,
-}
-
-impl ScriptVillagerGoalFailure {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::BindingUnavailable => "binding_unavailable",
-            Self::Busy => "busy",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ScriptVillagerReleaseRequest {
-    request_id: String,
-    binding_token: String,
-}
-
-impl ScriptVillagerReleaseRequest {
-    pub fn try_new(
-        request_id: impl AsRef<str>,
-        binding_token: impl AsRef<str>,
-    ) -> Result<Self, ScriptDtoError> {
-        Ok(Self {
-            request_id: validate_script_id(request_id.as_ref())?,
-            binding_token: validate_script_id(binding_token.as_ref())?,
-        })
-    }
-
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    pub fn binding_token(&self) -> &str {
-        &self.binding_token
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ScriptVillagerReleaseFailure {
-    BindingUnavailable,
-    Busy,
-}
-
-impl ScriptVillagerReleaseFailure {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::BindingUnavailable => "binding_unavailable",
-            Self::Busy => "busy",
-        }
-    }
-}
-
 /// Server-normalized inventory click kind. Plugins never receive slot stacks or packet state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2562,89 +2383,101 @@ impl ScriptEvent {
         })
     }
 
-    /// Build a targeted ephemeral villager-binding result without exposing an entity reference.
-    pub(crate) fn villager_binding_result(
-        target_plugin_id: impl AsRef<str>,
-        request: &ScriptVillagerBindingRequest,
-        binding: Option<ScriptVillagerBinding>,
-        failure: Option<ScriptVillagerBindingFailure>,
-    ) -> Result<Self, ScriptDtoError> {
-        if binding.is_some() == failure.is_some() {
-            return Err(ScriptDtoError::InvalidBounds);
-        }
-        Ok(Self {
-            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
-            kind: ScriptEventKind::VillagerBindingResult {
-                request_id: request.request_id().to_owned(),
-                binding,
-                failure,
-            },
-        })
-    }
-
-    /// Build a targeted result for one admitted bound-villager goal.
-    pub(crate) fn villager_goal_result(
-        target_plugin_id: impl AsRef<str>,
-        request: &ScriptVillagerGoalRequest,
-        failure: Option<ScriptVillagerGoalFailure>,
-    ) -> Result<Self, ScriptDtoError> {
-        Ok(Self {
-            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
-            kind: ScriptEventKind::VillagerGoalResult {
-                request_id: request.request_id().to_owned(),
-                goal: request.goal().clone(),
-                failure,
-            },
-        })
-    }
-
-    /// Build a targeted result for one admitted bound-villager release.
-    pub(crate) fn villager_release_result(
-        target_plugin_id: impl AsRef<str>,
-        request: &ScriptVillagerReleaseRequest,
-        failure: Option<ScriptVillagerReleaseFailure>,
-    ) -> Result<Self, ScriptDtoError> {
-        Ok(Self {
-            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
-            kind: ScriptEventKind::VillagerReleaseResult {
-                request_id: request.request_id().to_owned(),
-                failure,
-            },
-        })
-    }
-
-    /// Build one client-originated Loader interaction targeted to its bundle owner.
-    pub fn loader_interaction(
+    /// Build one explicit key-driven view request event targeted to the owner.
+    pub fn loader_view_request(
         target_plugin_id: impl AsRef<str>,
         player_id: ScriptPlayerId,
-        interaction_id: impl AsRef<str>,
-        phase: ScriptLoaderInteractionPhase,
-        payload: impl AsRef<str>,
+        request_kind: ScriptClientViewRequestKind,
     ) -> Result<Self, ScriptDtoError> {
-        let target_plugin_id = validate_target_plugin_id(target_plugin_id.as_ref())?;
-        let interaction_id = validate_contract_resource_id(interaction_id.as_ref())?;
-        if !interaction_id
-            .strip_prefix(&target_plugin_id)
-            .is_some_and(|suffix| suffix.starts_with(':') && suffix.len() > 1)
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::LoaderViewRequest {
+                player_id,
+                request_kind,
+            },
+        })
+    }
+
+    /// Build one admitted client view action snapshot targeted to the owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn loader_view_action(
+        target_plugin_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        view_instance_id: impl AsRef<str>,
+        view_revision: u64,
+        action_id: impl AsRef<str>,
+        action_sequence: u64,
+        fields: Vec<ScriptClientViewField>,
+        selection_token: Option<String>,
+    ) -> Result<Self, ScriptDtoError> {
+        let view_instance_id = validate_contract_resource_id(view_instance_id.as_ref())?;
+        let action_id = validate_contract_resource_id(action_id.as_ref())?;
+        if view_revision > MAX_CLIENT_VIEW_EXACT_INTEGER
+            || action_sequence > MAX_CLIENT_VIEW_EXACT_INTEGER
         {
-            return Err(ScriptDtoError::InvalidResourceId {
-                field: "Loader interaction id",
-                actual_bytes: interaction_id.len(),
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        if fields.len() > MAX_CLIENT_VIEW_FIELDS {
+            return Err(ScriptDtoError::TooManyEntries {
+                field: "view action fields",
+                max: MAX_CLIENT_VIEW_FIELDS,
             });
         }
-        let payload = payload.as_ref();
-        validate_bounded_value(
-            "Loader interaction payload",
-            payload,
-            MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES,
-        )?;
+        if let Some(token) = selection_token.as_deref() {
+            validate_bounded_nonempty("view selection token", token, MAX_CLIENT_VIEW_ID_BYTES)?;
+        }
         Ok(Self {
-            target_plugin_id: Some(target_plugin_id),
-            kind: ScriptEventKind::LoaderInteraction {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::LoaderViewAction {
                 player_id,
-                interaction_id: interaction_id.to_owned(),
-                phase,
-                payload: payload.to_owned(),
+                view_instance_id,
+                view_revision,
+                action_id,
+                action_sequence,
+                fields,
+                selection_token,
+            },
+        })
+    }
+
+    /// Build the outcome of one `open_client_view` request for the caller.
+    pub fn client_view_opened(
+        target_plugin_id: impl AsRef<str>,
+        request_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        view_instance_id: Option<String>,
+        revision: Option<u64>,
+        failure: Option<ScriptClientViewFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::ClientViewOpened {
+                request_id: validate_script_id(request_id.as_ref())?,
+                player_id,
+                view_instance_id,
+                revision,
+                failure,
+            },
+        })
+    }
+
+    /// Build the outcome of one `begin_client_selection` request for the caller.
+    pub fn client_selection_started(
+        target_plugin_id: impl AsRef<str>,
+        request_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        selection_context_id: Option<String>,
+        expires_at_tick: Option<u64>,
+        failure: Option<ScriptClientViewFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::ClientSelectionStarted {
+                request_id: validate_script_id(request_id.as_ref())?,
+                player_id,
+                selection_context_id,
+                expires_at_tick,
+                failure,
             },
         })
     }
@@ -2743,10 +2576,10 @@ impl ScriptEvent {
             ScriptEventKind::EntitySpawnResult { .. } => "entity.spawn_result",
             ScriptEventKind::EntityDamageResult { .. } => "entity.damage_result",
             ScriptEventKind::OnlinePlayersResult { .. } => "player.online_result",
-            ScriptEventKind::VillagerBindingResult { .. } => "villager.binding_result",
-            ScriptEventKind::VillagerGoalResult { .. } => "villager.goal_result",
-            ScriptEventKind::VillagerReleaseResult { .. } => "villager.release_result",
-            ScriptEventKind::LoaderInteraction { .. } => "loader.interaction",
+            ScriptEventKind::LoaderViewRequest { .. } => "loader.view_request",
+            ScriptEventKind::LoaderViewAction { .. } => "loader.view_action",
+            ScriptEventKind::ClientViewOpened { .. } => "loader.view_opened",
+            ScriptEventKind::ClientSelectionStarted { .. } => "loader.selection_started",
             ScriptEventKind::ClientBrand { .. } => "player.client_brand",
             ScriptEventKind::CustomPayload { .. } => "player.custom_payload",
         }
@@ -3064,40 +2897,89 @@ impl ScriptEvent {
                 }
                 Ok(())
             }
-            ScriptEventKind::VillagerBindingResult {
-                request_id,
-                binding,
-                failure,
+            ScriptEventKind::LoaderViewRequest { .. } => Ok(()),
+            ScriptEventKind::LoaderViewAction {
+                view_instance_id,
+                view_revision,
+                action_id,
+                action_sequence,
+                fields,
+                selection_token,
+                ..
             } => {
-                validate_script_id(request_id)?;
-                if binding.is_some() == failure.is_some() {
+                validate_contract_resource_id(view_instance_id)?;
+                validate_contract_resource_id(action_id)?;
+                if *view_revision > MAX_CLIENT_VIEW_EXACT_INTEGER
+                    || *action_sequence > MAX_CLIENT_VIEW_EXACT_INTEGER
+                {
                     return Err(ScriptDtoError::InvalidBounds);
                 }
-                if let Some(binding) = binding {
-                    validate_script_id(binding.token())?;
+                if fields.len() > MAX_CLIENT_VIEW_FIELDS {
+                    return Err(ScriptDtoError::TooManyEntries {
+                        field: "view action fields",
+                        max: MAX_CLIENT_VIEW_FIELDS,
+                    });
+                }
+                let mut ids = std::collections::BTreeSet::new();
+                for field in fields {
+                    if !ids.insert(field.id()) {
+                        return Err(ScriptDtoError::DuplicateId {
+                            field: "view action field",
+                            actual_bytes: field.id().len(),
+                        });
+                    }
+                }
+                if let Some(token) = selection_token.as_deref() {
+                    validate_bounded_nonempty(
+                        "view selection token",
+                        token,
+                        MAX_CLIENT_VIEW_ID_BYTES,
+                    )?;
                 }
                 Ok(())
             }
-            ScriptEventKind::VillagerGoalResult {
-                request_id, goal, ..
-            } => {
-                validate_script_id(request_id)?;
-                goal.validate()
-            }
-            ScriptEventKind::VillagerReleaseResult { request_id, .. } => {
-                validate_script_id(request_id).map(drop)
-            }
-            ScriptEventKind::LoaderInteraction {
-                interaction_id,
-                payload,
+            ScriptEventKind::ClientViewOpened {
+                request_id,
+                view_instance_id,
+                revision,
+                failure,
                 ..
             } => {
-                validate_contract_resource_id(interaction_id)?;
-                validate_bounded_value(
-                    "Loader interaction payload",
-                    payload,
-                    MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES,
-                )
+                validate_script_id(request_id)?;
+                if view_instance_id.is_some() != failure.is_none()
+                    || revision.is_some() != view_instance_id.is_some()
+                    || revision.is_some_and(|revision| {
+                        revision == 0 || revision > MAX_CLIENT_VIEW_EXACT_INTEGER
+                    })
+                {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "client view opened result",
+                    });
+                }
+                if let Some(id) = view_instance_id.as_deref() {
+                    validate_contract_resource_id(id)?;
+                }
+                Ok(())
+            }
+            ScriptEventKind::ClientSelectionStarted {
+                request_id,
+                selection_context_id,
+                expires_at_tick,
+                failure,
+                ..
+            } => {
+                validate_script_id(request_id)?;
+                if selection_context_id.is_some() != expires_at_tick.is_some()
+                    || selection_context_id.is_some() != failure.is_none()
+                {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "client selection started result",
+                    });
+                }
+                if let Some(id) = selection_context_id.as_deref() {
+                    validate_contract_resource_id(id)?;
+                }
+                Ok(())
             }
             ScriptEventKind::ClientBrand { brand, .. } => {
                 validate_bounded_value("client brand", brand, MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES)
@@ -3115,6 +2997,35 @@ impl ScriptEvent {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+/// Why a view lifecycle request was refused before it reached the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptClientViewFailure {
+    /// The owner does not own the requested view or lacks the permission pair.
+    Refused,
+    /// The target player has no live Loader session.
+    PlayerUnavailable,
+    /// The referenced instance is not open (or already retired).
+    UnknownInstance,
+    /// The caller's expected revision no longer matches the live instance.
+    StaleRevision,
+    /// The model exceeded a hard bound.
+    TooLarge,
+}
+
+impl ScriptClientViewFailure {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::PlayerUnavailable => "player_unavailable",
+            Self::UnknownInstance => "unknown_instance",
+            Self::StaleRevision => "stale_revision",
+            Self::TooLarge => "too_large",
         }
     }
 }
@@ -3327,25 +3238,36 @@ pub enum ScriptEventKind {
         players: Vec<ScriptOnlinePlayerSnapshot>,
         truncated: bool,
     },
-    VillagerBindingResult {
-        request_id: String,
-        binding: Option<ScriptVillagerBinding>,
-        failure: Option<ScriptVillagerBindingFailure>,
-    },
-    VillagerGoalResult {
-        request_id: String,
-        goal: ScriptVillagerGoal,
-        failure: Option<ScriptVillagerGoalFailure>,
-    },
-    VillagerReleaseResult {
-        request_id: String,
-        failure: Option<ScriptVillagerReleaseFailure>,
-    },
-    LoaderInteraction {
+    /// One explicit key-driven view request admitted for the owning plugin.
+    LoaderViewRequest {
         player_id: ScriptPlayerId,
-        interaction_id: String,
-        phase: ScriptLoaderInteractionPhase,
-        payload: String,
+        request_kind: ScriptClientViewRequestKind,
+    },
+    /// One admitted client view action after the server re-read the instance.
+    LoaderViewAction {
+        player_id: ScriptPlayerId,
+        view_instance_id: String,
+        view_revision: u64,
+        action_id: String,
+        action_sequence: u64,
+        fields: Vec<ScriptClientViewField>,
+        selection_token: Option<String>,
+    },
+    /// Outcome of one `open_client_view` request.
+    ClientViewOpened {
+        request_id: String,
+        player_id: ScriptPlayerId,
+        view_instance_id: Option<String>,
+        revision: Option<u64>,
+        failure: Option<ScriptClientViewFailure>,
+    },
+    /// Outcome of one `begin_client_selection` request.
+    ClientSelectionStarted {
+        request_id: String,
+        player_id: ScriptPlayerId,
+        selection_context_id: Option<String>,
+        expires_at_tick: Option<u64>,
+        failure: Option<ScriptClientViewFailure>,
     },
     ClientBrand {
         player_id: ScriptPlayerId,
@@ -3405,9 +3327,27 @@ pub enum ScriptCommand {
         player_id: ScriptPlayerId,
         menu: ScriptInventoryMenu,
     },
-    PresentClientUi {
+    OpenClientView {
+        request: ScriptClientViewOpen,
+    },
+    PresentClientView {
+        request: ScriptClientViewPresent,
+    },
+    CloseClientView {
         player_id: ScriptPlayerId,
-        presentation: ScriptClientUiPresentation,
+        view_instance_id: String,
+    },
+    BeginClientSelection {
+        request_id: String,
+        player_id: ScriptPlayerId,
+        view_instance_id: String,
+        view_revision: u64,
+        action_id: String,
+        constraints: ScriptClientSelectionConstraints,
+    },
+    CancelClientSelection {
+        player_id: ScriptPlayerId,
+        selection_context_id: String,
     },
     ClientSound {
         player_id: ScriptPlayerId,
@@ -3434,15 +3374,6 @@ pub enum ScriptCommand {
     },
     RemoveZone {
         zone_id: String,
-    },
-    RequestVillagerBinding {
-        request: ScriptVillagerBindingRequest,
-    },
-    SetVillagerGoal {
-        request: ScriptVillagerGoalRequest,
-    },
-    ReleaseVillagerBinding {
-        request: ScriptVillagerReleaseRequest,
     },
     TeleportPlayer {
         request: ScriptPlayerTeleportRequest,
@@ -3690,33 +3621,114 @@ impl AdmittedScriptCommand {
         ))
     }
 
-    pub fn into_present_client_ui(
+    pub fn into_open_client_view(
         self,
-    ) -> Result<
-        (
-            ScriptPluginTarget,
-            ScriptPlayerId,
-            ScriptClientUiPresentation,
-        ),
-        ScriptDtoError,
-    > {
+    ) -> Result<(ScriptPluginTarget, ScriptClientViewOpen), ScriptDtoError> {
         let request =
             Arc::try_unwrap(self.request).unwrap_or_else(|request| request.as_ref().clone());
-        let ScriptCommand::PresentClientUi {
-            player_id,
-            presentation,
-        } = request
-        else {
+        let ScriptCommand::OpenClientView { request } = request else {
             return Err(ScriptDtoError::InconsistentResult {
-                field: "client UI admission",
+                field: "client view open admission",
             });
         };
         Ok((
             ScriptPluginTarget {
                 plugin_id: self.plugin_id,
             },
+            request,
+        ))
+    }
+
+    pub fn into_present_client_view(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptClientViewPresent), ScriptDtoError> {
+        let request =
+            Arc::try_unwrap(self.request).unwrap_or_else(|request| request.as_ref().clone());
+        let ScriptCommand::PresentClientView { request } = request else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "client view present admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            request,
+        ))
+    }
+
+    pub fn into_close_client_view(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptPlayerId, String), ScriptDtoError> {
+        let ScriptCommand::CloseClientView {
             player_id,
-            presentation,
+            view_instance_id,
+        } = self.request.as_ref()
+        else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "client view close admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            *player_id,
+            view_instance_id.clone(),
+        ))
+    }
+
+    pub fn into_begin_client_selection(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptClientSelectionBegin), ScriptDtoError> {
+        let request =
+            Arc::try_unwrap(self.request).unwrap_or_else(|request| request.as_ref().clone());
+        let ScriptCommand::BeginClientSelection {
+            request_id,
+            player_id,
+            view_instance_id,
+            view_revision,
+            action_id,
+            constraints,
+        } = request
+        else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "client selection begin admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            ScriptClientSelectionBegin::try_new(
+                &request_id,
+                player_id,
+                &view_instance_id,
+                view_revision,
+                &action_id,
+                constraints,
+            )?,
+        ))
+    }
+
+    pub fn into_cancel_client_selection(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptPlayerId, String), ScriptDtoError> {
+        let ScriptCommand::CancelClientSelection {
+            player_id,
+            selection_context_id,
+        } = self.request.as_ref()
+        else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "client selection cancel admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            *player_id,
+            selection_context_id.clone(),
         ))
     }
 
@@ -3883,43 +3895,6 @@ impl AdmittedScriptCommand {
             });
         };
         ScriptEvent::player_inventory_transaction_result(&self.plugin_id, transaction, failure)
-    }
-
-    pub fn villager_binding_result(
-        self,
-        binding: Option<ScriptVillagerBinding>,
-        failure: Option<ScriptVillagerBindingFailure>,
-    ) -> Result<ScriptEvent, ScriptDtoError> {
-        let ScriptCommand::RequestVillagerBinding { request } = self.request.as_ref() else {
-            return Err(ScriptDtoError::InconsistentResult {
-                field: "villager binding admission",
-            });
-        };
-        ScriptEvent::villager_binding_result(&self.plugin_id, request, binding, failure)
-    }
-
-    pub fn villager_goal_result(
-        self,
-        failure: Option<ScriptVillagerGoalFailure>,
-    ) -> Result<ScriptEvent, ScriptDtoError> {
-        let ScriptCommand::SetVillagerGoal { request } = self.request.as_ref() else {
-            return Err(ScriptDtoError::InconsistentResult {
-                field: "villager goal admission",
-            });
-        };
-        ScriptEvent::villager_goal_result(&self.plugin_id, request, failure)
-    }
-
-    pub fn villager_release_result(
-        self,
-        failure: Option<ScriptVillagerReleaseFailure>,
-    ) -> Result<ScriptEvent, ScriptDtoError> {
-        let ScriptCommand::ReleaseVillagerBinding { request } = self.request.as_ref() else {
-            return Err(ScriptDtoError::InconsistentResult {
-                field: "villager release admission",
-            });
-        };
-        ScriptEvent::villager_release_result(&self.plugin_id, request, failure)
     }
 
     pub fn player_teleport_result(
@@ -4138,7 +4113,11 @@ impl ScriptCommand {
             Self::SendChatMessage { .. }
             | Self::BroadcastChatMessage { .. }
             | Self::DisconnectPlayer { .. }
-            | Self::PresentClientUi { .. }
+            | Self::OpenClientView { .. }
+            | Self::PresentClientView { .. }
+            | Self::CloseClientView { .. }
+            | Self::BeginClientSelection { .. }
+            | Self::CancelClientSelection { .. }
             | Self::ClientSound { .. }
             | Self::PlaceLoaderBlock { .. }
             | Self::GrantLoaderBlockItem { .. } => None,
@@ -4149,7 +4128,39 @@ impl ScriptCommand {
             Self::PluginStorageGet { .. }
             | Self::PluginStorageCompareAndSwap { .. }
             | Self::PluginStorageDelete { .. } => Some(RequiredCommandCapability::PluginStorage),
-            Self::Operation { .. } => Some(RequiredCommandCapability::StorageBatches),
+            Self::Operation { request } => Some(match request.operation() {
+                ScriptOperation::Inventory { .. } => RequiredCommandCapability::InventoryTransfers,
+                ScriptOperation::Resident { .. } => RequiredCommandCapability::PersistentResidents,
+                ScriptOperation::ResidentOrder { operation } => match operation {
+                    ScriptResidentOrderOperation::AssignWork { .. }
+                    | ScriptResidentOrderOperation::CancelWork { .. } => {
+                        RequiredCommandCapability::ResidentWork
+                    }
+                    ScriptResidentOrderOperation::IssueOrder { .. }
+                    | ScriptResidentOrderOperation::CancelOrder { .. }
+                    | ScriptResidentOrderOperation::Demobilize { .. } => {
+                        RequiredCommandCapability::ResidentOrders
+                    }
+                },
+                ScriptOperation::Settlement { operation } => match operation {
+                    ScriptSettlementOperation::ListSites { .. }
+                    | ScriptSettlementOperation::QuerySite { .. }
+                    | ScriptSettlementOperation::ReserveResidentSite { .. }
+                    | ScriptSettlementOperation::ReleaseResidentSite { .. }
+                    | ScriptSettlementOperation::Survey { .. } => {
+                        RequiredCommandCapability::WorldSites
+                    }
+                    ScriptSettlementOperation::PrepareStructure { .. }
+                    | ScriptSettlementOperation::AdvanceStructure { .. }
+                    | ScriptSettlementOperation::PauseStructure { .. }
+                    | ScriptSettlementOperation::CancelStructure { .. }
+                    | ScriptSettlementOperation::Status { .. }
+                    | ScriptSettlementOperation::BindWarehouse { .. } => {
+                        RequiredCommandCapability::StructureOperations
+                    }
+                },
+                _ => RequiredCommandCapability::StorageBatches,
+            }),
             Self::OpenInventoryMenu { .. } | Self::CloseInventoryMenu { .. } => {
                 Some(RequiredCommandCapability::InventoryMenus)
             }
@@ -4162,9 +4173,6 @@ impl ScriptCommand {
             Self::UpsertZone { .. } | Self::RemoveZone { .. } => {
                 Some(RequiredCommandCapability::Zones)
             }
-            Self::RequestVillagerBinding { .. }
-            | Self::SetVillagerGoal { .. }
-            | Self::ReleaseVillagerBinding { .. } => Some(RequiredCommandCapability::Villagers),
             Self::TeleportPlayer { .. } => Some(RequiredCommandCapability::PlayerTeleport),
             Self::SetWorldTime { .. } => Some(RequiredCommandCapability::WorldTime),
             Self::SetWorldBlock { .. } => Some(RequiredCommandCapability::WorldBlocks),
@@ -4210,8 +4218,53 @@ impl ScriptCommand {
                 ScriptInventoryMenu::try_new(menu.id(), menu.title(), menu.slots().to_vec())
                     .map(drop)
             }
-            // The presentation has private fields and a checked constructor.
-            Self::PresentClientUi { .. } | Self::ClientSound { .. } => Ok(()),
+            // The view lifecycle DTOs have private fields and checked constructors.
+            Self::OpenClientView { request } => ScriptClientViewOpen::try_new(
+                request.request_id(),
+                request.player_id(),
+                request.owned_view_id(),
+                request.model().clone(),
+            )
+            .map(drop),
+            Self::PresentClientView { request } => ScriptClientViewPresent::try_new(
+                request.player_id(),
+                request.view_instance_id(),
+                request.expected_revision(),
+                request.model().clone(),
+            )
+            .map(drop),
+            Self::CloseClientView {
+                view_instance_id, ..
+            } => validate_contract_resource_id(view_instance_id).map(drop),
+            Self::BeginClientSelection {
+                request_id,
+                view_instance_id,
+                view_revision,
+                action_id,
+                constraints,
+                ..
+            } => {
+                validate_script_id(request_id)?;
+                validate_contract_resource_id(view_instance_id)?;
+                validate_contract_resource_id(action_id)?;
+                if *view_revision == 0 || *view_revision > MAX_CLIENT_VIEW_EXACT_INTEGER {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                ScriptClientSelectionConstraints::try_new(
+                    constraints.dimension(),
+                    constraints.range_limit(),
+                    constraints.ttl_ticks(),
+                    constraints.formation(),
+                    constraints.radius(),
+                )
+                .map(drop)
+            }
+            Self::CancelClientSelection {
+                selection_context_id,
+                ..
+            } => validate_contract_resource_id(selection_context_id).map(drop),
+            // The sound DTO has private fields and a checked constructor.
+            Self::ClientSound { .. } => Ok(()),
             Self::PlaceLoaderBlock { request } => ScriptLoaderBlockPlacementRequest::try_new(
                 request.request_id(),
                 request.block_id(),
@@ -4274,23 +4327,6 @@ impl ScriptCommand {
                 .map(drop)
             }
             Self::RemoveZone { zone_id } => validate_script_id(zone_id).map(drop),
-            Self::RequestVillagerBinding { request } => ScriptVillagerBindingRequest::try_new(
-                request.request_id(),
-                request.center(),
-                request.radius(),
-            )
-            .map(drop),
-            Self::SetVillagerGoal { request } => ScriptVillagerGoalRequest::try_new(
-                request.request_id(),
-                request.binding_token(),
-                request.goal().clone(),
-            )
-            .and_then(|request| request.goal().validate())
-            .map(drop),
-            Self::ReleaseVillagerBinding { request } => {
-                ScriptVillagerReleaseRequest::try_new(request.request_id(), request.binding_token())
-                    .map(drop)
-            }
             Self::TeleportPlayer { request } => ScriptPlayerTeleportRequest::try_new(
                 request.request_id(),
                 request.player_id(),
@@ -4401,6 +4437,55 @@ pub(crate) enum ScriptHostInput {
     LuaReload(lua::LuaReloadRequest),
 }
 
+/// One deployed package the script host discovered.
+///
+/// The host already parses each package manifest; this exposes the facts core
+/// needs to trigger authored-data subsystems (an authored catalog directory and
+/// the manifest's declared required features) without a second manifest reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaPluginPackage {
+    plugin_id: String,
+    package_dir: PathBuf,
+    required_features: Vec<String>,
+}
+
+impl LuaPluginPackage {
+    #[must_use]
+    pub fn new(
+        plugin_id: impl Into<String>,
+        package_dir: impl Into<PathBuf>,
+        required_features: Vec<String>,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            package_dir: package_dir.into(),
+            required_features,
+        }
+    }
+
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    /// Root directory of the deployed package (`plugin.toml`'s parent).
+    #[must_use]
+    pub fn package_dir(&self) -> &Path {
+        &self.package_dir
+    }
+
+    #[must_use]
+    pub fn required_features(&self) -> &[String] {
+        &self.required_features
+    }
+
+    /// Whether the deployed manifest declared `feature` in `required_features`.
+    #[must_use]
+    pub fn declares_feature(&self, feature: &str) -> bool {
+        self.required_features.iter().any(|entry| entry == feature)
+    }
+}
+
 /// Server-owned side of the script boundary.
 #[derive(Debug, Clone)]
 pub struct ScriptBoundary {
@@ -4408,6 +4493,7 @@ pub struct ScriptBoundary {
     command_rx: Arc<Mutex<mpsc::Receiver<ScriptCommand>>>,
     plugin_routes: PluginRouteAuthority,
     host_admissions: Arc<HostAdmissionLedger>,
+    deployed_packages: Arc<[LuaPluginPackage]>,
 }
 
 #[derive(Debug)]
@@ -4519,6 +4605,12 @@ impl ScriptBoundary {
     pub fn close_event_admission(&self) {
         self.event_admission.close();
         self.plugin_routes.clear();
+    }
+
+    /// Every deployed package the host discovered, with its manifest facts.
+    #[must_use]
+    pub fn deployed_packages(&self) -> &[LuaPluginPackage] {
+        &self.deployed_packages
     }
 
     /// Return a sorted snapshot of currently active plugin command roots.
@@ -4643,6 +4735,9 @@ pub struct ScriptHostEndpoint {
 impl ScriptHostEndpoint {
     /// Wait asynchronously until an event arrives or the server side closes.
     pub async fn recv_event(&mut self) -> Option<ScriptEvent> {
+        // The loop only iterates with the `lua-runtime` reload arm present; under
+        // default features a single hand-off returns, hence the conditional lint.
+        #[cfg_attr(not(feature = "lua-runtime"), allow(clippy::never_loop))]
         loop {
             match self.recv_input().await? {
                 ScriptHostInput::Event(event) => return Some(event),
@@ -4654,6 +4749,7 @@ impl ScriptHostEndpoint {
 
     /// Block the dedicated host thread until an event arrives or the server side closes.
     pub fn recv_event_blocking(&mut self) -> Option<ScriptEvent> {
+        #[cfg_attr(not(feature = "lua-runtime"), allow(clippy::never_loop))]
         loop {
             match self.recv_input_blocking()? {
                 ScriptHostInput::Event(event) => return Some(event),
@@ -5301,6 +5397,7 @@ pub fn script_boundary_pair(
             command_rx: Arc::new(Mutex::new(command_rx)),
             plugin_routes: plugin_routes.clone(),
             host_admissions: Arc::clone(&host_admissions),
+            deployed_packages: Arc::from(Vec::new()),
         },
         ScriptHostEndpoint {
             event_rx,
@@ -5338,11 +5435,16 @@ pub enum ScriptCommandCapability {
     EntityDamage,
     PluginStorage,
     StorageBatches,
+    InventoryTransfers,
+    PersistentResidents,
+    ResidentWork,
+    ResidentOrders,
+    WorldSites,
+    StructureOperations,
     InventoryMenus,
     InventoryStorageTransactions,
     PlayerInventory,
     Zones,
-    Villagers,
     PlayerTeleport,
     PlayerQueries,
     WorldTime,
@@ -5358,11 +5460,16 @@ pub enum ScriptCommandCapabilityKind {
     EntityDamage,
     PluginStorage,
     StorageBatches,
+    InventoryTransfers,
+    PersistentResidents,
+    ResidentWork,
+    ResidentOrders,
+    WorldSites,
+    StructureOperations,
     InventoryMenus,
     InventoryStorageTransactions,
     PlayerInventory,
     Zones,
-    Villagers,
     PlayerTeleport,
     PlayerQueries,
     WorldTime,
@@ -5377,11 +5484,16 @@ impl ScriptCommandCapabilityKind {
             Self::EntityDamage => "entity_damage",
             Self::PluginStorage => "plugin_storage",
             Self::StorageBatches => "storage_batches",
+            Self::InventoryTransfers => "inventory_transfers",
+            Self::PersistentResidents => "persistent_residents",
+            Self::ResidentWork => "resident_work",
+            Self::ResidentOrders => "resident_orders",
+            Self::WorldSites => "world_sites",
+            Self::StructureOperations => "structure_operations",
             Self::InventoryMenus => "inventory_menus",
             Self::InventoryStorageTransactions => "inventory_storage_transactions",
             Self::PlayerInventory => "player_inventory",
             Self::Zones => "zones",
-            Self::Villagers => "villagers",
             Self::PlayerTeleport => "player_teleport",
             Self::PlayerQueries => "player_queries",
             Self::WorldTime => "world_time",
@@ -5396,11 +5508,16 @@ impl ScriptCommandCapabilityKind {
             Self::EntityDamage => "entity damage",
             Self::PluginStorage => "plugin storage",
             Self::StorageBatches => "storage batches",
+            Self::InventoryTransfers => "inventory transfer",
+            Self::PersistentResidents => "persistent resident",
+            Self::ResidentWork => "resident work order",
+            Self::ResidentOrders => "resident squad order",
+            Self::WorldSites => "settlement site",
+            Self::StructureOperations => "structure operation",
             Self::InventoryMenus => "inventory menu",
             Self::InventoryStorageTransactions => "inventory storage transaction",
             Self::PlayerInventory => "player inventory transaction",
             Self::Zones => "zone",
-            Self::Villagers => "villager",
             Self::PlayerTeleport => "player teleport",
             Self::PlayerQueries => "player query",
             Self::WorldTime => "world time",
@@ -5416,11 +5533,16 @@ enum RequiredCommandCapability<'a> {
     EntityDamage,
     PluginStorage,
     StorageBatches,
+    InventoryTransfers,
+    PersistentResidents,
+    ResidentWork,
+    ResidentOrders,
+    WorldSites,
+    StructureOperations,
     InventoryMenus,
     InventoryStorageTransactions,
     PlayerInventory,
     Zones,
-    Villagers,
     PlayerTeleport,
     PlayerQueries,
     WorldTime,
@@ -5435,13 +5557,18 @@ impl RequiredCommandCapability<'_> {
             Self::EntityDamage => ScriptCommandCapabilityKind::EntityDamage,
             Self::PluginStorage => ScriptCommandCapabilityKind::PluginStorage,
             Self::StorageBatches => ScriptCommandCapabilityKind::StorageBatches,
+            Self::InventoryTransfers => ScriptCommandCapabilityKind::InventoryTransfers,
+            Self::PersistentResidents => ScriptCommandCapabilityKind::PersistentResidents,
+            Self::ResidentWork => ScriptCommandCapabilityKind::ResidentWork,
+            Self::ResidentOrders => ScriptCommandCapabilityKind::ResidentOrders,
+            Self::WorldSites => ScriptCommandCapabilityKind::WorldSites,
+            Self::StructureOperations => ScriptCommandCapabilityKind::StructureOperations,
             Self::InventoryMenus => ScriptCommandCapabilityKind::InventoryMenus,
             Self::InventoryStorageTransactions => {
                 ScriptCommandCapabilityKind::InventoryStorageTransactions
             }
             Self::PlayerInventory => ScriptCommandCapabilityKind::PlayerInventory,
             Self::Zones => ScriptCommandCapabilityKind::Zones,
-            Self::Villagers => ScriptCommandCapabilityKind::Villagers,
             Self::PlayerTeleport => ScriptCommandCapabilityKind::PlayerTeleport,
             Self::PlayerQueries => ScriptCommandCapabilityKind::PlayerQueries,
             Self::WorldTime => ScriptCommandCapabilityKind::WorldTime,
@@ -5658,6 +5785,42 @@ impl ScriptPluginManifest {
         self
     }
 
+    /// Declare bounded ownership-checked item transfers and durable reservations.
+    pub fn declare_inventory_transfers(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::InventoryTransfers);
+        self
+    }
+
+    /// Declare durable resident handles, lifecycle queries, spawn and release.
+    pub fn declare_persistent_residents(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::PersistentResidents);
+        self
+    }
+
+    /// Declare bounded resident work orders and their cancellation.
+    pub fn declare_resident_work(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::ResidentWork);
+        self
+    }
+
+    /// Declare bounded resident squad orders, combat policy and demobilisation.
+    pub fn declare_resident_orders(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::ResidentOrders);
+        self
+    }
+
+    /// Declare settlement site discovery, queries, resident reservation and surveys.
+    pub fn declare_world_sites(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::WorldSites);
+        self
+    }
+
+    /// Declare durable structure preparation, advancement, pause, cancel and status.
+    pub fn declare_structure_operations(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::StructureOperations);
+        self
+    }
+
     /// Declare access to server-owned inventory menu requests and click events.
     pub fn declare_inventory_menus(mut self) -> Self {
         self.push_capability(ScriptCommandCapability::InventoryMenus);
@@ -5679,12 +5842,6 @@ impl ScriptPluginManifest {
     /// Declare access to plugin-owned axis-aligned zones.
     pub fn declare_zones(mut self) -> Self {
         self.push_capability(ScriptCommandCapability::Zones);
-        self
-    }
-
-    /// Declare access to opaque villager bindings and bounded goal requests.
-    pub fn declare_villagers(mut self) -> Self {
-        self.push_capability(ScriptCommandCapability::Villagers);
         self
     }
 
@@ -6053,11 +6210,16 @@ impl ScriptPluginManifest {
                 ScriptCommandCapability::EntityDamage
                 | ScriptCommandCapability::PluginStorage
                 | ScriptCommandCapability::StorageBatches
+                | ScriptCommandCapability::InventoryTransfers
+                | ScriptCommandCapability::PersistentResidents
+                | ScriptCommandCapability::ResidentWork
+                | ScriptCommandCapability::ResidentOrders
+                | ScriptCommandCapability::WorldSites
+                | ScriptCommandCapability::StructureOperations
                 | ScriptCommandCapability::InventoryMenus
                 | ScriptCommandCapability::InventoryStorageTransactions
                 | ScriptCommandCapability::PlayerInventory
                 | ScriptCommandCapability::Zones
-                | ScriptCommandCapability::Villagers
                 | ScriptCommandCapability::PlayerTeleport
                 | ScriptCommandCapability::PlayerQueries
                 | ScriptCommandCapability::WorldTime
@@ -6206,6 +6368,24 @@ impl ValidatedScriptPluginManifest {
                 ScriptCommandCapability::StorageBatches => {
                     capabilities = capabilities.allow_storage_batches();
                 }
+                ScriptCommandCapability::InventoryTransfers => {
+                    capabilities = capabilities.allow_inventory_transfers();
+                }
+                ScriptCommandCapability::PersistentResidents => {
+                    capabilities = capabilities.allow_persistent_residents();
+                }
+                ScriptCommandCapability::ResidentWork => {
+                    capabilities = capabilities.allow_resident_work();
+                }
+                ScriptCommandCapability::ResidentOrders => {
+                    capabilities = capabilities.allow_resident_orders();
+                }
+                ScriptCommandCapability::WorldSites => {
+                    capabilities = capabilities.allow_world_sites();
+                }
+                ScriptCommandCapability::StructureOperations => {
+                    capabilities = capabilities.allow_structure_operations();
+                }
                 ScriptCommandCapability::InventoryMenus => {
                     capabilities = capabilities.allow_inventory_menus();
                 }
@@ -6217,9 +6397,6 @@ impl ValidatedScriptPluginManifest {
                 }
                 ScriptCommandCapability::Zones => {
                     capabilities = capabilities.allow_zones();
-                }
-                ScriptCommandCapability::Villagers => {
-                    capabilities = capabilities.allow_villagers();
                 }
                 ScriptCommandCapability::PlayerTeleport => {
                     capabilities = capabilities.allow_player_teleport();
@@ -6375,11 +6552,16 @@ pub struct CommandCapabilities {
     entity_damage: bool,
     plugin_storage: bool,
     storage_batches: bool,
+    inventory_transfers: bool,
+    persistent_residents: bool,
+    resident_work: bool,
+    resident_orders: bool,
+    world_sites: bool,
+    structure_operations: bool,
     inventory_menus: bool,
     inventory_storage_transactions: bool,
     player_inventory: bool,
     zones: bool,
-    villagers: bool,
     player_teleport: bool,
     player_queries: bool,
     world_time: bool,
@@ -6425,6 +6607,41 @@ impl CommandCapabilities {
     }
 
     #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_inventory_transfers(mut self) -> Self {
+        self.inventory_transfers = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_persistent_residents(mut self) -> Self {
+        self.persistent_residents = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_resident_work(mut self) -> Self {
+        self.resident_work = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_resident_orders(mut self) -> Self {
+        self.resident_orders = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_world_sites(mut self) -> Self {
+        self.world_sites = true;
+        self
+    }
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_structure_operations(mut self) -> Self {
+        self.structure_operations = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_inventory_menus(mut self) -> Self {
         self.inventory_menus = true;
         self
@@ -6445,12 +6662,6 @@ impl CommandCapabilities {
     #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_zones(mut self) -> Self {
         self.zones = true;
-        self
-    }
-
-    #[cfg(any(test, feature = "lua-runtime"))]
-    pub(crate) fn allow_villagers(mut self) -> Self {
-        self.villagers = true;
         self
     }
 
@@ -6506,13 +6717,18 @@ impl CommandCapabilities {
             RequiredCommandCapability::EntityDamage => self.entity_damage,
             RequiredCommandCapability::PluginStorage => self.plugin_storage,
             RequiredCommandCapability::StorageBatches => self.storage_batches,
+            RequiredCommandCapability::InventoryTransfers => self.inventory_transfers,
+            RequiredCommandCapability::PersistentResidents => self.persistent_residents,
+            RequiredCommandCapability::ResidentWork => self.resident_work,
+            RequiredCommandCapability::ResidentOrders => self.resident_orders,
+            RequiredCommandCapability::WorldSites => self.world_sites,
+            RequiredCommandCapability::StructureOperations => self.structure_operations,
             RequiredCommandCapability::InventoryMenus => self.inventory_menus,
             RequiredCommandCapability::InventoryStorageTransactions => {
                 self.inventory_storage_transactions
             }
             RequiredCommandCapability::PlayerInventory => self.player_inventory,
             RequiredCommandCapability::Zones => self.zones,
-            RequiredCommandCapability::Villagers => self.villagers,
             RequiredCommandCapability::PlayerTeleport => self.player_teleport,
             RequiredCommandCapability::PlayerQueries => self.player_queries,
             RequiredCommandCapability::WorldTime => self.world_time,
@@ -6650,8 +6866,6 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.zone_exited"
             | "zone.command_result"
             | "player.teleport_result"
-            | "villager.binding_result"
-            | "villager.goal_result"
             | "player.custom_payload"
             | "player.client_brand"
     )
@@ -7543,8 +7757,6 @@ mod tests {
             "player.zone_exited",
             "zone.command_result",
             "player.teleport_result",
-            "villager.binding_result",
-            "villager.goal_result",
         ] {
             assert!(is_supported_event_name(event_name), "missing {event_name}");
         }
@@ -8360,14 +8572,6 @@ mod tests {
             ScriptInventoryMenuItem::try_new("invalid", 1, None),
             Err(ScriptDtoError::InvalidResourceId { .. })
         ));
-        assert!(matches!(
-            ScriptVillagerBindingRequest::try_new(
-                "bind",
-                ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
-                MAX_VILLAGER_BINDING_RADIUS + 1.0,
-            ),
-            Err(ScriptDtoError::InvalidBounds)
-        ));
     }
 
     #[test]
@@ -8428,25 +8632,6 @@ mod tests {
             ScriptEvent::plugin_storage_delete_result("owner", &delete, true, None),
             Err(ScriptDtoError::InconsistentResult { .. })
         ));
-        let binding_request = ScriptVillagerBindingRequest::try_new(
-            "bind",
-            ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
-            16.0,
-        )
-        .unwrap();
-        assert!(matches!(
-            ScriptEvent::villager_binding_result(
-                "invalid owner",
-                &binding_request,
-                None,
-                Some(ScriptVillagerBindingFailure::NotFound),
-            ),
-            Err(ScriptDtoError::InvalidId { .. })
-        ));
-        assert!(matches!(
-            ScriptEvent::villager_binding_result("owner", &binding_request, None, None),
-            Err(ScriptDtoError::InvalidBounds)
-        ));
 
         let event =
             ScriptEvent::plugin_storage_get_result("owner.plugin", &get, Some("9".into()), Some(4))
@@ -8462,60 +8647,6 @@ mod tests {
                 failure: None,
             } if request_id == "read" && key == "balance" && value == "9"
         ));
-    }
-
-    #[test]
-    fn villager_goal_requests_are_bounded_and_keep_domain_vocabulary_out_of_rust() {
-        let idle = ScriptVillagerGoalRequest::try_new(
-            "goal-idle",
-            "binding-1",
-            ScriptVillagerGoal::idle(),
-        )
-        .unwrap();
-        assert_eq!(idle.request_id(), "goal-idle");
-        assert_eq!(idle.binding_token(), "binding-1");
-        assert_eq!(idle.goal().kind(), "idle");
-        assert_eq!(idle.goal().target(), None);
-        assert_eq!(idle.goal().speed(), None);
-
-        let target = ScriptPosition::try_new(8.5, 64.0, -3.5).unwrap();
-        let moving = ScriptVillagerGoalRequest::try_new(
-            "goal-home",
-            "binding-2",
-            ScriptVillagerGoal::follow_position(target, 0.3).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(moving.goal().kind(), "follow_position");
-        assert_eq!(moving.goal().target(), Some(target));
-        assert_eq!(moving.goal().speed(), Some(0.3));
-
-        assert!(matches!(
-            ScriptVillagerGoal::follow_position(target, 0.0),
-            Err(ScriptDtoError::InvalidBounds)
-        ));
-        assert!(matches!(
-            ScriptVillagerGoal::follow_position(target, MAX_VILLAGER_GOAL_SPEED + 0.1),
-            Err(ScriptDtoError::InvalidBounds)
-        ));
-        for rejected in [
-            ScriptVillagerGoalRequest::try_new("Goal", "binding-1", ScriptVillagerGoal::idle()),
-            ScriptVillagerGoalRequest::try_new("goal", "Binding-1", ScriptVillagerGoal::idle()),
-            ScriptVillagerGoalRequest::try_new(
-                "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
-                "binding-1",
-                ScriptVillagerGoal::idle(),
-            ),
-            ScriptVillagerGoalRequest::try_new(
-                "goal",
-                "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
-                ScriptVillagerGoal::idle(),
-            ),
-        ] {
-            assert!(matches!(
-                rejected,
-                Err(ScriptDtoError::InvalidId { .. } | ScriptDtoError::ValueTooLong { .. })
-            ));
-        }
     }
 
     #[test]
@@ -8802,65 +8933,6 @@ mod tests {
         drop(boundary);
 
         assert_eq!(endpoint.host_admissions.pending_len(), 0);
-    }
-
-    #[tokio::test]
-    async fn admitted_villager_goal_builds_one_targeted_result() {
-        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest =
-            ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
-                .declare_villagers()
-                .validate()
-                .unwrap();
-        let admission = HostCommandAdmission::from_manifest(&manifest);
-        let request =
-            ScriptVillagerGoalRequest::try_new("goal-1", "binding-1", ScriptVillagerGoal::idle())
-                .unwrap();
-        let command = ScriptCommand::SetVillagerGoal { request };
-        assert_eq!(
-            command.required_capability_kind(),
-            Some(ScriptCommandCapabilityKind::Villagers)
-        );
-        let mut batch = CommandBatch::new(nonzero(1));
-        batch
-            .try_push_authorized(command, &manifest.to_command_capabilities())
-            .unwrap();
-        endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
-
-        let raw = boundary.recv_command().await.unwrap();
-        assert!(matches!(raw, ScriptCommand::HostAttached { .. }));
-        let admitted = boundary.accept_host_command(raw).unwrap();
-        let result = admitted.villager_goal_result(None).unwrap();
-        assert_eq!(result.target_plugin_id(), Some("settlement"));
-        assert_eq!(result.event_name(), "villager.goal_result");
-        assert!(matches!(
-            result.kind(),
-            ScriptEventKind::VillagerGoalResult {
-                request_id,
-                goal: ScriptVillagerGoal::Idle,
-                failure: None,
-            } if request_id == "goal-1"
-        ));
-    }
-
-    #[test]
-    fn villager_goal_requires_declared_villagers_capability() {
-        let command = ScriptCommand::SetVillagerGoal {
-            request: ScriptVillagerGoalRequest::try_new(
-                "goal-1",
-                "binding-1",
-                ScriptVillagerGoal::idle(),
-            )
-            .unwrap(),
-        };
-        let mut batch = CommandBatch::new(nonzero(1));
-        assert_eq!(
-            batch.try_push_authorized(command, &CommandCapabilities::default()),
-            Err(CommandBatchError::PermissionDenied {
-                capability: ScriptCommandCapabilityKind::Villagers,
-            })
-        );
-        assert!(batch.commands().is_empty());
     }
 
     #[tokio::test]

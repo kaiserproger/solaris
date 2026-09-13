@@ -93,14 +93,14 @@ fn wire_velocity(velocity: Vec3) -> EntityVec3 {
     }
 }
 
-fn player_info_entry(player: &PlayerEntitySnapshot) -> PlayerInfoEntry {
+pub(super) fn player_info_entry(player: &PlayerEntitySnapshot) -> PlayerInfoEntry {
     PlayerInfoEntry {
         profile_id: player.uuid,
         name: player.name.clone(),
         properties: player.properties.clone(),
         listed: true,
         latency: 0,
-        game_mode: 0,
+        game_mode: player.game_mode.id(),
         list_order: player.entity_id,
         show_hat: true,
     }

@@ -21,6 +21,11 @@ impl CommandPermissions {
     pub(super) const fn can_use_admin_commands(self) -> bool {
         self.op
     }
+
+    /// Operator authority as resolved for this session.
+    pub(crate) const fn is_op(self) -> bool {
+        self.op
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

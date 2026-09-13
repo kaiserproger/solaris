@@ -107,6 +107,7 @@ async fn placement_harness_with(
             desired: HashSet::new(),
             tx,
             pose,
+            game_mode: mc_domain::GameMode::Survival,
             max_sessions: usize::MAX,
             script_operator: false,
             dimension: "minecraft:overworld",

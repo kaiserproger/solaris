@@ -1,4 +1,927 @@
 # Solaris current cursor
+## Handover snapshot (uncommitted batch)
+
+- base_tree: `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`
+- owned_hash: `52a5e94e417ee168aa1f5aa2abf2c6becd4dd706b23f3ee0d335f8861c9e29b5` (SHA-256 over the 13 checkpoint-owned paths, recomputed after the C1a slice and the C1b revert: `crates/mc-net/src/settlement.rs`, `server.rs`, `play.rs`, `play/simulation.rs`, `play/block_wire.rs`, `play/tests/campfire_cooking.rs`, `script/storage/settlement.rs`, `script/storage/settlement_tests.rs`, `script/storage/resident_settlement_tests.rs`, `crates/mc-test-harness/tests/settlement_lifecycle.rs`, `docs/decisions/0004-staged-single-writer-simulation.md`, `docs/PLUGINS.md`, `../solaris-default-plugins/solaris-settlements/main.lua`; recipe: SHA-256 over `"<sha256>  <path>\n"` lines in that order. Other dirty paths belong to earlier checkpoints)
+- changed_files: owned batch 18 paths; the rest of the dirty tree (191 paths) is pre-existing workspace WIP, not this batch
+- sibling_batch: `../solaris-default-plugins` base `2d51ae5559cd` SHA-256 `71f40021def7e280b2de94fa3a27d206a2eecf6e2e247d36d2f7bec2e774c041` over the 9 files the package agents changed (root `README.md`/contract/`WATCHDOG.yml` and untouched package files excluded — pre-existing WIP; the package's two older receipts under `server/evidence/` are pre-existing as well)
+- classification: `.analysis/handover/2026-09-13-batch-files.txt` (ignored artifact)
+- checkpoint_site_vertical: settlements are grounded on the world's own terrain.
+  `ChunkGenerator::surface_height` (defaulted `None`) with a `TerrainGenerator`
+  override; `SettlementSelector::layout`/`::road` take a
+  `&dyn Fn(i32, i32) -> Option<i32>` ground resolver and anchor each building so
+  its authored anchor meets the terrain row at the anchor column (flush rule);
+  `SettlementRuntime` holds the `WorldStorage` generator (fail-closed when a
+  deployment has none); `site_snapshot` reports the grounded candidate;
+  `spawn_resident` verifies `ResidentWorld::standable` before materialising.
+  Evidence: `correctness` PASS `.analysis/validation/20260913T052447-correctness-_wlwlfgp`;
+  receipt `.analysis/codex-logs/site-vertical/receipt.md`; live real-client
+  `/settlement site` reports `origin 839,62,296` and `origin 1788,87,58` where the
+  previous receipt recorded `origin 1788,0,58`, with
+  `adopt`/`survey`/`project`/`fund`/`build`/`info houses=1` completing
+  (`.analysis/validation/20260913T053315-regression-vbm3xulo`).
+- checkpoint_site_vertical_open: both review findings are closed. (1) The first
+  grounding rule (`+1`) was wrong: the shipped data anchors `plaza_well` at
+  `[7, 0, 7]` with its layer at local y=0 and `house_small` at `[5, 0, 8]` with
+  rows only at y=1..6, so `+1` floated the plaza and put the house floor at
+  `surface+2` instead of the accepted `surface+1`. The rule is now
+  `origin_y = surface - anchor_local_y`; live re-check confirms it
+  (`origin 1788,86,58`, `origin 839,61,296`, no y=0). (2) A deployed catalog
+  missing a required role now fails startup (`missing_required_role` +
+  `SettlementStartupError::MissingRole`), covered by
+  `catalog_violations_fail_loudly_with_a_typed_error`. The single independent
+  reviewer re-read the settled tree and returned `overall_correctness: correct`
+  with no new findings; the site-origin row is the origin column's first free
+  row, `road` kept its original signature (no production caller), and a focused
+  `anchor = [1,1,0]` deck test covers the anchor-above-base case under rotation.
+- checkpoint_commit_publication: fixed behaviourally, cause not proven. Before the
+  change, a player-visible `/settlement build` reported `house_sm_1 committed
+  (solaris:house_small)` and `houses=1` while a client scan of the footprint found
+  only terrain (QA runs 4/5). After it, run 6 on a fresh world found the whole
+  house in the client at `origin 1788,94,58` (oak_planks 628, oak_log 32, glass 20,
+  red_bed 20, torch 4, oak_door 4, crafting_table 2, chest 2; dirt 92 → snow 93 →
+  air 94 → planks 95 → log 96-99) with the same `committed` answer. What changed in
+  code: `play::block_wire::broadcast_applied_edits` publishes a writer-less batch
+  (`invalidate_prepared_chunks`, delta broadcast, incremental light + chunk
+  invalidation) and evicts session cooking state for an applied campfire →
+  non-campfire edit, instead of returning after the storage commit. That eviction
+  came from the independent read-only review (verdict `incorrect`, one P2 finding
+  with the concrete failure path: the tick loop skips only positions whose current
+  block is not a campfire, so a stale entry could be inherited by a later campfire
+  and materialise its pending outputs); the review confirmed the rest of the fanout
+  as correct, and its two minor notes (call `lighting::light_update_chunks`, revert
+  the `invalidate_prepared_chunks` widening) are applied. Two explanations for the
+  original invisibility remain open in attribution only: run 6's own saved world
+  was decoded read-only and contains the committed house (oak_planks 314, oak_log
+  16, glass 10, red_bed 10, torch 2, oak_door 2, crafting_table 1, chest 1 — the
+  authored `house_small` totals, `.analysis/real-client-runs/settlement-ground-qa/run6-persistence.json`),
+  so that run's placement and persistence are not in question; what is not run is
+  an A/B of the pre-change build on one world, which is the only way to attribute
+  the earlier invisibility to the missing publication rather than to the grounding
+  change from the same window. A live reload of that world was not possible for the
+  QA agent (entity-owner journal refuses recovery past the supported
+  30,000-decision boundary; setting it aside trips the deliberate
+  `world metadata identity mismatch` for the copied path). The reviewed campfire
+  gap has a regression:
+  `play/tests/campfire_cooking.rs::a_writer_less_commit_evicts_cooking_for_a_replaced_campfire`,
+  which fails with the eviction disabled and passes with it.
+  `.analysis/codex-logs/placement-visibility/receipt.md`; scan
+  `.analysis/real-client-runs/settlement-ground-qa/run6-watchdog-scan.json`.
+  Still open from the same run: `/settlement populate` refused with `blocked`
+  (residents not materialised).
+- checkpoint_commit_publication_residual: run 6 proves in-session client
+  visibility and (by read-only region decode) disk persistence. It does not prove
+  what a restarted server or a reloaded client serves: the QA's reload attempt
+  failed before serving (`regional decision recovery exceeds the supported
+  30,000-decision boundary`, then the deliberate `world metadata identity mismatch`
+  on the copied path). One scan against run 6's own world directory after a real
+  restart is the closure for that, tracked as a todo; do not infer reload
+  behaviour from the decode.
+- checkpoint_settlement_commit_pipeline: DONE (2026-09-13). A structure portion now
+  commits as exactly one awaited `SimulationCommand::ApplyBlockEdits
+  { actor_session: None, .. }` on the server-owned `SimulationHandle` bound into
+  `LiveSettlementWorld` (`crates/mc-net/src/settlement.rs`), created by `server.rs`
+  before the settlement deployment; the direct `WorldStorage` write, the
+  `broadcast_applied_edits` fanout and the `OnceLock` late binding are gone. Every
+  actor-`None` batch stays off the session fast lanes (`command_can_use_resident_
+  mutation`, with `command_can_use_regional_mutation` delegating for that command),
+  so the staged path owns cooking eviction, reactivity, owner relighting and
+  post-commit publication; ADR 0004 records the invariant. Evidence:
+  `.analysis/decomposition/evidence/{P01,P02,P03,P04,P04b,P05}/receipt.json`.
+  Validation: `cargo test -p mc-net --lib` 2172 passed; `server_owned_block_edits`
+  neighbourhood 5 passed (eviction for cross-region and single-region batches,
+  fenced-handle refusal, lane-policy predicate, `BlockDeltas` seen by a loaded
+  session); `cargo test -p mc-test-harness --test settlement_lifecycle` 6 passed;
+  `plugin_examples` 4 passed; `code-health` PASS
+  `.analysis/validation/20260913T085900-code-health-2culc043`; `fmt` PASS
+  `.analysis/validation/20260913T085903-fmt-vpq5t0nt`.
+  Closed in the same checkpoint: `release_resident_site` refuses a consumed
+  reservation (`.analysis/decomposition/evidence/P06`); the plugin releases a
+  stranded resident-site reservation only for `blocked`/`unloaded` - the two
+  refusals that provably precede any effect in `residents.rs` - and keeps the
+  reservation for `runtime_unavailable`/`invalid_request`/`not_found`/`capacity`/
+  `busy` (`P08`, plus the missing `continue_write` release-intent branch and the
+  release-completion hydration fix, `P10_P11`); a refused `project` is withdrawn by
+  a confirmed durable batch and its pending intent survives an unconfirmed cleanup
+  (`P10`); batch ids no longer alias names differing only by `-`/`_` (`P11`); the
+  native m94-09 loop anchors each stage on chat observed after the submission and
+  fails closed on absent feedback (`P13`).
+  Residual gaps: batch ids built from two 40-char components can still exceed the
+  core's 64-byte `MAX_SCRIPT_ID_BYTES`; live-proof driver steps below are missing.
+  (The earlier note about writer-session campfire eviction on an accelerated lane
+  was wrong and is withdrawn: the writer path clears replaced campfire cooking in
+  `finalize_visible_block_edit_outcome`, `play/block_edit_commit.rs:315-338`.)
+
+- release_installed: `~/.local/bin/solaris` md5 `006e7195848f901918118890709b3d3a`
+  (`mc-server 0.0.6`, built from the current tree after the settlement commit
+  pipeline cutover and the plugin lifecycle fixes), and
+  `$HOME/sarvar/plugins/solaris-settlements/main.lua` is byte-identical to the
+  sibling package source; the other five deployed packages are untouched. Plugin
+  discovery must be checked from `~/sarvar`, because `[plugins].directory =
+  "plugins"` is relative: `cd ~/sarvar && solaris --check --config server.toml`
+  exits 0 with `operator_warnings: []` and discovers all six packages (the same
+  check from the repository root resolves no plugin directory and reports
+  `discovered_plugins: []`).
+- validation: `run correctness` PASS `.analysis/validation/20260913T071815-correctness-nt60vl9s`
+  (fmt, `code-health`, strict workspace Clippy, workspace tests, including the new
+  campfire regression) and `.analysis/validation/20260913T070609-correctness-skxjk7sx`
+  on the same revision the installed binary came from (the later addition is
+  `#[cfg(test)]` only, so `~/.local/bin/solaris` md5 `c6dc5444d9bc91c058c84877c0521060`
+  is unchanged); live real-client QA run 6 verified the committed house in the
+  client (`.analysis/real-client-runs/settlement-ground-qa/run6-*`) and its saved
+  world was decoded read-only as persisted; a smoke start of the installed release
+  bound `127.0.0.1:25565` with `plugins=6` and was stopped again, and
+  `solaris --check --config ~/sarvar/server.toml` exits 0 with six discovered
+  packages, so the port is free for the owner's test.
+- validation_latest: `run correctness` PASS
+  `.analysis/validation/20260913T104202-correctness-41olrp8v` on the current tree
+  (after the C1a review fixes) and
+  `.analysis/validation/20260913T103025-correctness-ry310o95` after the C1b revert;
+  earlier: `.analysis/validation/20260913T090714-correctness-jrwjk54y` (settlement
+  commit pipeline). Focused: `cargo test -p mc-net --lib warehouse` 8 passed,
+  `--lib owned_inventory` 18 passed, `cargo test -p mc-script` 129 passed,
+  `cargo test -p mc-test-harness --test settlement_lifecycle` 7 passed,
+  `--test plugin_examples` 4 passed; `code-health` and `fmt` PASS on the same tree.
+  Independent reviews at this checkpoint: `CutoverReview` (settlement commit
+  pipeline, verdict changes -> all fixed) and `WarehouseReadReview` (C1a bind/read,
+  verdict changes -> receipt-per-bind + doc corrections fixed).
+- visibility_claim (behavioral only, A/B not run by decision): committed settlement
+  houses are client-visible and persist to the region file on the current build
+  (run 6). No causal attribution is made between the missing publication fanout and
+  the structure grounding change from the same window; see
+  `.analysis/decomposition/evidence/P22/receipt.json`.
+- c1_writable_warehouse (in progress, split): the documented contract is an
+  opaque handle for a verified loaded container, never coordinates
+  (`docs/PLUGINS.md:1577-1621`); canonical storage stays `Chunk.chests` keyed by
+  `BlockPos`, so no second item ledger may appear. Verified today: three refusal
+  gates (`play/session/owned_inventory_endpoint.rs:41-43` read, `:93-97` transfer,
+  `:398-402` reservation), routing at `script/storage/world_inventory.rs:530-545,609-630,655-672`,
+  the prepare boundary at `play/owned_inventory.rs:25-65`, and the issuance
+  precedent at `script/storage/residents.rs:875-949`; `commit_prepared` still
+  passes `Vec::new()` chunk snapshots (`world_inventory.rs:466-470`), so container
+  after-images are not yet journaled. The authored warehouse blueprint exists
+  (3 chests + 3 barrels + six `empty_container` entities) and the plugin's
+  `/settlement deposit` is an unconditional refusal (`main.lua:2344-2355`).
+  Handle invariant: core mints the handle; the plugin never supplies positions. The
+  warehouse blueprint's `stores` POI is kind `work`, not a container, so no POI
+  receipt can address a chest; the plugin names its durable `structure_id`
+  plus the authored container ordinal and core verifies it against the
+  blueprint catalog and the placed, loaded block. A plugin-chosen coordinate
+  or a second container-address authority stays forbidden.
+  Slice 1 DONE (2026-09-13, `.analysis/decomposition/evidence/C1a/receipt.json`): the
+  DTO/Lua `bind_warehouse` + `ScriptWarehouseBinding {handle,structure_id,container_id,revision}`,
+  a durable `DurableSettlementChange::Warehouse` binding, verification (ownership,
+  placed `is_placed() == state != Cancelled`, authored `empty_container` ordinal,
+  loaded chunk, container present) and a real READ path resolving a handle to the
+  canonical `Chunk.chests` snapshot; `is_active()` is deliberately not used (it
+  excludes completed structures, and a warehouse is a completed container).
+  Evidence: `cargo test -p mc-net --lib warehouse` 8 passed, `-p mc-script` 129 passed,
+  L2 `correctness` PASS `.analysis/validation/20260913T094337-correctness-gstdsd2t`.
+  Slice 2 ATTEMPTED AND REVERTED (`.analysis/decomposition/evidence/C1b/receipt.json`,
+  status reverted): the write path was built on a raw `WorldMutationView` container
+  mutation, bypassing the typed container transaction, so it neither advanced
+  `chest_state_ids` nor published `ChestSlots` to viewers and a concurrent menu
+  commit could plan from pre-transfer state (ADR 0004 violation, a second
+  authority). Nothing of it remains; the transfer endpoint refuses again and
+  `commit_prepared` is back to `Vec::new()`.
+  Required design for the next checkpoint: ONE server-owned simulation command
+  carrying the operation receipt, the player after-image, the container with its
+  expected/updated slots and the expected fences, executed entirely inside the
+  owner turn - validate fences and current chest state, stage via the chest
+  transaction boundary, append the ONE world-journal decision, project both sides,
+  advance `chest_state_ids`, publish `ChestSlots`, then respond - so no container
+  transaction can interleave. That is a cross-domain ownership migration whose
+  recovery/data lifetime must be designed, not a small container fix; it is not to
+  be improvised.
+  Slice 3 (plugin deposit/withdraw) is BLOCKED on three owner decisions, because the
+  package defines none of them: (a) which items deposit, (b) whether quantity is
+  user-visible, (c) whether a withdraw surface exists at all. `/settlement deposit`
+  stays an honest refusal (`main.lua:2344-2355`); no plugin-side money balance may
+  be invented and `record.money` is only a carried-inventory projection.
+  Slice 4: restart round-trip evidence, after slice 2. Deferred: multi-container /
+  double chest and C4 haul (`resident_order_execution.rs:646-650`) /
+  demobilization (`:1063-1065`).
+  with container after-images in one recoverable decision. Slice 3: plugin
+  deposit/withdraw wiring. Slice 4: restart round-trip evidence. Deferred:
+  multi-container/double chest and C4 haul/demobilization.
+- next: the native chain is runnable
+  (`SOLARIS_REAL_CLIENT_AGENT_SCENARIO=m94-09-settlement-chain python3 -m tools.harness
+  run regression --timeout-seconds 600 --run`) but there is no settlement sweep
+  profile and the refused-spawn retry, second-create, warehouse round-trip and
+  dismiss proofs need driver steps that do not exist yet
+  (`.analysis/decomposition/evidence/D5/receipt.json`); after that, the C1 writable
+  warehouse endpoint (no handle issuer or ownership binding exists today:
+  `.analysis/decomposition/evidence/D4/receipt.json`), then the owner's commit
+  decision for the owned batch.
+
+Top changed groups: `crates/mc-net` (70), `crates/mc-test-harness` (57), `crates/mc-script` (20), `crates/mc-worldgen` (13), `crates/mc-server` (10), `examples/loader-live-gate` (10), `crates/mc-entity` (7), `crates/mc-protocol` (2)
+
+## Queued after handover (dependencies, not motion)
+
+Blocked on the owner's field test:
+- **Owner manual structure-fit test**: the shipped gate's accepted-anchor path on the release
+  binary (`~/.local/bin/solaris`, md5 `d066538256ec088b760ae11f027a9f64`); its live evidence so
+  far is the terminal refusal on the previous, looser revision plus the unit test.
+
+Blocked on the site-vertical checkpoint (deterministic `TerrainGenerator::surface_height`
+plumbed into `SettlementRuntime`; the live-occupancy attempt was cancelled, reverted and
+recorded):
+- Settlement residents standing on the ground, the live `hire` + `squad order attack` combat
+  proof the package still owes, and the canonical `m94-09-settlement-chain` run (its driver
+  also needs paced commands, and the run root must stay short until the world-identity fix is
+  in a build the harness uses). `/settlement populate` is refused by the core with `blocked`;
+  the cause is diagnosed from run 6's plugin journal below.
+- QA finding, real-client run 6: the m94-09 runner stalls when the server's
+  command ingress bucket drops a `/give` (`COMMAND_BURST=8`, `class="command"`
+  drop in `logs/debug.log`). Its second half is fixed: `await_state` in
+  `tools/harness/backends/driver.py` clamped its event timeout to the client's
+  accepted 0.1 s floor, so a deadline-driven wait no longer surfaces as
+  `IllegalArgumentException: timeout_seconds must be between 0.1 and 120.0`
+  instead of a clean timeout. Still open: the dropped `/give` itself — the runner
+  should wait for the give to be acknowledged (inventory state or the log drop
+  marker) rather than firing the next command, and that pacing decision is not
+  made yet.
+- The package's ghost `projected` entry after a refused `project`: `S.refuse` does not clear
+  the prepare intent/index/record.
+- **Why `/settlement populate` is refused with `blocked` (diagnosed from run 6's own plugin
+  journal, `.analysis/validation/20260913T063935-regression-958j57r4/regression/20260913T063936Z-m94-regression-pack-w2tEzP/world/solaris/plugin-storage-v1/journal-v1.bin`):**
+  the journal holds three resident-site ops — `reserve-regsville-25` (`reserve_poi`,
+  `site_3_0_31f075c1.0.home`), then `spawn-regsville-27` (`spawn`, token `1a0807e0…`), then
+  `reserve-regsville-29` for the *same* home. So the first reserve committed, the spawn failed
+  (`runtime_unavailable`), and nothing ever handed the reservation back; the core refuses a
+  second reserve of a live reservation (`script/storage/settlement.rs:1163`), which is the
+  observed `Core refused the request: blocked.`. Required fix, in this order: resolve the spawn
+  op through the plugin's existing durable intent/receipt lifecycle (`operation_status`), and
+  release with `solaris.release_resident_site(request_id, op_id, spawn_site_token)` (core
+  handler `release_resident_site`, release DTO `ScriptSettlementOperation::ReleaseResidentSite`)
+  **only** on a confirmed non-commit. A fire-and-forget release from the generic refusal branch
+  is wrong: an unconfirmed failure can race a committed spawn, and the core marks `released`
+  without refusing a consumed reservation, so it would free an occupied home. A core-side guard
+  refusing a release whose reservation is already `consumed` is a proposed hardening and belongs
+  to the core file the current checkpoint owns. Any release intent must also be its own durable
+  transition: `set_pending` overwrites the same `resident-site` slot, so an intent whose bundle
+  write fails followed by `clear_pending` would drop the only recovery handle while the core
+  reservation stays live — model the cleanup exactly like the package's other resident-site
+  intents (including failed-write and restart recovery) and cover it with the package's
+  intent-lifecycle tests before deploying it.
+
+Open design decisions, no code yet:
+- The base-row rule for the eight blueprints that author cells at their local `y=0`
+  (`farm`, `market`, `plaza_well`, `mine_entrance`, `pen`, `palisade_gate`, `stone_wall`,
+  `fishing_pier`): re-author their base rows hollow, or gate base-row blueprints strictly
+  above the terrain. `mine_entrance` cannot be placed into a hillside under the current rule.
+- POI leash for villagers and golems: the global 6..32 wander reach moves idle villagers up to
+  32 blocks from home. Needs a measured policy, not a guess.
+- A writable `warehouse` inventory endpoint (core C1) and the remaining C4 coverage gaps.
+
+## Handover state (owner manual test)
+
+L2 `python3 -m tools.harness run correctness` PASS on the final tree
+(`.analysis/validation/20260913T034637-correctness-ualx2zif`, 333.8s) after one independent
+read-only review (`FinalReview`, 9m23s) whose verdict was **`changes`, `overall_correctness:
+incorrect`** — four findings, not a pass. Three were claim/evidence defects and are fixed:
+the structure-fit and wander receipts now state the shipped boundary (`max_opaque_y > anchor[1]`),
+record that the live acceptance run predates that correction and is owner-manual pending, and
+drop the imaginary `/fill` platform (the server has no `fill` command, so the wander A/B ran on
+natural terrain at 0,0). The review also established that villagers and golems share
+`GoalState::Wander`, so the global 6..32 reach moves idle villagers up to 32 blocks from home;
+a measured POI-leash policy is a separate queued checkpoint, not folded into this batch.
+Its fourth finding stays **open, not fixed**: the eight shipped blueprints that author cells at
+their local `y=0` (`farm`, `market`, `plaza_well`, `mine_entrance`, `pen`, `palisade_gate`,
+`stone_wall`, `fishing_pier`) do replace the terrain's top ground row when anchored flush with
+it, so "a structure is never built into terrain" is literally true only for the other fourteen.
+Deciding that rule (re-author their base rows hollow, or gate base-row blueprints to strictly
+above the terrain) is its own checkpoint.
+
+One harness test needed a determinism fix, not a product change:
+`survival_tnt_explosion_damages_mob_over_wire` raced the new wander — a summoned chicken
+walked out of the four-block blast radius while the fuse burned. A/B in
+`.analysis/codex-logs/tnt-mob-wander/repro.log`: with reach 3..4 the test passes, with 6..26 it
+fails. Fix: the test pins `minecraft:chicken` to `MobMovementPolicy::Immobile` through
+`bound.entity_behavior_handle().configure_mob_behavior_table(...)` before serve, which removes
+the incidental wander premise without touching explosion geometry.
+
+Delivered for the owner's field test: release binary installed at `~/.local/bin/solaris`
+(built from this exact tree) and the six packages deployed to `$HOME/sarvar/plugins`
+(`solaris-permissions`, `solaris-essentials`, `solaris-economy`, `solaris-towns`,
+`solaris-audit`, `solaris-settlements`), which the owner's existing config already points at
+through its relative `[plugins] directory = "plugins"`.
+
+## Buildings buried in terrain: diagnosed, guarded, and the real fix dispatched
+
+Owner report (screenshot + "по полу невозможно ходить, я застреваю в нём"). Evidence
+from the live probe world: the committed `solaris:house_small` at probetown has its floor
+planks at world y=73, windows at y=76 and roof at y=78 while the surrounding terrain is
+y≈79-80, and **the interior columns are solid stone**. The player stands inside terrain.
+
+Causal chain, from code plus world scan:
+1. `mc_worldgen::SiteCandidate::origin` always carries `y = 0`; its own doc comment says
+   "the y coordinate is resolved by the caller" and nothing resolves it, so
+   `/settlement site` reports `origin 1788,0,58` and the plugin's `S.site_anchor`
+   fallback (`y = site.min_y`) points at y=0.
+2. The structure anchor therefore came from the ordering player's position (the plugin's
+   `project ... here`), which stood on a slope, so the house was built inside the hill.
+3. `prepare_structure` validated bounds, claims and the survey token but never checked
+   that the reserved volume was free, while contract A03 requires invalid sites to be
+   refused or re-checked **without overwriting** terrain.
+
+Fixed by Main in core: `SettlementWorld::max_opaque_y(bounds)` (bounded per-column read,
+honestly named — it is an occupancy ceiling, not a terrain surface) plus the fit gate in
+`prepare_structure` that answers `Blocked` when `max_opaque_y > anchor[1]`: nothing may sit
+above the base row, and terrain level with it is the ground the structure stands on. The
+first revision of that gate allowed the row above as well and was corrected, because a floor
+authored at local `y=1` would then overwrite the terrain top. No
+terrain is ever cleared: an air/clearance write path was designed and rejected because it
+contradicts A03 and would need new blueprint semantics for water-bearing structures such
+as `fishing_pier` (which authors `minecraft:water` at local y=0 with its deck at y=1).
+Test `prepare_refuses_a_footprint_the_terrain_rises_into` covers the refusal, the
+flush-fit boundary and the unloaded footprint; `cargo test -p mc-net --lib` 2162 passed,
+clippy `-D warnings` clean, `run fmt` and `run code-health` PASS. Live proof: an
+obstructed anchor answered `Core refused the request: blocked.` in the real client.
+
+Independent confirmation, from agent `P1SquadHandle`: a resident entity sat at
+(1793, 2, 64) inside solid stone with terrain at y≈92 there, same cause (site POIs use the
+unresolved y=0 origin).
+
+Live proof on a **fresh** world (`.analysis/live-probe/gate_proof.py`, own `world_dir`,
+frozen binary `/tmp/mc-server-gate`): an anchor whose footprint contains terrain answers
+`Core refused the request: blocked.`, and a house committed and stood on the ground with its
+floor planks one row above the terrain top, glass walls and a 99-plank roof
+(`house_sm_1 committed (solaris:house_small) at revision 20`, raw column scan in
+`.analysis/codex-logs/structure-fit/floorscan.json`). That run predates the boundary
+correction — it anchored at `terrain_top - 1`, which the old `anchor + 1` rule accepted and
+today's rule refuses — so for the shipped revision the live *refusal* and
+`prepare_refuses_a_footprint_the_terrain_rises_into` are the matching evidence, and the
+accepted-anchor path is **owner-manual pending** (blocked gate, never green): the shipped
+revision's live evidence is the refusal plus the unit test, and the accepted-anchor gameplay
+check is the owner's own field test. Details, hashes and the tooling limits (stale
+client block reads after a build; `minecraft_press_inputs` not moving the player in this
+setup) are in `.analysis/codex-logs/structure-fit/receipt.md`.
+
+The site/POI vertical placement is still unresolved and is the next checkpoint. An agent
+grounded it from **live occupancy**; that is rejected and being reverted (`Unground`),
+because the canonical layout must stay a pure function of `(seed, revision, cell)` — the
+live read made `list`/`query` depend on loaded chunks and mutable blocks, so a distant
+site would answer `Unloaded` and the same settlement could report different coordinates.
+The deterministic design to implement next is
+`mc_worldgen::TerrainGenerator::surface_height(x, z)` (public, pure, "the same function
+the generator does") plumbed into `SettlementRuntime`, with the fit gate above still
+checking real world contents; the rule itself comes from the blueprint's own data (every
+shipped blueprint's `[footprint].anchor` equals its first `[[street_connection]].at`, and
+`fishing_pier` authors water at local y=0 with its deck at y=1).
+
+## Long-path world identity fixed (owner-relevant)
+
+Agent `WorldIdentity` (21m38s, pass) removed the 128-byte cap on the world identity input
+in `mc-script` (`resident_generation_id`): a deep server directory previously made
+`/settlement site` answer `Core refused the request: invalid_request.`. The returned id was
+already fixed-width 64-hex, so ids for paths ≤128 bytes are byte-identical (persisted CAS
+generation ids stay valid). Live proof at a 179-byte world path: `create` and `site`
+accepted. `cargo test -p mc-script` 128 passed, clippy clean, `run code-health` PASS.
+
+## Long-range mob wander (owner: "чтобы мир реально был живым и в движении")
+
+Wander targets were rolled 3..7 blocks from the agent's current position
+(`WANDER_MIN_DISTANCE 3.0` + `WANDER_DISTANCE_SPREAD 4.0`, `crates/mc-entity/src/lib.rs`),
+so the world read as static. They are now rolled 6..32 blocks. Because a target is
+rolled relative to the *current* position there is no home leash, so the wider reach
+becomes real roaming rather than a wider idle. Cost stays flat per tick: pathing is a
+greedy per-tick step under `PathingBudget`, so a longer walk costs ticks, not work, and
+an unreachable target is abandoned by the retained-path no-progress budget and re-rolled
+(aquatic agents discard the blocked target and re-roll the same way). Hostile mobs share
+the goal, so they roam too; villagers do not use it.
+
+Measured A/B on a clean 129x129 stone platform at y=119 with ten sheep summoned on a
+tight ring, sampled every 3 s for 60 s through the real MCP client, same world snapshot
+and therefore the same entity ids and the same deterministic angle sequence for both
+builds (before = `/tmp/mc-server-prewander`, mtime 09:23:48, the last build preceding the
+edit; after = `target/debug/mc-server`, mtime 09:40:51):
+
+| metric (60 s, 10 sheep) | before (3..7) | after (6..32) |
+| --- | --- | --- |
+| median net displacement | 15.98 | 33.40 |
+| max net displacement | 27.12 | 57.71 |
+| median travel | 79.85 | 106.39 |
+| smallest net displacement | 6.00 | 20.90 |
+
+Tests: `wander_targets_are_multiblock_and_not_synchronized` now samples the real roll
+path over 64 entity ids and fails if the reach drops back to a stroll;
+`wander_pauses_after_reaching_its_retained_target` derives its tick budget from the reach
+instead of a magic 80. `cargo test -p mc-entity --lib` 625 passed,
+`cargo test -p mc-net --lib mob_spin` 3 passed, `run fmt` PASS, clippy `-D warnings` clean.
+Raw method, binaries and totals: `.analysis/codex-logs/wander-range/receipt.md`.
+
+## Mob spin near leaves fixed and measured (owner bug)
+
+Agent `MobSpinFix` (52m23s) found the real cause, which is **not** leaf passability:
+leaves were already solid obstacles (oak_leaves state 279, probe `Blocked` inside),
+and no leaf-id special-casing was added. The wander pathfinder accepted a detour
+that moved the mob *away* from an unsatisfiable target, then walked it back; the
+no-progress guard only watched position deltas, so the ~0.9-block oscillation reset
+it, and `face_horizontal_motion` chased the flipping velocity — endless rotation
+(`crates/mc-entity/src/lib.rs`, `bounded_pathing_step`). Fixes: a detour is accepted
+only when it strictly reduces target distance or the body already overlaps terrain,
+otherwise `Blocked` (zero velocity, no rotation) and the existing cadence/backoff
+retargets; an overlapping agent gets a bounded cardinal escape (feet level and one
+block down) so one spawned *inside* a canopy walks out; the terrain probe now
+declares the entity position and escape probes.
+
+Measured live on its own server/ports with the real MCP client: pre-fix 4 sheep
+matched the spin (net movement < 1 m, yaw > 1700°/5 s); post-fix 0 matched, and
+3 spiders summoned inside the canopy walked out 11.2–26.7 m. Tests:
+`cargo test -p mc-entity` 625 passed, `cargo test -p mc-net --lib` 2162 passed with
+3 new `mob_spin` tests (one fails pre-fix), fmt/clippy/check clean. Known
+limitation, honest and recorded: an agent fully enclosed by a ≥2-block leaf pocket
+or embedded in a 1x1 trunk log can stay stationary when no cardinal neighbour is
+walkable — it no longer rotates, but it also cannot escape a sealed pocket.
+
+## Plugin ↔ C4 wiring landed; live combat blocked by one plugin bug
+
+Agent `P1C4Wiring` (43m5s) wired the shipped package to the C4 APIs and deleted
+every "needs core C4" placeholder: `assign/cancel_resident_work`,
+`issue/cancel_resident_order`, `demobilize_resident`, and
+`transfer_owned_items` with the `resident_equipment`/`resident_carry` endpoints
+(`main.lua` 4224→5468, manifest gained `resident_work`/`resident_orders`). It also
+fixed a real plugin bug (`squad <name> list` was unreachable) and reported one it
+did not fix: `create`'s durable operation id is not per-settlement, so founding a
+second settlement name returns `operation_conflict`.
+
+Main proved two thirds of it live on the running server (creative, then the dry
+site coordinate 1789/74/59 used by the earlier chain):
+- `hire` reads the employer's real player inventory and refuses with the exact
+  missing item — `Cannot equip 29ae7f40 as militia; missing from your inventory:
+  minecraft:leather_chestplate. Nothing was equipped.` — then after giving the kit:
+  `29ae7f40 serves as militia (core equipment: iron_sword,leather_chestplate).`
+  with `residents` reporting `service=military role=militia squad=alpha
+  gear=iron_sword,leather_chestplate`, i.e. C1's `resident_equipment` endpoint
+  really committed the gear.
+- `/summon minecraft:zombie` works and the squad record stores `order=hold`.
+
+**Remaining plugin defect found live**: `squad <name> order <squad> hold` answers
+`Squad alpha has no member with a core handle.` even though `residents` shows the
+same member with its handle and `squad list` reports `members=1 armed=1`, and
+`squad <name> add <squad> <handle>` prints nothing at all. So the squad record does
+not retain/resolve the resident's core handle, which blocks the order path (and
+therefore the live combat proof). Fix is plugin-side and small; it must be followed
+by the live proof: armed militia + summoned hostile → observed committed damage,
+then `dismiss` returning the gear.
+
+## Live re-verification on the gate-green build + the last gameplay gap
+
+After `correctness` passed, Main re-ran the live chain against the rebuilt binary
+(server + real MCP client, same six-package set and the same world, so persistence
+was re-proven too): `/settlement info probetown` still reports `houses=1` from the
+house built before the gate, and `/settlement populate probetown` now spawns a real
+resident through C3 — `29ae7f40 settled in probetown (alive_loaded), home
+site_3_0_31f075c1.0.home. House capacity is tracked by that home POI.` —
+`/settlement residents` shows `29ae7f40 family=unassigned job=- service=civilian
+squad=- life=alive_loaded`, `info` moves to `pop=1 houses=1`, and
+`grep -c "wall-clock budget exceeded\|plugin disabled"` = 0.
+
+**Last gameplay gap found by that probe**: the shipped plugin still answers
+`29ae7f40 serves as militia; equipment and orders need core C4.` and `Squad alpha
+order hold recorded; physical execution needs core C4 (issue_resident_order).`
+because it was written before C4's Lua surface existed and (correctly, per its
+brief) recorded the missing call instead of faking it. Core C4 is landed and
+gate-green, so the gap is purely plugin-side: agent `P1C4Wiring` is wiring
+`hire`/gear (`transfer_owned_items` with `resident_equipment`/`resident_carry`),
+`squad order` (`issue_resident_order`/`cancel_resident_order`), `job`
+(`assign_resident_work`) and `dismiss` (`demobilize_resident`), and must prove it
+live by summoning a hostile next to an armed militia member and showing committed
+combat damage with no ally hit.
+
+## Full L2 `correctness` gate PASSES on the whole settlement program
+
+`python3 -m tools.harness run correctness` → **status passed**, artifact
+`.analysis/validation/20260913T005844-correctness-8o6u6sbt` (supervised via
+`hub start name=correctness`; the earlier attempt died when its foreground job was
+lost). That is fmt + `code-health` + workspace clippy `-D warnings` +
+`cargo test --workspace --all-targets` green on the tree that now carries C1–C4,
+the settlement runtime, the loader protocol-3 cutover and the plugin-set changes.
+
+Two integration defects were found by the gate itself and fixed by Main before it
+went green:
+1. `code-health`: the new public plugin DTO
+   `ScriptClientViewFieldValue` (crates/mc-script/src/client_view.rs) lacked
+   `#[non_exhaustive]`; adding it exposed two exhaustive matches in
+   `crates/mc-net/src/play/session/loader_views.rs`, which now have explicit
+   catch-alls (a substituted-field refusal and a `FieldKind::Unknown` that cannot
+   match a declared model field) instead of being silently widened.
+2. `cargo test --workspace`: `crates/mc-server/tests/cli.rs`
+   `check_reports_derived_deployment_for_every_plugin` still built its fixture
+   plugin with `[client] schema = 1`, which the schema-2 cutover now rejects; the
+   fixture is schema 2 (`content = ["assets"]`, `permissions = ["load_assets"]`
+   remain valid pairs). 42 cli tests green after the fix.
+
+## C4 combat proven — five real executor bugs fixed
+
+Agent `A10Combat` (43m33s) removed both `#[ignore]`s after finding the recorded
+reason was a **misdiagnosis**: `resident_perception` does see a spawned zombie; the
+executor was wrong in five places, each a gameplay bug, not a test artifact:
+1. proximity orders dropped their engagement radius (`let _ = engagement_radius`),
+   so Hold/patrol never perceived anything;
+2. no order ever issued a *fresh* target ref (only TTL-refreshed resolved ones), so
+   the Attack op was unreachable — proximity orders now perceive with their own
+   radius, fill targets and mint server-issued refs, with attack refs deduped;
+3. ranged detection used `weapon.ends_with("_bow")`, which is never true for
+   `minecraft:bow`, so the ammunition gate was dead and every "archer" meleed;
+4. a dead guard (`references.get(&uuid_of(record))` — the attacker is not in the
+   target-ref map) aborted every attack;
+5. the ally set was matched against the member's *handle* instead of resolved
+   resident handles, so allies were issued and could be hit.
+
+Tests: `cargo test -p mc-net --lib --features load-bench resident_order` → 11
+passed, 0 ignored; full mc-net lib → 2152 passed, 8 ignored; fmt/clippy clean;
+`cargo check -p mc-server` clean. Six mutations each fail the named assertion
+(ammo, LOS, ally-hit, ally-issued, retreat, patrol-resume), so the tests defend
+behaviour rather than plumbing.
+
+Residual to prove live (I1 item, not a code gap on this evidence): production
+residents are not tracked through the session-local fixture path the tests use, so
+their perceivability must be confirmed on a running server (spawn/claim a resident,
+put a hostile nearby, order an attack, observe committed damage). The per-tick
+simulation-input publication path is the expected tracker; that assumption is not
+yet verified outside unit tests.
+
+## Loader wire cutover closed (protocol 3 / schema 2 both sides)
+
+Agent `L1Core` (33m9s, verdict `pass`) landed the core half: bundle schema 2 with
+no schema-1 decoder, Loader protocol 3, the full wire-3 view lifecycle
+(`crates/mc-net/src/play/session/loader_views.rs`, `script_client_view_endpoint.rs`,
+`crates/mc-script/src/client_view.rs`), client ingress `view_action` /
+`cancel_selection` admitted through ledger-owned permission pairs and re-read per
+action, single-use tick-expiring selection contexts invalidated by
+replacement/close/disconnect/revocation, and a clean cutover that deleted
+`ScriptClientUi`, `present_client_ui`, `loader_interaction` and their endpoint
+files/tests. The shipped `examples/loader-live-gate` fixtures were migrated and
+rebuilt. `docs/PLUGINS.md` now states that no shipped package declares `[client]`.
+
+Main verified the cross-repo signal directly, not just through the profile: the
+harness `java` profile reports `loader-core:test` as UP-TO-DATE (the fixture test
+reads a system property), so I forced
+`./gradlew --offline --no-configuration-cache --rerun-tasks :loader-core:test
+--tests '*LoaderLiveGateFixtureTest*'` → BUILD SUCCESSFUL with
+`LoaderLiveGateFixtureTest tests=2 failures=0 errors=0 skipped=0` (written 02:07).
+Harness receipt: `20260912T190619-java-1p3l15pg`. Also green: mc-script 262
+passed, mc-net `loader_view` 6, `script_client_view` 3, `cargo check -p mc-server
+--all-targets`, fmt and clippy clean.
+
+Two intentional deferrals, now written into the frozen wire doc as the shipped
+contract rather than left as open gaps: (1) the marker payload on the wire is
+`{ marker_id, selection_token, action_id, formation, radius }` — the earlier
+`selection_context_id`/`preview_id` naming was never implemented, and the
+projection binding (`world_preview_ref`) plus the V/R `view_request` message stay
+deferred with the Loader UI feature; `LoaderViewRequest.java` is the intended
+carrier for the latter. Declared view kinds and `revoke_loader_views` are
+implemented and unit-tested but unwired while no `[client]` package exists.
+
+Next: A10 — `resident_perception` does not see a test-spawned hostile, so the C4
+archer-ammo/LOS/ally-policy and attack→retreat→patrol behaviours are implemented
+but unproven (both tests `#[ignore]`d with that reason).
+
+## C4 execution landed (verified)
+
+Agent `C4Exec` (56m38s, verdict `changes`) landed the mc-net execution half:
+`script/storage/resident_orders.rs` (870), `resident_order_execution.rs` (2429),
+`play/resident_work.rs` (418), `play/session/resident_orders.rs` (294),
+`resident_order_tests.rs` (1278). Design: an order change rides inside the existing
+`PreparedStorageBatch` and its operation receipt (`OP_RESIDENT_ORDER_CHANGE` /
+`OP_SNAPSHOT_ORDER`), so the admission frame *is* the commit; `recover_resident_orders`
+applies pending members exactly once at actor start; server-issued target refs are
+persisted with the batch and forged/expired/allied/out-of-reach/wall-blocked targets
+are refused; damage commits through `damage_batch_if_current` fenced on the observed
+snapshot. mc-script's frozen DTOs needed no change.
+
+Independently re-run by Main: `cargo test -p mc-net --lib --features load-bench
+resident_order` → 9 passed, 0 failed, 2 ignored; `cargo fmt`/`clippy -D warnings`
+clean for mc-net/mc-script/mc-entity; `cargo check -p mc-net --all-targets
+--features load-bench` clean.
+
+Proven: A08 (harvest needs its tool and commits real drops; craft consumes inputs
+exactly once; haul moves items between canonical resident endpoints across process
+boundaries), A09 (a squad reforms through an open passage and refuses a closed one
+with `blocked_route`, no teleport, distinct slots), A11's stale-member leg (a member
+dying between prepare and commit changes no order), A12 (a committed admission
+replays exactly once and a repeated operation id with a new payload conflicts),
+demobilisation without a warehouse keeps the handle and the gear. The tests also
+caught and fixed a real bug: haul re-used a stale slot clone and over-reported work
+units.
+
+Open C4 gaps, each recorded rather than papered over:
+- A10 and the attack leg of A11 are `#[ignore]`d with an explicit reason:
+  `resident_perception` returns no candidate for a test-spawned hostile, so the
+  archer-ammo/LOS/ally-policy and attack→retreat→patrol behaviours are implemented
+  but unproven. This is the next C4 item after `L1Core`.
+- Garrison post occupancy has no POI → position resolver yet (reports `blocked_route`);
+  demobilisation cannot complete without a warehouse resolver; `construct` is wired
+  to C2's committed reservation but has no focused test.
+- C1's Lua `transfer_owned_items` still rejects the `resident_equipment` /
+  `resident_carry` endpoint kinds, so player↔resident gear movement through the
+  script API is not exercisable yet (the execution layer moves gear internally).
+
+## Open regression carried into the next wave: Loader protocol cutover
+
+Wave-1 agent `LoaderSchema2` cut the Loader to bundle **schema 2 / wire protocol 3**
+and made schema-1 bundles fail closed, but core still advertises protocol 2 and
+schema 1: the core L1 endpoint (`open/present/close_client_view`,
+`begin/cancel_client_selection`, `on_loader_view_action`, `view_request`) was never
+built, so a Loader client and the current core disagree on the handshake. The Loader
+repo's own gates are green (`python3 -m tools.harness run java` PASS,
+`20260912T173749-java-bi9gs9sg`) and `loader-live` is the cross-repo gate that stays
+red until core lands the cutover.
+
+Plan: land the core L1 endpoint as the next mc-script slice *after* `C4Exec` (both
+edit `operations.rs` / `lua/operations.rs` / `lib.rs`, so they must not run
+together). Frozen decisions to implement, from
+`'/home/kaiserroman/.omp/agent/sessions/-solaris/2026-09-11T15-31-29-764Z_01a09118-6364-762a-a2ac-b4dd04f8e34c/local/settlement-wire-freeze.md'`:
+- `view_request { request_kind }` with `request_kind ∈ {settlement, army}` is the
+  client→server open request; the Loader-side `LoaderViewRequest.java` is that
+  message, not dead code — core must accept it, admit by session + owning plugin +
+  declared view permission, deliver it to that owner, and open nothing on refusal.
+- the selection context id is a **top-level field of the marker model**
+  (`markers[].selection_context_id`), not buried in an unspecified inner shape;
+- a view/marker binds to a verified projection through `world_preview_ref` on both
+  sides (markers reference a `world_previews[]` entry of the same bundle);
+- `entity_presentations` stays deferred (C4 may claim it later).
+Owner decision still holds: no shipped plugin declares `[client]`, so nothing
+Loader-facing is *enabled* — this slice only restores cross-repo agreement.
+
+## Other carried items
+
+- `materialize_resident` (C3 worldgen seam) still carries a localised
+  `#[allow(dead_code)]`; `reserve_resident_site` is used by C2Runtime, the
+  materialiser stays unused until the plugin's `populate` path lands. Remove the
+  allowance when that caller exists.
+- The regression manifest `docs/real-client-regression/manifests/m94-regression-pack.json`
+  lacks boolean `no_debug_commands` on 6 of 21 scenarios (including
+  `m94-01-join-rejoin-chunks-movement`), so `run regression --run` rejects them.
+  Not "fixed" blindly: labelling a scenario's debug-command policy wrongly would
+  weaken a gate; decide per scenario when that manifest is next touched.
+- Money stays a plugin-side ledger (solaris-economy / the settlements treasury
+  projection); there is no core money authority, and none may be invented.
+- Probe attribution: the live probe above ran against
+  `target/debug/mc-server` sha256 `446e17b57d0b821e228f2767025db183cbd3747a0c2abc6d72cf2e3ee7ea5c0e` (rebuild it before re-probing; see
+  `.analysis/codex-logs/live-probe/receipt.md` for the full commands and log lines).
+
+## Live probe of the default plugin set (owner request)
+
+Set installed with `../solaris-default-plugins/install.sh` into
+`.analysis/live-probe/plugins`: solaris-permissions, solaris-essentials,
+solaris-economy, solaris-towns, solaris-audit, solaris-settlements; config
+`.analysis/live-probe/server.toml` (absolute directory, strict, six expected ids,
+operators SolarisMcp/SolarisPrimary). `--check` shows all six discovered as
+`deployment: "server_only"` with no client bundles or permissions, i.e. the
+server-side v1 decision holds. Canonical gate: `run regression --run` with
+scenario `m94-02b-rejected-block-resync` PASSED in 27.0 s
+(`.analysis/validation/20260912T165404-regression-zjobn0xi`) driving a real
+Gradle client under Xvfb.
+
+All six plugins answered with their own messages, including operator and
+adversarial paths (`Only an operator ...` refusals, usage text for wrong args,
+`Cannot create that town.` on a repeat, `Chunk is claimed ...` on a repeat claim,
+`No matching bounded audit records.`). Full table in
+`.analysis/codex-logs/live-probe/receipt.md`.
+
+Settlements v1 is live server-side: `/settlement create probetown small` ->
+`Founded probetown (small hamlet).`, `list`/`info` report real progress
+(`Next village missing: houses 0/9, residents 0/24, jobs 0/12, food 0/64,
+committed meeting hall; pause=running`), `/settlement site probetown` prints the
+C2 deterministic candidates (`site_3_0_31f075c1 village origin 1788,0,58 size
+192,32,192 buildings=12`, `site_1_0_0ac99d6a hamlet ... 128,32,128 buildings=8`),
+`adopt` commits (`Adopted site_3_0_31f075c1 (village): 12 buildings, 8 points of
+interest, revision 0.`), the workflow gates correctly (`Adopt a deterministic site
+first`, `Survey the plot first`), records survive a server restart, and startup
+logs `settlement blueprint catalog validated ... blueprints=22`.
+
+**Fixed and re-verified live**: agent `SurveyBudgetFix` (32m) measured the real
+cause — the request was fine (core survey 2.1 ms at 64x64, 8.1 ms at 128x128,
+never loads chunks); the *script-visible result* carried one Lua record per
+surface column (<=16,384 records; 47 ms at 4096, 190 ms at 16384) against the
+50 ms `HOST_EVENT_WALL_BUDGET`, so `set_result` alone guaranteed the trap. The fix
+is a bounded aggregate snapshot (plots/water/claimed/chunks/tags) instead of
+per-column records; no deployed plugin read the columns, so no plugin change and
+no tiling (which would have shipped dead data) was needed. Per-column heights and
+slopes deliberately no longer cross the script boundary.
+
+Post-fix live chain, same real client: survey -> `plots=4096 chunks=loaded`,
+project -> `house_sm_1 projected (solaris:house_small, 4 stages)`, fund without
+materials -> `Not enough materials in your inventory; nothing was reserved.`,
+fund with the authored materials (planks 314/oak_log 16/glass 10/red_bed 10/
+torch 2/oak_door 2/crafting_table 1/chest 1) -> `Reserved real materials for
+house_sm_1 (84c74c16...)`, build -> `house_sm_1 committed (solaris:house_small)
+at revision 28.`, `/settlement info` -> `houses=1`, and a client block scan at the
+anchor shows 32 oak_planks / 4 oak_log / 2 glass / 1 torch, i.e. the building is
+physically in the world. `grep -c "wall-clock budget exceeded"` = 0.
+Screenshots: `.analysis/live-probe/house-front.png`, `house.png` (captured,
+unverified visually).
+
+Historical record of the defect: `/settlement survey probetown plot` trapped the Lua host
+(`Lua plugin disabled after handler failure plugin=solaris-settlements error=Trap
+{ message: "wall-clock budget exceeded" }`), after which the plugin was disabled
+and later subcommands answered `Unknown command` (root cause and fix above).
+
+Also noted: `m94-01-join-rejoin-chunks-movement` cannot run via the harness
+because the regression manifest does not declare boolean `no_debug_commands` for
+it (6 of 21 entries lack it) — manifest gap, not a server bug.
+
+## Settlement overhaul program — waves
+
+Owner order: "добивай поселения полностью" with subagents authorized (still capped at
+two concurrent, disjoint write sets). Contract:
+`../solaris-default-plugins/SETTLEMENT_OVERHAUL_CONTRACT.md` §10 queue. Frozen
+shared interfaces written as local artifacts (not repo files):
+`local://settlement-wire-freeze.md` (bundle schema 2 / wire 3, resolved the four
+gaps the Loader pass reported: selection context id travels in
+`model.markers[]`, markers reference a verified `world_previews[]` entry,
+key-driven open uses a `view_request` message admitted server-side, entity
+presentation stays deferred) and `local://settlement-blueprint-freeze.md`
+(blueprint schema 1, authoring layout, hard limits, determinism, ruins).
+
+Wave 1 (uncommitted):
+- **C3 persistent residents** (agent, 42m23s, verdict `changes`): five §6.1 calls
+  (`claim/spawn/query/release/set_resident_pois`) as closed DTOs on the C1
+  operation envelope, `persistent_residents` capability replacing the old
+  `villagers` API, core-owned `ResidentLedger` replayed from the plugin storage
+  journal (OP_RESIDENT_CHANGE 13 / OP_SNAPSHOT_RESIDENT 14) so a handle resolves
+  to the same UUID after reopen and reports `alive_unloaded`, not `dead`.
+  Files: `mc-script/src/resident_operations{,_tests}.rs`,
+  `mc-net/src/script/storage/residents.rs` (1166) + `resident_tests.rs` (438),
+  `mc-net/src/play/session/script_resident_endpoint.rs`.
+  Not finished: site-bootstrap wiring (C2), POI validity (C2), `resident.changed`
+  notifications and assignment exclusivity (C4).
+- **L1 Loader half** (agent, 32m8s, verdict `pass`) in `../solaris-loader`:
+  schema 2 / wire 3 cutover, closed widget set, view-instance + selection-context
+  lifecycle, bounded model validation, world-selection input, one shared
+  model/validator/presenter for all three adapters, no schema-1 decoder left.
+  Graphical U01–U06 still need the harness and the core endpoint (below).
+
+Main integration work after wave 1: `cargo fmt`/`clippy -D warnings` clean for
+mc-script/mc-net/mc-entity. Fixed by shrinking the shared types rather than
+boxing 29 call sites: both heavyweight `ScriptOperationPayload` variants
+(`OwnedInventory`, `Resident`) now hold `Box<...>`, which removed both
+`large_enum_variant` findings (C3's new results had grown the old outcome enum);
+deleted dead `track_villager_override` and `bootstrap_resident_change`; the two
+worldgen-facing seams `materialize_resident`/`reserve_resident_site` are kept
+with a localised `#[allow(dead_code)]` and a reason naming C2 as their caller.
+Evidence: mc-script `--features lua-runtime` 233 passed, mc-net lib 2118 passed /
+8 ignored, mc-net `--all-targets` compiles.
+
+Known debt from wave 1:
+- `crates/mc-entity/src/regional.rs` still carries the unreachable old villager
+  binding lane (`claim_nearest_villager`, `apply_villager_binding_goal`,
+  `release_villager_binding`, purge hooks, `villager_binding_tests.rs`) with no
+  callers: delete it in the entity/C4 wave.
+- `../solaris-default-plugins/colony-villager-scaffold` still calls the removed
+  villagers API: the contract deletes it when P1 lands.
+- Wave 1 broke `crates/mc-test-harness/tests/commands.rs`
+  (`lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_result`
+  fails 0 vs 1); wave 2 migrates it to the resident API.
+
+Wave 2 closed:
+- **C2 catalog/sites/construction** landed by agent `C2CatalogSites`, which then
+  failed (exit 1) after 1h4m before reporting; the integration owner verified the
+  tree and wrote `.analysis/codex-logs/c2-catalog/receipt.md` from verified state.
+  Landed: `mc-script/src/settlement_operations.rs` (1097) + tests, catalog loader
+  and deterministic sites in `mc-worldgen/src/settlement_catalog*.rs` /
+  `settlement_sites*.rs`, execution/receipts in
+  `mc-net/src/script/storage/settlement.rs` (1996) + tests (1612),
+  `session/settlement_authority.rs`, Lua install, `docs/PLUGINS.md`.
+  Main ruled and the implementer landed the bound split: 64-axis is a blueprint
+  bound (`MAX_BLUEPRINT_FOOTPRINT_AXIS`), a site is territory
+  (`MAX_SETTLEMENT_SITE_AXIS = 256`), pinned by
+  `site_territory_footprint_is_accepted_above_the_blueprint_bound`; the interim
+  "report the built layout bbox" workaround was rejected. Verified: fmt/clippy
+  clean for mc-script/mc-net/mc-worldgen, mc-script settlement 22 passed,
+  mc-net settlement 36 passed, mc-worldgen settlement modules green, determinism
+  (A02), catalog rejection, rotation, survey/prepare/cancel/replay coverage.
+- Harness fallout fixed by agent `C3HarnessTail` (19m10s):
+  `mc-test-harness/tests/commands.rs` migrated to `persistent_residents`
+  (13 passed), and `cargo fmt -p mc-test-harness` closed the last fmt debt — the
+  workspace `cargo fmt --all --check` is now clean (0 diffs).
+
+Wave 3 in flight: **C4** (resident work orders, squad orders/formations,
+cross-region group admission, combat commits, equipment, plus deleting the dead
+mc-entity villager binding lane) and **P1 v1 server-side** (the merged
+`solaris-settlements` package: strict manifest, authored blueprints, growth /
+economy / population domain logic, no Loader dependency).
+
+Owner decision recorded: settlement plugin **v1 is server-side only**; everything
+Loader-dependent stays implemented-but-disabled (`local://settlement-wire-freeze.md`
+frozen, Loader repo work landed and unused for now). Next after wave 3: a live
+probe of the default plugin set with a real player, then fixes.
+
+## Bounded region pregeneration CLI + login-burst flake closed
+
+`mc-server --config server.toml pregenerate --from x,z --to x,z` (uncommitted,
+base tree f77525da). Inclusive block corners, either order, rounded outward with
+`div_euclid`; fail-closed cap `MAX_PREGENERATE_CHUNKS = 4_194_304` (4096x4096
+chunks). Runs the same startup path as serve (contract/baseline/seed), generates
+the spawn window plus the rectangle through one shared worker batch
+(`generate_chunk_positions(..., label)` — `label` = "spawn" keeps the tested
+panic/incomplete messages), flushes dirty chunks, logs
+`region pre-generation finished; every chunk is on disk`, exits before the
+listener. Args need `allow_hyphen_values = true`: clap's negative-number
+heuristic rejects `-600,900` because of the comma (`allow_negative_numbers` is
+not enough).
+
+Evidence: debug run `--from 2000,2000 --to 2060,2060` -> 16 region chunks,
+`flushed=241`, `world/region/r.3.3.mca`; installed release (`~/.local/bin/solaris`,
+18:16) `--from -600,900 --to -450,1050` -> 100 chunks, region `r.-1.1.mca`;
+serve then opened that world with `existing world startup spawn window warmed
+... region_files=8` and reached `Solaris is listening`. Tests: unit
+`parses_pregenerate_block_coordinates`, `region_positions_normalise_corners_and_refuse_absurd_requests`,
+`region_pre_generation_stores_every_requested_chunk_and_repeats` (reopens the
+storage and proves the chunks are on disk); CLI
+`pregenerate_rejects_malformed_block_coordinates`,
+`pregenerate_cannot_be_combined_with_check`,
+`pregenerate_accepts_negative_coordinates_and_repeats_on_a_fresh_world` (real
+binary twice on one tempdir world: success, `solaris/world.json`, region files).
+
+Flake closed: `plugin_owned_command_argument_limits_do_not_terminate_play_ingress`
+(crates/mc-server/tests/play.rs) failed under load because the test client never
+read the login burst (tab list + roster fills the socket), so the session task
+blocked writing and `PlayerCommand` missed the 2s budget. Fix is the file's own
+convention: `drain_initial_play_burst` after `drive_to_play`. 8/8 green at
+0.76-0.80s (failure path was 2.5s). No production change.
+
+Gates: `cargo test -p mc-server --all-targets` green (79 lib / 46+1 ignored bin /
+2 / 42 cli / 14 / 0+4 ignored / 12 / 1 / 19 play / 2), `cargo fmt -p mc-server
+--check` clean, `cargo clippy -p mc-server --all-targets -- -D warnings` clean,
+`code-health` PASS (20260912T111836 and 20260912T111927). Workspace `cargo fmt
+--all --check` still reports 58 pre-existing diffs, all in
+`crates/mc-test-harness/tests/**`, none touched here.
+
+Docs: `docs/OPERATING.md` "Pre-generating a region" + worldgen revision 21 text
+(was stale at 20) + console-vs-CLI operator/whitelist wording (console commands
+apply live, standalone CLI applies at next start) + `whitelist.json` defaulting;
+`README.md` mentions the subcommand.
+
+Reviewer round (read-only agent `PregenerateReview`, 7m5s, verdict
+"incorrect", 0.8) found five real defects, all fixed:
+1. `pregenerate` wrote Solaris terrain into an unversioned vanilla Anvil import
+   that serve keeps read-only -> `ensure_pregenerate_target` now bails
+   fail-closed on `WorldSource::ExistingVanilla`;
+2. `insert_generated_chunk` bypasses the disk-first rule, so a rerun rewrote
+   stored chunks (reviewer measured changing md5s) and would erase in-game
+   edits -> `WorldStorage::chunk_is_stored` (resident-or-on-disk probe, no
+   payload load, no generator) + `pending_region_positions` split; the log now
+   reports `chunks/generated/skipped/flushed` and stored chunks are never
+   regenerated;
+3. the constant comment and the operator doc called 4,194,304 chunks a
+   4096x4096 square -> corrected to 2048x2048 in both places;
+4. the CLI test's `regions.count() > 0` passed on spawn-window files alone ->
+   now asserts the rectangle's own r.-2.1/r.-1.1/r.-2.2/r.-1.2 files;
+5. the cap check ran after the world had been created and the spawn window
+   generated -> positions (and the cap) are resolved before the world is
+   touched, so an oversized request cannot create a world.
+
+Those fixes are verified live with the rebuilt release binary (installed
+`~/.local/bin/solaris`, 12:00):
+- oversized request `--from 0,0 --to 999999999,999999999` -> `error: requested
+  region covers 3906250000000000 chunks, above the 4194304 chunk pre-generation
+  cap` and the world directory is never created;
+- first run of the -600,900/-450,1050 rectangle -> `chunks=100 generated=100
+  skipped=0 flushed=325`; second run -> `chunks=100 generated=0 skipped=100
+  flushed=0` and `md5sum -c` reports all four region files unchanged, so a rerun
+  no longer rewrites stored chunks or in-game edits;
+- unversioned-vanilla-import refusal is pinned by
+  `pregenerate_refuses_an_unversioned_vanilla_import` (a live vanilla import is
+  not reproducible locally, so this evidence is code-level only).
+
+Final gates on the combined tree (my checkpoint plus the C1 inventory work):
+`cargo test -p mc-server --all-targets` green (79 / 47+1 ignored / 2 / 42 / 14 /
+0+4 ignored / 12 / 1 / 19 / 2), `cargo test -p mc-net --lib owned_` 27 passed,
+`cargo fmt -p mc-server -p mc-world --check` clean, `cargo clippy -p mc-server
+-p mc-world --all-targets -- -D warnings` 0, `code-health` PASS
+(20260912T120025).
+
+## Settlement contract C1 (inventory) — delegated slice complete, uncommitted
+
+Agent `C1Inventory` (39m56s, verdict `changes`) implemented the C1 inventory half
+on top of the existing DTO layer: `inventory_transfers` capability through the
+existing `required_features` gate, 5 Lua functions installed, new
+`crates/mc-net/src/play/session/owned_inventory_endpoint.rs` +
+`crates/mc-net/src/script/storage/owned_inventory.rs`, and one durable
+world-journal decision per mutation carrying the plugin receipt and the player
+after-image (idempotent by `operation_id` + canonical fingerprint; typed
+failures). Its crash test forks the process and `kill -9`s at three durable
+boundaries, then reopens and replays: the item moves exactly once, and reverting
+to two independent writes fails the test. Receipt:
+`.analysis/codex-logs/c1-inventory/receipt.md`.
+
+Two documented gaps, both correct scope boundaries rather than shortcuts:
+1. the warehouse endpoint cannot resolve container block-entity NBT from the
+   storage actor (that needs `&mut mc_world::WorldStorage` in the simulation
+   interaction path); the endpoint kind is defined and fails closed with
+   `unloaded`, and the handle issuer is documented for C2, so player<->warehouse
+   transfer and cross-endpoint reservation blocking are not exercisable yet;
+2. reservation `consumed` is always 0 in C1 because consumption receipts are
+   written by the C2/C4 world/work operation; release arithmetic and the
+   blocking predicate are implemented and tested.
+
+next: owner decides whether to keep the pregenerate chunk cap and whether to
+commit these two checkpoints; the next contract task is C3 (persistent resident
+handles) or C2 (catalog/sites), which also unblocks the warehouse endpoint.
 
 ## GitHub release v0.0.6 republished with current binary
 
@@ -1665,3 +2588,123 @@ then L2 `correctness`. `SKELETON_SHOT_PERIOD_TICKS` const removed; do not
 re-add. `.analysis/server.jar` (official Mojang download, ignored) + vineflower
 decomp under /tmp/decomp (Cow/Sheep/Pig/Chicken/PanicGoal/Zombie/Skeleton/
 AbstractSkeleton/RangedBowAttackGoal) back further vanilla checks.
+
+## Tab-list checkpoint 2026-09-12 (uncommitted, L1 green)
+Config-driven tab list: `ClientboundTabList` (0x7A, header/footer NBT),
+`[tab_list]` in `example.toml`, login burst sends full roster + header/footer
+(skipped when both empty), join broadcasts add, leave broadcasts remove,
+game-mode changes broadcast `UPDATE_GAME_MODE`. Roster entries carry live
+`game_mode` (was hardcoded 0). `OutboundCommand::PlayerInfo/PlayerInfoRemove`
+dispatched via trailing `Some(cmd)` arm + `write_player_info` helper
+(play_loop_inner gateway budget 731 holds). Fail-closed codec kept: test
+profile renamed `InitialRecipeSync` (17) -> `InitialRecipe` (16) instead of
+truncating production names. Removed dead `OutboundCommand::TabList` variant.
+Gates: mc-net lib 2090/0, mc-protocol 321/0, fmt clean, code-health PASS,
+clippy clean except pre-existing furnace collapsible-if (FurnaceBoats-owned).
+NOT committed (no authorization). Biome blotches seed 9700063978612627 still open.
+
+## Biome-river checkpoint 2026-09-12 (uncommitted, L1 green)
+Seed 9700063978612627 diagnosis (TellusLike): macro continents healthy (2km+
+masses, smooth J/G/D borders on 8km map); sampled lowland river textbook
+(sand bed, water 2-5, clean banks). Real defect: weak upland carves routed
+as warm_ocean stripes (river field 0.03 at w~0.7 missed the 0.016 band that
+only covered the w>0.84 core) with grassy savanna shallows at y62-63.
+Fix: TELLUS_RIVER_BIOME_WIDTH 0.016->0.04 (covers carve to w~0.6, open water
+stays 1.0->ocean; 0.05 tried first but ate the riparian-wetland shoulders
+pinned by generated_riparian_wetlands test). No river/swamp reorder, no
+field rescale (both wider blast radius). WORLDGEN_REVISION 20->21 (biome
+layout change; old worlds must wipe per startup gate). Regression:
+tellus_carved_channel_routes_river_wall_to_wall. Gates: mc-worldgen
+138+1+12/0, fmt clean, code-health PASS. Straightness: mapped reaches
+meander; residual downhill-chain coherence is a known accepted tradeoff
+(branch jitter 0.22, see drainage comment). NOT committed.
+
+## Beach-shore checkpoint 2026-09-12 (uncommitted, L1 green)
+Seed 1785772562805887200 field report (screenshots): grass underwater at the
+waterline + beach sheets across flats. Transect (1283,1740-1832) reproduced
+plains y62 + water over grass. Fix 1 (kept): below-sea non-river/swamp/ocean
+land routes to shore in Tellus (`tellus_sub_sea_land_routes_shore_not_grass`).
+Fix 2 (kept): Tellus shore capped at sea+1 (`tellus_beach_stays_near_waterline`;
+y65+ sheets -> climate, y63-64 fringe stays). sea+0 tried, reverted (killed
+y64 berm, broke 2 coastal tests). Rivers on this seed verified healthy
+(sand beds, water 2-5, meandering with anabranching knots at confluences).
+Revision stays 21. Release binary rebuilt+reinstalled with all fixes.
+Queued tuning (owner): rougher meanders, softer biome transitions, more land
+share. (Live operator/whitelist landed 2026-09-12.)
+
+## Live operator/whitelist checkpoint 2026-09-12 (uncommitted, L1 green)
+Console `operator add|remove` and new `whitelist add|remove|list` now take effect
+without a restart. Single live source: `CommandPermissionConfig.operators` and
+`LoginAccessConfig.whitelist` are `Arc<ArcSwap<BTreeSet<String>>>`; login reads
+the whitelist at the check, and chat-command ingress re-resolves op via
+`live_permissions_for` (loopback dev fallback stays valid only while no operator
+is configured) and re-sends the command tree when it changed. `operator list`
+and `whitelist list` report the effective live set.
+Persistence mirrors the file manager: `manage_access_file` with
+`AccessControlTarget::{Operators,Whitelist}`, console defaults `ops.json` /
+`whitelist.json` beside the config, and startup auto-loads `whitelist.json` when
+`auth.whitelist_file` is unset (as it already did for `ops.json`).
+`operator_file_tests.rs` renamed `access_control_file_tests.rs`.
+Known limit: enforcement toggle (`whitelist_enabled`) and online clients'
+initial command tree still need a config edit/reconnect; the F3+F4 game-mode
+packet path uses login-time authority until reconnect.
+Gates: mc-net lib 2093/0, mc-server 78+40+39+14/0, fmt clean, code-health PASS,
+`clippy -D warnings` clean (furnace collapsible-if collapsed). Release binary
+rebuilt + reinstalled.
+
+## River/beach realism checkpoint 2026-09-12 (uncommitted, L1 green)
+Owner field reports on seed 1785772562805887200 (screenshots): grass under
+water, beach sand cutting dry valleys, rivers starting at full width out of
+nowhere, no gravel in river beds, no savanna found.
+- Beaches now require adjacent water: `tellus_biome_for` probes one step (6
+  blocks) for a sub-sea neighbour, so a y64 flat 140 blocks from water keeps
+  its climate instead of a sand band (`tellus_beach_never_cuts_dry_ground_inland`).
+  The two coastal design tests now pin a shoreline column (seed 712816 at
+  -448,-32) because synthetic inland samples no longer qualify.
+- River beds mix sand with gravel bars: two-octave field, scale 34, threshold
+  0.30 (~16% of bed measured), `river_beds_carry_gravel_bars_between_sand`.
+- Headwaters taper: Tellus only, `drainage::sample(..., taper_headwaters)`
+  scales the minimum channel width by reach strength. VanillaLike keeps the
+  flat 20-block minimum so its terrain and the 3-block step budget stay
+  byte-identical (measured: Tellus worst step 3, 0 violations; VanillaLike
+  continuity test green again).
+- Savanna exists on that seed (hot_dry is ~4% of land, vanilla-like):
+  first at 1840,-3072, also 2176,-2928, 2560,-2656, 2176,-2544, 2576,-2544;
+  a plains at 2848,-2464. No code change.
+- Villages: diagnosed as unreachable by default. `structure_rules_for_startup`
+  only builds village rules from a Luau settlement plan
+  (`PreparedLuaPlugins::worldgen_settlement_plan`) plus `data.vanilla_data_dir`;
+  `example.toml` sets neither, so a stock server generates zero villages.
+- WORLDGEN_REVISION stays 21 (still unpublished). Binary rebuilt+reinstalled
+  at ~/.local/bin/solaris (17:28).
+- Queued owner asks: tectonic-plate canyons/mountains, Chunky-style bounded
+  pregeneration, more realistic mob spawning, village availability, redstone
+  and pistons (delegated to the `RedstonePistons` subagent, uncommitted).
+
+## Villages + redstone checkpoint 2026-09-12 (uncommitted, L1 green)
+Villages are reachable without a plugin: `[data] settlement_profile =
+"plains_village_prototype"` builds the vanilla plains prototype from
+`vanilla_data_dir` (still required; Mojang NBT never enters Git). A deployed
+plugin settlement plan still wins and stays the recorded identity, otherwise the
+built-in profile name is recorded. Verified end-to-end locally: startup logs
+`materialized built-in settlement prototype profile="plains_village_prototype"`
+and the sidecar tests now skip-when-absent instead of `#[ignore]`, asserting the
+built-in profile changes >200 generated blocks around the fixed centre.
+Redstone/pistons landed by the `RedstonePistons` subagent (uncommitted):
+`crates/mc-net/src/play/redstone/` (power model, event-driven settle,
+atomic piston moves, 17 new tests) plus the old one-hop power fanout deleted
+from `toggles.rs`; fence = 256 positions/settle, 1024/tick, 64 ticks/commit,
+work beyond a cap is dropped and counted (`budget_drops`) rather than deferred.
+Deviations are documented in the module header (no piston animation packet,
+no strong-power relaying, one scheduled tick of latency for non-interactive
+edits, no quasi-connectivity).
+Known flake, not fixed here: `plugin_owned_command_argument_limits_do_not_
+terminate_play_ingress` (2s script-event budget; 1 pass / 3 fail under load).
+A/B evidence: it still flakes with the tab-list burst disabled and with the
+live-permission refresh disabled, so it is load-sensitive, not a feature
+regression. `crates/mc-server/tests/play.rs` is unmodified apart from the
+required `tab_list` struct-literal lines.
+Gates: mc-net lib 2110/0, mc-server 79/43/2/39/14/0/12/1 (+the flake),
+mc-worldgen 141+1+12/0, fmt clean, `clippy -D warnings` clean for the three
+crates, code-health PASS. Binary rebuilt + reinstalled (~/.local/bin/solaris).
+

@@ -23,6 +23,9 @@ whitelist = []
 # Relative paths are resolved from this config file's directory. Explicit missing,
 # malformed, oversized, or invalid files fail startup and `--check`.
 # whitelist_file = "whitelist.json"
+# The console `whitelist add|remove` commands write this file (defaulting to
+# whitelist.json beside the config) and apply to the next login attempt; no
+# restart is needed. Turning enforcement on still requires whitelist_enabled.
 banned_players = []
 # banned_players_file = "banned-players.json"
 
@@ -31,6 +34,8 @@ banned_players = []
 # optional vanilla-style JSON profile file on each startup.
 operators = []
 # operators_file = "ops.json"
+# Console `operator add|remove` writes this file (defaulting to ops.json beside
+# the config) and applies immediately to online players and future logins.
 # allow_local_dev_operators = true only for throwaway loopback development.
 allow_local_dev_operators = false
 
@@ -71,6 +76,12 @@ world_dir = "world"
 seed = 0
 # Optional Earth-scale terrain profile. Changing it requires a fresh world_dir.
 worldgen_mode = "tellus_like"
+# Optional built-in settlement profile, used when no deployed plugin supplies a
+# settlement plan. "plains_village_prototype" places vanilla plains village
+# sections on vanilla village spacing and requires vanilla_data_dir (see
+# tools/extract-vanilla-data.sh). The default "vanilla" generates no villages.
+# Changing it requires a fresh world_dir.
+# settlement_profile = "plains_village_prototype"
 
 [simulation]
 # Random block ticks per active chunk per game tick. Set to 0 to disable
@@ -121,3 +132,10 @@ profile = "balanced"
 # Seconds, not tick/observation counts; both normalize to a minimum of 60.
 # scale_down_after_seconds = 60
 # scale_up_after_seconds = 60
+
+[tab_list]
+# Optional player-list (tab menu) header and footer shown to every player on
+# login. Both default to empty (vanilla default: no header/footer lines).
+# TOML basic strings support `\n` escapes for multi-line text.
+# header = "Welcome to Solaris"
+# footer = "play.example.com"

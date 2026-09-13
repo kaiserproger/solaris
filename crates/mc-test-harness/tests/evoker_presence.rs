@@ -35,6 +35,7 @@ async fn embedded_evoker_spawns_fangs_that_strike_and_expire_over_tcp() {
     let fangs_type_id = entity_type_id(&entity_types, "minecraft:evoker_fangs");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 evoker TCP".into(),
         max_players: 2,

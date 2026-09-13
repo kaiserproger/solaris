@@ -50,32 +50,30 @@ async fn survival_bonemeal_grows_oak_sapling_into_tree() {
     let bone_meal = mc_data::Identifier::parse("minecraft:bone_meal").unwrap();
     let bone_meal_item_id = items.id_of(&bone_meal).expect("bone meal item");
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M60 sapling growth".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::clone(&world)),
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types,
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "M60 sapling growth".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::clone(&world)),
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    entity_types,
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -226,32 +224,30 @@ async fn survival_bonemeal_stage_one_oak_replaces_existing_canopy_leaf() {
     let bone_meal = mc_data::Identifier::parse("minecraft:bone_meal").unwrap();
     let bone_meal_item_id = items.id_of(&bone_meal).expect("bone meal item");
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "sapling canopy replacement".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::clone(&world)),
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types,
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "sapling canopy replacement".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::clone(&world)),
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    entity_types,
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -372,32 +368,30 @@ async fn survival_bonemeal_does_not_consume_on_single_dark_oak() {
     let dirt = sapling_test_state(&blocks, "minecraft:dirt", &[]);
     let bone_meal = mc_data::Identifier::parse("minecraft:bone_meal").unwrap();
     let bone_meal_item_id = items.id_of(&bone_meal).expect("bone meal item");
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "single dark oak gate".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::clone(&world)),
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types,
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "single dark oak gate".into(),
+    max_players: 8,
+    view_distance: VIEW_DISTANCE,
+    data,
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::clone(&world)),
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    entity_types,
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
@@ -832,32 +826,30 @@ async fn start_mega_sapling_wire_fixture(
             .expect("exact 26.1.2 entity registry"),
     );
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "mega sapling raw-wire proof".into(),
-        max_players: 8,
-        view_distance,
-        data,
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::clone(&world)),
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types,
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 0,
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        loader_manifest: None,
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
+    let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+    motd: "mega sapling raw-wire proof".into(),
+    max_players: 8,
+    view_distance,
+    data,
+    blocks: Arc::clone(&blocks),
+    world: Some(Arc::clone(&world)),
+    tags,
+    recipes: Arc::new(Vec::new()),
+    loot: Arc::new(mc_data::loot::LootTables::default()),
+    block_light: None,
+    items,
+    item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    entity_types,
+    biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    random_tick: mc_net::RandomTickPolicy {
+        random_tick_speed: 0,
+        ..mc_net::RandomTickPolicy::default()
+    },
+    command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    loader_manifest: None,
+    shutdown: mc_net::ShutdownHandle::default(), };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {

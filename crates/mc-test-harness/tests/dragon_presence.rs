@@ -31,6 +31,7 @@ async fn embedded_dragon_air_combat_moves_fires_clouds_damages_and_discards_over
     let cloud_type_id = entity_type_id(&entity_types, "minecraft:area_effect_cloud");
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Phase 4 dragon D1 TCP".into(),
         max_players: 2,

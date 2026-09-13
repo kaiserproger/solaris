@@ -172,7 +172,7 @@ fn check_reports_derived_deployment_for_every_plugin() {
             api = "0.6.0"
 
             [client]
-            schema = 1
+            schema = 2
 
             [[client.bundles]]
             id = "assets"
@@ -1694,4 +1694,102 @@ fn check_unknown_config_field_exits_nonzero_with_clear_error() {
         .failure()
         .stderr(contains("parsing config file"))
         .stderr(contains("unknown field `vanilla_dir`"));
+}
+
+#[test]
+fn pregenerate_rejects_malformed_block_coordinates() {
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(SAMPLE_TOML.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("pregenerate")
+        .arg("--from")
+        .arg("100")
+        .arg("--to")
+        .arg("200,200")
+        .assert()
+        .failure()
+        .stderr(contains("expected `x,z` block coordinates"));
+}
+
+#[test]
+fn pregenerate_accepts_negative_coordinates_and_repeats_on_a_fresh_world() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(
+        format!(
+            r#"
+                [server]
+                name = "Pregen"
+                motd = "Hello"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 30001
+
+                [data]
+                world_dir = "{}"
+                seed = 712816
+            "#,
+            world_dir.path().display()
+        )
+        .as_bytes(),
+    )
+    .expect("write toml");
+
+    // `--from -600,900` must parse as a value rather than as an unknown flag.
+    // A second identical run must also succeed, which proves the stored world
+    // contract accepts being reopened by the same pregeneration request.
+    for run in 0..2 {
+        Command::cargo_bin("mc-server")
+            .expect("locate mc-server binary")
+            .arg("--config")
+            .arg(file.path())
+            .arg("--no-console")
+            .arg("pregenerate")
+            .arg("--from")
+            .arg("-600,900")
+            .arg("--to")
+            .arg("-450,1050")
+            .assert()
+            .success();
+        assert!(
+            world_dir.path().join("solaris/world.json").is_file(),
+            "run {run} did not write the world contract"
+        );
+    }
+
+    // The requested rectangle spans chunk x -38..=-29 and z 56..=65, i.e. region
+    // files r.-2.1/r.-1.1/r.-2.2/r.-1.2. The spawn window alone only fills
+    // r.-1.0/r.0.-1/r.0.0/r.-1.-1, so these four can only exist because the
+    // requested region was generated and stored.
+    for region in ["r.-2.1.mca", "r.-1.1.mca", "r.-2.2.mca", "r.-1.2.mca"] {
+        assert!(
+            world_dir.path().join("region").join(region).is_file(),
+            "pregeneration stored no {region} for the requested rectangle"
+        );
+    }
+}
+
+#[test]
+fn pregenerate_cannot_be_combined_with_check() {
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(SAMPLE_TOML.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .arg("pregenerate")
+        .arg("--from")
+        .arg("0,0")
+        .arg("--to")
+        .arg("16,16")
+        .assert()
+        .failure()
+        .stderr(contains(
+            "--check cannot be combined with the pregenerate subcommand",
+        ));
 }

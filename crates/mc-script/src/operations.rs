@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     MAX_INVENTORY_STORAGE_MUTATIONS, MAX_PLUGIN_STORAGE_KEY_BYTES, MAX_SCRIPT_ID_BYTES,
-    MAX_SCRIPT_WORLD_TIME, ScriptDtoError, ScriptOwnedInventoryOperation, ScriptStorageMutation,
-    validate_bounded_nonempty, validate_bounded_value, validate_plugin_storage_value,
-    validate_script_id,
+    MAX_SCRIPT_WORLD_TIME, ScriptDtoError, ScriptOwnedInventoryOperation, ScriptResidentOperation,
+    ScriptResidentOrderOperation, ScriptSettlementOperation, ScriptSettlementResult,
+    ScriptStorageMutation, validate_bounded_nonempty, validate_bounded_value,
+    validate_plugin_storage_value, validate_script_id,
 };
 
 pub const MAX_STORAGE_SCAN_PAGE: usize = 64;
@@ -29,6 +30,15 @@ pub enum ScriptOperation {
     },
     Inventory {
         operation: ScriptOwnedInventoryOperation,
+    },
+    Resident {
+        operation: ScriptResidentOperation,
+    },
+    ResidentOrder {
+        operation: ScriptResidentOrderOperation,
+    },
+    Settlement {
+        operation: ScriptSettlementOperation,
     },
 }
 
@@ -64,6 +74,9 @@ impl ScriptOperationRequest {
                 mutations.sort_unstable_by(|left, right| left.key().cmp(right.key()));
             }
             ScriptOperation::Inventory { operation } => operation.canonicalize(),
+            ScriptOperation::Resident { operation } => operation.canonicalize(),
+            ScriptOperation::ResidentOrder { operation } => operation.canonicalize(),
+            ScriptOperation::Settlement { operation } => operation.canonicalize(),
             _ => {}
         }
         let request = Self {
@@ -88,6 +101,9 @@ impl ScriptOperationRequest {
             | ScriptOperation::Status { operation_id } => Some(operation_id),
             ScriptOperation::StorageScan { .. } => None,
             ScriptOperation::Inventory { operation } => operation.operation_id(),
+            ScriptOperation::Resident { operation } => operation.operation_id(),
+            ScriptOperation::ResidentOrder { operation } => operation.operation_id(),
+            ScriptOperation::Settlement { operation } => operation.operation_id(),
         }
     }
 
@@ -123,6 +139,9 @@ impl ScriptOperationRequest {
                 crate::validate_script_id_value(operation_id)
             }
             ScriptOperation::Inventory { operation } => operation.validate(),
+            ScriptOperation::Resident { operation } => operation.validate(),
+            ScriptOperation::ResidentOrder { operation } => operation.validate(),
+            ScriptOperation::Settlement { operation } => operation.validate(),
         }
     }
 }
@@ -282,7 +301,16 @@ pub enum ScriptOperationPayload {
         cursor: Option<String>,
     },
     OwnedInventory {
-        result: crate::ScriptOwnedInventoryResult,
+        result: Box<crate::ScriptOwnedInventoryResult>,
+    },
+    Resident {
+        result: Box<crate::ScriptResidentResult>,
+    },
+    ResidentOrder {
+        result: Box<crate::ScriptResidentOrderResult>,
+    },
+    Settlement {
+        result: Box<ScriptSettlementResult>,
     },
 }
 
@@ -319,6 +347,21 @@ impl ScriptOperationOutcome {
         }
     }
 
+    /// Reject one operation while still carrying the per-member detail the
+    /// caller needs — used by all-or-nothing batch refusals that must report a
+    /// reason for every member they considered.
+    pub fn rejected_with_payload(
+        failure: ScriptOperationFailure,
+        payload: ScriptOperationPayload,
+    ) -> Self {
+        Self {
+            state: ScriptOperationState::Rejected,
+            revision: None,
+            failure: Some(failure),
+            payload,
+        }
+    }
+
     pub const fn state(&self) -> ScriptOperationState {
         self.state
     }
@@ -348,6 +391,9 @@ impl ScriptOperationOutcome {
         }
         match &self.payload {
             ScriptOperationPayload::None => Ok(()),
+            ScriptOperationPayload::Resident { result } => result.validate(),
+            ScriptOperationPayload::ResidentOrder { result } => result.validate(),
+            ScriptOperationPayload::Settlement { result } => result.validate(),
             ScriptOperationPayload::OwnedInventory { result } => result.validate(),
             ScriptOperationPayload::StorageBatch { changes } => {
                 if changes.is_empty() || changes.len() > MAX_INVENTORY_STORAGE_MUTATIONS {

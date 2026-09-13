@@ -28,6 +28,11 @@ use super::{
 };
 use crate::script::ZoneProtectionSnapshot;
 
+// The redstone planner is declared here, with the scheduled-tick queue it
+// enqueues into, rather than beside the other play modules.
+#[path = "redstone/mod.rs"]
+pub(super) mod redstone;
+
 #[derive(Debug, Default)]
 pub(super) struct ScheduledBlockTickPlan {
     pub(super) edits: Vec<BlockEdit>,
@@ -70,6 +75,7 @@ pub(super) fn plan_scheduled_block_tick_edits(
 ) -> Option<ScheduledBlockTickPlan> {
     let mut world = SnapshotPlanningWorld::new(snapshot);
     let mut plan = ScheduledBlockTickPlan::default();
+    let mut redstone_budget = redstone::RedstoneBudget::new(redstone::MAX_POSITIONS_PER_TICK);
     for tick in ticks {
         let Some(state_id) = world.get_cached_block(tick.pos) else {
             continue;
@@ -83,9 +89,19 @@ pub(super) fn plan_scheduled_block_tick_edits(
         if matches!(state.block.id.path(), "hopper" | "comparator") {
             return None;
         }
-        let Some(edits) = scheduled_simple_block_tick_edits_with_protection(
-            blocks, &world, tick.pos, state_id, protection,
-        ) else {
+        let Some(edits) = redstone::redstone_tick_edits(
+            blocks,
+            &world,
+            tick.pos,
+            state_id,
+            protection,
+            &mut redstone_budget,
+        )
+        .or_else(|| {
+            scheduled_simple_block_tick_edits_with_protection(
+                blocks, &world, tick.pos, state_id, protection,
+            )
+        }) else {
             continue;
         };
         if edits
@@ -113,6 +129,12 @@ pub(super) fn scheduled_block_tick_edits(
     let state = blocks.by_id(state_id)?;
     if state.block.id.path() == "comparator" {
         return scheduled_comparator_tick_edits(blocks, storage, pos, state);
+    }
+    let mut budget = redstone::RedstoneBudget::new(redstone::MAX_POSITIONS_PER_SETTLE);
+    if let Some(edits) =
+        redstone::redstone_tick_edits(blocks, storage, pos, state_id, None, &mut budget)
+    {
+        return Some(edits);
     }
     scheduled_simple_block_tick_edits_with_protection(blocks, storage, pos, state_id, None)
 }

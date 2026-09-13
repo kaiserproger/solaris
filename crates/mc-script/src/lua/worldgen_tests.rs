@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    LuaHostConfig, LuaHostError, LuaSettlementBuildingRole, LuaSettlementBuildingTemplate,
-    LuaSettlementInhabitantKind, LuaSettlementJob, LuaWorldgenOreProfile,
-    LuaWorldgenSettlementProfile, MAX_SETTLEMENT_INHABITANTS, prepare_lua_plugins,
+    LuaHostConfig, LuaHostError, LuaWorldgenOreProfile, LuaWorldgenSettlementProfile,
+    MAX_SETTLEMENT_INHABITANTS, prepare_lua_plugins,
 };
 
 static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
@@ -118,82 +117,6 @@ fn shipped_realistic_deposits_plugin_selects_the_startup_ore_profile() {
         .expect("shipped geological-mines plugin declares an ore profile");
     assert_eq!(profile, LuaWorldgenOreProfile::RealisticDeposits);
     assert_eq!(profile.contract_name(), "realistic_deposits");
-}
-
-#[test]
-fn shipped_settlement_plugin_selects_the_village_prototype() {
-    let plugins = TempPlugins::new();
-    deploy_sibling_plugin("settlement-prototype", plugins.path());
-    let prepared = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
-
-    assert_eq!(
-        prepared.worldgen_settlement_profile(),
-        Some(LuaWorldgenSettlementProfile::PlainsVillagePrototype)
-    );
-    let plan = prepared.worldgen_settlement_plan().unwrap();
-    assert_eq!(plan.owner_plugin_id(), "settlement-prototype");
-    assert_eq!(
-        plan.buildings()
-            .iter()
-            .map(|building| (building.id(), building.template(), building.role()))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "square",
-                LuaSettlementBuildingTemplate::PlainsFountain,
-                LuaSettlementBuildingRole::MeetingPoint,
-            ),
-            (
-                "home",
-                LuaSettlementBuildingTemplate::PlainsSmallHouse,
-                LuaSettlementBuildingRole::Home,
-            ),
-            (
-                "smithy",
-                LuaSettlementBuildingTemplate::PlainsToolsmith,
-                LuaSettlementBuildingRole::Workplace,
-            ),
-        ]
-    );
-    assert_eq!(
-        plan.inhabitants()
-            .iter()
-            .map(|inhabitant| (
-                inhabitant.id(),
-                inhabitant.kind(),
-                inhabitant.building_id(),
-                inhabitant.job(),
-            ))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "resident",
-                LuaSettlementInhabitantKind::Villager,
-                "home",
-                LuaSettlementJob::Unemployed,
-            ),
-            (
-                "smith",
-                LuaSettlementInhabitantKind::Villager,
-                "smithy",
-                LuaSettlementJob::Toolsmith,
-            ),
-        ]
-    );
-    assert_eq!(
-        plan.extensions()[0].id(),
-        "settlement-prototype:smithy-work-orders"
-    );
-    assert_eq!(plan.extensions()[0].building_id(), "smithy");
-    assert_eq!(
-        plan.contract_name(),
-        "plains_village_prototype|owner=settlement-prototype|buildings=\
-square,plains_fountain,meeting_point;home,plains_small_house,home;\
-smithy,plains_toolsmith,workplace;|inhabitants=\
-resident,minecraft:villager,home,unemployed;\
-smith,minecraft:villager,smithy,toolsmith;|extensions=\
-settlement-prototype:smithy-work-orders,smithy;"
-    );
 }
 
 #[test]

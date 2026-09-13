@@ -24,6 +24,7 @@ mc-physics = { path = "../mc-physics" }
 mc-protocol = { path = "../mc-protocol" }
 mc-script = { path = "../mc-script" }
 mc-world = { path = "../mc-world" }
+mc-worldgen = { path = "../mc-worldgen" }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 tokio = { workspace = true }

@@ -31,6 +31,23 @@ SECOND_AGENT_BRIDGE_URL="${SOLARIS_REAL_CLIENT_SECOND_AGENT_BRIDGE_URL:-}"
 MODE="prepare"
 VALIDATE_RUN_DIR=""
 SCENARIO_NO_DEBUG="0"
+# The settlement chain runs against the six default server-only packages
+# installed into the run directory; no Loader/client surface is involved.
+SETTLEMENT_CHAIN_SCENARIO="m94-09-settlement-chain"
+DEFAULT_PLUGIN_INSTALLER="$REPO_ROOT/../solaris-default-plugins/install.sh"
+DEFAULT_PLUGIN_IDS=(
+  solaris-permissions
+  solaris-essentials
+  solaris-economy
+  solaris-towns
+  solaris-audit
+  solaris-settlements
+)
+SCENARIO_SERVER_PORT=""
+
+scenario_uses_default_plugins() {
+  [[ "$AGENT_SCENARIO" == "$SETTLEMENT_CHAIN_SCENARIO" ]]
+}
 
 usage() {
   cat <<'EOF'
@@ -367,11 +384,24 @@ real_client_operator_list() {
 }
 
 write_real_client_server_config() {
-  local source_config target_config world_dir operators hostile_spawn_interval_override
+  local source_config target_config world_dir plugin_dir server_port operators
+  local hostile_spawn_interval_override expected_plugins
   source_config="$1"
   target_config="$2"
   world_dir="$3"
+  plugin_dir="${4:-}"
+  server_port="${5:-}"
   operators="$(real_client_operator_list)"
+  expected_plugins=""
+  if [[ -n "$plugin_dir" ]]; then
+    expected_plugins="$(python3 - "${DEFAULT_PLUGIN_IDS[@]}" <<'PY'
+import json
+import sys
+
+print(json.dumps(sorted(sys.argv[1:])))
+PY
+)"
+  fi
   case "$AGENT_SCENARIO" in
     playable-04-twenty-minute-survival-loop)
       hostile_spawn_interval_override=""
@@ -386,18 +416,30 @@ write_real_client_server_config() {
   if [[ -n "$world_dir" && "$MODE" == "run" ]]; then
     mkdir -p "$world_dir"
   fi
-  awk -v world_dir="$world_dir" -v operators="$operators" -v hostile_spawn_interval_override="$hostile_spawn_interval_override" -v seed_override="$SERVER_SEED" '
+  awk -v world_dir="$world_dir" \
+    -v operators="$operators" \
+    -v hostile_spawn_interval_override="$hostile_spawn_interval_override" \
+    -v seed_override="$SERVER_SEED" \
+    -v plugin_dir="$plugin_dir" \
+    -v expected_plugins="$expected_plugins" \
+    -v server_port="$server_port" '
     BEGIN {
       section = ""
       seen_admin = 0
       seen_simulation = 0
+      seen_plugins = 0
       wrote_admin_operators = 0
       wrote_hostile_spawn_interval = 0
+      wrote_plugins = 0
       replaced_world_dir = 0
       replaced_seed = 0
+      replaced_port = 0
       escaped_world_dir = world_dir
       gsub(/\\/, "\\\\", escaped_world_dir)
       gsub(/"/, "\\\"", escaped_world_dir)
+      escaped_plugin_dir = plugin_dir
+      gsub(/\\/, "\\\\", escaped_plugin_dir)
+      gsub(/"/, "\\\"", escaped_plugin_dir)
     }
     function emit_admin_operators_if_needed() {
       if (section == "admin" && wrote_admin_operators == 0) {
@@ -411,9 +453,18 @@ write_real_client_server_config() {
         wrote_hostile_spawn_interval = 1
       }
     }
+    function emit_plugins_if_needed() {
+      if (section == "plugins" && plugin_dir != "" && wrote_plugins == 0) {
+        print "directory = \"" escaped_plugin_dir "\""
+        print "strict = true"
+        print "expected = " expected_plugins
+        wrote_plugins = 1
+      }
+    }
     /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
       emit_admin_operators_if_needed()
       emit_hostile_spawn_interval_if_needed()
+      emit_plugins_if_needed()
       section = $0
       gsub(/^[[:space:]]*\[/, "", section)
       gsub(/\][[:space:]]*$/, "", section)
@@ -423,7 +474,19 @@ write_real_client_server_config() {
       if (section == "simulation") {
         seen_simulation = 1
       }
+      if (section == "plugins") {
+        seen_plugins = 1
+      }
       print
+      next
+    }
+    section == "network" && server_port != "" && /^[[:space:]]*port[[:space:]]*=/ && replaced_port == 0 {
+      print "port = " server_port
+      replaced_port = 1
+      next
+    }
+    section == "plugins" && plugin_dir != "" && /^[[:space:]]*(directory|strict|expected)[[:space:]]*=/ {
+      emit_plugins_if_needed()
       next
     }
     section == "data" && world_dir != "" && /^[[:space:]]*world_dir[[:space:]]*=/ && replaced_world_dir == 0 {
@@ -450,6 +513,7 @@ write_real_client_server_config() {
     END {
       emit_admin_operators_if_needed()
       emit_hostile_spawn_interval_if_needed()
+      emit_plugins_if_needed()
       if (seen_admin == 0) {
         print ""
         print "[admin]"
@@ -463,6 +527,14 @@ write_real_client_server_config() {
         print "error: server config has no data.seed setting" > "/dev/stderr"
         exit 1
       }
+      if (server_port != "" && replaced_port == 0) {
+        print "error: server config has no network.port setting" > "/dev/stderr"
+        exit 1
+      }
+      if (plugin_dir != "" && seen_plugins == 0) {
+        print "error: server config has no plugins section" > "/dev/stderr"
+        exit 1
+      }
       if (hostile_spawn_interval_override != "" && seen_simulation == 0) {
         print ""
         print "[simulation]"
@@ -470,6 +542,23 @@ write_real_client_server_config() {
       }
     }
   ' "$source_config" > "$target_config"
+}
+
+install_scenario_plugins() {
+  local run_dir plugin_dir install_log
+  run_dir="$1"
+  plugin_dir="$run_dir/plugins"
+  install_log="$run_dir/plugin-install.log"
+  require_file "$DEFAULT_PLUGIN_INSTALLER"
+  if ! bash "$DEFAULT_PLUGIN_INSTALLER" --directory "$plugin_dir" "${DEFAULT_PLUGIN_IDS[@]}" > "$install_log" 2>&1; then
+    printf 'error: default plugin installation failed; see %s\n' "$install_log" >&2
+    exit 1
+  fi
+  {
+    printf 'scenario_plugin_installer=%s\n' "$DEFAULT_PLUGIN_INSTALLER"
+    printf 'scenario_plugin_directory=%s\n' "$plugin_dir"
+    printf 'scenario_plugin_ids=%s\n' "$(IFS=,; printf '%s' "${DEFAULT_PLUGIN_IDS[*]}")"
+  } >> "$run_dir/automation-driver.txt"
 }
 
 client_adapter_status() {
@@ -1163,6 +1252,11 @@ if [[ "$MODE" == "prepare" ]]; then
   configure_primary_agent_bridge
   configure_second_agent_bridge
   SCENARIO_NO_DEBUG="$(requested_scenario_no_debug 2>/dev/null || printf '1\n')"
+  plugin_dir=""
+  if scenario_uses_default_plugins; then
+    SCENARIO_SERVER_PORT="$(pick_free_loopback_port)"
+    SERVER_ADDR="127.0.0.1:$SCENARIO_SERVER_PORT"
+  fi
   run_dir="$(prepare_run_dir)"
   server_config_source="$(server_config_path)"
   server_config="$run_dir/server.toml"
@@ -1170,7 +1264,13 @@ if [[ "$MODE" == "prepare" ]]; then
   if [[ "$FRESH_WORLD" == "1" || "$AGENT_SCENARIO" == "playable-46-generated-ruin-cache" ]]; then
     fresh_world_dir="$run_dir/world"
   fi
-  write_real_client_server_config "$server_config_source" "$server_config" "$fresh_world_dir"
+  if scenario_uses_default_plugins; then
+    install_scenario_plugins "$run_dir"
+    plugin_dir="$run_dir/plugins"
+    fresh_world_dir="$run_dir/world"
+  fi
+  write_real_client_server_config \
+    "$server_config_source" "$server_config" "$fresh_world_dir" "$plugin_dir" "$SCENARIO_SERVER_PORT"
   {
     printf 'server_config_source=%s\n' "$server_config_source"
     printf 'server_config_effective=%s\n' "$server_config"
@@ -1179,6 +1279,9 @@ if [[ "$MODE" == "prepare" ]]; then
     fi
     if [[ -n "$SERVER_SEED" ]]; then
       printf 'server_seed_override=%s\n' "$SERVER_SEED"
+    fi
+    if [[ -n "$SCENARIO_SERVER_PORT" ]]; then
+      printf 'server_port_effective=%s\n' "$SCENARIO_SERVER_PORT"
     fi
   } >> "$run_dir/automation-driver.txt"
   printf '%s\n' "$run_dir"
@@ -1203,6 +1306,11 @@ PY
   fi
   configure_primary_agent_bridge
   configure_second_agent_bridge
+  plugin_dir=""
+  if scenario_uses_default_plugins; then
+    SCENARIO_SERVER_PORT="$(pick_free_loopback_port)"
+    SERVER_ADDR="127.0.0.1:$SCENARIO_SERVER_PORT"
+  fi
   run_dir="$(prepare_run_dir)"
   server_config_source="$(server_config_path)"
   server_config="$run_dir/server.toml"
@@ -1215,7 +1323,13 @@ PY
     printf 'error: playable-46 refuses to reuse an existing world directory: %s\n' "$fresh_world_dir" >&2
     exit 1
   fi
-  write_real_client_server_config "$server_config_source" "$server_config" "$fresh_world_dir"
+  if scenario_uses_default_plugins; then
+    install_scenario_plugins "$run_dir"
+    plugin_dir="$run_dir/plugins"
+    fresh_world_dir="$run_dir/world"
+  fi
+  write_real_client_server_config \
+    "$server_config_source" "$server_config" "$fresh_world_dir" "$plugin_dir" "$SCENARIO_SERVER_PORT"
   {
     printf 'server_config_source=%s\n' "$server_config_source"
     printf 'server_config_effective=%s\n' "$server_config"
@@ -1232,6 +1346,9 @@ PY
     fi
     if [[ -n "$SERVER_SEED" ]]; then
       printf 'server_seed_override=%s\n' "$SERVER_SEED"
+    fi
+    if [[ -n "$SCENARIO_SERVER_PORT" ]]; then
+      printf 'server_port_effective=%s\n' "$SCENARIO_SERVER_PORT"
     fi
   } >> "$run_dir/automation-driver.txt"
   printf 'running real-client regression into %s\n' "$run_dir"

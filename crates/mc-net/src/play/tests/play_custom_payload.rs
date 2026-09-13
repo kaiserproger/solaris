@@ -18,9 +18,9 @@ fn oversized_play_custom_payload_is_rejected_before_decode() {
 }
 
 #[test]
-fn loader_interaction_channel_is_claimed_before_extension_forwarding() {
-    let channel = b"solaris:loader/interaction";
-    let payload = b"action";
+fn loader_view_action_channel_is_claimed_before_extension_forwarding() {
+    let channel = b"solaris:loader/view_action";
+    let payload = br#"{"protocol":3,"message":"view_request","request_kind":"settlement"}"#;
     let mut body = Vec::with_capacity(1 + channel.len() + payload.len());
     body.push(channel.len() as u8);
     body.extend_from_slice(channel);
@@ -28,6 +28,6 @@ fn loader_interaction_channel_is_claimed_before_extension_forwarding() {
 
     assert_eq!(
         classify_play_custom_payload(Bytes::from(body)).unwrap(),
-        PlayCustomPayloadAction::LoaderInteraction(Bytes::from_static(payload))
+        PlayCustomPayloadAction::LoaderView(Bytes::from_static(payload))
     );
 }

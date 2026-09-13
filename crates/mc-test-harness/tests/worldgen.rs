@@ -142,6 +142,7 @@ async fn fresh_seed_server_spawn_is_dry_with_clear_body_space_inner() {
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let shutdown = mc_net::ShutdownHandle::default();
         let config = mc_net::ServerConfig {
+            tab_list: mc_net::TabListConfig::default(),
             bind_address: "127.0.0.1:0".parse().expect("loopback address"),
             motd: format!("fresh seed spawn {seed}"),
             max_players: 1,
@@ -425,6 +426,7 @@ where
         .with_spawn(spawn)
         .with_generator(generator as Arc<dyn ChunkGenerator>);
     mc_net::ServerConfig {
+        tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().expect("loopback address"),
         motd: motd.into(),
         max_players: 8,

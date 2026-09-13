@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mc_script::{
-    AdmittedScriptCommand, ScriptCommand, ScriptEvent, ScriptPluginStorageCompareAndSwapRequest,
+    AdmittedScriptCommand, ScriptCommand, ScriptEvent, ScriptInventoryEndpoint,
+    ScriptInventoryReservationSnapshot, ScriptOperationOutcome, ScriptOperationPayload,
+    ScriptOperationRequest, ScriptOwnedInventoryResult, ScriptPluginStorageCompareAndSwapRequest,
     ScriptPluginStorageDeleteRequest, ScriptPluginStorageFailure, ScriptStorageMutation,
 };
 use serde::{Deserialize, Serialize};
@@ -24,12 +26,33 @@ use crate::server::{ScriptEventSink, ShutdownHandle};
 mod operations;
 #[cfg(test)]
 mod operations_tests;
+mod owned_inventory;
+mod resident_order_execution;
+#[cfg(test)]
+mod resident_order_tests;
+mod resident_orders;
+#[cfg(test)]
+mod resident_settlement_tests;
+#[cfg(test)]
+mod resident_tests;
+mod residents;
 mod scan;
+mod settlement;
+#[cfg(test)]
+mod settlement_tests;
 pub(crate) mod world_inventory;
 use operations::{
     DurableOperationReceipt, OP_OPERATION_DELIVERED, OP_SNAPSHOT_OPERATION, OperationDeliveryAck,
     OperationExecution,
 };
+use resident_orders::{
+    DurableResidentOrderChange, ResidentOrderLedger, decode_resident_order_change,
+};
+use residents::{DurableResidentChange, ResidentLedger, decode_resident_change};
+pub(crate) use settlement::{
+    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
+};
+use settlement::{DurableSettlementChange, SettlementLedger, decode_settlement_change};
 use world_inventory::InventoryRuntime;
 
 const STORAGE_DIRECTORY: &str = "solaris/plugin-storage-v1";
@@ -48,6 +71,11 @@ const OP_DURABLE_DELETE: u8 = 6;
 const OP_RESULT_DELIVERED: u8 = 7;
 const OP_SNAPSHOT_RESULT: u8 = 8;
 const OP_STORAGE_BATCH: u8 = 9;
+const OP_RESIDENT_CHANGE: u8 = 13;
+const OP_SNAPSHOT_RESIDENT: u8 = 14;
+const OP_SNAPSHOT_SETTLEMENT: u8 = 15;
+const OP_RESIDENT_ORDER_CHANGE: u8 = 16;
+const OP_SNAPSHOT_ORDER: u8 = 17;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -148,6 +176,12 @@ pub(crate) struct PreparedStorageBatch {
     inventory: Option<PlayerInventoryRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation: Option<DurableOperationReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resident: Vec<DurableResidentChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    settlement: Vec<DurableSettlementChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    order: Vec<DurableResidentOrderChange>,
 }
 
 impl DurableMutationResult {
@@ -193,6 +227,20 @@ enum DurableMutationCommit {
     Replay(DurableMutationResult),
 }
 
+/// Settlement consumption folded from committed structure receipts.
+///
+/// Contributions are additive and the release latch is monotone, so replaying
+/// the receipts in any order reaches the same fold; the cancellation fold is
+/// derived from the reservation itself and needs no receipt ordering.
+#[derive(Debug, Default)]
+struct SettlementFold {
+    consumed: BTreeMap<String, u64>,
+    watermark: u64,
+    bound_to: Option<String>,
+    released: bool,
+    revision: u64,
+}
+
 enum PendingStorageResult {
     Mutation(DurableMutationResult),
     Operation(DurableOperationReceipt),
@@ -209,6 +257,19 @@ pub(crate) struct PluginStorage {
     unknown_result: Option<DurableMutationResult>,
     operation_results: BTreeMap<(String, String), DurableOperationReceipt>,
     unknown_operation: Option<DurableOperationReceipt>,
+    /// Durable reservation projections keyed by owner and opaque reservation
+    /// reference, rebuilt from committed operation receipts at startup.
+    reservations: BTreeMap<(String, String), (u64, ScriptInventoryReservationSnapshot)>,
+    /// Settlement consumption folded from committed structure receipts. The fold
+    /// is a separate, additive projection: it is applied when a settlement reads
+    /// a reservation, so the C1 status and release views stay untouched.
+    settlement_folds: BTreeMap<(String, String), SettlementFold>,
+    /// Core-owned resident identity ledger, replayed from the journal on open.
+    residents: ResidentLedger,
+    /// Core-owned settlement site, structure and survey ledger.
+    settlements: SettlementLedger,
+    /// Core-owned resident order, work, gear and admission ledger.
+    orders: ResidentOrderLedger,
     scans: scan::StorageScans,
     #[cfg(test)]
     fault: Option<StorageFaultPoint>,
@@ -247,6 +308,11 @@ impl PluginStorage {
             unknown_result: None,
             operation_results: BTreeMap::new(),
             unknown_operation: None,
+            reservations: BTreeMap::new(),
+            settlement_folds: BTreeMap::new(),
+            residents: ResidentLedger::new(),
+            settlements: SettlementLedger::default(),
+            orders: ResidentOrderLedger::default(),
             scans: scan::StorageScans::default(),
             #[cfg(test)]
             fault: None,
@@ -498,6 +564,9 @@ impl PluginStorage {
             mutations,
             inventory,
             operation: None,
+            resident: Vec::new(),
+            settlement: Vec::new(),
+            order: Vec::new(),
         };
         if !self.batch_preconditions_match(&batch) {
             return Ok(ScriptStoragePrepareOutcome::Rejected);
@@ -523,6 +592,48 @@ impl PluginStorage {
         self.install_storage_batch(batch)
             .expect("prepared storage batch must install after durable append");
         Ok(())
+    }
+
+    fn prepare_owned_batch(
+        &mut self,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+        payload: ScriptOperationPayload,
+        inventory: Option<PlayerInventoryRecovery>,
+    ) -> Result<ScriptStoragePrepareOutcome<PreparedStorageBatch>, PluginStorageMutationError> {
+        let transaction_id = self
+            .revision
+            .checked_add(1)
+            .ok_or(PluginStorageMutationError::RevisionOverflow)?;
+        let outcome = ScriptOperationOutcome::committed(transaction_id, payload)
+            .map_err(|error| PluginStorageMutationError::Io(std::io::Error::other(error)))?;
+        let operation_id = request
+            .operation_id()
+            .expect("owned inventory decision identity")
+            .to_owned();
+        let receipt = DurableOperationReceipt {
+            plugin_id: plugin_id.to_owned(),
+            operation_id,
+            request_id: request.request_id().to_owned(),
+            fingerprint: crate::play::owned_inventory::owned_inventory_fingerprint(
+                request.operation(),
+            ),
+            revision: transaction_id,
+            outcome,
+            delivered: false,
+        };
+        Ok(ScriptStoragePrepareOutcome::Prepared(
+            PreparedStorageBatch {
+                transaction_id,
+                plugin_id: plugin_id.to_owned(),
+                mutations: Vec::new(),
+                inventory,
+                operation: Some(receipt),
+                resident: Vec::new(),
+                settlement: Vec::new(),
+                order: Vec::new(),
+            },
+        ))
     }
 
     fn batch_preconditions_match(&self, batch: &PreparedStorageBatch) -> bool {
@@ -641,13 +752,184 @@ impl PluginStorage {
             }
         }
         self.revision = batch.transaction_id;
+        for change in &batch.resident {
+            self.residents.apply(change)?;
+        }
+        for change in &batch.settlement {
+            self.settlements.apply(change)?;
+        }
+        for change in &batch.order {
+            self.orders.apply(change)?;
+        }
         if let Some(receipt) = batch.operation {
+            self.index_operation_receipt(&receipt);
             self.operation_results.insert(
                 (receipt.plugin_id.clone(), receipt.operation_id.clone()),
                 receipt,
             );
         }
         Ok(())
+    }
+
+    /// Project one committed operation receipt into the reservation index.
+    /// Receipt revisions are strictly monotonic per owner, so replaying the
+    /// journal in any order still keeps the newest reservation projection.
+    fn index_operation_receipt(&mut self, receipt: &DurableOperationReceipt) {
+        match receipt.outcome.payload() {
+            ScriptOperationPayload::OwnedInventory { result } => {
+                let ScriptOwnedInventoryResult::Reservation { reservation } = &**result else {
+                    return;
+                };
+                let key = (
+                    receipt.plugin_id.clone(),
+                    reservation.reservation_ref.clone(),
+                );
+                if self
+                    .reservations
+                    .get(&key)
+                    .is_some_and(|(revision, _)| *revision >= receipt.revision)
+                {
+                    return;
+                }
+                self.reservations
+                    .insert(key, (receipt.revision, reservation.clone()));
+            }
+            ScriptOperationPayload::Settlement { result } => {
+                self.index_settlement_receipt(receipt, result);
+            }
+            _ => {}
+        }
+    }
+
+    /// Fold one settlement receipt into the projection its structure spends
+    /// from. The fold only ever adds consumption and latches release, so a
+    /// snapshot replay that visits the receipts in any order — including before
+    /// the C1 reservation receipt they belong to — reaches the same result.
+    fn index_settlement_receipt(
+        &mut self,
+        receipt: &DurableOperationReceipt,
+        result: &mc_script::ScriptSettlementResult,
+    ) {
+        let (structure_id, portion, cancelled) = match result {
+            mc_script::ScriptSettlementResult::Receipt { receipt } => {
+                (receipt.structure_id.as_str(), Some(receipt), false)
+            }
+            mc_script::ScriptSettlementResult::Structure { structure }
+                if structure.state == mc_script::ScriptStructureState::Cancelled =>
+            {
+                (structure.structure_id.as_str(), None, true)
+            }
+            _ => return,
+        };
+        let Some(projection) = self.settlement_projection(structure_id) else {
+            return;
+        };
+        if projection.plugin_id != receipt.plugin_id {
+            return;
+        }
+        let Some(reservation_ref) = projection.reservation_ref else {
+            return;
+        };
+        let fold = self
+            .settlement_folds
+            .entry((receipt.plugin_id.clone(), reservation_ref))
+            .or_default();
+        if fold
+            .bound_to
+            .as_deref()
+            .is_some_and(|bound| bound != structure_id)
+        {
+            return;
+        }
+        if cancelled {
+            fold.released = true;
+        } else if let Some(portion) = portion {
+            for material in &portion.consumed {
+                *fold.consumed.entry(material.resource.clone()).or_insert(0) += material.quantity;
+            }
+            fold.watermark = fold.watermark.max(portion.sequence);
+        }
+        fold.bound_to = Some(structure_id.to_owned());
+        fold.revision = fold.revision.max(receipt.revision);
+    }
+
+    /// The C1 reservation projection with its bound structure's committed
+    /// consumption applied. A released reservation has returned everything it
+    /// did not spend, so `reserved = consumed + returned + remaining` holds.
+    fn settlement_reservation(
+        &self,
+        plugin_id: &str,
+        reservation_ref: &str,
+    ) -> Option<(u64, ScriptInventoryReservationSnapshot)> {
+        let key = (plugin_id.to_owned(), reservation_ref.to_owned());
+        let (base_revision, base) = self.reservations.get(&key)?;
+        let mut snapshot = base.clone();
+        let mut revision = *base_revision;
+        if let Some(fold) = self.settlement_folds.get(&key) {
+            for quantity in &mut snapshot.quantities {
+                let spent = fold
+                    .consumed
+                    .get(&quantity.resource_id)
+                    .copied()
+                    .unwrap_or(0);
+                let consumed = quantity
+                    .consumed
+                    .saturating_add(spent)
+                    .min(quantity.reserved);
+                quantity.consumed = consumed;
+                if fold.released {
+                    quantity.returned = quantity.reserved - consumed;
+                    quantity.remaining = 0;
+                } else {
+                    quantity.remaining = quantity
+                        .reserved
+                        .saturating_sub(consumed)
+                        .saturating_sub(quantity.returned);
+                }
+            }
+            snapshot.bound_to = fold.bound_to.clone().or(snapshot.bound_to);
+            snapshot.receipt_watermark = snapshot.receipt_watermark.max(fold.watermark);
+            snapshot.released |= fold.released;
+            revision = revision.max(fold.revision);
+        }
+        Some((revision, snapshot))
+    }
+
+    fn operation_receipt(
+        &self,
+        plugin_id: &str,
+        operation_id: &str,
+    ) -> Option<&DurableOperationReceipt> {
+        self.operation_results
+            .get(&(plugin_id.to_owned(), operation_id.to_owned()))
+    }
+
+    fn reservation(
+        &self,
+        plugin_id: &str,
+        reservation_ref: &str,
+    ) -> Option<(u64, &ScriptInventoryReservationSnapshot)> {
+        self.reservations
+            .get(&(plugin_id.to_owned(), reservation_ref.to_owned()))
+            .map(|(revision, snapshot)| (*revision, snapshot))
+    }
+
+    /// Every still-held reservation on one endpoint, summed per resource across
+    /// owners. A transfer must leave at least these quantities untouched.
+    fn reserved_quantities(&self, endpoint: &ScriptInventoryEndpoint) -> BTreeMap<String, u64> {
+        let mut quantities = BTreeMap::new();
+        for (_, snapshot) in self.reservations.values() {
+            if snapshot.released || &snapshot.endpoint != endpoint {
+                continue;
+            }
+            for quantity in &snapshot.quantities {
+                let total = quantities
+                    .entry(quantity.resource_id.clone())
+                    .or_insert(0_u64);
+                *total = total.saturating_add(quantity.remaining);
+            }
+        }
+        quantities
     }
 
     fn existing_result(
@@ -788,7 +1070,7 @@ impl PluginStorage {
                 || (length > MAX_FRAME_BYTES
                     && !matches!(
                         bytes.get(offset + 4).copied(),
-                        Some(OP_STORAGE_BATCH | OP_SNAPSHOT_OPERATION)
+                        Some(OP_STORAGE_BATCH | OP_SNAPSHOT_OPERATION | OP_SNAPSHOT_SETTLEMENT)
                     ))
             {
                 return Err(PluginStorageStartError::Malformed("frame length"));
@@ -839,6 +1121,10 @@ impl PluginStorage {
                 }
                 self.records.clear();
                 self.mutation_results.clear();
+                self.residents.reset();
+                self.settlements.reset();
+                self.orders.reset();
+                self.settlement_folds.clear();
                 self.live_bytes = 0;
                 self.revision = u64::from_le_bytes(rest.try_into().unwrap());
                 Ok(true)
@@ -918,6 +1204,7 @@ impl PluginStorage {
                     ));
                 }
                 let identity = (receipt.plugin_id.clone(), receipt.operation_id.clone());
+                self.index_operation_receipt(&receipt);
                 if self.operation_results.insert(identity, receipt).is_some() {
                     return Err(PluginStorageStartError::Malformed(
                         "duplicate operation snapshot",
@@ -935,6 +1222,68 @@ impl PluginStorage {
                 let batch = decode_storage_batch(rest)?;
                 self.install_storage_batch(batch)?;
                 Ok(false)
+            }
+            OP_RESIDENT_CHANGE => {
+                let change = decode_resident_change(rest)?;
+                if change.revision()
+                    != self
+                        .revision
+                        .checked_add(1)
+                        .ok_or(PluginStorageStartError::Malformed("revision overflow"))?
+                {
+                    return Err(PluginStorageStartError::Malformed(
+                        "non-monotonic resident revision",
+                    ));
+                }
+                self.residents.apply(&change)?;
+                self.revision = change.revision();
+                Ok(false)
+            }
+            OP_SNAPSHOT_RESIDENT => {
+                let change = decode_resident_change(rest)?;
+                if !snapshot_mode || change.revision() > self.revision {
+                    return Err(PluginStorageStartError::Malformed(
+                        "resident snapshot revision",
+                    ));
+                }
+                self.residents.apply(&change)?;
+                Ok(true)
+            }
+            OP_SNAPSHOT_SETTLEMENT => {
+                let change = decode_settlement_change(rest)?;
+                if !snapshot_mode || change.revision() > self.revision {
+                    return Err(PluginStorageStartError::Malformed(
+                        "settlement snapshot revision",
+                    ));
+                }
+                self.settlements.apply(&change)?;
+                Ok(true)
+            }
+            OP_RESIDENT_ORDER_CHANGE => {
+                let change = decode_resident_order_change(rest)?;
+                if change.revision()
+                    != self
+                        .revision
+                        .checked_add(1)
+                        .ok_or(PluginStorageStartError::Malformed("revision overflow"))?
+                {
+                    return Err(PluginStorageStartError::Malformed(
+                        "non-monotonic resident order revision",
+                    ));
+                }
+                self.orders.apply(&change)?;
+                self.revision = change.revision();
+                Ok(false)
+            }
+            OP_SNAPSHOT_ORDER => {
+                let change = decode_resident_order_change(rest)?;
+                if !snapshot_mode || change.revision() > self.revision {
+                    return Err(PluginStorageStartError::Malformed(
+                        "resident order snapshot revision",
+                    ));
+                }
+                self.orders.apply(&change)?;
+                Ok(true)
             }
             _ => Err(PluginStorageStartError::Malformed("frame operation")),
         }
@@ -1082,6 +1431,21 @@ impl PluginStorage {
             }
             temporary.write_all(&frame(&payload))?;
         }
+        // Settlement ledger frames are written before the operation receipts so
+        // a replayed receipt can resolve the reservation its structure spends
+        // from while the projection is rebuilt.
+        for change in self.settlements.change_log() {
+            let mut payload = vec![OP_SNAPSHOT_SETTLEMENT];
+            payload.extend_from_slice(
+                &serde_json::to_vec(&change).map_err(|error| {
+                    PluginStorageMutationError::Io(std::io::Error::other(error))
+                })?,
+            );
+            if payload.len() > MAX_TRANSACTION_FRAME_BYTES {
+                return Err(PluginStorageMutationError::QuotaExceeded);
+            }
+            temporary.write_all(&frame(&payload))?;
+        }
         for receipt in self.operation_results.values() {
             let mut payload = vec![OP_SNAPSHOT_OPERATION];
             payload.extend_from_slice(
@@ -1090,6 +1454,33 @@ impl PluginStorage {
                 })?,
             );
             if payload.len() > MAX_TRANSACTION_FRAME_BYTES {
+                return Err(PluginStorageMutationError::QuotaExceeded);
+            }
+            temporary.write_all(&frame(&payload))?;
+        }
+        for change in self.residents.change_log() {
+            let mut payload = vec![OP_SNAPSHOT_RESIDENT];
+            payload.extend_from_slice(
+                &serde_json::to_vec(&change).map_err(|error| {
+                    PluginStorageMutationError::Io(std::io::Error::other(error))
+                })?,
+            );
+            if payload.len() > MAX_FRAME_BYTES {
+                return Err(PluginStorageMutationError::QuotaExceeded);
+            }
+            temporary.write_all(&frame(&payload))?;
+        }
+        // Order ledger frames carry the durable group-admission record, so they
+        // are written after the resident frames their handles resolve against
+        // and before the operation receipts that replay them.
+        for change in self.orders.change_log() {
+            let mut payload = vec![OP_SNAPSHOT_ORDER];
+            payload.extend_from_slice(
+                &serde_json::to_vec(&change).map_err(|error| {
+                    PluginStorageMutationError::Io(std::io::Error::other(error))
+                })?,
+            );
+            if payload.len() > MAX_FRAME_BYTES {
                 return Err(PluginStorageMutationError::QuotaExceeded);
             }
             temporary.write_all(&frame(&payload))?;
@@ -1182,7 +1573,15 @@ fn decode_storage_batch(payload: &[u8]) -> Result<PreparedStorageBatch, PluginSt
 
 fn validate_storage_batch(batch: &PreparedStorageBatch) -> Result<(), PluginStorageStartError> {
     validate_delete_fields(&batch.plugin_id, "batch")?;
-    if batch.transaction_id == 0 || batch.mutations.is_empty() || batch.mutations.len() > 16 {
+    if batch.transaction_id == 0
+        || batch.mutations.len() > 16
+        || (batch.mutations.is_empty()
+            && batch.inventory.is_none()
+            && batch.operation.is_none()
+            && batch.resident.is_empty()
+            && batch.settlement.is_empty()
+            && batch.order.is_empty())
+    {
         return Err(PluginStorageStartError::Malformed("storage batch identity"));
     }
     let mut keys = std::collections::BTreeSet::new();
@@ -1216,24 +1615,60 @@ fn validate_storage_batch(batch: &PreparedStorageBatch) -> Result<(), PluginStor
                 "storage batch operation identity",
             ));
         }
-        let mc_script::ScriptOperationPayload::StorageBatch { changes } = receipt.outcome.payload()
-        else {
+        match receipt.outcome.payload() {
+            mc_script::ScriptOperationPayload::StorageBatch { changes } => {
+                if changes.len() != batch.mutations.len()
+                    || changes
+                        .iter()
+                        .zip(&batch.mutations)
+                        .any(|(change, mutation)| {
+                            change.key != mutation.key()
+                                || change.deleted
+                                    != matches!(
+                                        mutation,
+                                        DurableStorageBatchMutation::Delete { .. }
+                                    )
+                        })
+                {
+                    return Err(PluginStorageStartError::Malformed(
+                        "storage batch operation changes",
+                    ));
+                }
+            }
+            // Owned inventory decisions carry no plugin ledger mutations; their
+            // receipt is checked by the receipt validator above.
+            mc_script::ScriptOperationPayload::OwnedInventory { .. } => {}
+            mc_script::ScriptOperationPayload::Resident { .. } => {}
+            mc_script::ScriptOperationPayload::ResidentOrder { .. } => {}
+            mc_script::ScriptOperationPayload::Settlement { .. } => {}
+            _ => {
+                return Err(PluginStorageStartError::Malformed(
+                    "storage batch operation payload",
+                ));
+            }
+        }
+    }
+    for change in &batch.resident {
+        change.validate()?;
+        if change.revision() != batch.transaction_id {
             return Err(PluginStorageStartError::Malformed(
-                "storage batch operation payload",
+                "resident batch revision",
             ));
-        };
-        if changes.len() != batch.mutations.len()
-            || changes
-                .iter()
-                .zip(&batch.mutations)
-                .any(|(change, mutation)| {
-                    change.key != mutation.key()
-                        || change.deleted
-                            != matches!(mutation, DurableStorageBatchMutation::Delete { .. })
-                })
-        {
+        }
+    }
+    for change in &batch.settlement {
+        change.validate()?;
+        if change.revision() != batch.transaction_id {
             return Err(PluginStorageStartError::Malformed(
-                "storage batch operation changes",
+                "settlement batch revision",
+            ));
+        }
+    }
+    for change in &batch.order {
+        change.validate()?;
+        if change.revision() != batch.transaction_id {
+            return Err(PluginStorageStartError::Malformed(
+                "resident order batch revision",
             ));
         }
     }
@@ -1485,6 +1920,9 @@ async fn run_storage_actor(
         fail_queued_storage_commands(&mut commands, &events).await;
         return;
     }
+    // A committed group admission whose owners still owe an engine goal push is
+    // applied once here, before any new command is admitted.
+    inventory.recover_resident_orders(&mut storage).await;
     loop {
         let command = tokio::select! {
             biased;
@@ -1650,68 +2088,165 @@ async fn run_storage_actor(
                 TargetedEventDelivery::Delivered
             }
             ScriptCommand::Operation { request } => {
-                let execution = storage.execute_operation(command.plugin_id(), request);
-                let (outcome, receipt) = match execution {
-                    Ok(OperationExecution::Reply(outcome)) => (outcome, None),
-                    Ok(OperationExecution::Durable(receipt)) => {
-                        (receipt.outcome.clone(), Some(receipt))
-                    }
-                    Err(
-                        PluginStorageMutationError::QuotaExceeded
-                        | PluginStorageMutationError::RevisionOverflow,
-                    ) => (
-                        mc_script::ScriptOperationOutcome::rejected(
-                            mc_script::ScriptOperationFailure::Capacity,
-                        ),
-                        None,
-                    ),
-                    Err(PluginStorageMutationError::RequestIdentityConflict) => (
-                        mc_script::ScriptOperationOutcome::rejected(
-                            mc_script::ScriptOperationFailure::OperationConflict,
-                        ),
-                        None,
-                    ),
-                    Err(error @ PluginStorageMutationError::DurabilityUnknown(_)) => {
-                        warn!(
-                            ?error,
-                            "operation durability unknown; leaving receipt for recovery"
-                        );
-                        if let Some(receipt) = storage.unknown_operation.take() {
-                            let _ = command.operation_result(receipt.outcome);
+                if matches!(
+                    request.operation(),
+                    mc_script::ScriptOperation::Inventory { .. }
+                        | mc_script::ScriptOperation::Resident { .. }
+                        | mc_script::ScriptOperation::ResidentOrder { .. }
+                        | mc_script::ScriptOperation::Settlement { .. }
+                ) {
+                    let resident = matches!(
+                        request.operation(),
+                        mc_script::ScriptOperation::Resident { .. }
+                    );
+                    let settlement = matches!(
+                        request.operation(),
+                        mc_script::ScriptOperation::Settlement { .. }
+                    );
+                    let resident_order = matches!(
+                        request.operation(),
+                        mc_script::ScriptOperation::ResidentOrder { .. }
+                    );
+                    let plugin_id = command.plugin_id().to_owned();
+                    let operation_id = request.operation_id().map(str::to_owned);
+                    let outcome = match if settlement {
+                        inventory
+                            .execute_settlement_operation(&mut storage, &plugin_id, request)
+                            .await
+                    } else if resident {
+                        inventory
+                            .execute_resident_operation(&mut storage, &plugin_id, request)
+                            .await
+                    } else if resident_order {
+                        inventory
+                            .execute_resident_order_operation(&mut storage, &plugin_id, request)
+                            .await
+                    } else {
+                        inventory
+                            .execute_owned_inventory(&mut storage, &plugin_id, request)
+                            .await
+                    } {
+                        Ok(outcome) => outcome,
+                        Err(
+                            error @ (PluginStorageMutationError::QuotaExceeded
+                            | PluginStorageMutationError::RevisionOverflow),
+                        ) => {
+                            debug!(?error, "owned inventory decision exceeded storage limits");
+                            mc_script::ScriptOperationOutcome::rejected(
+                                mc_script::ScriptOperationFailure::Capacity,
+                            )
                         }
+                        Err(PluginStorageMutationError::RequestIdentityConflict) => {
+                            debug!("owned inventory decision identity conflicted");
+                            mc_script::ScriptOperationOutcome::rejected(
+                                mc_script::ScriptOperationFailure::OperationConflict,
+                            )
+                        }
+                        Err(error @ PluginStorageMutationError::DurabilityUnknown(_)) => {
+                            warn!(
+                                ?error,
+                                "owned inventory durability unknown; leaving its decision for recovery"
+                            );
+                            stopped.mark_failed();
+                            fail_queued_storage_commands(&mut commands, &events).await;
+                            return;
+                        }
+                        Err(error @ PluginStorageMutationError::Io(_)) => {
+                            warn!(
+                                ?error,
+                                "owned inventory durability failed; stopping storage actor"
+                            );
+                            fail_storage_actor(command, &mut commands, &events, &stopped).await;
+                            return;
+                        }
+                    };
+                    let event = match command.operation_result(outcome) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            warn!(?error, "owned inventory result construction rejected");
+                            return;
+                        }
+                    };
+                    let delivery = deliver_targeted_event(&events, event, &shutdown).await;
+                    if !matches!(delivery, TargetedEventDelivery::Delivered) {
+                        return;
+                    }
+                    if let Some(operation_id) = operation_id
+                        && let Some(receipt) = storage
+                            .operation_receipt(&plugin_id, &operation_id)
+                            .cloned()
+                        && let Err(error) = storage.acknowledge_operation(&receipt)
+                    {
+                        warn!(?error, "owned inventory receipt acknowledgement failed");
                         stopped.mark_failed();
                         fail_queued_storage_commands(&mut commands, &events).await;
                         return;
                     }
-                    Err(error @ PluginStorageMutationError::Io(_)) => {
-                        warn!(
-                            ?error,
-                            "operation durability failed; stopping storage actor"
-                        );
-                        fail_storage_actor(command, &mut commands, &events, &stopped).await;
+                    delivery
+                } else {
+                    let execution = storage.execute_operation(command.plugin_id(), request);
+                    let (outcome, receipt) = match execution {
+                        Ok(OperationExecution::Reply(outcome)) => (outcome, None),
+                        Ok(OperationExecution::Durable(receipt)) => {
+                            (receipt.outcome.clone(), Some(receipt))
+                        }
+                        Err(
+                            PluginStorageMutationError::QuotaExceeded
+                            | PluginStorageMutationError::RevisionOverflow,
+                        ) => (
+                            mc_script::ScriptOperationOutcome::rejected(
+                                mc_script::ScriptOperationFailure::Capacity,
+                            ),
+                            None,
+                        ),
+                        Err(PluginStorageMutationError::RequestIdentityConflict) => (
+                            mc_script::ScriptOperationOutcome::rejected(
+                                mc_script::ScriptOperationFailure::OperationConflict,
+                            ),
+                            None,
+                        ),
+                        Err(error @ PluginStorageMutationError::DurabilityUnknown(_)) => {
+                            warn!(
+                                ?error,
+                                "operation durability unknown; leaving receipt for recovery"
+                            );
+                            if let Some(receipt) = storage.unknown_operation.take() {
+                                let _ = command.operation_result(receipt.outcome);
+                            }
+                            stopped.mark_failed();
+                            fail_queued_storage_commands(&mut commands, &events).await;
+                            return;
+                        }
+                        Err(error @ PluginStorageMutationError::Io(_)) => {
+                            warn!(
+                                ?error,
+                                "operation durability failed; stopping storage actor"
+                            );
+                            fail_storage_actor(command, &mut commands, &events, &stopped).await;
+                            return;
+                        }
+                    };
+                    let event = match command.operation_result(outcome) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            warn!(?error, "operation result construction rejected");
+                            return;
+                        }
+                    };
+                    let delivery = deliver_targeted_event(&events, event, &shutdown).await;
+                    if !matches!(delivery, TargetedEventDelivery::Delivered) {
                         return;
                     }
-                };
-                let event = match command.operation_result(outcome) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        warn!(?error, "operation result construction rejected");
+                    if let Some(receipt) = receipt
+                        && let Err(error) = storage.acknowledge_operation(&receipt)
+                    {
+                        warn!(?error, "operation receipt acknowledgement failed");
+                        stopped.mark_failed();
+                        fail_queued_storage_commands(&mut commands, &events).await;
                         return;
                     }
-                };
-                let delivery = deliver_targeted_event(&events, event, &shutdown).await;
-                if !matches!(delivery, TargetedEventDelivery::Delivered) {
-                    return;
+                    delivery
                 }
-                if let Some(receipt) = receipt
-                    && let Err(error) = storage.acknowledge_operation(&receipt)
-                {
-                    warn!(?error, "operation receipt acknowledgement failed");
-                    stopped.mark_failed();
-                    fail_queued_storage_commands(&mut commands, &events).await;
-                    return;
-                }
-                delivery
             }
             ScriptCommand::InventoryStorageTransaction { transaction } => {
                 let outcome = inventory

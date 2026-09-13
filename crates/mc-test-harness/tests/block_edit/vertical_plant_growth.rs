@@ -74,33 +74,31 @@ async fn survival_random_tick_grows_visible_vertical_plant_columns() {
         )
         .with_generator(generator);
         let world = Arc::new(tokio::sync::Mutex::new(storage));
-        let cfg = mc_net::ServerConfig {
-            bind_address: "127.0.0.1:0".parse().unwrap(),
-            motd: format!("M76 {name} growth"),
-            max_players: 8,
-            view_distance: VIEW_DISTANCE,
-            data: Arc::clone(&data),
-            blocks: Arc::clone(&blocks),
-            world: Some(Arc::clone(&world)),
-            tags: Arc::clone(&tags),
-            recipes: Arc::new(Vec::new()),
-            loot: Arc::new(mc_data::loot::LootTables::default()),
-            block_light: None,
-            items: Arc::clone(&items),
-            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-            block_facts: Arc::clone(&block_facts),
-            entity_types: Arc::clone(&entity_types),
-            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-            random_tick: mc_net::RandomTickPolicy {
-                random_tick_speed: 512,
-                chunk_budget: ((2 * VIEW_DISTANCE + 1) as usize).pow(2),
-                ..mc_net::RandomTickPolicy::default()
-            },
-            command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-            loader_manifest: None,
-            shutdown: mc_net::ShutdownHandle::default(),
-        };
+        let cfg = mc_net::ServerConfig { tab_list: mc_net::TabListConfig::default(), bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: format!("M76 {name} growth"),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data: Arc::clone(&data),
+        blocks: Arc::clone(&blocks),
+        world: Some(Arc::clone(&world)),
+        tags: Arc::clone(&tags),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::clone(&items),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::clone(&block_facts),
+        entity_types: Arc::clone(&entity_types),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy {
+            random_tick_speed: 512,
+            chunk_budget: ((2 * VIEW_DISTANCE + 1) as usize).pow(2),
+            ..mc_net::RandomTickPolicy::default()
+        },
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
+        shutdown: mc_net::ShutdownHandle::default(), };
         let bound = mc_net::bind(cfg).await.expect("bind");
         let addr = bound.local_addr().expect("local_addr");
         tokio::spawn(async move {

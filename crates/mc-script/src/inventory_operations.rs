@@ -18,7 +18,13 @@ pub const MAX_OWNED_INVENTORY_TRANSFERS: usize = 16;
 pub const MAX_INVENTORY_RESOURCE_TYPES: usize = 16;
 pub const MAX_INVENTORY_WORK_PORTIONS: usize = 512;
 pub const MAX_OWNED_INVENTORY_SLOTS: usize = 54;
-const MAX_WAREHOUSE_HANDLE_BYTES: usize = 128;
+/// Total items one transfer request may move across all of its transfers.
+pub const MAX_OWNED_INVENTORY_ITEM_BUDGET: u32 = 4096;
+pub const MAX_WAREHOUSE_HANDLE_BYTES: usize = 128;
+/// Canonical carry slots of one durable resident.
+pub const MAX_RESIDENT_CARRY_SLOTS: u8 = 8;
+/// Canonical equipment slots of one durable resident (hands + armor).
+pub const MAX_RESIDENT_EQUIPMENT_SLOTS: u8 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -26,6 +32,8 @@ const MAX_WAREHOUSE_HANDLE_BYTES: usize = 128;
 pub enum ScriptInventoryEndpoint {
     PlayerInventory { player_id: u64 },
     Warehouse { handle: String },
+    ResidentEquipment { handle: String },
+    ResidentCarry { handle: String },
 }
 
 impl ScriptInventoryEndpoint {
@@ -35,6 +43,18 @@ impl ScriptInventoryEndpoint {
             Self::Warehouse { handle } => {
                 validate_bounded_nonempty("warehouse handle", handle, MAX_WAREHOUSE_HANDLE_BYTES)
             }
+            Self::ResidentEquipment { handle } | Self::ResidentCarry { handle } => {
+                crate::validate_resident_handle(handle)
+            }
+        }
+    }
+
+    /// The durable resident handle this endpoint addresses, when it is one.
+    #[must_use]
+    pub fn resident_handle(&self) -> Option<&str> {
+        match self {
+            Self::ResidentEquipment { handle } | Self::ResidentCarry { handle } => Some(handle),
+            Self::PlayerInventory { .. } | Self::Warehouse { .. } => None,
         }
     }
 }
@@ -291,6 +311,7 @@ impl ScriptOwnedInventoryOperation {
                     return Err(ScriptDtoError::InvalidBounds);
                 }
                 let mut endpoints = BTreeSet::new();
+                let mut item_budget = 0_u32;
                 for transfer in transfers {
                     transfer.source.validate()?;
                     transfer.destination.validate()?;
@@ -303,6 +324,10 @@ impl ScriptOwnedInventoryOperation {
                     {
                         return Err(ScriptDtoError::InvalidBounds);
                     }
+                    item_budget = item_budget
+                        .checked_add(transfer.count)
+                        .filter(|budget| *budget <= MAX_OWNED_INVENTORY_ITEM_BUDGET)
+                        .ok_or(ScriptDtoError::InvalidBounds)?;
                     endpoints.insert(&transfer.source);
                     endpoints.insert(&transfer.destination);
                 }
@@ -355,6 +380,8 @@ fn valid_slot(endpoint: &ScriptInventoryEndpoint, slot: u8) -> bool {
     match endpoint {
         ScriptInventoryEndpoint::PlayerInventory { .. } => (9..=44).contains(&slot),
         ScriptInventoryEndpoint::Warehouse { .. } => usize::from(slot) < MAX_OWNED_INVENTORY_SLOTS,
+        ScriptInventoryEndpoint::ResidentEquipment { .. } => slot < MAX_RESIDENT_EQUIPMENT_SLOTS,
+        ScriptInventoryEndpoint::ResidentCarry { .. } => slot < MAX_RESIDENT_CARRY_SLOTS,
     }
 }
 
