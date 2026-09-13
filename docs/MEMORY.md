@@ -1,8 +1,8 @@
 # Solaris current cursor
-## Handover snapshot (batch commit `5ebb33c4`)
+## Handover snapshot (pushed `44eea177`)
 
-- base_tree: `5ebb33c413d2017f0256f67e5445934a817d7da4` (batch commit of the
-  validated tree; parent `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`)
+- base_tree: `44eea177c0f2a25998d876f5c5945ed0e830ef02` (pushed to `main`; parents
+  `5ebb33c4` batch commit -> `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`)
 - checkpoint_closed: settlement commit pipeline through the simulation lane, mob spin
   fix, worldgen (biome/river/beach/villages), live operator+whitelist access control,
   tab list, redstone/pistons, pregeneration, warehouse bind/read (C1a) - landed as one
@@ -21,6 +21,14 @@
   out of the play gateway, 745 -> 727 lines against the 731 budget; the first attempt failed
   code-health). Focused: `--lib ingress_rate` 8, `--lib settlement` 55,
   `--test settlement_fund` 1 (new repro, fails before the fix).
+- tree_freeze_proof: before pushing, no other omp/agent writer was alive and two
+  `git status --porcelain` + `git diff HEAD` fingerprints taken apart were identical
+  (`97a4df1a411b6a64970e446b95eb6ded7fd1bffb5051a65f4950bb545aa08d1d`), with an empty
+  index and only the five local-only paths differing from HEAD.
+- validation_on_pushed_commit: `run correctness` PASS
+  `.analysis/validation/20260913T231751-correctness-wwdhk_td` (244.3 s) re-run on
+  `44eea177c0f2a25998d876f5c5945ed0e830ef02`, so the pushed revision itself - not an
+  earlier snapshot of it - is the one the L2 gate covers.
 - pushed: `main` now carries both live-chain fixes (ingress burst limiter no longer drops a
   serialized command and answers a dropped one; `advance_structure` re-observes the footprint
   after its own portion commit instead of pausing as `site_changed`), together with the
