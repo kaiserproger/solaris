@@ -3,6 +3,9 @@
 
 - base_tree: `44eea177c0f2a25998d876f5c5945ed0e830ef02` (pushed to `main`; parents
   `5ebb33c4` batch commit -> `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`)
+- cursor_commits: this snapshot lives at `14ba3835`, which is cursor bookkeeping only; any
+  commit after the `base_tree` commit that touches only `docs/MEMORY.md` is the same
+  kind, so the content diff for the next session starts at `base_tree`.
 - checkpoint_closed: settlement commit pipeline through the simulation lane, mob spin
   fix, worldgen (biome/river/beach/villages), live operator+whitelist access control,
   tab list, redstone/pistons, pregeneration, warehouse bind/read (C1a) - landed as one
