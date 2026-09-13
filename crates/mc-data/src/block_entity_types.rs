@@ -3,10 +3,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
 use thiserror::Error;
 
 use crate::Identifier;
+use crate::sidecar::RawRegistries;
 
 #[derive(Debug, Error)]
 pub enum BlockEntityTypesReportError {
@@ -108,22 +108,6 @@ pub fn solaris_required_block_entity_types() -> BlockEntityTypeRegistry {
     })
     .collect::<Vec<_>>();
     BlockEntityTypeRegistry::from_report(&report)
-}
-
-#[derive(Deserialize)]
-struct RawRegistries {
-    #[serde(flatten)]
-    registries: BTreeMap<String, RawRegistry>,
-}
-
-#[derive(Deserialize)]
-struct RawRegistry {
-    entries: BTreeMap<String, RawEntry>,
-}
-
-#[derive(Deserialize)]
-struct RawEntry {
-    protocol_id: u32,
 }
 
 #[cfg(test)]

@@ -1,7 +1,40 @@
 # Solaris current cursor
-## Handover snapshot (uncommitted batch)
+## Handover snapshot (batch commit `5ebb33c4`)
 
-- base_tree: `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`
+- base_tree: `5ebb33c413d2017f0256f67e5445934a817d7da4` (batch commit of the
+  validated tree; parent `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`)
+- checkpoint_closed: settlement commit pipeline through the simulation lane, mob spin
+  fix, worldgen (biome/river/beach/villages), live operator+whitelist access control,
+  tab list, redstone/pistons, pregeneration, warehouse bind/read (C1a) - landed as one
+  local batch commit `5ebb33c4` (210 files, +45618/-7730, no push/tag) after the owner
+  sanctioned a whole-tree batch because earlier checkpoint lines share hunks with the
+  settlement hunks. Local-only paths stayed out: `dist/` (120 MB), the omp session dump,
+  `crates/mc-entity/.analysis/bench/entity-battle-1500x1500.json` and four tracked root
+  `.analysis/*` deletions.
+- validation_at_close: `run correctness` PASS
+  `.analysis/validation/20260913T104202-correctness-41olrp8v`; `--lib warehouse` 8,
+  `--lib owned_inventory` 18, `-p mc-script` 129, `--test settlement_lifecycle` 7,
+  `--test plugin_examples` 4. Independent reviews: `CutoverReview` and
+  `WarehouseReadReview` (both verdict changes, all findings fixed).
+- validation_after_limiter_fix: `run correctness` PASS
+  `.analysis/validation/20260913T151643-correctness-5wnrl9nr` (after moving the drop-refusal
+  out of the play gateway, 745 -> 727 lines against the 731 budget; the first attempt failed
+  code-health). Focused: `--lib ingress_rate` 8, `--lib settlement` 55,
+  `--test settlement_fund` 1 (new repro, fails before the fix).
+- pushed: `main` now carries both live-chain fixes (ingress burst limiter no longer drops a
+  serialized command and answers a dropped one; `advance_structure` re-observes the footprint
+  after its own portion commit instead of pausing as `site_changed`), together with the
+  owner's concurrent cleanup sweep over mc-data/mc-test-harness.
+- validation_latest_push: `run correctness` PASS
+  `.analysis/validation/20260913T231231-correctness-a7ak29y2` (248.7 s) on the pushed tree.
+- next: live acceptance of the `site_changed` fix once the machine and the worldgen sweep are
+  free - `SOLARIS_REAL_CLIENT_AGENT_SCENARIO=m94-09-settlement-chain python3 -m tools.harness
+  run regression --timeout-seconds 600 --run`. Deferred only for the owner's power-saver/noise
+  window and because the sweep's terrain turns the driver's deterministic site pick (3203,60,300)
+  into 3995/4096 water, which made `.analysis/validation/20260913T164410-regression-go7um90p`
+  invalid as acceptance (project refused and withdrawn). If the terrain stays, the driver needs
+  a dry-site preference instead of the first candidate. Receipts:
+  `.analysis/codex-logs/live-chain/receipt.md`, `.analysis/codex-logs/site-changed/receipt.md`.
 - owned_hash: `52a5e94e417ee168aa1f5aa2abf2c6becd4dd706b23f3ee0d335f8861c9e29b5` (SHA-256 over the 13 checkpoint-owned paths, recomputed after the C1a slice and the C1b revert: `crates/mc-net/src/settlement.rs`, `server.rs`, `play.rs`, `play/simulation.rs`, `play/block_wire.rs`, `play/tests/campfire_cooking.rs`, `script/storage/settlement.rs`, `script/storage/settlement_tests.rs`, `script/storage/resident_settlement_tests.rs`, `crates/mc-test-harness/tests/settlement_lifecycle.rs`, `docs/decisions/0004-staged-single-writer-simulation.md`, `docs/PLUGINS.md`, `../solaris-default-plugins/solaris-settlements/main.lua`; recipe: SHA-256 over `"<sha256>  <path>\n"` lines in that order. Other dirty paths belong to earlier checkpoints)
 - changed_files: owned batch 18 paths; the rest of the dirty tree (191 paths) is pre-existing workspace WIP, not this batch
 - sibling_batch: `../solaris-default-plugins` base `2d51ae5559cd` SHA-256 `71f40021def7e280b2de94fa3a27d206a2eecf6e2e247d36d2f7bec2e774c041` over the 9 files the package agents changed (root `README.md`/contract/`WATCHDOG.yml` and untouched package files excluded — pre-existing WIP; the package's two older receipts under `server/evidence/` are pre-existing as well)
@@ -2708,3 +2741,43 @@ Gates: mc-net lib 2110/0, mc-server 79/43/2/39/14/0/12/1 (+the flake),
 mc-worldgen 141+1+12/0, fmt clean, `clippy -D warnings` clean for the three
 crates, code-health PASS. Binary rebuilt + reinstalled (~/.local/bin/solaris).
 
+## LOC unification and plugin authoring audit 2026-09-13 (uncommitted, draft)
+
+Whole tracked source/config inventory: 817 files, 542097 physical lines across
+all 13 crates and tooling; exact-clone scan plus targeted semantic audits.
+This is not a claim that all similar code is interchangeable. Owned code delta:
+**-730 lines**, including new Luau declarations and authoring regression tests.
+Shared registry decoding, the common TCP Play handshake (16 test files),
+identical two-client harness setup/screenshots, script-host dequeue policy, and
+identical noise interpolation formulas now have single implementations.
+Different handshake, preflight, floating-point, and authority contracts remain
+separate rather than being forced through a generic abstraction.
+
+Plugin discovery now checks 61 real host functions against bundled Luau
+declarations instead of typing `solaris` as `any`. All ten first-party package
+sources typechecked; an actual strict-loaded command and simulation timer
+reached a real TCP client. Advanced result records remain dynamically typed and
+runtime-validated; durable async request/result correlation is still explicit.
+Plugin docs now use the real completion callback and observed inventory fence,
+and no longer advertise the removed ephemeral villager bindings.
+
+Evidence: `.analysis/codex-logs/loc-unification/receipt.json` records
+`base_tree`, `diff_hash`, the 31 owned `changed_files`, validation, and next action.
+Base: `5ebb33c413d2017f0256f67e5445934a817d7da4`.
+Owned patch SHA256:
+`b9f55c01c4bc4be3290f0ff3d11aebec461a426032aa79f8b59b8ab8ead87b6e`.
+The patch excludes this append-only cursor record and concurrent settlement
+changes, which were preserved. No staging, commit, push, or sibling-source edits.
+
+Validation: canonical `correctness` passed (4763 passed, 192 ignored), receipt
+`.analysis/validation/20260913T165448-correctness-7hjn9uiy/result.json`;
+`harness-check` passed; two normally ignored multiplayer presence scenarios
+passed with real TCP clients; 48 old/new Python driver trace comparisons passed
+with substituted bridge calls. Independent read-only sonic review passed.
+No graphical Minecraft client gate was run (client credentials absent); this
+does not establish gameplay parity or close any failed owner scenario.
+
+Owner requested quiet operation during closeout. All owned build/test jobs had
+finished; no further heavy work was launched, and power saver was left untouched.
+Next: review the scoped uncommitted patch while preserving concurrent settlement
+work. This appendix does not advance the existing route cursor.

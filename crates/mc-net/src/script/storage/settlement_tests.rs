@@ -196,6 +196,9 @@ impl SettlementWorld for FakeWorld {
                 .entry(structure_id.to_owned())
                 .or_default()
                 .extend(blocks.iter().map(|block| block.pos));
+            // A portion is a durable world commit, so it advances the world's
+            // revision exactly like the live adapter's journal decision does.
+            self.mark_change();
             Ok(())
         })
     }
@@ -1222,6 +1225,100 @@ async fn advance_pauses_when_the_reserved_site_changed() {
         )
         .await;
     assert_eq!(outcome.failure(), Some(ScriptOperationFailure::Blocked));
+}
+
+#[tokio::test]
+async fn advance_absorbs_its_own_durable_commits_but_a_foreign_edit_still_pauses() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let structure = prepared_cottage(&fixture, &mut storage, "prepare-own")
+        .await
+        .0;
+    let plan = plan_of(&structure);
+    reserve_plan(&mut storage, "res-own", &plan);
+
+    // First portion: two of the foundation's three cells. Applying it is a
+    // durable world commit of this structure's own work, which advances the
+    // world revision exactly like the live adapter's journal decision does.
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-own-1",
+                &structure.structure_id,
+                &structure.stages[0].stage,
+                "res-own",
+                structure.revision,
+                2,
+            ),
+        )
+        .await;
+    assert_eq!(outcome.failure(), None, "first advance: {outcome:?}");
+    assert_eq!(receipt_of(&outcome).block_count, 2);
+    let revision = receipt_of(&outcome).revision;
+
+    // Second portion completes the same stage. The previous portion's own
+    // durable commit must not be mistaken for a site change: no foreign edit
+    // happened, so this advance must build, not pause.
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-own-2",
+                &structure.structure_id,
+                &structure.stages[0].stage,
+                "res-own",
+                revision,
+                2,
+            ),
+        )
+        .await;
+    assert_eq!(outcome.failure(), None, "second advance: {outcome:?}");
+    assert_eq!(receipt_of(&outcome).block_count, 1);
+    let revision = receipt_of(&outcome).revision;
+    let status = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &status_request(&structure.structure_id),
+        )
+        .await;
+    let running = structure_of(&status);
+    assert_eq!(running.state, ScriptStructureState::Running);
+    assert_eq!(running.pause_reason, None);
+    assert_eq!(fixture.world.built_blocks(&structure.structure_id), 3);
+
+    // A durable change this structure did not make must still pause the build.
+    fixture.world.mark_change();
+    let next_stage = structure
+        .stages
+        .get(1)
+        .expect("the cottage has a second stage to advance");
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-own-3",
+                &structure.structure_id,
+                &next_stage.stage,
+                "res-own",
+                revision,
+                2,
+            ),
+        )
+        .await;
+    assert_eq!(outcome.failure(), None, "third advance: {outcome:?}");
+    let paused = structure_of(&outcome);
+    assert_eq!(paused.state, ScriptStructureState::Paused);
+    assert_eq!(paused.pause_reason.as_deref(), Some("site_changed"));
+    assert_eq!(
+        fixture.world.built_blocks(&structure.structure_id),
+        3,
+        "the paused advance built nothing"
+    );
 }
 
 #[tokio::test]

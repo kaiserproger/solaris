@@ -1449,6 +1449,48 @@ def run_bridge_scenario(
     return scenario_result, final_state, [screenshot_path.relative_to(run_dir).as_posix()], scenario_report
 
 
+def prepare_two_client_scenario(
+    primary: AgentClient,
+    secondary: AgentClient,
+    run_dir: Path,
+    server_addr: str,
+    timeout_seconds: float,
+    transcript: list[dict[str, Any]],
+) -> Path:
+    screenshots_dir = run_dir / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
+    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
+    wait_for_existing_or_explicit_connection(
+        primary, transcript, server_addr, timeout_seconds, actor="primary",
+    )
+    wait_for_existing_or_explicit_connection(
+        secondary, transcript, server_addr, timeout_seconds, actor="secondary",
+    )
+    return screenshots_dir
+
+
+def capture_two_client_screenshots(
+    primary: AgentClient,
+    secondary: AgentClient,
+    transcript: list[dict[str, Any]],
+    run_dir: Path,
+    screenshots_dir: Path,
+    scenario_id: str,
+    timeout_seconds: float,
+) -> list[str]:
+    return [
+        capture_screenshot(
+            primary, transcript, run_dir, screenshots_dir,
+            f"{scenario_id}-primary", timeout_seconds, actor="primary",
+        ),
+        capture_screenshot(
+            secondary, transcript, run_dir, screenshots_dir,
+            f"{scenario_id}-secondary", timeout_seconds, actor="secondary",
+        ),
+    ]
+
+
 def run_two_client_visibility_scenario(
     primary: AgentClient,
     secondary: AgentClient,
@@ -1458,24 +1500,8 @@ def run_two_client_visibility_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_report = call_and_record(
         primary,
@@ -1503,26 +1529,9 @@ def run_two_client_visibility_scenario(
     secondary_result = scenario_report_result(secondary_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -1553,24 +1562,8 @@ def run_two_client_shared_chest_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_report = call_and_record(
         primary,
@@ -1598,26 +1591,9 @@ def run_two_client_shared_chest_scenario(
     secondary_result = scenario_report_result(secondary_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -1648,24 +1624,8 @@ def run_two_client_shared_chest_live_update_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_open_report = call_and_record(
         primary,
@@ -1705,26 +1665,9 @@ def run_two_client_shared_chest_live_update_scenario(
     primary_observe_result = scenario_report_result(primary_observe_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -1761,24 +1704,8 @@ def run_two_client_shared_drop_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_report = call_and_record(
         primary,
@@ -1806,26 +1733,9 @@ def run_two_client_shared_drop_scenario(
     secondary_result = scenario_report_result(secondary_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -1856,24 +1766,8 @@ def run_two_client_shared_pickup_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_drop_report = call_and_record(
         primary,
@@ -1925,26 +1819,9 @@ def run_two_client_shared_pickup_scenario(
     secondary_gone_result = scenario_report_result(secondary_gone_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -1984,24 +1861,8 @@ def run_playable_two_client_shared_log_drop_pickup_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_drop_report = call_and_record(
         primary,
@@ -2053,26 +1914,9 @@ def run_playable_two_client_shared_log_drop_pickup_scenario(
     secondary_gone_result = scenario_report_result(secondary_gone_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -2112,24 +1956,8 @@ def run_playable_two_client_earned_shared_chest_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_deposit_report = call_and_record(
         primary,
@@ -2169,26 +1997,9 @@ def run_playable_two_client_earned_shared_chest_scenario(
     primary_empty_result = scenario_report_result(primary_empty_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -2225,24 +2036,8 @@ def run_playable_two_client_shared_chest_save_restart_before_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_deposit_report = call_and_record(
         primary,
@@ -2259,26 +2054,9 @@ def run_playable_two_client_shared_chest_save_restart_before_scenario(
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
     clients_in_play = is_in_play(primary_state) and is_in_play(secondary_state)
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -2366,26 +2144,9 @@ def run_playable_two_client_shared_chest_save_restart_after_scenario(
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
     clients_in_play = is_in_play(primary_state) and is_in_play(secondary_state)
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -2470,24 +2231,8 @@ def run_playable_two_client_earned_torch_block_edit_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_place_report = call_and_record(
         primary,
@@ -2539,26 +2284,9 @@ def run_playable_two_client_earned_torch_block_edit_scenario(
     secondary_gone_result = scenario_report_result(secondary_gone_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -2598,24 +2326,8 @@ def run_playable_two_client_player_visibility_movement_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     secondary_observe_report = call_and_record(
         secondary,
@@ -2654,26 +2366,9 @@ def run_playable_two_client_player_visibility_movement_scenario(
     secondary_moved_result = scenario_report_result(secondary_moved_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -2710,24 +2405,8 @@ def run_playable_two_client_chat_message_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_send_report = call_and_record(
         primary,
@@ -2755,26 +2434,9 @@ def run_playable_two_client_chat_message_scenario(
     secondary_observe_result = scenario_report_result(secondary_observe_report)
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -2808,24 +2470,8 @@ def run_playable_two_client_player_disconnect_removal_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     secondary_visible_report = call_and_record(
         secondary,
@@ -2918,24 +2564,8 @@ def run_playable_two_client_player_reconnect_cleanup_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     secondary_visible_report = call_and_record(
         secondary,
@@ -3066,24 +2696,8 @@ def run_playable_two_client_player_death_respawn_visibility_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     secondary_baseline_report = call_and_record(
         secondary,
@@ -3143,26 +2757,9 @@ def run_playable_two_client_player_death_respawn_visibility_scenario(
         secondary_moved_result = "failed"
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -3204,24 +2801,8 @@ def run_playable_two_client_inventory_drop_handoff_scenario(
     timeout_seconds: float,
     transcript: list[dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
-    screenshots_dir = run_dir / "screenshots"
-    screenshots_dir.mkdir(parents=True, exist_ok=True)
-
-    call_and_record(primary, transcript, "ping", {}, timeout_seconds, "primary")
-    call_and_record(secondary, transcript, "ping", {}, timeout_seconds, "secondary")
-    wait_for_existing_or_explicit_connection(
-        primary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="primary",
-    )
-    wait_for_existing_or_explicit_connection(
-        secondary,
-        transcript,
-        server_addr,
-        timeout_seconds,
-        actor="secondary",
+    screenshots_dir = prepare_two_client_scenario(
+        primary, secondary, run_dir, server_addr, timeout_seconds, transcript,
     )
     primary_drop_report = call_and_record(
         primary,
@@ -3297,26 +2878,9 @@ def run_playable_two_client_inventory_drop_handoff_scenario(
         primary_gone_result = "failed"
     primary_state = call_and_record(primary, transcript, "state", {}, timeout_seconds, "primary")
     secondary_state = call_and_record(secondary, transcript, "state", {}, timeout_seconds, "secondary")
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 
@@ -3427,26 +2991,9 @@ def run_playable_two_client_movement_soak_scenario(
     )
     result = "passed" if all_states_in_play and movement_passed else "failed"
 
-    screenshots = [
-        capture_screenshot(
-            primary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-primary",
-            timeout_seconds,
-            actor="primary",
-        ),
-        capture_screenshot(
-            secondary,
-            transcript,
-            run_dir,
-            screenshots_dir,
-            f"{scenario_id}-secondary",
-            timeout_seconds,
-            actor="secondary",
-        ),
-    ]
+    screenshots = capture_two_client_screenshots(
+        primary, secondary, transcript, run_dir, screenshots_dir, scenario_id, timeout_seconds,
+    )
     call_and_record(secondary, transcript, "disconnect", {}, timeout_seconds, "secondary")
     call_and_record(primary, transcript, "disconnect", {}, timeout_seconds, "primary")
 

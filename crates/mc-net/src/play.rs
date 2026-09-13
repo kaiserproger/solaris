@@ -14729,28 +14729,9 @@ where
                 let frame = result?;
                 match ingress_limiter.admit(frame.id, frame.body.len(), Instant::now())? {
                     ingress_rate::IngressDecision::Allow => {}
-                    ingress_rate::IngressDecision::Drop {
-                        class,
-                        violations,
-                        class_violations,
-                    } => {
-                        if violations == 1 {
-                            debug!(
-                                packet_id = frame.id,
-                                class,
-                                violations,
-                                class_violations,
-                                "Play ingress packet dropped by rate budget"
-                            );
-                        } else {
-                            warn!(
-                                packet_id = frame.id,
-                                class,
-                                violations,
-                                class_violations,
-                                "repeated Play ingress rate violation"
-                            );
-                        }
+                    decision @ ingress_rate::IngressDecision::Drop { .. } => {
+                        ingress_rate::answer_dropped_ingress(writer, compression, frame.id, decision)
+                            .await?;
                         continue;
                     }
                 }

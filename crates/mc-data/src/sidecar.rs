@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{DirEntry, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use same_file::Handle;
+use serde::Deserialize;
 
 use crate::{
     MAX_JSON_FILE_BYTES, MAX_JSON_FILES, MAX_JSON_TOTAL_BYTES, MAX_JSON_WALK_DEPTH,
@@ -393,6 +395,28 @@ fn read_sorted_entries(
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+// Raw deserialisation shape of `registries.json`, shared by the item,
+// entity type and block entity type loaders:
+// `{ <registry>: { entries: { <name>: { protocol_id } } } }`. Kept
+// separate from the public report types so those stay plain and
+// serde-free for downstream consumers.
+
+#[derive(Deserialize)]
+pub(crate) struct RawRegistries {
+    #[serde(flatten)]
+    pub(crate) registries: BTreeMap<String, RawRegistry>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RawRegistry {
+    pub(crate) entries: BTreeMap<String, RawEntry>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RawEntry {
+    pub(crate) protocol_id: u32,
 }
 
 #[cfg(test)]

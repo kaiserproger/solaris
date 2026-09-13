@@ -25,8 +25,10 @@ use mc_protocol::packets::configuration::{
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
-    ClientboundChangeDifficulty, ClientboundPlayerAbilities, ClientboundSetHeldSlot, EntityEvent,
-    LoginPlay, PlayDisconnect,
+    ClientboundChangeDifficulty, ClientboundCommands, ClientboundInitializeBorder,
+    ClientboundPlayerAbilities, ClientboundSetHeldSlot, ClientboundSetTime, ConfirmTeleportation,
+    EntityEvent, GameEvent, LoginPlay, PlayDisconnect, SetCenterChunk, SetDefaultSpawnPosition,
+    SynchronizePlayerPosition,
 };
 use mc_protocol::{PROTOCOL_VERSION, RawFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -334,6 +336,44 @@ impl Client {
         let _: ClientboundSetHeldSlot = self.read_typed().await?;
         let _: EntityEvent = self.read_typed().await?;
         Ok(login)
+    }
+
+    /// Drive a fresh connection through the full Play-entry prelude shared by
+    /// the TCP integration tests: handshake/login/configuration, the Play
+    /// login sequence, then the fixed packet prelude Solaris emits before the
+    /// command tree, and finally acknowledge the server's teleport.
+    pub async fn connect_to_play(
+        addr: SocketAddr,
+        name: &str,
+    ) -> Result<(Self, SynchronizePlayerPosition)> {
+        let mut client = Self::connect(addr).await.context("client connect")?;
+        let _ = client
+            .drive_login(addr, name)
+            .await
+            .context("drive login")?;
+        client
+            .drive_configuration()
+            .await
+            .context("drive configuration")?;
+        let _ = client.read_play_login().await.context("play entry")?;
+        let _: ClientboundCommands = client.read_typed().await.context("Commands")?;
+        let sync: SynchronizePlayerPosition = client.read_typed().await.context("SyncPlayerPos")?;
+        let _: ClientboundInitializeBorder =
+            client.read_typed().await.context("InitializeBorder")?;
+        let _: ClientboundSetTime = client.read_typed().await.context("SetTime")?;
+        let _: SetDefaultSpawnPosition = client
+            .read_typed()
+            .await
+            .context("SetDefaultSpawnPosition")?;
+        let _: GameEvent = client.read_typed().await.context("GameEvent")?;
+        let _: SetCenterChunk = client.read_typed().await.context("SetCenterChunk")?;
+        client
+            .write_packet(&ConfirmTeleportation {
+                teleport_id: sync.teleport_id,
+            })
+            .await
+            .context("ack teleport")?;
+        Ok((client, sync))
     }
 }
 

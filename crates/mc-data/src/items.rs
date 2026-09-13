@@ -13,10 +13,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
 use thiserror::Error;
 
 use crate::Identifier;
+use crate::sidecar::RawRegistries;
 
 const REQUIRED_REGISTRIES: &str = include_str!("../data/required_registries.json");
 
@@ -131,25 +131,6 @@ pub fn solaris_required_items() -> ItemRegistry {
         })
         .collect();
     ItemRegistry::from_report(&report)
-}
-
-// Raw deserialisation shape — keep separate so the public ItemReport
-// stays plain and serde-free for downstream consumers.
-
-#[derive(Deserialize)]
-struct RawRegistries {
-    #[serde(flatten)]
-    registries: BTreeMap<String, RawRegistry>,
-}
-
-#[derive(Deserialize)]
-struct RawRegistry {
-    entries: BTreeMap<String, RawEntry>,
-}
-
-#[derive(Deserialize)]
-struct RawEntry {
-    protocol_id: u32,
 }
 
 #[cfg(test)]

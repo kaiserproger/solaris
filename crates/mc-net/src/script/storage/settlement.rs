@@ -1883,6 +1883,12 @@ impl super::InventoryRuntime {
         {
             return Ok(rejected(failure));
         }
+        // The portion above is a durable world commit of this structure's own
+        // staged work, so it advances the world's durable revision just like a
+        // foreign edit would. Re-observe the footprint after it: the next
+        // advance must fence against the state this structure itself produced,
+        // not pause on the durable decision it just wrote.
+        record.prepare_revision = world.world_revision();
         let receipt = ScriptStructureReceipt::new(
             structure_id.to_owned(),
             stage.to_owned(),

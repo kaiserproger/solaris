@@ -7,11 +7,10 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, ClientboundContainerSetSlot, ClientboundKeepAlive,
-    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetTime, ConfirmTeleportation,
-    EntityAnimation, EntityEvent, GameEvent, InteractionHand, LevelChunkWithLight,
-    MoveEntityPosRot, MovePlayerFlags, RemoveEntities, ServerboundAttack, ServerboundChatCommand,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot,
-    ServerboundUseItem, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
+    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetTime, EntityAnimation,
+    EntityEvent, InteractionHand, LevelChunkWithLight, MoveEntityPosRot, MovePlayerFlags,
+    RemoveEntities, ServerboundAttack, ServerboundChatCommand, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundUseItem, SetEntityMotion,
 };
 use mc_test_harness::client::Client;
 
@@ -98,7 +97,9 @@ async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, _) = connect_to_play(addr, "M17MobProbe").await;
+    let (mut client, _) = Client::connect_to_play(addr, "M17MobProbe")
+        .await
+        .expect("connect to play");
     let mob = wait_for_chunk_and_entity_spawn(&mut client, (0, 0), |_| true).await;
     wait_for_mob_motion_after_spawn(&mut client, mob.entity_id).await;
 }
@@ -165,7 +166,9 @@ async fn embedded_playable_seed_spawns_food_mob_in_initial_window() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, _) = connect_to_play(addr, "P10EmbeddedFood").await;
+    let (mut client, _) = Client::connect_to_play(addr, "P10EmbeddedFood")
+        .await
+        .expect("connect to play");
     let mob = wait_for_chunk_and_entity_spawn(&mut client, (0, 0), |entity| {
         food_mob_type_ids.contains(&entity.entity_type_id)
     })
@@ -246,10 +249,14 @@ async fn two_clients_receive_same_server_owned_mob() {
         let _ = bound.serve().await;
     });
 
-    let (mut alice, _) = connect_to_play(addr, "M32MobAlice").await;
+    let (mut alice, _) = Client::connect_to_play(addr, "M32MobAlice")
+        .await
+        .expect("connect to play");
     let mob = wait_for_chunk_and_entity_spawn(&mut alice, (0, 0), |_| true).await;
 
-    let (mut bob, _) = connect_to_play(addr, "M32MobBob").await;
+    let (mut bob, _) = Client::connect_to_play(addr, "M32MobBob")
+        .await
+        .expect("connect to play");
     wait_for_chunk_and_entity_spawn(&mut bob, (0, 0), |entity| entity.entity_id == mob.entity_id)
         .await;
     wait_for_mob_motion_after_spawn(&mut alice, mob.entity_id).await;
@@ -356,7 +363,9 @@ async fn survival_attack_passive_mob_uses_all_configured_drops() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M23MobFood").await;
+    let (mut client, sync) = Client::connect_to_play(addr, "M23MobFood")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut client, (0, 0)).await;
     client
         .write_packet(&ServerboundChatCommand {
@@ -529,7 +538,9 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, _) = connect_to_play(addr, "M24Zombie").await;
+    let (mut client, _) = Client::connect_to_play(addr, "M24Zombie")
+        .await
+        .expect("connect to play");
     client
         .write_packet(&ServerboundChatCommand {
             command: "summon minecraft:zombie".to_string(),
@@ -687,7 +698,9 @@ async fn survival_shield_blocks_frontal_zombie_damage() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M56Shield").await;
+    let (mut client, sync) = Client::connect_to_play(addr, "M56Shield")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut client, (0, 0)).await;
 
     client
@@ -770,37 +783,6 @@ async fn wait_for_entity_hurt(client: &mut Client, entity_id: i32) {
             }
         }
     }
-}
-
-async fn connect_to_play(
-    addr: std::net::SocketAddr,
-    name: &str,
-) -> (Client, SynchronizePlayerPosition) {
-    let mut client = Client::connect(addr).await.expect("client connect");
-    let _ = client.drive_login(addr, name).await.expect("drive login");
-    client
-        .drive_configuration()
-        .await
-        .expect("drive configuration");
-    let _ = client.read_play_login().await.expect("play entry");
-    let _: mc_protocol::packets::play::ClientboundCommands =
-        client.read_typed().await.expect("Commands");
-    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
-    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
-        client.read_typed().await.expect("InitializeBorder");
-    let _: mc_protocol::packets::play::ClientboundSetTime =
-        client.read_typed().await.expect("SetTime");
-    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
-        client.read_typed().await.expect("SetDefaultSpawnPosition");
-    let _: GameEvent = client.read_typed().await.expect("GameEvent");
-    let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
-    client
-        .write_packet(&ConfirmTeleportation {
-            teleport_id: sync.teleport_id,
-        })
-        .await
-        .expect("ack teleport");
-    (client, sync)
 }
 
 async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {

@@ -21,6 +21,8 @@ pub use gameplay_rules::{
 };
 
 #[cfg(test)]
+mod authoring_tests;
+#[cfg(test)]
 mod loader_tests;
 #[cfg(test)]
 mod worldgen_tests;
@@ -73,7 +75,7 @@ const MAX_PENDING_PLUGIN_TIMERS: usize = 256;
 const MAX_PLUGIN_TIMER_CALLBACKS_PER_TICK: usize = 8;
 const MAX_PLUGIN_TIMER_DELAY_TICKS: u64 = 630_720_000;
 const MAX_PLUGIN_DISABLE_DIAGNOSTIC_BYTES: usize = 4 * 1024;
-const SOLARIS_LUAU_PRELUDE: &str = "local solaris: any = nil :: any\n";
+const SOLARIS_LUAU_DEFINITIONS: &str = include_str!("lua/solaris.d.luau");
 
 /// Filesystem configuration for the built-in Luau plugin host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1859,13 +1861,25 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
     let source_path = directory.join("main.lua");
     let source = read_utf8_file_limited(&source_path, MAX_PLUGIN_SOURCE_BYTES)
         .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
-    let strict_source = format!("--!strict\n{SOLARIS_LUAU_PRELUDE}\n{source}");
-    luaur::check(&strict_source).map_err(|error| {
-        PluginSourceError::new(
-            format!("Luau type check failed: {error:?}"),
-            startup_contract_declared,
-        )
-    })?;
+    let strict_source = format!("--!strict\n{source}");
+    luaur::check_with_definitions(&strict_source, SOLARIS_LUAU_DEFINITIONS).map_err(
+        |mut errors| {
+            for diagnostic in errors
+                .iter_mut()
+                .filter(|diagnostic| !diagnostic.in_definitions)
+            {
+                diagnostic.line = diagnostic.line.saturating_sub(1);
+                diagnostic.end_line = diagnostic.end_line.saturating_sub(1);
+            }
+            PluginSourceError::new(
+                format!(
+                    "Luau type check failed in {}: {errors:?}",
+                    source_path.display()
+                ),
+                startup_contract_declared,
+            )
+        },
+    )?;
     Ok(PluginSource {
         manifest,
         config,

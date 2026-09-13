@@ -8,11 +8,7 @@ use flate2::read::GzDecoder;
 use mc_entity::{SpawnEntity, Vec3};
 use mc_nbt::Tag;
 use mc_protocol::packets::Packet;
-use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundInitializeBorder, ClientboundKeepAlive,
-    ClientboundSetTime, ConfirmTeleportation, GameEvent, LevelChunkWithLight, SetCenterChunk,
-    SetDefaultSpawnPosition, SynchronizePlayerPosition,
-};
+use mc_protocol::packets::play::{AddEntity, ClientboundKeepAlive, LevelChunkWithLight};
 use mc_test_harness::client::Client;
 
 const VIEW_DISTANCE: i32 = 2;
@@ -61,7 +57,9 @@ async fn natural_entities_keep_identity_across_save_restart_rejoin() {
     let addr = bound.local_addr().expect("natural restart server address");
     let server = tokio::spawn(async move { bound.serve_and_save().await });
 
-    let (mut client, spawn) = connect_to_play(addr, "RestartSpawn").await;
+    let (mut client, spawn) = Client::connect_to_play(addr, "RestartSpawn")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut client, (0, 0)).await;
     let specs = [
         (
@@ -164,7 +162,9 @@ async fn natural_entities_keep_identity_across_save_restart_rejoin() {
         .expect("restarted natural spawn address");
     let second_server = tokio::spawn(async move { second_bound.serve_and_save().await });
 
-    let (mut rejoined, _) = connect_to_play(second_addr, "RestartSpawn").await;
+    let (mut rejoined, _) = Client::connect_to_play(second_addr, "RestartSpawn")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut rejoined, (0, 0)).await;
     let observed = collect_entity_uuids(&mut rejoined, &persisted_before).await;
     assert_eq!(
@@ -238,33 +238,6 @@ fn entity_type_id(registry: &mc_data::entity_types::EntityTypeRegistry, name: &s
         .id_of(&mc_data::Identifier::parse(name).unwrap())
         .and_then(|id| i32::try_from(id).ok())
         .unwrap_or_else(|| panic!("missing entity type {name}"))
-}
-
-async fn connect_to_play(
-    addr: std::net::SocketAddr,
-    name: &str,
-) -> (Client, SynchronizePlayerPosition) {
-    let mut client = Client::connect(addr).await.expect("client connect");
-    let _ = client.drive_login(addr, name).await.expect("drive login");
-    client
-        .drive_configuration()
-        .await
-        .expect("drive configuration");
-    let _ = client.read_play_login().await.expect("play entry");
-    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
-    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
-    let _: ClientboundInitializeBorder = client.read_typed().await.expect("InitializeBorder");
-    let _: ClientboundSetTime = client.read_typed().await.expect("SetTime");
-    let _: SetDefaultSpawnPosition = client.read_typed().await.expect("SetDefaultSpawnPosition");
-    let _: GameEvent = client.read_typed().await.expect("GameEvent");
-    let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
-    client
-        .write_packet(&ConfirmTeleportation {
-            teleport_id: sync.teleport_id,
-        })
-        .await
-        .expect("ack teleport");
-    (client, sync)
 }
 
 async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {

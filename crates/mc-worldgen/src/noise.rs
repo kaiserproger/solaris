@@ -63,12 +63,12 @@ fn lattice_3d(x: i32, y: i32, z: i32, seed: i64) -> f64 {
 /// Perlin's quintic fade: `6t^5 - 15t^4 + 10t^3`. C2-smooth, removes
 /// the visible grid that a plain bilinear blend leaves behind.
 #[inline]
-fn fade(t: f64) -> f64 {
+pub(crate) fn fade(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
 #[inline]
-fn lerp(a: f64, b: f64, t: f64) -> f64 {
+pub(crate) fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 

@@ -8,10 +8,8 @@ use mc_entity::{SpawnEntity, Vec3};
 use mc_nbt::Tag;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundInitializeBorder, ClientboundKeepAlive,
-    ClientboundSetTime, ConfirmTeleportation, GameEvent, LevelChunkWithLight, RemoveEntities,
-    ServerboundChatCommand, ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition,
-    SynchronizePlayerPosition,
+    AddEntity, ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight,
+    RemoveEntities, ServerboundChatCommand, ServerboundKeepAlive, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 
@@ -81,9 +79,13 @@ async fn distant_natural_hostile_hard_despawns_for_nearby_spectator_and_stays_ab
     let addr = bound.local_addr().expect("natural despawn server address");
     let server = tokio::spawn(async move { bound.serve_and_save().await });
 
-    let (mut survival, survival_spawn) = connect_to_play(addr, "DespawnSurvive").await;
+    let (mut survival, survival_spawn) = Client::connect_to_play(addr, "DespawnSurvive")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut survival, (0, 0)).await;
-    let (mut spectator, _) = connect_to_play(addr, "DespawnSpectate").await;
+    let (mut spectator, _) = Client::connect_to_play(addr, "DespawnSpectate")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut spectator, (0, 0)).await;
     set_spectator_and_wait(&mut spectator).await;
 
@@ -212,33 +214,6 @@ async fn teleport_and_wait(client: &mut Client, x: f64, y: f64, z: f64) {
             return;
         }
     }
-}
-
-async fn connect_to_play(
-    addr: std::net::SocketAddr,
-    name: &str,
-) -> (Client, SynchronizePlayerPosition) {
-    let mut client = Client::connect(addr).await.expect("client connect");
-    let _ = client.drive_login(addr, name).await.expect("drive login");
-    client
-        .drive_configuration()
-        .await
-        .expect("drive configuration");
-    let _ = client.read_play_login().await.expect("play entry");
-    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
-    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
-    let _: ClientboundInitializeBorder = client.read_typed().await.expect("InitializeBorder");
-    let _: ClientboundSetTime = client.read_typed().await.expect("SetTime");
-    let _: SetDefaultSpawnPosition = client.read_typed().await.expect("SetDefaultSpawnPosition");
-    let _: GameEvent = client.read_typed().await.expect("GameEvent");
-    let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
-    client
-        .write_packet(&ConfirmTeleportation {
-            teleport_id: sync.teleport_id,
-        })
-        .await
-        .expect("ack teleport");
-    (client, sync)
 }
 
 async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {

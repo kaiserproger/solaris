@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use mc_protocol::frame::Compression;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ServerboundAttack, ServerboundChat, ServerboundChatCommand, ServerboundCommandSuggestion,
@@ -9,6 +10,8 @@ use mc_protocol::packets::play::{
     ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
     ServerboundSignUpdate, ServerboundUseItem, ServerboundUseItemOn,
 };
+use tokio::io::AsyncWriteExt;
+use tracing::{debug, warn};
 
 use crate::error::ConnectionError;
 
@@ -24,8 +27,6 @@ const WORK_BURST: u64 = 1024;
 const WORK_REFILL_PER_SECOND: u64 = 512;
 const CHAT_BURST: u64 = 16;
 const CHAT_REFILL_PER_SECOND: u64 = 4;
-const COMMAND_BURST: u64 = 8;
-const COMMAND_REFILL_PER_SECOND: u64 = 2;
 const SUGGESTION_BURST: u64 = 8;
 const SUGGESTION_REFILL_PER_SECOND: u64 = 2;
 const CUSTOM_PAYLOAD_BURST_BYTES: u64 = 128 * 1024;
@@ -47,7 +48,6 @@ enum LimitClass {
     Bytes,
     Work,
     Chat,
-    Command,
     Suggestion,
     CustomPayload,
 }
@@ -59,7 +59,6 @@ impl LimitClass {
             Self::Bytes => "bytes",
             Self::Work => "weighted_work",
             Self::Chat => "chat",
-            Self::Command => "command",
             Self::Suggestion => "suggestion",
             Self::CustomPayload => "custom_payload",
         }
@@ -73,7 +72,6 @@ struct ViolationCounters {
     bytes: u64,
     work: u64,
     chat: u64,
-    command: u64,
     suggestion: u64,
     custom_payload: u64,
 }
@@ -86,7 +84,6 @@ impl ViolationCounters {
             LimitClass::Bytes => &mut self.bytes,
             LimitClass::Work => &mut self.work,
             LimitClass::Chat => &mut self.chat,
-            LimitClass::Command => &mut self.command,
             LimitClass::Suggestion => &mut self.suggestion,
             LimitClass::CustomPayload => &mut self.custom_payload,
         };
@@ -185,6 +182,11 @@ impl PacketKind {
         match self {
             Self::Movement => 1,
             Self::Chat => 8,
+            // A command resolves and dispatches against the live world, so it
+            // carries the same cost whether it is a core command or a plugin
+            // one. The weighted-work bucket is what bounds command load; there
+            // is no separate command bucket because a serialized command burst
+            // from a normal client must never be discarded.
             Self::Command => 24,
             Self::Suggestion => 32,
             Self::CustomPayload => {
@@ -202,7 +204,6 @@ pub(super) struct PlayIngressLimiter {
     bytes: TokenBucket,
     work: TokenBucket,
     chat: TokenBucket,
-    commands: TokenBucket,
     suggestions: TokenBucket,
     custom_payload_bytes: TokenBucket,
     violation_streak: u32,
@@ -218,7 +219,6 @@ impl PlayIngressLimiter {
             bytes: TokenBucket::new(BYTE_BURST, BYTE_REFILL_PER_SECOND, now),
             work: TokenBucket::new(WORK_BURST, WORK_REFILL_PER_SECOND, now),
             chat: TokenBucket::new(CHAT_BURST, CHAT_REFILL_PER_SECOND, now),
-            commands: TokenBucket::new(COMMAND_BURST, COMMAND_REFILL_PER_SECOND, now),
             suggestions: TokenBucket::new(SUGGESTION_BURST, SUGGESTION_REFILL_PER_SECOND, now),
             custom_payload_bytes: TokenBucket::new(
                 CUSTOM_PAYLOAD_BURST_BYTES,
@@ -251,7 +251,6 @@ impl PlayIngressLimiter {
         } else {
             match kind {
                 PacketKind::Chat if !self.chat.can_take(1) => Some(LimitClass::Chat),
-                PacketKind::Command if !self.commands.can_take(1) => Some(LimitClass::Command),
                 PacketKind::Suggestion if !self.suggestions.can_take(1) => {
                     Some(LimitClass::Suggestion)
                 }
@@ -271,10 +270,10 @@ impl PlayIngressLimiter {
         self.work.take(work_cost);
         match kind {
             PacketKind::Chat => self.chat.take(1),
-            PacketKind::Command => self.commands.take(1),
             PacketKind::Suggestion => self.suggestions.take(1),
             PacketKind::CustomPayload => self.custom_payload_bytes.take(body_bytes),
-            PacketKind::Movement | PacketKind::Action | PacketKind::Other => {}
+            PacketKind::Movement | PacketKind::Command | PacketKind::Action | PacketKind::Other => {
+            }
         }
         Ok(IngressDecision::Allow)
     }
@@ -284,7 +283,6 @@ impl PlayIngressLimiter {
         self.bytes.refill(now);
         self.work.refill(now);
         self.chat.refill(now);
-        self.commands.refill(now);
         self.suggestions.refill(now);
         self.custom_payload_bytes.refill(now);
         if self
@@ -316,6 +314,58 @@ impl PlayIngressLimiter {
             class_violations,
         })
     }
+}
+
+/// The refusal a player sees when their command was discarded by the ingress
+/// budget instead of being executed.
+const DROPPED_COMMAND_REFUSAL: &str =
+    "Command not executed: server ingress rate budget exceeded; retry.";
+
+/// Report one dropped inbound packet and answer the player when the packet
+/// carried a command.
+///
+/// A dropped player command must never be silent: the client that sent it is
+/// waiting for a reply, and a client that gets none cannot tell a deliberate
+/// rejection from a hung server. Commands are charged to the shared budgets, so
+/// a drop is a real overload; say so instead of swallowing it. The refusal
+/// wording lives here, with the budget that produced it.
+pub(super) async fn answer_dropped_ingress<W>(
+    writer: &mut W,
+    compression: Compression,
+    packet_id: i32,
+    decision: IngressDecision,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let IngressDecision::Drop {
+        class,
+        violations,
+        class_violations,
+    } = decision
+    else {
+        return Ok(());
+    };
+    if violations == 1 {
+        debug!(
+            packet_id,
+            class, violations, class_violations, "Play ingress packet dropped by rate budget"
+        );
+    } else {
+        warn!(
+            packet_id,
+            class, violations, class_violations, "repeated Play ingress rate violation"
+        );
+    }
+    if packet_id == ServerboundChatCommand::ID {
+        super::command_execution::send_command_feedback(
+            writer,
+            compression,
+            DROPPED_COMMAND_REFUSAL,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -445,6 +495,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A client serializes its commands: each is sent only after the previous
+    /// reply, so a setup sequence like the settlement chain (survey, project,
+    /// materials, fund) is normal behaviour and must never be discarded. The
+    /// shared budgets still bound a real command flood.
+    #[test]
+    fn serialized_command_burst_is_never_dropped() {
+        let start = Instant::now();
+        let mut limiter = PlayIngressLimiter::new(start);
+        for index in 0..13 {
+            let now = start + Duration::from_millis(index * 150);
+            assert_eq!(
+                limiter.admit(ServerboundChatCommand::ID, 64, now).unwrap(),
+                IngressDecision::Allow,
+                "serialized command {index} must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_command_flood_still_hits_the_weighted_work_budget() {
+        let now = Instant::now();
+        let mut limiter = PlayIngressLimiter::new(now);
+        let mut dropped = None;
+        for _ in 0..(WORK_BURST / 24 + 8) {
+            if let IngressDecision::Drop { class, .. } =
+                limiter.admit(ServerboundChatCommand::ID, 64, now).unwrap()
+            {
+                dropped = Some(class);
+                break;
+            }
+        }
+        assert_eq!(
+            dropped,
+            Some("weighted_work"),
+            "a command flood is still bounded by the shared work budget"
+        );
     }
 
     #[test]

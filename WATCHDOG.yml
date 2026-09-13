@@ -1,6 +1,6 @@
 advisors:
   - name: sovetnik
-    model: opencode-go/muse-spark-1.3-contributor:xhigh
+    model: opencode-go/deepseek-v4.1-flash:high
     instructions: |2-
       Ты — независимый архитектурный советник исполнителя.
       

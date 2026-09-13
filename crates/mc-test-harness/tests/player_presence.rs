@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundKeepAlive, ConfirmTeleportation, EntityPositionSync, GameEvent,
-    LevelChunkWithLight, MovePlayerFlags, PlayerInfoRemove, PlayerInfoUpdate, RemoveEntities,
-    ServerboundKeepAlive, ServerboundMovePlayerPosRot, SetCenterChunk, SynchronizePlayerPosition,
+    AddEntity, ClientboundKeepAlive, EntityPositionSync, LevelChunkWithLight, MovePlayerFlags,
+    PlayerInfoRemove, PlayerInfoUpdate, RemoveEntities, ServerboundKeepAlive,
+    ServerboundMovePlayerPosRot,
 };
 use mc_test_harness::client::Client;
 use uuid::Uuid;
@@ -22,10 +22,14 @@ async fn two_clients_spawn_move_and_despawn_visible_players() {
         return;
     };
 
-    let (mut alice, _) = connect_to_play(addr, "M16Alice").await;
+    let (mut alice, _) = Client::connect_to_play(addr, "M16Alice")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut alice, (0, 0)).await;
 
-    let (mut bob, bob_sync) = connect_to_play(addr, "M16Bob").await;
+    let (mut bob, bob_sync) = Client::connect_to_play(addr, "M16Bob")
+        .await
+        .expect("connect to play");
     let bob_entity = wait_for_player_spawn(&mut alice, "M16Bob").await;
     let alice_entity = wait_for_player_spawn(&mut bob, "M16Alice").await;
     assert_ne!(alice_entity, bob_entity, "remote entity ids must be unique");
@@ -53,16 +57,22 @@ async fn disconnect_reconnect_replaces_player_visibility_cleanly() {
         return;
     };
 
-    let (mut alice, _) = connect_to_play(addr, "M36Alice").await;
+    let (mut alice, _) = Client::connect_to_play(addr, "M36Alice")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut alice, (0, 0)).await;
 
-    let (mut bob, _) = connect_to_play(addr, "M36Bob").await;
+    let (mut bob, _) = Client::connect_to_play(addr, "M36Bob")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut bob, (0, 0)).await;
     let first_bob_entity = wait_for_player_spawn(&mut alice, "M36Bob").await;
     drop(bob);
     wait_for_player_remove(&mut alice, first_bob_entity).await;
 
-    let (mut bob, _) = connect_to_play(addr, "M36Bob").await;
+    let (mut bob, _) = Client::connect_to_play(addr, "M36Bob")
+        .await
+        .expect("connect to play");
     drain_until_chunk(&mut bob, (0, 0)).await;
     let second_bob_entity = wait_for_player_spawn(&mut alice, "M36Bob").await;
     assert_ne!(first_bob_entity, second_bob_entity);
@@ -123,37 +133,6 @@ async fn start_presence_server(max_players: u32) -> Option<std::net::SocketAddr>
         let _ = bound.serve().await;
     });
     Some(addr)
-}
-
-async fn connect_to_play(
-    addr: std::net::SocketAddr,
-    name: &str,
-) -> (Client, SynchronizePlayerPosition) {
-    let mut client = Client::connect(addr).await.expect("client connect");
-    let _ = client.drive_login(addr, name).await.expect("drive login");
-    client
-        .drive_configuration()
-        .await
-        .expect("drive configuration");
-    let _ = client.read_play_login().await.expect("play entry");
-    let _: mc_protocol::packets::play::ClientboundCommands =
-        client.read_typed().await.expect("Commands");
-    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
-    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
-        client.read_typed().await.expect("InitializeBorder");
-    let _: mc_protocol::packets::play::ClientboundSetTime =
-        client.read_typed().await.expect("SetTime");
-    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
-        client.read_typed().await.expect("SetDefaultSpawnPosition");
-    let _: GameEvent = client.read_typed().await.expect("GameEvent");
-    let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
-    client
-        .write_packet(&ConfirmTeleportation {
-            teleport_id: sync.teleport_id,
-        })
-        .await
-        .expect("ack teleport");
-    (client, sync)
 }
 
 async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {

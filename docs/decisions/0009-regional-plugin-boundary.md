@@ -102,6 +102,11 @@ record. Each plugin therefore observes serial handler execution without pretendi
 server is single-threaded. If the host is later split into per-plugin workers, each
 plugin must retain its admitted ordering and reload barrier semantics.
 
+The asynchronous and dedicated-thread receivers share one nonblocking dequeue
+policy in `ScriptHostEndpoint::try_recv_input`. FIFO priority, coalesced-tick
+fairness, monotonic tick filtering and close-time draining remain identical;
+only the empty-queue wait differs (`recv().await` versus `blocking_recv()`).
+
 Queries return immutable snapshots with an explicit observed revision. A
 transaction rechecks that revision or the narrower generation named by its DTO.
 Cross-region or cross-service atomicity is provided only by a typed transaction
@@ -137,13 +142,11 @@ serialization point: candidate VMs and their bounded `server.started` work are s
 command capacity/admission and command-root ownership are committed before generation
 swap, and Unix `mc-server` exposes strict SIGHUP preparation without replacing the
 `ScriptBoundary`. `mc-net` already has production adapters for storage, zones, menus,
-player inventory transactions, teleports, and opaque villager bindings/goals.
-Colony identity, homes, roles, orders, limits, and persistence are not Rust
-runtime concepts: the shipped Luau plugin owns them and maps its vocabulary to
-bounded `idle`/`follow_position` engine goals. The adapter retains only the
-host-attested plugin owner and simulation-tick expiry of an opaque binding; no
-entity id, region key, ECS reference, or pathing handle crosses the boundary.
-Entity spawn and villager goals enter simulation/regional owners; menu,
+player inventory transactions, teleports, durable resident handles, work and
+orders. Colony identity, roles and durable domain intent remain plugin-owned;
+runtime adapters receive bounded requests and return owner-scoped results,
+without exposing region keys, ECS references or pathing internals.
+Entity spawn and resident work/orders enter simulation/regional owners; menu,
 teleport, and standalone player-inventory commands enter the exact ordered
 session lane. Standalone inventory transactions now plan against live
 session-owner state and update its durable mirror before publishing a result,
@@ -151,6 +154,14 @@ instead of mutating persistence from the script router. The compound
 inventory/storage transaction remains an explicit typed coordinator with an
 internal session gate shared with standalone inventory owner commands; this
 keeps their plan, durable mutation, and ordered owner application serialized.
+
+Package discovery type-checks all callable `solaris` functions against the
+check-only `lua/solaris.d.luau` declarations. Known-name/argument errors fail
+before VM startup, including in handlers not executed by `--check`. Dynamic
+`any` values, advanced record shapes, resource bounds and authority checks remain
+runtime responsibilities. The declarations do not add a runtime SDK or change
+the asynchronous command/result boundary.
+
 The existing world journal owns the compound commit decision: its inventory
 frame contains canonical named-item player after-images and the prepared ledger
 batch. Storage and playerdata are durable projections, completed before live

@@ -3,11 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
 use thiserror::Error;
 
 use crate::Identifier;
 use crate::entity_contract_26_1_2;
+use crate::sidecar::RawRegistries;
 
 pub use crate::entity_contract_26_1_2::{
     DefaultAttributeTemplateIdentity, ENTITY_TYPE_COUNT, EntityArchetype, EntityBehaviorContract,
@@ -449,22 +449,6 @@ pub fn movement_speed_26_1_2(name: &str) -> Option<f64> {
 
 fn static_id(value: &str) -> Option<Identifier> {
     Identifier::parse(value).ok()
-}
-
-#[derive(Deserialize)]
-struct RawRegistries {
-    #[serde(flatten)]
-    registries: BTreeMap<String, RawRegistry>,
-}
-
-#[derive(Deserialize)]
-struct RawRegistry {
-    entries: BTreeMap<String, RawEntry>,
-}
-
-#[derive(Deserialize)]
-struct RawEntry {
-    protocol_id: u32,
 }
 
 #[cfg(test)]

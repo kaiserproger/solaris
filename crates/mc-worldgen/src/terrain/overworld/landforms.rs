@@ -1,4 +1,4 @@
-use crate::noise::fbm_2d;
+use crate::noise::{fade, fbm_2d, lerp};
 
 use super::{OverworldRouter, TerrainSample, drainage};
 
@@ -77,7 +77,7 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         0.5,
     );
     let continentalness = continent_macro * 0.82 + continent_detail * 0.18;
-    let land = smootherstep(remap(continentalness, -0.20, 0.09));
+    let land = fade(remap(continentalness, -0.20, 0.09));
 
     let erosion = normalized(fbm_2d(
         wx / (EROSION_SCALE * scale),
@@ -133,13 +133,13 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         .clamp(0.0, 1.0)
         .powi(5)
         .max(ridge_b.clamp(0.0, 1.0).powi(6) * 0.72);
-    let mountain_domain = smootherstep(remap(continentalness, 0.10, 0.46))
-        * smootherstep(remap(1.0 - erosion, 0.30, 0.78));
+    let mountain_domain =
+        fade(remap(continentalness, 0.10, 0.46)) * fade(remap(1.0 - erosion, 0.30, 0.78));
     let ridges = ridge_shape * mountain_domain;
 
     let ocean_scale = settings.map_or(1.0, |value| value.oceanic_height_scale.max(0.0));
     let land_scale = settings.map_or(1.0, |value| value.terrestrial_height_scale.max(0.0));
-    let deep_ocean = smootherstep(remap(-continentalness, 0.10, 0.62));
+    let deep_ocean = fade(remap(-continentalness, 0.10, 0.62));
     let ocean_floor = sea - (10.0 + deep_ocean * 38.0) * ocean_scale + hills * 2.5 * ocean_scale;
     let rolling_land = sea
         + 7.0
@@ -156,8 +156,8 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     // the resulting segment network.
     // Keep carving alive through the coast band so channels meet the ocean rather
     // than disappearing at the old inland mask boundary.
-    let low_relief = 1.0 - smootherstep(remap(ridges, 0.025, 0.16));
-    let coast_connection = 1.0 - smootherstep(remap(-continentalness, 0.18, 0.48));
+    let low_relief = 1.0 - fade(remap(ridges, 0.025, 0.16));
+    let coast_connection = 1.0 - fade(remap(-continentalness, 0.18, 0.48));
     let drainage = if continentalness > -0.48 && ridges < 0.18 {
         // Quintic falloff has maximum slope 15/8. Reserve one block of the
         // three-block terrain-step budget for existing relief and use the
@@ -193,16 +193,16 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     // drainage width, relief and climate vary the band; broad detail creates
     // shallow pockets and dry hummocks rather than a level shelf or pixel noise.
     let wetland = if settings.is_none_or(|value| value.water_enabled) {
-        let shoulder = smootherstep(remap(drainage.channel_weight, 0.12, 0.70))
-            * (1.0 - smootherstep(remap(drainage.channel_weight, 0.90, 1.0)));
+        let shoulder = fade(remap(drainage.channel_weight, 0.12, 0.70))
+            * (1.0 - fade(remap(drainage.channel_weight, 0.90, 1.0)));
         shoulder
             * coast_connection
             * low_relief
             // A weak reach that never reaches water is still ordinary lowland.
-            * smootherstep(remap(sea - channel_center_y, 0.75, 2.0))
-            * smootherstep(remap(moisture, 0.02, 0.30))
-            * smootherstep(remap(base_temperature, -0.25, -0.05))
-            * (1.0 - smootherstep(remap(height - sea, 1.0, 5.0)))
+            * fade(remap(sea - channel_center_y, 0.75, 2.0))
+            * fade(remap(moisture, 0.02, 0.30))
+            * fade(remap(base_temperature, -0.25, -0.05))
+            * (1.0 - fade(remap(height - sea, 1.0, 5.0)))
     } else {
         0.0
     };
@@ -388,12 +388,4 @@ fn normalized(value: f64) -> f64 {
 
 fn remap(value: f64, low: f64, high: f64) -> f64 {
     ((value - low) / (high - low)).clamp(0.0, 1.0)
-}
-
-fn smootherstep(value: f64) -> f64 {
-    value * value * value * (value * (value * 6.0 - 15.0) + 10.0)
-}
-
-fn lerp(a: f64, b: f64, weight: f64) -> f64 {
-    a + (b - a) * weight
 }

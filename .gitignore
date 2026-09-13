@@ -56,3 +56,7 @@ logs/
 /repomix-*.md
 /repomix-output.md
 /repomix-output.xml
+
+# local build artifacts and omp session dumps never enter git
+dist/
+omp-session-*.html

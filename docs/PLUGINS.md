@@ -175,7 +175,7 @@ Create `plugins/hello/main.lua`:
 
 ```luau
 --!strict
-function on_player_command(event: any)
+function on_player_command(event: SolarisPlayerCommandEvent)
     solaris.send_message(event.player_id, "Hello, " .. event.username .. "!")
 end
 ```
@@ -187,12 +187,19 @@ client, and run `/hello`. The reply must name that player. No Loader or
 capability is needed for this bounded message command.
 
 Use explicit local types for your own state and validate operator configuration
-once at load. The current type-check-only prelude declares `solaris` as `any`;
-strict checking catches errors in your Luau, but does **not** statically prove
-host method names, argument shapes, or event DTO fields. The host validates
-those at invocation. `--check` executes loading/startup, not every future
-handler: exercise commands, rejected inputs, result callbacks, and restart
-recovery against the server.
+once at load. Discovery checks source against the
+[host declarations](../crates/mc-script/src/lua/solaris.d.luau): function names,
+argument types, optional arguments, return values, and the common inventory/menu
+records are checked before handlers run. `SolarisPlayerCommandEvent` also checks
+the command callback's fields without an `any` annotation. These declarations
+are check-only; plugins do not load or execute another runtime module.
+
+Values explicitly typed `any` bypass static checking. Advanced records represented
+by `SolarisTable`, most result-event DTOs, numeric/string bounds, capabilities and
+ownership still require runtime validation. `--check` executes loading/startup,
+not every future handler: exercise commands, rejected inputs, result callbacks,
+and restart recovery against the server. An uncaught handler error disables that
+plugin; type checking does not replace runtime error handling.
 
 Declare only events and capabilities actually needed. Correlate asynchronous
 results by `request_id`; returning from a host call means submission, not
@@ -1604,17 +1611,33 @@ unknown, cancelled, unloaded or non-container handle fails closed with
 container. The write/transfer path for a warehouse endpoint is not enabled yet
 and still fails closed.
 
+This illustrates one transfer with durable operation id `haul-1`; a different
+transfer needs a different operation id. The query returns no snapshot directly:
+
 ```luau
-local inventory = solaris.query_owned_inventory("q", { kind = "player_inventory", player_id = 512 })
-solaris.transfer_owned_items("t", "haul-1", 512, {
-    { source = { kind = "player_inventory", player_id = 512 }, source_slot = 9,
-      destination = { kind = "player_inventory", player_id = 512 }, destination_slot = 10,
-      count = 8 },
-}, {
-    { endpoint = { kind = "player_inventory", player_id = 512 },
-      fence = { revision = 41, snapshot_hash = "…64 hex…" } },
-})
+function on_player_command(event: SolarisPlayerCommandEvent)
+    solaris.query_owned_inventory("haul-query", {
+        kind = "player_inventory", player_id = event.player_id,
+    })
+end
+
+function on_operation_result(event: any)
+    if event.request_id ~= "haul-query" or event.state ~= "committed" then
+        return
+    end
+    local inventory = event.payload.result
+    local endpoint = inventory.endpoint
+    solaris.transfer_owned_items("haul-transfer", "haul-1", endpoint.player_id, {
+        { source = endpoint, source_slot = 9,
+          destination = endpoint, destination_slot = 10, count = 8 },
+    }, {
+        { endpoint = endpoint, fence = inventory.fence },
+    })
+end
 ```
+
+The fence comes from that exact snapshot, not a hard-coded revision/hash. Report
+transfer success only after the separate `haul-transfer` completion event.
 
 A snapshot result is `kind = "owned_inventory"` with `result.kind = "snapshot"`:
 the endpoint, a `fence` (`revision` plus derived canonical `snapshot_hash`), and
@@ -1979,61 +2002,10 @@ teleport-result events come from separate producers and have no relative-order
 guarantee; plugins must correlate the teleport result by `request_id` instead
 of using a zone event as its completion fence.
 
-Villager control is an engine primitive, not a Rust-owned colony model:
-
-```luau
-solaris.bind_nearest_villager("bind-player-7", 0, 64, 0, 16)
-solaris.move_villager_to("send-home", binding_token, 0, 64, 0, 0.3)
-solaris.set_villager_idle("hold-position", binding_token)
-```
-
-Request and binding ids follow the 64-byte script-id rule. A binding search
-radius must be finite, positive, and no greater than 64. A movement target must
-use finite bounded coordinates and a finite speed in `(0, 4]`. The result token
-is ephemeral; it is not an entity id, pointer, durable capability, region key,
-or ECS reference.
-
-`bind_nearest_villager` asks the regional entity owner to atomically claim the
-nearest alive exact `minecraft:villager` inside the radius. No session snapshot
-scan is used. A successful claim returns a random 128-bit lowercase hexadecimal
-token and its simulation-tick expiry. The targeted result uses `failure =
-"not_found"` when no eligible villager exists and `failure = "busy"` for
-transient owner/capacity pressure. A closed or failed owner or result-queue
-closure stops the router instead of fabricating delivery. A claim committed
-before publication failure remains reserved until its normal simulation-tick
-expiry.
-
-The adapter retains only the mapping from each token to its host-attested plugin
-owner and exact simulation-tick expiry. It contains no colony id, home, role,
-order, settlement record, or other domain state. Expired entries are purged from
-the pushed simulation tick; no wall-clock timer or polling loop is involved. A
-foreign plugin receives `failure = "binding_unavailable"` and cannot consume or
-invalidate the owner's token.
-
-`move_villager_to` installs a validated follow-position goal and
-`set_villager_idle` installs the idle goal through the journaled regional entity
-owner. Missing, expired, removed, non-villager, or otherwise stale bindings
-return `failure = "binding_unavailable"`; temporary owner pressure returns
-`failure = "busy"` while retaining the unexpired token. If result publication
-closes after the owner commits the goal, the committed goal remains in effect
-and the router stops instead of pretending the mutation was rejected.
-`release_villager_binding` drops a previously claimed binding token from both
-the adapter ownership map and the regional entity owner, so the bound villager
-becomes claimable again immediately instead of lingering until its
-simulation-tick expiry. A missing, expired, or foreign token returns `failure =
-"binding_unavailable"`; temporary owner pressure returns `failure = "busy"`.
-The result carries no goal because no new goal is installed.
-
-The shipped colony scaffold owns all colony vocabulary in Luau. Its
-`config.toml` defines colony identity, display name, dimension, home, zone,
-roles, accepted orders, limits, and home speed. Plugin storage owns the durable
-colony metadata and per-player role/order intent. Rust receives only the generic
-zone plus villager binding/goal requests. The plugin maps its `home` order to
-`move_villager_to` and `hold` to `set_villager_idle`, retains an accepted token
-only in Luau memory, retries one typed transient/stale failure, and clears its
-session state on disconnect. Durable entity handles, pathing internals, villager
-inventory/memory access, and complete colony gameplay remain outside API
-`0.6.0`.
+Villager control uses [durable resident handles](#durable-residents) and
+[resident work and orders](#resident-work-and-squad-orders). Colony identities,
+roles and durable domain intent remain plugin-owned; region/ECS/pathing handles
+do not cross this boundary.
 
 ## Isolation And Limits
 

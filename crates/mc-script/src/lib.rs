@@ -4764,13 +4764,13 @@ impl ScriptHostEndpoint {
         self.recv_input_blocking()
     }
 
-    async fn recv_input(&mut self) -> Option<ScriptHostInput> {
+    fn try_recv_input(&mut self) -> Result<ScriptHostInput, mpsc::error::TryRecvError> {
         loop {
             if self.coalesced_tick_due {
                 self.coalesced_tick_due = false;
                 if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
                     if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(ScriptHostInput::Event(event));
+                        return Ok(ScriptHostInput::Event(event));
                     }
                     continue;
                 }
@@ -4780,24 +4780,28 @@ impl ScriptHostEndpoint {
                     self.coalesced_tick_due =
                         has_coalesced_server_tick(&self.coalesced_server_tick);
                     if let Some(input) = self.accept_input(input) {
-                        return Some(input);
+                        return Ok(input);
                     }
-                    continue;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    let event = take_coalesced_server_tick(&self.coalesced_server_tick)?;
-                    if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(ScriptHostInput::Event(event));
+                Err(error) => {
+                    if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
+                        if let Some(event) = self.accept_monotonic_event(event) {
+                            return Ok(ScriptHostInput::Event(event));
+                        }
+                        continue;
                     }
-                    continue;
+                    return Err(error);
                 }
             }
-            if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
-                if let Some(event) = self.accept_monotonic_event(event) {
-                    return Some(ScriptHostInput::Event(event));
-                }
-                continue;
+        }
+    }
+
+    async fn recv_input(&mut self) -> Option<ScriptHostInput> {
+        loop {
+            match self.try_recv_input() {
+                Ok(input) => return Some(input),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {}
             }
             let Some(input) = self.event_rx.recv().await else {
                 continue;
@@ -4811,38 +4815,10 @@ impl ScriptHostEndpoint {
 
     fn recv_input_blocking(&mut self) -> Option<ScriptHostInput> {
         loop {
-            if self.coalesced_tick_due {
-                self.coalesced_tick_due = false;
-                if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
-                    if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(ScriptHostInput::Event(event));
-                    }
-                    continue;
-                }
-            }
-            match self.event_rx.try_recv() {
-                Ok(input) => {
-                    self.coalesced_tick_due =
-                        has_coalesced_server_tick(&self.coalesced_server_tick);
-                    if let Some(input) = self.accept_input(input) {
-                        return Some(input);
-                    }
-                    continue;
-                }
+            match self.try_recv_input() {
+                Ok(input) => return Some(input),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
                 Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    let event = take_coalesced_server_tick(&self.coalesced_server_tick)?;
-                    if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(ScriptHostInput::Event(event));
-                    }
-                    continue;
-                }
-            }
-            if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
-                if let Some(event) = self.accept_monotonic_event(event) {
-                    return Some(ScriptHostInput::Event(event));
-                }
-                continue;
             }
             let Some(input) = self.event_rx.blocking_recv() else {
                 continue;
