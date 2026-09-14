@@ -1,8 +1,9 @@
 # Solaris current cursor
-## Handover snapshot (pushed `44eea177`)
+## Handover snapshot (pushed `2ae90ff4`)
 
-- base_tree: `44eea177c0f2a25998d876f5c5945ed0e830ef02` (pushed to `main`; parents
-  `5ebb33c4` batch commit -> `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`)
+- base_tree: `2ae90ff4` (pushed to `main`; parents `f313b4a6` -> `44eea177` -> `5ebb33c4`
+  batch commit -> `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`). The pause fix in `44eea177`
+  was live-verified as insufficient and is superseded by this one.
 - cursor_commits: this snapshot lives at `14ba3835`, which is cursor bookkeeping only; any
   commit after the `base_tree` commit that touches only `docs/MEMORY.md` is the same
   kind, so the content diff for the next session starts at `base_tree`.
