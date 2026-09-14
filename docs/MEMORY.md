@@ -4019,3 +4019,31 @@ feature there and the branch terminates because the element has no connectors - 
 candidate order and the RNG stream already diverge, and the village may connect a piece
 vanilla never placed. The decor checkpoint must reproduce `FeaturePoolElement`'s
 position/terminal-vs-retry/RNG semantics, not merely call `CompiledPlacedFeature`.
+
+**Decor lane: the decompiled `FeaturePoolElement` contract (verified 2026-09-14,
+`/tmp/vandecomp/net/minecraft/world/level/levelgen/structure/pools/FeaturePoolElement.java`).**
+Recorded so the decor checkpoint reproduces the seam instead of guessing it:
+
+- `getSize` returns `Vec3i.ZERO`, so `getBoundingBox(manager, position, rotation)` is
+  the degenerate box `position..position` (`getYSpan() == 1`) and `place` ignores
+  `rotation`, `referencePos` and `chunkBB` entirely. It is a single-block leaf, not a
+  template.
+- `StructureTemplatePool.getMaxSize` filters out only `EmptyPoolElement`, so an
+  all-feature pool (`village/*/decor`, `village/*/trees`) reports `maxSize == 1` — that
+  value feeds `use_expansion_hack`'s `expandTo + 1` for children that point at such a
+  pool.
+- As a *source*, `getShuffledJigsawBlocks` returns exactly one synthetic jigsaw at
+  `position` with front `DOWN`, top `SOUTH`, name `bottom`, pool `Pools.EMPTY`
+  (`minecraft:empty`), target `EMPTY_ID`, joint `ROLLABLE`, `final_state`
+  `minecraft:air`. A one-element list means `Util.shuffle` draws nothing, and the empty
+  pool then attaches nothing, so the branch terminates. A drawn feature element must
+  therefore be **placed as a terminal leaf**, never skipped in favour of the next
+  candidate the way `grow` does today (`solver.rs:565-577`) — skipping it changes both
+  the candidate order and the RNG stream, which is why "village geometry is vanilla's"
+  is currently unverified rather than merely decor-incomplete.
+- `place` calls `feature.value().place(level, generator, random, position)` with the
+  **same** `RandomSource` that drives jigsaw growth, so the feature consumes draws from
+  the shared stream at exactly that point in the assembly.
+- Because the target box is degenerate, `Shapes.create(AABB.of(targetBB).deflate(0.25))`
+  is empty, so the `joinIsNotEmpty(..., ONLY_SECOND)` acceptance test cannot reject a
+  feature element.
