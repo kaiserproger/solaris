@@ -4130,11 +4130,15 @@ doc-comment fix in `mc-server`.
 **Sibling package state, for continuing on another machine.** The core's
 `deployed_sibling_plugins_prepare_runtime_and_worldgen_profiles` test — recorded
 as owner-blocked in the previous entry because the sibling checkout lacked the
-package it deploys — passes again, and `../solaris-default-plugins` is pushed as
-`b01342b`: `solaris-settlements` replaces the removed
+package it deploys — passes again, and `../solaris-default-plugins` is pushed (as
+`b01342b`, plus `1d7db97` dropping the live entity dumps that first commit
+accidentally carried: this repository never ships world or server state):
+`solaris-settlements` replaces the removed
 `colony-villager-scaffold`/`settlement-prototype` packages (22 authored
 blueprints plus their generator, a strict server-only manifest with no worldgen
-selector), the wave's receipts moved to a tracked `evidence/`, and
+selector), the wave's narrative receipts moved to a tracked `evidence/`
+(`c4-combat/receipt.md` and `live-report2.json`; the entity samples and drive
+logs behind them are local only), and
 `tools/gen_structures.py --check` reports the catalog current. Verified against
 it here: `cargo test -p mc-server --bin mc-server --
 deployed_sibling_plugins_prepare_runtime_and_worldgen_profiles` 1/0,
