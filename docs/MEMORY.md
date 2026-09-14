@@ -4121,9 +4121,26 @@ activated-path proof printing `seed 4242, village at chunk (379, 0), 95 pieces,
 188 junctions, 55 beard pieces, region 5989,49,-28..6146,94,97, 696 village
 blocks, 11 columns moved` (257 worldgen tests after the anchor regression test was
 added); the full L2 gate `run correctness` PASS
-`.analysis/validation/20260914T225812-correctness-14v_9___` on the final tree
-(earlier runs `20260914T142832-correctness-rk8v8o75` and
-`20260914T145752-correctness-cpnapg1f` predate the last test and doc edits). The decor stream, chest seed and start-connector facts are pinned
+`.analysis/validation/20260914T231326-correctness-wec8qjcb`, run on the tree this
+checkpoint was pushed as (`e01b5bb1` on `main`) — earlier runs
+`20260914T142832-correctness-rk8v8o75`, `20260914T145752-correctness-cpnapg1f`
+and `20260914T225812-correctness-14v_9___` predate it, the last of them by a
+doc-comment fix in `mc-server`.
+
+**Sibling package state, for continuing on another machine.** The core's
+`deployed_sibling_plugins_prepare_runtime_and_worldgen_profiles` test — recorded
+as owner-blocked in the previous entry because the sibling checkout lacked the
+package it deploys — passes again, and `../solaris-default-plugins` is pushed as
+`b01342b`: `solaris-settlements` replaces the removed
+`colony-villager-scaffold`/`settlement-prototype` packages (22 authored
+blueprints plus their generator, a strict server-only manifest with no worldgen
+selector), the wave's receipts moved to a tracked `evidence/`, and
+`tools/gen_structures.py --check` reports the catalog current. Verified against
+it here: `cargo test -p mc-server --bin mc-server --
+deployed_sibling_plugins_prepare_runtime_and_worldgen_profiles` 1/0,
+`cargo test -p mc-net -- settlement` 59/0, and a strict deployment of the six
+standard-plus-settlement packages under
+`target/debug/mc-server --check` (exit 0, all six discovered `server_only`). The decor stream, chest seed and start-connector facts are pinned
 against the real classes: `.analysis/codex-logs/village-decor-random/` (Java
 probe over the named `client-26.1.2.jar`, with its output and the source facts it
 sits on).
