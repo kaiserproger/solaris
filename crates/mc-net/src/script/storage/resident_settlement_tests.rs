@@ -97,7 +97,7 @@ impl SettlementWorld for TestWorld {
         })
     }
 
-    fn world_revision(&self) -> u64 {
+    fn observe_footprint(&self, _bounds: ScriptSurveyBounds) -> u64 {
         1
     }
 

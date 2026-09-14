@@ -32,7 +32,6 @@ use mc_worldgen::{BlueprintCatalog, CatalogError, SettlementSelector};
 use sha2::{Digest, Sha256};
 
 use crate::play::BlockEdit;
-use crate::play::SessionRegistry;
 use crate::play::SimulationHandle;
 use crate::play::owned_inventory::container_slot_to_item;
 use crate::script::PluginZoneAdapter;
@@ -356,14 +355,13 @@ pub(crate) struct LiveSettlementWorld {
     read: WorldReadView,
     blocks: Arc<BlockRegistry>,
     zones: Option<PluginZoneAdapter>,
-    sessions: Arc<SessionRegistry>,
     /// The single server-owned simulation handle structure portions commit
     /// through, owned by the same server that constructs this world.
     simulation: SimulationHandle,
     /// Next observation revision.
     revision: AtomicU64,
-    /// Observed revision to the world chunk journal watermark it saw.
-    observations: Mutex<BTreeMap<u64, u64>>,
+    /// Observed revision to the block content of the observed footprint.
+    observations: Mutex<BTreeMap<u64, Option<u64>>>,
 }
 
 impl LiveSettlementWorld {
@@ -371,36 +369,69 @@ impl LiveSettlementWorld {
         read: WorldReadView,
         blocks: Arc<BlockRegistry>,
         zones: Option<PluginZoneAdapter>,
-        sessions: Arc<SessionRegistry>,
         simulation: SimulationHandle,
     ) -> Self {
         Self {
             read,
             blocks,
             zones,
-            sessions,
             simulation,
             revision: AtomicU64::new(0),
             observations: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Mint a fresh observation revision bound to the current durable world
-    /// watermark. Later [`SettlementWorld::footprint_changed_since`] checks can
-    /// then localize any durable change to a footprint.
-    fn next_revision(&self) -> u64 {
+    /// Mint a fresh observation revision over `bounds`.
+    ///
+    /// The revision records the block content of the observed volume, so a
+    /// later [`SettlementWorld::footprint_changed_since`] check localizes a
+    /// change to the footprint itself instead of to any durable write that
+    /// happened to share a chunk with it.
+    fn next_revision(&self, bounds: ScriptSurveyBounds) -> u64 {
         let revision = self
             .revision
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        let watermark = self.sessions.world_chunk_journal_watermark().unwrap_or(0);
+        let footprint = self.footprint_digest(bounds);
         if let Ok(mut observations) = self.observations.lock() {
             if observations.len() >= MAX_OBSERVED_REVISIONS {
                 observations.clear();
             }
-            observations.insert(revision, watermark);
+            observations.insert(revision, footprint);
         }
         revision
+    }
+
+    /// A digest of every block state inside `bounds`, in a fixed order.
+    ///
+    /// `None` when any covering chunk is not loaded: a footprint that cannot be
+    /// read back cannot be proven unchanged.
+    fn footprint_digest(&self, bounds: ScriptSurveyBounds) -> Option<u64> {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let positions = Self::chunk_positions(bounds);
+        let snapshot = self.read.snapshot_chunks(&positions);
+        let mut digest = FNV_OFFSET;
+        for y in bounds.min[1]..=bounds.max[1] {
+            for z in bounds.min[2]..=bounds.max[2] {
+                for x in bounds.min[0]..=bounds.max[0] {
+                    let position = ChunkPos {
+                        x: x.div_euclid(CHUNK_AXIS),
+                        z: z.div_euclid(CHUNK_AXIS),
+                    };
+                    let chunk = snapshot.chunk_ref(position)?;
+                    let state = chunk
+                        .get_block(
+                            x.rem_euclid(CHUNK_AXIS) as u8,
+                            y,
+                            z.rem_euclid(CHUNK_AXIS) as u8,
+                        )
+                        .map_or(u64::MAX, |state| u64::from(state.0));
+                    digest = (digest ^ state).wrapping_mul(FNV_PRIME);
+                }
+            }
+        }
+        Some(digest)
     }
 
     /// Chunk positions covering an inclusive block bounds rectangle.
@@ -460,7 +491,7 @@ impl SettlementWorld for LiveSettlementWorld {
         }
         let positions = Self::chunk_positions(bounds);
         let snapshot = self.read.snapshot_chunks(&positions);
-        let revision = self.next_revision();
+        let revision = self.next_revision(bounds);
         if positions
             .iter()
             .any(|position| !snapshot.contains_chunk(*position))
@@ -537,8 +568,8 @@ impl SettlementWorld for LiveSettlementWorld {
         })
     }
 
-    fn world_revision(&self) -> u64 {
-        self.next_revision()
+    fn observe_footprint(&self, bounds: ScriptSurveyBounds) -> u64 {
+        self.next_revision(bounds)
     }
 
     fn footprint_changed_since(&self, bounds: ScriptSurveyBounds, revision: u64) -> bool {
@@ -550,21 +581,13 @@ impl SettlementWorld for LiveSettlementWorld {
         let Some(observed) = observations.get(&revision).copied() else {
             return true;
         };
-        // Nothing durable was appended anywhere after the observation, so the
-        // footprint cannot have changed.
-        let Some(current) = self.sessions.world_chunk_journal_watermark() else {
-            return false;
-        };
-        if current <= observed {
-            return false;
+        drop(observations);
+        match (observed, self.footprint_digest(bounds)) {
+            (Some(before), Some(now)) => before != now,
+            // A footprint that could not be read back when it was observed, or
+            // that cannot be read back now, cannot be proven unchanged.
+            _ => true,
         }
-        let positions = Self::chunk_positions(bounds);
-        let snapshot = self.read.snapshot_chunks(&positions);
-        positions.iter().any(|position| {
-            snapshot
-                .chunk_ref(*position)
-                .is_none_or(|chunk| chunk.world_journal_lsn() > observed)
-        })
     }
 
     fn claims_overlap(&self, plugin_id: &str, bounds: ScriptSurveyBounds) -> bool {

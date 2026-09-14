@@ -148,7 +148,7 @@ impl SettlementWorld for FakeWorld {
         })
     }
 
-    fn world_revision(&self) -> u64 {
+    fn observe_footprint(&self, _bounds: ScriptSurveyBounds) -> u64 {
         self.revision.load(Ordering::Relaxed)
     }
 
@@ -2133,7 +2133,6 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
             read,
             Arc::clone(&blocks),
             None,
-            Arc::clone(&sessions),
             simulation,
         );
         let runtime = InventoryRuntime::new(
@@ -2293,6 +2292,334 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
     assert_eq!(projection.remaining_total(), 0);
     assert_eq!(reservation.remaining_total(), 0);
     assert_eq!(structure.stages.len(), 2);
+}
+
+/// The world keeps committing chunk frames for the chunk that carries a
+/// structure's staged blocks: scheduled block ticks (fluid, snow, leaf decay),
+/// block drops and worldgen flushes all stamp a newer durable position on that
+/// chunk without the settlement pipeline writing anything. The live fence must
+/// scope to the reserved footprint's blocks, not to the chunk's durable
+/// position, while an edit that does land inside the footprint still parks the
+/// build.
+#[tokio::test]
+async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_position() {
+    use mc_world::{BlockPos, BlockStateId, Chunk, WorldStorage};
+
+    let catalog = Arc::new(catalog());
+    let plugin_root = tempfile::tempdir().unwrap();
+    let world_root = tempfile::tempdir().unwrap();
+    let blocks = Arc::new(stub_registry());
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let selector = SettlementSelector::new(SEED, PROFILE_REVISION);
+    let candidate = selector
+        .discover(START_CELL, 64)
+        .into_iter()
+        .next()
+        .expect("the deterministic selector finds a site");
+    let anchor = [candidate.origin[0], ANCHOR_Y, candidate.origin[2]];
+    let survey_bounds = ScriptSurveyBounds::new(
+        [anchor[0] - 4, 0, anchor[2] - 4],
+        [anchor[0] + 8, 3, anchor[2] + 8],
+    )
+    .unwrap();
+    let biome = Identifier::parse("minecraft:plains").unwrap();
+    std::fs::create_dir_all(
+        world_root
+            .path()
+            .join("dimensions/minecraft/overworld/region"),
+    )
+    .unwrap();
+    let handle: crate::server::WorldHandle = Arc::new(tokio::sync::Mutex::new(
+        WorldStorage::open(world_root.path(), Arc::clone(&blocks)).unwrap(),
+    ));
+    {
+        let mut world = handle.lock().await;
+        for position in covering_chunks(
+            survey_bounds.min[0],
+            survey_bounds.max[0],
+            survey_bounds.min[2],
+            survey_bounds.max[2],
+        ) {
+            world
+                .insert_generated_chunk(
+                    position,
+                    Chunk::empty(position, BlockStateId(0), biome.clone()),
+                )
+                .unwrap();
+        }
+    }
+
+    let sessions = Arc::new(SessionRegistry::new());
+    let (journal, _) = crate::play::world_journal::WorldChunkJournal::open_for_test(
+        world_root.path(),
+        Arc::clone(&blocks),
+        Arc::clone(&items),
+    )
+    .unwrap();
+    // One durable decision precedes every observation, so the journal names a
+    // real position instead of an empty log.
+    let first_decision = journal.reserve_decision_ids(1).unwrap()[0];
+    journal
+        .record_reserved_snapshot_groups(1, vec![(first_decision, Vec::new())])
+        .unwrap();
+    sessions.install_world_chunk_journal(journal.clone());
+
+    let read = handle.lock().await.read_view();
+    let (simulation, mut owner) = crate::play::simulation_channel();
+    let _driver = {
+        let sessions = Arc::clone(&sessions);
+        let world = Arc::clone(&handle);
+        tokio::spawn(async move {
+            while owner.wait_for_command().await {
+                owner
+                    .process_commands_with_world(&sessions, Some(&world), None, 1)
+                    .await;
+            }
+        })
+    };
+    let adapter = crate::settlement::LiveSettlementWorld::new(
+        read,
+        Arc::clone(&blocks),
+        None,
+        simulation.clone(),
+    );
+    let runtime = InventoryRuntime::new(
+        None,
+        &ShutdownHandle::default(),
+        Arc::clone(&sessions),
+        Arc::clone(&items),
+        Arc::new(mc_data::item_components::solaris_required_item_facts()),
+    )
+    .with_settlement_runtime(Arc::new(SettlementRuntime::new(
+        selector.clone(),
+        Arc::clone(&catalog),
+        WORLD_IDENTITY,
+        START_CELL,
+        Arc::new(FlatGround),
+    )))
+    .with_settlement_world(Arc::new(adapter) as Arc<dyn SettlementWorld>);
+    let mut storage = PluginStorage::open(plugin_root.path()).unwrap();
+
+    let outcome = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", survey_bounds),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.failure(), None, "survey: {outcome:?}");
+    let survey = survey_of(&outcome);
+    let outcome = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &prepare_request("prepare-scope", COTTAGE, anchor, &survey.survey_token, 0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.failure(), None, "prepare: {outcome:?}");
+    let prepared = structure_of(&outcome);
+    let plan = plan_of(&prepared);
+    reserve_plan(&mut storage, "res-scope", &plan);
+
+    // The first portion of the foundation. It commits its staged blocks, and the
+    // structure re-reads the footprint it just built into.
+    let first = &prepared.stages[0];
+    let outcome = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-scope-1",
+                &prepared.structure_id,
+                &first.stage,
+                "res-scope",
+                prepared.revision,
+                2,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.failure(), None, "first advance: {outcome:?}");
+    assert_eq!(receipt_of(&outcome).block_count, 2);
+    let revision = receipt_of(&outcome).revision;
+
+    // A durable chunk frame lands in the footprint's own chunk exactly the way
+    // the world commits one: a scheduled block tick edits a block of that chunk
+    // that is outside the reserved footprint, through the resident transaction
+    // kernel, and journals the chunk image it stamps.
+    commit_world_chunk_frame_outside_footprint(&handle, &journal, &prepared, anchor).await;
+
+    let outcome = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-scope-2",
+                &prepared.structure_id,
+                &first.stage,
+                "res-scope",
+                revision,
+                2,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.failure(),
+        None,
+        "a world write in the footprint's chunk but outside the footprint is not a site change: {outcome:?}"
+    );
+    assert_eq!(receipt_of(&outcome).block_count, 1);
+    let revision = receipt_of(&outcome).revision;
+
+    let next = prepared
+        .stages
+        .get(1)
+        .expect("the cottage has a second stage to advance");
+    // Half of the second stage, so a later advance can still fence it.
+    let first_half_of_next_stage = next.work_units / 2;
+    let outcome = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-scope-3",
+                &prepared.structure_id,
+                &next.stage,
+                "res-scope",
+                revision,
+                first_half_of_next_stage,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.failure(), None, "third advance: {outcome:?}");
+
+    // An edit inside the reserved footprint is a site change and parks the
+    // build before it commits anything.
+    let footprint_corner = [
+        prepared.origin[0] + prepared.reserved_footprint[0] - 1,
+        prepared.origin[1] + prepared.reserved_footprint[1] - 1,
+        prepared.origin[2] + prepared.reserved_footprint[2] - 1,
+    ];
+    let revision = receipt_of(&outcome).revision;
+    let landed = simulation
+        .apply_server_owned_block_edits(vec![crate::play::BlockEdit::new(
+            BlockPos {
+                x: footprint_corner[0],
+                y: footprint_corner[1],
+                z: footprint_corner[2],
+            },
+            BlockStateId(1),
+        )])
+        .await
+        .unwrap();
+    assert!(landed.is_some(), "the foreign edit landed in the world");
+    let outcome = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-scope-4",
+                &prepared.structure_id,
+                &next.stage,
+                "res-scope",
+                revision,
+                first_half_of_next_stage,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.failure(), None, "fourth advance: {outcome:?}");
+    let paused = structure_of(&outcome);
+    assert_eq!(paused.state, ScriptStructureState::Paused);
+    assert_eq!(paused.pause_reason.as_deref(), Some("site_changed"));
+}
+
+/// Commit one scheduled-block-tick chunk frame the way
+/// `run_scheduled_block_ticks_owned` does: reserve a decision, prepare the
+/// resident transaction, then journal the chunk image the commit stamps.
+async fn commit_world_chunk_frame_outside_footprint(
+    handle: &crate::server::WorldHandle,
+    journal: &crate::play::world_journal::WorldChunkJournal,
+    structure: &ScriptStructureSnapshot,
+    anchor: [i32; 3],
+) {
+    use mc_world::{BlockPos, BlockStateId};
+
+    let chunk_origin = [anchor[0].div_euclid(16) * 16, anchor[2].div_euclid(16) * 16];
+    let x = if anchor[0] - chunk_origin[0] < 8 {
+        chunk_origin[0] + 15
+    } else {
+        chunk_origin[0]
+    };
+    let z = if anchor[2] - chunk_origin[1] < 8 {
+        chunk_origin[1] + 15
+    } else {
+        chunk_origin[1]
+    };
+    let position = BlockPos { x, y: anchor[1], z };
+    assert!(
+        x < structure.origin[0]
+            || x > structure.origin[0] + structure.reserved_footprint[0] - 1
+            || z < structure.origin[2]
+            || z > structure.origin[2] + structure.reserved_footprint[2] - 1,
+        "the tick must edit outside the reserved footprint"
+    );
+
+    let read = handle.lock().await.read_view();
+    let snapshot = read.snapshot_chunks(&[mc_world::ChunkPos {
+        x: x.div_euclid(16),
+        z: z.div_euclid(16),
+    }]);
+    let expected_state = snapshot
+        .get_cached_block(position)
+        .expect("the tick position is loaded");
+    let expected_token = snapshot
+        .block_mutation_token(position)
+        .expect("the tick position carries a token");
+    let mutation = handle.lock().await.mutation_view();
+
+    let decision_id = journal.reserve_decision_ids(1).unwrap()[0];
+    journal.wait_for_append_turn(decision_id).await.unwrap();
+    let edits = [mc_world::ResidentBlockEdit {
+        pos: position,
+        new_state: BlockStateId(1),
+        preserve_light: false,
+    }];
+    let preconditions = [mc_world::ResidentBlockPrecondition {
+        pos: position,
+        expected_state,
+        expected_token,
+    }];
+    let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+        Some(decision_id),
+        &mc_world::ResidentScheduledBlockTickPlan {
+            consumed_ticks: &[],
+            edits: &edits,
+            preconditions: &preconditions,
+            light_table: None,
+            leaf_trigger_tick: None,
+        },
+    );
+    let mc_world::resident::ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(
+        transaction,
+    ) = prepared
+    else {
+        panic!("the world chunk frame scheduled tick did not prepare a transaction");
+    };
+    let committed = transaction.commit_durably(|snapshots| {
+        journal.record_reserved_snapshot_groups(2, vec![(decision_id, snapshots)])
+    });
+    assert!(
+        matches!(
+            committed,
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Applied(_)
+        ),
+        "the world chunk frame committed"
+    );
 }
 
 /// Survey the fixture's first site and prepare the authored-container

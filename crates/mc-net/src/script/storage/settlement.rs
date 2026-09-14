@@ -830,8 +830,14 @@ pub(crate) trait SettlementWorld: Send + Sync {
         dimension: &str,
         bounds: ScriptSurveyBounds,
     ) -> Result<SurveyReading, ScriptOperationFailure>;
-    /// Current revision of the loaded world.
-    fn world_revision(&self) -> u64;
+    /// Mint the revision later [`Self::footprint_changed_since`] checks compare
+    /// `bounds` against.
+    ///
+    /// An observation is scoped to `bounds`: the world keeps writing chunks that
+    /// share space with a footprint - fluid, snow, leaf decay, the structure's
+    /// own staged commits - without changing the footprint itself, so a revision
+    /// only means anything for the volume it was minted over.
+    fn observe_footprint(&self, bounds: ScriptSurveyBounds) -> u64;
     /// Whether anything inside `bounds` changed after `revision`.
     fn footprint_changed_since(&self, bounds: ScriptSurveyBounds, revision: u64) -> bool;
     /// Whether another plugin's structure or claim overlaps `bounds`.
@@ -1727,7 +1733,7 @@ impl super::InventoryRuntime {
             reservation_ref: None,
             resource_plan_hash: resource_plan_hash(&plan),
             consumed: BTreeMap::new(),
-            prepare_revision: world.world_revision(),
+            prepare_revision: world.observe_footprint(bounds),
             pause_reason: None,
             revision: 0,
         };
@@ -1883,12 +1889,11 @@ impl super::InventoryRuntime {
         {
             return Ok(rejected(failure));
         }
-        // The portion above is a durable world commit of this structure's own
-        // staged work, so it advances the world's durable revision just like a
-        // foreign edit would. Re-observe the footprint after it: the next
-        // advance must fence against the state this structure itself produced,
-        // not pause on the durable decision it just wrote.
-        record.prepare_revision = world.world_revision();
+        // The portion above staged this structure's own blocks durably, so the
+        // footprint the next advance fences against must be re-read after it:
+        // the observation has to describe the site the structure itself just
+        // produced, not the one it started from.
+        record.prepare_revision = world.observe_footprint(record.bounds());
         let receipt = ScriptStructureReceipt::new(
             structure_id.to_owned(),
             stage.to_owned(),

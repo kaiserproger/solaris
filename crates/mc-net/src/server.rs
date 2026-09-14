@@ -4164,7 +4164,6 @@ async fn bind_internal(
                         read,
                         Arc::clone(&config.blocks),
                         script_zones.clone(),
-                        Arc::clone(&sessions),
                         simulation.clone(),
                     );
                     Some((runtime, Arc::new(adapter)))

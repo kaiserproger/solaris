@@ -1,10 +1,22 @@
-//! End-to-end regression for the settlement fund step of the M94-09 chain.
+//! End-to-end regression for the settlement chain steps a headless server
+//! reaches: create -> site -> adopt -> teleport -> survey -> project -> give ->
+//! fund -> build.
 //!
 //! Drives the shipped `solaris-settlements` package over a real headless server
-//! exactly like the real-client scenario does (create -> site -> adopt ->
-//! teleport -> survey -> project -> give -> fund) and asserts the funding step
-//! answers the player. A silent fund is the defect: the command must produce
-//! either `Reserved real materials for <building> (` or a typed refusal.
+//! exactly like the real-client scenario does and asserts two things a silent
+//! server would hide: the funding step answers the player (the defect a dropped
+//! burst command produced) and the build reaches
+//! `committed (<blueprint>)`.
+//!
+//! What it cannot reach: the `site_changed` pause. A headless server drains its
+//! owner ticks far faster than a real client round trip, so the world's own
+//! durable writes to the chunk that carries the footprint (scheduled block
+//! ticks, worldgen and block-drop frames) land after the build finished instead
+//! of between two stage advances. The fence semantics that decide the pause are
+//! covered deterministically by
+//! `script::storage::settlement_tests::live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_position`
+//! and `...::advance_absorbs_its_own_durable_commits_but_a_foreign_edit_still_pauses`;
+//! the graphical `m94-09-settlement-chain` run is the end-to-end acceptance.
 
 use std::path::Path;
 use std::sync::Arc;

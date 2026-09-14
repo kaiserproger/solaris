@@ -38,6 +38,45 @@
   owner's concurrent cleanup sweep over mc-data/mc-test-harness.
 - validation_latest_push: `run correctness` PASS
   `.analysis/validation/20260913T231231-correctness-a7ak29y2` (248.7 s) on the pushed tree.
+- fixed_live_pause (supersedes the `44eea177` attempt): the pause was a race with the WORLD's own
+  scheduled-block-tick writes, not with the settlement's own commits. Writer:
+  `run_scheduled_block_ticks_owned` (`crates/mc-net/src/play.rs:10090`) ->
+  `commit_cross_region_scheduled_block_tick` (`play.rs:8630`) ->
+  `WorldChunkJournal::record_reserved_snapshot_groups` (`play.rs:8702`). The paused run's journal
+  (`.analysis/validation/20260913T232942-regression-eov066g3`) holds WIF1 id=1 (the fund
+  reservation) then WCF1 id=2 tick=680 images=[(215,7) lsn=2] carrying the house blocks; the
+  settlement's own staged portions journal nothing (alloc_high stayed 1 across 99/144/99-block
+  portions), so the earlier attribution to `apply_structure_portion`/`regional_mutation.rs:848`
+  was wrong. Fix: the fence now observes the footprint's CONTENT - an FNV-1a digest over the
+  blocks inside `bounds`, `None` when a covering chunk is unloaded (fail closed)
+  (`crates/mc-net/src/settlement.rs:409`, `:571`, `:575`) - instead of the chunk's durable
+  journal position; the trait method is `observe_footprint`, called at prepare
+  (`script/storage/settlement.rs:1736`) and after each own portion commit (`:1896`); the adapter
+  no longer takes a session handle (`server.rs`). A genuine edit inside the footprint still parks
+  the build as `site_changed` (`settlement_tests.rs:1166`, `:1231`).
+- live_after_real_fix: `.analysis/validation/20260914T002326-regression-76agjkm2` reaches
+  `Reserved real materials for house_sm_1 (66d36952...)`, then
+  `house_sm_1 committed (solaris:house_small) at revision 19.` and
+  `regsville | small site_6_0_9af75e77 hamlet tier=hamlet pop=0 houses=1 ...`; the driver's
+  commit and info matchers both fired and no `site_changed` pause appears anywhere in the run.
+  The harness still reports failed only because the driver times out at the next stage.
+- next_blocker: `settlement populate` never reaches `settled in regsville` - the resident spawn is
+  refused and the plugin answers "The refused spawn left the site reservation free again."
+  (resident/site-vertical path, tracked as blocked; not the fence).
+- validation_latest_push: `run correctness` PASS
+  `.analysis/validation/20260914T003603-correctness-72k40m62` (326.5 s).
+- live_after_fix: `.analysis/validation/20260913T232942-regression-eov066g3` (pushed tree,
+  seed 81) still ends at `house_sm_1 paused: site_changed.` - `fund` answers
+  (`Reserved real materials for house_sm_1 (0c06d1b4...)`) and the next line is the pause,
+  then the 615 s driver timeout. So the post-portion re-observe added in `44eea177` is
+  downstream of the write that actually lands between `project` and `build`: the fence sits
+  at the top of the stage-advance
+  (`crates/mc-net/src/script/storage/settlement.rs:1805`) and pauses before any portion is
+  applied in that command, so the re-observe never runs for the offending frame. Next:
+  instrument which frame lands in the footprint chunk between `project` and `build`
+  (`fund` reservation and/or `prepare_structure`, `script/storage/settlement.rs:1611`), then
+  re-observe at the end of that path (or attribute the structure's own decisions) instead of
+  only after a portion commit.
 - next: live acceptance of the `site_changed` fix once the machine and the worldgen sweep are
   free - `SOLARIS_REAL_CLIENT_AGENT_SCENARIO=m94-09-settlement-chain python3 -m tools.harness
   run regression --timeout-seconds 600 --run`. Deferred only for the owner's power-saver/noise
