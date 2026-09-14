@@ -1,12 +1,14 @@
 # Solaris current cursor
 ## Handover snapshot (pushed `2ae90ff4`)
 
-- base_tree: `2ae90ff4` (pushed to `main`; parents `f313b4a6` -> `44eea177` -> `5ebb33c4`
-  batch commit -> `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`). The pause fix in `44eea177`
-  was live-verified as insufficient and is superseded by this one.
-- cursor_commits: this snapshot lives at `14ba3835`, which is cursor bookkeeping only; any
-  commit after the `base_tree` commit that touches only `docs/MEMORY.md` is the same
-  kind, so the content diff for the next session starts at `base_tree`.
+- base_tree: `0febdfa3` (pushed to `main`; chain `bdb665cd` -> `2ae90ff4` -> `f313b4a6` ->
+  `44eea177` -> `5ebb33c4` batch commit -> `f77525da6b1f7c6e460d1ae538aca409ce9b6d6b`). The
+  pause fix in `44eea177` was live-verified as insufficient and is superseded by `2ae90ff4`
+  (content-scoped footprint fence), which `0febdfa3` documents in the owning ADR.
+- cursor_commits: cursor and documentation bookkeeping is never content; any commit after
+  `base_tree` that touches only `docs/MEMORY.md` or only documentation under `docs/` is the
+  same kind, so the next session's content diff starts at `base_tree` and any later commit
+  listed here is bookkeeping for it.
 - checkpoint_closed: settlement commit pipeline through the simulation lane, mob spin
   fix, worldgen (biome/river/beach/villages), live operator+whitelist access control,
   tab list, redstone/pistons, pregeneration, warehouse bind/read (C1a) - landed as one
