@@ -1551,11 +1551,12 @@ changed, or the batch crosses a region. A committed portion marks its chunks
 dirty and reaches `.mca` through the server's dirty-flush owner, so a committed
 stage is visible to players and survives a world reopen; re-opening the plugin
 ledger replays the structure, its consumption and its reservation without
-building a second portion. Footprint change detection is localized through the
-world chunk journal watermark, so a player edit inside the reserved footprint
-pauses the structure as `paused/site_changed` while unrelated edits elsewhere do
-not. A protected zone owned by another plugin intersecting the footprint blocks
-`prepare_structure` (`blocked`) before anything is reserved.
+building a second portion. Footprint change detection is content-scoped: the core
+compares the block states strictly inside the reserved footprint and fails closed while
+a covering chunk is unloaded, so a player edit inside the reserved footprint pauses the
+structure as `paused/site_changed` while unrelated edits elsewhere - including elsewhere
+in the same chunk - do not. A protected zone owned by another plugin intersecting the
+footprint blocks `prepare_structure` (`blocked`) before anything is reserved.
 
 `solaris.assign_resident_work` with a `construct` work order drives the prepared
 stage directly: core resolves the structure's committed reservation (by the

@@ -49,6 +49,15 @@ skip eviction of a replaced campfire's cooking state; they take the staged
 storage path, which owns that eviction, reactivity, owner relighting, and the
 post-commit publication to loaded sessions.
 
+Structure footprint change detection is content-scoped, not journal-scoped: a stage
+fence compares a digest of the block states strictly inside the reserved footprint and
+fails closed while a covering chunk is unloaded. Keying it on the covering chunks'
+durable journal position was wrong: the world's own scheduled-block-tick transaction
+advances that position for work no player did, so a build paused as `site_changed` on
+its own surroundings. The deliberate narrowing is that an edit elsewhere in the same
+16x16 chunk - digging beside the reserved box - no longer pauses the operation, while
+any block change inside the footprint still does.
+
 `WorldStorage::commit_opaque_block_entity_conditionally` loads the chunk, then
 checks state/token and publishes NBT under the existing resident region lock.
 The net-side check/write split and unconditional opaque storage setter are gone.
