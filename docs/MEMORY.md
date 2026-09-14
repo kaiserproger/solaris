@@ -3958,3 +3958,64 @@ the warehouse endpoint work in `mc-net`, the harness capture, and `Cargo.lock`
 (which changed for a concrete reason: `mc-server` gained `reqwest`, `sha1`, `zip`,
 `thiserror` and the `mc-test-harness` dependency) — so a revert of that commit
 drops more than the village activation.
+
+**Independent checkpoint review of the activation (2026-09-14): verdict `changes`.**
+The reviewer read the working tree against vanilla and found the assembled village
+geometry is **not yet vanilla's**; the fixes below are the next checkpoint and each
+one changes generated terrain, so the activation needs another
+`WORLDGEN_REVISION` bump (23) when they land.
+
+- **blocker — source jigsaw position and faces are not rotated** (`solver.rs:534-539`).
+  Vanilla iterates `sourceElement.getShuffledJigsawBlocks(manager, sourceBoxPosition,
+  sourceRotation, random)` -> `StructureTemplate.getJigsaws(position, rotation)`, whose
+  entries are `calculateRelativePosition(settings, local).offset(position)` with
+  `state.rotate(rotation)` (`StructureTemplate.java:201-219`). `grow` uses the raw
+  template-local position and the unrotated `front`, so `target_jigsaw_pos`
+  (= pos + front) drives `attach_inside`, the target's placement base and the
+  `free_height` column from a jigsaw that is not where the piece actually placed it,
+  and `can_attach` compares unrotated faces on both sides while vanilla compares both
+  rotated by their own piece rotations (`JigsawBlock.canAttach`). Fires on every
+  rotation except `None`. `anchor_origin` already rotates, so the module contradicts
+  itself, and no test covers a rotated source attachment.
+- **major — target pool and fallback candidate lists are not shuffled**
+  (`solver.rs:556-563`). Vanilla uses `targetPool.value().getShuffledTemplates(random)`
+  then `fallback.value().getShuffledTemplates(random)`
+  (`JigsawPlacement.java:351-356`); `flat_elements` is right for `pick_element` only.
+  Besides choosing a different first-fitting template, the two missing shuffles consume
+  no draws, so every later draw (`Rotation::get_shuffled`, `shuffled_jigsaws`) comes
+  from a stream vanilla has already advanced by `len(pool) + len(fallback) - 2` per
+  source jigsaw.
+- **major — `use_expansion_hack`'s `expandTo` is not applied** (`solver.rs:584-600`).
+  All five village structures set the flag; vanilla raises the target box to
+  `max(expandTo + 1, ySpan)` before the free-space test, before the piece is created
+  and therefore before the RIGID piece's `BeardContribution`
+  (`JigsawPlacement.java:368-406`). The engine computes the hack box and discards it.
+- **major — the source-jigsaw loop is not continued, and the inside free shape is
+  never grown** (`solver.rs:636-660, 717`). Vanilla's `continue label129` abandons the
+  remaining candidates for that jigsaw after an attachment; `continue 'candidates` keeps
+  scanning them, so a second piece can attach to the same jigsaw. And the grown shape is
+  written back only when the target attached outside the source, while vanilla writes it
+  to whichever `childrenFree` it used, so several attachments inside one source piece
+  may overlap where vanilla rejects them.
+- **minor — non-rigid `ground_level_delta` must be 1, not 0** (`solver.rs:662-666`);
+  `StructurePoolElement.getGroundLevelDelta()` returns 1 and it feeds the second
+  junction's `ground_y`, i.e. the analogue's `BeardJunction.ground_y`.
+- **minor — `reference_pos` is the stub centre, not vanilla's**
+  (`plan_source.rs:496-499`); `StructureStart.placeInChunk` uses
+  `(centerPos.x, centerBB.minY, centerPos.z)`. Nothing observable changes today (no
+  reachable village list declares `position_predicate`), but the modelled input is wrong.
+- **minor — a named processor list missing from the closure silently becomes empty**
+  (`plan_source.rs:535-543`), and `validate` probes through the same function, so the
+  piece validates clean and then places with only the ignore/jigsaw/projection passes.
+- **minor — stale docs**: the added paragraphs in `docs/PLUGINS.md` and
+  `docs/decisions/0008-overworld-density-router.md` still say the `vanilla` profile
+  places no villages, and `docs/VILLAGE_GENERATION.md` said the lookup "keeps the one"
+  plan. (The `village/mod.rs` header claim about `feature_pool_element` was corrected in
+  `d766018c`.)
+
+The advisor added the same class of defect for the skipped decor lane: `grow`'s
+`PlacedKind::Feature` arm `continue`s past a drawn element, while vanilla places the
+feature there and the branch terminates because the element has no connectors - so the
+candidate order and the RNG stream already diverge, and the village may connect a piece
+vanilla never placed. The decor checkpoint must reproduce `FeaturePoolElement`'s
+position/terminal-vs-retry/RNG semantics, not merely call `CompiledPlacedFeature`.
