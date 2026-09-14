@@ -28,7 +28,7 @@ Operational meaning:
 - Status updates are checkpoint-level summaries. Do not interrupt implementation
   flow for routine commands, passing tests, formatting fixes, or small discoveries.
   `Retry` or `продолжай` first revalidates current state.
-- Self-check, then use exactly one independent read-only reviewer. Larger agent
+- Self-check, then use an independent read-only reviewer. Larger agent
   pipelines require explicit owner authorization.
 
 ## Autonomous Goal Protocol
@@ -87,20 +87,9 @@ Batch independent tool calls. Do not narrate or execute one shell command per
 model round when calls can run together. Never issue the same read, search, or
 validation command twice for the same working-tree fingerprint.
 
-Default checkpoint budget unless the wrapper supplies another value:
-
-```yaml
-model_roundtrips_soft: 8
-model_roundtrips_hard: 12
-shell_batches: 6
-subagents: 1
-l2_validation_runs: 1
-context_compactions: 0
-```
-
-At the hard budget, stop expanding scope. Record evidence and a precise resume
-cursor, close the checkpoint as `complete`, `partial`, or `checkpoint-blocked`,
-and let runtime start a fresh continuation. These checkpoint states do not
+There is no enforced per-checkpoint budget: continue until the outcome is
+achieved, and record evidence plus a precise resume cursor whenever a real
+blocker stops the work. A closed checkpoint does not
 complete or block the persistent `/goal`.
 
 Do not carry a completed checkpoint into another compaction. Start the next
@@ -204,10 +193,9 @@ simulation event. The producer must wake consumers; use push, not pull.
 
 ## Subagents
 
-Use subagents only when owner/runtime authorizes delegation. At most two may run
-concurrently, with disjoint responsibilities and write sets. Do not delegate
-the immediate blocker and then wait for it. Prefer GPT-5.6 Sol for implementation
-and GPT-5.6 Luna for QA/review; do not use `terra`.
+Use subagents only when owner/runtime authorizes delegation. Give concurrent
+agents disjoint responsibilities and write sets. Do not delegate
+the immediate blocker and then wait for it.
 
 For agent delegation, do not hand-roll tmux/pid/exit/log plumbing: validation
 and client-visible QA run through the canonical harness, which owns
@@ -232,18 +220,18 @@ One agent returns one compact result per revision:
 
 ```yaml
 verdict: pass | changes | blocked
-findings: [maximum 8 bullets]
+findings: [...]
 changed_files: [...]
 validation: [...]
 report_path: optional
 ```
 
-Inline content is at most 1,000 characters. Details go to a file. Deduplicate
+Put long detail in a file rather than inline; the inline summary stays short enough to read at a glance. Deduplicate
 notification/result by `agent_id + revision`. Reviewers do not edit or spawn
 agents; fixing findings does not trigger a second reviewer.
 
-`quaka-whaka-zaka-du` explicitly authorizes parallel work, still capped at two
-agents and subject to all correctness/validation rules.
+`quaka-whaka-zaka-du` explicitly authorizes parallel work, subject to all
+correctness/validation rules.
 
 ## Process Skills
 

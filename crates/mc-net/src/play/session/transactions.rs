@@ -7,6 +7,7 @@ use mc_data::block_light::BlockLightTable;
 use tracing::warn;
 
 use crate::lock_policy::lock_authoritative_mutex;
+use crate::play::VisibilityDispatch;
 use crate::play::bucket_interactions::plan_bucket_replacement;
 use crate::play::campfire::CampfireCookingState;
 use crate::play::containers::{ChestView, chest_slot_stacks};
@@ -83,7 +84,122 @@ pub(in crate::play) struct FurnaceTransactionRequest<'a> {
     pub(in crate::play) player: &'a ContainerPlayerPlan,
 }
 
+/// The container half of one server-owned deposit, as the transaction left it.
+///
+/// The composite commits the container and the actor's inventory together; this
+/// carries no decision identity of its own, because the run pairs a committed
+/// container with the world-journal decision that carries its after-image.
+pub(in crate::play) enum ServerOwnedChestCommit {
+    /// The container's viewers' post-commit slot view, published only after the
+    /// decision that carries the after-image is durable.
+    Committed(Vec<VisibilityDispatch>),
+    /// The player fence moved: recovery pending, a different inventory or a
+    /// different carried item.
+    StalePlayer,
+    /// The container fence moved: its state id, or its authoritative slots.
+    StaleContainer,
+    /// The container is not a loaded container at the expected position.
+    MissingContainer,
+}
+
 impl ChestTransaction {
+    /// The server-owned entry point beside [`Self::commit`]: the same container
+    /// composite without the `actor_has_open_view` fence, because a plugin
+    /// deposit has no menu, and publishing the container's slots to every
+    /// viewer including the actor, which receives no menu acknowledgement of
+    /// its own. Every other fence is unchanged: the container's state id, its
+    /// authoritative block entity, the expected inventory and the expected
+    /// carried item.
+    pub(in crate::play) fn commit_server_owned(
+        &self,
+        mutation: &mc_world::WorldMutationView,
+        request: ChestTransactionRequest<'_>,
+    ) -> Result<ServerOwnedChestCommit, SimulationRequestError> {
+        let ChestTransactionRequest {
+            primary_position,
+            positions,
+            expected_state_id,
+            expected,
+            updated,
+            player,
+        } = request;
+        let state_id_increment = chest_menu_state_change_count(
+            &ChestView {
+                chests: expected.to_vec(),
+            },
+            &ChestView {
+                chests: updated.to_vec(),
+            },
+            &player.expected_inventory,
+            &player.updated_inventory,
+            &player.expected_carried_item,
+            &player.updated_carried_item,
+        );
+        let container_wait_started = Instant::now();
+        let container_guard = lock_authoritative_mutex(&self.containers, "play.container_registry");
+        let mut containers = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::ContainerRegistry,
+            "commit server-owned chest slots",
+            container_wait_started,
+            container_guard,
+        );
+        let player_wait_started = Instant::now();
+        let player_guard = lock_authoritative_mutex(&self.player_state, "play.player_persistence");
+        let mut player_state = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::PlayerPersistence,
+            "commit server-owned chest player state",
+            player_wait_started,
+            player_guard,
+        );
+        if player_state.inventory_recovery_required
+            || player_state.inventory.slots != player.expected_inventory.slots
+            || player_state.carried_item != player.expected_carried_item
+        {
+            return Ok(ServerOwnedChestCommit::StalePlayer);
+        }
+        let current_state_id = containers
+            .chest_state_ids
+            .get(&primary_position)
+            .copied()
+            .unwrap_or(1);
+        if current_state_id != expected_state_id {
+            return Ok(ServerOwnedChestCommit::StaleContainer);
+        }
+
+        match mutation.commit_chests_conditionally(positions, expected, updated) {
+            mc_world::ResidentChestCommitResult::Applied => {}
+            mc_world::ResidentChestCommitResult::Rejected(_) => {
+                return Ok(ServerOwnedChestCommit::StaleContainer);
+            }
+            mc_world::ResidentChestCommitResult::Missing => {
+                return Ok(ServerOwnedChestCommit::MissingContainer);
+            }
+            mc_world::ResidentChestCommitResult::CrossRegion => {
+                return Err(SimulationRequestError::CrossRegion);
+            }
+        }
+
+        player_state.replace_container(
+            player.updated_inventory.clone(),
+            player.updated_carried_item.clone(),
+        );
+        let state_id = current_state_id.wrapping_add(state_id_increment.max(1));
+        containers
+            .chest_state_ids
+            .insert(primary_position, state_id);
+        let recipients = chest_recipients(&containers, primary_position, None);
+        Ok(ServerOwnedChestCommit::Committed(visibility_dispatches(
+            recipients,
+            || OutboundCommand::ChestSlots {
+                position: primary_position,
+                state_id,
+                slots: chest_slot_stacks(&ChestView {
+                    chests: updated.to_vec(),
+                }),
+            },
+        )))
+    }
+
     pub(in crate::play) fn commit(
         &self,
         mutation: &mc_world::WorldMutationView,

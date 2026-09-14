@@ -37,6 +37,8 @@ const STARTUP_LIGHT_BAKE_WORKER_CAP: usize = 16;
 const STARTUP_GENERATION_QUEUE_BATCHES: usize = 8;
 
 mod console;
+mod content_cache;
+mod content_import;
 mod startup_rules;
 
 #[derive(Debug, Parser)]
@@ -81,6 +83,36 @@ enum Command {
         /// Inclusive opposite corner, as `x,z` block coordinates.
         #[arg(long, value_parser = parse_block_coords, allow_hyphen_values = true)]
         to: (i32, i32),
+    },
+    /// Manage the vanilla content cache the server runs on.
+    Content {
+        #[command(subcommand)]
+        command: ContentCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContentCommand {
+    /// Derive a complete vanilla content cache from your own licensed
+    /// Minecraft Java installation and publish it atomically.
+    ///
+    /// Nothing is redistributed: the artifact is taken from `--from`, or
+    /// downloaded from Mojang's public metadata and verified against the
+    /// version's size and SHA-1, and the derived cache stays in a local,
+    /// gitignored directory. A JDK is required for the derivation steps.
+    Import {
+        /// Release to derive. Solaris targets a single release.
+        #[arg(long, default_value = mc_protocol::TARGET_RELEASE)]
+        version: String,
+        /// Use a local server bundle jar instead of downloading one.
+        #[arg(long, conflicts_with = "download")]
+        from: Option<PathBuf>,
+        /// Download the artifact from Mojang's public metadata (the default).
+        #[arg(long)]
+        download: bool,
+        /// Cache root to publish. Defaults to the discovered location.
+        #[arg(long)]
+        cache: Option<PathBuf>,
     },
 }
 
@@ -237,6 +269,28 @@ impl<'a> EffectiveConfig<'a> {
 struct OperatorWarning {
     code: &'static str,
     message: &'static str,
+}
+
+/// The honest operator notice for the vanilla village terrain analogue.
+///
+/// Vanilla villages carry `terrain_adaptation = beard_thin`, a 3D density term
+/// vanilla adds inside `NoiseChunk`. Solaris terrain is a 2D per-column surface
+/// with no density array for that term to enter, so the same Beardifier kernel,
+/// weights and `box.minY() + groundLevelDelta` targets are applied as a
+/// **column-height analogue**: each column's surface is pulled toward the rigid
+/// pieces' ground level. The village geometry is vanilla's; the terrain around
+/// it is not, and the operator is told so rather than discovering it in a diff.
+const VILLAGE_BEARD_ANALOGUE_NOTICE: OperatorWarning = OperatorWarning {
+    code: "village_terrain_adaptation_beard_thin_is_a_column_height_analogue",
+    message: "vanilla villages generate with terrain_adaptation = beard_thin applied as a Solaris column-height analogue, not as vanilla's density arithmetic: the terrain around a village is pulled toward the rigid pieces' ground level by the Beardifier kernel (crates/mc-worldgen/src/village/beard.rs), so village surroundings differ from vanilla",
+};
+
+/// The notice the operator is owed for a generator that places vanilla
+/// villages, `Some` exactly when it does: the analogue is not something a
+/// village world can be built without, so it is reported with the build rather
+/// than promised in a document.
+fn village_terrain_analogue_notice(village_analogue: bool) -> Option<&'static OperatorWarning> {
+    village_analogue.then_some(&VILLAGE_BEARD_ANALOGUE_NOTICE)
 }
 
 #[derive(serde::Deserialize)]
@@ -486,20 +540,19 @@ fn vanilla_block_light_report_matches_target(vanilla_data_dir: &Path) -> bool {
 }
 
 fn vanilla_tags_are_usable(vanilla_data_dir: &Path) -> bool {
-    let Ok(protocol_data) = load_effective_protocol_data(Some(vanilla_data_dir)) else {
+    let Ok(protocol_data) = load_effective_protocol_data(vanilla_data_dir) else {
         return false;
     };
     let items = mc_data::items::solaris_required_items();
-    let blocks = mc_data::blocks::solaris_required_blocks_report();
-    load_effective_tags(Some(vanilla_data_dir), &protocol_data, &items, &blocks).is_ok()
+    load_effective_tags(vanilla_data_dir, &protocol_data, &items).is_ok()
 }
 
 fn vanilla_recipes_are_usable(vanilla_data_dir: &Path) -> bool {
-    load_effective_recipes(Some(vanilla_data_dir)).is_ok()
+    load_effective_recipes(vanilla_data_dir).is_ok()
 }
 
 fn vanilla_loot_is_usable(vanilla_data_dir: &Path) -> bool {
-    load_effective_loot(Some(vanilla_data_dir)).is_ok()
+    load_effective_loot(vanilla_data_dir).is_ok()
 }
 
 #[derive(serde::Serialize)]
@@ -682,6 +735,8 @@ async fn serve(
             Ok::<_, anyhow::Error>(Arc::new(manifest))
         })
         .transpose()?;
+    let content = content_import::resolve_or_import(&content_search(&cfg)).await?;
+    let vanilla_data_dir = content.root();
     let StartupData {
         data,
         blocks,
@@ -694,22 +749,28 @@ async fn serve(
         block_facts,
         entity_types,
         mut biome_spawns,
-    } = StartupData::load(
-        cfg.data.vanilla_data_dir.as_deref(),
-        loader_manifest.as_deref(),
-    )?;
+    } = StartupData::load(vanilla_data_dir, loader_manifest.as_deref())?;
     let structure_rules = structure_rules_for_startup(
         cfg.data.seed,
         cfg.data.worldgen_mode,
-        cfg.data.vanilla_data_dir.as_deref(),
+        vanilla_data_dir,
         &blocks,
         &items,
         plugin_settlement_plan.as_ref(),
         cfg.data.settlement_profile,
     )?;
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
-    let chest_loot = chest_loot_catalog_for_startup(cfg.data.vanilla_data_dir.as_deref())
-        .map(|catalog| (catalog, (*items).clone()));
+    let chest_loot =
+        chest_loot_catalog_for_startup(vanilla_data_dir).map(|catalog| (catalog, (*items).clone()));
+    let village_plans = village_plan_source_for_startup(
+        cfg.data.seed,
+        vanilla_data_dir,
+        &blocks,
+        &data,
+        &tags,
+        plugin_settlement_plan.as_ref(),
+        cfg.data.settlement_profile,
+    )?;
     let mut terrain_generator = build_terrain_generator(
         cfg.data.seed,
         worldgen_mode,
@@ -718,6 +779,7 @@ async fn serve(
         structure_rules,
         plugin_ore_profile,
         chest_loot,
+        village_plans,
     )?;
     let gameplay_rules = prepared_plugins
         .as_ref()
@@ -1059,12 +1121,23 @@ async fn run_bound_server(
     terminal_console: Option<console::Console<console::server_commands::ServerCommands>>,
 ) -> Result<()> {
     // Every exit path drains admitted work and performs exactly one final save.
-    // Ctrl-C only requests shutdown; it then waits for that same lifecycle. SIGHUP
-    // prepares/reloads plugins without pausing the network future while files are read.
+    // Ctrl-C and SIGTERM only request shutdown; they then wait for that same
+    // lifecycle, so `kill` and container/supervisor stops save exactly like the
+    // console does. SIGHUP prepares/reloads plugins without pausing the network
+    // future while files are read.
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
     let mut run_fut = std::pin::pin!(bound.serve_and_save());
     let mut shutdown = Box::pin(async {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.context("installing shutdown signal handler"),
+            () = async {
+                #[cfg(unix)]
+                let _ = terminate.recv().await;
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            } => Ok(()),
             result = async {
                 match terminal_console {
                     Some(console) => console.run().await,
@@ -1185,9 +1258,9 @@ async fn join_lua_host(host: mc_script::LuaHost) -> Result<()> {
 }
 
 fn chest_loot_catalog_for_startup(
-    vanilla_data_dir: Option<&Path>,
+    vanilla_data_dir: &Path,
 ) -> Option<mc_data::loot::chest_26_1_2::ChestLootCatalog> {
-    let dir = vanilla_data_dir?;
+    let dir = vanilla_data_dir;
     let tables = [
         mc_worldgen::structures::VILLAGE_TOOLSMITH_LOOT_TABLE,
         mc_worldgen::structures::SOLARIS_RUIN_LOOT_TABLE,
@@ -1209,6 +1282,10 @@ fn chest_loot_catalog_for_startup(
     }
 }
 
+/// The arguments are the startup configuration's pieces, each owned by a
+/// different layer (data cache, plugin, world contract, village pipeline); the
+/// alternative is a bag struct the callers would fill the same way.
+#[allow(clippy::too_many_arguments)]
 fn build_terrain_generator(
     seed: i64,
     worldgen_mode: mc_worldgen::WorldgenMode,
@@ -1220,6 +1297,7 @@ fn build_terrain_generator(
         mc_data::loot::chest_26_1_2::ChestLootCatalog,
         mc_data::items::ItemRegistry,
     )>,
+    village_plans: Option<Arc<mc_worldgen::village::plan_source::VillagePlanSource>>,
 ) -> Result<Arc<mc_worldgen::TerrainGenerator>> {
     let biomes = mc_worldgen::BiomeRules::vanilla_overworld();
     let mut generator =
@@ -1228,6 +1306,13 @@ fn build_terrain_generator(
             .with_geometry(geometry)
             .with_mode(worldgen_mode)
             .with_structures(structure_rules);
+    if let Some(village_plans) = village_plans {
+        generator = generator.with_village_plans(village_plans);
+    }
+    if let Some(notice) = village_terrain_analogue_notice(generator.village_plan_source().is_some())
+    {
+        tracing::warn!(code = notice.code, "{}", notice.message);
+    }
     if let Some((catalog, items)) = chest_loot {
         generator = generator.with_chest_loot(catalog, items);
     }
@@ -1242,16 +1327,13 @@ fn build_terrain_generator(
 fn structure_rules_for_startup(
     seed: i64,
     worldgen_mode: mc_server::WorldgenMode,
-    vanilla_data_dir: Option<&Path>,
+    vanilla_data_dir: &Path,
     blocks: &mc_world::BlockRegistry,
     items: &mc_data::items::ItemRegistry,
     settlement_plan: Option<&mc_script::LuaSettlementPlan>,
     settlement_profile: mc_server::SettlementProfile,
 ) -> Result<mc_worldgen::StructureRules> {
     if let Some(settlement_plan) = settlement_plan {
-        let vanilla_data_dir = vanilla_data_dir.context(
-            "worldgen settlement profile plains_village_prototype requires data.vanilla_data_dir",
-        )?;
         let parts = settlement_plan
             .buildings()
             .iter()
@@ -1312,9 +1394,6 @@ fn structure_rules_for_startup(
     }
     if settlement_profile == mc_server::SettlementProfile::PlainsVillagePrototype {
         // A deployed plugin settlement plan wins; this is the no-plugin path.
-        let vanilla_data_dir = vanilla_data_dir.context(
-            "worldgen settlement profile plains_village_prototype requires data.vanilla_data_dir",
-        )?;
         let rules = mc_worldgen::StructureRules::plains_village_prototype(vanilla_data_dir, blocks)
             .context("loading plains village prototype from vanilla structure data")?;
         tracing::info!(
@@ -1327,11 +1406,80 @@ fn structure_rules_for_startup(
             rules
         });
     }
+    // No plugin settlement plan and no prototype opt-in: this is the default
+    // `vanilla` profile, whose villages core generates itself (the plan source
+    // `village_plan_source_for_startup` builds). `structure_rules_for_startup`
+    // owns no village content on this path.
     if seed == 0 && worldgen_mode == mc_server::WorldgenMode::VanillaLike {
         return mc_worldgen::StructureRules::solaris_playable_ruin(blocks, items)
             .context("resolving Solaris playable ruin");
     }
     Ok(mc_worldgen::StructureRules::none())
+}
+
+/// Core's own vanilla village generation for a world, or `None` when this world
+/// is not core's to village.
+///
+/// Core villages apply to the default `vanilla` profile only, and only when no
+/// Luau settlement plan is deployed: a deployed plan owns settlement content and
+/// wins, so attaching core villages as well would place two villages over one
+/// landscape. The `plains_village_prototype` profile keeps its own bounded
+/// prototype rules and gets no plan source.
+///
+/// The source is built from the resolved content cache: the village closure
+/// (`minecraft:villages`), the tag set the server already loaded, and the
+/// closure's own biome gates. [`VillagePlanSource::new`] validates every piece
+/// against the block registry before it is handed out, so a registry that cannot
+/// carry the village fails here, loudly, instead of dropping blocks during chunk
+/// generation.
+fn village_plan_source_for_startup(
+    seed: i64,
+    vanilla_data_dir: &Path,
+    blocks: &Arc<mc_world::BlockRegistry>,
+    data: &Arc<mc_data::VanillaData>,
+    tags: &Arc<mc_data::tags::TagsData>,
+    settlement_plan: Option<&mc_script::LuaSettlementPlan>,
+    settlement_profile: mc_server::SettlementProfile,
+) -> Result<Option<Arc<mc_worldgen::village::plan_source::VillagePlanSource>>> {
+    if settlement_plan.is_some() {
+        tracing::info!(
+            owner = settlement_plan.map(mc_script::LuaSettlementPlan::owner_plugin_id),
+            "a deployed Luau settlement plan owns settlement content; core places no villages",
+        );
+        return Ok(None);
+    }
+    if settlement_profile != mc_server::SettlementProfile::Vanilla {
+        return Ok(None);
+    }
+    let structure_set = mc_data::Identifier::parse("minecraft:villages")
+        .expect("the vanilla villages structure set id is static");
+    let closure =
+        mc_worldgen::village::load_village_closure(vanilla_data_dir, &structure_set, blocks)
+            .context("loading the vanilla village closure from the content cache")?;
+    let cache_tags = Arc::new(mc_worldgen::vanilla_features::CacheTags::new(
+        Arc::clone(blocks),
+        Arc::clone(data),
+        Arc::clone(tags),
+    ));
+    let source = mc_worldgen::village::plan_source::VillagePlanSource::new(
+        Arc::new(closure),
+        seed,
+        Arc::clone(blocks),
+        cache_tags.clone(),
+        cache_tags,
+    )
+    .context("validating the vanilla village against the block registry")?;
+    let source = Arc::new(source);
+    tracing::info!(
+        structure_set = %structure_set,
+        structures = source.closure().structures.len(),
+        pools = source.closure().pools.len(),
+        pieces = source.closure().pieces.len(),
+        processor_lists = source.closure().processor_lists.len(),
+        placed_features = source.closure().placed_features.len(),
+        "core vanilla village generation active",
+    );
+    Ok(Some(source))
 }
 
 fn startup_spawn_view_distance(config: &mc_server::ServerConfig) -> i32 {
@@ -1915,6 +2063,68 @@ fn init_tracing() -> Result<Arc<mc_server::dashboard_stats::WarningRing>> {
     Ok(ring)
 }
 
+/// Resolve the content cache for this machine/config without importing.
+pub(crate) fn content_search(config: &ServerConfig) -> content_cache::ContentSearch {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let environment = std::env::var_os(content_cache::CONTENT_CACHE_ENV).map(PathBuf::from);
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    content_cache::ContentSearch::from_config(
+        config.data.vanilla_data_dir.as_deref(),
+        environment,
+        home.as_deref(),
+        &working_dir,
+    )
+}
+
+async fn content_command(config_path: &Path, command: ContentCommand) -> Result<()> {
+    let configured_dir = match std::fs::metadata(config_path) {
+        Ok(_) => load_config(config_path)?.data.vanilla_data_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading config file {}", config_path.display()));
+        }
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let environment = std::env::var_os(content_cache::CONTENT_CACHE_ENV).map(PathBuf::from);
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match command {
+        ContentCommand::Import {
+            version,
+            from,
+            download: _,
+            cache,
+        } => {
+            let mut search = content_cache::ContentSearch::from_config(
+                cache.as_deref().or(configured_dir.as_deref()),
+                environment,
+                home.as_deref(),
+                &working_dir,
+            );
+            if let Some(cache) = cache {
+                search.explicit = Some(cache);
+            }
+            let request = content_import::ImportRequest {
+                version,
+                source: match from {
+                    Some(jar) => content_import::ContentSource::LocalJar(jar),
+                    None => content_import::ContentSource::Download,
+                },
+                cache: search.import_target(),
+            };
+            let report = content_import::import_content(&request).await?;
+            println!(
+                "imported vanilla content {} into {}: {} registries, {} entries",
+                request.version,
+                report.cache.display(),
+                report.registries,
+                report.entries,
+            );
+            Ok(())
+        }
+    }
+}
+
 fn manage_operators(config_path: &Path, command: OperatorCommand) -> Result<()> {
     let mut config = load_config(config_path)?;
     if config.admin.operators_file.is_none() {
@@ -1981,8 +2191,9 @@ async fn main() -> ExitCode {
             Err(error) => Err(error),
         },
         (false, Some(Command::Operator { command })) => manage_operators(&cli.config, command),
+        (false, Some(Command::Content { command })) => content_command(&cli.config, command).await,
         (true, Some(_)) => Err(anyhow::anyhow!(
-            "--check cannot be combined with the operator subcommand"
+            "--check cannot be combined with a subcommand"
         )),
     };
     match result {
@@ -1993,6 +2204,10 @@ async fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "structure_rules_tests.rs"]
+mod structure_rules_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2803,6 +3018,61 @@ mod tests {
         assert!(world_contract_path(world.path()).is_file());
     }
 
+    /// The built-in settlement profile is a first-class world identity: startup
+    /// writes it, accepts a world that already carries it, and refuses a world
+    /// whose persisted profile differs instead of generating villages into it.
+    #[test]
+    fn world_contract_accepts_and_persists_the_builtin_settlement_profile() {
+        let world = tempfile::tempdir().unwrap();
+        let geometry = mc_world::OVERWORLD_GEOMETRY;
+        let profile = mc_server::SettlementProfile::PlainsVillagePrototype.name();
+
+        assert_eq!(
+            ensure_world_contract(
+                world.path(),
+                geometry,
+                712_816,
+                "tellus_like",
+                "vanilla",
+                profile,
+            )
+            .unwrap(),
+            WorldSource::SolarisGenerated,
+        );
+        let bytes = std::fs::read(world_contract_path(world.path())).unwrap();
+        let persisted: PersistedWorldContract = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(persisted.settlement_profile, profile);
+
+        assert_eq!(
+            ensure_world_contract(
+                world.path(),
+                geometry,
+                712_816,
+                "tellus_like",
+                "vanilla",
+                profile,
+            )
+            .unwrap(),
+            WorldSource::SolarisGenerated,
+        );
+
+        let error = ensure_world_contract(
+            world.path(),
+            geometry,
+            712_816,
+            "tellus_like",
+            "vanilla",
+            "vanilla",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("settlement_profile=plains_village_prototype"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn startup_chunk_workers_cover_configured_and_available_parallelism() {
         let available = std::thread::available_parallelism()
@@ -2824,10 +3094,8 @@ mod tests {
 
     #[test]
     fn chest_loot_catalog_for_startup_falls_back_without_data_dir() {
-        assert!(chest_loot_catalog_for_startup(None).is_none());
         assert!(
-            chest_loot_catalog_for_startup(Some(std::path::Path::new("/nonexistent-data-dir")))
-                .is_none()
+            chest_loot_catalog_for_startup(std::path::Path::new("/nonexistent-data-dir")).is_none()
         );
     }
 
@@ -2840,6 +3108,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
+            None,
             None,
             None,
         ) {
@@ -2876,6 +3145,7 @@ mod tests {
             mc_worldgen::StructureRules::none(),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2886,6 +3156,60 @@ mod tests {
 
         assert_eq!(chunk.geometry(), geometry);
         assert_eq!(chunk.sections.len(), 16);
+    }
+
+    /// The analogue notice is owed exactly when a build places vanilla
+    /// villages, and it says what actually changed: the terrain adaptation is
+    /// the column-height analogue, not vanilla's density arithmetic.
+    #[test]
+    fn village_terrain_analogue_notice_fires_only_for_vanilla_villages() {
+        assert!(village_terrain_analogue_notice(false).is_none());
+        let notice =
+            village_terrain_analogue_notice(true).expect("a village build owes the notice");
+        assert_eq!(
+            notice.code,
+            "village_terrain_adaptation_beard_thin_is_a_column_height_analogue"
+        );
+        assert!(notice.message.contains("beard_thin"), "{}", notice.message);
+        assert!(
+            notice.message.contains("column-height analogue"),
+            "{}",
+            notice.message
+        );
+        assert!(
+            notice
+                .message
+                .contains("not as vanilla's density arithmetic"),
+            "{}",
+            notice.message,
+        );
+    }
+
+    /// Activation is off: `settlement_profile = "vanilla"` builds a generator
+    /// with no village plan source, so it places no villages and the analogue
+    /// notice has nothing to report.
+    #[test]
+    fn build_terrain_generator_places_no_villages_without_a_plan_source() {
+        let blocks =
+            Arc::new(
+                mc_world::BlockRegistry::from_report(
+                    &mc_data::blocks::solaris_required_blocks_report(),
+                )
+                .unwrap(),
+            );
+        let generator = build_terrain_generator(
+            42,
+            mc_worldgen::WorldgenMode::VanillaLike,
+            mc_world::OVERWORLD_GEOMETRY,
+            blocks,
+            mc_worldgen::StructureRules::none(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(generator.village_plan_source().is_none());
     }
 
     #[test]
@@ -2904,6 +3228,7 @@ mod tests {
             blocks,
             mc_worldgen::StructureRules::none(),
             Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits),
+            None,
             None,
         )
         .unwrap();
@@ -2925,7 +3250,7 @@ mod tests {
         let playable = structure_rules_for_startup(
             0,
             mc_server::WorldgenMode::VanillaLike,
-            None,
+            std::path::Path::new("resolved-content-cache"),
             &blocks,
             &items,
             None,
@@ -2935,7 +3260,7 @@ mod tests {
         let unrelated_seed = structure_rules_for_startup(
             7,
             mc_server::WorldgenMode::VanillaLike,
-            None,
+            std::path::Path::new("resolved-content-cache"),
             &blocks,
             &items,
             None,
@@ -2945,7 +3270,7 @@ mod tests {
         let unrelated_mode = structure_rules_for_startup(
             0,
             mc_server::WorldgenMode::TellusLike,
-            None,
+            std::path::Path::new("resolved-content-cache"),
             &blocks,
             &items,
             None,
@@ -2956,52 +3281,6 @@ mod tests {
         assert!(!playable.is_empty());
         assert!(unrelated_seed.is_empty());
         assert!(unrelated_mode.is_empty());
-    }
-
-    #[test]
-    fn builtin_settlement_profile_requires_the_vanilla_sidecar() {
-        let blocks = mc_world::BlockRegistry::from_report(
-            &mc_data::blocks::solaris_required_blocks_report(),
-        )
-        .unwrap();
-        let items = mc_data::items::solaris_required_items();
-
-        let error = structure_rules_for_startup(
-            0,
-            mc_server::WorldgenMode::TellusLike,
-            None,
-            &blocks,
-            &items,
-            None,
-            mc_server::SettlementProfile::PlainsVillagePrototype,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("requires data.vanilla_data_dir"));
-    }
-
-    #[test]
-    fn settlement_profile_requires_the_vanilla_sidecar() {
-        let blocks = mc_world::BlockRegistry::from_report(
-            &mc_data::blocks::solaris_required_blocks_report(),
-        )
-        .unwrap();
-        let items = mc_data::items::solaris_required_items();
-
-        let error = structure_rules_for_startup(
-            0,
-            mc_server::WorldgenMode::TellusLike,
-            None,
-            &blocks,
-            &items,
-            Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
-                "test-settlement",
-            )),
-            mc_server::SettlementProfile::Vanilla,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("requires data.vanilla_data_dir"));
     }
 
     #[test]
@@ -3022,7 +3301,7 @@ mod tests {
         let rules = structure_rules_for_startup(
             0,
             mc_server::WorldgenMode::TellusLike,
-            Some(&vanilla_data_dir),
+            &vanilla_data_dir,
             &blocks,
             &items,
             Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
@@ -3056,7 +3335,7 @@ mod tests {
         let rules = structure_rules_for_startup(
             0,
             mc_server::WorldgenMode::TellusLike,
-            Some(&vanilla_data_dir),
+            &vanilla_data_dir,
             &blocks,
             &items,
             Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
@@ -3069,7 +3348,7 @@ mod tests {
         let builtin_rules = structure_rules_for_startup(
             0,
             mc_server::WorldgenMode::TellusLike,
-            Some(&vanilla_data_dir),
+            &vanilla_data_dir,
             &blocks,
             &items,
             None,
@@ -3088,6 +3367,7 @@ mod tests {
             builtin_rules,
             None,
             None,
+            None,
         )
         .unwrap();
         let first = build_terrain_generator(
@@ -3096,6 +3376,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             Arc::clone(&blocks),
             rules.clone(),
+            None,
             None,
             None,
         )
@@ -3108,6 +3389,7 @@ mod tests {
             rules,
             None,
             None,
+            None,
         )
         .unwrap();
         let baseline = build_terrain_generator(
@@ -3116,6 +3398,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
+            None,
             None,
             None,
         )
@@ -3480,6 +3763,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             Arc::clone(&blocks),
             mc_worldgen::StructureRules::none(),
+            None,
             None,
             None,
         )

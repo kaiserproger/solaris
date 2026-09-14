@@ -70,6 +70,96 @@ pub struct StructureTemplate {
     blocks: Vec<TemplateBlock>,
     chests: Vec<TemplateChest>,
     villager_markers: Vec<[i32; 3]>,
+    jigsaws: Vec<TemplateJigsaw>,
+}
+
+/// `minecraft:jigsaw` joint type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Joint {
+    Aligned,
+    Rollable,
+}
+
+/// A block face, as the jigsaw block's `orientation` property names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockFace {
+    Down,
+    Up,
+    North,
+    South,
+    West,
+    East,
+}
+
+impl BlockFace {
+    #[must_use]
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Down => Self::Up,
+            Self::Up => Self::Down,
+            Self::North => Self::South,
+            Self::South => Self::North,
+            Self::West => Self::East,
+            Self::East => Self::West,
+        }
+    }
+
+    #[must_use]
+    pub fn step(self) -> [i32; 3] {
+        match self {
+            Self::Down => [0, -1, 0],
+            Self::Up => [0, 1, 0],
+            Self::North => [0, 0, -1],
+            Self::South => [0, 0, 1],
+            Self::West => [-1, 0, 0],
+            Self::East => [1, 0, 0],
+        }
+    }
+}
+
+/// One `minecraft:jigsaw` block of a piece, in template-local coordinates.
+///
+/// `front`/`top` come from the jigsaw state's `orientation`
+/// (`JigsawBlock.getFrontFacing`/`getTopFacing` are
+/// `state.getValue(ORIENTATION).front()/top()`), and `final_state` is the state
+/// the jigsaw is replaced with once the structure is placed.
+#[derive(Debug, Clone)]
+pub struct TemplateJigsaw {
+    pub pos: [i32; 3],
+    pub state: BlockStateId,
+    pub front: BlockFace,
+    pub top: BlockFace,
+    pub name: Identifier,
+    pub target: Identifier,
+    pub pool: Identifier,
+    pub joint: Joint,
+    pub final_state: BlockStateId,
+    pub selection_priority: i32,
+}
+
+/// `FrontAndTop`'s names, as they appear in a jigsaw state's `orientation`.
+const ORIENTATIONS: &[(&str, BlockFace, BlockFace)] = &[
+    ("down_east", BlockFace::Down, BlockFace::East),
+    ("down_north", BlockFace::Down, BlockFace::North),
+    ("down_south", BlockFace::Down, BlockFace::South),
+    ("down_west", BlockFace::Down, BlockFace::West),
+    ("up_east", BlockFace::Up, BlockFace::East),
+    ("up_north", BlockFace::Up, BlockFace::North),
+    ("up_south", BlockFace::Up, BlockFace::South),
+    ("up_west", BlockFace::Up, BlockFace::West),
+    ("west_up", BlockFace::West, BlockFace::Up),
+    ("east_up", BlockFace::East, BlockFace::Up),
+    ("north_up", BlockFace::North, BlockFace::Up),
+    ("south_up", BlockFace::South, BlockFace::Up),
+];
+
+/// Decode `FrontAndTop` from a jigsaw state's `orientation` value.
+#[must_use]
+pub fn orientation_faces(orientation: &str) -> Option<(BlockFace, BlockFace)> {
+    ORIENTATIONS
+        .iter()
+        .find(|(name, _, _)| *name == orientation)
+        .map(|(_, front, top)| (*front, *top))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -349,6 +439,7 @@ impl StructureTemplate {
             blocks,
             chests: Vec::new(),
             villager_markers: Vec::new(),
+            jigsaws: Vec::new(),
         }
     }
 
@@ -411,14 +502,20 @@ impl StructureTemplate {
         &self.villager_markers
     }
 
+    /// The piece's jigsaw blocks, in template-local coordinates.
+    #[must_use]
+    pub fn jigsaws(&self) -> &[TemplateJigsaw] {
+        &self.jigsaws
+    }
+
     fn from_tag(path: &str, root: &Tag, registry: &BlockRegistry) -> Result<Self, StructureError> {
         let compound = expect_compound(path, root, "root")?;
         let size = expect_int_triplet(path, require(compound, path, "size")?, "size")?;
         let palette = parse_palette(path, require(compound, path, "palette")?, registry)?;
-        let (blocks, villager_markers) =
-            parse_blocks(path, require(compound, path, "blocks")?, &palette)?;
-        let mut template = Self::new(size, blocks);
-        template.villager_markers = villager_markers;
+        let parsed = parse_blocks(path, require(compound, path, "blocks")?, &palette, registry)?;
+        let mut template = Self::new(size, parsed.blocks);
+        template.villager_markers = parsed.villager_markers;
+        template.jigsaws = parsed.jigsaws;
         Ok(template)
     }
 
@@ -455,6 +552,7 @@ impl StructureTemplate {
             blocks,
             chests,
             villager_markers,
+            jigsaws: Vec::new(),
         }
     }
 }
@@ -819,7 +917,10 @@ impl Default for StructureRules {
 #[derive(Debug, Clone, Copy)]
 enum TemplatePaletteEntry {
     Block(BlockStateId),
-    Jigsaw,
+    /// A `minecraft:jigsaw` state, kept separate from `Block` because the
+    /// prototype only needed its position; the piece loader reads its
+    /// `orientation` for the connector.
+    Jigsaw(BlockStateId),
     Ignored,
 }
 
@@ -847,7 +948,17 @@ fn parse_palette_entry(
         field: "palette[].Name",
     })?;
     if id.as_str() == "minecraft:jigsaw" {
-        return Ok(TemplatePaletteEntry::Jigsaw);
+        let props = match compound.iter().find(|(key, _)| key == "Properties") {
+            Some((_, tag)) => parse_properties(path, tag)?,
+            None => Vec::new(),
+        };
+        let state = registry.by_name_and_props(&id, &props).ok_or_else(|| {
+            StructureError::InvalidField {
+                path: path.to_string(),
+                field: "palette[].jigsaw orientation",
+            }
+        })?;
+        return Ok(TemplatePaletteEntry::Jigsaw(state));
     }
     if matches!(id.as_str(), "minecraft:air" | "minecraft:structure_void") {
         return Ok(TemplatePaletteEntry::Ignored);
@@ -884,14 +995,23 @@ fn parse_properties(path: &str, tag: &Tag) -> Result<Vec<(String, String)>, Stru
         .collect()
 }
 
+/// What one piece's `blocks` list yields.
+struct ParsedBlocks {
+    blocks: Vec<TemplateBlock>,
+    villager_markers: Vec<[i32; 3]>,
+    jigsaws: Vec<TemplateJigsaw>,
+}
+
 fn parse_blocks(
     path: &str,
     tag: &Tag,
     palette: &[TemplatePaletteEntry],
-) -> Result<(Vec<TemplateBlock>, Vec<[i32; 3]>), StructureError> {
+    registry: &BlockRegistry,
+) -> Result<ParsedBlocks, StructureError> {
     let list = expect_list(path, tag, "blocks")?;
     let mut blocks = Vec::new();
     let mut villager_markers = Vec::new();
+    let mut jigsaws = Vec::new();
     for entry in &list.elements {
         let compound = expect_compound(path, entry, "blocks[]")?;
         let pos = expect_int_triplet(path, require(compound, path, "pos")?, "blocks[].pos")?;
@@ -907,13 +1027,157 @@ fn parse_blocks(
             TemplatePaletteEntry::Block(state) => {
                 blocks.push(TemplateBlock { pos, state: *state });
             }
-            TemplatePaletteEntry::Jigsaw if is_plains_villager_jigsaw(compound) => {
-                villager_markers.push(pos);
+            TemplatePaletteEntry::Jigsaw(jigsaw_state) => {
+                let jigsaw = parse_template_jigsaw(path, pos, *jigsaw_state, compound, registry)?;
+                if is_plains_villager_jigsaw(compound) {
+                    villager_markers.push(pos);
+                }
+                jigsaws.push(jigsaw);
             }
-            TemplatePaletteEntry::Jigsaw | TemplatePaletteEntry::Ignored => {}
+            TemplatePaletteEntry::Ignored => {}
         }
     }
-    Ok((blocks, villager_markers))
+    Ok(ParsedBlocks {
+        blocks,
+        villager_markers,
+        jigsaws,
+    })
+}
+
+/// Read one jigsaw block entity into a [`TemplateJigsaw`].
+fn parse_template_jigsaw(
+    path: &str,
+    pos: [i32; 3],
+    state: BlockStateId,
+    compound: &[(String, Tag)],
+    registry: &BlockRegistry,
+) -> Result<TemplateJigsaw, StructureError> {
+    let nbt = compound
+        .iter()
+        .find(|(key, _)| key == "nbt")
+        .map(|(_, tag)| tag)
+        .and_then(|tag| match tag {
+            Tag::Compound(fields) => Some(fields),
+            _ => None,
+        })
+        .ok_or_else(|| StructureError::InvalidField {
+            path: path.to_string(),
+            field: "blocks[].nbt",
+        })?;
+    let text = |field: &'static str| -> Result<String, StructureError> {
+        nbt.iter()
+            .find(|(key, _)| key == field)
+            .and_then(|(_, tag)| match tag {
+                Tag::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| StructureError::InvalidField {
+                path: path.to_string(),
+                field: "jigsaw field",
+            })
+    };
+    let identifier = |field: &'static str| -> Result<Identifier, StructureError> {
+        Identifier::parse(text(field)?).map_err(|_| StructureError::InvalidField {
+            path: path.to_string(),
+            field: "jigsaw identifier",
+        })
+    };
+    // The jigsaw's own state carries `orientation`
+    // (`JigsawBlock.getFrontFacing` = `state.getValue(ORIENTATION).front()`).
+    let orientation = registry
+        .by_id(state)
+        .and_then(|state| {
+            state
+                .properties
+                .iter()
+                .find(|(key, _)| key == "orientation")
+                .map(|(_, value)| value.clone())
+        })
+        .ok_or_else(|| StructureError::InvalidField {
+            path: path.to_string(),
+            field: "jigsaw orientation",
+        })?;
+    let (front, top) =
+        orientation_faces(&orientation).ok_or_else(|| StructureError::InvalidField {
+            path: path.to_string(),
+            field: "jigsaw orientation",
+        })?;
+    let final_state = parse_state_string(path, &text("final_state")?, registry)?;
+    let joint = match text("joint")?.as_str() {
+        "rollable" => Joint::Rollable,
+        _ => Joint::Aligned,
+    };
+    let selection_priority = nbt
+        .iter()
+        .find(|(key, _)| key == "selection_priority")
+        .and_then(|(_, tag)| match tag {
+            Tag::Int(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Ok(TemplateJigsaw {
+        pos,
+        state,
+        front,
+        top,
+        name: identifier("name")?,
+        target: identifier("target")?,
+        pool: identifier("pool")?,
+        joint,
+        final_state,
+        selection_priority,
+    })
+}
+
+/// `minecraft:oak_planks` / `minecraft:oak_stairs[facing=east,half=bottom]`.
+fn parse_state_string(
+    path: &str,
+    text: &str,
+    registry: &BlockRegistry,
+) -> Result<BlockStateId, StructureError> {
+    let invalid = || StructureError::InvalidField {
+        path: path.to_string(),
+        field: "final_state",
+    };
+    let (name, properties) = match text.split_once('[') {
+        Some((name, rest)) => {
+            // Vanilla's block-state string reader stops at the closing bracket
+            // and does not assert end-of-input, so real piece NBT carries values
+            // such as `minecraft:acacia_fence[...west=false]]` (a trailing `]`
+            // the game itself reads and ignores); everything after the closing
+            // bracket is ignored here too.
+            let closing = rest.find(']').ok_or_else(invalid)?;
+            let inner = &rest[..closing];
+            let mut pairs = Vec::new();
+            if !inner.is_empty() {
+                for pair in inner.split(',') {
+                    let (key, value) = pair.split_once('=').ok_or_else(invalid)?;
+                    pairs.push((key.to_owned(), value.to_owned()));
+                }
+            }
+            (name, pairs)
+        }
+        None => (text, Vec::new()),
+    };
+    let id = Identifier::parse(name.to_owned()).map_err(|_| invalid())?;
+    // `BlockStateParser` fills the properties the string omits from the block's
+    // default state and rejects unknown ones, so `minecraft:sandstone_stairs
+    // [facing=south]` and a bare `minecraft:grass_block` both resolve.
+    let block = registry.block(&id).ok_or_else(invalid)?;
+    let mut resolved: Vec<(String, String)> = registry
+        .by_id(block.default)
+        .ok_or_else(invalid)?
+        .properties
+        .clone();
+    for (key, value) in properties {
+        match resolved.iter_mut().find(|(name, _)| *name == key) {
+            Some(slot) => slot.1 = value,
+            None => return Err(invalid()),
+        }
+    }
+    registry
+        .by_name_and_props(&id, &resolved)
+        .ok_or_else(invalid)
 }
 
 fn is_plains_villager_jigsaw(compound: &[(String, Tag)]) -> bool {

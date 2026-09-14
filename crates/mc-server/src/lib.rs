@@ -151,10 +151,19 @@ pub struct TabListSection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettlementProfile {
-    /// No settlement rules: the stock world generates no villages.
+    /// Core stock world. Solaris core does not implement vanilla village
+    /// generation, so this profile places no villages at all; startup reports
+    /// the gap instead of quietly generating none. Villages reach a world only
+    /// through a deployed plugin settlement plan or the explicit
+    /// [`Self::PlainsVillagePrototype`] opt-in.
     #[default]
     Vanilla,
-    /// Vanilla plains village sections around vanilla village spacing.
+    /// Bounded Solaris prototype, not full vanilla village generation: the
+    /// three vanilla plains templates (`plains_fountain_01`,
+    /// `plains_small_house_1`, `plains_tool_smith_1`) are combined into one
+    /// composite and placed on the vanilla plains village spacing,
+    /// separation, and salt read from `vanilla_data_dir`. Needs the sidecar;
+    /// it places no desert, savanna, snowy, or taiga villages.
     PlainsVillagePrototype,
 }
 
@@ -174,9 +183,12 @@ impl SettlementProfile {
 pub struct DataSection {
     #[serde(default)]
     pub world_dir: Option<PathBuf>,
-    /// Optional local vanilla data sidecar root. Mojang-owned files stay outside
-    /// the repo; when set, Solaris treats the sidecar as authoritative and
-    /// requires supported registries, tags, reports, and simple loot data.
+    /// Optional vanilla content cache override. Solaris runs on data derived
+    /// from the operator's own licensed Minecraft Java installation: when this
+    /// is unset the server discovers a derived cache (or imports one from the
+    /// local source/Mojang's public metadata before binding), and when it is
+    /// set it must name a complete derived cache root. Mojang-owned files stay
+    /// outside the repo; nothing is redistributed.
     #[serde(default)]
     pub vanilla_data_dir: Option<PathBuf>,
     /// World seed for the M7 terrain generator. Defaults to `0` —
@@ -189,8 +201,11 @@ pub struct DataSection {
     #[serde(default)]
     pub worldgen_mode: WorldgenMode,
     /// Built-in settlement profile used when no deployed plugin supplies a
-    /// settlement plan. `plains_village_prototype` places vanilla plains
-    /// village sections and needs `vanilla_data_dir`.
+    /// settlement plan. The default `vanilla` places no villages because core
+    /// vanilla village generation is not implemented, and startup reports that
+    /// gap; `plains_village_prototype` opts into the bounded Solaris plains
+    /// prototype (fountain, small house, toolsmith on vanilla plains village
+    /// spacing) and needs `vanilla_data_dir`.
     #[serde(default)]
     pub settlement_profile: SettlementProfile,
     /// Lowest generated world Y, inclusive.

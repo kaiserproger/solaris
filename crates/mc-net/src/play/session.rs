@@ -227,7 +227,7 @@ pub(super) use outbound::{
     dispatch_visibility_commands, is_bow_skeleton_type_26_1_2,
 };
 #[cfg(test)]
-pub(super) use outbound::{PlayerInventorySlotDelta, SessionRecipient};
+pub(super) use outbound::{PlayerInventorySlotDelta, SessionRecipient, publication_probe};
 pub(in crate::play) use passive_mobs::SHEEP_GRAZING_ANIMATION_TICKS;
 pub(super) use passive_mobs::SheepGrazingCandidate;
 #[cfg(test)]

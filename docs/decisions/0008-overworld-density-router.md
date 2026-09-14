@@ -214,6 +214,13 @@ and plugin-owned extension records. Vanilla villager jigsaw positions become
 persisted chunk markers; runtime installation routes them to the dedicated
 system-owned simulation command rather than ambient-herd admission.
 
+The config default `vanilla` settlement profile is *not* vanilla village
+generation: core Solaris has no per-type village structure sets, biome tags, or
+jigsaw assembler, so `vanilla` places no villages at all and startup reports
+that gap with the typed `settlement_profile_vanilla_generates_no_villages`
+warning. `plains_village_prototype` is the explicit opt-in to the bounded
+prototype above and is the only core profile that places anything.
+
 The revision-6 router replaced the revision-5 router instead of tuning it.
 `terrain::overworld::landforms` owns a new coordinate field: domain-warped
 continents establish shelves and land, erosion and uplands shape broad relief,

@@ -850,6 +850,73 @@ pub(in crate::play) struct VisibilityDispatch {
     pub(crate) command: OutboundCommand,
 }
 
+/// Test-only observation point for the append-before-publication rule.
+///
+/// A server-owned warehouse transfer must append the reserved world-journal
+/// decision that carries the container's after-image BEFORE the container's
+/// `ChestSlots` command is published. The regional run arms this probe for the
+/// container it is about to publish; the observation itself is taken here,
+/// where the command leaves the run, so what the journal records is the append
+/// state AT publication - not the state at some adjacent statement.
+///
+/// The arming is thread-local: the probe is armed and the command is published
+/// by the same owner task, and the arm is consumed by the first matching
+/// publication, so one publication leaves exactly one observation.
+#[cfg(test)]
+pub(in crate::play) mod publication_probe {
+    use std::cell::RefCell;
+
+    use mc_world::BlockPos;
+
+    use crate::play::world_journal::WorldChunkJournal;
+
+    use super::OutboundCommand;
+
+    struct Armed {
+        journal: WorldChunkJournal,
+        decision_id: u64,
+        position: BlockPos,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    /// Arm the probe for the container position a run is about to publish. The
+    /// journal records the observation, so a test reads it back from the same
+    /// journal instance the run itself used.
+    pub(in crate::play) fn arm(journal: &WorldChunkJournal, decision_id: u64, position: BlockPos) {
+        ARMED.with(|armed| {
+            *armed.borrow_mut() = Some(Armed {
+                journal: journal.clone(),
+                decision_id,
+                position,
+            });
+        });
+    }
+
+    /// Observe one outbound command as it is enqueued for publication. The
+    /// `ChestSlots` command of the armed container is the publication the rule
+    /// is about; the arm is consumed so it cannot be observed twice.
+    pub(super) fn observe(command: &OutboundCommand) {
+        let OutboundCommand::ChestSlots { position, .. } = command else {
+            return;
+        };
+        let armed = ARMED.with(|armed| {
+            let mut armed = armed.borrow_mut();
+            let matches = armed
+                .as_ref()
+                .is_some_and(|pending| pending.position == *position);
+            if matches { armed.take() } else { None }
+        });
+        if let Some(armed) = armed {
+            armed
+                .journal
+                .record_warehouse_publication_for_test(armed.decision_id);
+        }
+    }
+}
+
 // Runtime observers read this producer-published projection without entering gameplay locks.
 #[derive(Debug, Default)]
 pub(super) struct SessionPressureObservation {
@@ -960,6 +1027,8 @@ pub(in crate::play) fn dispatch_visibility_commands(dispatches: Vec<VisibilityDi
     let mut batches = Vec::<(SessionRecipient, Vec<OutboundCommand>)>::new();
     let mut ordered_batches = HashMap::<(SessionId, usize, u64), usize>::new();
     for dispatch in dispatches {
+        #[cfg(test)]
+        publication_probe::observe(&dispatch.command);
         let Some(reservation) = dispatch.recipient.ordered.as_ref() else {
             batches.push((dispatch.recipient, vec![dispatch.command]));
             continue;

@@ -21,14 +21,10 @@ pub struct StartupData {
 
 impl StartupData {
     pub fn load(
-        vanilla_data_dir: Option<&Path>,
+        vanilla_data_dir: &Path,
         loader_manifest: Option<&mc_net::LoaderManifest>,
     ) -> Result<Self> {
-        let source = if vanilla_data_dir.is_some() {
-            "vanilla_sidecar"
-        } else {
-            "embedded_solaris_fallback"
-        };
+        let source = "vanilla_content_cache";
         let data = Arc::new(load_effective_protocol_data(vanilla_data_dir)?);
         tracing::info!(
             registries = data.registry_count(),
@@ -41,7 +37,7 @@ impl StartupData {
         tracing::info!(version = %block_light.version, states = block_light.len(), source, "block-light table loaded");
         let block_mining = load_effective_block_mining(vanilla_data_dir, &blocks_report)?;
         tracing::info!(
-            states = block_mining.as_ref().map_or(0, |table| table.len()),
+            states = block_mining.len(),
             source,
             "block-mining table loaded"
         );
@@ -71,7 +67,7 @@ impl StartupData {
         );
         let block_explosion = load_effective_block_explosion(vanilla_data_dir)?;
         tracing::info!(
-            states = block_explosion.as_ref().map_or(0, |table| table.len()),
+            states = block_explosion.len(),
             source,
             "block-explosion table loaded"
         );
@@ -83,12 +79,7 @@ impl StartupData {
             source,
             "item component facts loaded"
         );
-        let tags = Arc::new(load_effective_tags(
-            vanilla_data_dir,
-            &data,
-            &items,
-            &blocks_report,
-        )?);
+        let tags = Arc::new(load_effective_tags(vanilla_data_dir, &data, &items)?);
         tracing::info!(
             tags = tags.total_tags(),
             entries = tags.total_entries(),
@@ -99,30 +90,20 @@ impl StartupData {
         validate_recipe_result_stacks(&recipes, &item_facts)?;
         tracing::info!(
             entries = recipes.len(),
-            source = if vanilla_data_dir.is_some() {
-                "vanilla_sidecar+stable_embedded_prefix"
-            } else {
-                source
-            },
+            source = "vanilla_content_cache+stable_embedded_prefix",
             "recipe registry loaded"
         );
         let loot = Arc::new(load_effective_loot(vanilla_data_dir)?);
         tracing::info!(
             drops = loot.total_drops(),
-            source = if vanilla_data_dir.is_some() {
-                "vanilla_sidecar_simple_subset+embedded_fallback"
-            } else {
-                source
-            },
+            source = "vanilla_content_cache_simple_subset+embedded_fallback",
             "survival loot tables loaded"
         );
         let mut block_facts = mc_data::block_facts::BlockFactsTable::from_blocks_report_with_mining(
             &blocks_report,
-            block_mining.as_ref(),
+            Some(&block_mining),
         );
-        if let Some(table) = block_explosion {
-            block_facts = block_facts.with_explosion_table(table);
-        }
+        block_facts = block_facts.with_explosion_table(block_explosion);
         tracing::info!(
             states = block_facts.len(),
             random_tick_states = block_facts.eligible_states(),
@@ -154,85 +135,69 @@ impl StartupData {
     }
 }
 
-pub fn load_effective_protocol_data(
-    vanilla_data_dir: Option<&Path>,
-) -> Result<mc_data::VanillaData> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        validate_vanilla_sidecar_version(vanilla_data_dir)?;
-        let data = mc_data::load(vanilla_data_dir).with_context(|| {
-            format!(
-                "loading vanilla registry data from {}",
-                vanilla_data_dir.display()
-            )
-        })?;
-        return Ok(data);
-    }
-
-    Ok(mc_data::solaris_required_data())
+pub fn load_effective_protocol_data(vanilla_data_dir: &Path) -> Result<mc_data::VanillaData> {
+    validate_vanilla_sidecar_version(vanilla_data_dir)?;
+    mc_data::load(vanilla_data_dir).with_context(|| {
+        format!(
+            "loading vanilla registry data from {}",
+            vanilla_data_dir.display()
+        )
+    })
 }
 
 pub fn load_effective_tags(
-    vanilla_data_dir: Option<&Path>,
+    vanilla_data_dir: &Path,
     data: &mc_data::VanillaData,
     items: &mc_data::items::ItemRegistry,
-    blocks: &[mc_data::blocks::BlockReport],
 ) -> Result<mc_data::tags::TagsData> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let tags = mc_data::tags::load(vanilla_data_dir, data)
-            .with_context(|| format!("loading vanilla tags from {}", vanilla_data_dir.display()))?
-            .with_vanilla_fuel_values(items);
-        if tags.total_tags() == 0 {
+    let tags = mc_data::tags::load(vanilla_data_dir, data)
+        .with_context(|| format!("loading vanilla tags from {}", vanilla_data_dir.display()))?
+        .with_vanilla_fuel_values(items);
+    if tags.total_tags() == 0 {
+        bail!(
+            "vanilla tags from {} were empty; import a complete content cache with `mc-server content import`",
+            vanilla_data_dir.display()
+        );
+    }
+    for registry in ["minecraft:block", "minecraft:item", "minecraft:entity_type"] {
+        let registry_id = mc_data::Identifier::parse(registry).expect("static registry id");
+        let missing = match tags.registries.get(&registry_id) {
+            Some(entries) => !entries.values().any(|ids| !ids.is_empty()),
+            None => true,
+        };
+        if missing {
             bail!(
-                "vanilla tags from {} were empty; run tools/extract-vanilla-data.sh with tag data",
+                "vanilla tags from {} missing required resolved entries for tag registry {registry}",
                 vanilla_data_dir.display()
             );
         }
-        for registry in ["minecraft:block", "minecraft:item", "minecraft:entity_type"] {
-            let registry_id = mc_data::Identifier::parse(registry).expect("static registry id");
-            let missing = match tags.registries.get(&registry_id) {
-                Some(entries) => !entries.values().any(|ids| !ids.is_empty()),
-                None => true,
-            };
-            if missing {
-                bail!(
-                    "vanilla tags from {} missing required resolved entries for tag registry {registry}",
-                    vanilla_data_dir.display()
-                );
-            }
-        }
-        if !tags.fuel_values().matches_default_vanilla_26_1_2(items) {
-            bail!(
-                "vanilla tags from {} resolved {} furnace fuels instead of the canonical 26.1.2 default set; regenerate the sidecar",
-                vanilla_data_dir.display(),
-                tags.fuel_values().fuel_count(),
-            );
-        }
-        return Ok(tags);
     }
-
-    Ok(mc_data::tags::solaris_required_client_tags(items, blocks))
-}
-
-pub fn load_effective_loot(vanilla_data_dir: Option<&Path>) -> Result<mc_data::loot::LootTables> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let root = vanilla_data_dir
-            .join("data")
-            .join("minecraft")
-            .join("loot_table");
-        let mut tables = mc_data::loot::load_vanilla_subset(&root)
-            .with_context(|| format!("loading vanilla loot tables from {}", root.display()))?;
-        if tables.total_drops() > 0 {
-            tables.fill_missing_from(mc_data::loot::builtin());
-            tables.fill_missing_entity_items_from(mc_data::loot::builtin());
-            return Ok(tables);
-        }
+    if !tags.fuel_values().matches_default_vanilla_26_1_2(items) {
         bail!(
-            "vanilla loot tables from {} had no supported simple drops; run tools/extract-vanilla-data.sh with loot_table data",
-            root.display()
+            "vanilla tags from {} resolved {} furnace fuels instead of the canonical 26.1.2 default set; reimport the content cache",
+            vanilla_data_dir.display(),
+            tags.fuel_values().fuel_count(),
         );
     }
+    Ok(tags)
+}
 
-    Ok(mc_data::loot::builtin().clone())
+pub fn load_effective_loot(vanilla_data_dir: &Path) -> Result<mc_data::loot::LootTables> {
+    let root = vanilla_data_dir
+        .join("data")
+        .join("minecraft")
+        .join("loot_table");
+    let mut tables = mc_data::loot::load_vanilla_subset(&root)
+        .with_context(|| format!("loading vanilla loot tables from {}", root.display()))?;
+    if tables.total_drops() > 0 {
+        tables.fill_missing_from(mc_data::loot::builtin());
+        tables.fill_missing_entity_items_from(mc_data::loot::builtin());
+        return Ok(tables);
+    }
+    bail!(
+        "vanilla loot tables from {} had no supported simple drops; import a complete content cache with `mc-server content import`",
+        root.display()
+    );
 }
 
 pub(crate) fn validate_recipe_result_stacks(
@@ -259,67 +224,51 @@ pub(crate) fn validate_recipe_result_stacks(
     Ok(())
 }
 
-pub fn load_effective_recipes(
-    vanilla_data_dir: Option<&Path>,
-) -> Result<Vec<mc_data::recipes::Recipe>> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let root = vanilla_data_dir
-            .join("data")
-            .join("minecraft")
-            .join("recipe");
-        let sidecar_recipes = mc_data::recipes::load_recipes(&root)
-            .with_context(|| format!("loading vanilla recipes from {}", root.display()))?;
-        if !sidecar_recipes.is_empty() {
-            let mut sidecar_by_id: BTreeMap<_, _> = sidecar_recipes
-                .into_iter()
-                .map(|recipe| (recipe.id.clone(), recipe))
-                .collect();
-            let embedded = mc_data::recipes::solaris_required_recipes();
-            let mut recipes = Vec::with_capacity(embedded.len() + sidecar_by_id.len());
-            for fallback in embedded {
-                let recipe = sidecar_by_id.remove(&fallback.id).unwrap_or(fallback);
-                recipes.push(recipe);
-            }
-            recipes.extend(sidecar_by_id.into_values());
-            return Ok(recipes);
-        }
+pub fn load_effective_recipes(vanilla_data_dir: &Path) -> Result<Vec<mc_data::recipes::Recipe>> {
+    let root = vanilla_data_dir
+        .join("data")
+        .join("minecraft")
+        .join("recipe");
+    let recipes_from_cache = mc_data::recipes::load_recipes(&root)
+        .with_context(|| format!("loading vanilla recipes from {}", root.display()))?;
+    if recipes_from_cache.is_empty() {
         bail!(
-            "vanilla recipes from {} had no supported recipes; run tools/extract-vanilla-data.sh with recipe data",
+            "vanilla recipes from {} had no supported recipes; import a complete content cache with `mc-server content import`",
             root.display()
         );
     }
-
-    Ok(mc_data::recipes::solaris_required_recipes())
+    let mut cache_by_id: BTreeMap<_, _> = recipes_from_cache
+        .into_iter()
+        .map(|recipe| (recipe.id.clone(), recipe))
+        .collect();
+    let embedded = mc_data::recipes::solaris_required_recipes();
+    let mut recipes = Vec::with_capacity(embedded.len() + cache_by_id.len());
+    for fallback in embedded {
+        let recipe = cache_by_id.remove(&fallback.id).unwrap_or(fallback);
+        recipes.push(recipe);
+    }
+    recipes.extend(cache_by_id.into_values());
+    Ok(recipes)
 }
 
 pub fn load_effective_block_explosion(
-    vanilla_data_dir: Option<&Path>,
-) -> Result<Option<mc_data::block_explosion::BlockExplosionTable>> {
-    let Some(vanilla_data_dir) = vanilla_data_dir else {
-        return Ok(None);
-    };
-
+    vanilla_data_dir: &Path,
+) -> Result<mc_data::block_explosion::BlockExplosionTable> {
     let path = vanilla_data_dir
         .join("reports")
         .join("block_explosion.json");
-    let table =
-        mc_data::block_explosion::load_block_explosion_report(&path).with_context(|| {
-            format!(
-                "loading vanilla block-explosion table from {}",
-                path.display()
-            )
-        })?;
-    Ok(Some(table))
+    mc_data::block_explosion::load_block_explosion_report(&path).with_context(|| {
+        format!(
+            "loading vanilla block-explosion table from {}",
+            path.display()
+        )
+    })
 }
 
 pub fn load_effective_block_mining(
-    vanilla_data_dir: Option<&Path>,
+    vanilla_data_dir: &Path,
     blocks_report: &[mc_data::blocks::BlockReport],
-) -> Result<Option<mc_data::block_mining::BlockMiningTable>> {
-    let Some(vanilla_data_dir) = vanilla_data_dir else {
-        return Ok(None);
-    };
-
+) -> Result<mc_data::block_mining::BlockMiningTable> {
     let path = vanilla_data_dir.join("reports").join("block_mining.json");
     let table = mc_data::block_mining::load(&path)
         .with_context(|| format!("loading vanilla block-mining table from {}", path.display()))?;
@@ -343,71 +292,62 @@ pub fn load_effective_block_mining(
             mc_protocol::TARGET_RELEASE
         );
     }
-
-    Ok(Some(table))
+    Ok(table)
 }
 
 pub fn load_effective_item_facts(
-    vanilla_data_dir: Option<&Path>,
+    vanilla_data_dir: &Path,
 ) -> Result<mc_data::item_components::ItemFactsTable> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let path = vanilla_data_dir
-            .join("reports")
-            .join("minecraft")
-            .join("components")
-            .join("item");
-        let table = mc_data::item_components::load_item_facts(&path).with_context(|| {
-            format!(
-                "loading vanilla item component facts from {}",
-                path.display()
-            )
-        })?;
-        if table.is_empty() {
-            bail!(
-                "vanilla item component facts from {} were empty; rerun tools/extract-vanilla-data.sh",
-                path.display()
-            );
-        }
-        return Ok(table);
+    let path = vanilla_data_dir
+        .join("reports")
+        .join("minecraft")
+        .join("components")
+        .join("item");
+    let table = mc_data::item_components::load_item_facts(&path).with_context(|| {
+        format!(
+            "loading vanilla item component facts from {}",
+            path.display()
+        )
+    })?;
+    if table.is_empty() {
+        bail!(
+            "vanilla item component facts from {} were empty; reimport the content cache",
+            path.display()
+        );
     }
-
-    Ok(mc_data::item_components::solaris_required_item_facts())
+    Ok(table)
 }
 
 pub fn load_effective_block_light(
-    vanilla_data_dir: Option<&Path>,
+    vanilla_data_dir: &Path,
     blocks_report: &[mc_data::blocks::BlockReport],
 ) -> Result<mc_data::block_light::BlockLightTable> {
-    if let Some(vanilla_data_dir) = vanilla_data_dir {
-        let path = vanilla_data_dir.join("reports").join("block_light.json");
-        let table = mc_data::block_light::load(&path).with_context(|| {
-            format!("loading vanilla block-light table from {}", path.display())
-        })?;
-        if let Some(max_state_id) = blocks_report
-            .iter()
-            .flat_map(|block| block.states.iter().map(|state| state.id as usize))
-            .max()
-            && table.len() <= max_state_id
-        {
-            bail!(
-                "vanilla block-light table from {} has {} states but blocks report requires state id {max_state_id}",
-                path.display(),
-                table.len()
-            );
-        }
-        if table.version != mc_protocol::TARGET_RELEASE {
-            bail!(
-                "vanilla block-light table from {} targets {} but Solaris targets {}",
-                path.display(),
-                table.version,
-                mc_protocol::TARGET_RELEASE
-            );
-        }
-        return Ok(table);
+    let path = vanilla_data_dir.join("reports").join("block_light.json");
+    let table = mc_data::block_light::load(&path)
+        .with_context(|| format!("loading vanilla block-light table from {}", path.display()))?;
+    if let Some(max_state_id) = blocks_report
+        .iter()
+        .flat_map(|block| block.states.iter().map(|state| state.id as usize))
+        .max()
+        && table.len() <= max_state_id
+    {
+        bail!(
+            "vanilla block-light table from {} has {} states but blocks report requires state id {max_state_id}",
+            path.display(),
+            table.len()
+        );
     }
-
-    Ok(mc_data::block_light::BlockLightTable::conservative_from_blocks_report(blocks_report))
+    if table.version != mc_protocol::TARGET_RELEASE {
+        bail!(
+            "vanilla block-light table from {} targets {} but Solaris targets {}",
+            path.display(),
+            table.version,
+            mc_protocol::TARGET_RELEASE
+        );
+    }
+    Ok(table)
 }
+
 #[derive(serde::Deserialize)]
 struct VanillaVersionMetadata {
     id: String,

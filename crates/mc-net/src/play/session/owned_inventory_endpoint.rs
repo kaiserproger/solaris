@@ -17,9 +17,10 @@ use crate::play::inventory::PlayerInventory;
 use crate::play::owned_inventory::{
     OwnedInventoryCommit, OwnedInventoryPrepare, ResidentEndpointState, ResidentGearUpdate,
     endpoint_window, gear_slots_to_items, inventory_resource_stock, items_to_gear_slots,
-    owned_inventory_snapshot, plan_owned_item_transfers, resource_plan_hash, resource_plan_totals,
-    transfer_endpoints,
+    owned_inventory_snapshot, plan_owned_item_transfers, reservation_stock_survives,
+    resource_plan_hash, resource_plan_totals, transfer_endpoints,
 };
+use crate::play::persistence::PlayerPersistedState;
 use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::play::script_inventory_transaction::{
     ScriptStorageCommitError, ScriptStoragePrepareOutcome,
@@ -121,12 +122,10 @@ impl SessionRegistry {
                         ScriptOperationOutcome::rejected(ScriptOperationFailure::Forbidden),
                     ));
                 }
-                ScriptInventoryEndpoint::Warehouse { .. } => {
-                    return Ok(OwnedInventoryCommit::Rejected(
-                        ScriptOperationOutcome::rejected(ScriptOperationFailure::Unloaded),
-                    ));
-                }
-                // A resident endpoint is resolved against the owner's resident
+                // A warehouse endpoint is a server-owned container composite,
+                // which needs the world half the caller owns; it is routed
+                // before this player/resident planner is reached. A resident
+                // endpoint is resolved against the owner's resident
                 // ledger below; a foreign, absent or released resident gets a
                 // typed refusal there.
                 _ => {}
@@ -586,21 +585,169 @@ fn committed(revision: u64, result: ScriptOwnedInventoryResult) -> ScriptOperati
     .expect("core-owned inventory outcome is canonical")
 }
 
-/// The reservation keeps its claim on the planned stock: a transfer may never
-/// drop an endpoint below the quantities other operations still hold.
-pub(super) fn reservation_stock_survives(
-    planned: &BTreeMap<ScriptInventoryEndpoint, Vec<ItemStack>>,
-    reserved: &BTreeMap<ScriptInventoryEndpoint, BTreeMap<String, u64>>,
-    items: &ItemRegistry,
-) -> bool {
-    reserved.iter().all(|(endpoint, quantities)| {
-        let Some(slots) = planned.get(endpoint) else {
-            return true;
-        };
-        let window = endpoint_window(endpoint, slots);
-        quantities.iter().all(|(resource_id, quantity)| {
-            inventory_resource_stock(window, items, resource_id)
-                .is_ok_and(|stock| stock >= *quantity)
+/// The actor's canonical state one server-owned warehouse deposit fences and
+/// after-images.
+pub(crate) struct WarehouseTransferActor {
+    pub(crate) inventory: Vec<ItemStack>,
+    pub(crate) carried_item: ItemStack,
+    pub(crate) revision: u64,
+    pub(crate) recovery_required: bool,
+}
+
+impl SessionRegistry {
+    /// The actor's canonical inventory, carried item, durable revision and
+    /// identity, or `None` when no live session owns it.
+    ///
+    /// A warehouse deposit acts for a real player, so a gone or closed session
+    /// is a refusal before any plan is made, exactly like the player-only
+    /// transfer.
+    pub(crate) fn warehouse_transfer_actor(&self, actor_id: u64) -> Option<WarehouseTransferActor> {
+        let (uuid, state) = self.warehouse_transfer_actor_state(actor_id)?;
+        let wait_started = std::time::Instant::now();
+        let guard = crate::lock_policy::lock_authoritative_mutex(&state, "play.player_persistence");
+        let state = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::PlayerPersistence,
+            "read warehouse transfer actor",
+            wait_started,
+            guard,
+        );
+        let _ = uuid;
+        Some(WarehouseTransferActor {
+            inventory: state.inventory.slots.to_vec(),
+            carried_item: state.carried_item.clone(),
+            revision: state.inventory_operation_revision,
+            recovery_required: state.inventory_recovery_required,
         })
-    })
+    }
+
+    /// The actor's durable inventory after-image for one planned inventory.
+    ///
+    /// The caller has planned the move against the state it observed; this
+    /// captures the same after-image the composite commits, so the plugin
+    /// receipt and the player's own file are replayed together.
+    pub(crate) fn warehouse_transfer_recovery(
+        &self,
+        actor_id: u64,
+        planned: &[ItemStack],
+        items: &ItemRegistry,
+    ) -> Result<PlayerInventoryRecovery, ScriptOperationFailure> {
+        let Some((uuid, state)) = self.warehouse_transfer_actor_state(actor_id) else {
+            return Err(ScriptOperationFailure::NotFound);
+        };
+        let Ok(slots) = <[ItemStack; 46]>::try_from(planned.to_vec()) else {
+            return Err(ScriptOperationFailure::InvalidRequest);
+        };
+        let planned = PlayerInventory { slots };
+        let wait_started = std::time::Instant::now();
+        let guard = crate::lock_policy::lock_authoritative_mutex(&state, "play.player_persistence");
+        let state = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::PlayerPersistence,
+            "capture warehouse transfer recovery",
+            wait_started,
+            guard,
+        );
+        PlayerInventoryRecovery::capture(uuid, &state, &planned, items)
+            .map_err(|_| ScriptOperationFailure::InvalidRequest)
+    }
+
+    /// Publish the actor's authoritative inventory after a committed
+    /// server-owned warehouse deposit, keyed by the world-journal decision the
+    /// composite appended.
+    ///
+    /// The owner turn already replaced the inventory; this is the live
+    /// projection that follows the durable decision, and the revision a later
+    /// endpoint fence round-trips.
+    pub(crate) fn publish_warehouse_transfer(&self, actor_id: u64, decision_id: u64) {
+        let (state, recipient) = {
+            let inner = self.lock_inner("publish warehouse transfer");
+            let Some(state) = inner.player_persistence.get(&actor_id).cloned() else {
+                return;
+            };
+            let recipient = inner
+                .sessions
+                .get(&actor_id)
+                .map(|session| ordered_session_recipient(actor_id, session));
+            (state, recipient)
+        };
+        let wait_started = std::time::Instant::now();
+        let guard = crate::lock_policy::lock_authoritative_mutex(&state, "play.player_persistence");
+        let mut state = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::PlayerPersistence,
+            "publish warehouse transfer",
+            wait_started,
+            guard,
+        );
+        state.inventory_operation_revision = decision_id;
+        let inventory = Box::new(state.inventory.clone());
+        let carried_item = state.carried_item.clone();
+        drop(state);
+        let Some(recipient) = recipient else {
+            return;
+        };
+        dispatch_visibility_command(
+            &recipient,
+            OutboundCommand::AuthoritativeInventory {
+                inventory,
+                carried_item,
+            },
+        );
+    }
+
+    /// The actor's durable state handle and identity, behind the same liveness
+    /// check every owned-inventory path takes before fencing a player.
+    fn warehouse_transfer_actor_state(
+        &self,
+        actor_id: u64,
+    ) -> Option<(uuid::Uuid, Arc<std::sync::Mutex<PlayerPersistedState>>)> {
+        let inner = self.lock_inner("read warehouse transfer actor state");
+        let session = inner.sessions.get(&actor_id)?;
+        if session.tx.is_closed() {
+            return None;
+        }
+        let state = inner.player_persistence.get(&actor_id).cloned()?;
+        Some((session.uuid, state))
+    }
+}
+
+#[cfg(test)]
+impl SessionRegistry {
+    /// Register one connected player holding `inventory` in its canonical
+    /// slots, with a fresh durable state.
+    ///
+    /// A server-owned warehouse deposit acts for a real session, and the C1
+    /// boundary tests outside this module need one. Returns the session id as a
+    /// raw `u64`, which is what the crate-level boundary types carry; the
+    /// session's outbound channel is drained by a task so it stays open — a
+    /// closed channel is a session no owned-inventory path will fence — while
+    /// those tests assert durable state and the world rather than the wire.
+    pub(crate) fn register_owned_inventory_test_session(
+        &self,
+        name: &str,
+        inventory: &[ItemStack],
+    ) -> u64 {
+        let profile = crate::login::LoggedInProfile {
+            uuid: crate::login::offline_uuid(name),
+            name: name.to_owned(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (id, _) = self.register(
+            &profile,
+            (0, 0),
+            2,
+            std::collections::HashSet::new(),
+            tx,
+            crate::play::PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        let mut state =
+            PlayerPersistedState::new_default(crate::play::PlayerPose::new(0.5, 64.0, 0.5));
+        if let Ok(slots) = <[ItemStack; 46]>::try_from(inventory.to_vec()) {
+            state.inventory = PlayerInventory { slots };
+        }
+        self.register_player_persistence(id, Arc::new(std::sync::Mutex::new(state)));
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while rx.recv().await.is_some() {}
+        });
+        id
+    }
 }

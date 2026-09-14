@@ -135,3 +135,42 @@ fn decoder_rejects_complete_payloads_above_image_and_inventory_limits() {
     payload.resize(payload.len() + oversized, 0);
     assert!(decode_decision_payload(&payload, true).is_err());
 }
+
+/// A run of reserved decisions may mix plain chunk decisions with one that also
+/// carries an encoded plugin batch; the batch stays attached to its own
+/// decision, blocks the checkpoint cutoff until it is projected, and does not
+/// leak into its neighbours.
+#[test]
+fn one_append_carries_a_batch_beside_decisions_without_one() {
+    let root = tempfile::tempdir().unwrap();
+    let (blocks, items) = registries();
+    let (journal, pending) =
+        WorldChunkJournal::open_for_test(root.path(), blocks.clone(), items.clone()).unwrap();
+    assert!(pending.is_empty());
+    let batch = inventory_batch(&items);
+    let payload = batch.encode_world_inventory().unwrap();
+    assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
+
+    journal
+        .record_reserved_decisions(
+            7,
+            vec![(1, Vec::new(), None), (2, Vec::new(), Some(payload))],
+        )
+        .unwrap();
+    assert_ne!(journal.watermark(), Some(2));
+    drop(journal);
+
+    let (journal, pending) =
+        WorldChunkJournal::open_for_test(root.path(), blocks.clone(), items.clone()).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].id(), 1);
+    assert_eq!(pending[1].id(), 2);
+    assert_eq!(pending[0].inventory_batch().unwrap(), None);
+    assert_eq!(pending[1].inventory_batch().unwrap(), Some(batch));
+    journal.mark_inventory_projected(2).unwrap();
+    journal.checkpoint_through(2).unwrap();
+    drop(journal);
+
+    let (_, pending) = WorldChunkJournal::open_for_test(root.path(), blocks, items).unwrap();
+    assert!(pending.is_empty());
+}

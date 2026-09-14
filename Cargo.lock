@@ -2046,9 +2046,11 @@ dependencies = [
  "mc-worldgen",
  "predicates",
  "ratatui",
+ "reqwest",
  "rsa",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "stats_alloc",
  "tempfile",
@@ -2057,6 +2059,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -2078,6 +2081,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "toml",
  "tracing-subscriber",

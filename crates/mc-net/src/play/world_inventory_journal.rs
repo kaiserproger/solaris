@@ -2,7 +2,7 @@ use mc_world::ChunkSnapshot;
 
 use crate::script::storage::PreparedStorageBatch;
 
-use super::{WorldChunkDecision, WorldChunkJournal, WorldChunkJournalError, append_decisions};
+use super::{WorldChunkDecision, WorldChunkJournal, WorldChunkJournalError};
 
 pub(super) const INVENTORY_FRAME_MAGIC: &[u8; 4] = b"WIF1";
 
@@ -55,47 +55,7 @@ impl WorldChunkJournal {
         let payload = batch
             .encode_world_inventory()
             .map_err(WorldChunkJournalError::InventoryEncoding)?;
-        for snapshot in &snapshots {
-            let actual = snapshot.world_journal_lsn();
-            if actual != id {
-                return Err(WorldChunkJournalError::SnapshotLsnMismatch {
-                    decision_id: id,
-                    position: snapshot.pos,
-                    actual,
-                });
-            }
-        }
-        let decision = WorldChunkDecision {
-            id,
-            current_tick,
-            images: self.encode_images(current_tick, snapshots)?,
-            inventory: Some(InventoryDecision {
-                payload,
-                projected: false,
-            }),
-        };
-        let mut state = self.shared.lock_state();
-        if state.poisoned {
-            return Err(WorldChunkJournalError::PoisonedOutcomeUnknown);
-        }
-        if id != state.next_append_id || id > state.next_id {
-            return Err(WorldChunkJournalError::InvalidReservation);
-        }
-        if let Err(error) = append_decisions(&mut state, vec![decision]) {
-            drop(state);
-            self.shared.append_advanced.notify_waiters();
-            return Err(error);
-        }
-        state.next_append_id = id
-            .checked_add(1)
-            .ok_or(WorldChunkJournalError::RecordIdExhausted)?;
-        drop(state);
-        self.shared.append_advanced.notify_waiters();
-        self.writer.flush().map_err(
-            |source| WorldChunkJournalError::InventorySyncOutcomeUnknown {
-                source: Box::new(source),
-            },
-        )
+        self.record_reserved_decisions(current_tick, vec![(id, snapshots, Some(payload))])
     }
 
     /// Call only after durable player/storage projection and participant publication.

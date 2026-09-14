@@ -6,15 +6,16 @@ use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_script::{
     MAX_RESIDENT_CARRY_SLOTS, MAX_RESIDENT_EQUIPMENT_SLOTS, ScriptInventoryEndpoint,
-    ScriptInventoryStorageTransaction, ScriptOperation, ScriptOperationFailure,
-    ScriptOperationOutcome, ScriptOperationPayload, ScriptOperationRequest,
-    ScriptOwnedInventoryOperation, ScriptStorageMutation,
+    ScriptInventoryExpectedRevision, ScriptInventoryStorageTransaction, ScriptOperation,
+    ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload, ScriptOperationRequest,
+    ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult, ScriptOwnedItemTransfer,
+    ScriptStorageMutation,
 };
 
 use crate::play::SessionRegistry;
 use crate::play::owned_inventory::{
     OwnedInventoryCommit, OwnedInventoryPrepare, ResidentEndpointState, ResidentGearStack,
-    ResidentGearUpdate, owned_inventory_fingerprint,
+    ResidentGearUpdate, WarehouseTransferRequest, owned_inventory_fingerprint,
 };
 use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::play::world_journal::{WorldChunkJournal, WorldChunkJournalError};
@@ -454,10 +455,8 @@ impl WorldInventoryCommit<'_> {
         &mut self,
         mut batch: PreparedStorageBatch,
     ) -> Result<u64, ScriptStorageCommitError<PluginStorageMutationError>> {
-        let player = batch.inventory.take();
-        let payload = encode_storage_batch(&batch);
-        batch.inventory = player;
-        let projection = frame(&payload.map_err(ScriptStorageCommitError::NotCommitted)?);
+        let projection =
+            inventory_ledger_frame(&mut batch).map_err(ScriptStorageCommitError::NotCommitted)?;
         self.storage
             .compact_before_append_if_needed(projection.len())
             .map_err(ScriptStorageCommitError::NotCommitted)?;
@@ -493,21 +492,53 @@ impl WorldInventoryCommit<'_> {
 
     fn project(
         &mut self,
-        mut batch: PreparedStorageBatch,
+        batch: PreparedStorageBatch,
         frame: &[u8],
     ) -> Result<(), PluginStorageMutationError> {
-        let player = batch.inventory.take();
-        self.storage.append_frame(frame, false)?;
-        self.storage
-            .install_storage_batch(batch)
-            .expect("prepared inventory projection matches the actor-owned ledger");
-        if let Some(player) = player {
-            player
-                .recover(self.root, self.id)
-                .map_err(std::io::Error::other)?;
-        }
-        Ok(())
+        let (storage, root, decision_id) = (&mut *self.storage, self.root, self.id);
+        append_inventory_projection(storage, root, decision_id, batch, frame)
     }
+}
+
+/// The plugin ledger frame of one decided inventory batch.
+///
+/// The batch's mutations and its operation receipt are the ledger's half; the
+/// player after-image belongs to the world journal, which recovers it with the
+/// same decision, so it never enters this frame.
+fn inventory_ledger_frame(
+    batch: &mut PreparedStorageBatch,
+) -> Result<Vec<u8>, PluginStorageMutationError> {
+    let player = batch.inventory.take();
+    let payload = encode_storage_batch(batch);
+    batch.inventory = player;
+    Ok(frame(&payload?))
+}
+
+/// Project one decided inventory batch into the plugin ledger and the player's
+/// own file.
+///
+/// The caller has already compacted the ledger for `frame` and the decision
+/// that carries both participants is already durable; this is the durable
+/// projection that must precede the acknowledgement, and a failure here leaves
+/// the decision unprojected for the next startup to replay.
+fn append_inventory_projection(
+    storage: &mut PluginStorage,
+    root: &Path,
+    decision_id: u64,
+    mut batch: PreparedStorageBatch,
+    frame: &[u8],
+) -> Result<(), PluginStorageMutationError> {
+    let player = batch.inventory.take();
+    storage.append_frame(frame, false)?;
+    storage
+        .install_storage_batch(batch)
+        .expect("prepared inventory projection matches the actor-owned ledger");
+    if let Some(player) = player {
+        player
+            .recover(root, decision_id)
+            .map_err(std::io::Error::other)?;
+    }
+    Ok(())
 }
 
 impl InventoryRuntime {
@@ -614,6 +645,25 @@ impl InventoryRuntime {
                     return Ok(outcome);
                 }
                 let endpoints = crate::play::owned_inventory::transfer_endpoints(transfers);
+                if endpoints
+                    .iter()
+                    .any(|endpoint| matches!(endpoint, ScriptInventoryEndpoint::Warehouse { .. }))
+                {
+                    // A warehouse endpoint is a server-owned container
+                    // composite: the container's real slots and the actor's
+                    // canonical inventory move under ONE journal decision, so
+                    // the player/resident planner below never sees it.
+                    return self
+                        .commit_warehouse_transfer(
+                            storage,
+                            plugin_id,
+                            request,
+                            *actor_id,
+                            transfers,
+                            expected_revisions,
+                        )
+                        .await;
+                }
                 let reserved: BTreeMap<ScriptInventoryEndpoint, BTreeMap<String, u64>> = endpoints
                     .iter()
                     .map(|endpoint| (endpoint.clone(), storage.reserved_quantities(endpoint)))
@@ -684,6 +734,268 @@ impl InventoryRuntime {
                 ScriptOperationFailure::InvalidRequest,
             )),
         }
+    }
+
+    /// Execute one `transfer_owned_items` that names a bound warehouse
+    /// container.
+    ///
+    /// The container's real slots and the actor's canonical inventory move
+    /// through one server-owned composite, and the plugin operation receipt
+    /// rides that composite's own world-journal decision: the container's
+    /// after-image and the receipt are durable together or not at all. The
+    /// caller prepares, the composite commits, and only then does this project
+    /// the ledger, the player's after-image and the acknowledgement.
+    async fn commit_warehouse_transfer(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+        actor_id: u64,
+        transfers: &[ScriptOwnedItemTransfer],
+        expected_revisions: &[ScriptInventoryExpectedRevision],
+    ) -> Result<ScriptOperationOutcome, PluginStorageMutationError> {
+        let Some(operation_id) = request.operation_id() else {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::InvalidRequest,
+            ));
+        };
+        let Some(world) = self.settlement_world() else {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::RuntimeUnavailable,
+            ));
+        };
+        // Acquire save admission before the ledger batch is prepared, exactly
+        // like every other owned-inventory decision: the batch's transaction id
+        // is the ledger revision this projection installs.
+        let _save_guard = self.save_coordinator.lock().await;
+        // One authored container, and only the actor's own inventory beside it:
+        // the composite has exactly one container participant.
+        let mut handle = None;
+        for endpoint in crate::play::owned_inventory::transfer_endpoints(transfers) {
+            match endpoint {
+                ScriptInventoryEndpoint::Warehouse { handle: named } => {
+                    if handle.is_some() {
+                        return Ok(ScriptOperationOutcome::rejected(
+                            ScriptOperationFailure::InvalidRequest,
+                        ));
+                    }
+                    handle = Some(named);
+                }
+                ScriptInventoryEndpoint::PlayerInventory { player_id } if player_id == actor_id => {
+                }
+                ScriptInventoryEndpoint::PlayerInventory { .. } => {
+                    return Ok(ScriptOperationOutcome::rejected(
+                        ScriptOperationFailure::Forbidden,
+                    ));
+                }
+                _ => {
+                    return Ok(ScriptOperationOutcome::rejected(
+                        ScriptOperationFailure::InvalidRequest,
+                    ));
+                }
+            }
+        }
+        let Some(handle) = handle else {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::InvalidRequest,
+            ));
+        };
+        let container = match self.resolve_warehouse_container(storage, plugin_id, &handle) {
+            Ok(container) => container,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let warehouse_endpoint = ScriptInventoryEndpoint::Warehouse {
+            handle: handle.clone(),
+        };
+        let player_endpoint = ScriptInventoryEndpoint::PlayerInventory {
+            player_id: actor_id,
+        };
+        // Both participants are fenced by the revisions the plugin holds: the
+        // container by its durable binding revision, the actor by the journal
+        // watermark its own inventory round-trips.
+        let container_fence = match crate::play::owned_inventory::owned_inventory_snapshot(
+            warehouse_endpoint.clone(),
+            container.revision,
+            &container.items,
+            &self.items,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let Some(container_expected) = expected_revisions
+            .iter()
+            .find(|expected| expected.endpoint == warehouse_endpoint)
+        else {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::InvalidRequest,
+            ));
+        };
+        if container_expected.fence != container_fence.fence {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::StaleRevision,
+            ));
+        }
+        let Some(actor) = self.sessions.warehouse_transfer_actor(actor_id) else {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::NotFound,
+            ));
+        };
+        if actor.recovery_required {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::Busy,
+            ));
+        }
+        let actor_fence = match crate::play::owned_inventory::owned_inventory_snapshot(
+            player_endpoint.clone(),
+            actor.revision,
+            &actor.inventory,
+            &self.items,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let Some(actor_expected) = expected_revisions
+            .iter()
+            .find(|expected| expected.endpoint == player_endpoint)
+        else {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::InvalidRequest,
+            ));
+        };
+        if actor_expected.fence != actor_fence.fence {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::StaleRevision,
+            ));
+        }
+        let inventories = BTreeMap::from([
+            (warehouse_endpoint.clone(), container.items.clone()),
+            (player_endpoint.clone(), actor.inventory.clone()),
+        ]);
+        let planned = match crate::play::owned_inventory::plan_owned_item_transfers(
+            transfers,
+            &inventories,
+            &self.items,
+            &self.item_facts,
+        ) {
+            Ok(planned) => planned,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let reserved: BTreeMap<ScriptInventoryEndpoint, BTreeMap<String, u64>> = inventories
+            .keys()
+            .map(|endpoint| (endpoint.clone(), storage.reserved_quantities(endpoint)))
+            .collect();
+        if !crate::play::owned_inventory::reservation_stock_survives(
+            &planned,
+            &reserved,
+            &self.items,
+        ) {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::InsufficientItems,
+            ));
+        }
+        let planned_container = planned
+            .get(&warehouse_endpoint)
+            .expect("planned warehouse inventory")
+            .clone();
+        let planned_player = planned
+            .get(&player_endpoint)
+            .expect("planned player inventory")
+            .clone();
+        // The receipt names the container's resulting fence. The actor's own
+        // resulting fence is deliberately not part of it: a player endpoint's
+        // revision IS the world-journal decision id, which the composite
+        // allocates while this receipt is already encoded, so the plugin reads
+        // the actor's fence back from a query instead of a receipt that could
+        // not state it.
+        let warehouse_snapshot = match crate::play::owned_inventory::owned_inventory_snapshot(
+            warehouse_endpoint.clone(),
+            container.revision,
+            &planned_container,
+            &self.items,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let payload = ScriptOperationPayload::OwnedInventory {
+            result: Box::new(ScriptOwnedInventoryResult::Transfer {
+                inventories: vec![ScriptInventoryExpectedRevision::new(
+                    warehouse_endpoint.clone(),
+                    warehouse_snapshot.fence,
+                )],
+            }),
+        };
+        let recovery =
+            match self
+                .sessions
+                .warehouse_transfer_recovery(actor_id, &planned_player, &self.items)
+            {
+                Ok(recovery) => recovery,
+                Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+            };
+        let prepared =
+            match storage.prepare_owned_batch(plugin_id, request, payload, Some(recovery)) {
+                Ok(ScriptStoragePrepareOutcome::Prepared(prepared)) => prepared,
+                Ok(ScriptStoragePrepareOutcome::Rejected) => {
+                    return Ok(ScriptOperationOutcome::rejected(
+                        ScriptOperationFailure::Busy,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+        let encoded = prepared.encode_world_inventory()?;
+        let position = mc_world::BlockPos {
+            x: container.position[0],
+            y: container.position[1],
+            z: container.position[2],
+        };
+        let decision_id = match world
+            .commit_warehouse_transfer(WarehouseTransferRequest {
+                actor_id,
+                position,
+                expected_state_id: self.sessions.chest_state_id(position),
+                expected_container: container.items.clone(),
+                updated_container: planned_container,
+                expected_inventory: actor.inventory,
+                expected_carried_item: actor.carried_item.clone(),
+                updated_inventory: planned_player,
+                updated_carried_item: actor.carried_item,
+                receipt: encoded,
+            })
+            .await
+        {
+            Ok(decision_id) => decision_id,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        // Only now is the composite reachable: every refusal above is the
+        // plugin's own, and none of them needs a world journal.
+        let Some((root, journal)) = &self.world else {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::RuntimeUnavailable,
+            ));
+        };
+        let mut batch = prepared;
+        let projection = inventory_ledger_frame(&mut batch)?;
+        storage.compact_before_append_if_needed(projection.len())?;
+        if let Err(error) =
+            append_inventory_projection(storage, root, decision_id, batch, &projection)
+        {
+            return Err(match error {
+                error @ PluginStorageMutationError::DurabilityUnknown(_) => error,
+                error => {
+                    PluginStorageMutationError::DurabilityUnknown(std::io::Error::other(error))
+                }
+            });
+        }
+        self.sessions
+            .publish_warehouse_transfer(actor_id, decision_id);
+        journal
+            .mark_inventory_projected(decision_id)
+            .expect("unacknowledged inventory decision remains retained");
+        Ok(storage
+            .operation_receipt(plugin_id, operation_id)
+            .expect("committed owned inventory receipt remains installed")
+            .outcome
+            .clone())
     }
 
     /// Canonical snapshot of one resident endpoint, or the typed failure that

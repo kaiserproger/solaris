@@ -15,21 +15,23 @@ use mc_data::blocks::{BlockReport, BlockStateReport};
 use mc_data::item_components::solaris_required_item_facts;
 use mc_data::items::solaris_required_items;
 use mc_script::{
-    ScriptChunkAvailability, ScriptInventoryEndpoint, ScriptInventoryMaterial,
-    ScriptInventoryReservationQuantity, ScriptInventoryReservationSnapshot,
-    ScriptInventoryResourcePlan, ScriptInventoryWorkPortion, ScriptOperation,
-    ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload, ScriptOperationRequest,
-    ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult, ScriptResidentSiteReservation,
-    ScriptSettlementBuilding, ScriptSettlementOperation, ScriptSettlementResult,
-    ScriptSettlementSite, ScriptSitePoiKind, ScriptSitePoiState, ScriptStructureReceipt,
-    ScriptStructureSnapshot, ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose,
-    ScriptWarehouseBinding, resident_generation_id,
+    ScriptChunkAvailability, ScriptInventoryEndpoint, ScriptInventoryExpectedRevision,
+    ScriptInventoryFence, ScriptInventoryMaterial, ScriptInventoryReservationQuantity,
+    ScriptInventoryReservationSnapshot, ScriptInventoryResourcePlan, ScriptInventoryWorkPortion,
+    ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload,
+    ScriptOperationRequest, ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult,
+    ScriptOwnedItemTransfer, ScriptResidentSiteReservation, ScriptSettlementBuilding,
+    ScriptSettlementOperation, ScriptSettlementResult, ScriptSettlementSite, ScriptSitePoiKind,
+    ScriptSitePoiState, ScriptStructureReceipt, ScriptStructureSnapshot, ScriptStructureState,
+    ScriptSurveyBounds, ScriptSurveyPurpose, ScriptWarehouseBinding, resident_generation_id,
 };
 use mc_world::BlockRegistry;
 use mc_worldgen::{BlueprintCatalog, SettlementSelector};
 
 use crate::play::SessionRegistry;
-use crate::play::owned_inventory::{resource_plan_hash, resource_plan_totals};
+use crate::play::owned_inventory::{
+    WarehouseTransferRequest, resource_plan_hash, resource_plan_totals,
+};
 use crate::server::ShutdownHandle;
 
 use super::PluginStorage;
@@ -37,6 +39,7 @@ use super::PreparedStorageBatch;
 use super::ScriptStoragePrepareOutcome;
 use super::settlement::{
     ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
+    journal_test_warehouse_transfer,
 };
 use super::world_inventory::InventoryRuntime;
 
@@ -65,6 +68,13 @@ struct FakeWorld {
     opaque_y: Mutex<Option<i32>>,
     applied: Mutex<BTreeMap<String, Vec<[i32; 3]>>>,
     containers: Mutex<BTreeMap<[i32; 3], Vec<ItemStack>>>,
+    /// The server-owned deposits this fake's world half accepted, so a test can
+    /// assert the plan the composite committed.
+    warehouse_requests: Mutex<Vec<WarehouseTransferRequest>>,
+    /// The runtime's own registry, so a warehouse deposit journals its decision
+    /// here exactly like the live owner turn; absent in fixtures that own no
+    /// journal, where a deposit answers `runtime_unavailable`.
+    warehouse: Option<Arc<SessionRegistry>>,
 }
 
 impl FakeWorld {
@@ -78,7 +88,16 @@ impl FakeWorld {
             opaque_y: Mutex::new(Some(i32::MIN)),
             applied: Mutex::new(BTreeMap::new()),
             containers: Mutex::new(BTreeMap::new()),
+            warehouse_requests: Mutex::new(Vec::new()),
+            warehouse: None,
         }
+    }
+
+    /// Let this fake stand in for the server-owned composite's world half: a
+    /// warehouse deposit journals its encoded receipt on the fixture's journal.
+    fn journal_warehouse_transfers(mut self, sessions: Arc<SessionRegistry>) -> Self {
+        self.warehouse = Some(sessions);
+        self
     }
 
     /// Set the highest opaque block every footprint reports; `None` means the
@@ -117,6 +136,16 @@ impl FakeWorld {
     /// of a binding that resolves there reads exactly these items.
     fn set_container(&self, position: [i32; 3], items: Vec<ItemStack>) {
         self.containers.lock().unwrap().insert(position, items);
+    }
+
+    /// The last server-owned deposit this world half accepted.
+    fn last_warehouse_request(&self) -> WarehouseTransferRequest {
+        self.warehouse_requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the world half accepted a deposit")
     }
 
     /// Remove the container at a position: loaded terrain that no longer holds
@@ -180,6 +209,24 @@ impl SettlementWorld for FakeWorld {
         Ok(match self.containers.lock().unwrap().get(&position) {
             Some(items) => ContainerReading::Loaded(items.clone()),
             None => ContainerReading::Missing,
+        })
+    }
+
+    fn commit_warehouse_transfer(
+        &self,
+        request: WarehouseTransferRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + '_>> {
+        Box::pin(async move {
+            let Some(sessions) = self.warehouse.as_ref() else {
+                return Err(ScriptOperationFailure::RuntimeUnavailable);
+            };
+            let decision_id = journal_test_warehouse_transfer(sessions, request.receipt.clone())?;
+            self.containers.lock().unwrap().insert(
+                [request.position.x, request.position.y, request.position.z],
+                request.updated_container.clone(),
+            );
+            self.warehouse_requests.lock().unwrap().push(request);
+            Ok(decision_id)
         })
     }
 
@@ -318,13 +365,40 @@ fn runtime_at(
     selector: bool,
     adapter: bool,
 ) -> InventoryRuntime {
-    let mut runtime = InventoryRuntime::new(
-        None,
-        &ShutdownHandle::default(),
+    runtime_at_with(
+        catalog,
+        world,
         Arc::new(SessionRegistry::new()),
-        Arc::new(solaris_required_items()),
-        Arc::new(solaris_required_item_facts()),
-    );
+        None,
+        selector,
+        adapter,
+    )
+}
+
+/// A runtime over an explicit registry, optionally owning a real journal: a
+/// fixture whose world half journals decisions needs both to be the same ones.
+fn runtime_at_with(
+    catalog: Arc<BlueprintCatalog>,
+    world: Arc<FakeWorld>,
+    sessions: Arc<SessionRegistry>,
+    root: Option<&std::path::Path>,
+    selector: bool,
+    adapter: bool,
+) -> InventoryRuntime {
+    let items = Arc::new(solaris_required_items());
+    let item_facts = Arc::new(solaris_required_item_facts());
+    let mut runtime = match root {
+        Some(root) => {
+            InventoryRuntime::player_only_for_test(root, Arc::clone(&sessions), items, item_facts)
+        }
+        None => InventoryRuntime::new(
+            None,
+            &ShutdownHandle::default(),
+            Arc::clone(&sessions),
+            items,
+            item_facts,
+        ),
+    };
     if selector {
         runtime = runtime.with_settlement_runtime(Arc::new(SettlementRuntime::new(
             SettlementSelector::new(SEED, PROFILE_REVISION),
@@ -345,6 +419,8 @@ struct Fixture {
     runtime: InventoryRuntime,
     world: Arc<FakeWorld>,
     catalog: Arc<BlueprintCatalog>,
+    /// The runtime's registry when this fixture owns a journal.
+    sessions: Option<Arc<SessionRegistry>>,
 }
 
 impl Fixture {
@@ -371,7 +447,59 @@ impl Fixture {
             runtime,
             world,
             catalog,
+            sessions: None,
         }
+    }
+
+    /// A fixture whose runtime owns a world journal and whose world half
+    /// journals a warehouse deposit's own decision, so the owned-inventory
+    /// write path runs its whole protocol.
+    fn with_journal() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(catalog());
+        let sessions = Arc::new(SessionRegistry::new());
+        let world = Arc::new(FakeWorld::new().journal_warehouse_transfers(Arc::clone(&sessions)));
+        let runtime = runtime_at_with(
+            Arc::clone(&catalog),
+            Arc::clone(&world),
+            Arc::clone(&sessions),
+            Some(root.path()),
+            true,
+            true,
+        );
+        Self {
+            root,
+            runtime,
+            world,
+            catalog,
+            sessions: Some(sessions),
+        }
+    }
+
+    /// Register one connected actor holding `stacks` in its canonical slots.
+    /// The returned guard keeps the session's outbound channel open.
+    fn register_actor(&self, name: &str, stacks: &[(usize, u32, i32)]) -> u64 {
+        let sessions = self
+            .sessions
+            .as_ref()
+            .expect("a journal fixture registers sessions");
+        let mut inventory = vec![ItemStack::EMPTY; 46];
+        for (slot, item_id, count) in stacks {
+            inventory[*slot] = ItemStack::new(*item_id, *count);
+        }
+        sessions.register_owned_inventory_test_session(name, &inventory)
+    }
+
+    /// The actor's canonical inventory and durable revision, as the boundary
+    /// reports them.
+    fn actor_inventory(&self, actor_id: u64) -> (Vec<ItemStack>, u64) {
+        let actor = self
+            .sessions
+            .as_ref()
+            .expect("a journal fixture registers sessions")
+            .warehouse_transfer_actor(actor_id)
+            .expect("the registered actor is live");
+        (actor.inventory, actor.revision)
     }
 
     /// A second runtime over the same journal directory with a fresh world fake.
@@ -383,6 +511,19 @@ impl Fixture {
 
     fn storage(&self) -> PluginStorage {
         PluginStorage::open(self.root.path()).unwrap()
+    }
+
+    /// Execute one owned-inventory request through the C1 boundary.
+    async fn execute_inventory(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+    ) -> ScriptOperationOutcome {
+        self.runtime
+            .execute_owned_inventory(storage, plugin_id, request)
+            .await
+            .expect("an owned inventory request reaches the durable boundary")
     }
 
     fn selector(&self) -> SettlementSelector {
@@ -3108,4 +3249,444 @@ async fn warehouse_survives_structure_completion_and_binds_after_it() {
         )
         .await;
     assert_eq!(unplaced.failure(), Some(ScriptOperationFailure::NotFound));
+}
+
+/// One warehouse transfer request: the container's handle, the actor it acts
+/// for, and the slot-to-slot moves between them.
+fn warehouse_transfer_request(
+    operation_id: &str,
+    actor_id: u64,
+    transfers: Vec<ScriptOwnedItemTransfer>,
+    expected_revisions: Vec<ScriptInventoryExpectedRevision>,
+) -> ScriptOperationRequest {
+    let transfers_debug = transfers.clone();
+    let fences_debug = expected_revisions.clone();
+    ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Inventory {
+            operation: ScriptOwnedInventoryOperation::Transfer {
+                operation_id: operation_id.to_owned(),
+                actor_id,
+                transfers,
+                expected_revisions,
+            },
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "a warehouse transfer is a valid request: {error:?} transfers={transfers:?} fences={expected_revisions:?}",
+            transfers = transfers_debug,
+            expected_revisions = fences_debug,
+        )
+    })
+}
+
+/// The fence one endpoint reports for an observed state, exactly as the read
+/// path hands it to a plugin.
+fn owned_fence(
+    endpoint: &ScriptInventoryEndpoint,
+    revision: u64,
+    slots: &[ItemStack],
+) -> ScriptInventoryFence {
+    crate::play::owned_inventory::owned_inventory_snapshot(
+        endpoint.clone(),
+        revision,
+        slots,
+        &solaris_required_items(),
+    )
+    .expect("an observed endpoint is a canonical window")
+    .fence
+}
+
+/// The resulting fences of one transfer receipt.
+fn transfer_fences(outcome: &ScriptOperationOutcome) -> Vec<ScriptInventoryExpectedRevision> {
+    match outcome.payload() {
+        ScriptOperationPayload::OwnedInventory { result } => match &**result {
+            ScriptOwnedInventoryResult::Transfer { inventories } => inventories.clone(),
+            other => panic!("expected a transfer payload, got {other:?}"),
+        },
+        other => panic!("expected an owned inventory payload, got {other:?}"),
+    }
+}
+
+/// A warehouse write resolves through the same durable binding and loaded
+/// container the read path uses, and every refusal answers its own family
+/// without moving an item.
+#[tokio::test]
+async fn warehouse_transfer_refuses_foreign_unknown_unloaded_and_stale_containers() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let structure = prepared_warehouse(&fixture, &mut storage, "prepare-write").await;
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(BIRCH_LOG, 12);
+    let position = container_position(&fixture, 1);
+    fixture.world.set_container(position, chest.clone());
+    let bind = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-write", &structure.structure_id, 0),
+        )
+        .await;
+    let binding = warehouse_of(&bind);
+    let revision = bind
+        .revision()
+        .expect("a committed bind carries a revision");
+    let warehouse = ScriptInventoryEndpoint::Warehouse {
+        handle: binding.handle.clone(),
+    };
+    let player = ScriptInventoryEndpoint::PlayerInventory { player_id: PLAYER };
+    let fence = owned_fence(&warehouse, revision, &chest);
+    let deposit = vec![ScriptOwnedItemTransfer::new(
+        player.clone(),
+        9,
+        warehouse.clone(),
+        1,
+        4,
+    )];
+    let player_fence = ScriptInventoryExpectedRevision::new(player.clone(), fence.clone());
+
+    // A handle core never minted, and a handle another plugin owns. The
+    // request's fences must name the endpoints of its own transfers, so the
+    // unknown handle is the one the transfer addresses.
+    for (plugin, handle, failure) in [
+        (
+            OWNER,
+            "warehouse:settlement:nobody:0".to_owned(),
+            ScriptOperationFailure::NotFound,
+        ),
+        (
+            FOREIGN,
+            binding.handle.clone(),
+            ScriptOperationFailure::Forbidden,
+        ),
+    ] {
+        let named = ScriptInventoryEndpoint::Warehouse {
+            handle: handle.clone(),
+        };
+        let request = warehouse_transfer_request(
+            "write-unknown",
+            PLAYER,
+            vec![ScriptOwnedItemTransfer::new(
+                player.clone(),
+                9,
+                named.clone(),
+                1,
+                4,
+            )],
+            vec![
+                player_fence.clone(),
+                ScriptInventoryExpectedRevision::new(named, fence.clone()),
+            ],
+        );
+        let outcome = fixture
+            .execute_inventory(&mut storage, plugin, &request)
+            .await;
+        assert_eq!(outcome.failure(), Some(failure), "handle {handle}");
+        assert!(
+            storage.operation_receipt(plugin, "write-unknown").is_none(),
+            "a refused deposit records no receipt"
+        );
+    }
+
+    // A container fence the plugin no longer holds.
+    let moved = {
+        let mut moved = chest.clone();
+        moved[0] = ItemStack::new(BIRCH_LOG, 11);
+        moved
+    };
+    let stale = owned_fence(&warehouse, revision, &moved);
+    let request = warehouse_transfer_request(
+        "write-stale",
+        PLAYER,
+        deposit.clone(),
+        vec![
+            player_fence.clone(),
+            ScriptInventoryExpectedRevision::new(warehouse.clone(), stale),
+        ],
+    );
+    let outcome = fixture
+        .execute_inventory(&mut storage, OWNER, &request)
+        .await;
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+
+    // A resident endpoint is not a participant of this composite, even when
+    // every endpoint of the request is fenced as the DTO requires.
+    let resident = ScriptInventoryEndpoint::ResidentCarry {
+        handle: "resident-1".to_owned(),
+    };
+    let request = warehouse_transfer_request(
+        "write-resident",
+        PLAYER,
+        vec![ScriptOwnedItemTransfer::new(
+            resident.clone(),
+            0,
+            warehouse.clone(),
+            1,
+            1,
+        )],
+        vec![
+            ScriptInventoryExpectedRevision::new(
+                resident.clone(),
+                owned_fence(&resident, 0, &[ItemStack::EMPTY; 8]),
+            ),
+            ScriptInventoryExpectedRevision::new(warehouse.clone(), fence.clone()),
+        ],
+    );
+    let outcome = fixture
+        .execute_inventory(&mut storage, OWNER, &request)
+        .await;
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::InvalidRequest)
+    );
+
+    // Loaded terrain whose container is gone, and a chunk core cannot observe.
+    fixture.world.clear_container(position);
+    let request = warehouse_transfer_request(
+        "write-missing",
+        PLAYER,
+        deposit.clone(),
+        vec![
+            player_fence.clone(),
+            ScriptInventoryExpectedRevision::new(warehouse.clone(), fence.clone()),
+        ],
+    );
+    let outcome = fixture
+        .execute_inventory(&mut storage, OWNER, &request)
+        .await;
+    assert_eq!(outcome.failure(), Some(ScriptOperationFailure::NotFound));
+
+    fixture.world.set_container(position, chest.clone());
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Unloaded);
+    let request = warehouse_transfer_request(
+        "write-unloaded",
+        PLAYER,
+        deposit.clone(),
+        vec![
+            player_fence.clone(),
+            ScriptInventoryExpectedRevision::new(warehouse.clone(), fence.clone()),
+        ],
+    );
+    let outcome = fixture
+        .execute_inventory(&mut storage, OWNER, &request)
+        .await;
+    assert_eq!(outcome.failure(), Some(ScriptOperationFailure::Unloaded));
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Loaded);
+
+    // No refusal moved an item: the container still holds exactly what it held.
+    let read = fixture
+        .runtime
+        .execute_owned_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle, None),
+        )
+        .await
+        .unwrap();
+    let snapshot = owned_snapshot_of(&read);
+    assert_eq!(
+        snapshot.slots[0].item.as_ref().map(|item| item.count),
+        Some(12),
+        "no refusal moved an item"
+    );
+
+    // A cancelled structure stops being warehouse-addressable.
+    let cancel = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &cancel_request("cancel-write", &structure.structure_id, structure.revision),
+        )
+        .await;
+    assert_eq!(cancel.failure(), None, "cancel: {cancel:?}");
+    let request = warehouse_transfer_request(
+        "write-cancelled",
+        PLAYER,
+        deposit,
+        vec![
+            player_fence,
+            ScriptInventoryExpectedRevision::new(warehouse, fence),
+        ],
+    );
+    let outcome = fixture
+        .execute_inventory(&mut storage, OWNER, &request)
+        .await;
+    assert_eq!(outcome.failure(), Some(ScriptOperationFailure::Blocked));
+}
+
+/// A warehouse deposit moves real container slots and the actor's canonical
+/// inventory under ONE journal decision, and the plugin's stored receipt names
+/// the container's resulting fence.
+#[tokio::test]
+async fn warehouse_transfer_commits_both_participants_under_one_decision() {
+    let fixture = Fixture::with_journal();
+    let mut storage = fixture.storage();
+    let structure = prepared_warehouse(&fixture, &mut storage, "prepare-write").await;
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(BIRCH_LOG, 12);
+    let position = container_position(&fixture, 1);
+    fixture.world.set_container(position, chest.clone());
+    let bind = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-write", &structure.structure_id, 0),
+        )
+        .await;
+    let binding = warehouse_of(&bind);
+    let revision = bind
+        .revision()
+        .expect("a committed bind carries a revision");
+    let warehouse = ScriptInventoryEndpoint::Warehouse {
+        handle: binding.handle.clone(),
+    };
+    let actor = fixture.register_actor("WarehouseSettler", &[(9, BIRCH_LOG, 10)]);
+    let player = ScriptInventoryEndpoint::PlayerInventory { player_id: actor };
+    let (actor_inventory, actor_revision) = fixture.actor_inventory(actor);
+    let request = warehouse_transfer_request(
+        "write-deposit",
+        actor,
+        vec![ScriptOwnedItemTransfer::new(
+            player.clone(),
+            9,
+            warehouse.clone(),
+            1,
+            4,
+        )],
+        vec![
+            ScriptInventoryExpectedRevision::new(
+                player.clone(),
+                owned_fence(&player, actor_revision, &actor_inventory),
+            ),
+            ScriptInventoryExpectedRevision::new(
+                warehouse.clone(),
+                owned_fence(&warehouse, revision, &chest),
+            ),
+        ],
+    );
+    let outcome = fixture
+        .execute_inventory(&mut storage, OWNER, &request)
+        .await;
+    assert_eq!(outcome.failure(), None, "deposit: {outcome:?}");
+
+    // The container's own slots moved, and the receipt names the fence a
+    // subsequent warehouse read reports.
+    let read = fixture
+        .runtime
+        .execute_owned_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle, None),
+        )
+        .await
+        .unwrap();
+    let snapshot = owned_snapshot_of(&read);
+    let slot = snapshot.slots[1]
+        .item
+        .as_ref()
+        .expect("the deposited stack is in the container");
+    assert_eq!(slot.resource_id, "minecraft:birch_log");
+    assert_eq!(slot.count, 4);
+    assert_eq!(
+        snapshot.slots[0].item.as_ref().map(|item| item.count),
+        Some(12),
+        "the rest of the container is untouched"
+    );
+    let fences = transfer_fences(&outcome);
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].endpoint, warehouse);
+    assert_eq!(fences[0].fence, snapshot.fence);
+
+    // The world half was handed the observed and the planned actor inventory,
+    // and the actor's durable revision is the decision the composite journaled:
+    // the fence a later transfer round-trips.
+    let accepted = fixture.world.last_warehouse_request();
+    assert_eq!(accepted.actor_id, actor);
+    assert_eq!(
+        accepted.expected_inventory[9],
+        ItemStack::new(BIRCH_LOG, 10)
+    );
+    assert_eq!(accepted.updated_inventory[9], ItemStack::new(BIRCH_LOG, 6));
+    assert_eq!(accepted.updated_container[1], ItemStack::new(BIRCH_LOG, 4));
+    let (_after, after_revision) = fixture.actor_inventory(actor);
+    let sessions = fixture.sessions.as_ref().unwrap();
+    let journal = sessions.world_chunk_journal().unwrap();
+    let pending = journal.pending_decisions_for_test();
+    assert_eq!(pending.len(), 1, "one deposit, one decision");
+    assert_eq!(
+        pending[0].id(),
+        after_revision,
+        "the actor's revision is the decision the receipt rode"
+    );
+    assert!(
+        pending[0].inventory_batch().unwrap().is_some(),
+        "the receipt rides the container's own decision"
+    );
+    assert_eq!(
+        journal.watermark(),
+        Some(pending[0].id()),
+        "the decision is acknowledged once both participants are projected"
+    );
+    assert!(
+        storage.operation_receipt(OWNER, "write-deposit").is_some(),
+        "a committed deposit records its receipt"
+    );
+
+    // A stale actor fence and a recovering actor each refuse without moving
+    // anything; the container's content is unchanged by both.
+    // A stale actor fence: the same revision, but the state this plugin read is
+    // no longer the actor's.
+    let (_actor_slots, actor_revision) = fixture.actor_inventory(actor);
+    let request = warehouse_transfer_request(
+        "write-stale-actor",
+        actor,
+        vec![ScriptOwnedItemTransfer::new(
+            player.clone(),
+            9,
+            warehouse.clone(),
+            2,
+            1,
+        )],
+        vec![
+            ScriptInventoryExpectedRevision::new(
+                player.clone(),
+                owned_fence(&player, actor_revision, &[ItemStack::EMPTY; 46]),
+            ),
+            ScriptInventoryExpectedRevision::new(
+                warehouse.clone(),
+                owned_fence(&warehouse, revision, &chest),
+            ),
+        ],
+    );
+    let outcome = fixture
+        .execute_inventory(&mut storage, OWNER, &request)
+        .await;
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+
+    let read = fixture
+        .runtime
+        .execute_owned_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle, None),
+        )
+        .await
+        .unwrap();
+    let snapshot = owned_snapshot_of(&read);
+    assert_eq!(
+        snapshot.slots[1].item.as_ref().map(|item| item.count),
+        Some(4),
+        "a refused deposit leaves the container as it was"
+    );
 }

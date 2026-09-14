@@ -25,6 +25,41 @@ port = 30000
 world_dir = ".analysis/cli-check-world"
 "#;
 
+/// A derived vanilla content cache for tests that must actually start the
+/// server.
+///
+/// The server runs only on content derived from the operator's licensed
+/// installation, so such a test reuses the developer's cache when one is
+/// present and skips otherwise — CI has no Mojang data.
+fn content_cache_for_tests() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("SOLARIS_CONTENT_CACHE") {
+        let dir = std::path::PathBuf::from(dir);
+        if is_content_cache(&dir) {
+            return Some(dir);
+        }
+    }
+    let mut directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for _ in 0..=4 {
+        let candidate = directory.join("data").join("vanilla");
+        if is_content_cache(&candidate) {
+            return Some(candidate);
+        }
+        directory = directory.parent()?.to_path_buf();
+    }
+    let home = std::env::var_os("HOME")?;
+    let candidate = std::path::PathBuf::from(home)
+        .join(".local/share/solaris/content")
+        .join(mc_protocol::TARGET_RELEASE);
+    is_content_cache(&candidate).then_some(candidate)
+}
+
+fn is_content_cache(dir: &Path) -> bool {
+    dir.join("version.json").is_file()
+        && dir.join("data/minecraft/tags").is_dir()
+        && dir.join("reports/block_light.json").is_file()
+        && dir.join("reports/registry_network_nbt").is_dir()
+}
+
 fn write_current_vanilla_version(vanilla_dir: &Path) {
     std::fs::write(
         vanilla_dir.join("version.json"),
@@ -1715,6 +1750,13 @@ fn pregenerate_rejects_malformed_block_coordinates() {
 
 #[test]
 fn pregenerate_accepts_negative_coordinates_and_repeats_on_a_fresh_world() {
+    // The server runs only on content derived from a licensed installation, so
+    // this test reuses the developer's cache when present and skips otherwise
+    // (CI has no Mojang data, exactly like the other sidecar-dependent tests).
+    let Some(content_cache) = content_cache_for_tests() else {
+        eprintln!("skipping: no derived vanilla content cache on this machine");
+        return;
+    };
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(
@@ -1744,6 +1786,7 @@ fn pregenerate_accepts_negative_coordinates_and_repeats_on_a_fresh_world() {
     for run in 0..2 {
         Command::cargo_bin("mc-server")
             .expect("locate mc-server binary")
+            .env("SOLARIS_CONTENT_CACHE", &content_cache)
             .arg("--config")
             .arg(file.path())
             .arg("--no-console")

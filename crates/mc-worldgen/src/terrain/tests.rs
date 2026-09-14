@@ -1116,6 +1116,7 @@ fn tellus_like_high_mountain_blocks_use_snow_over_stone() {
         },
         (-78_080_i32).rem_euclid(16) as u8,
         (-28_928_i32).rem_euclid(16) as u8,
+        None,
     );
     assert!(g.biomes.mountain.contains(&high.biome));
     assert!(high.height >= settings.sea_level + 112);
@@ -2025,7 +2026,7 @@ fn pumpkins_remain_a_rare_surface_decoration() {
                 let chunk = generator.generate(pos);
                 for lx in 0..16u8 {
                     for lz in 0..16u8 {
-                        let plan = generator.plan_column(pos, lx, lz);
+                        let plan = generator.plan_column(pos, lx, lz, None);
                         if (generator.biomes.grassland.contains(&plan.biome)
                             || generator.biomes.temperate_forest.contains(&plan.biome)
                             || generator.biomes.jungle.contains(&plan.biome))
@@ -2078,7 +2079,7 @@ fn surface_vegetation_density_is_moderate_and_biome_specific() {
             let chunk = generator.generate(pos);
             for lx in 0..16u8 {
                 for lz in 0..16u8 {
-                    let plan = generator.plan_column(pos, lx, lz);
+                    let plan = generator.plan_column(pos, lx, lz, None);
                     let category = if generator.biomes.jungle.contains(&plan.biome) {
                         2
                     } else if generator.biomes.temperate_forest.contains(&plan.biome) {
@@ -2139,7 +2140,7 @@ fn jungle_admits_trees_more_often_than_forest_and_plains() {
             };
             for lx in 0..16u8 {
                 for lz in 0..16u8 {
-                    let plan = generator.plan_column(pos, lx, lz);
+                    let plan = generator.plan_column(pos, lx, lz, None);
                     let category = if generator.biomes.jungle.contains(&plan.biome) {
                         2
                     } else if generator.biomes.temperate_forest.contains(&plan.biome) {
@@ -2210,7 +2211,7 @@ fn generated_jungles_have_both_bushes_and_trees_across_seeds() {
                 let chunk = generator.generate(pos);
                 for lz in 0..16 {
                     for lx in 0..16 {
-                        let plan = generator.plan_column(pos, lx, lz);
+                        let plan = generator.plan_column(pos, lx, lz, None);
                         if !generator.biomes.jungle.contains(&plan.biome) {
                             continue;
                         }
@@ -2256,6 +2257,7 @@ fn vegetation_density_changes_over_regions_instead_of_columns() {
                     },
                     x.rem_euclid(16) as u8,
                     z.rem_euclid(16) as u8,
+                    None,
                 );
                 let near = generator.plan_column(
                     ChunkPos {
@@ -2264,6 +2266,7 @@ fn vegetation_density_changes_over_regions_instead_of_columns() {
                     },
                     (x + 8).rem_euclid(16) as u8,
                     z.rem_euclid(16) as u8,
+                    None,
                 );
                 let regional = generator.plan_column(
                     ChunkPos {
@@ -2272,6 +2275,7 @@ fn vegetation_density_changes_over_regions_instead_of_columns() {
                     },
                     (x + 192).rem_euclid(16) as u8,
                     z.rem_euclid(16) as u8,
+                    None,
                 );
                 near_change += (centre.vegetation_density - near.vegetation_density).abs();
                 regional_change += (centre.vegetation_density - regional.vegetation_density).abs();
@@ -2325,6 +2329,7 @@ fn tellus_multi_seed_biome_and_feature_fingerprints_are_distinct_and_bounded() {
                     },
                     x.rem_euclid(16) as u8,
                     z.rem_euclid(16) as u8,
+                    None,
                 );
                 if land_biome_family(&generator, &plan.biome).is_some() {
                     land_samples += 1;
@@ -2662,7 +2667,7 @@ fn tellus_savanna_generates_sparse_acacia_while_desert_remains_treeless() {
                 };
                 let lx = x.rem_euclid(16) as u8;
                 let lz = z.rem_euclid(16) as u8;
-                let plan = generator.plan_column(pos, lx, lz);
+                let plan = generator.plan_column(pos, lx, lz, None);
                 if plan.biome.path() == "desert" {
                     desert_columns += 1;
                     assert_eq!(generator.tree_spacing_for_biome(&plan.biome), None);
@@ -2784,7 +2789,7 @@ fn generated_tree_trunks_start_on_the_planned_surface() {
                 let chunk = generator.generate(pos);
                 for lx in 0..16u8 {
                     for lz in 0..16u8 {
-                        let plan = generator.plan_column(pos, lx, lz);
+                        let plan = generator.plan_column(pos, lx, lz, None);
                         let first_above = chunk.get_block(lx, plan.height + 1, lz);
                         let has_trunk = (plan.height + 1..=plan.height + 6).any(|y| {
                             chunk
@@ -2892,7 +2897,7 @@ fn generated_tree_canopies_narrow_above_the_main_crown() {
                 let chunk = generator.generate(pos);
                 for lx in 2..=13u8 {
                     for lz in 2..=13u8 {
-                        let plan = generator.plan_column(pos, lx, lz);
+                        let plan = generator.plan_column(pos, lx, lz, None);
                         let base_y = plan.height + 1;
                         if !chunk
                             .get_block(lx, base_y, lz)
@@ -2946,7 +2951,7 @@ fn generated_tree_canopies_narrow_above_the_main_crown() {
 fn radius_one_tree_crowns_are_raised_and_irregular() {
     let registry = tiny_registry();
     let generator = TerrainGenerator::new(42, registry);
-    let plan = generator.plan_column(ChunkPos { x: 0, z: 0 }, 8, 8);
+    let plan = generator.plan_column(ChunkPos { x: 0, z: 0 }, 8, 8, None);
     let trunk_top_y = plan.height + 5;
 
     let layer = |kind, relative_y| {
@@ -3004,7 +3009,7 @@ fn structures_precede_tree_and_single_plant_decoration() {
                 x: wx.div_euclid(16),
                 z: wz.div_euclid(16),
             };
-            let plan = plain.plan_column(pos, lx, lz);
+            let plan = plain.plan_column(pos, lx, lz, None);
             let Some(tree) = plain.tree_blocks_for_biome(&plan.biome) else {
                 continue;
             };
@@ -3712,7 +3717,7 @@ fn generated_spawn_window_debug_stage_profile() {
             let columns = std::array::from_fn(|idx| {
                 let lx = (idx % 16) as u8;
                 let lz = (idx / 16) as u8;
-                g.plan_column(pos, lx, lz)
+                g.plan_column(pos, lx, lz, None)
             });
             column_plan += started.elapsed();
 
@@ -3749,7 +3754,7 @@ fn generated_spawn_window_debug_stage_profile() {
             biomes += started.elapsed();
 
             let started = std::time::Instant::now();
-            g.apply_structures(&mut chunk);
+            g.apply_structures(&mut chunk, None);
             structures += started.elapsed();
 
             let started = std::time::Instant::now();

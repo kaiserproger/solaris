@@ -1535,11 +1535,34 @@ A violation fails startup by name — never a degraded empty catalog:
 - two deployed packages claiming the profile, or a claim with no catalog.
 
 When no package claims the profile, the config-driven `[data] settlement_profile`
-prototype path in `crates/mc-server` stays the default and every settlement call
+prototype path in `crates/mc-server` is the fallback and every settlement call
 answers the typed `runtime_unavailable`; nothing panics and no empty catalog is
-installed. No part of discovery requires the Solaris Loader: the shipped
-server-side package declares no client bundle, and a Loader-required package is
-not needed for the profile.
+installed. The config default is `vanilla`, which places no villages because core
+Solaris does not implement vanilla village generation — startup reports that gap
+with the typed `settlement_profile_vanilla_generates_no_villages` warning instead
+of quietly generating none. `plains_village_prototype` is the explicit opt-in: it
+combines the three vanilla plains templates (fountain, small house, toolsmith)
+into one bounded composite on the extracted plains village spacing and requires
+`vanilla_data_dir`; it is not full vanilla village generation and places no
+desert, savanna, snowy, or taiga villages. No part of discovery requires the
+Solaris Loader: the shipped server-side package declares no client bundle, and a
+Loader-required package is not needed for the profile.
+
+**Vanilla content source**
+
+The data every settlement/worldgen decision reads comes from one cache derived
+from the operator's own licensed Minecraft Java installation, never
+redistributed. A normal launch discovers a complete cache
+(`[data].vanilla_data_dir` override → `SOLARIS_CONTENT_CACHE` → the user-level
+cache under `$XDG_DATA_HOME/solaris/content/<release>` → `./data/vanilla`) and
+reuses it offline; when none is usable the server runs the packaged importer
+automatically before binding the listener, failing with the concrete cause if
+that fails. The same code path is exposed as
+`mc-server content import --version 26.1.2 [--from <jar>|--download]`, which
+derives the cache (jar data subset, the bundle's own datagen, the Solaris Java
+extractors, and the wire-accurate `RegistryData` capture) and publishes it
+atomically, keeping the previous cache on any failure. `content import` needs a
+JDK 25; startup never does.
 
 **Committed structure bounds**
 
@@ -1609,8 +1632,34 @@ its revision. The handle is a predictable, non-secret string of the form
 container's canonical snapshot, fenced by the binding revision; a foreign,
 unknown, cancelled, unloaded or non-container handle fails closed with
 `forbidden`, `not_found`, `blocked` or `unloaded` and never reads as an empty
-container. The write/transfer path for a warehouse endpoint is not enabled yet
-and still fails closed.
+container.
+
+A warehouse endpoint also writes through `transfer_owned_items`. One request may
+name exactly one warehouse container beside the actor's own
+`{ kind = "player_inventory", player_id = actor_id }` endpoint; a resident
+endpoint, a second warehouse handle or another player's inventory is refused with
+`invalid_request`/`forbidden`. Both participants must be fenced: the DTO requires
+one `expected_revisions` entry per distinct endpoint of the transfers, and the
+caller fences the container with the binding revision plus the container's
+hash it read, and the actor with the fence its own snapshot returned. The
+container's real slots and the actor's canonical inventory then move through one
+server-owned world transaction: the request either moves exactly the requested
+items on both or changes neither, `chest_state_ids` advances and every open
+viewer of that container — the actor included — receives its slots. A stale
+container fence, a stale actor fence, an absent or unloaded container, a
+cancelled structure and a container whose slots moved under the request each
+answer their own typed refusal (`stale_revision`, `not_found`, `unloaded`,
+`blocked`) and change nothing.
+
+The container's committed after-image and the plugin's operation receipt are
+appended as ONE world-inventory decision, so a crash never leaves items inside a
+durable container with an unspent receipt. Because that decision id is also the
+actor's new durable inventory revision — and it is allocated with the commit —
+a warehouse transfer's `result.kind = "transfer"` names the WAREHOUSE endpoint's
+resulting fence only. The actor's resulting fence is read back with
+`query_owned_inventory` after the operation completes; the actor receives the
+committed inventory as an authoritative inventory update either way. A repeated
+operation id replays the stored receipt without moving anything twice.
 
 This illustrates one transfer with durable operation id `haul-1`; a different
 transfer needs a different operation id. The query returns no snapshot directly:

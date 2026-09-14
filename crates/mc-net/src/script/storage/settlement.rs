@@ -46,7 +46,9 @@ use super::{
     DurableOperationReceipt, PluginStorage, PluginStorageMutationError, PluginStorageStartError,
     PreparedStorageBatch, ScriptStoragePrepareOutcome,
 };
-use crate::play::owned_inventory::{owned_inventory_fingerprint, resource_plan_hash};
+use crate::play::owned_inventory::{
+    WarehouseTransferRequest, owned_inventory_fingerprint, resource_plan_hash,
+};
 
 /// Storage transactions one survey token stays valid for.
 const SURVEY_TOKEN_TTL_TRANSACTIONS: u64 = 64;
@@ -805,6 +807,48 @@ fn validate_warehouse_binding(
     validate_revision(binding.revision)
 }
 
+/// The in-memory [`SettlementWorld`]s' stand-in for the server-owned
+/// composite's world half.
+///
+/// Those fakes own no world, so they cannot stamp a container after-image; they
+/// journal the caller's encoded receipt under a fresh decision id exactly like
+/// the live owner turn does, so the submitter's ledger projection, its player
+/// after-image, its acknowledgement and the startup replay are exercised for
+/// real.
+#[cfg(test)]
+pub(super) fn journal_test_warehouse_transfer(
+    sessions: &crate::play::SessionRegistry,
+    receipt: Vec<u8>,
+) -> Result<u64, ScriptOperationFailure> {
+    let Some(journal) = sessions.world_chunk_journal() else {
+        return Err(ScriptOperationFailure::RuntimeUnavailable);
+    };
+    let decision_id = journal
+        .reserve_decision_ids(1)
+        .map_err(|_| ScriptOperationFailure::RuntimeUnavailable)?[0];
+    journal
+        .record_reserved_decisions(
+            sessions.simulation_tick(),
+            vec![(decision_id, Vec::new(), Some(receipt))],
+        )
+        .map_err(|_| ScriptOperationFailure::RuntimeUnavailable)?;
+    Ok(decision_id)
+}
+
+/// One resolved, writable warehouse container.
+///
+/// The reading endpoint and the writing endpoint resolve through the same
+/// helper, so a handle that reads also writes and every refusal family stays
+/// identical: the handle names a durable binding the caller owns, its structure
+/// is still placed, and the authored position holds a loaded container.
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedWarehouseContainer {
+    /// The binding revision, the fence a warehouse endpoint reports.
+    pub(super) revision: u64,
+    pub(super) position: [i32; 3],
+    pub(super) items: Vec<ItemStack>,
+}
+
 /// One loaded-container reading of the authoritative world.
 ///
 /// The variant is what keeps a missing container distinct from an unloaded
@@ -864,6 +908,18 @@ pub(crate) trait SettlementWorld: Send + Sync {
         &self,
         position: [i32; 3],
     ) -> Result<ContainerReading, ScriptOperationFailure>;
+    /// Commit one server-owned warehouse deposit against a bound container.
+    ///
+    /// The caller has already resolved the durable binding, read the loaded
+    /// container and planned the move against the actor's canonical inventory;
+    /// this is the world half: the owner turn fences both participants,
+    /// journals the container's after-image and the encoded plugin receipt in
+    /// ONE decision and answers the decision id the caller projects and
+    /// acknowledges, or the typed refusal that changed nothing.
+    fn commit_warehouse_transfer(
+        &self,
+        request: WarehouseTransferRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + '_>>;
     /// Apply one committed structure portion to the world.
     ///
     /// The portion commits on the world's own async surface, so the future is
@@ -1329,16 +1385,58 @@ impl super::InventoryRuntime {
         )
     }
 
-    /// Canonical snapshot of one bound warehouse container, or the typed
-    /// failure that keeps a plugin from reading a foreign, unloaded or inactive
-    /// container.
+    /// Resolve one bound warehouse container, or the typed failure that keeps a
+    /// plugin from reading or writing a foreign, inactive, unloaded or
+    /// non-container handle.
     ///
     /// The opaque handle resolves through the durable binding; the binding owner
     /// must be the caller; the bound structure must still be active; and the
     /// authored container must still be a loaded container at its placed
     /// position. Every one of those closes with its own family rather than an
-    /// empty snapshot, so a plugin can never mistake a refusal for an empty
-    /// container.
+    /// empty container, so a plugin can never mistake a refusal for one. The
+    /// reading and the writing endpoint resolve through this one helper.
+    pub(super) fn resolve_warehouse_container(
+        &self,
+        storage: &PluginStorage,
+        plugin_id: &str,
+        handle: &str,
+    ) -> Result<ResolvedWarehouseContainer, ScriptOperationFailure> {
+        let Some(runtime) = self.settlement_runtime() else {
+            return Err(ScriptOperationFailure::RuntimeUnavailable);
+        };
+        let Some(world) = self.settlement_world() else {
+            return Err(ScriptOperationFailure::RuntimeUnavailable);
+        };
+        let Some(binding) = storage.settlements().warehouse(handle) else {
+            return Err(ScriptOperationFailure::NotFound);
+        };
+        if binding.plugin_id != plugin_id {
+            return Err(ScriptOperationFailure::Forbidden);
+        }
+        let Some(structure) = storage
+            .settlements()
+            .structure(&binding.structure_id)
+            .cloned()
+        else {
+            return Err(ScriptOperationFailure::NotFound);
+        };
+        if !structure.is_placed() {
+            return Err(ScriptOperationFailure::Blocked);
+        }
+        let position = warehouse_container_position(runtime, &structure, binding.container_id)?;
+        let items = match world.container_reading(position)? {
+            ContainerReading::Loaded(items) => items,
+            ContainerReading::Unloaded => return Err(ScriptOperationFailure::Unloaded),
+            ContainerReading::Missing => return Err(ScriptOperationFailure::NotFound),
+        };
+        Ok(ResolvedWarehouseContainer {
+            revision: binding.revision,
+            position,
+            items,
+        })
+    }
+
+    /// Canonical snapshot of one bound warehouse container.
     pub(super) fn warehouse_inventory_snapshot(
         &self,
         storage: &PluginStorage,
@@ -1346,48 +1444,19 @@ impl super::InventoryRuntime {
         handle: &str,
         expected_revision: Option<u64>,
     ) -> ScriptOperationOutcome {
-        let Some(runtime) = self.settlement_runtime() else {
-            return rejected(ScriptOperationFailure::RuntimeUnavailable);
+        let container = match self.resolve_warehouse_container(storage, plugin_id, handle) {
+            Ok(container) => container,
+            Err(failure) => return rejected(failure),
         };
-        let Some(world) = self.settlement_world() else {
-            return rejected(ScriptOperationFailure::RuntimeUnavailable);
-        };
-        let Some(binding) = storage.settlements().warehouse(handle) else {
-            return rejected(ScriptOperationFailure::NotFound);
-        };
-        if binding.plugin_id != plugin_id {
-            return rejected(ScriptOperationFailure::Forbidden);
-        }
-        let Some(structure) = storage
-            .settlements()
-            .structure(&binding.structure_id)
-            .cloned()
-        else {
-            return rejected(ScriptOperationFailure::NotFound);
-        };
-        if !structure.is_placed() {
-            return rejected(ScriptOperationFailure::Blocked);
-        }
-        if expected_revision.is_some_and(|expected| expected != binding.revision) {
+        if expected_revision.is_some_and(|expected| expected != container.revision) {
             return rejected(ScriptOperationFailure::StaleRevision);
         }
-        let position = match warehouse_container_position(runtime, &structure, binding.container_id)
-        {
-            Ok(position) => position,
-            Err(failure) => return rejected(failure),
-        };
-        let items = match world.container_reading(position) {
-            Ok(ContainerReading::Loaded(items)) => items,
-            Ok(ContainerReading::Unloaded) => return rejected(ScriptOperationFailure::Unloaded),
-            Ok(ContainerReading::Missing) => return rejected(ScriptOperationFailure::NotFound),
-            Err(failure) => return rejected(failure),
-        };
         self.sessions().query_warehouse_inventory(
             &ScriptInventoryEndpoint::Warehouse {
                 handle: handle.to_owned(),
             },
-            binding.revision,
-            &items,
+            container.revision,
+            &container.items,
             self.items(),
         )
     }

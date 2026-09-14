@@ -22,6 +22,7 @@ use mc_script::{
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::login::LoggedInProfile;
+use crate::play::OutboundCommand;
 use crate::play::PlayerPose;
 use crate::play::inventory::PlayerInventory;
 use crate::play::owned_inventory::owned_inventory_snapshot;
@@ -33,15 +34,16 @@ use crate::script::storage::PluginStorageMutationError;
 use crate::script::storage::StorageFaultPoint;
 use crate::script::storage::world_inventory::InventoryRuntime;
 
-use super::owned_inventory_endpoint::reservation_stock_survives;
+use crate::play::owned_inventory::reservation_stock_survives;
 
 const OWNER: &str = "settlement";
 
 struct Harness {
-    _outbound: tokio_mpsc::Receiver<crate::play::session::outbound::OutboundCommand>,
+    outbound: tokio_mpsc::Receiver<crate::play::session::outbound::OutboundCommand>,
     _root: tempfile::TempDir,
     runtime: InventoryRuntime,
     storage: PluginStorage,
+    sessions: Arc<SessionRegistry>,
     player_id: u64,
     state: Arc<Mutex<PlayerPersistedState>>,
     items: Arc<ItemRegistry>,
@@ -84,10 +86,11 @@ impl Harness {
         );
         sessions.register_player_persistence(player_id, Arc::clone(&state));
         Self {
-            _outbound: receiver,
+            outbound: receiver,
             _root: root,
             runtime,
             storage,
+            sessions,
             player_id,
             state,
             items,
@@ -422,6 +425,9 @@ async fn owned_transfer_rejects_stale_foreign_and_unavailable_endpoints() {
     assert_eq!(outcome.failure(), Some(ScriptOperationFailure::Forbidden));
     assert_eq!(harness.state.lock().unwrap().inventory.slots[9], apple);
 
+    // A warehouse endpoint is a server-owned container composite: this harness
+    // installs no settlement profile, so the deposit has no container to
+    // resolve and refuses as unavailable instead of moving anything.
     let warehouse = ScriptInventoryEndpoint::Warehouse {
         handle: "completed-container".to_owned(),
     };
@@ -437,7 +443,10 @@ async fn owned_transfer_rejects_stale_foreign_and_unavailable_endpoints() {
         vec![(player.clone(), fence), (warehouse, harness.fence())],
     );
     let outcome = harness.execute(&request).await;
-    assert_eq!(outcome.failure(), Some(ScriptOperationFailure::Unloaded));
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::RuntimeUnavailable)
+    );
     assert_eq!(harness.state.lock().unwrap().inventory.slots[9], apple);
 }
 
@@ -1199,4 +1208,37 @@ async fn resident_transfer_never_duplicates_equipment_held_by_an_active_order() 
         harness.state.lock().unwrap().inventory.slots[10],
         ItemStack::EMPTY
     );
+}
+
+/// A committed server-owned deposit publishes the actor's authoritative
+/// inventory and keys it by the world-journal decision the composite appended,
+/// which is the revision a later endpoint fence round-trips.
+#[tokio::test]
+async fn publish_warehouse_transfer_advances_the_actor_inventory_projection() {
+    let mut harness = Harness::new(PlayerInventory::empty());
+    harness.state.lock().unwrap().inventory.slots[9] = ItemStack::new(10, 6);
+    harness.state.lock().unwrap().carried_item = ItemStack::new(11, 2);
+    assert_eq!(
+        harness.state.lock().unwrap().inventory_operation_revision,
+        0
+    );
+
+    harness
+        .sessions
+        .publish_warehouse_transfer(harness.player_id, 3);
+
+    assert_eq!(
+        harness.state.lock().unwrap().inventory_operation_revision,
+        3,
+        "the actor's durable revision is the decision its receipt rode"
+    );
+    let Some(OutboundCommand::AuthoritativeInventory {
+        inventory,
+        carried_item,
+    }) = harness.outbound.try_recv().ok()
+    else {
+        panic!("the actor receives its authoritative inventory");
+    };
+    assert_eq!(inventory.slots[9], ItemStack::new(10, 6));
+    assert_eq!(carried_item, ItemStack::new(11, 2));
 }

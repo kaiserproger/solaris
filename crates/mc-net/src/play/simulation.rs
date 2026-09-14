@@ -25,6 +25,9 @@ use super::lighting::{
 use super::movement::{
     PlayerMovementAuthorityResources, PlayerMovementRejection, PlayerPoseCommitKind,
 };
+use super::owned_inventory::{
+    WarehouseTransferOutcome, WarehouseTransferRequest, container_chest_image,
+};
 use super::persistence::PersistedEntityCheckpoint;
 #[cfg(test)]
 use super::session::EntityKillRewards;
@@ -34,9 +37,9 @@ use super::session::{
     CreditedExperiencePickup, CreditedItemPickup, ENTITY_DEATH_TICKS, EntityAttackOutcome,
     FurnaceTransaction, FurnaceTransactionRequest, OutboundCommand, PlayerAttackResult,
     PlayerEntityAttack, PlayerInventoryCommitError, ScriptPlayerTeleportCompletion,
-    ServerEntityExplosionImpact, SessionId, SessionRegistry, SurvivalBreakTransaction,
-    SurvivalPlacementTransaction, VillagerPopulationSelection, VisibilityDispatch,
-    dispatch_visibility_commands,
+    ServerEntityExplosionImpact, ServerOwnedChestCommit, SessionId, SessionRegistry,
+    SurvivalBreakTransaction, SurvivalPlacementTransaction, VillagerPopulationSelection,
+    VisibilityDispatch, dispatch_visibility_commands,
 };
 use super::{
     AppliedBlockEdit, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition,
@@ -466,6 +469,12 @@ pub(super) enum SimulationCommand {
         expected: Vec<ChestBlockEntity>,
         updated: Vec<ChestBlockEntity>,
         player: Box<ContainerPlayerPlan>,
+        /// The encoded plugin operation receipt a server-owned deposit journals
+        /// beside the container's after-image, or `None` for the menu path. A
+        /// receipt makes the command server-owned: it drops the open-menu fence
+        /// and publishes the container's slots to every viewer including the
+        /// actor.
+        plugin_receipt: Option<Vec<u8>>,
     },
     CommitFurnace {
         position: BlockPos,
@@ -620,6 +629,7 @@ pub(super) enum SimulationResponse {
     BowRelease(Result<Option<Box<CommittedBowRelease>>, SimulationRequestError>),
     SelectedItemDrop(Result<Option<Box<CommittedSelectedItemDrop>>, SimulationRequestError>),
     ChestCommit(Result<Box<ChestCommitOutcome>, SimulationRequestError>),
+    WarehouseTransfer(Result<WarehouseTransferOutcome, SimulationRequestError>),
     FurnaceCommit(Result<Box<FurnaceCommitOutcome>, SimulationRequestError>),
     OpaqueBlockEntity(Result<bool, SimulationRequestError>),
     CampfireUse(Result<Option<Box<CommittedCampfireUse>>, SimulationRequestError>),
@@ -792,6 +802,21 @@ fn command_requires_world(command: &SimulationCommand) -> bool {
             | SimulationCommand::CommitOpaqueBlockEntity { .. }
             | SimulationCommand::CommitCampfireUse(_)
             | SimulationCommand::CommitTntIgnition { .. }
+    )
+}
+
+/// Whether one command's own journal decision must carry a plugin receipt.
+///
+/// A server-owned container composite has no menu participant to fall back on:
+/// its receipt and the container's after-image are durable only together, so it
+/// is admitted to a journaled run or refused before any mutation.
+fn command_needs_world_journal(command: &SimulationCommand) -> bool {
+    matches!(
+        command,
+        SimulationCommand::CommitChest {
+            plugin_receipt: Some(_),
+            ..
+        }
     )
 }
 
@@ -1353,6 +1378,10 @@ struct ChestCommitRequest<'a> {
     expected: &'a [ChestBlockEntity],
     updated: &'a [ChestBlockEntity],
     player: &'a ContainerPlayerPlan,
+    /// Present when the envelope is a server-owned composite; the menu path
+    /// never reaches it, because that mode only travels through a journaled
+    /// regional run.
+    plugin_receipt: Option<&'a [u8]>,
 }
 
 struct FurnaceCommitRequest<'a> {
@@ -2856,10 +2885,83 @@ impl SimulationHandle {
             expected,
             updated,
             player: Box::new(player),
+            plugin_receipt: None,
         })?;
         match receiver.await {
             Ok(Ok(SimulationResponse::ChestCommit(Ok(outcome)))) => Ok(*outcome),
             Ok(Ok(SimulationResponse::ChestCommit(Err(error)))) => Err(error),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
+
+    /// Commit one server-owned warehouse deposit: the container's canonical
+    /// slots and the actor's inventory move together, and the container's
+    /// after-image and the caller's encoded plugin receipt ride the same world
+    /// journal decision.
+    ///
+    /// The command is the menu chest composite with the plugin receipt
+    /// attached, enqueued under the actor's session fence; the owner turn owns
+    /// the fences, the journal append and the publication.
+    pub(crate) async fn commit_warehouse_transfer(
+        &self,
+        request: WarehouseTransferRequest,
+    ) -> Result<WarehouseTransferOutcome, SimulationRequestError> {
+        let WarehouseTransferRequest {
+            actor_id,
+            position,
+            expected_state_id,
+            expected_container,
+            updated_container,
+            expected_inventory,
+            expected_carried_item,
+            updated_inventory,
+            updated_carried_item,
+            receipt,
+        } = request;
+        let Some(expected) = container_chest_image(&expected_container) else {
+            return Err(SimulationRequestError::InvalidCommand);
+        };
+        let Some(updated) = container_chest_image(&updated_container) else {
+            return Err(SimulationRequestError::InvalidCommand);
+        };
+        let (Ok(expected_inventory), Ok(updated_inventory)) = (
+            <[ItemStack; 46]>::try_from(expected_inventory),
+            <[ItemStack; 46]>::try_from(updated_inventory),
+        ) else {
+            return Err(SimulationRequestError::InvalidCommand);
+        };
+        let player = ContainerPlayerPlan {
+            expected_inventory: PlayerInventory {
+                slots: expected_inventory,
+            },
+            expected_carried_item,
+            updated_inventory: PlayerInventory {
+                slots: updated_inventory,
+            },
+            updated_carried_item,
+            crafting_table_input: None,
+            enchanting_table_input: None,
+            merchant_input: None,
+            drops: Vec::new(),
+            xp_orb: None,
+        };
+        let receiver =
+            self.for_session(actor_id)
+                .enqueue_player_command(SimulationCommand::CommitChest {
+                    primary_position: position,
+                    positions: vec![position],
+                    expected_state_id,
+                    actor_session: actor_id,
+                    expected: vec![expected],
+                    updated: vec![updated],
+                    player: Box::new(player),
+                    plugin_receipt: Some(receipt),
+                })?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::WarehouseTransfer(Ok(outcome)))) => Ok(outcome),
+            Ok(Ok(SimulationResponse::WarehouseTransfer(Err(error)))) => Err(error),
             Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(SimulationRequestError::OwnerStopped),
@@ -3897,10 +3999,24 @@ impl SimulationOwner {
                 && envelope
                     .session_fence
                     .is_none_or(|session_id| sessions.is_active_session(session_id))
-                && command_can_use_regional_mutation(&envelope.command, access.read, block_light);
+                && command_can_use_regional_mutation(&envelope.command, access.read, block_light)
+                // A server-owned composite carries a plugin receipt in the same
+                // decision as its container after-image, so a run that cannot
+                // journal it must not admit it: the non-regional fallback
+                // refuses the command instead of committing a container whose
+                // receipt has nowhere to go.
+                && (!command_needs_world_journal(&envelope.command)
+                    || world_chunk_journal.is_some());
             let journaled_block_edit = regional_block_edit
                 && world_chunk_journal.is_some()
-                && matches!(envelope.command, SimulationCommand::ApplyBlockEdits { .. });
+                && matches!(
+                    envelope.command,
+                    SimulationCommand::ApplyBlockEdits { .. }
+                        | SimulationCommand::CommitChest {
+                            plugin_receipt: Some(_),
+                            ..
+                        }
+                );
             if let Some((
                 last_requires_world,
                 last_regional_block_edit,
@@ -4592,7 +4708,15 @@ impl SimulationOwner {
             expected,
             updated,
             player,
+            plugin_receipt,
         } = request;
+        if plugin_receipt.is_some() {
+            // A server-owned composite journals its receipt and the container's
+            // after-image in one decision, so it only ever runs in the
+            // journaled regional lane; reaching the menu path means that lane
+            // could not admit it, and nothing may mutate.
+            return Err(SimulationRequestError::WorldMutationFailed);
+        }
         if positions.is_empty()
             || positions.len() > 2
             || positions.first() != Some(&primary_position)
@@ -6378,6 +6502,7 @@ impl SimulationOwner {
                     expected,
                     updated,
                     player,
+                    plugin_receipt,
                 } => self.chest_commit_response(
                     sessions,
                     storage.as_deref_mut(),
@@ -6390,6 +6515,7 @@ impl SimulationOwner {
                         expected,
                         updated,
                         player,
+                        plugin_receipt: plugin_receipt.as_deref(),
                     },
                 ),
                 SimulationCommand::CommitFurnace {
@@ -13142,7 +13268,7 @@ mod tests {
             Some(2),
             Some(3),
             Some(77),
-            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::items::solaris_required_items()),
             Arc::new(mc_data::item_components::ItemFactsTable::default()),
             Arc::new(mc_data::loot::LootTables::default()),
         );
@@ -16176,6 +16302,7 @@ mod tests {
                 expected: vec![initial.clone()],
                 updated: vec![first_update.clone()],
                 player: Box::new(player.clone()),
+                plugin_receipt: None,
             })
             .unwrap();
         let stale = handle
@@ -16187,6 +16314,7 @@ mod tests {
                 expected: vec![initial],
                 updated: vec![stale_update],
                 player: Box::new(player),
+                plugin_receipt: None,
             })
             .unwrap();
 
@@ -16292,6 +16420,7 @@ mod tests {
                         expected: vec![initial.clone()],
                         updated: vec![updated.clone()],
                         player: Box::new(empty_container_player_plan()),
+                        plugin_receipt: None,
                     })
                     .unwrap()
             })
@@ -16412,6 +16541,7 @@ mod tests {
                 expected: vec![initial.clone()],
                 updated: vec![first_update.clone()],
                 player: Box::new(player.clone()),
+                plugin_receipt: None,
             })
             .unwrap();
         let stale = handle
@@ -16423,6 +16553,7 @@ mod tests {
                 expected: vec![initial],
                 updated: vec![stale_update],
                 player: Box::new(player),
+                plugin_receipt: None,
             })
             .unwrap();
 
@@ -17799,5 +17930,458 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// One server-owned warehouse deposit commits the container and the actor's
+    /// inventory, journals the container's own after-image together with the
+    /// encoded plugin receipt in ONE decision - appended BEFORE the container's
+    /// slots are published - and leaves both participants recoverable: the
+    /// images rebuild the container and the batch rebuilds the plugin ledger and
+    /// the player's file, and only then is the decision acknowledged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_owned_warehouse_deposit_appends_before_publishing_and_recovers_both() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("region")).unwrap();
+        let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
+        let items = Arc::new(mc_data::items::solaris_required_items());
+        let item_id = items
+            .id_of(&Identifier::parse("minecraft:birch_log").unwrap())
+            .expect("the baseline items hold the moved stack");
+        let mut storage = WorldStorage::open(temp.path(), Arc::clone(&blocks))
+            .unwrap()
+            .with_item_registry(Arc::clone(&items));
+        let chunk_position = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk_position,
+                Chunk::empty(
+                    chunk_position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let position = BlockPos { x: 1, y: 64, z: 1 };
+        storage.set_block_at(position, BlockStateId(1)).unwrap();
+        let mut chest = ChestBlockEntity::default();
+        chest.slots[0] = mc_world::FurnaceSlot {
+            count: 12,
+            item_id,
+            ..mc_world::FurnaceSlot::EMPTY
+        };
+        assert!(
+            storage
+                .set_chest_block_entity(position, chest.clone())
+                .unwrap()
+        );
+        let read_view = storage.read_view();
+        let mutation_view = storage.mutation_view();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+
+        let registry = SessionRegistry::new();
+        let (depositor, mut depositor_outbound) =
+            register_test_session_with_outbound(&registry, "WarehouseDepositor");
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[9] = ItemStack::new(item_id, 10);
+        let carried_item = ItemStack::new(item_id, 1);
+        let state = register_test_player_state(&registry, depositor, inventory.clone());
+        state.lock().unwrap().carried_item = carried_item.clone();
+        // The actor is a viewer of the container, and a second client watches it.
+        let (observer, mut observer_outbound) =
+            register_test_session_with_outbound(&registry, "WarehouseObserver");
+        assert_eq!(registry.register_chest_viewer(depositor, position), 1);
+        assert_eq!(registry.register_chest_viewer(observer, position), 1);
+
+        let (journal, pending) = crate::play::world_journal::WorldChunkJournal::open_for_test(
+            temp.path(),
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+        )
+        .unwrap();
+        assert!(pending.is_empty());
+        registry.install_world_chunk_journal(journal);
+
+        // The plugin receipt the deposit journals beside the container image.
+        let recovery =
+            crate::play::persistence::inventory_recovery::PlayerInventoryRecovery::capture(
+                crate::login::offline_uuid("WarehouseDepositor"),
+                &state.lock().unwrap(),
+                &{
+                    let mut planned = PlayerInventory::empty();
+                    planned.slots[9] = ItemStack::new(item_id, 6);
+                    planned
+                },
+                &items,
+            )
+            .unwrap();
+        let batch: crate::script::storage::PreparedStorageBatch =
+            serde_json::from_value(serde_json::json!({
+                "transaction_id": 1,
+                "plugin_id": "settlement",
+                "mutations": [{
+                    "kind": "compare_and_swap",
+                    "key": "balance",
+                    "expected_version": null,
+                    "value": "10"
+                }],
+                "inventory": recovery
+            }))
+            .unwrap();
+        let receipt = batch.encode_world_inventory().unwrap();
+
+        let mut updated_chest = chest.clone();
+        updated_chest.slots[1] = mc_world::FurnaceSlot {
+            count: 4,
+            item_id,
+            ..mc_world::FurnaceSlot::EMPTY
+        };
+        let mut updated_inventory = PlayerInventory::empty();
+        updated_inventory.slots[9] = ItemStack::new(item_id, 6);
+        let request = WarehouseTransferRequest {
+            actor_id: depositor,
+            position,
+            expected_state_id: registry.chest_state_id(position),
+            expected_container: chest
+                .slots
+                .iter()
+                .map(crate::play::owned_inventory::container_slot_to_item)
+                .collect(),
+            updated_container: updated_chest
+                .slots
+                .iter()
+                .map(crate::play::owned_inventory::container_slot_to_item)
+                .collect(),
+            expected_inventory: inventory.slots.to_vec(),
+            expected_carried_item: carried_item.clone(),
+            updated_inventory: updated_inventory.slots.to_vec(),
+            updated_carried_item: carried_item,
+            receipt,
+        };
+
+        let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let (result, report) = tokio::join!(
+            handle.commit_warehouse_transfer(request),
+            owner.process_commands_with_world_views(
+                &registry,
+                Some(&world),
+                SimulationWorldAccess {
+                    read: Some(&read_view),
+                    mutation: Some(&mutation_view),
+                    cpu: Some(&resources),
+                    light: None,
+                },
+                None,
+                1,
+            )
+        );
+        assert_eq!(report.processed, 1);
+        let decision_id = match result.expect("the deposit reached the owner") {
+            WarehouseTransferOutcome::Committed { decision_id } => decision_id,
+            other => panic!("expected a committed deposit, got {other:?}"),
+        };
+
+        // The container moved, its state id advanced, and every viewer — the
+        // actor included — received its slots.
+        let live = read_view.snapshot_chunks(&[chunk_position]);
+        let live_chest = live.chunk(chunk_position).unwrap().chests[&position].clone();
+        assert_eq!(live_chest.slots[0].count, 12);
+        assert_eq!(live_chest.slots[1].item_id, item_id);
+        assert_eq!(live_chest.slots[1].count, 4);
+        let published_state_id = registry.chest_state_id(position);
+        assert!(
+            published_state_id > 1,
+            "the deposit advanced the container's state id"
+        );
+        for (name, outbound) in [
+            ("depositor", &mut depositor_outbound),
+            ("observer", &mut observer_outbound),
+        ] {
+            let mut published = None;
+            while let Ok(command) = outbound.try_recv() {
+                if let OutboundCommand::ChestSlots {
+                    state_id,
+                    slots: sent,
+                    ..
+                } = command
+                {
+                    published = Some((state_id, sent));
+                    break;
+                }
+            }
+            let (state_id, slots) =
+                published.unwrap_or_else(|| panic!("{name} received the container's slots"));
+            assert_eq!(
+                state_id, published_state_id,
+                "{name} sees the advanced state id"
+            );
+            assert_eq!(slots[1].count, 4, "{name} sees the deposit");
+        }
+        let live_state = state.lock().unwrap();
+        assert_eq!(live_state.inventory.slots[9], ItemStack::new(item_id, 6));
+
+        // ONE decision carries the container's own after-image and the receipt.
+        let live_journal = registry.world_chunk_journal().unwrap();
+        // The append-before-publication rule: the observation is taken inside
+        // the publication path, where the container's `ChestSlots` command
+        // leaves the run, and it records that this decision was already
+        // appended. An inverted order records `false` here.
+        assert_eq!(
+            live_journal.warehouse_publications_for_test(),
+            vec![(decision_id, true)],
+            "the deposit's decision must be appended before its slots are published"
+        );
+        let decisions = live_journal.pending_decisions_for_test();
+        assert_eq!(decisions.len(), 1, "one deposit, one decision");
+        assert_eq!(decisions[0].id(), decision_id);
+        assert!(
+            decisions[0].inventory_batch().unwrap().is_some(),
+            "the encoded receipt rides the container's decision"
+        );
+        let images = live_journal.decode_pending(&decisions).unwrap();
+        assert_eq!(images.len(), 1);
+        let image_chest = images[0].chests[&position].clone();
+        assert_eq!(
+            image_chest.slots[1].count, 4,
+            "the decision carries the POST-deposit container image"
+        );
+        assert!(
+            registry
+                .world_chunk_journal()
+                .unwrap()
+                .watermark()
+                .is_none(),
+            "an unprojected decision blocks the checkpoint cutoff"
+        );
+        drop(live_state);
+
+        // Reopen the journal as a restart does: the images rebuild the
+        // container and the batch replays both participants, which is what lets
+        // the decision be acknowledged.
+        drop(live_journal);
+        drop(registry);
+        let (reopened, pending) = crate::play::world_journal::WorldChunkJournal::open_for_test(
+            temp.path(),
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+        )
+        .unwrap();
+        let restored = reopened.decode_pending(&pending).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].chests[&position].slots[1].count, 4,
+            "the container recovers from the decision's own image"
+        );
+        assert_eq!(restored[0].chests[&position].slots[1].item_id, item_id);
+        // The restarted runtime replays the decision's participants: the plugin
+        // ledger batch installs and the player's own after-image is written, so
+        // the decision is projected and the checkpoint cutoff can pass it.
+        let registry = Arc::new(SessionRegistry::new());
+        registry.install_world_chunk_journal(reopened);
+        let runtime = crate::script::storage::world_inventory::InventoryRuntime::new(
+            Some(temp.path()),
+            &crate::server::ShutdownHandle::default(),
+            Arc::clone(&registry),
+            Arc::clone(&items),
+            Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        );
+        // The plugin ledger is its own store, not the world's own directory.
+        let ledger_root = tempfile::tempdir().unwrap();
+        let mut ledger = crate::script::storage::PluginStorage::open(ledger_root.path()).unwrap();
+        runtime
+            .recover(&mut ledger)
+            .expect("both participants of the decision replay");
+        let journal = registry.world_chunk_journal().unwrap();
+        assert_eq!(
+            journal.watermark(),
+            Some(decision_id),
+            "a replayed decision is projected and can be checkpointed"
+        );
+    }
+
+    /// A stale container fence, a stale player fence and a rejected conditional
+    /// commit each answer their own typed refusal, leave the container and the
+    /// actor untouched and close the reserved decision with no participant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_owned_warehouse_deposit_refuses_stale_fences_without_mutating() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("region")).unwrap();
+        let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
+        let items = Arc::new(mc_data::items::solaris_required_items());
+        let item_id = items
+            .id_of(&Identifier::parse("minecraft:birch_log").unwrap())
+            .expect("the baseline items hold the moved stack");
+        let mut storage = WorldStorage::open(temp.path(), Arc::clone(&blocks))
+            .unwrap()
+            .with_item_registry(Arc::clone(&items));
+        let chunk_position = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk_position,
+                Chunk::empty(
+                    chunk_position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let position = BlockPos { x: 1, y: 64, z: 1 };
+        storage.set_block_at(position, BlockStateId(1)).unwrap();
+        let mut chest = ChestBlockEntity::default();
+        chest.slots[0] = mc_world::FurnaceSlot {
+            count: 12,
+            item_id,
+            ..mc_world::FurnaceSlot::EMPTY
+        };
+        assert!(
+            storage
+                .set_chest_block_entity(position, chest.clone())
+                .unwrap()
+        );
+        let read_view = storage.read_view();
+        let mutation_view = storage.mutation_view();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+
+        let registry = SessionRegistry::new();
+        let (depositor, _outbound) =
+            register_test_session_with_outbound(&registry, "WarehouseRefused");
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[9] = ItemStack::new(item_id, 10);
+        let state = register_test_player_state(&registry, depositor, inventory.clone());
+        assert_eq!(registry.register_chest_viewer(depositor, position), 1);
+        let (journal, pending) = crate::play::world_journal::WorldChunkJournal::open_for_test(
+            temp.path(),
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+        )
+        .unwrap();
+        assert!(pending.is_empty());
+        registry.install_world_chunk_journal(journal);
+
+        let mut updated_chest = chest.clone();
+        updated_chest.slots[1] = mc_world::FurnaceSlot {
+            count: 4,
+            item_id,
+            ..mc_world::FurnaceSlot::EMPTY
+        };
+        let mut updated_inventory = PlayerInventory::empty();
+        updated_inventory.slots[9] = ItemStack::new(item_id, 6);
+        let receipt = |registry: &SessionRegistry| {
+            let recovery =
+                crate::play::persistence::inventory_recovery::PlayerInventoryRecovery::capture(
+                    crate::login::offline_uuid("WarehouseRefused"),
+                    &state.lock().unwrap(),
+                    &updated_inventory,
+                    &items,
+                )
+                .unwrap();
+            let batch: crate::script::storage::PreparedStorageBatch =
+                serde_json::from_value(serde_json::json!({
+                    "transaction_id": 1,
+                    "plugin_id": "settlement",
+                    "mutations": [{
+                        "kind": "compare_and_swap",
+                        "key": "balance",
+                        "expected_version": null,
+                        "value": "10"
+                    }],
+                    "inventory": recovery
+                }))
+                .unwrap();
+            let _ = registry;
+            batch.encode_world_inventory().unwrap()
+        };
+        let container_items = |entity: &ChestBlockEntity| {
+            entity
+                .slots
+                .iter()
+                .map(crate::play::owned_inventory::container_slot_to_item)
+                .collect::<Vec<_>>()
+        };
+
+        // A stale container state-id fence, then a conditional commit the world
+        // itself rejects, then a stale player fence.
+        let request =
+            |expected_state_id: i32,
+             expected_container: Vec<ItemStack>,
+             expected_inventory: Vec<ItemStack>,
+             expected_carried_item: ItemStack| WarehouseTransferRequest {
+                actor_id: depositor,
+                position,
+                expected_state_id,
+                expected_container,
+                updated_container: container_items(&updated_chest),
+                expected_inventory,
+                expected_carried_item,
+                updated_inventory: updated_inventory.slots.to_vec(),
+                updated_carried_item: ItemStack::EMPTY,
+                receipt: receipt(&registry),
+            };
+        let live_state_id = registry.chest_state_id(position);
+        let stale_state_id = request(
+            live_state_id + 1,
+            container_items(&chest),
+            inventory.slots.to_vec(),
+            ItemStack::EMPTY,
+        );
+        let rejected_commit = request(
+            live_state_id,
+            container_items(&updated_chest),
+            inventory.slots.to_vec(),
+            ItemStack::EMPTY,
+        );
+        let stale_player = request(
+            live_state_id,
+            container_items(&chest),
+            PlayerInventory::empty().slots.to_vec(),
+            ItemStack::EMPTY,
+        );
+
+        let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+        let (handle, mut owner) = simulation_channel_with_capacity(3);
+        let (first, second, third, report) = tokio::join!(
+            handle.commit_warehouse_transfer(stale_state_id),
+            handle.commit_warehouse_transfer(rejected_commit),
+            handle.commit_warehouse_transfer(stale_player),
+            owner.process_commands_with_world_views(
+                &registry,
+                Some(&world),
+                SimulationWorldAccess {
+                    read: Some(&read_view),
+                    mutation: Some(&mutation_view),
+                    cpu: Some(&resources),
+                    light: None,
+                },
+                None,
+                3,
+            )
+        );
+        assert_eq!(report.processed, 3);
+        assert_eq!(first.unwrap(), WarehouseTransferOutcome::StaleContainer);
+        assert_eq!(second.unwrap(), WarehouseTransferOutcome::StaleContainer);
+        assert_eq!(third.unwrap(), WarehouseTransferOutcome::StalePlayer);
+
+        // Nothing moved, nothing published, and each reserved id was closed
+        // with no participant so the run's append stayed contiguous.
+        let live = read_view.snapshot_chunks(&[chunk_position]);
+        let live_chest = live.chunk(chunk_position).unwrap().chests[&position].clone();
+        assert_eq!(live_chest.slots[0].count, 12);
+        assert!(live_chest.slots[1].is_empty());
+        assert_eq!(registry.chest_state_id(position), 1);
+        assert_eq!(
+            state.lock().unwrap().inventory.slots[9],
+            ItemStack::new(item_id, 10)
+        );
+        let decisions = registry
+            .world_chunk_journal()
+            .unwrap()
+            .pending_decisions_for_test();
+        assert_eq!(decisions.len(), 3);
+        for decision in &decisions {
+            assert!(
+                decision.inventory_batch().unwrap().is_none(),
+                "a refused deposit journals no receipt"
+            );
+        }
     }
 }

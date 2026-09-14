@@ -201,6 +201,79 @@ pub(crate) fn container_slot_to_item(slot: &FurnaceSlot) -> ItemStack {
     super::containers::furnace_slot_to_stack(slot)
 }
 
+/// The container block-entity image of one 27-slot canonical projection.
+///
+/// The inverse of [`container_slot_to_item`], and the image the server-owned
+/// warehouse composite fences the container with. The menu planner keeps its
+/// own item-to-slot projection private to the container module, which the
+/// warehouse path cannot reach; the struct literal makes both compile against
+/// the same slot field set, so a new field breaks this one too instead of
+/// drifting silently.
+pub(crate) fn container_chest_image(slots: &[ItemStack]) -> Option<mc_world::ChestBlockEntity> {
+    let slots: [FurnaceSlot; 27] = slots
+        .iter()
+        .map(|stack| {
+            if stack.is_empty() {
+                FurnaceSlot::EMPTY
+            } else {
+                FurnaceSlot {
+                    count: stack.count,
+                    item_id: stack.item_id,
+                    damage: stack.damage,
+                    enchantments: stack.enchantments.clone(),
+                    custom_name: stack.custom_name.clone(),
+                    item_model: stack.item_model.clone(),
+                    stew_effects: stack.stew_effects.clone(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    Some(mc_world::ChestBlockEntity { slots })
+}
+
+/// One planned server-owned warehouse deposit, as its caller observed it.
+///
+/// The caller has already resolved the durable warehouse binding, read the
+/// loaded container through the same projection a warehouse snapshot uses, and
+/// planned the move against the actor's canonical inventory; this carries only
+/// what the composite fences and commits, so the world half stays an adapter
+/// over the ordered container command.
+#[derive(Debug, Clone)]
+pub(crate) struct WarehouseTransferRequest {
+    pub(crate) actor_id: u64,
+    pub(crate) position: mc_world::BlockPos,
+    /// The container's canonical state id, as the caller observed it.
+    pub(crate) expected_state_id: i32,
+    /// The container's expected and planned 27-slot canonical images.
+    pub(crate) expected_container: Vec<ItemStack>,
+    pub(crate) updated_container: Vec<ItemStack>,
+    /// The actor's expected and planned canonical inventory.
+    pub(crate) expected_inventory: Vec<ItemStack>,
+    pub(crate) expected_carried_item: ItemStack,
+    pub(crate) updated_inventory: Vec<ItemStack>,
+    pub(crate) updated_carried_item: ItemStack,
+    /// The encoded plugin operation receipt that rides the container's own
+    /// world-journal decision.
+    pub(crate) receipt: Vec<u8>,
+}
+
+/// Result of one server-owned warehouse deposit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WarehouseTransferOutcome {
+    /// The container and the actor's inventory committed together and the
+    /// container's after-image and the receipt are journaled under this id.
+    Committed { decision_id: u64 },
+    /// The player fence moved before the owner turn: recovery pending, a
+    /// different inventory or a different carried item.
+    StalePlayer,
+    /// The container fence moved: its state id, or its authoritative slots.
+    StaleContainer,
+    /// The container is not a loaded container at the expected position.
+    MissingContainer,
+}
+
 /// Result of one session-side owned inventory decision.
 pub(crate) enum OwnedInventoryCommit {
     /// The request never reached a durable decision; the caller replies with
@@ -373,6 +446,26 @@ pub(crate) fn inventory_resource_stock(
         .filter(|stack| !stack.is_empty() && stack.item_id == item_id)
         .map(|stack| u64::try_from(stack.count).unwrap_or(0))
         .sum())
+}
+
+/// The reservation keeps its claim on the planned stock: a transfer may never
+/// drop an endpoint below the quantities other operations still hold. Both the
+/// player/resident transfer and the server-owned warehouse deposit check it.
+pub(crate) fn reservation_stock_survives(
+    planned: &BTreeMap<ScriptInventoryEndpoint, Vec<ItemStack>>,
+    reserved: &BTreeMap<ScriptInventoryEndpoint, BTreeMap<String, u64>>,
+    items: &ItemRegistry,
+) -> bool {
+    reserved.iter().all(|(endpoint, quantities)| {
+        let Some(slots) = planned.get(endpoint) else {
+            return true;
+        };
+        let window = endpoint_window(endpoint, slots);
+        quantities.iter().all(|(resource_id, quantity)| {
+            inventory_resource_stock(window, items, resource_id)
+                .is_ok_and(|stock| stock >= *quantity)
+        })
+    })
 }
 
 /// Slot window of one endpoint inside its canonical inventory vector.

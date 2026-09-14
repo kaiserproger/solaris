@@ -267,6 +267,11 @@ struct JournalShared {
     items: Arc<ItemRegistry>,
     state: Mutex<JournalState>,
     append_advanced: Arc<tokio::sync::Notify>,
+    /// Test-only ordered evidence for the append-before-publication rule: every
+    /// server-owned warehouse publication a regional run made, as
+    /// `(reserved decision id, decision already appended at publication)`.
+    #[cfg(test)]
+    warehouse_publications: Mutex<Vec<(u64, bool)>>,
 }
 
 impl JournalShared {
@@ -366,6 +371,8 @@ impl WorldChunkJournal {
                 blocks,
                 items,
                 append_advanced: Arc::clone(&writer.advanced),
+                #[cfg(test)]
+                warehouse_publications: Mutex::new(Vec::new()),
                 state: Mutex::new(JournalState {
                     path,
                     checkpoint_base: base_id,
@@ -450,11 +457,33 @@ impl WorldChunkJournal {
         current_tick: u64,
         groups: Vec<(u64, Vec<ChunkSnapshot>)>,
     ) -> Result<(), WorldChunkJournalError> {
+        self.record_reserved_decisions(
+            current_tick,
+            groups
+                .into_iter()
+                .map(|(id, snapshots)| (id, snapshots, None))
+                .collect(),
+        )
+    }
+
+    /// Append one run of reserved decisions, in reserved id order.
+    ///
+    /// A decision may carry an encoded plugin storage batch - an operation
+    /// receipt and its participant after-images - beside its chunk images, so a
+    /// server-owned composite mutation journals both participants in ONE
+    /// decision. A run that carries a batch is synced before this returns,
+    /// because its caller marks the decision projected and publishes only after.
+    pub(crate) fn record_reserved_decisions(
+        &self,
+        current_tick: u64,
+        groups: Vec<(u64, Vec<ChunkSnapshot>, Option<Vec<u8>>)>,
+    ) -> Result<(), WorldChunkJournalError> {
         if groups.is_empty() {
             return Ok(());
         }
         let mut decisions = Vec::with_capacity(groups.len());
-        for (id, snapshots) in groups {
+        let mut inventory = false;
+        for (id, snapshots, batch) in groups {
             for snapshot in &snapshots {
                 let actual = snapshot.world_journal_lsn();
                 if actual != id {
@@ -465,11 +494,15 @@ impl WorldChunkJournal {
                     });
                 }
             }
+            inventory |= batch.is_some();
             decisions.push(WorldChunkDecision {
                 id,
                 current_tick,
                 images: self.encode_images(current_tick, snapshots)?,
-                inventory: None,
+                inventory: batch.map(|payload| InventoryDecision {
+                    payload,
+                    projected: false,
+                }),
             });
         }
 
@@ -504,6 +537,13 @@ impl WorldChunkJournal {
             .ok_or(WorldChunkJournalError::RecordIdExhausted)?;
         drop(state);
         self.shared.append_advanced.notify_waiters();
+        if inventory {
+            self.writer.flush().map_err(|source| {
+                WorldChunkJournalError::InventorySyncOutcomeUnknown {
+                    source: Box::new(source),
+                }
+            })?;
+        }
         Ok(())
     }
 
@@ -568,6 +608,39 @@ impl WorldChunkJournal {
     #[cfg(test)]
     pub(crate) fn pending_decisions_for_test(&self) -> Vec<WorldChunkDecision> {
         self.shared.lock_state().pending.clone()
+    }
+
+    /// Whether the reserved decision `decision_id` has been appended to the
+    /// journal's record.
+    #[cfg(test)]
+    fn decision_appended_for_test(&self, decision_id: u64) -> bool {
+        self.shared.lock_state().next_append_id > decision_id
+    }
+
+    /// Record, at the moment a server-owned warehouse transfer publishes its
+    /// container slots, whether the decision behind that publication was
+    /// already appended.
+    ///
+    /// Ordered evidence for the append-before-publication rule: a run that
+    /// published before appending records `false`, so the test fails instead of
+    /// silently publishing a container whose after-image is not journaled.
+    #[cfg(test)]
+    pub(crate) fn record_warehouse_publication_for_test(&self, decision_id: u64) {
+        let appended = self.decision_appended_for_test(decision_id);
+        self.shared
+            .warehouse_publications
+            .lock()
+            .expect("warehouse publication probe")
+            .push((decision_id, appended));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warehouse_publications_for_test(&self) -> Vec<(u64, bool)> {
+        self.shared
+            .warehouse_publications
+            .lock()
+            .expect("warehouse publication probe")
+            .clone()
     }
 
     pub(crate) fn checkpoint_through(&self, watermark: u64) -> Result<(), WorldChunkJournalError> {
@@ -666,6 +739,8 @@ impl WorldChunkJournal {
                 blocks,
                 items,
                 append_advanced: Arc::new(tokio::sync::Notify::new()),
+                #[cfg(test)]
+                warehouse_publications: Mutex::new(Vec::new()),
                 state: Mutex::new(JournalState {
                     path,
                     checkpoint_base: 0,

@@ -28,7 +28,9 @@ use mc_world::BlockRegistry;
 use mc_worldgen::{BlueprintCatalog, PoiKind, SettlementSelector};
 
 use crate::play::SessionRegistry;
-use crate::play::owned_inventory::{resource_plan_hash, resource_plan_totals};
+use crate::play::owned_inventory::{
+    WarehouseTransferRequest, resource_plan_hash, resource_plan_totals,
+};
 use crate::play::resident_work::{ResidentBlock, ResidentDrop, ResidentWorld};
 use crate::server::ShutdownHandle;
 
@@ -125,6 +127,15 @@ impl SettlementWorld for TestWorld {
         // This fake never holds a container: a warehouse bind against it stays
         // a typed not-found rather than an invented empty container.
         Ok(ContainerReading::Missing)
+    }
+
+    fn commit_warehouse_transfer(
+        &self,
+        _request: WarehouseTransferRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + '_>> {
+        // This fake holds no container and owns no world journal, so a
+        // warehouse deposit has nothing to commit against.
+        Box::pin(async { Err(ScriptOperationFailure::RuntimeUnavailable) })
     }
 
     fn apply_structure_portion<'a>(

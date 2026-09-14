@@ -12,7 +12,7 @@ fn effective_protocol_data_rejects_missing_sidecar_root() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("missing-vanilla");
 
-    let err = match load_effective_protocol_data(Some(&missing)) {
+    let err = match load_effective_protocol_data(&missing) {
         Ok(_) => panic!("missing sidecar root must fail"),
         Err(err) => err,
     };
@@ -36,7 +36,7 @@ fn effective_protocol_data_rejects_mismatched_sidecar_version() {
     )
     .unwrap();
 
-    let err = match load_effective_protocol_data(Some(tmp.path())) {
+    let err = match load_effective_protocol_data(tmp.path()) {
         Ok(_) => panic!("mismatched sidecar version must fail before registry loading"),
         Err(err) => err,
     };
@@ -56,31 +56,13 @@ fn effective_tags_reject_empty_vanilla_sidecar() {
     let data = mc_data::VanillaData::from_registries("", vec![]);
     let items = mc_data::items::ItemRegistry::default();
 
-    let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
+    let err = match load_effective_tags(tmp.path(), &data, &items) {
         Ok(_) => panic!("empty vanilla tag sidecar must fail"),
         Err(err) => err,
     };
 
     assert!(err.to_string().contains("vanilla tags"));
     assert!(err.to_string().contains("were empty"));
-}
-
-#[test]
-fn effective_tags_attach_fuel_values_to_embedded_startup_data() {
-    let items = mc_data::items::solaris_required_items();
-    let blocks = mc_data::blocks::solaris_required_blocks_report();
-
-    let effective =
-        load_effective_tags(None, &mc_data::solaris_required_data(), &items, &blocks).unwrap();
-    let oak_stairs = items
-        .id_of(&Identifier::parse("minecraft:oak_stairs").unwrap())
-        .unwrap();
-    let warped_stairs = items
-        .id_of(&Identifier::parse("minecraft:warped_stairs").unwrap())
-        .unwrap();
-
-    assert_eq!(effective.fuel_values().burn_duration(oak_stairs), Some(300));
-    assert!(!effective.fuel_values().is_fuel(warped_stairs));
 }
 
 #[test]
@@ -150,10 +132,9 @@ fn effective_tags_reject_partial_fuel_membership_with_all_required_keys() {
     }]);
 
     let err = match load_effective_tags(
-        Some(tmp.path()),
+        tmp.path(),
         &mc_data::VanillaData::from_registries("", vec![]),
         &items,
-        &[],
     ) {
         Ok(_) => panic!("partial canonical fuel membership must fail startup"),
         Err(err) => err,
@@ -193,7 +174,7 @@ fn effective_tags_reject_missing_required_vanilla_tag_registry() {
     let data = mc_data::VanillaData::from_registries("", vec![]);
     let items = mc_data::items::ItemRegistry::default();
 
-    let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
+    let err = match load_effective_tags(tmp.path(), &data, &items) {
         Ok(_) => panic!("partial vanilla tag sidecar must fail"),
         Err(err) => err,
     };
@@ -232,7 +213,7 @@ fn effective_tags_reject_required_tag_registries_without_protocol_ids() {
     let data = mc_data::VanillaData::from_registries("", vec![]);
     let items = mc_data::items::ItemRegistry::default();
 
-    let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
+    let err = match load_effective_tags(tmp.path(), &data, &items) {
         Ok(_) => panic!("unresolved required tag registries must fail"),
         Err(err) => err,
     };
@@ -259,7 +240,7 @@ fn effective_block_light_requires_sidecar_file_when_vanilla_dir_is_set() {
         }],
     }];
 
-    let err = match load_effective_block_light(Some(tmp.path()), &report) {
+    let err = match load_effective_block_light(tmp.path(), &report) {
         Ok(_) => panic!("missing block_light.json must fail"),
         Err(err) => err,
     };
@@ -275,7 +256,7 @@ fn effective_block_light_requires_sidecar_file_when_vanilla_dir_is_set() {
 fn effective_item_facts_reject_missing_sidecar_report() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let error = match load_effective_item_facts(Some(tmp.path())) {
+    let error = match load_effective_item_facts(tmp.path()) {
         Ok(_) => panic!("missing item component report must fail"),
         Err(error) => error,
     };
@@ -297,7 +278,7 @@ fn effective_block_mining_requires_sidecar_file_when_configured() {
         }],
     }];
 
-    let error = match load_effective_block_mining(Some(tmp.path()), &report) {
+    let error = match load_effective_block_mining(tmp.path(), &report) {
         Ok(_) => panic!("missing block_mining.json must fail"),
         Err(error) => error,
     };
@@ -329,10 +310,10 @@ fn effective_block_mining_loads_matching_sidecar() {
         }],
     }];
 
-    let effective = load_effective_block_mining(Some(tmp.path()), &report).unwrap();
+    let effective = load_effective_block_mining(tmp.path(), &report).unwrap();
 
     assert_eq!(
-        effective.as_ref().and_then(|table| table.facts(1)),
+        effective.facts(1),
         Some(mc_data::block_mining::BlockMiningFacts {
             destroy_speed: 1.5,
             requires_correct_tool_for_drops: true,
@@ -366,7 +347,7 @@ fn effective_item_facts_load_sidecar_tool_rules() {
     )
     .unwrap();
 
-    let effective = load_effective_item_facts(Some(tmp.path())).unwrap();
+    let effective = load_effective_item_facts(tmp.path()).unwrap();
 
     let tool = effective
         .get(&Identifier::parse("minecraft:wooden_pickaxe").unwrap())
@@ -396,7 +377,7 @@ fn effective_block_light_rejects_sidecar_that_does_not_cover_blocks_report() {
         }],
     }];
 
-    let err = match load_effective_block_light(Some(tmp.path()), &report) {
+    let err = match load_effective_block_light(tmp.path(), &report) {
         Ok(_) => panic!("stale block-light sidecar must fail"),
         Err(err) => err,
     };
@@ -424,23 +405,13 @@ fn effective_block_light_rejects_wrong_target_version() {
         }],
     }];
 
-    let err = match load_effective_block_light(Some(tmp.path()), &report) {
+    let err = match load_effective_block_light(tmp.path(), &report) {
         Ok(_) => panic!("wrong block-light target version must fail"),
         Err(err) => err,
     };
 
     assert!(err.to_string().contains("not-the-target"));
     assert!(err.to_string().contains(mc_protocol::TARGET_RELEASE));
-}
-
-#[test]
-fn effective_loot_uses_embedded_fallback_without_sidecar() {
-    let loot = load_effective_loot(None).unwrap();
-
-    assert_eq!(
-        loot.block_drop(&Identifier::parse("minecraft:stone").unwrap()),
-        Some(&Identifier::parse("minecraft:cobblestone").unwrap())
-    );
 }
 
 #[test]
@@ -466,7 +437,7 @@ fn effective_loot_uses_simple_vanilla_sidecar_when_present() {
     )
     .unwrap();
 
-    let loot = load_effective_loot(Some(tmp.path())).unwrap();
+    let loot = load_effective_loot(tmp.path()).unwrap();
 
     assert_eq!(
         loot.block_drop(&Identifier::parse("minecraft:stone").unwrap()),
@@ -521,7 +492,7 @@ fn effective_loot_completes_partial_entity_table_from_fallback() {
     )
     .unwrap();
 
-    let loot = load_effective_loot(Some(tmp.path())).unwrap();
+    let loot = load_effective_loot(tmp.path()).unwrap();
 
     assert_eq!(
         loot.entity_drop_stacks(&Identifier::parse("minecraft:sheep").unwrap())
@@ -537,7 +508,7 @@ fn effective_loot_completes_partial_entity_table_from_fallback() {
 fn effective_loot_rejects_sidecar_with_no_simple_loot() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let err = match load_effective_loot(Some(tmp.path())) {
+    let err = match load_effective_loot(tmp.path()) {
         Ok(_) => panic!("configured vanilla loot sidecar without usable drops must fail"),
         Err(err) => err,
     };
@@ -578,7 +549,7 @@ fn effective_recipes_keep_embedded_display_ids_when_sidecar_is_present() {
     )
     .unwrap();
 
-    let recipes = load_effective_recipes(Some(tmp.path())).unwrap();
+    let recipes = load_effective_recipes(tmp.path()).unwrap();
     let embedded = mc_data::recipes::solaris_required_recipes();
     let oak_planks_index = embedded
         .iter()
@@ -632,22 +603,11 @@ fn recipe_result_stack_validation_rejects_known_item_overflow() {
 fn effective_recipes_reject_configured_sidecar_without_supported_recipes() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let err = match load_effective_recipes(Some(tmp.path())) {
+    let err = match load_effective_recipes(tmp.path()) {
         Ok(_) => panic!("configured vanilla recipe sidecar without recipes must fail"),
         Err(err) => err,
     };
 
     assert!(err.to_string().contains("vanilla recipes"));
     assert!(err.to_string().contains("no supported recipes"));
-}
-
-#[test]
-fn effective_recipes_use_embedded_fallback_without_sidecar() {
-    let recipes = load_effective_recipes(None).unwrap();
-
-    assert!(
-        recipes
-            .iter()
-            .any(|recipe| recipe.id.as_str() == "minecraft:oak_planks")
-    );
 }

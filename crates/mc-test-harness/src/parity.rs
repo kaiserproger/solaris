@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -756,6 +756,37 @@ pub fn reserve_local_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Typed failure while launching the vanilla oracle process.
+///
+/// The capture step maps these onto its own error so a caller can tell "Java
+/// is not installed" from "the server never became ready" without parsing
+/// message text.
+#[derive(Debug, thiserror::Error)]
+pub enum VanillaLaunchError {
+    #[error("vanilla server jar missing: {}", path.display())]
+    JarMissing { path: PathBuf },
+
+    #[error("prepare the vanilla work directory at {}: {detail}", path.display())]
+    WorkDir { path: PathBuf, detail: String },
+
+    #[error("launch vanilla oracle {} with {}: {source}", jar.display(), program.display())]
+    Spawn {
+        jar: PathBuf,
+        program: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("vanilla oracle did not become ready within {timeout:?}: {log}")]
+    NotReady { timeout: Duration, log: String },
+
+    #[error("vanilla oracle exited before ready with {status}: {log}")]
+    Exited { status: ExitStatus, log: String },
+
+    #[error("reap the vanilla oracle process: {detail}")]
+    Reap { detail: String },
+}
+
 /// Owns a running vanilla oracle process. Dropping it tries to stop the server
 /// gracefully before killing the child as a fallback.
 pub struct VanillaServerProcess {
@@ -766,23 +797,44 @@ pub struct VanillaServerProcess {
 }
 
 impl VanillaServerProcess {
+    /// Launch with the `JAVA` environment override, or `java` from `PATH`.
     pub fn launch(jar: &Path, work_dir: &Path, timeout: Duration) -> Result<Self> {
+        let java = std::env::var_os("JAVA").map_or_else(|| PathBuf::from("java"), PathBuf::from);
+        Ok(Self::launch_with_java(jar, work_dir, &java, timeout)?)
+    }
+
+    /// Launch `jar` with an explicit Java executable.
+    ///
+    /// Readiness is the server's own "Done"/command-prompt log line, watched on
+    /// the child's stdout/stderr; there is no polling sleep.
+    pub fn launch_with_java(
+        jar: &Path,
+        work_dir: &Path,
+        java: &Path,
+        timeout: Duration,
+    ) -> Result<Self, VanillaLaunchError> {
         if !jar.is_file() {
-            bail!("vanilla server jar missing: {}", jar.display());
+            return Err(VanillaLaunchError::JarMissing {
+                path: jar.to_path_buf(),
+            });
         }
-        std::fs::create_dir_all(work_dir)
-            .with_context(|| format!("create {}", work_dir.display()))?;
-        std::fs::write(work_dir.join("eula.txt"), "eula=true\n")?;
-        let port = reserve_local_port()?;
+        let work_dir_error = |error: &dyn std::fmt::Display| VanillaLaunchError::WorkDir {
+            path: work_dir.to_path_buf(),
+            detail: error.to_string(),
+        };
+        std::fs::create_dir_all(work_dir).map_err(|error| work_dir_error(&error))?;
+        std::fs::write(work_dir.join("eula.txt"), "eula=true\n")
+            .map_err(|error| work_dir_error(&error))?;
+        let port = reserve_local_port().map_err(|error| work_dir_error(&error))?;
         std::fs::write(
             work_dir.join("server.properties"),
             format!(
                 "online-mode=false\nserver-ip=127.0.0.1\nserver-port={port}\nlevel-name=world\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\nallow-flight=true\n"
             ),
-        )?;
+        )
+        .map_err(|error| work_dir_error(&error))?;
 
-        let java = std::env::var_os("JAVA").unwrap_or_else(|| "java".into());
-        let mut child = Command::new(&java)
+        let mut child = Command::new(java)
             .arg("-Xms256M")
             .arg("-Xmx1G")
             .arg("-jar")
@@ -793,22 +845,24 @@ impl VanillaServerProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| {
-                format!(
-                    "launch vanilla oracle {} with {}",
-                    jar.display(),
-                    Path::new(&java).display()
-                )
+            .map_err(|source| VanillaLaunchError::Spawn {
+                jar: jar.to_path_buf(),
+                program: java.to_path_buf(),
+                source,
             })?;
 
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow!("missing child stdout"))?;
+            .ok_or_else(|| VanillaLaunchError::Reap {
+                detail: "missing child stdout".into(),
+            })?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| anyhow!("missing child stderr"))?;
+            .ok_or_else(|| VanillaLaunchError::Reap {
+                detail: "missing child stderr".into(),
+            })?;
         let stdin = child.stdin.take();
         let (tx, rx) = mpsc::channel();
         spawn_log_watcher(stdout, tx.clone());
@@ -816,14 +870,23 @@ impl VanillaServerProcess {
 
         let deadline = Instant::now() + timeout;
         let mut recent = Vec::new();
+        let exited = |child: &mut Child, recent: &Vec<String>| {
+            let status = child.wait().map_err(|error| VanillaLaunchError::Reap {
+                detail: error.to_string(),
+            })?;
+            Err(VanillaLaunchError::Exited {
+                status,
+                log: recent.join("\n"),
+            })
+        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 let _ = child.kill();
-                bail!(
-                    "timed out waiting for vanilla oracle: {}",
-                    recent.join("\n")
-                );
+                return Err(VanillaLaunchError::NotReady {
+                    timeout,
+                    log: recent.join("\n"),
+                });
             }
             match rx.recv_timeout(remaining) {
                 Ok(line) => {
@@ -842,18 +905,12 @@ impl VanillaServerProcess {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let _ = child.kill();
-                    bail!(
-                        "timed out waiting for vanilla oracle: {}",
-                        recent.join("\n")
-                    );
+                    return Err(VanillaLaunchError::NotReady {
+                        timeout,
+                        log: recent.join("\n"),
+                    });
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let status = child.wait()?;
-                    bail!(
-                        "vanilla oracle exited before ready with {status}: {}",
-                        recent.join("\n")
-                    );
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return exited(&mut child, &recent),
             }
         }
     }

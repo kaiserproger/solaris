@@ -28,6 +28,7 @@ use mc_world::{
 
 use crate::noise::fbm_2d;
 use crate::structures::{StructureLoot, StructureRules, StructureTemplate};
+use crate::village::plan_source::{VillagePlanSet, VillagePlanSource};
 
 mod biome_routing;
 mod biome_rules;
@@ -222,6 +223,12 @@ pub struct TerrainGenerator {
     geological_ores: Option<GeologicalOreRules>,
     ore_generation_profile: &'static str,
     structures: StructureRules,
+    /// The village plan lookup. `None` — no village generation — keeps every
+    /// path in this generator byte-identical to the pre-village behaviour:
+    /// [`TerrainGenerator::surface_height`] reads the router directly and
+    /// [`TerrainGenerator::apply_structures`] takes its `structures.is_empty()`
+    /// fast path.
+    village_plans: Option<Arc<VillagePlanSource>>,
     /// Compiled vanilla chest tables rolled at structure paste time. Empty
     /// by default, in which case structure chests paste fixed contents.
     chest_loot: ChestLootCatalog,
@@ -281,6 +288,10 @@ impl OreColumnCache {
     ) -> Option<&'a ColumnPlan> {
         let index = self.column_index(world_x, world_z)?;
         if self.columns[index].is_none() {
+            // The column's own village plan, from the same on-demand lookup
+            // every other column surface comes from: the halo reaches into
+            // neighbouring chunks, so the plan cannot be this chunk's.
+            let plan = generator.village_plans_for_column(world_x, world_z);
             self.columns[index] = Some(generator.plan_column(
                 ChunkPos {
                     x: world_x.div_euclid(16),
@@ -288,6 +299,7 @@ impl OreColumnCache {
                 },
                 world_x.rem_euclid(16) as u8,
                 world_z.rem_euclid(16) as u8,
+                plan.as_ref(),
             ));
         }
         self.columns[index].as_ref()
@@ -685,6 +697,7 @@ impl TerrainGenerator {
             geological_ores: None,
             ore_generation_profile: "vanilla",
             structures: StructureRules::none(),
+            village_plans: None,
             chest_loot: ChestLootCatalog::new(),
             chest_loot_items: ItemRegistry::default(),
             decorations: DecorationBlocks::new(registry.as_ref()),
@@ -699,6 +712,25 @@ impl TerrainGenerator {
     pub fn with_structures(mut self, structures: StructureRules) -> Self {
         self.structures = structures;
         self
+    }
+
+    /// Wire the village plan source: vanilla villages assembled by the jigsaw
+    /// solver, placed through [`crate::village::piece`], with their
+    /// `terrain_adaptation = beard_thin` applied as [`crate::village::beard`]'s
+    /// column-height analogue.
+    ///
+    /// Until this is called the generator places no villages, and every path
+    /// stays byte-identical to a build without village generation.
+    #[must_use]
+    pub fn with_village_plans(mut self, source: Arc<VillagePlanSource>) -> Self {
+        self.village_plans = Some(source);
+        self
+    }
+
+    /// The village plan source, when the generator was given one.
+    #[must_use]
+    pub fn village_plan_source(&self) -> Option<&Arc<VillagePlanSource>> {
+        self.village_plans.as_ref()
     }
 
     /// Wire compiled vanilla chest tables plus the item registry that
@@ -755,15 +787,104 @@ impl TerrainGenerator {
     /// Sample the terrain height for an absolute world `(x, z)`.
     /// Public so tests + spawn-position picking can use the same
     /// function the generator does.
+    ///
+    /// A configured village plan source applies the column-height analogue
+    /// here, on the same on-demand plan lookup
+    /// ([`VillagePlanSource::plans_for_column`]) the chunk fill reads its own
+    /// chunk's plans from, so this query and the generated terrain agree.
     #[must_use]
     pub fn surface_height(&self, world_x: i32, world_z: i32) -> i32 {
+        let base = self.base_surface_y(world_x, world_z);
+        match self.village_plans_for_column(world_x, world_z) {
+            Some(plans) => self.village_surface_y(world_x, world_z, base, Some(&plans)),
+            None => base,
+        }
+    }
+
+    /// The router's surface for one column, before the village analogue.
+    fn base_surface_y(&self, world_x: i32, world_z: i32) -> i32 {
         self.density_router().sample(world_x, world_z).surface_y
+    }
+
+    /// `WORLD_SURFACE_WG`'s first free height: one above the surface block,
+    /// the height the jigsaw solver projects a start piece to.
+    fn first_free_height(&self, world_x: i32, world_z: i32) -> i32 {
+        self.base_surface_y(world_x, world_z).saturating_add(1)
+    }
+
+    /// The plans the chunk being filled reads its pieces and beard columns
+    /// from: a single on-demand lookup per generated chunk.
+    fn village_plans_for_chunk(&self, pos: ChunkPos) -> Option<VillagePlanSet> {
+        let source = self.village_plans.as_ref()?;
+        let free_height = |x, z| self.first_free_height(x, z);
+        let biome_at = |x, z| self.base_biome(x, z);
+        source.plans_for_chunk(pos.x, pos.z, &free_height, &biome_at)
+    }
+
+    /// The plans covering one column, for callers that hold a column rather than
+    /// the chunk being filled. The chunk's own set filtered to the column, so a
+    /// column and its chunk cannot disagree.
+    fn village_plans_for_column(&self, world_x: i32, world_z: i32) -> Option<VillagePlanSet> {
+        let source = self.village_plans.as_ref()?;
+        let free_height = |x, z| self.first_free_height(x, z);
+        let biome_at = |x, z| self.base_biome(x, z);
+        source.plans_for_column(world_x, world_z, &free_height, &biome_at)
+    }
+
+    /// The terrain's own biome at a column, before any village is applied.
+    ///
+    /// This is the biome the structure gate reads, and it deliberately does not
+    /// go through [`TerrainGenerator::surface_height`] or
+    /// [`TerrainGenerator::diagnostic_sample`]: both consult the plan lookup,
+    /// which asks this question, so a plan-aware path here would recurse.
+    #[must_use]
+    pub fn base_biome(&self, world_x: i32, world_z: i32) -> Identifier {
+        self.cached_diagnostic_sample(world_x, world_z).biome
+    }
+
+    /// The surface a column is planned at: the terrain's own surface, moved by
+    /// the column-height analogue of every plan that reaches the column.
+    fn village_surface_y(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        base: i32,
+        plans: Option<&VillagePlanSet>,
+    ) -> i32 {
+        match plans {
+            Some(plans) => plans.adjusted_surface_y(
+                world_x,
+                world_z,
+                base,
+                self.geometry.min_y(),
+                self.geometry.max_y(),
+            ),
+            None => base,
+        }
     }
 
     /// Sample the same terrain, biome, and vegetation decisions used to plan a
     /// generated column, without constructing or mutating a chunk.
+    ///
+    /// A configured village plan source moves `surface_y` exactly where it moves
+    /// a generated column's surface: [`TerrainGenerator::surface_height`],
+    /// [`TerrainGenerator::plan_column`] and this sample all read one plan per
+    /// chunk ([`VillagePlanSource::plans_for_column`] here, the chunk's own plans
+    /// inside generation), so they cannot disagree.
     #[must_use]
     pub fn diagnostic_sample(&self, world_x: i32, world_z: i32) -> TerrainDiagnosticSample {
+        let sample = self.cached_diagnostic_sample(world_x, world_z);
+        let plans = self.village_plans_for_column(world_x, world_z);
+        TerrainDiagnosticSample {
+            surface_y: self.village_surface_y(world_x, world_z, sample.surface_y, plans.as_ref()),
+            ..sample
+        }
+    }
+
+    /// The terrain's own decisions for a column, memoized, before the village
+    /// analogue. The fill path reads this and applies its chunk's plan to the
+    /// result, so the analogue is applied once per consumer, not twice.
+    fn cached_diagnostic_sample(&self, world_x: i32, world_z: i32) -> TerrainDiagnosticSample {
         if let Some(sample) = self.diagnostic_cache.get(world_x, world_z) {
             return sample;
         }
@@ -931,11 +1052,17 @@ impl TerrainGenerator {
             || Self::is_savanna(biome)
     }
 
-    fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
+    fn plan_column(
+        &self,
+        pos: ChunkPos,
+        lx: u8,
+        lz: u8,
+        plans: Option<&VillagePlanSet>,
+    ) -> ColumnPlan {
         let wx = world_block_coordinate(pos.x, lx);
         let wz = world_block_coordinate(pos.z, lz);
-        let diagnostic = self.diagnostic_sample(wx, wz);
-        let height = diagnostic.surface_y;
+        let diagnostic = self.cached_diagnostic_sample(wx, wz);
+        let height = self.village_surface_y(wx, wz, diagnostic.surface_y, plans);
         let biome = diagnostic.biome;
         let vegetation_density = diagnostic.vegetation_density.unwrap_or(-1.0);
         let (sea_level, water_enabled) = match self.worldgen_mode {
@@ -1539,7 +1666,10 @@ impl TerrainGenerator {
         Some(surface)
     }
 
-    fn apply_structures(&self, chunk: &mut Chunk) {
+    fn apply_structures(&self, chunk: &mut Chunk, village: Option<&VillagePlanSet>) {
+        if let Some(plans) = village {
+            self.apply_village_pieces(chunk, plans);
+        }
         if self.structures.is_empty() {
             return;
         }
@@ -1552,6 +1682,44 @@ impl TerrainGenerator {
             for gz in (cell_z - 1)..=(cell_z + 1) {
                 self.apply_structure_cell(chunk, gx, gz, &mut touched);
             }
+        }
+        for lz in 0..16u8 {
+            for lx in 0..16u8 {
+                if touched[lz as usize * 16 + lx as usize] {
+                    self.refresh_structure_column(chunk, lx, lz);
+                }
+            }
+        }
+    }
+
+    /// Write every plan's piece blocks into this chunk and refresh the
+    /// heightmaps of the columns they touched.
+    ///
+    /// Pieces are clipped to the chunk's box, so a village spanning several
+    /// chunks writes each chunk's part of it when that chunk is filled, and a
+    /// chunk two villages reach writes both.
+    ///
+    /// A piece that cannot be placed is a registry mismatch, and
+    /// [`VillagePlanSource::new`] refuses such a registry at startup rather than
+    /// dropping blocks here. Chunk generation has no way to report a failure, so
+    /// the invariant is enforced where it can be, once, before a world uses the
+    /// village — and reaching the failure here means the village would silently
+    /// lose blocks, which is worse than stopping.
+    fn apply_village_pieces(&self, chunk: &mut Chunk, plans: &VillagePlanSet) {
+        let Some(source) = self.village_plans.as_ref() else {
+            return;
+        };
+        let surface = |x: i32, z: i32| self.base_surface_y(x, z);
+        let loot = StructureLoot {
+            seed: self.seed,
+            catalog: &self.chest_loot,
+            items: &self.chest_loot_items,
+        };
+        let mut touched = [false; 256];
+        for plan in plans.plans() {
+            source
+                .write_pieces(chunk, plan, &mut touched, &surface, self.air, &loot)
+                .expect("the plan source was validated against this registry at construction");
         }
         for lz in 0..16u8 {
             for lx in 0..16u8 {
@@ -2376,10 +2544,11 @@ impl ChunkGenerator for TerrainGenerator {
         chunk
             .heightmaps
             .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
+        let village = self.village_plans_for_chunk(pos);
         let columns = std::array::from_fn(|idx| {
             let lx = (idx % 16) as u8;
             let lz = (idx / 16) as u8;
-            self.plan_column(pos, lx, lz)
+            self.plan_column(pos, lx, lz, village.as_ref())
         });
 
         for plan in &columns {
@@ -2410,7 +2579,7 @@ impl ChunkGenerator for TerrainGenerator {
             self.apply_ores_with_cache(&mut chunk, &mut ore_cache);
         }
         self.assign_biomes(&mut chunk, &columns);
-        self.apply_structures(&mut chunk);
+        self.apply_structures(&mut chunk, village.as_ref());
         self.apply_decorations(&mut chunk, &columns);
         chunk.status = "minecraft:full".into();
         chunk.mark_dirty();

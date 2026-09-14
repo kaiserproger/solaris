@@ -14,6 +14,8 @@ pub mod settlement_catalog;
 pub mod settlement_sites;
 pub mod structures;
 pub mod terrain;
+pub mod vanilla_features;
+pub mod village;
 
 #[cfg(test)]
 mod mosaic_tests;
@@ -21,6 +23,20 @@ mod mosaic_tests;
 mod settlement_catalog_tests;
 #[cfg(test)]
 mod settlement_sites_tests;
+#[cfg(test)]
+mod vanilla_features_tests;
+#[cfg(test)]
+mod village_piece_tests;
+#[cfg(test)]
+mod village_plan_source_tests;
+#[cfg(test)]
+mod village_processors_tests;
+#[cfg(test)]
+mod village_shapes_tests;
+#[cfg(test)]
+mod village_solver_tests;
+#[cfg(test)]
+mod village_tests;
 
 pub use end::{
     END_HEIGHT, END_ISLAND_AMPLITUDE, END_ISLAND_BASE_Y, END_ISLAND_FALLOFF, END_ISLAND_RADIUS,
@@ -57,7 +73,13 @@ pub use terrain::{
 };
 
 /// Changes whenever Solaris intentionally changes newly generated terrain.
-pub const WORLDGEN_REVISION: u32 = 21;
+///
+/// 22: core generates vanilla villages (`settlement_profile = "vanilla"`) —
+/// jigsaw-assembled pieces with their processors, and their
+/// `terrain_adaptation = beard_thin` applied as the column-height analogue in
+/// [`village::beard`]. A world written by revision 21 has no villages and keeps
+/// generating without them; the mismatch is what startup reports.
+pub const WORLDGEN_REVISION: u32 = 22;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

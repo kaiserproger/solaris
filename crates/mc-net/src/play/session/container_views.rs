@@ -101,7 +101,11 @@ impl SessionRegistry {
         }
     }
 
-    pub(in crate::play) fn chest_state_id(&self, position: mc_world::BlockPos) -> i32 {
+    /// The container's canonical menu generation, the fence a caller observes
+    /// before a transfer of its slots. Widened to the crate because the
+    /// server-owned warehouse deposit observes it on the plugin side, which is
+    /// the caller of that composite.
+    pub(crate) fn chest_state_id(&self, position: mc_world::BlockPos) -> i32 {
         let containers = self.lock_containers(position, "chest state id");
         containers
             .chest_state_ids

@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::play::BlockEdit;
 use crate::play::SimulationHandle;
 use crate::play::owned_inventory::container_slot_to_item;
+use crate::play::owned_inventory::{WarehouseTransferOutcome, WarehouseTransferRequest};
 use crate::script::PluginZoneAdapter;
 use crate::script::storage::{
     ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
@@ -657,6 +658,30 @@ impl SettlementWorld for LiveSettlementWorld {
         Ok(ContainerReading::Loaded(
             chest.slots.iter().map(container_slot_to_item).collect(),
         ))
+    }
+
+    fn commit_warehouse_transfer(
+        &self,
+        request: WarehouseTransferRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + '_>> {
+        Box::pin(async move {
+            match self.simulation.commit_warehouse_transfer(request).await {
+                Ok(WarehouseTransferOutcome::Committed { decision_id }) => Ok(decision_id),
+                // A moved container fence and a moved player fence are the one
+                // family a transfer fences with: the caller re-reads and retries.
+                Ok(
+                    WarehouseTransferOutcome::StalePlayer
+                    | WarehouseTransferOutcome::StaleContainer,
+                ) => Err(ScriptOperationFailure::StaleRevision),
+                Ok(WarehouseTransferOutcome::MissingContainer) => {
+                    Err(ScriptOperationFailure::NotFound)
+                }
+                // A closed queue, a refused command or a journal that could not
+                // take the decision leaves nothing behind: report the runtime,
+                // never a committed deposit.
+                Err(_) => Err(ScriptOperationFailure::RuntimeUnavailable),
+            }
+        })
     }
 
     fn apply_structure_portion<'a>(

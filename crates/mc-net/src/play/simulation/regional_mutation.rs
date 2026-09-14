@@ -1,4 +1,4 @@
-use mc_world::{ResidentBlockEdit, ResidentBlockPrecondition};
+use mc_world::{ChunkPos, JournalStampResult, ResidentBlockEdit, ResidentBlockPrecondition};
 
 use super::super::block_edit_commit::{
     resident_block_edit_result_outcome, resident_block_edits, resident_block_preconditions,
@@ -10,12 +10,13 @@ use super::{
     ChestTransactionRequest, CommittedBucketUse, CommittedCampfireUse, CommittedSurvivalBreak,
     CommittedSurvivalPlacement, ContainerDropPlan, ContainerPlayerPlan, ContainerXpPlan,
     FurnaceBlockEntity, FurnaceCommitOutcome, FurnaceTransaction, FurnaceTransactionRequest,
-    HashMap, IncrementalLightSources, Ordering, ScheduledBlockTick, SessionId, SessionRegistry,
-    SharedContainerCommit, SimulationCommand, SimulationCommandAttribution,
-    SimulationCommandEnvelope, SimulationLaneAttribution, SimulationOwner, SimulationRequestError,
-    SimulationResponse, SimulationTickReport, SimulationWorldAccess, SurvivalBreakPlan,
-    SurvivalBreakRequest, SurvivalBreakTransaction, SurvivalPlacementPlan,
-    SurvivalPlacementTransaction, Vec3, air_state_id, append_block_edit_outcome,
+    HashMap, IncrementalLightSources, Ordering, ScheduledBlockTick, ServerOwnedChestCommit,
+    SessionId, SessionRegistry, SharedContainerCommit, SimulationCommand,
+    SimulationCommandAttribution, SimulationCommandEnvelope, SimulationLaneAttribution,
+    SimulationOwner, SimulationRequestError, SimulationResponse, SimulationTickReport,
+    SimulationWorldAccess, SurvivalBreakPlan, SurvivalBreakRequest, SurvivalBreakTransaction,
+    SurvivalPlacementPlan, SurvivalPlacementTransaction, Vec3, VisibilityDispatch,
+    WarehouseTransferOutcome, air_state_id, append_block_edit_outcome,
     applied_edits_need_fluid_ticks, command_single_owner_region, dispatch_regional_block_outcome,
     dispatch_visibility_commands, elapsed_us, falling_block_start_chunks, is_campfire_block,
     is_falling_block_state, plan_falling_block_starts, prepare_survival_block_break_plan,
@@ -24,6 +25,8 @@ use super::{
 };
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use super::OutboundCommand;
 #[cfg(test)]
 use super::RegionKey;
 
@@ -86,6 +89,9 @@ enum RegionalMutationJob {
         expected: Vec<ChestBlockEntity>,
         updated: Vec<ChestBlockEntity>,
         player: Box<ContainerPlayerPlan>,
+        /// Present for a server-owned deposit: the encoded plugin receipt the
+        /// run journals beside the container's after-image.
+        plugin_receipt: Option<Vec<u8>>,
     },
     Furnace {
         transaction: Option<FurnaceTransaction>,
@@ -106,6 +112,24 @@ enum RegionalMutationJob {
         transaction: Option<CampfireUseTransaction>,
         plan: Box<CampfireUsePlan>,
     },
+}
+
+/// What one server-owned deposit contributes to the run's single group append.
+enum RegionalWarehouseDecision {
+    /// The container committed and its after-image is stamped for the id this
+    /// envelope reserved, so the run journals the container and the plugin
+    /// receipt together and then releases the stamp's flush fence.
+    Stamped {
+        images: Vec<mc_world::ChunkSnapshot>,
+        receipt: Vec<u8>,
+    },
+    /// The composite refused before any mutation: the reserved id is closed
+    /// with no participant so the run's append stays contiguous.
+    Refused,
+    /// The container committed but its chunk could not be stamped for this id,
+    /// so the decision cannot be appended at all: the run fails closed rather
+    /// than publishing a receipt recoverable without its container.
+    Unjournaled,
 }
 
 enum RegionalBlockEditJobResult {
@@ -152,6 +176,14 @@ enum RegionalBlockEditJobResult {
         outcome: Box<Result<ChestCommitOutcome, SimulationRequestError>>,
         drops: Vec<ContainerDropPlan>,
     },
+    /// One server-owned deposit: the run pairs its decision with the reserved
+    /// id this envelope already holds.
+    WarehouseTransfer {
+        sequence: u64,
+        outcome: Box<Result<WarehouseTransferOutcome, SimulationRequestError>>,
+        decision: Option<RegionalWarehouseDecision>,
+        dispatches: Vec<VisibilityDispatch>,
+    },
     Furnace {
         sequence: u64,
         outcome: Box<Result<FurnaceCommitOutcome, SimulationRequestError>>,
@@ -179,6 +211,7 @@ impl RegionalBlockEditJobResult {
             | Self::SurvivalBreak { sequence, .. }
             | Self::BucketUse { sequence, .. }
             | Self::Chest { sequence, .. }
+            | Self::WarehouseTransfer { sequence, .. }
             | Self::Furnace { sequence, .. }
             | Self::OpaqueBlockEntity { sequence, .. }
             | Self::CampfireUse { sequence, .. } => *sequence,
@@ -309,6 +342,7 @@ impl SimulationOwner {
                     expected,
                     updated,
                     player,
+                    plugin_receipt,
                 } => RegionalMutationJob::Chest {
                     transaction: sessions
                         .prepare_chest_transaction(*actor_session, *primary_position),
@@ -318,6 +352,7 @@ impl SimulationOwner {
                     expected: expected.clone(),
                     updated: updated.clone(),
                     player: player.clone(),
+                    plugin_receipt: plugin_receipt.clone(),
                 },
                 SimulationCommand::CommitFurnace {
                     position,
@@ -649,27 +684,128 @@ impl SimulationOwner {
                                 expected,
                                 updated,
                                 player,
+                                plugin_receipt,
                             } => {
-                                let outcome = transaction.map_or(
-                                    Err(SimulationRequestError::StaleSession),
-                                    |transaction| {
-                                        transaction.commit(
-                                            &mutation,
-                                            ChestTransactionRequest {
-                                                primary_position,
-                                                positions: &positions,
-                                                expected_state_id,
-                                                expected: &expected,
-                                                updated: &updated,
-                                                player: &player,
-                                            },
-                                        )
-                                    },
-                                );
-                                RegionalBlockEditJobResult::Chest {
-                                    sequence: job.sequence,
-                                    outcome: Box::new(outcome),
-                                    drops: player.drops.clone(),
+                                if let Some(receipt) = plugin_receipt {
+                                    let committed = transaction.map_or(
+                                        Err(SimulationRequestError::StaleSession),
+                                        |transaction| {
+                                            transaction.commit_server_owned(
+                                                &mutation,
+                                                ChestTransactionRequest {
+                                                    primary_position,
+                                                    positions: &positions,
+                                                    expected_state_id,
+                                                    expected: &expected,
+                                                    updated: &updated,
+                                                    player: &player,
+                                                },
+                                            )
+                                        },
+                                    );
+                                    let (outcome, decision, dispatches) = match (committed, journal_id)
+                                    {
+                                        (
+                                            Ok(ServerOwnedChestCommit::Committed(dispatches)),
+                                            Some(decision_id),
+                                        ) => {
+                                            let container_chunk = ChunkPos {
+                                                x: primary_position.x.div_euclid(16),
+                                                z: primary_position.z.div_euclid(16),
+                                            };
+                                            match mutation.stamp_chunks_for_world_journal(
+                                                decision_id,
+                                                std::slice::from_ref(&container_chunk),
+                                            ) {
+                                                JournalStampResult::Stamped(images) => (
+                                                    Ok(WarehouseTransferOutcome::Committed {
+                                                        decision_id,
+                                                    }),
+                                                    Some(RegionalWarehouseDecision::Stamped {
+                                                        images,
+                                                        receipt,
+                                                    }),
+                                                    dispatches,
+                                                ),
+                                                JournalStampResult::NewerDecision(newer) => {
+                                                    warn!(
+                                                        decision_id,
+                                                        newer,
+                                                        "server-owned container stamp lost its decision"
+                                                    );
+                                                    (
+                                                        Err(SimulationRequestError::WorldMutationFailed),
+                                                        Some(RegionalWarehouseDecision::Unjournaled),
+                                                        Vec::new(),
+                                                    )
+                                                }
+                                                JournalStampResult::Missing => {
+                                                    warn!(
+                                                        decision_id,
+                                                        "server-owned container chunk is not resident"
+                                                    );
+                                                    (
+                                                        Err(SimulationRequestError::WorldMutationFailed),
+                                                        Some(RegionalWarehouseDecision::Unjournaled),
+                                                        Vec::new(),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        (Ok(ServerOwnedChestCommit::Committed(_)), None) => (
+                                            Err(SimulationRequestError::WorldMutationFailed),
+                                            Some(RegionalWarehouseDecision::Unjournaled),
+                                            Vec::new(),
+                                        ),
+                                        (Ok(ServerOwnedChestCommit::StalePlayer), _) => (
+                                            Ok(WarehouseTransferOutcome::StalePlayer),
+                                            Some(RegionalWarehouseDecision::Refused),
+                                            Vec::new(),
+                                        ),
+                                        (Ok(ServerOwnedChestCommit::StaleContainer), _) => (
+                                            Ok(WarehouseTransferOutcome::StaleContainer),
+                                            Some(RegionalWarehouseDecision::Refused),
+                                            Vec::new(),
+                                        ),
+                                        (Ok(ServerOwnedChestCommit::MissingContainer), _) => (
+                                            Ok(WarehouseTransferOutcome::MissingContainer),
+                                            Some(RegionalWarehouseDecision::Refused),
+                                            Vec::new(),
+                                        ),
+                                        (Err(error), _) => (
+                                            Err(error),
+                                            Some(RegionalWarehouseDecision::Refused),
+                                            Vec::new(),
+                                        ),
+                                    };
+                                    RegionalBlockEditJobResult::WarehouseTransfer {
+                                        sequence: job.sequence,
+                                        outcome: Box::new(outcome),
+                                        decision,
+                                        dispatches,
+                                    }
+                                } else {
+                                    let outcome = transaction.map_or(
+                                        Err(SimulationRequestError::StaleSession),
+                                        |transaction| {
+                                            transaction.commit(
+                                                &mutation,
+                                                ChestTransactionRequest {
+                                                    primary_position,
+                                                    positions: &positions,
+                                                    expected_state_id,
+                                                    expected: &expected,
+                                                    updated: &updated,
+                                                    player: &player,
+                                                },
+                                            )
+                                        },
+                                    );
+                                    RegionalBlockEditJobResult::Chest {
+                                        sequence: job.sequence,
+                                        outcome: Box::new(outcome),
+                                        drops: player.drops.clone(),
+                                    }
                                 }
                             }
                             RegionalMutationJob::Furnace {
@@ -799,6 +935,13 @@ impl SimulationOwner {
             .map(|(_, attribution)| attribution)
             .collect::<Vec<_>>();
 
+        // Arm the publication probe before the run appends: the observation is
+        // taken inside the publication path itself, so the evidence is the
+        // append state when the container's slots leave the run, wherever that
+        // statement sits.
+        #[cfg(test)]
+        arm_warehouse_publication_probe(journal, &journal_ids, &results);
+
         let world_journal_failed = if let Some(journal) = journal {
             let mut complete = true;
             let mut groups = Vec::with_capacity(run.len());
@@ -807,24 +950,43 @@ impl SimulationOwner {
                     complete = false;
                     break;
                 };
-                let Some(RegionalBlockEditJobOutcome {
-                    result:
-                        RegionalBlockEditJobResult::BlockEdits {
-                            journal_snapshots: Some(snapshots),
-                            journal_snapshot_complete,
-                            ..
-                        },
-                    ..
-                }) = results.get(&envelope.sequence)
+                let Some(RegionalBlockEditJobOutcome { result, .. }) =
+                    results.get(&envelope.sequence)
                 else {
                     complete = false;
                     break;
                 };
-                if !journal_snapshot_complete {
-                    complete = false;
-                    break;
+                match result {
+                    RegionalBlockEditJobResult::BlockEdits {
+                        journal_snapshots: Some(snapshots),
+                        journal_snapshot_complete,
+                        ..
+                    } => {
+                        if !journal_snapshot_complete {
+                            complete = false;
+                            break;
+                        }
+                        groups.push((id, snapshots.clone(), None));
+                    }
+                    // A refused server-owned deposit closes its reserved id
+                    // with no participant, exactly like a cancelled block-drop
+                    // decision, so the run's append stays contiguous.
+                    RegionalBlockEditJobResult::WarehouseTransfer {
+                        decision: Some(RegionalWarehouseDecision::Refused),
+                        ..
+                    } => groups.push((id, Vec::new(), None)),
+                    RegionalBlockEditJobResult::WarehouseTransfer {
+                        decision:
+                            Some(RegionalWarehouseDecision::Stamped {
+                                images, receipt, ..
+                            }),
+                        ..
+                    } => groups.push((id, images.clone(), Some(receipt.clone()))),
+                    _ => {
+                        complete = false;
+                        break;
+                    }
                 }
-                groups.push((id, snapshots.clone()));
             }
             if !complete {
                 warn!("world chunk journal worker snapshot was incomplete");
@@ -833,7 +995,7 @@ impl SimulationOwner {
             } else {
                 let completions = groups
                     .iter()
-                    .map(|(decision_id, snapshots)| {
+                    .map(|(decision_id, snapshots, _)| {
                         (
                             *decision_id,
                             snapshots
@@ -845,7 +1007,7 @@ impl SimulationOwner {
                     .collect::<Vec<_>>();
                 let journal = journal.clone();
                 match tokio::task::spawn_blocking(move || {
-                    journal.record_reserved_snapshot_groups(world_tick, groups)
+                    journal.record_reserved_decisions(world_tick, groups)
                 })
                 .await
                 {
@@ -889,6 +1051,7 @@ impl SimulationOwner {
             self.metrics.processed.fetch_add(1, Ordering::Relaxed);
             match &result {
                 RegionalBlockEditJobResult::Chest { .. }
+                | RegionalBlockEditJobResult::WarehouseTransfer { .. }
                 | RegionalBlockEditJobResult::Furnace { .. } => {
                     self.metrics
                         .container_commits_processed
@@ -1103,6 +1266,31 @@ impl SimulationOwner {
                         (*outcome).map(Box::new),
                     )));
                 }
+                RegionalBlockEditJobResult::WarehouseTransfer {
+                    outcome,
+                    decision,
+                    dispatches,
+                    ..
+                } => {
+                    if world_journal_failed {
+                        // The decision never landed: nothing may be published,
+                        // and a committed container whose after-image is not
+                        // journaled is not recoverable with its receipt.
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                        continue;
+                    }
+                    debug_assert!(
+                        !matches!(decision, Some(RegionalWarehouseDecision::Unjournaled)),
+                        "an unjournaled container commit fails the run's append"
+                    );
+                    if outcome.is_ok() {
+                        dispatch_visibility_commands(dispatches);
+                    }
+                    envelope.respond(Ok(SimulationResponse::WarehouseTransfer(*outcome)));
+                }
                 RegionalBlockEditJobResult::Furnace {
                     mut outcome,
                     drops,
@@ -1164,5 +1352,49 @@ impl SimulationOwner {
             remaining_depth: self.metrics.depth.load(Ordering::Relaxed),
             lane_attribution,
         }
+    }
+}
+
+/// Test-only arming for the append-before-publication rule.
+///
+/// The observation itself is taken inside `dispatch_visibility_commands`, at the
+/// point the container's `ChestSlots` command leaves the run, so the journal
+/// records the append state at publication rather than at some adjacent
+/// statement. Arming every server-owned warehouse publication the run holds
+/// before it appends keeps that evidence true wherever the publication sits.
+#[cfg(test)]
+fn arm_warehouse_publication_probe(
+    journal: Option<&crate::play::world_journal::WorldChunkJournal>,
+    journal_ids: &HashMap<u64, u64>,
+    results: &HashMap<u64, RegionalBlockEditJobOutcome>,
+) {
+    let Some(journal) = journal else {
+        return;
+    };
+    for (sequence, job_outcome) in results {
+        let RegionalBlockEditJobResult::WarehouseTransfer {
+            outcome,
+            dispatches,
+            ..
+        } = &job_outcome.result
+        else {
+            continue;
+        };
+        if outcome.is_err() {
+            continue;
+        }
+        let Some(position) = dispatches
+            .iter()
+            .find_map(|dispatch| match &dispatch.command {
+                OutboundCommand::ChestSlots { position, .. } => Some(*position),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let Some(decision_id) = journal_ids.get(sequence).copied() else {
+            continue;
+        };
+        crate::play::session::publication_probe::arm(journal, decision_id, position);
     }
 }

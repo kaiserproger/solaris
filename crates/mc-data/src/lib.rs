@@ -66,6 +66,8 @@ pub mod recipes;
 pub mod resource_path;
 mod sidecar;
 pub mod tags;
+pub mod vanilla_feature_closure;
+pub mod village_data;
 pub mod villager_trades_26_1_2;
 pub mod worldgen_features;
 pub mod worldgen_inventory;
