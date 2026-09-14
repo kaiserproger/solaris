@@ -10,7 +10,7 @@
 //! `SOLARIS_CONTENT_CACHE` or `<workspace>/data/vanilla`) and skips loudly,
 //! never silently, when none is available.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,7 +24,10 @@ use mc_world::{BlockPos, BlockRegistry, BlockStateId, Chunk, ChunkGenerator, Chu
 
 use crate::structures::{StructureTemplate, TemplateBlock};
 use crate::terrain::TerrainGenerator;
-use crate::vanilla_features::{BiomeTagIndex, BlockTagIndex};
+use crate::vanilla_features::{
+    BiomeTagIndex, BlockSemantics, BlockTagIndex, FeatureLevel, RandomSource, XoroshiroRandom,
+};
+use crate::village::VillageDecor;
 use crate::village::beard::{BEARD_KERNEL_RADIUS, apply_columns_over};
 use crate::village::closure::{ClosureElement, ClosurePool, ClosureStructure, VillageClosure};
 use crate::village::load_village_closure;
@@ -154,6 +157,7 @@ fn synthetic_source_with_grid(
     let pool = ClosurePool {
         id: pool_id.clone(),
         fallback: identifier("minecraft:empty"),
+        max_size: 1,
         elements: vec![(
             1,
             ClosureElement::Single {
@@ -171,6 +175,7 @@ fn synthetic_source_with_grid(
             id: structure_id,
             weight: 1,
             spec,
+            start_height: 0,
         }],
         pools: BTreeMap::from([(pool_id, pool)]),
         processor_lists: BTreeMap::from([(processor_id, Vec::new())]),
@@ -179,6 +184,7 @@ fn synthetic_source_with_grid(
     };
     let source = VillagePlanSource::new(
         Arc::new(closure),
+        Arc::new(VillageDecor::empty()),
         seed,
         Arc::clone(&blocks),
         Arc::new(NoTags),
@@ -186,6 +192,15 @@ fn synthetic_source_with_grid(
     )
     .expect("the synthetic closure places against the required registry");
     (Arc::new(source), blocks)
+}
+
+/// The template a plan piece places. The synthetic fixtures place single
+/// elements only, so a feature piece is a fixture defect.
+fn piece_template(piece: &crate::village::plan_source::PlanPiece) -> &Identifier {
+    match &piece.element {
+        crate::village::plan_source::PlanElement::Single { template, .. } => template,
+        other => panic!("the synthetic fixtures place no feature elements: {other:?}"),
+    }
 }
 
 /// The first chunk the placement formula starts a structure in, scanning a
@@ -331,7 +346,10 @@ fn synthetic_plan_is_found_for_its_placement_chunk() {
     assert_eq!(plan.start_chunk(), (chunk_x, chunk_z));
     assert_eq!(plan.assembly().chunk, (chunk_x, chunk_z));
     assert_eq!(plan.pieces().len(), 1);
-    assert_eq!(plan.pieces()[0].template, identifier("test:village/center"));
+    assert_eq!(
+        piece_template(&plan.pieces()[0]),
+        &identifier("test:village/center")
+    );
 
     // The region is the rigid start piece's own box, inflated by the kernel
     // radius the analogue reaches through: the start piece is a RIGID piece, so
@@ -470,7 +488,7 @@ fn every_plan_reaching_a_chunk_is_returned_and_placed() {
     for plan in set.plans() {
         let template = source
             .closure()
-            .piece(&plan.pieces()[0].template)
+            .piece(piece_template(&plan.pieces()[0]))
             .expect("the plan's template is in the closure");
         let piece = &plan.pieces()[0];
         let world = template.blocks().iter().map(|block| {
@@ -580,7 +598,7 @@ fn planned_chunk_writes_plan_blocks_and_unplanned_chunk_is_byte_identical() {
     let piece = &plan.pieces()[0];
     let template = source
         .closure()
-        .piece(&piece.template)
+        .piece(piece_template(piece))
         .expect("the plan's template is in the closure");
     let mut expected: Vec<BlockPos> = template
         .blocks()
@@ -815,9 +833,15 @@ fn content_cache_selection_ignores_directories_without_a_cache() {
 /// finds the first placement chunk that actually places a village.
 fn live_source(cache: &Path, seed: i64) -> Option<(Arc<VillagePlanSource>, Arc<BlockRegistry>)> {
     let blocks = required_registry();
-    let closure = load_village_closure(cache, &identifier("minecraft:villages"), &blocks).ok()?;
+    let closure =
+        Arc::new(load_village_closure(cache, &identifier("minecraft:villages"), &blocks).ok()?);
+    // The live layer runs the real decor lane: every `feature_pool_element` the
+    // closure reaches is compiled, which is what the plan source validates.
+    let semantics = BlockSemantics::new(&blocks, &NoTags);
+    let decor = Arc::new(VillageDecor::compile(cache, &closure, &semantics).ok()?);
     let source = VillagePlanSource::new(
-        Arc::new(closure),
+        closure,
+        decor,
         seed,
         Arc::clone(&blocks),
         Arc::new(NoTags),
@@ -1047,4 +1071,177 @@ fn live_village_plan_lookup_agrees_for_chunk_and_column() {
     let again = live_plan(&source, &plain, chunk).expect("the lookup is deterministic");
     assert_eq!(again.plans()[0].assembly(), plan.assembly());
     assert_eq!(again.plans()[0].pieces(), plan.pieces());
+}
+
+/// A level that records every decor write, for the feature-placement proof.
+/// Nothing here is terrain except the ground below `ground_top`: the executor
+/// decides where a feature's blocks go, and this witnesses what it placed. A
+/// feature still asks the level what it is standing on — `pile_hay`'s own
+/// placement test is "air above a sturdy face" — so the level has to answer that
+/// the way any real chunk would.
+struct WrittenLevel {
+    air: BlockStateId,
+    ground: BlockStateId,
+    /// The highest `y` the ground fills; above it the level is air.
+    ground_top: i32,
+    writes: HashMap<BlockPos, BlockStateId>,
+}
+
+impl FeatureLevel for WrittenLevel {
+    fn min_y(&self) -> i32 {
+        -64
+    }
+
+    fn max_y(&self) -> i32 {
+        320
+    }
+
+    fn block_state(&self, pos: BlockPos) -> BlockStateId {
+        if pos.y <= self.ground_top {
+            return self.ground;
+        }
+        self.writes.get(&pos).copied().unwrap_or(self.air)
+    }
+
+    fn set_block(&mut self, pos: BlockPos, state: BlockStateId) {
+        self.writes.insert(pos, state);
+    }
+
+    fn is_water_source_at(&self, _pos: BlockPos) -> bool {
+        false
+    }
+}
+
+/// The decor lane places a real feature: the closure's `pile_hay` entry, run
+/// through the data-driven executor at the position a feature piece would carry,
+/// writes hay blocks. `pile_hay` declares no placement modifiers, so its blocks
+/// land around the position itself — and no other lane in this engine places a
+/// hay block at all.
+#[test]
+fn live_decor_places_a_feature_through_the_executor() {
+    let Some(cache) = content_cache() else {
+        println!(
+            "SKIP live_decor_places_a_feature_through_the_executor: no vanilla content cache \
+             found (set SOLARIS_CONTENT_CACHE, or run with /tmp/jdk-cold2 present)"
+        );
+        return;
+    };
+    let blocks = required_registry();
+    let closure = Arc::new(
+        load_village_closure(&cache, &identifier("minecraft:villages"), &blocks)
+            .expect("the village closure loads"),
+    );
+    let semantics = BlockSemantics::new(&blocks, &NoTags);
+    let decor = VillageDecor::compile(&cache, &closure, &semantics)
+        .expect("the village decor compiles from the cache");
+    let pool = identifier("minecraft:village/desert/decor");
+    let placed_feature = identifier("minecraft:pile_hay");
+    assert!(
+        decor.feature(&pool, &placed_feature).is_some(),
+        "the desert decor pool carries the hay pile"
+    );
+
+    let air = blocks
+        .block(&identifier("minecraft:air"))
+        .expect("air is a required block")
+        .default;
+    let dirt = blocks
+        .block(&identifier("minecraft:dirt"))
+        .expect("dirt is a required block")
+        .default;
+    let position = BlockPos { x: 8, y: 70, z: -8 };
+    let mut written = WrittenLevel {
+        air,
+        ground: dirt,
+        ground_top: position.y - 1,
+        writes: HashMap::new(),
+    };
+    let mut random = XoroshiroRandom::new(7);
+    let level: &mut dyn FeatureLevel = &mut written;
+    let placed = decor
+        .place(
+            &pool,
+            &placed_feature,
+            level,
+            &semantics,
+            &mut random,
+            position,
+        )
+        .expect("the hay pile places");
+    assert!(placed, "the hay pile reports that it placed something");
+    assert!(!written.writes.is_empty(), "the hay pile wrote blocks");
+
+    let hay = blocks
+        .block(&identifier("minecraft:hay_block"))
+        .expect("hay_block is a required block")
+        .default;
+    let hay_positions: Vec<BlockPos> = written
+        .writes
+        .iter()
+        .filter(|(_, state)| **state == hay)
+        .map(|(pos, _)| *pos)
+        .collect();
+    assert!(
+        !hay_positions.is_empty(),
+        "the hay pile's blocks are hay blocks: {:?}",
+        written.writes.values().collect::<Vec<_>>()
+    );
+    // A pile is a small shape around its position, not a single block.
+    assert!(
+        hay_positions
+            .iter()
+            .all(|pos| (pos.x - position.x).abs() <= 2
+                && (pos.y - position.y).abs() <= 2
+                && (pos.z - position.z).abs() <= 2),
+        "the pile stays around its position: {hay_positions:?}"
+    );
+}
+
+/// The seeding is vanilla's: one chunk's stream for `village_plains` is
+/// `setFeatureSeed(setDecorationSeed(seed, chunkX * 16, chunkZ * 16), index,
+/// step)` with the structure's index among the registry's `surface_structures`
+/// entries (22 in the 26.1.2 cache, which registers entries sorted by
+/// identifier) and that step's ordinal (4).
+#[test]
+fn live_decor_seeding_matches_the_structure_registry_order() {
+    let Some(cache) = content_cache() else {
+        println!(
+            "SKIP live_decor_seeding_matches_the_structure_registry_order: no vanilla content \
+             cache found (set SOLARIS_CONTENT_CACHE, or run with /tmp/jdk-cold2 present)"
+        );
+        return;
+    };
+    let seed = 4242;
+    let Some((source, _blocks)) = live_source(&cache, seed) else {
+        println!(
+            "SKIP live_decor_seeding_matches_the_structure_registry_order: the village closure \
+             did not load from {}",
+            cache.display()
+        );
+        return;
+    };
+    let mut actual =
+        source
+            .decor()
+            .random_for(seed, 427, 0, &identifier("minecraft:village_plains"));
+    // The stream `village_plains` decorates chunk (427, 0) of seed 4242 with,
+    // read from the real 26.1.2 classes
+    // (`.analysis/codex-logs/village-decor-random/`): index 22 (the set's
+    // position among the step's registered structures) and ordinal 4
+    // (`SURFACE_STRUCTURES`) through a `WorldgenRandom` wrapper over Xoroshiro.
+    assert_eq!(actual.next_long(), -5_071_117_971_071_978_252);
+    assert_eq!(actual.next_int(), -127_179_403);
+    // A different structure of the same set is a different index, so a
+    // different stream.
+    let mut desert =
+        source
+            .decor()
+            .random_for(seed, 427, 0, &identifier("minecraft:village_desert"));
+    let mut plains =
+        source
+            .decor()
+            .random_for(seed, 427, 0, &identifier("minecraft:village_plains"));
+    assert_eq!(desert.next_long(), 9_222_894_648_221_271_537);
+    assert_eq!(plains.next_long(), -5_071_117_971_071_978_252);
+    assert_ne!(desert.next_long(), plains.next_long());
 }

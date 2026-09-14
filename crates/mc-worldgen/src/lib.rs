@@ -79,7 +79,19 @@ pub use terrain::{
 /// `terrain_adaptation = beard_thin` applied as the column-height analogue in
 /// [`village::beard`]. A world written by revision 21 has no villages and keeps
 /// generating without them; the mismatch is what startup reports.
-pub const WORLDGEN_REVISION: u32 = 22;
+///
+/// 23: the village assembly is rebuilt on the 26.1.2 bodies end to end — the
+/// structure selection re-draws from the set the way
+/// `ChunkGenerator.createStructures` does and the growth runs on
+/// `setLargeFeatureSeed`, source jigsaws are rotated before they attach, the
+/// target pool's and fallback's candidate lists are shuffled, the
+/// `use_expansion_hack` box and the shared free-space shape are applied, the
+/// queue is priority-ordered, the biome gate is decided at the stub position —
+/// and the closure's `feature_pool_element` entries are placed as decor through
+/// the data-driven feature executor on the `FEATURES` step's own random
+/// ([`village::decor`]). Every change moves village geometry or adds blocks, so
+/// revision-22 worlds are refused with the fresh-`world_dir` message.
+pub const WORLDGEN_REVISION: u32 = 23;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

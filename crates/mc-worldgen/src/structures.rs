@@ -134,7 +134,13 @@ pub struct TemplateJigsaw {
     pub pool: Identifier,
     pub joint: Joint,
     pub final_state: BlockStateId,
+    /// `JigsawBlockInfo.selection_priority`: the order the jigsaws of one piece
+    /// are offered in, highest first (`SinglePoolElement.sortBySelectionPriority`).
     pub selection_priority: i32,
+    /// `JigsawBlockInfo.placement_priority`: the priority the pieces placed
+    /// through this jigsaw are queued at (`JigsawPlacement$Placer`, a
+    /// `SequencedPriorityIterator`).
+    pub placement_priority: i32,
 }
 
 /// `FrontAndTop`'s names, as they appear in a jigsaw state's `orientation`.
@@ -179,24 +185,19 @@ pub struct TemplateChest {
 }
 
 impl TemplateChest {
-    /// Resolve the pasted contents: roll `loot_table` from the catalog with
-    /// a seed derived from `(seed, world_pos, index)`, scattering stacks
-    /// into random slots (vanilla overwrite semantics). Falls back to the
-    /// fixed `chest` contents when no table is configured or the catalog
-    /// lacks it; rolled stacks whose items the registry cannot resolve are
-    /// skipped.
+    /// Resolve the pasted contents: roll `loot_table` from the catalog under
+    /// `loot_seed` — vanilla's `LootTableSeed`, the `nextLong` the structure
+    /// placement draws for this container — scattering stacks into random slots
+    /// (vanilla overwrite semantics). Falls back to the fixed `chest` contents
+    /// when no table is configured or the catalog lacks it; rolled stacks whose
+    /// items the registry cannot resolve are skipped.
     #[must_use]
-    pub fn resolve_contents(
-        &self,
-        loot: &StructureLoot<'_>,
-        world_pos: [i32; 3],
-        index: usize,
-    ) -> ChestBlockEntity {
+    pub fn resolve_contents(&self, loot: &StructureLoot<'_>, loot_seed: u64) -> ChestBlockEntity {
         let table = self.loot_table.as_ref().and_then(|id| loot.catalog.get(id));
         let Some(table) = table else {
             return self.chest.clone();
         };
-        let mut rng = ChestRng::new(chest_loot_seed(loot.seed, world_pos, index));
+        let mut rng = ChestRng::new(loot_seed);
         let mut out = ChestBlockEntity::default();
         for drop in table.roll(&mut rng) {
             let Some(item_id) = loot.items.id_of(&drop.item) else {
@@ -249,6 +250,10 @@ const CHEST_LOOT_SALT: u64 = 0xC4E5_57A1_1007;
 /// Deterministic per-chest loot seed from the world seed, the chest's pasted
 /// world position, and its index in the template. Same seed and position
 /// roll the same contents; distinct chests differ.
+///
+/// This is the *plugin* prototype lane's seeding. The vanilla village lane does
+/// not use it: there a chest's `LootTableSeed` is the `nextLong` the structure's
+/// placement random draws for it ([`crate::village::piece::place_piece`]).
 #[must_use]
 pub fn chest_loot_seed(seed: i64, world_pos: [i32; 3], index: usize) -> u64 {
     let mut hash = seed as u64 ^ CHEST_LOOT_SALT;
@@ -446,6 +451,12 @@ impl StructureTemplate {
     #[must_use]
     pub fn with_chests(mut self, chests: Vec<TemplateChest>) -> Self {
         self.chests = chests;
+        self
+    }
+
+    #[must_use]
+    pub fn with_jigsaws(mut self, jigsaws: Vec<TemplateJigsaw>) -> Self {
+        self.jigsaws = jigsaws;
         self
     }
 
@@ -1115,6 +1126,14 @@ fn parse_template_jigsaw(
             _ => None,
         })
         .unwrap_or(0);
+    let placement_priority = nbt
+        .iter()
+        .find(|(key, _)| key == "placement_priority")
+        .and_then(|(_, tag)| match tag {
+            Tag::Int(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(0);
     Ok(TemplateJigsaw {
         pos,
         state,
@@ -1126,6 +1145,7 @@ fn parse_template_jigsaw(
         joint,
         final_state,
         selection_priority,
+        placement_priority,
     })
 }
 

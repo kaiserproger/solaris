@@ -17,6 +17,10 @@
 //!
 //! Only entries the caller names are read; the vanilla registries are never
 //! enumerated, so registries Solaris does not implement cannot fail a load.
+//! One exception is deliberate and reads no codec:
+//! [`VillageDataLoader::structures_in_step`] lists `worldgen/structure/*.json`
+//! to recover the registry order vanilla's feature-placement seeding indexes
+//! into, and takes only each entry's `step` string.
 //! Anything a loaded entry reaches that is unsupported or malformed fails
 //! closed, naming both the type id and the entry that referenced it. Referrers
 //! are a within-load notion: a nested entry (a rule test inside an inline
@@ -96,6 +100,8 @@ pub enum VillageDataError {
         id: Identifier,
         referrer: Identifier,
     },
+    #[error("structure entry file {path} does not name a valid identifier")]
+    InvalidStructureFile { path: PathBuf },
     #[error("unsupported {kind} type {type_id} referenced by {referrer}")]
     UnsupportedType {
         kind: EntryKind,
@@ -246,6 +252,29 @@ pub enum StructureStep {
     FluidSprings,
     VegetalDecoration,
     TopLayerModification,
+}
+
+impl StructureStep {
+    /// `GenerationStep.Decoration.ordinal()`, the step index vanilla's
+    /// `ChunkGenerator.applyBiomeDecoration` seeds structure placement with
+    /// (`WorldgenRandom.setFeatureSeed(seed, index, step)` adds `10000 * step`).
+    /// The variants are declared in the enum's own order.
+    #[must_use]
+    pub const fn decoration_ordinal(self) -> i32 {
+        match self {
+            Self::RawGeneration => 0,
+            Self::Lakes => 1,
+            Self::LocalModifications => 2,
+            Self::UndergroundStructures => 3,
+            Self::SurfaceStructures => 4,
+            Self::Strongholds => 5,
+            Self::UndergroundOres => 6,
+            Self::UndergroundDecoration => 7,
+            Self::FluidSprings => 8,
+            Self::VegetalDecoration => 9,
+            Self::TopLayerModification => 10,
+        }
+    }
 }
 
 /// `TerrainAdjustment`.
@@ -563,6 +592,53 @@ impl VillageDataLoader {
         parse_processor_list(id, &value)
     }
 
+    /// The ids of every `structure/*.json` entry whose `step` is `step`, in
+    /// vanilla's registry order.
+    ///
+    /// The one place this module reads a registry *directory* instead of an
+    /// entry a caller named, and it reads exactly one string out of each file:
+    /// the `step`. Vanilla registers a registry's entries in identifier order —
+    /// `ResourceManagerRegistryLoadTask.load` registers
+    /// `loadedEntries.entrySet().stream().sorted(Entry.comparingByKey())`, and
+    /// `Identifier.compareTo` compares the path first and the namespace second —
+    /// and `ChunkGenerator.applyBiomeDecoration` seeds the random its structure
+    /// placement runs on from `(index of the structure within its step, step
+    /// ordinal)`, an index nothing else in the village data names.
+    /// No other field of a structure entry is parsed here, so the structure
+    /// types this engine does not implement contribute their step and nothing
+    /// more; a file vanilla's registry load would reject is rejected here too.
+    ///
+    /// # Errors
+    ///
+    /// [`VillageDataError`] when the structure directory cannot be read, a file
+    /// is not JSON, an entry does not carry a valid `step`, or a file name is
+    /// not a valid identifier.
+    pub fn structures_in_step(
+        &self,
+        step: StructureStep,
+    ) -> Result<Vec<Identifier>, VillageDataError> {
+        let root = self.worldgen_dir.join("structure");
+        let mut ids = Vec::new();
+        collect_structure_files(&root, "", &mut ids)?;
+        let mut in_step = Vec::new();
+        for id in ids {
+            let value = self.read_entry(STRUCTURE, "structure", &id, &id)?;
+            if enum_field(&value, "step", STRUCTURE, &id, STRUCTURE_STEPS)? == step {
+                in_step.push(id);
+            }
+        }
+        // Vanilla's order is `Identifier.compareTo`: **path first**, then
+        // namespace, both by UTF-16 code unit (the registry load sorts the
+        // loaded entries by that key before registering them). Identifiers are
+        // ASCII, so byte order is that order — but the derived `Ord` on
+        // `Identifier` compares the joined `namespace:path` string, where `:`
+        // sorts after a digit and so orders `minecraft:z` before `a0:x`.
+        in_step.sort_by(|first, second| {
+            (first.path(), first.namespace()).cmp(&(second.path(), second.namespace()))
+        });
+        Ok(in_step)
+    }
+
     fn read_entry(
         &self,
         kind: EntryKind,
@@ -593,6 +669,41 @@ impl VillageDataLoader {
         };
         read_json_resource(opened, &io_error, &parse_error)
     }
+}
+
+/// Collect the `minecraft:<relative path>` ids of every `*.json` under a
+/// registry directory, recursing into subdirectories (vanilla's registry
+/// resource listing is recursive).
+fn collect_structure_files(
+    root: &std::path::Path,
+    prefix: &str,
+    ids: &mut Vec<Identifier>,
+) -> Result<(), VillageDataError> {
+    let entries = std::fs::read_dir(root).map_err(|source| VillageDataError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| VillageDataError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(VillageDataError::InvalidStructureFile { path });
+        };
+        if path.is_dir() {
+            collect_structure_files(&path, &format!("{prefix}{name}/"), ids)?;
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let id = Identifier::parse(format!("minecraft:{prefix}{stem}"))
+            .map_err(|_| VillageDataError::InvalidStructureFile { path: path.clone() })?;
+        ids.push(id);
+    }
+    Ok(())
 }
 
 fn parse_placement(

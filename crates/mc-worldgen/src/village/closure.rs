@@ -31,6 +31,13 @@ pub struct ClosureStructure {
     pub id: Identifier,
     pub weight: u32,
     pub spec: mc_data::village_data::StructureSpec,
+    /// `start_height` resolved to an absolute block Y.
+    ///
+    /// Only `Constant`/`Absolute` is accepted ([`ClosureError::UnsupportedStartHeight`]):
+    /// the other providers sample the growth random, and the solver has no
+    /// height-provider sampler, so a structure carrying one must fail the load
+    /// rather than place at Y 0 with a shifted stream.
+    pub start_height: i32,
 }
 
 /// One pool element the engine can place.
@@ -59,6 +66,15 @@ pub struct ClosurePool {
     pub id: Identifier,
     pub fallback: Identifier,
     pub elements: Vec<(u32, ClosureElement)>,
+    /// `StructureTemplatePool.getMaxSize`: the tallest bounding box any
+    /// non-`empty_pool_element` element of the pool produces at
+    /// `Rotation.NONE`, or 0 for a pool of empty elements only.
+    ///
+    /// `use_expansion_hack` reads it for every jigsaw of a candidate whose
+    /// front position lands inside the candidate's own box, so a village pool
+    /// carrying only `feature_pool_element` entries reports 1 (a feature
+    /// element is a degenerate one-block box) rather than 0.
+    pub max_size: i32,
 }
 
 /// Everything the village closure reached.
@@ -110,6 +126,14 @@ pub enum ClosureError {
          each of its children, which the engine does not implement"
     )]
     UnsupportedListElement { pool: Identifier },
+    #[error(
+        "structure {structure} declares a start_height provider the engine does not sample: \\
+         {provider}; only a constant absolute height is implemented"
+    )]
+    UnsupportedStartHeight {
+        structure: Identifier,
+        provider: String,
+    },
 }
 
 /// Load and walk the closure from a vanilla content cache root (the directory
@@ -124,10 +148,23 @@ pub fn load_village_closure(
     let set = loader.load_structure_set(structure_set)?;
     let mut structures = Vec::with_capacity(set.structures.len());
     for entry in &set.structures {
+        let spec = loader.load_structure(&entry.structure)?;
+        let start_height = match &spec.start_height {
+            mc_data::village_data::HeightProviderSpec::Constant(
+                mc_data::village_data::VerticalAnchor::Absolute(value),
+            ) => *value,
+            other => {
+                return Err(ClosureError::UnsupportedStartHeight {
+                    structure: entry.structure.clone(),
+                    provider: format!("{other:?}"),
+                });
+            }
+        };
         structures.push(ClosureStructure {
             id: entry.structure.clone(),
             weight: u32::try_from(entry.weight).unwrap_or(1),
-            spec: loader.load_structure(&entry.structure)?,
+            spec,
+            start_height,
         });
     }
 
@@ -190,12 +227,14 @@ pub fn load_village_closure(
         if !pools.contains_key(&spec.fallback) {
             queue.push_back((spec.fallback.clone(), pool_id.clone()));
         }
+        let max_size = max_size_of(&elements, &pieces);
         pools.insert(
             pool_id.clone(),
             ClosurePool {
                 id: pool_id,
                 fallback: spec.fallback,
                 elements,
+                max_size,
             },
         );
     }
@@ -224,6 +263,30 @@ pub fn load_village_closure(
         pieces,
         placed_features,
     })
+}
+
+/// `StructureTemplatePool.getMaxSize`, over the elements the closure kept.
+///
+/// The pool's templates at `Rotation.NONE` produce the template's own height for
+/// a piece element and a one-block box for a feature element
+/// (`FeaturePoolElement.getBoundingBox` is `position..position`); empty elements
+/// are filtered out before the maximum, and a pool with nothing else reports 0.
+fn max_size_of(
+    elements: &[(u32, ClosureElement)],
+    pieces: &BTreeMap<Identifier, StructureTemplate>,
+) -> i32 {
+    let mut max = 0;
+    for (_, element) in elements {
+        let height = match element {
+            ClosureElement::Empty => continue,
+            ClosureElement::Feature { .. } => 1,
+            ClosureElement::Single { piece, .. } => {
+                pieces.get(piece).map_or(1, |template| template.size()[1])
+            }
+        };
+        max = max.max(height);
+    }
+    max
 }
 
 fn load_processors(

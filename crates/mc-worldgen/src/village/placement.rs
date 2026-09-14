@@ -1,4 +1,5 @@
-//! Structure placement and structure selection.
+//! Structure placement: which chunk a structure set can start in, and the
+//! `setLargeFeatureSeed` derivation the solver and this placement share.
 //!
 //! `RandomSpreadStructurePlacement.getPotentialStructureChunk` (26.1.2) is:
 //! `gridX = floorDiv(sourceX, spacing)`, the same for Z, a
@@ -10,12 +11,10 @@
 //! candidate chunk is `grid * spacing + spread`. A chunk generates the set when
 //! that candidate is the chunk itself.
 //!
-//! Which structure of the set actually starts there is vanilla's weighted pick
-//! over the entries that pass their biome tag, using the chunk's
-//! `WORLD_SURFACE_WG`-style start column; the engine performs that pick with the
-//! same per-chunk seed.
+//! Which entry of the set actually starts there, and how the village is grown,
+//! is [`super::solver`]'s: both run on `setLargeFeatureSeed`, a different
+//! derivation from the placement's own salt-seeded source.
 
-use mc_data::Identifier;
 use mc_world::BlockPos;
 
 use crate::vanilla_features::{LegacyRandom, RandomSource};
@@ -73,57 +72,19 @@ pub fn set_large_feature_with_salt(seed: i64, x: i32, z: i32, salt: i64) -> i64 
         .wrapping_add(salt)
 }
 
-/// One weighted structure of the set.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WeightedStructure {
-    pub id: Identifier,
-    pub weight: u32,
-    /// The biome tag the structure requires at its start column.
-    pub biomes: Identifier,
-    /// The structure's `start_height.absolute`.
-    pub start_height: i32,
-}
-
-/// The weighted pick over the entries whose biome tag contains `biome`.
+/// `WorldgenRandom.setLargeFeatureSeed`:
+/// `seed` seeds a legacy source, two `nextLong`s scale the chunk coordinates,
+/// and `result = chunkX * xScale ^ chunkZ * zScale ^ seed` re-seeds it.
 ///
-/// Vanilla rolls the set's entries with the placement's per-chunk random; the
-/// engine uses the same seed so the choice is deterministic per (seed, chunk).
+/// This — not [`set_large_feature_with_salt`] — is the seed
+/// `ChunkGenerator.createStructures` selects a structure set entry with and
+/// `Structure.GenerationContext` grows the structure on.
 #[must_use]
-pub fn select_structure(
-    placement: RandomSpreadPlacement,
-    seed: i64,
-    chunk_x: i32,
-    chunk_z: i32,
-    structures: &[WeightedStructure],
-    biome_matches: impl Fn(&Identifier) -> bool,
-) -> Option<usize> {
-    let eligible: Vec<usize> = structures
-        .iter()
-        .enumerate()
-        .filter(|(_, structure)| biome_matches(&structure.biomes))
-        .map(|(index, _)| index)
-        .collect();
-    if eligible.is_empty() {
-        return None;
-    }
-    let total: u32 = eligible
-        .iter()
-        .map(|index| structures[*index].weight.max(1))
-        .sum();
-    let mut random = LegacyRandom::new(set_large_feature_with_salt(
-        seed,
-        chunk_x,
-        chunk_z,
-        placement.salt.wrapping_add(1),
-    ));
-    let mut roll = random.next_int_bounded(i32::try_from(total).unwrap_or(i32::MAX));
-    for index in eligible {
-        roll -= i32::try_from(structures[index].weight.max(1)).unwrap_or(1);
-        if roll < 0 {
-            return Some(index);
-        }
-    }
-    None
+pub fn set_large_feature_seed(seed: i64, chunk_x: i32, chunk_z: i32) -> i64 {
+    let mut random = LegacyRandom::new(seed);
+    let x_scale = random.next_long();
+    let z_scale = random.next_long();
+    i64::from(chunk_x).wrapping_mul(x_scale) ^ i64::from(chunk_z).wrapping_mul(z_scale) ^ seed
 }
 
 /// `WorldGenerationContext`-free start column: vanilla's

@@ -1,23 +1,18 @@
 //! Vanilla village generation (checkpoint B), engine side.
 //!
-//! This module assembles a village the way vanilla does: one
-//! `minecraft:random_spread` structure set picks a chunk, the weighted
-//! structure whose biome tag matches the start column is chosen, `JigsawStructure`
-//! places a start piece at the `WORLD_SURFACE_WG` height, and
-//! `JigsawPlacement` grows the village by connecting jigsaw blocks across
-//! template pools. Piece blocks carry their rotation, projection and processor
-//! list, and the terrain around rigid pieces is blended with the column-height
-//! analogue described in [`beard`].
+//! This module assembles a village the way vanilla does: the
+//! `minecraft:villages` structure set has one candidate chunk per
+//! `random_spread` cell, the candidate's weighted entries are drawn (and
+//! re-drawn when one fails its biome gate) the way
+//! `ChunkGenerator.createStructures` draws them, `JigsawStructure` places a
+//! start piece at the `WORLD_SURFACE_WG` height, and `JigsawPlacement` grows the
+//! village by connecting jigsaw blocks across the template pools.
 //!
-//! ## What is not placed yet
-//!
-//! `feature_pool_element` entries — the 13 village decor features the A1/A2
-//! executor in [`crate::vanilla_features`] implements — are **not** placed: the
-//! growth loop accepts piece elements only, [`solver::feature_elements`] has no
-//! non-test caller, and nothing in this module runs the executor. A village
-//! therefore generates its buildings, streets and terrain without its decorative
-//! features; wiring that lane is the next village item, not an approximation
-//! already in place.
+//! Piece blocks are written with their rotation, projection and processor
+//! list, `feature_pool_element` entries place their feature through
+//! [`crate::vanilla_features`] with the random vanilla's `FEATURES` step seeds
+//! them with (see [`decor`]), and the terrain around rigid pieces is blended
+//! with the column-height analogue described in [`beard`].
 //!
 //! ## One authority for the data
 //!
@@ -27,8 +22,8 @@
 //! closure from a structure set, loads pieces through
 //! [`crate::structures::StructureTemplate`] (jigsaw metadata is engine-side) and
 //! carries the `mc-data` specs verbatim. [`placement`] is engine logic over the
-//! placement fields the data side owns, and [`beard`] implements the
-//! column-height terrain analogue.
+//! placement fields the data side owns, [`decor`] compiles the closure's feature
+//! elements, and [`beard`] implements the column-height terrain analogue.
 //!
 //! ## Terrain adaptation
 //!
@@ -38,6 +33,7 @@
 
 pub mod beard;
 pub mod closure;
+pub mod decor;
 pub mod piece;
 pub mod placement;
 pub mod plan_source;
@@ -50,8 +46,11 @@ pub use closure::{
     ClosureElement, ClosureError, ClosurePool, ClosureStructure, VillageClosure,
     load_village_closure,
 };
+pub use decor::{DecorError, VillageDecor};
 pub use placement::{
-    RandomSpreadPlacement, WeightedStructure, select_structure, set_large_feature_with_salt,
-    start_origin,
+    RandomSpreadPlacement, set_large_feature_seed, set_large_feature_with_salt, start_origin,
 };
-pub use solver::{Junction, PlacedPiece, Rotation, VillageAssembly, assemble_village};
+pub use solver::{
+    Jigsaw, Junction, PlacedElement, PlacedPiece, Rotation, VillageAssembly, assemble_village,
+    can_attach,
+};

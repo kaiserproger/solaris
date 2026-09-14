@@ -4047,3 +4047,133 @@ Recorded so the decor checkpoint reproduces the seam instead of guessing it:
 - Because the target box is degenerate, `Shapes.create(AABB.of(targetBB).deflate(0.25))`
   is empty, so the `joinIsNotEmpty(..., ONLY_SECOND)` acceptance test cannot reject a
   feature element.
+
+## Vanilla-faithful village solver and the decor lane (landed 2026-09-14)
+
+The solver now reproduces `JigsawPlacement`'s growth seam and the
+`feature_pool_element` decor lane is wired, as one checkpoint: the assembled
+geometry, the placement seeds and the chunk writes changed together, so
+`WORLDGEN_REVISION` is 23 (`crates/mc-worldgen/src/lib.rs`). Base tree
+`e1a46a31`; committed on `main` as the `feat(worldgen)` commit that carries this
+entry (naming its own hash would make the record stale the moment it is written,
+so this entry names its base tree instead).
+
+What landed, all read from the decompiled 26.1.2 classes and pinned by tests:
+
+- **Selection re-draws.** `ChunkGenerator.createStructures` removes the failed
+  entry and draws again from the *same* `setLargeFeatureSeed` stream, so a
+  candidate chunk holds a village whenever any entry's biome gate passes — the
+  single-roll model that made most candidates empty was wrong
+  (`village_solver_tests::selection_retries_until_an_entry_passes_its_biome_gate`).
+- **The biome gate is decided at the stub** and the growth random is
+  per-attempt/discarded, so the gate can be answered before growing: identical
+  villages, ~5× cheaper per candidate (`plan_start`/`grow_start` split).
+- **Growth fidelity:** rotated source jigsaw positions and faces, shuffled pool
+  *and* fallback candidate lists, the empty element terminating the candidate
+  list, `use_expansion_hack`'s `max(expandTo + 1, maxY - minY)` applied to the
+  target box, `continue 'source_jigsaw` after an attach, one shared-and-grown
+  free shape per source (inside vs outside), both junctions with
+  `groundLevelDelta` (rigid `parentDelta − deltaY`, non-rigid 1), RIGID boxes as
+  beard contributions, the `placement_priority` queue, and feature elements as
+  terminal leaves carrying the synthetic `bottom` front jigsaw.
+- **The start anchor subtracts the named connector's local offset**
+  (`JigsawPlacement.addPieces`: `adjustedPosition = position − (anchor − position)`).
+  No village structure declares `start_jigsaw_name`, so nothing observable moved,
+  but the modelled input was wrong.
+- **Decor lane.** `village/decor.rs` compiles the closure's
+  `feature_pool_element` entries and seeds per (chunk, structure) the way
+  `ChunkGenerator.applyBiomeDecoration` does — `setDecorationSeed(seed, chunkX ×
+  16, chunkZ × 16)` then `setFeatureSeed(decorationSeed, index, step)`, index
+  being the structure's position in its step's registry list, which the data
+  layer derives by sorting on `(path, namespace)` (`Identifier.compareTo`).
+- **The decor random is vanilla's `WorldgenRandom` wrapper**, not a raw
+  `XoroshiroRandomSource`: `WorldgenRandom extends LegacyRandomSource`, so every
+  composed draw is the legacy formula over the wrapped bits. The first versions
+  used the raw source, which is a different stream from the same seed.
+- **Chest `LootTableSeed` comes off that same stream.** `StructureTemplate
+  .placeInWorld` draws one `nextLong` per container it writes (after the block is
+  set, never for a clipped block), so the piece lane draws it from the
+  per-(chunk, structure) random, in piece order, and the decor that follows in
+  that order continues it. The plugin prototype lane keeps its own hashtable seed
+  (`structures::chest_loot_seed`); only the vanilla village lane uses the stream.
+- **Terrain-adaptation and decor divergences stay declared**, not hidden
+  (`docs/VILLAGE_GENERATION.md`), and its claim that a pile or flower at a chunk
+  border loses nothing was wrong — piles scatter 2–3 blocks and plain-flower
+  patches 64 attempts up to 6 blocks, so a border decor piece loses its
+  out-of-chunk scatter.
+
+**Measured performance fix, in the same checkpoint.** The lookup's expensive part
+is per *start* chunk while questions arrive per column, so the ore/cave halo
+(~900 columns per chunk) re-ran the same assemblies hundreds of times.
+`VillagePlanSource` now keeps a bounded memo of assemblies keyed by start chunk
+(64 entries, only `Some`, solved outside the lock) and `OreColumnCache::plans`
+memoizes the chunk's plan set (the *chunk's* set, never a column's filtered
+slice). Evidence, debug build: `cargo test -p mc-worldgen --lib` 373 s → 40 s; the
+live village test's 110 moved columns 78.4 s → 0.18 s and its chunk generation
+2.19 s → 0.05 s. An assembly is a pure function of the world seed and its start
+chunk, which is why the memo cannot answer differently from a miss; the memo
+belongs to one world's source, and no production path reconfigures a generator
+that holds one (world identity fences mode/geometry).
+
+**Evidence.** `cargo test -p mc-worldgen --lib` 256 passed / 0 failed / 5 ignored;
+`cargo test -p mc-server --bin mc-server -- structure_rules` 4/0 with the live
+activated-path proof printing `seed 4242, village at chunk (379, 0), 95 pieces,
+188 junctions, 55 beard pieces, region 5989,49,-28..6146,94,97, 696 village
+blocks, 11 columns moved` (257 worldgen tests after the anchor regression test was
+added); the full L2 gate `run correctness` PASS
+`.analysis/validation/20260914T225812-correctness-14v_9___` on the final tree
+(earlier runs `20260914T142832-correctness-rk8v8o75` and
+`20260914T145752-correctness-cpnapg1f` predate the last test and doc edits). The decor stream, chest seed and start-connector facts are pinned
+against the real classes: `.analysis/codex-logs/village-decor-random/` (Java
+probe over the named `client-26.1.2.jar`, with its output and the source facts it
+sits on).
+
+**Independent review of this checkpoint (2026-09-14, verdict `changes`).** Six
+findings, all resolved here:
+
+- blocker — the decor random was the raw `XoroshiroRandomSource`, and the test
+  pinned that: replaced with the `WorldgenRandom` wrapper, and every draw the
+  Java probe read is now asserted.
+- blocker — chest `LootTableSeed` did not come off the structure stream: fixed as
+  above, with a test that a clipped chest does not draw.
+- blocker — the ore-halo memo cached a *column-filtered* plan set under the chunk
+  key, which suppressed a village for the chunk's other columns: fixed to cache
+  `village_plans_for_chunk`.
+- should-fix — the start anchor did not subtract the connector's local offset:
+  fixed (unreachable for the village set, wrong as a model).
+- should-fix — the assembly memo's reuse assumes the caller's terrain answers are
+  the world's: kept, and stated as the memo's contract in the code and in
+  `docs/VILLAGE_GENERATION.md` rather than enforced structurally.
+- note — the doc over-claimed that piles and flowers at a border lose nothing:
+  corrected.
+
+The start-anchor fix is now covered: `the_start_piece_is_anchored_on_its_named_connector`
+builds a synthetic structure whose named connector sits at a non-origin local
+offset (all five village structures leave `start_jigsaw_name` absent, which is why
+the live plans cannot see the convention), asserts the connector lands on the
+start chunk's minimum block corner, and fails on the pre-fix code with
+`left: 202, right: 192` — twice the rotated offset.
+
+The review also repeated an earlier note in this file that
+`FeaturePoolElement.place` runs on the *growth* random. That is wrong and the
+entry above supersedes it: `JigsawPlacement.addPieces` never places features, and
+`FeaturePoolElement.place` is called from `StructureStart.placeInChunk` with the
+`FEATURES`-step random `applyBiomeDecoration` seeded per (chunk, structure).
+
+**Unresolved, stated rather than approximated.** Villagers are still not spawned
+from piece entity markers; `start_height` providers other than `absolute` and
+vanilla's `dimension_padding` are unmodelled (documented in the route page); the
+`plains_village_prototype` composite and its profile remain until a plugin-side
+placement mechanism exists; chest *contents* are rolled by the `mc-data` catalog
+implementation seeded with vanilla's `LootTableSeed`, which is not yet a
+vanilla-`LootTable` execution; the plugin settlement `ground.surface_height`
+callback pays one plan lookup (and now one memo insert) per column.
+
+**Manual/client gate: not run for revision 23.** No PrismLauncher walk and no
+harness real-client profile was run for this revision; the evidence is the Rust
+gates plus the Java probe over the real classes. What is therefore unexercised is
+what a client shows — a village's silhouette on generated terrain, the chest
+contents a player opens, and the decor a player walks through.
+
+**Next.** Take the next village/parity outcome from the route page — the villager spawn from piece
+markers is the largest remaining gap between a generated village and vanilla's.

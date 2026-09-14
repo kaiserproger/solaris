@@ -38,7 +38,7 @@ use mc_nbt::{ListTag, Tag, tag_type};
 use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 
 use crate::structures::{StructureTemplate, TemplateChest};
-use crate::vanilla_features::{BlockSemantics, BlockTagIndex};
+use crate::vanilla_features::{BlockSemantics, BlockTagIndex, LegacyRandom};
 use crate::village::piece::{
     BlockClip, Mirror, PieceSettings, PieceWriter, mirror_state, place_piece, rotate_state,
     transform,
@@ -691,7 +691,7 @@ struct RecordingWriter {
     air: BlockStateId,
     world: HashMap<BlockPos, BlockStateId>,
     blocks: Vec<(BlockPos, BlockStateId)>,
-    chests: Vec<(BlockPos, usize)>,
+    chests: Vec<(BlockPos, u64)>,
 }
 
 impl RecordingWriter {
@@ -733,8 +733,8 @@ impl PieceWriter for RecordingWriter {
         self.blocks.push((pos, state));
     }
 
-    fn set_chest(&mut self, pos: BlockPos, _chest: &TemplateChest, index: usize) {
-        self.chests.push((pos, index));
+    fn set_chest(&mut self, pos: BlockPos, _chest: &TemplateChest, loot_seed: u64) {
+        self.chests.push((pos, loot_seed));
     }
 }
 
@@ -1101,6 +1101,7 @@ fn place_piece_rotates_the_layout_and_substitutes_final_states() {
             &owner,
         ),
         &mut writer,
+        Some(&mut LegacyRandom::new(0)),
     )
     .expect("the synthetic piece places");
 
@@ -1141,6 +1142,9 @@ fn place_piece_rotates_the_layout_and_substitutes_final_states() {
         "structure_void jigsaw"
     );
     assert_eq!(writer.state_at([99, 64, 201]), None, "structure_block");
+    // The chest's block entity carries the `LootTableSeed` vanilla draws for it
+    // from the placing structure's random (`StructureTemplate.placeInWorld`):
+    // the first draw of the source this test handed `place_piece`.
     assert_eq!(
         writer.chests,
         vec![(
@@ -1149,7 +1153,7 @@ fn place_piece_rotates_the_layout_and_substitutes_final_states() {
                 y: 64,
                 z: 202
             },
-            0
+            13_483_975_608_033_169_720
         )]
     );
 }
@@ -1171,8 +1175,16 @@ fn place_piece_clips_to_the_bounding_box() {
     );
     // Keeps only the `x = 100` column, i.e. the piece's `z = 0` row.
     piece.clip = Some(BlockClip::new([100, 64, 200], [100, 64, 203]));
-    let written =
-        place_piece(&semantics, &template, &piece, &mut writer).expect("the piece places");
+    let mut random = LegacyRandom::new(0);
+    let before = random.state();
+    let written = place_piece(
+        &semantics,
+        &template,
+        &piece,
+        &mut writer,
+        Some(&mut random),
+    )
+    .expect("the piece places");
 
     assert_eq!(written, 3);
     assert_eq!(
@@ -1205,6 +1217,11 @@ fn place_piece_clips_to_the_bounding_box() {
         writer.chests.is_empty(),
         "a clipped chest block is not written, so its block entity is not either"
     );
+    assert_eq!(
+        random.state(),
+        before,
+        "a chest the clip dropped must not draw a loot seed from the stream"
+    );
 }
 
 #[test]
@@ -1236,6 +1253,7 @@ fn waterlogged_states_follow_the_world_water() {
             &owner,
         ),
         &mut writer,
+        Some(&mut LegacyRandom::new(0)),
     )
     .expect("the piece places");
     assert_eq!(
@@ -1276,6 +1294,7 @@ fn processors_apply_in_list_order_per_block() {
                 &owner,
             ),
             &mut writer,
+            Some(&mut LegacyRandom::new(0)),
         )
         .expect("the piece places");
         writer
@@ -1322,6 +1341,7 @@ fn legacy_elements_ignore_air_and_single_elements_do_not() {
                 &owner,
             ),
             &mut writer,
+            Some(&mut LegacyRandom::new(0)),
         )
         .expect("the piece places");
         (written, writer.state_at([99, 64, 203]))
@@ -1373,6 +1393,7 @@ fn a_template_without_blocks_writes_nothing() {
             &owner,
         ),
         &mut writer,
+        Some(&mut LegacyRandom::new(0)),
     )
     .expect("an empty template places");
     assert_eq!(written, 0);
@@ -1473,8 +1494,14 @@ fn real_cache_places_the_desert_town_centre() {
     );
 
     let mut writer = fixture.writer();
-    let written = place_piece(&semantics, &element.template, &settings, &mut writer)
-        .expect("the town centre places");
+    let written = place_piece(
+        &semantics,
+        &element.template,
+        &settings,
+        &mut writer,
+        Some(&mut LegacyRandom::new(0)),
+    )
+    .expect("the town centre places");
     assert_eq!(written, REAL_PLACEMENT_COUNT);
     for (position, state) in REAL_PLACEMENT {
         assert_eq!(
@@ -1493,16 +1520,28 @@ fn real_cache_places_the_desert_town_centre() {
 
     // The same piece, twice: placement is deterministic and draws nothing.
     let mut repeat = fixture.writer();
-    let again = place_piece(&semantics, &element.template, &settings, &mut repeat)
-        .expect("the town centre places again");
+    let again = place_piece(
+        &semantics,
+        &element.template,
+        &settings,
+        &mut repeat,
+        Some(&mut LegacyRandom::new(0)),
+    )
+    .expect("the town centre places again");
     assert_eq!(again, written);
     assert_eq!(repeat.blocks, writer.blocks);
 
     // The chunk-box clip `SinglePoolElement.place` passes: `z <= -246`.
     settings.clip = Some(BlockClip::new([120, -64, -256], [143, 319, -246]));
     let mut clipped = fixture.writer();
-    let clipped_written = place_piece(&semantics, &element.template, &settings, &mut clipped)
-        .expect("the clipped town centre places");
+    let clipped_written = place_piece(
+        &semantics,
+        &element.template,
+        &settings,
+        &mut clipped,
+        Some(&mut LegacyRandom::new(0)),
+    )
+    .expect("the clipped town centre places");
     assert_eq!(clipped_written, REAL_CLIPPED_COUNT);
     for (position, state) in REAL_CLIPPED {
         assert_eq!(

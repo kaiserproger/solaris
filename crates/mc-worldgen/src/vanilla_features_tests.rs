@@ -20,7 +20,7 @@ use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use crate::vanilla_features::{
     BlockSemantics, BlockTagIndex, CacheTags, CompileError, CompiledPlacedFeature,
     CompiledStateProvider, FeatureLevel, JavaHashSet, LegacyPositionalRandomFactory, LegacyRandom,
-    NormalNoise, PlaceError, RandomSource, java_hash, java_string_hash,
+    NormalNoise, PlaceError, PositionalRandomSource, RandomSource, java_hash, java_string_hash,
 };
 
 // ---------------------------------------------------------------- fixtures
@@ -218,7 +218,9 @@ impl RandomSource for ScriptedRandom {
         self.bits.push(bits);
         self.draws.pop_front().expect("scripted random exhausted")
     }
+}
 
+impl PositionalRandomSource for ScriptedRandom {
     fn fork_positional(&mut self) -> LegacyPositionalRandomFactory {
         panic!("scripted random has no positional factory")
     }
@@ -244,7 +246,9 @@ impl RandomSource for RecordingRandom {
         self.bits.push(bits);
         self.inner.next(bits)
     }
+}
 
+impl PositionalRandomSource for RecordingRandom {
     fn fork_positional(&mut self) -> LegacyPositionalRandomFactory {
         self.inner.fork_positional()
     }

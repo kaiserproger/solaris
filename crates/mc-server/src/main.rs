@@ -1453,16 +1453,24 @@ fn village_plan_source_for_startup(
     }
     let structure_set = mc_data::Identifier::parse("minecraft:villages")
         .expect("the vanilla villages structure set id is static");
-    let closure =
+    let closure = Arc::new(
         mc_worldgen::village::load_village_closure(vanilla_data_dir, &structure_set, blocks)
-            .context("loading the vanilla village closure from the content cache")?;
+            .context("loading the vanilla village closure from the content cache")?,
+    );
     let cache_tags = Arc::new(mc_worldgen::vanilla_features::CacheTags::new(
         Arc::clone(blocks),
         Arc::clone(data),
         Arc::clone(tags),
     ));
+    let semantics =
+        mc_worldgen::vanilla_features::BlockSemantics::new(blocks.as_ref(), cache_tags.as_ref());
+    let decor = Arc::new(
+        mc_worldgen::village::VillageDecor::compile(vanilla_data_dir, &closure, &semantics)
+            .context("compiling the vanilla village decor from the content cache")?,
+    );
     let source = mc_worldgen::village::plan_source::VillagePlanSource::new(
-        Arc::new(closure),
+        closure,
+        decor,
         seed,
         Arc::clone(blocks),
         cache_tags.clone(),
@@ -3185,9 +3193,11 @@ mod tests {
         );
     }
 
-    /// Activation is off: `settlement_profile = "vanilla"` builds a generator
-    /// with no village plan source, so it places no villages and the analogue
-    /// notice has nothing to report.
+    /// No plan source, no villages: `build_terrain_generator` receives the
+    /// source from its caller, and this call passes `None` (the shape a world
+    /// whose profile is not `vanilla`, or where a deployed Luau plan owns
+    /// settlement, reaches it with). The generator then places nothing and the
+    /// terrain-adaptation analogue notice has nothing to report.
     #[test]
     fn build_terrain_generator_places_no_villages_without_a_plan_source() {
         let blocks =

@@ -6,7 +6,7 @@
 //! `0.16666666666666666 / expectedDeviation(octaveSpan)`. Only this one entry
 //! point is implemented because it is all `noise_threshold_provider` reaches.
 
-use super::random::RandomSource;
+use super::random::{PositionalRandomSource, RandomSource};
 
 /// `NormalNoise.INPUT_FACTOR`.
 const INPUT_FACTOR: f64 = 1.018_126_888_217_522_7;
@@ -46,7 +46,11 @@ impl NormalNoise {
     /// wraps the seed in `WorldgenRandom`, whose `next`/`forkPositional` simply
     /// delegate to the legacy source; a `LegacyRandom` is therefore equivalent.
     #[must_use]
-    pub fn create(random: &mut impl RandomSource, first_octave: i32, amplitudes: &[f64]) -> Self {
+    pub fn create(
+        random: &mut impl PositionalRandomSource,
+        first_octave: i32,
+        amplitudes: &[f64],
+    ) -> Self {
         let first = PerlinNoise::create(random, first_octave, amplitudes);
         let second = PerlinNoise::create(random, first_octave, amplitudes);
 
@@ -95,7 +99,11 @@ struct PerlinNoise {
 impl PerlinNoise {
     /// Vanilla `PerlinNoise.create(random, firstOctave, amplitudes)` with the
     /// new (positional-factory) initialization.
-    fn create(random: &mut impl RandomSource, first_octave: i32, amplitudes: &[f64]) -> Self {
+    fn create(
+        random: &mut impl PositionalRandomSource,
+        first_octave: i32,
+        amplitudes: &[f64],
+    ) -> Self {
         let octaves = amplitudes.len();
         let zero_octave_index = -first_octave;
         let factory = random.fork_positional();

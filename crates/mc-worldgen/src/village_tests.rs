@@ -1,8 +1,8 @@
 //! Engine tests for checkpoint B's placement and terrain-adaptation layers.
 //!
-//! The jigsaw solver itself is not covered here yet; these are the pieces of the
-//! village engine that are complete: `minecraft:random_spread` placement and
-//! structure selection, and the column-height beard analogue.
+//! The jigsaw solver itself lives in `village_solver_tests.rs`; these are the
+//! other pieces of the village engine: `minecraft:random_spread` placement, the
+//! worldgen random's seeding functions, and the column-height beard analogue.
 
 use std::path::{Path, PathBuf};
 
@@ -10,13 +10,13 @@ use mc_data::Identifier;
 use mc_world::{BlockPos, BlockRegistry};
 
 use crate::structures::{BlockFace, Joint, orientation_faces};
+use crate::vanilla_features::{LegacyRandom, RandomSource, WorldgenRandom, XoroshiroRandom};
 use crate::village::beard::{
     BEARD_KERNEL_RADIUS, BeardContribution, BeardJunction, affected_box, apply_columns,
     beard_contribution, kernel_value, vanilla_contribution,
 };
 use crate::village::placement::{
-    RandomSpreadPlacement, WeightedStructure, select_structure, set_large_feature_with_salt,
-    start_origin,
+    RandomSpreadPlacement, set_large_feature_seed, set_large_feature_with_salt, start_origin,
 };
 
 /// `Mth.fastInvSqrt`, restated in the test so the expectation above is derived
@@ -359,71 +359,85 @@ fn large_feature_with_salt_matches_worldgen_random() {
     );
 }
 
+/// `WorldgenRandom.setLargeFeatureSeed`: the seed the structure selection and
+/// the growth both run on, and *not* the placement's salted one.
 #[test]
-fn structure_selection_respects_biome_filter_and_weights() {
-    let placement = RandomSpreadPlacement {
-        spacing: 34,
-        separation: 8,
-        salt: 10387312,
-        triangular: false,
+fn large_feature_seed_matches_the_worldgen_random() {
+    // Restated from the formula: a legacy source seeded with `seed`, two
+    // `nextLong` scale factors, combined by `x * xScale ^ z * zScale ^ seed`.
+    let derived = |seed: i64, chunk_x: i32, chunk_z: i32| {
+        let mut random = LegacyRandom::new(seed);
+        let x_scale = random.next_long();
+        let z_scale = random.next_long();
+        i64::from(chunk_x).wrapping_mul(x_scale) ^ i64::from(chunk_z).wrapping_mul(z_scale) ^ seed
     };
-    let structures = vec![
-        WeightedStructure {
-            id: identifier("minecraft:village_plains"),
-            weight: 1,
-            biomes: identifier("minecraft:has_structure/village_plains"),
-            start_height: 0,
-        },
-        WeightedStructure {
-            id: identifier("minecraft:village_desert"),
-            weight: 1,
-            biomes: identifier("minecraft:has_structure/village_desert"),
-            start_height: 0,
-        },
-        WeightedStructure {
-            id: identifier("minecraft:village_taiga"),
-            weight: 1,
-            biomes: identifier("minecraft:has_structure/village_taiga"),
-            start_height: 0,
-        },
-    ];
-
-    // Only desert matches: the pick must be the desert entry every time.
-    for chunk in 0..16 {
-        let picked = select_structure(placement, 4242, chunk, -chunk, &structures, |tag| {
-            *tag == identifier("minecraft:has_structure/village_desert")
-        })
-        .expect("a matching structure exists");
-        assert_eq!(picked, 1);
-    }
-
-    // No biome matches: no village.
-    assert!(
-        select_structure(placement, 4242, 3, 4, &structures, |_| false).is_none(),
-        "no eligible structure means no village"
+    assert_eq!(set_large_feature_seed(0, 5, 7), derived(0, 5, 7));
+    assert_eq!(set_large_feature_seed(-3, -9, 12), derived(-3, -9, 12));
+    // Pinned so an LCG or composition change cannot slip through unnoticed.
+    assert_eq!(set_large_feature_seed(0, 5, 7), 624_053_714_787_533_610);
+    assert_eq!(
+        set_large_feature_seed(4242, 427, 0),
+        7_101_243_444_056_765_349
     );
+    // The placement's own source is a different derivation from the same seed.
+    assert_ne!(
+        set_large_feature_seed(0, 5, 7),
+        set_large_feature_with_salt(0, 5, 7, 10387312)
+    );
+}
 
-    // Two eligible entries: the pick is deterministic per (seed, chunk) and
-    // lands on both entries across chunks.
-    let mut seen = [false; 3];
-    for chunk in 0..32 {
-        let picked = select_structure(placement, 99, chunk, chunk * 3, &structures, |tag| {
-            *tag != identifier("minecraft:has_structure/village_taiga")
-        })
-        .expect("two eligible structures");
-        assert!(picked == 0 || picked == 1);
-        seen[picked] = true;
-        // Determinism: the same inputs pick the same structure.
-        assert_eq!(
-            select_structure(placement, 99, chunk, chunk * 3, &structures, |tag| {
-                *tag != identifier("minecraft:has_structure/village_taiga")
-            }),
-            Some(picked)
-        );
-    }
-    assert!(
-        seen[0] && seen[1],
-        "both eligible structures appear across chunks"
+/// `WorldgenRandom.setDecorationSeed`/`setFeatureSeed`: the decor lane's seeding
+/// and the first draws of the stream it seeds.
+///
+/// Every number here was read out of the real 26.1.2 classes —
+/// `new WorldgenRandom(new XoroshiroRandomSource(seed))` with
+/// `setDecorationSeed(seed, chunkX * 16, chunkZ * 16)` then
+/// `setFeatureSeed(decorationSeed, 22, 4)`, the village set's index among the
+/// `surface_structures` entries and that step's ordinal
+/// (`.analysis/codex-logs/village-decor-random/`). The seed is a `WorldgenRandom`
+/// *wrapper*, so both calls compose their draws from the legacy formulas over the
+/// Xoroshiro bits: a raw [`XoroshiroRandom`] gives a different decoration seed
+/// (and a different stream) from the same world seed.
+#[test]
+fn decor_seeds_match_the_worldgen_random() {
+    let mut random = WorldgenRandom::over_xoroshiro(4242);
+    let decoration_seed = random.set_decoration_seed(4242, 427 * 16, 0);
+    assert_eq!(decoration_seed, 3_979_914_027_210_390_498);
+    random.set_feature_seed(decoration_seed, 22, 4);
+    // Every composed draw, in the order the probe read them: these are
+    // `BitRandomSource`'s legacy formulas over the Xoroshiro bits, which is what
+    // makes the wrapper a wrapper.
+    assert_eq!(random.next_long(), -5_071_117_971_071_978_252);
+    assert_eq!(random.next_int(), -127_179_403);
+    assert_eq!(random.next_int_bounded(5), 0);
+    assert_eq!(random.next_float(), 0.982_076_6);
+    assert_eq!(random.next_double(), 0.590_878_973_655_357_9);
+    assert!(random.next_boolean());
+
+    // At the origin the mixed seed is 0, and the stream that follows is still a
+    // wrapper's: a raw source seeded with 0 draws differently.
+    let mut origin = WorldgenRandom::over_xoroshiro(0);
+    let origin_seed = origin.set_decoration_seed(0, 0, 0);
+    assert_eq!(origin_seed, 0);
+    origin.set_feature_seed(origin_seed, 22, 4);
+    assert_eq!(origin.next_long(), 7_615_636_877_602_399_696);
+
+    // The structure's index is the set's position in its step's registry list,
+    // so the desert village (index 21) runs a different stream.
+    let mut desert = WorldgenRandom::over_xoroshiro(4242);
+    let desert_seed = desert.set_decoration_seed(4242, 427 * 16, 0);
+    desert.set_feature_seed(desert_seed, 21, 4);
+    assert_eq!(desert.next_long(), 9_222_894_648_221_271_537);
+
+    // The wrapper is the point: the same world seed through the raw source is a
+    // different stream.
+    assert_eq!(
+        WorldgenRandom::over_xoroshiro(4242).next_long(),
+        -8_923_083_906_554_867_932
+    );
+    assert_eq!(
+        XoroshiroRandom::new(4242).next_long(),
+        -8_923_083_901_228_911_911
     );
 }
 

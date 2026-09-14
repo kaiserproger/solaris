@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use mc_data::Identifier;
 use mc_server::ServerConfig;
+use mc_worldgen::village::plan_source::PlanElement;
 
 use crate::{build_terrain_generator, structure_rules_for_startup};
 
@@ -521,32 +522,59 @@ fn live_activated_path_places_a_vanilla_village() {
             if !placement.is_placement_chunk(seed, candidate.0, candidate.1) {
                 continue;
             }
-            if let Some(set) =
+            let Some(set) =
                 source.plans_for_chunk(candidate.0, candidate.1, &free_height, &biome_at)
-                && !set.is_empty()
-            {
-                found = Some((candidate, set));
+            else {
+                continue;
+            };
+            // The candidate's *own* village, not just any village the
+            // neighbourhood reaches: a set can hold a neighbour's plan too, and
+            // only the village started here has its start piece in this chunk.
+            let own = set
+                .plans()
+                .iter()
+                .find(|plan| plan.start_chunk() == candidate)
+                .map(Arc::clone);
+            if let Some(plan) = own {
+                found = Some((candidate, set, plan));
                 break 'cells;
             }
         }
     }
-    let (chunk, set) = found.expect("a placement chunk in the first 16x16 cells holds a village");
-    let plan = &set.plans()[0];
+    let (chunk, set, plan) =
+        found.expect("a placement chunk in the first 16x16 cells holds a village");
+    assert_eq!(plan.start_chunk(), chunk);
     assert!(
         plan.pieces().len() > 1,
         "the village grew past its start piece: {} pieces",
         plan.pieces().len()
     );
+    // The village pools declare two kinds: `legacy_single_pool_element`
+    // templates and `feature_pool_element` decor leaves. Every *template* piece
+    // must be the legacy kind; a decor leaf carries its feature instead.
     assert!(
-        plan.pieces()
-            .iter()
-            .all(|piece| piece.element == piece_element_legacy()),
-        "every village piece is placed as a legacy single pool element"
+        plan.pieces().iter().all(|piece| !matches!(
+            &piece.element,
+            PlanElement::Single { kind, .. } if *kind != piece_element_legacy()
+        )),
+        "every village template piece is a legacy single pool element"
     );
 
+    // The chunk the start piece's own box centres in, not the candidate: the
+    // start piece is anchored by its jigsaw at the candidate's middle block and
+    // its box extends west of that middle, so the candidate chunk can hold only
+    // a sliver of it while the piece's own chunk holds the village.
+    let start_piece = plan
+        .pieces()
+        .first()
+        .expect("a village starts with a piece");
     let pos = mc_world::ChunkPos {
-        x: chunk.0,
-        z: chunk.1,
+        x: (start_piece.bounds_min.x + start_piece.bounds_max.x)
+            .div_euclid(2)
+            .div_euclid(16),
+        z: (start_piece.bounds_min.z + start_piece.bounds_max.z)
+            .div_euclid(2)
+            .div_euclid(16),
     };
     let planned_chunk = mc_world::ChunkGenerator::generate(generator.as_ref(), pos);
     let plain_chunk = mc_world::ChunkGenerator::generate(plain.as_ref(), pos);
@@ -563,9 +591,9 @@ fn live_activated_path_places_a_vanilla_village() {
                     // column, which can leave the piece's pre-processor box
                     // vertically. Locality is therefore a horizontal property.
                     let world = mc_world::BlockPos {
-                        x: chunk.0 * 16 + i32::from(lx),
+                        x: pos.x * 16 + i32::from(lx),
                         y,
-                        z: chunk.1 * 16 + i32::from(lz),
+                        z: pos.z * 16 + i32::from(lz),
                     };
                     assert!(
                         (min.x..=max.x).contains(&world.x) && (min.z..=max.z).contains(&world.z),
@@ -578,7 +606,7 @@ fn live_activated_path_places_a_vanilla_village() {
     }
     assert!(
         changed > 32,
-        "the activated chunk must carry a village, changed {changed} blocks"
+        "the village's start chunk must carry the village, changed {changed} blocks"
     );
 
     // The terrain analogue is applied: columns of this chunk report the moved

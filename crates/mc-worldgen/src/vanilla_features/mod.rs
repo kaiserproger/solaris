@@ -77,7 +77,10 @@ use thiserror::Error;
 pub use execute::CompiledPlacedFeature;
 pub use placement::CompiledPredicate;
 pub use provider::CompiledStateProvider;
-pub use random::{LegacyPositionalRandomFactory, LegacyRandom, RandomSource, java_string_hash};
+pub use random::{
+    LegacyPositionalRandomFactory, LegacyRandom, PositionalRandomSource, RandomSource,
+    WorldgenRandom, XoroshiroRandom, java_string_hash,
+};
 pub use synth::NormalNoise;
 
 /// Blocks vanilla registers as `AirBlock` with the air property

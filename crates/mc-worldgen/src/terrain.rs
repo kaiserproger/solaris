@@ -27,7 +27,7 @@ use mc_world::{
 };
 
 use crate::noise::fbm_2d;
-use crate::structures::{StructureLoot, StructureRules, StructureTemplate};
+use crate::structures::{StructureLoot, StructureRules, StructureTemplate, chest_loot_seed};
 use crate::village::plan_source::{VillagePlanSet, VillagePlanSource};
 
 mod biome_routing;
@@ -262,6 +262,13 @@ struct OreColumnCache {
     min_z: i64,
     side: usize,
     columns: Vec<Option<ColumnPlan>>,
+    /// One village-plan lookup per chunk the halo reaches, shared by that
+    /// chunk's columns. The lookup is a pure function of the world seed and the
+    /// chunk, and it is the *chunk's* set — never a single column's filtered
+    /// result, which would be `None` for a column outside a village's region and
+    /// would then suppress the village for the chunk's other columns. The memo
+    /// is per call, so it cannot go stale.
+    plans: HashMap<(i32, i32), Option<VillagePlanSet>>,
     cave_min_y: i32,
     cave_layers: usize,
     cave_samples: Vec<u8>,
@@ -288,15 +295,22 @@ impl OreColumnCache {
     ) -> Option<&'a ColumnPlan> {
         let index = self.column_index(world_x, world_z)?;
         if self.columns[index].is_none() {
-            // The column's own village plan, from the same on-demand lookup
+            let chunk = ChunkPos {
+                x: world_x.div_euclid(16),
+                z: world_z.div_euclid(16),
+            };
+            // The column's own chunk's plan set, from the same on-demand lookup
             // every other column surface comes from: the halo reaches into
-            // neighbouring chunks, so the plan cannot be this chunk's.
-            let plan = generator.village_plans_for_column(world_x, world_z);
+            // neighbouring chunks, so the plan cannot be this chunk's, and the
+            // lookup is the *chunk's* set rather than this column's filtered
+            // slice of it (`plan_column` applies the set per column anyway).
+            let plan = self
+                .plans
+                .entry((chunk.x, chunk.z))
+                .or_insert_with(|| generator.village_plans_for_chunk(chunk))
+                .clone();
             self.columns[index] = Some(generator.plan_column(
-                ChunkPos {
-                    x: world_x.div_euclid(16),
-                    z: world_z.div_euclid(16),
-                },
+                chunk,
                 world_x.rem_euclid(16) as u8,
                 world_z.rem_euclid(16) as u8,
                 plan.as_ref(),
@@ -1352,6 +1366,7 @@ impl TerrainGenerator {
             min_z,
             side,
             columns: vec![None; side * side],
+            plans: HashMap::new(),
             cave_min_y,
             cave_layers,
             cave_samples: vec![0; side * side * cave_layers],
@@ -1716,11 +1731,9 @@ impl TerrainGenerator {
             items: &self.chest_loot_items,
         };
         let mut touched = [false; 256];
-        for plan in plans.plans() {
-            source
-                .write_pieces(chunk, plan, &mut touched, &surface, self.air, &loot)
-                .expect("the plan source was validated against this registry at construction");
-        }
+        source
+            .write_plans(chunk, plans, &mut touched, &surface, self.air, &loot)
+            .expect("the plan source was validated against this registry at construction");
         for lz in 0..16u8 {
             for lx in 0..16u8 {
                 if touched[lz as usize * 16 + lx as usize] {
@@ -2523,7 +2536,10 @@ fn paste_template(
         if chunk.get_block(lx, y, lz) != Some(expected_state) {
             continue;
         }
-        let contents = template_chest.resolve_contents(loot, [x, y, z], chest_index);
+        // The plugin lane's own seeding, not vanilla's: this composite has no
+        // vanilla counterpart to be faithful to.
+        let loot_seed = chest_loot_seed(loot.seed, [x, y, z], chest_index);
+        let contents = template_chest.resolve_contents(loot, loot_seed);
         chunk
             .chests
             .insert(mc_world::BlockPos { x, y, z }, contents);

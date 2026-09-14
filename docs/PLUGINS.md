@@ -1537,16 +1537,17 @@ A violation fails startup by name — never a degraded empty catalog:
 When no package claims the profile, the config-driven `[data] settlement_profile`
 prototype path in `crates/mc-server` is the fallback and every settlement call
 answers the typed `runtime_unavailable`; nothing panics and no empty catalog is
-installed. The config default is `vanilla`, which places no villages because core
-Solaris does not implement vanilla village generation — startup reports that gap
-with the typed `settlement_profile_vanilla_generates_no_villages` warning instead
-of quietly generating none. `plains_village_prototype` is the explicit opt-in: it
-combines the three vanilla plains templates (fountain, small house, toolsmith)
-into one bounded composite on the extracted plains village spacing and requires
-`vanilla_data_dir`; it is not full vanilla village generation and places no
-desert, savanna, snowy, or taiga villages. No part of discovery requires the
-Solaris Loader: the shipped server-side package declares no client bundle, and a
-Loader-required package is not needed for the profile.
+installed. The config default is `vanilla`, which is core's own vanilla village
+generation: the five `minecraft:villages` structures, jigsaw-assembled with their
+processors, decor features and the documented column-height terrain adaptation
+analogue. See [Village generation](VILLAGE_GENERATION.md).
+`plains_village_prototype` is the retained opt-in: it combines the three vanilla
+plains templates (fountain, small house, toolsmith) into one bounded composite on
+the extracted plains village spacing and requires `vanilla_data_dir`; it is not
+vanilla village generation and places no desert, savanna, snowy, or taiga
+villages. No part of discovery requires the Solaris Loader: the shipped
+server-side package declares no client bundle, and a Loader-required package is
+not needed for the profile.
 
 **Vanilla content source**
 

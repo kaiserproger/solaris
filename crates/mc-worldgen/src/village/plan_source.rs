@@ -1,24 +1,32 @@
-//! The one village-plan lookup the terrain pipeline consults.
+//! The one village-plan lookup the terrain pipeline consults, and the writer
+//! that turns plans into chunk contents.
 //!
 //! [`assemble_village`] (in [`super::solver`]) decides a village; this module is
-//! the adapter that turns one plan into the only two things the terrain
-//! pipeline needs from it:
+//! the adapter that turns one plan into the things the terrain pipeline needs
+//! from it:
 //!
 //! - the columns [`crate::village::beard::apply_columns`] moves, which the
 //!   generator reads at its surface decision
 //!   ([`crate::terrain::TerrainGenerator::surface_height`]), and
-//! - the piece blocks [`crate::village::piece::place_piece`] writes, which the
-//!   generator writes at its structure step.
+//! - the contents [`VillagePlanSource::write_plans`] writes at the structure
+//!   step: piece blocks through [`crate::village::piece::place_piece`], and
+//!   `feature_pool_element` features through [`super::decor`].
 //!
 //! ## One lookup for both consumers
 //!
-//! There is no cache and no second source of truth. For the chunk being filled
-//! the generator asks [`VillagePlanSource::plans_for_chunk`] once; the
+//! There is one plan computation and no second source of truth. For the chunk
+//! being filled the generator asks [`VillagePlanSource::plans_for_chunk`]; the
 //! [`VillagePlanSet`] it returns holds the plans the chunk's piece blocks are
 //! placed from and the plans its beard columns are read from — the same objects,
 //! not re-derived copies. The lookup assembles on demand by enumerating the
 //! candidate structure-start chunks within [`NEIGHBOURHOOD_CHUNK_RADIUS`] of the
-//! chunk and keeping every one whose affected box overlaps it.
+//! chunk and keeping every one whose affected box overlaps it, and it keeps the
+//! assemblies it has already run in a bounded memo keyed by start chunk
+//! ([`AssemblyCache`]), because the work is per start chunk while the questions
+//! arrive per column: a column query, an ore halo and a chunk's own fill all
+//! keep asking about the same candidates. A miss runs the solver and stores the
+//! result; evicting is never observable, because an assembly is a pure function
+//! of the world seed and its start chunk.
 //!
 //! A chunk can need more than one village. Vanilla's `random_spread` grid puts
 //! candidates at `grid * spacing + spread` with `spread` in
@@ -46,12 +54,25 @@
 //! [`VillagePlan`] carries the solver's [`VillageAssembly`] (pieces, junctions
 //! and the RIGID beard contributions), the junctions in
 //! [`BeardJunction`] form, the affected box, and one [`PlanPiece`] per placed
-//! piece: the element kind (`single_pool_element` /
-//! `legacy_single_pool_element`), the element's processor list, and the
-//! projection, rotation, position and reference position `place_piece` needs.
-//! Nothing here re-derives placement — the solver owns that — and nothing here
-//! applies terrain: [`VillagePlan::adjusted_surface_y`] delegates to
-//! [`apply_columns`].
+//! piece: the element (`single_pool_element` /
+//! `legacy_single_pool_element`, or a `feature_pool_element`), the element's
+//! processor list, the projection, rotation, position, reference position and
+//! box `write_plans` needs. Nothing here re-derives placement — the solver owns
+//! that — and nothing here applies terrain: [`VillagePlan::adjusted_surface_y`]
+//! delegates to [`apply_columns`].
+//!
+//! ## What a chunk write does
+//!
+//! `StructureStart.placeInChunk` places the pieces whose box intersects the
+//! chunk's writable area, in piece order, with one random per structure, so
+//! [`VillagePlanSource::write_plans`] does the same: a piece whose box misses
+//! the chunk is skipped (it would write nothing and, for a feature, must not
+//! draw), each plan's pieces are written through one [`ChunkPieceWriter`], and a
+//! feature element runs on the stream [`VillageDecor::random_for`] seeds per
+//! (chunk, structure) — shared by every plan of that structure reaching the
+//! chunk, exactly as vanilla shares one `WorldgenRandom` across the starts it
+//! places — and a chest's `LootTableSeed` is drawn from that same stream as the
+//! piece lane writes it, the way `StructureTemplate.placeInWorld` does.
 //!
 //! ## Terrain adaptation
 //!
@@ -63,23 +84,28 @@
 //! plan rather than gated per structure; the solver's RIGID pieces are the
 //! contributions it reads.
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use mc_data::Identifier;
 use mc_data::village_data::{HeightmapType, ProcessorRef, Projection, StructureProcessorSpec};
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, Chunk};
 
 use crate::structures::{StructureLoot, TemplateChest};
-use crate::vanilla_features::{BiomeTagIndex, BlockSemantics, BlockTagIndex};
+use crate::vanilla_features::{
+    BiomeTagIndex, BlockSemantics, BlockTagIndex, FeatureLevel, LegacyRandom, WorldgenRandom,
+};
 use crate::village::beard::{
     BeardColumn, BeardJunction, BeardSource, affected_box, apply_columns_over,
 };
 use crate::village::closure::{ClosureElement, VillageClosure};
+use crate::village::decor::VillageDecor;
 use crate::village::piece::{
     BlockClip, Mirror, PieceError, PieceSettings, PieceWriter, place_piece,
 };
 use crate::village::processors::{PieceElement, ProcessLevel};
-use crate::village::solver::{Rotation, VillageAssembly, assemble_village};
+use crate::village::solver::{PlacedElement, Rotation, VillageAssembly, assemble_village};
 
 /// How far, in chunks, a plan's affected box can reach from its start chunk.
 ///
@@ -88,14 +114,6 @@ use crate::village::solver::{Rotation, VillageAssembly, assemble_village};
 /// and given a chunk of margin. A column outside this neighbourhood of a
 /// structure start cannot be inside that plan's affected box.
 pub const NEIGHBOURHOOD_CHUNK_RADIUS: i32 = 8;
-
-/// The column a candidate structure's biome gate is evaluated at: the start
-/// chunk's minimum block corner, which is the position
-/// [`crate::village::placement::start_origin`] anchors the start piece on.
-#[must_use]
-pub const fn start_column(chunk_x: i32, chunk_z: i32) -> (i32, i32) {
-    (chunk_x * 16, chunk_z * 16)
-}
 
 /// Component-wise minimum of two corners.
 fn min_of(a: BlockPos, b: BlockPos) -> BlockPos {
@@ -115,32 +133,57 @@ fn max_of(a: BlockPos, b: BlockPos) -> BlockPos {
     }
 }
 
-/// One piece of a plan, with everything `place_piece` needs for it.
+/// One piece of a plan: a template to place, or a placed feature to run.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanElement {
+    /// `single_pool_element` / `legacy_single_pool_element`.
+    Single {
+        /// The template's id in the closure.
+        template: Identifier,
+        /// The two element kinds install different block-ignore processors, so
+        /// the kind is carried, never assumed.
+        kind: PieceElement,
+        /// The element's processor list, named lists resolved against the
+        /// closure.
+        processors: Vec<StructureProcessorSpec>,
+        /// The template pool that referred this element: the entry a processor
+        /// failure is reported against.
+        owner: Identifier,
+        projection: Projection,
+    },
+    /// `feature_pool_element`: the placed feature the solver placed as a
+    /// terminal leaf, run through the executor where the piece is written.
+    Feature {
+        placed_feature: Identifier,
+        owner: Identifier,
+    },
+}
+
+/// One piece of a plan, with everything placement needs for it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanPiece {
-    /// The template's id in the closure.
-    pub template: Identifier,
-    /// `single_pool_element` or `legacy_single_pool_element`; the two install
-    /// different block-ignore processors, so the kind is carried, never assumed.
-    pub element: PieceElement,
-    /// The element's processor list, named lists resolved against the closure.
-    pub processors: Vec<StructureProcessorSpec>,
-    /// The template pool that referred this element: the entry a processor
-    /// compile failure is reported against.
-    pub owner: Identifier,
-    pub projection: Projection,
-    /// World position of the template's origin.
+    pub element: PlanElement,
+    /// World position of the element's origin.
     pub position: BlockPos,
-    /// The reference position the element's position predicates read.
+    /// The reference position the element's position predicates read
+    /// (`StructureStart.placeInChunk`'s: the first piece's box centre at its
+    /// own minimum Y).
     pub reference_pos: BlockPos,
     pub rotation: Rotation,
     pub depth: i32,
+    /// The piece's box, as the solver decided it (`expandTo` included). A chunk
+    /// places a piece only when this box intersects the chunk's writable area,
+    /// the way `StructureStart.placeInChunk` filters pieces.
+    pub bounds_min: BlockPos,
+    pub bounds_max: BlockPos,
 }
 
 /// One assembled village, with the placement data its pieces are written from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VillagePlan {
-    assembly: VillageAssembly,
+    /// Shared with the memo that holds the start chunk's assembly
+    /// ([`AssemblyCache`]) and with every plan assembled from it.
+    assembly: Arc<VillageAssembly>,
     junctions: Vec<BeardJunction>,
     affected_min: BlockPos,
     affected_max: BlockPos,
@@ -150,8 +193,8 @@ pub struct VillagePlan {
 impl VillagePlan {
     /// The solver's assembly: pieces, junctions and RIGID beard contributions.
     #[must_use]
-    pub const fn assembly(&self) -> &VillageAssembly {
-        &self.assembly
+    pub fn assembly(&self) -> &VillageAssembly {
+        self.assembly.as_ref()
     }
 
     /// The assembly's junctions, as the beard analogue reads them.
@@ -168,7 +211,7 @@ impl VillagePlan {
 
     /// The chunk the placement formula started this village in.
     #[must_use]
-    pub const fn start_chunk(&self) -> (i32, i32) {
+    pub fn start_chunk(&self) -> (i32, i32) {
         self.assembly.chunk
     }
 
@@ -313,10 +356,70 @@ impl VillagePlanSet {
 /// generator that holds it.
 pub struct VillagePlanSource {
     closure: Arc<VillageClosure>,
+    decor: Arc<VillageDecor>,
     seed: i64,
     blocks: Arc<BlockRegistry>,
     block_tags: Arc<dyn BlockTagIndex + Send + Sync>,
     biome_tags: Arc<dyn BiomeTagIndex + Send + Sync>,
+    assemblies: Mutex<AssemblyCache>,
+}
+
+/// How many start chunks' assemblies the memo keeps. Placement puts a village
+/// in roughly one chunk in 230 (`random_spread` spacing 34, separation 8, five
+/// structures), and a village's region spans a handful of chunks, so this holds
+/// the villages a sweep of the world keeps asking about and bounds what a long
+/// session can keep.
+const ASSEMBLY_CACHE_CAPACITY: usize = 64;
+
+/// The assemblies the solver has already run, keyed by start chunk.
+///
+/// The lookup is asked about one chunk at a time, but the work is per *start*
+/// chunk: a column query re-derives its chunk's plan set, a chunk's plan set
+/// scans every candidate of the placement grid in reach, and each candidate that
+/// can start a village runs the whole solver — hundreds of candidate tests
+/// against a growing free shape. Every caller that asks about more than one
+/// column of the same neighbourhood (a mosaic pixel, a settlement layout row, an
+/// ore halo, a chunk being filled) would otherwise run the same assembly again
+/// for each of them.
+///
+/// An entry can be reused because an assembly is a pure function of the world
+/// seed and the start chunk: the two world facts it reads — the free height and
+/// the biome at a column — are [`VillagePlanSource`]'s caller's, and every
+/// caller in this engine derives them from the world's seed. A caller that
+/// answers differently for one position between two queries of the same world
+/// would invalidate it, which is why they are production terrain functions, not
+/// per-query state.
+///
+/// Only the start chunks that *do* hold a village are kept: a candidate the
+/// placement formula rejects costs that formula and nothing else, so the memo
+/// that would hold its `None` would be mostly empty answers — and, being
+/// bounded, would evict the real assemblies it exists for.
+///
+/// Eviction is insertion-ordered and bounded: the memo is a cache, never a
+/// source of truth, so evicting an entry costs only the assembly it holds.
+struct AssemblyCache {
+    order: VecDeque<(i32, i32)>,
+    entries: HashMap<(i32, i32), Arc<VillageAssembly>>,
+}
+
+impl AssemblyCache {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, key: (i32, i32), assembly: &Arc<VillageAssembly>) {
+        if self.entries.insert(key, assembly.clone()).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > ASSEMBLY_CACHE_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+    }
 }
 
 impl VillagePlanSource {
@@ -333,13 +436,15 @@ impl VillagePlanSource {
     /// processor execution resolves rule outputs and jigsaw final states
     /// through it. `block_tags` is the block tag index those processors test
     /// against. `biome_tags` is the worldgen biome tag contents the structure
-    /// gate reads.
+    /// gate reads. `decor` is the closure's compiled `feature_pool_element`
+    /// entries, which the piece walk places where the solver put them.
     ///
     /// # Errors
     ///
     /// The first [`PieceError`] the validation pass produces.
     pub fn new(
         closure: Arc<VillageClosure>,
+        decor: Arc<VillageDecor>,
         seed: i64,
         blocks: Arc<BlockRegistry>,
         block_tags: Arc<dyn BlockTagIndex + Send + Sync>,
@@ -347,10 +452,12 @@ impl VillagePlanSource {
     ) -> Result<Self, PieceError> {
         let source = Self {
             closure,
+            decor,
             seed,
             blocks,
             block_tags,
             biome_tags,
+            assemblies: Mutex::new(AssemblyCache::new()),
         };
         source.validate()?;
         Ok(source)
@@ -360,6 +467,12 @@ impl VillagePlanSource {
     #[must_use]
     pub fn closure(&self) -> &VillageClosure {
         &self.closure
+    }
+
+    /// The compiled decor the plan source places feature elements through.
+    #[must_use]
+    pub fn decor(&self) -> &VillageDecor {
+        &self.decor
     }
 
     /// The world seed the placement formula and the solver run on.
@@ -437,9 +550,11 @@ impl VillagePlanSource {
         set.affects_column(world_x, world_z).then_some(set)
     }
 
-    /// `JigsawStructure.findGenerationPoint`'s gate for one candidate start
-    /// chunk: the placement formula decides whether a structure can start
-    /// there, the biome gate decides whether it actually does.
+    /// `ChunkGenerator.createStructures` + `JigsawStructure.findGenerationPoint`
+    /// for one candidate start chunk: the placement formula decides whether the
+    /// set can start there, the solver draws the set's entries (re-drawing when
+    /// one fails its biome gate), and the biome gate itself is decided at the
+    /// assembly's stub position.
     fn plan_for_start_chunk(
         &self,
         chunk_x: i32,
@@ -447,32 +562,57 @@ impl VillagePlanSource {
         free_height: &dyn Fn(i32, i32) -> i32,
         biome_at: &dyn Fn(i32, i32) -> Identifier,
     ) -> Option<VillagePlan> {
-        if !self
-            .closure
-            .placement
-            .is_placement_chunk(self.seed, chunk_x, chunk_z)
+        let biome_matches =
+            |tag: &Identifier, biome: &Identifier| self.biome_tags.biome_in_tag(tag, biome);
+        let assembly = self.assembly_for(chunk_x, chunk_z, free_height, biome_at, biome_matches)?;
+        self.plan_from(assembly)
+    }
+
+    /// The start chunk's assembly, from the memo when this source has already
+    /// run it ([`AssemblyCache`]), or `None` when the chunk cannot start a
+    /// village.
+    ///
+    /// A miss is solved outside the lock: two threads that miss the same start
+    /// chunk both run the solver and store equal assemblies, which is the same
+    /// work the memo removes for every other caller and never a wrong answer.
+    fn assembly_for(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        free_height: &dyn Fn(i32, i32) -> i32,
+        biome_at: &dyn Fn(i32, i32) -> Identifier,
+        biome_matches: impl Fn(&Identifier, &Identifier) -> bool,
+    ) -> Option<Arc<VillageAssembly>> {
+        if let Some(hit) = self
+            .assemblies
+            .lock()
+            .expect("the assembly memo is never held across a panic")
+            .entries
+            .get(&(chunk_x, chunk_z))
         {
-            return None;
+            return Some(hit.clone());
         }
-        let (gate_x, gate_z) = start_column(chunk_x, chunk_z);
-        let biome = biome_at(gate_x, gate_z);
-        let biome_matches = |tag: &Identifier| self.biome_tags.biome_in_tag(tag, &biome);
-        let assembly = assemble_village(
+        let assembly = Arc::new(assemble_village(
             &self.closure,
             self.seed,
             chunk_x,
             chunk_z,
+            biome_at,
             biome_matches,
             free_height,
-        )?;
-        self.plan_from(assembly)
+        )?);
+        self.assemblies
+            .lock()
+            .expect("the assembly memo is never held across a panic")
+            .insert((chunk_x, chunk_z), &assembly);
+        Some(assembly)
     }
 
     /// Turn the solver's assembly into the plan, resolving per piece the
     /// element data placement needs. `None` when the closure cannot resolve a
     /// placed piece: the closure is loaded by walking exactly the pools the
     /// solver draws from, so this is a defect rather than a runtime case.
-    fn plan_from(&self, assembly: VillageAssembly) -> Option<VillagePlan> {
+    fn plan_from(&self, assembly: Arc<VillageAssembly>) -> Option<VillagePlan> {
         let junctions: Vec<BeardJunction> = assembly
             .junctions
             .iter()
@@ -482,6 +622,16 @@ impl VillagePlanSource {
                 z: junction.source.z,
             })
             .collect();
+        // `StructureStart.placeInChunk`'s reference position: the first
+        // (start) piece's box centre at that box's own minimum Y.
+        let reference_pos = assembly.pieces.first().map_or(assembly.origin, |piece| {
+            let bounds = (piece.bounds_min, piece.bounds_max);
+            BlockPos {
+                x: bounds.0.x + (bounds.1.x - bounds.0.x + 1) / 2,
+                y: bounds.0.y,
+                z: bounds.0.z + (bounds.1.z - bounds.0.z + 1) / 2,
+            }
+        });
         let mut pieces = Vec::with_capacity(assembly.pieces.len());
         let mut bounds: Option<(BlockPos, BlockPos)> = None;
         for piece in &assembly.pieces {
@@ -489,16 +639,38 @@ impl VillagePlanSource {
                 None => (piece.bounds_min, piece.bounds_max),
                 Some((min, max)) => (min_of(min, piece.bounds_min), max_of(max, piece.bounds_max)),
             });
+            let element = match &piece.element {
+                PlacedElement::Single {
+                    template,
+                    owner,
+                    processors,
+                    legacy,
+                    ..
+                } => PlanElement::Single {
+                    template: template.clone(),
+                    kind: element_kind(*legacy),
+                    processors: self.element_processors(processors, owner),
+                    owner: owner.clone(),
+                    projection: piece.projection,
+                },
+                PlacedElement::Feature {
+                    placed_feature,
+                    owner,
+                    ..
+                } => PlanElement::Feature {
+                    placed_feature: placed_feature.clone(),
+                    owner: owner.clone(),
+                },
+                PlacedElement::Empty => continue,
+            };
             pieces.push(PlanPiece {
-                template: piece.element.clone(),
-                element: element_kind(piece.legacy),
-                processors: self.element_processors(&piece.processors),
-                owner: piece.owner.clone(),
-                projection: piece.projection,
+                element,
                 position: piece.position,
-                reference_pos: assembly.origin,
+                reference_pos,
                 rotation: piece.rotation,
                 depth: piece.depth,
+                bounds_min: piece.bounds_min,
+                bounds_max: piece.bounds_max,
             });
         }
         // The region the plan reaches: the pieces themselves, unioned with the
@@ -531,28 +703,42 @@ impl VillagePlanSource {
     /// pools place differently (the four terminators are placed by four biome
     /// pools with four different processor lists) is placed with the list of the
     /// element that actually placed it, not with the first list some other pool
-    /// names for the same template.
-    fn element_processors(&self, processors: &ProcessorRef) -> Vec<StructureProcessorSpec> {
+    /// names for the same template. A named list that is *not* in the closure is
+    /// a defect: [`VillagePlanSource::new`] proves every element's list resolves
+    /// before a world uses the village, so this cannot be reached.
+    fn element_processors(
+        &self,
+        processors: &ProcessorRef,
+        owner: &Identifier,
+    ) -> Vec<StructureProcessorSpec> {
         match processors {
             ProcessorRef::List(list) => self
                 .closure
                 .processor_lists
                 .get(list)
                 .cloned()
-                .unwrap_or_default(),
+                .unwrap_or_else(|| {
+                    panic!("processor list {list} named by {owner} is not in the closure")
+                }),
             ProcessorRef::Inline(specs) => specs.clone(),
         }
     }
 
     /// Place every piece the closure reaches, under every rotation the solver
     /// can pick and under both world states the reachable processors branch on,
-    /// to prove the registry can carry the village before a world uses it.
+    /// to prove the registry can carry the village before a world uses it; and
+    /// prove that every non-piece element the closure reaches resolved.
     ///
     /// Placement rewrites block states (`rotate_state`, `mirror_state`) and the
     /// waterlogging decision reads the world, so a registry missing a rotated
     /// combination fails here, loudly, instead of silently dropping piece blocks
     /// inside chunk generation where nothing can report it. Nothing is written:
     /// the probe writer discards every block.
+    ///
+    /// The processor check is the same class of proof: a named list the closure
+    /// did not load would place a piece with only the ignore/jigsaw passes, and
+    /// a `feature_pool_element` [`VillageDecor`] did not compile would have
+    /// nothing to run where the solver placed it.
     ///
     /// The two passes are the two `locState` inputs the reachable processor
     /// lists branch on — air everywhere, then water everywhere (the plains
@@ -572,6 +758,26 @@ impl VillagePlanSource {
             .blocks
             .block(&Identifier::parse("minecraft:water").expect("a static id parses"))
             .map_or(air, |block| block.default);
+        for pool in self.closure.pools.values() {
+            for (_, element) in &pool.elements {
+                match element {
+                    ClosureElement::Empty => {}
+                    ClosureElement::Feature { placed_feature, .. } => {
+                        assert!(
+                            self.decor.feature(&pool.id, placed_feature).is_some(),
+                            "feature element {placed_feature} of pool {} was not compiled",
+                            pool.id
+                        );
+                    }
+                    ClosureElement::Single { processors, .. } => {
+                        self.element_processors(processors, &pool.id);
+                    }
+                }
+            }
+        }
+        // A throwaway source: validation reads no chest seed, and the pass must
+        // not touch any caller's stream.
+        let mut probe_random = LegacyRandom::new(0);
         for level_state in [air, water] {
             let mut writer = ProbePieceWriter { level_state };
             for pool in self.closure.pools.values() {
@@ -601,11 +807,17 @@ impl VillagePlanSource {
                             mirror: Mirror::None,
                             projection: *projection,
                             element: element_kind(*legacy),
-                            processors: &self.element_processors(processors),
+                            processors: &self.element_processors(processors, &pool.id),
                             owner: &pool.id,
                             clip: None,
                         };
-                        place_piece(&semantics, template, &settings, &mut writer)?;
+                        place_piece(
+                            &semantics,
+                            template,
+                            &settings,
+                            &mut writer,
+                            Some(&mut probe_random),
+                        )?;
                     }
                 }
             }
@@ -613,10 +825,17 @@ impl VillagePlanSource {
         Ok(())
     }
 
-    /// Write `plan`'s piece blocks into `chunk`, clipped to the chunk's box:
+    /// Write every plan's blocks into `chunk`, clipped to the chunk's box:
     /// vanilla places a structure into the generation region box it was
     /// referenced by, so a piece spanning several chunks writes its own part
     /// into each chunk that asks for it.
+    ///
+    /// Pieces are written in plan order, and a `feature_pool_element` is placed
+    /// where its piece falls, with the random vanilla's `FEATURES` step seeds
+    /// per (chunk, structure): one stream per structure, shared by every plan
+    /// of that structure reaching the chunk, exactly as
+    /// `StructureStart.placeInChunk` shares one `WorldgenRandom` across the
+    /// starts it places.
     ///
     /// `touched` records the columns that changed (for the caller's heightmap
     /// refresh), `surface` is the terrain's own surface (the
@@ -627,12 +846,14 @@ impl VillagePlanSource {
     /// # Errors
     ///
     /// Returns [`PieceError`] when a processor list or a template state cannot
-    /// be resolved. Both are registry/closure mismatches: the closure is loaded
-    /// against `blocks`, so a correctly configured world does not reach them.
-    pub fn write_pieces(
+    /// be resolved, and propagates the executor's [`PlaceError`] for a decor
+    /// feature. Both are registry/closure mismatches: the closure is loaded and
+    /// validated against `blocks` at startup, so a correctly configured world
+    /// does not reach them.
+    pub fn write_plans(
         &self,
         chunk: &mut Chunk,
-        plan: &VillagePlan,
+        plans: &VillagePlanSet,
         touched: &mut [bool; 256],
         surface: &dyn Fn(i32, i32) -> i32,
         air: BlockStateId,
@@ -642,40 +863,143 @@ impl VillagePlanSource {
         let geometry = chunk.geometry();
         let min_x = chunk.pos.x * 16;
         let min_z = chunk.pos.z * 16;
+        // `ChunkGenerator.getWritableArea`: the chunk's columns, from one above
+        // the world's bottom to its top. It both clips a piece's writes and
+        // decides which pieces the chunk places at all
+        // (`StructureStart.placeInChunk` skips a piece whose box does not
+        // intersect it), and that second job is load-bearing for the decor lane:
+        // a skipped feature must not draw from the structure's random.
+        let writable = (
+            BlockPos {
+                x: min_x,
+                y: geometry.min_y() + 1,
+                z: min_z,
+            },
+            BlockPos {
+                x: min_x + 15,
+                y: geometry.max_y() - 1,
+                z: min_z + 15,
+            },
+        );
         let clip = BlockClip::new(
-            [min_x, geometry.min_y(), min_z],
-            [min_x + 15, geometry.max_y() - 1, min_z + 15],
+            [writable.0.x, writable.0.y, writable.0.z],
+            [writable.1.x, writable.1.y, writable.1.z],
         );
         let mut placed = 0;
-        for piece in &plan.pieces {
-            let Some(template) = self.closure.piece(&piece.template) else {
-                continue;
-            };
-            let settings = PieceSettings {
-                position: piece.position,
-                reference_pos: piece.reference_pos,
-                rotation: piece.rotation,
-                // Village pieces are never mirrored: vanilla's jigsaw placement
-                // builds every `StructurePlaceSettings` with the default
-                // `Mirror.NONE`.
-                mirror: Mirror::None,
-                projection: piece.projection,
-                element: piece.element,
-                processors: &piece.processors,
-                owner: &piece.owner,
-                clip: Some(clip),
-            };
+        // One random per structure, seeded the way `applyBiomeDecoration` seeds
+        // the structure it is about to place: the stream rolls the `LootTableSeed`
+        // of every container the structure's pieces write *and* runs the
+        // structure's `feature_pool_element` features, in placement order.
+        let mut structure_random: BTreeMap<Identifier, WorldgenRandom> = BTreeMap::new();
+        let (chunk_x, chunk_z) = (chunk.pos.x, chunk.pos.z);
+        for plan in plans.plans() {
+            let structure = &plan.assembly().structure;
+            // A plan that can draw nothing never touches the stream, so a source
+            // whose decor carries no stream for this structure (a closure built
+            // without the worldgen cache) can still place it.
+            let mut random = plan_draws(self, plan).then(|| {
+                structure_random
+                    .entry(structure.clone())
+                    .or_insert_with(|| {
+                        self.decor
+                            .random_for(self.seed, chunk_x, chunk_z, structure)
+                    })
+            });
             let mut writer = ChunkPieceWriter {
                 chunk,
                 touched,
                 surface,
                 loot,
                 air,
+                registry: self.blocks.as_ref(),
             };
-            placed += place_piece(&semantics, template, &settings, &mut writer)?;
+            for piece in plan.pieces() {
+                if !intersects(piece.bounds_min, piece.bounds_max, writable) {
+                    continue;
+                }
+                match &piece.element {
+                    PlanElement::Single {
+                        template,
+                        kind,
+                        processors,
+                        owner,
+                        projection,
+                    } => {
+                        let Some(template) = self.closure.piece(template) else {
+                            continue;
+                        };
+                        let settings = PieceSettings {
+                            position: piece.position,
+                            reference_pos: piece.reference_pos,
+                            rotation: piece.rotation,
+                            // Village pieces are never mirrored: vanilla's
+                            // jigsaw placement builds every
+                            // `StructurePlaceSettings` with the default
+                            // `Mirror.NONE`.
+                            mirror: Mirror::None,
+                            projection: *projection,
+                            element: *kind,
+                            processors,
+                            owner,
+                            clip: Some(clip),
+                        };
+                        placed += place_piece(
+                            &semantics,
+                            template,
+                            &settings,
+                            &mut writer,
+                            random.as_deref_mut().map(|random| {
+                                random as &mut dyn crate::vanilla_features::RandomSource
+                            }),
+                        )?;
+                    }
+                    PlanElement::Feature {
+                        placed_feature,
+                        owner,
+                    } => {
+                        let random = random
+                            .as_deref_mut()
+                            .expect("a feature piece draws from its structure's placement random");
+                        let ran = self.decor.place(
+                            owner,
+                            placed_feature,
+                            &mut writer,
+                            &semantics,
+                            random,
+                            piece.position,
+                        )?;
+                        if ran {
+                            placed += 1;
+                        }
+                    }
+                }
+            }
         }
         Ok(placed)
     }
+}
+
+/// Whether a plan's placement draws from its structure's placement random: a
+/// `feature_pool_element` always does, and so does any template with a chest,
+/// whose `LootTableSeed` [`crate::village::piece::place_piece`] draws.
+fn plan_draws(source: &VillagePlanSource, plan: &VillagePlan) -> bool {
+    plan.pieces().iter().any(|piece| match &piece.element {
+        PlanElement::Feature { .. } => true,
+        PlanElement::Single { template, .. } => source
+            .closure
+            .piece(template)
+            .is_some_and(|template| !template.chests().is_empty()),
+    })
+}
+
+/// `BoundingBox.intersects`: both boxes inclusive on every axis.
+fn intersects(min: BlockPos, max: BlockPos, other: (BlockPos, BlockPos)) -> bool {
+    max.x >= other.0.x
+        && min.x <= other.1.x
+        && max.z >= other.0.z
+        && min.z <= other.1.z
+        && max.y >= other.0.y
+        && min.y <= other.1.y
 }
 
 /// `legacy_single_pool_element` rather than `single_pool_element`: the two place
@@ -710,7 +1034,7 @@ impl ProcessLevel for ProbePieceWriter {
 impl PieceWriter for ProbePieceWriter {
     fn set_block(&mut self, _pos: BlockPos, _state: BlockStateId) {}
 
-    fn set_chest(&mut self, _pos: BlockPos, _chest: &TemplateChest, _index: usize) {}
+    fn set_chest(&mut self, _pos: BlockPos, _chest: &TemplateChest, _loot_seed: u64) {}
 }
 
 /// The chunk the plan's blocks are written into, as the level view
@@ -728,6 +1052,9 @@ struct ChunkPieceWriter<'a, 'b> {
     surface: &'a dyn Fn(i32, i32) -> i32,
     loot: &'a StructureLoot<'b>,
     air: BlockStateId,
+    /// The registry the decor lane resolves a block state against when it asks
+    /// whether a position is a water source.
+    registry: &'a BlockRegistry,
 }
 
 impl ChunkPieceWriter<'_, '_> {
@@ -767,8 +1094,52 @@ impl PieceWriter for ChunkPieceWriter<'_, '_> {
         }
     }
 
-    fn set_chest(&mut self, pos: BlockPos, chest: &TemplateChest, index: usize) {
-        let contents = chest.resolve_contents(self.loot, [pos.x, pos.y, pos.z], index);
+    fn set_chest(&mut self, pos: BlockPos, chest: &TemplateChest, loot_seed: u64) {
+        let contents = chest.resolve_contents(self.loot, loot_seed);
         self.chunk.chests.insert(pos, contents);
+    }
+}
+
+/// The same chunk view serves the decor lane: `minecraft`'s `WorldGenLevel`
+/// subset a placed feature writes through.
+///
+/// One difference from the piece lane is structural, not chosen: vanilla places
+/// a structure into the `WorldGenRegion` that holds the chunk being decorated
+/// and its already-generated neighbours, so a decor feature can write into a
+/// neighbouring chunk, while this generator fills one chunk at a time and has
+/// no neighbour access. A feature write that lands outside the chunk is
+/// therefore dropped ([`FeatureLevel::set_block`] answers `false` to the
+/// caller's existence checks exactly as a write into unloaded ground would),
+/// and the neighbour chunk does not place it later: the piece that carries the
+/// feature belongs to this chunk alone.
+impl FeatureLevel for ChunkPieceWriter<'_, '_> {
+    fn min_y(&self) -> i32 {
+        self.chunk.geometry().min_y()
+    }
+
+    fn max_y(&self) -> i32 {
+        self.chunk.geometry().max_y()
+    }
+
+    fn block_state(&self, pos: BlockPos) -> BlockStateId {
+        ProcessLevel::block_state(self, pos)
+    }
+
+    fn set_block(&mut self, pos: BlockPos, state: BlockStateId) {
+        PieceWriter::set_block(self, pos, state);
+    }
+
+    fn is_water_source_at(&self, pos: BlockPos) -> bool {
+        // `LevelReader.isFluidAtPosition(pos, water source)`: the block at `pos`
+        // is water and its `level` property is 0.
+        let state = ProcessLevel::block_state(self, pos);
+        let Some(resolved) = self.registry.by_id(state) else {
+            return false;
+        };
+        resolved.block.id.path() == "water"
+            && !resolved
+                .properties
+                .iter()
+                .any(|(name, value)| name == "level" && value != "0")
     }
 }

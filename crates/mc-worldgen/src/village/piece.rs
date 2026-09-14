@@ -79,7 +79,7 @@ use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use thiserror::Error;
 
 use crate::structures::{StructureTemplate, TemplateChest};
-use crate::vanilla_features::{BlockSemantics, CompileError};
+use crate::vanilla_features::{BlockSemantics, CompileError, RandomSource};
 use crate::village::processors::{
     PieceBlock, PieceElement, ProcessLevel, apply_processors, piece_processors,
 };
@@ -469,16 +469,19 @@ pub trait PieceWriter: ProcessLevel {
 
     /// Vanilla's block-entity step for a chest the template carries.
     ///
-    /// `index` is the chest's index in [`StructureTemplate::chests`], which is
-    /// what [`TemplateChest::resolve_contents`] keys its loot seed on, so the
-    /// writer can roll the real table with its own [`crate::structures::StructureLoot`].
-    fn set_chest(&mut self, pos: BlockPos, chest: &TemplateChest, index: usize);
+    /// `chest` is the template's own chest and `loot_seed` is the
+    /// `LootTableSeed` vanilla drew for this container from the same random that
+    /// places the structure's decor, so the writer can roll the real table with
+    /// its own [`crate::structures::StructureLoot`].
+    fn set_chest(&mut self, pos: BlockPos, chest: &TemplateChest, loot_seed: u64);
 }
 
 #[derive(Debug, Error)]
 pub enum PieceError {
     #[error(transparent)]
     Processors(#[from] CompileError),
+    #[error(transparent)]
+    Decor(#[from] crate::vanilla_features::PlaceError),
     #[error(
         "piece block at ({pos:?}) cannot be written: the state after rotation/mirroring is not a \
          registered state ({state:?})"
@@ -500,11 +503,17 @@ pub enum PieceError {
 /// is dropped there. A template with an empty palette, or one whose size has a
 /// non-positive axis, writes nothing and returns `Ok(0)`, matching
 /// `placeInWorld`'s early `false`.
+///
+/// `random` is the structure's placement random, which vanilla draws a chest's
+/// `LootTableSeed` from. It is `None` for a piece that draws nothing — no chest
+/// of this template survives its clip — and drawing is the only thing that
+/// needs it.
 pub fn place_piece(
     semantics: &BlockSemantics<'_>,
     template: &StructureTemplate,
     settings: &PieceSettings<'_>,
     writer: &mut dyn PieceWriter,
+    mut random: Option<&mut dyn RandomSource>,
 ) -> Result<usize, PieceError> {
     let processors = piece_processors(
         semantics,
@@ -575,7 +584,14 @@ pub fn place_piece(
         // closure reaches: gravity only moves blocks of `terrain_matching`
         // pieces, and no piece with a chest is one.
         if let Some((_, index)) = chests.iter().find(|(pos, _)| *pos == block.pos) {
-            writer.set_chest(block.pos, &template.chests()[*index], *index);
+            // `StructureTemplate.placeInWorld` draws `LootTableSeed` from the
+            // random that places the structure, once per container the piece
+            // actually writes and never for a block the clip dropped.
+            let loot_seed = random
+                .as_deref_mut()
+                .expect("a chest-bearing piece draws its loot seed from the structure's random")
+                .next_long() as u64;
+            writer.set_chest(block.pos, &template.chests()[*index], loot_seed);
         }
     }
     Ok(written)

@@ -13,7 +13,7 @@ Village assembly follows the placed-feature executor
 (`crates/mc-worldgen/src/village/`) and its data loaders
 (`crates/mc-data/src/village_data.rs`) are active library code: the default
 `settlement_profile` builds a village plan source from the derived content cache
-at startup, `WORLDGEN_REVISION` is 22, and the interim
+at startup, `WORLDGEN_REVISION` is 23, and the interim
 `settlement_profile_vanilla_generates_no_villages` warning is retired. The one
 notice a vanilla village world still carries is the terrain-adaptation analogue
 below.
@@ -34,19 +34,51 @@ structures at equal weight, each gated by a biome tag:
 Placement is `minecraft:random_spread` with spacing 34 chunks, separation 8, and
 salt 10387312. Each 34×34-chunk cell has exactly one candidate chunk, chosen
 deterministically inside the cell; the set generates when the chunk being
-generated is that candidate. Which of the five structures starts there is a
-weighted pick over the entries whose biome tag contains the start column's
-biome, rolled from the same per-chunk random vanilla uses.
+generated is that candidate.
+
+**Which structure starts there is a re-drawn weighted draw, not one roll.**
+Vanilla seeds a `WorldgenRandom` with `setLargeFeatureSeed(seed, chunkX, chunkZ)`
+and repeatedly draws a weighted entry from the set's *remaining* entries: a drawn
+entry that fails its biome gate is removed and the next draw comes from the same
+stream. A candidate chunk therefore holds a village whenever any of the five
+entries is eligible there — a single-roll implementation would leave most
+candidate chunks empty, which is the difference between a village roughly every
+34 chunks and a village roughly every 170.
+
+The biome gate itself is decided on the *assembled* structure: vanilla resolves
+the biome at the start position the assembly reports (`StructureStart`'s stub,
+the start piece's box centre) and tests it against the structure's biome tag.
 
 All five are `minecraft:jigsaw` structures with `size` 6,
 `max_distance_from_center` 80, `start_pool`
 `minecraft:village/<type>/town_centers`, `start_height` absolute 0,
 `project_start_to_heightmap` `WORLD_SURFACE_WG`, `step` `surface_structures`,
-and `terrain_adaptation` `beard_thin`. The start piece is anchored to the
-world-surface height of the start chunk; the village then grows by connecting
-jigsaw blocks across the template pools. Piece blocks are written with their
-rotation, projection and processor list, and `feature_pool_element` entries
-(trees, hay piles, flowers) run through the placed-feature executor.
+`use_expansion_hack` true and `terrain_adaptation` `beard_thin`. The start piece
+is anchored to the world-surface height of the start chunk's centre column; the
+village then grows by connecting jigsaw blocks across the template pools:
+
+- the start pool's weighted element and the start piece's rotation are drawn from
+  the growth random, and the piece is anchored on the named start jigsaw when the
+  structure names one;
+- for each source jigsaw — its world position and its `orientation` faces rotated
+  by the piece's own rotation, then shuffled and ordered highest
+  `selection_priority` first — the target pool's weight-expanded element list is
+  copied and shuffled (at less than full depth) and the fallback's list is copied
+  and shuffled after it;
+- each candidate is tried under the four rotations and then its own shuffled
+  jigsaws; the first pair that `canAttach` and whose target box fits the free
+  space attaches, `use_expansion_hack` raises the target box first, both
+  junctions are written, and the child is queued at the source jigsaw's
+  `placement_priority`; one attachment abandons that source jigsaw's remaining
+  candidates;
+- the free space a candidate must fit into is shared and grown in place: one
+  shape for the whole village, plus a per-piece shape for attachments that land
+  inside their source piece.
+
+Piece blocks are written with their rotation, projection and processor list.
+`feature_pool_element` entries (trees, hay piles, flowers) are **placed**: they
+are leaves of the growth, and each is run through the placed-feature executor
+with the random vanilla's `FEATURES` step seeds (see [Village decor](#village-decor)).
 
 These are vanilla's own numbers and are read from the derived content cache, not
 from Solaris constants: `data/minecraft/worldgen/structure_set/villages.json`,
@@ -60,15 +92,65 @@ the same derived content cache as the rest of vanilla worldgen (see
 
 Code paths:
 
-- `crates/mc-data/src/village_data.rs` resolves the four worldgen registries by
+- `crates/mc-data/src/village_data.rs` resolves the worldgen registries by
   reference and fails closed on anything unsupported, naming the type id and the
-  entry that referenced it.
+  entry that referenced it. It also lists the structure registry's ids and their
+  `step` — the one enumeration in the data layer — because vanilla's decor
+  placement is seeded from a structure's index within its step.
 - `crates/mc-worldgen/src/village/placement.rs` holds the `random_spread`
-  candidate-chunk calculation and the weighted structure pick.
-- `crates/mc-worldgen/src/village/mod.rs` assembles the pieces into the
-  `VillagePlan` the caller writes into chunks.
-- `crates/mc-worldgen/src/structures.rs` reads piece templates and follows the
-  jigsaw walk.
+  candidate-chunk calculation and the `setLargeFeatureSeed` derivation the
+  structure selection and the growth share.
+- `crates/mc-worldgen/src/village/solver.rs` runs the structure selection, the
+  jigsaw growth and the biome gate, and produces the `VillagePlan` the caller
+  writes into chunks.
+- `crates/mc-worldgen/src/village/decor.rs` compiles the closure's
+  `feature_pool_element` entries and seeds the random they run on.
+- `crates/mc-worldgen/src/village/plan_source.rs` is the one lookup both
+  consumers read, and writes both lanes into a chunk.
+- `crates/mc-worldgen/src/village/processors.rs` and
+  `crates/mc-worldgen/src/structures.rs` execute the processor lists and the
+  piece templates.
+
+## Village decor
+
+The pools' decorative entries are `minecraft:feature_pool_element`: a single
+placed feature (oak/spruce/pine/acacia trees, plain flowers, berry bushes, taiga
+grass, cactus, and hay/ice/melon/pumpkin/snow piles) rather than a template. In
+vanilla one is a *piece* like any other — a one-block leaf whose synthetic jigsaw
+points at the empty pool, so it attaches, terminates the branch and is written
+when the chunk it lands in is generated — and its feature is then placed with:
+
+- the `FEATURES` step's random: vanilla's `WorldgenRandom` *wrapper* over an
+  `XoroshiroRandomSource` — the wrapper matters, because `WorldgenRandom extends
+  LegacyRandomSource` and so composes every draw with the legacy formulas over
+  the wrapped bits, which is a different stream from a raw
+  `XoroshiroRandomSource` — seeded per chunk with
+  `setDecorationSeed(worldSeed, chunkX × 16, chunkZ × 16)` and then per structure
+  with `setFeatureSeed(decorationSeed, index, step)`, where `step` is
+  `GenerationStep.Decoration.SURFACE_STRUCTURES` for the village set and `index`
+  is the structure's position among the registered structures of that step;
+- one stream per (chunk, structure): every plan of the same structure that
+  reaches the chunk shares it, in plan order, and a piece the chunk does not
+  place does not draw from it.
+
+That stream is not the decor's alone. Vanilla rolls a chest's `LootTableSeed`
+from it — `StructureTemplate.placeInWorld` draws one `nextLong` per container
+block entity it writes, after the block is set and never for a block its clip
+dropped — so the piece lane draws its chest seeds from the same per-(chunk,
+structure) stream, in piece order, before the decor that follows in that order.
+A template that reaches no container and a plan that reaches no feature never
+touch the stream at all.
+
+The seeding is pinned against numbers read out of the real 26.1.2 classes
+(`.analysis/codex-logs/village-decor-random/`), not restated from the formula:
+seed 4242 at chunk (427, 0) gives the decoration seed 3 979 914 027 210 390 498,
+and `village_plains`'s index 22 at step 4 then draws
+−5 071 117 971 071 978 252 — the value the tests assert.
+
+The features themselves are the data-driven executor's: their types, states,
+tokens, noise and placement modifiers come from the derived cache, resolved by
+reference from the pool entries the closure reaches, and anything outside that
+closure fails the startup load by name.
 
 ## `settlement_profile` semantics
 
@@ -78,7 +160,7 @@ value is part of the persisted world identity, so changing it means a fresh
 
 | Value | What places villages |
 | --- | --- |
-| `vanilla` (default) | Core Solaris generates the five vanilla village structures above: the startup path loads the `minecraft:villages` closure from the derived content cache, validates every reachable piece against the block registry, and attaches the plan source to the terrain generator. |
+| `vanilla` (default) | Core Solaris generates the five vanilla village structures above, decor included: the startup path loads the `minecraft:villages` closure from the derived content cache, compiles its feature elements, validates every reachable piece against the block registry, and attaches the plan source to the terrain generator. |
 | A deployed Luau settlement plan | The plan's worldgen declaration wins. Its descriptor string — profile, owner, buildings, inhabitants, extensions — is the recorded settlement identity. |
 | `plains_village_prototype` | Interim opt-in, still present because its composite is not yet removable (see below). It attaches no core villages and is not vanilla village generation. |
 
@@ -166,11 +248,39 @@ implementation can reuse it unchanged.
 One lookup decides a village's plan per chunk
 (`crates/mc-worldgen/src/village/plan_source.rs`): for the chunk being filled
 the generator assembles the structure starts the placement grid puts in reach,
-keeps the one whose region overlaps the chunk, and drives both consumers from
-that single plan — the piece blocks written during chunk generation and the
-column heights read at the surface decision. There is no second plan
-computation and no plan cache; the lookup is re-derived per generated chunk, and
-a column query re-derives the plan for its own chunk.
+keeps every one whose region overlaps the chunk, and drives both consumers from
+that one set — the piece blocks written during chunk generation and the column
+heights read at the surface decision. The chunk that is being filled looks its
+plan set up once and shares it with all of its columns
+(`TerrainGenerator::village_plans_for_chunk`), and the ore and cave pass, whose
+column cache reaches into neighbouring chunks
+(`OreColumnCache::plans`), looks each of those chunks up once rather than once
+per column.
+
+The expensive part of a lookup is per *start* chunk, not per question: a
+candidate that can start a village runs the whole solver, and the questions
+arrive per column. `VillagePlanSource` therefore keeps the start chunks it has
+already assembled in a bounded memo (`AssemblyCache`, 64 entries). An assembly
+is a pure function of the world seed and its start chunk — the free height and
+biome it reads come from the generator and are the world's own — so a memo hit
+cannot answer differently from a miss, and eviction costs only the work to redo
+it. A candidate the placement formula rejects is never memoized: it costs that
+formula and nothing else, and entries holding such answers would crowd out the
+real villages.
+
+The memo belongs to one world: a `VillagePlanSource` carries that world's seed,
+and every lookup hands it that world's own free height and biome, so an assembly
+is reusable for the source's lifetime and a memo hit cannot answer differently
+from a miss. Nothing is cached across worlds and there is no second plan
+computation: a column query outside generation
+([`TerrainGenerator::surface_height`],
+[`TerrainGenerator::diagnostic_sample`]) derives the plan of the chunk it
+belongs to from the same memo, so a column and its chunk cannot disagree.
+
+Measured on the live village proof (`cargo test -p mc-worldgen --lib
+live_village_plan_moves_columns_and_writes_blocks`, debug, one plains village of
+123 pieces): the test's 110 moved columns cost 78.4 s before the memo and 0.18 s
+after, and generating the house chunk 2.19 s before and 0.05 s after.
 
 A generator with no village plan source is unchanged: it assembles nothing,
 places nothing and blends nothing, byte for byte. A build that does place
@@ -201,6 +311,25 @@ the surface is known. It would also need the other adaptation modes vanilla
 defines (`bury`, `beard_box`, `encapsulate`), which this analogue does not
 implement; no structure in the villages set uses them.
 
+## Declared divergence: decor writes stay in their chunk
+
+Vanilla places a structure into a `WorldGenRegion` that holds the chunk being
+generated *and its already-generated neighbours*, so a piece or a decor tree at a
+chunk edge writes the part that falls in the neighbour. Solaris fills one chunk
+at a time and has no neighbour access, so a decor feature's writes outside the
+chunk being filled are dropped, and the neighbour does not place them later: the
+leaf piece that carries the feature belongs to one chunk.
+
+What that means as an operator: a village tree standing within a few blocks of a
+chunk boundary loses the part of its canopy that crosses the boundary, and so
+does anything else a feature places across it — a hay, melon, snow or ice pile
+spreads two to three blocks from its position, and a plain-flower patch makes 64
+attempts up to six blocks away, so a decor piece near a boundary loses the part
+of its own scatter that lands in the neighbour. Piece *blocks* are unaffected —
+vanilla clips those to the same per-chunk box this generator writes them through
+— and the terrain analogue is computed per column from the plan, so heightmaps
+stay correct.
+
 ## More than one village over a chunk
 
 `minecraft:random_spread` places a candidate at `grid * spacing + spread` with
@@ -210,21 +339,29 @@ a village's region reaches up to eight chunks past its start chunk. A chunk in
 that gap holds part of two villages.
 
 The engine returns every plan whose region reaches the chunk, in ascending
-start-chunk order, places each plan's piece blocks, and sums the terrain
-analogue's contributions before the surface is decided — the way vanilla's
-`Beardifier` sums every structure the chunk references. A chunk reached by no
-plan is byte-identical to the same world generated without villages; that is
-asserted directly, blocks, heightmaps and every column's surface.
+start-chunk order, places each plan's piece blocks and decor, and sums the
+terrain analogue's contributions before the surface is decided — the way
+vanilla's `Beardifier` sums every structure the chunk references. A chunk reached
+by no plan is byte-identical to the same world generated without villages; that
+is asserted directly, blocks, heightmaps and every column's surface.
 
 Two consequences worth knowing as an operator:
 
 - A village's blocks are clipped to the chunk being filled, so a village
-  spanning several chunks is written chunk by chunk as each is generated.
+  spanning several chunks is written chunk by chunk as each is generated, and a
+  piece whose own box does not reach the chunk is not placed in it at all —
+  vanilla's own per-chunk piece filter.
 - `terrain_matching` pieces (streets, terminators, plazas) follow the terrain:
   their gravity processor snaps each block to the height at that block's own
   column. On sloped ground a street therefore steps with the landscape rather
   than staying level, and its blocks can sit outside the piece's own box
   vertically. Locality of a village's influence is a horizontal property.
+
+Vanilla places the structures that reach a chunk in registry order, each with its
+own freshly seeded random, so the order between two *different* structures does
+not affect blocks or draws; two villages of the same type reaching one chunk
+share one decor stream here in ascending start-chunk order, which is the one
+ordering assumption this page makes.
 
 ## World identity and reusing a world
 
@@ -234,10 +371,14 @@ settlement profile, and the selected spawn block. A world that was generated
 without villages, or with a different settlement authority, is a different
 generation identity — it is not a superset or a subset of this one.
 
-The village checkpoint changes newly generated terrain in two ways: villages
-place structures and their contents where there were none, and the terrain
-analogue moves columns around every village. Both are generation changes, so
-both are fenced by `WORLDGEN_REVISION` in `crates/mc-worldgen/src/lib.rs`.
+The village checkpoint changes newly generated terrain in three ways: villages
+place structures and their contents where there were none, the terrain analogue
+moves columns around every village, and the assembled geometry and placement of
+those villages changed with `WORLDGEN_REVISION` 23 (selection re-draws, rotated
+source jigsaws, shuffled candidate lists, the expansion-hack box, the shared free
+shape, the priority queue, the stub-position biome gate, and the decor lane).
+All are generation changes, so all are fenced by `WORLDGEN_REVISION` in
+`crates/mc-worldgen/src/lib.rs`.
 
 What to expect as an operator:
 
@@ -254,8 +395,18 @@ What to expect as an operator:
   generation: Solaris does not generate villages into missing chunks of an
   import.
 
-`WORLDGEN_REVISION` is 22: revision 21 worlds were generated without villages
-and are refused with the fresh-`world_dir` message above. The
+**No real-client run was made for revision 23.** The checkpoint's evidence is the
+Rust gates (workspace tests, `fmt`, `code-health`, strict clippy) plus the Java
+probe over the real 26.1.2 classes for the decor stream, not a graphical client:
+no PrismLauncher walk, no harness real-client profile. What that leaves
+unexercised is exactly what a client would show — a village's silhouette on
+generated terrain, the chest contents a player opens, and the decor a player
+walks through — so a village walk (or the villager-from-markers work that follows
+it) is the first thing that would test this revision visually.
+
+`WORLDGEN_REVISION` is 23: revision-22 worlds carry villages assembled from the
+pre-26.1.2-fidelity solver and no decor, and are refused with the
+fresh-`world_dir` message above. The
 `settlement_profile_vanilla_generates_no_villages` warning is retired — the
 default profile now has villages to report — and the terrain-adaptation analogue
 notice is the one a village world carries.
@@ -265,6 +416,12 @@ notice is the one a village world carries.
 These are the places village generation still fails closed or does nothing, and
 they are deliberate:
 
+- **Village inhabitants.** A piece template's entity markers (the villagers a
+  village's houses place) are loaded by the template reader but not spawned by
+  the vanilla lane, so a generated village has buildings, streets, decor and
+  loot but no population. Villager behaviour, raids, patrols and the trade
+  economy are outside this page entirely, and `spawn_overrides` is parsed and
+  carried but consumed by nothing.
 - **Non-village structures.** Only the `minecraft:villages` structure set is
   assembled. The other structure sets in the content cache (ancient cities,
   mineshafts, ocean monuments, ruined portals, strongholds, mansions, and the
@@ -272,31 +429,32 @@ they are deliberate:
   `minecraft:jigsaw` structures driven by `minecraft:random_spread` placement.
   A structure or placement of another type fails the load by name instead of
   being approximated.
-- **Village decor features.** The `feature_pool_element` entries the village pools
-  reach (the 13 placed features the executor implements: trees, flowers, berry
-  bushes, hay/ice/melon/pumpkin/snow piles, cactus) are not yet placed by the
-  activated village path. The executor and its live proof exist, and the closure
-  carries the features, but the jigsaw growth loop only accepts piece elements
-  today, so a village generates its buildings, streets and terrain analogue
-  without its decorative features. Nothing is placed in their place, and the
-  operator sees the gap named here rather than a silently thinner village. The
-  owner accepted this gap for the activation checkpoint and made wiring the
-  decor lane the next village item.
+- **Start heights other than a constant absolute value.** Only
+  `start_height: {"absolute": n}` is implemented; a structure naming `uniform`,
+  `trapezoid` or a non-absolute anchor fails the closure load by name rather
+  than placing at the wrong Y (those providers also sample the placement random,
+  which the engine does not reproduce).
+- **Vanilla's dimension padding.** `JigsawStructure`'s default `dimension_padding`
+  clamps the growth limit box and rejects a start whose box comes within ten
+  blocks of the world's vertical bounds. Neither is modelled, because a village
+  starts at the world surface and never approaches those bounds; a structure
+  anchored near the world floor or ceiling would grow differently from vanilla.
 - **Other terrain adaptations.** Only `beard_thin` has a version of the
   analogue. `none` needs no behaviour, and `bury`, `beard_box` and
   `encapsulate` have no engine-side analogue; no structure in the villages set
   declares them.
 - **Jigsaw content outside the village closure.** The registry readers load
   entries by reference and fail closed on anything they reach that is not
-  implemented — other pool element types, processor types, rule tests, height
-  providers, and non-`minecraft` namespaces are rejected by type id and
-  referring entry rather than being skipped.
+  implemented — other pool element types (`list_pool_element` is refused rather
+  than flattened), processor types, rule tests, height providers, pool aliases,
+  and non-`minecraft` namespaces are rejected by type id and referring entry
+  rather than being skipped.
 - **Placed features outside the village decor closure.** The feature executor
   implements the feature types, state providers, placement modifiers, block
   predicates and int providers the village pool's `feature_pool_element` entries
   reach. Everything else fails closed at load or compile time, including
   `schedule_tick` on `simple_block`, double plants, and foliage providers that
   can place a state without a `distance` property.
-- **Not claimed.** Villager population and behaviour, raid and patrol
-  interaction, and vanilla's exact structure-spacing behaviour for structure
-  sets other than `villages` are outside this page.
+- **Not claimed.** Vanilla's exact behaviour for structure sets other than
+  `villages`, and the structure-spacing nuances no other set exercises here, are
+  outside this page.

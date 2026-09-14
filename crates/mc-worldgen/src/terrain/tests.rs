@@ -4043,8 +4043,9 @@ fn village_toolsmith_chest_rolls_real_table() {
         catalog: &catalog,
         items: &items,
     };
-    let first = chest.resolve_contents(&loot, [100, 64, -40], 0);
-    let second = chest.resolve_contents(&loot, [100, 64, -40], 0);
+    let loot_seed = crate::structures::chest_loot_seed(0, [100, 64, -40], 0);
+    let first = chest.resolve_contents(&loot, loot_seed);
+    let second = chest.resolve_contents(&loot, loot_seed);
     assert_eq!(first, second);
     assert!(
         first.slots.iter().any(|slot| !slot.is_empty()),
