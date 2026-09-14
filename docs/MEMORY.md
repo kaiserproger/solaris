@@ -3942,3 +3942,19 @@ Unresolved, stated rather than approximated:
   per-chunk draw rather than a confirmed `ChunkGeneratorStructureState` reproduction.
 - The terrain analogue remains the owner-approved column-height divergence, not
   vanilla density parity.
+
+**Owner decision on the decor gap (2026-09-14, after activation landed).** The
+activated path places buildings, streets and the terrain analogue but not the
+`feature_pool_element` decor (13 features; executor done and live-proved, lane not
+wired). Asked whether to keep the default profile on the incomplete village, roll
+the activation back until decor lands, or hide it behind a new opt-in profile, the
+owner chose to **keep the default with the decor gap and make the decor lane the
+next checkpoint**. So `settlement_profile = "vanilla"` stays the activated default,
+`WORLDGEN_REVISION` stays 22, and `crates/mc-worldgen/src/village/mod.rs` plus
+`docs/VILLAGE_GENERATION.md` name the gap explicitly rather than implying the
+decor lane is landed. The commit that carries the activation (`884857cb`) also
+carries the rest of the session's uncommitted work — the managed content import,
+the warehouse endpoint work in `mc-net`, the harness capture, and `Cargo.lock`
+(which changed for a concrete reason: `mc-server` gained `reqwest`, `sha1`, `zip`,
+`thiserror` and the `mc-test-harness` dependency) — so a revert of that commit
+drops more than the village activation.

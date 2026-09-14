@@ -6,9 +6,18 @@
 //! places a start piece at the `WORLD_SURFACE_WG` height, and
 //! `JigsawPlacement` grows the village by connecting jigsaw blocks across
 //! template pools. Piece blocks carry their rotation, projection and processor
-//! list, `feature_pool_element` entries run through the A1/A2 feature executor,
-//! and the terrain around rigid pieces is blended with the column-height
+//! list, and the terrain around rigid pieces is blended with the column-height
 //! analogue described in [`beard`].
+//!
+//! ## What is not placed yet
+//!
+//! `feature_pool_element` entries — the 13 village decor features the A1/A2
+//! executor in [`crate::vanilla_features`] implements — are **not** placed: the
+//! growth loop accepts piece elements only, [`solver::feature_elements`] has no
+//! non-test caller, and nothing in this module runs the executor. A village
+//! therefore generates its buildings, streets and terrain without its decorative
+//! features; wiring that lane is the next village item, not an approximation
+//! already in place.
 //!
 //! ## One authority for the data
 //!

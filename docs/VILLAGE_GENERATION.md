@@ -278,8 +278,10 @@ they are deliberate:
   activated village path. The executor and its live proof exist, and the closure
   carries the features, but the jigsaw growth loop only accepts piece elements
   today, so a village generates its buildings, streets and terrain analogue
-  without its decorative features. This is the next village item, not a silent
-  approximation: nothing is placed in their place.
+  without its decorative features. Nothing is placed in their place, and the
+  operator sees the gap named here rather than a silently thinner village. The
+  owner accepted this gap for the activation checkpoint and made wiring the
+  decor lane the next village item.
 - **Other terrain adaptations.** Only `beard_thin` has a version of the
   analogue. `none` needs no behaviour, and `bury`, `beard_box` and
   `encapsulate` have no engine-side analogue; no structure in the villages set
