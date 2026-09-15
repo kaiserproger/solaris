@@ -334,18 +334,6 @@ pub enum ScriptResidentWorkOrder {
 }
 
 impl ScriptResidentWorkOrder {
-    /// Canonical ordering so one operation fingerprint is input-order stable.
-    pub fn canonicalize(&mut self) {
-        if let Self::Haul {
-            source,
-            destination,
-        } = self
-            && source > destination
-        {
-            std::mem::swap(source, destination);
-        }
-    }
-
     pub fn validate(&self) -> Result<(), ScriptDtoError> {
         match self {
             Self::Harvest { area, tool }
@@ -620,7 +608,9 @@ impl ScriptResidentOrderOperation {
 
     pub fn canonicalize(&mut self) {
         match self {
-            Self::AssignWork { work, .. } => work.canonicalize(),
+            // A work order's fields are roles, not an unordered set: a haul is
+            // directed, so nothing in it may be reordered. `Craft`, the work
+            // area bounds and the tool names are already canonical.
             Self::IssueOrder {
                 handles,
                 expected_order_revisions,

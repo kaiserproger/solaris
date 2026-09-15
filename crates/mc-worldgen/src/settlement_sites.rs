@@ -250,6 +250,19 @@ impl SettlementSelector {
         })
     }
 
+    /// The cells of one discovery page, in scan order.
+    ///
+    /// The page is the contract every site source shares: a settlement owner
+    /// scans the same cells whether it is asking this selector for an authored
+    /// candidate or asking the generator for the vanilla villages inside a
+    /// cell, so one cursor names one region for both.
+    #[must_use]
+    pub fn page_cells(&self, start_cell: [i32; 2], limit: usize) -> Vec<[i32; 2]> {
+        (0..limit)
+            .map(|index| scan_cell(start_cell, index))
+            .collect()
+    }
+
     /// The reversible id of the settlement at `cell`, if it carries one.
     #[must_use]
     pub fn site_id_for_cell(&self, cell: [i32; 2]) -> Option<String> {
@@ -284,8 +297,7 @@ impl SettlementSelector {
     #[must_use]
     pub fn discover(&self, start_cell: [i32; 2], limit: usize) -> Vec<SiteCandidate> {
         let mut candidates = Vec::new();
-        for index in 0..limit {
-            let cell = scan_cell(start_cell, index);
+        for cell in self.page_cells(start_cell, limit) {
             if let Some(candidate) = self.candidate(cell) {
                 candidates.push(candidate);
             }

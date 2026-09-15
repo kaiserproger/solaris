@@ -37,11 +37,11 @@ use mc_data::village_data::{
 use mc_nbt::{ListTag, Tag, tag_type};
 use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 
-use crate::structures::{StructureTemplate, TemplateChest};
+use crate::structures::{StructureTemplate, TemplateChest, TemplateEntity, TemplateVillagerData};
 use crate::vanilla_features::{BlockSemantics, BlockTagIndex, LegacyRandom};
 use crate::village::piece::{
-    BlockClip, Mirror, PieceSettings, PieceWriter, mirror_state, place_piece, rotate_state,
-    transform,
+    BlockClip, Mirror, PieceSettings, PieceWriter, PlacedEntity, entity_yaw, mirror_state,
+    place_piece, rotate_state, transform, transform_position, wrap_degrees,
 };
 use crate::village::processors::{PieceElement, ProcessLevel};
 use crate::village::solver::Rotation;
@@ -687,11 +687,16 @@ impl BlockTagIndex for TestTags {
 
 /// In-memory world plus the piece sink: [`ProcessLevel`] reads `world`, and the
 /// write records what the piece placed.
+/// What one placed entity was: the block the bounding box tested, the double
+/// position it is moved to, the yaw and pitch it is snapped to, and its claim.
+type RecordedEntity = (BlockPos, [f64; 3], f32, f32, String);
+
 struct RecordingWriter {
     air: BlockStateId,
     world: HashMap<BlockPos, BlockStateId>,
     blocks: Vec<(BlockPos, BlockStateId)>,
     chests: Vec<(BlockPos, u64)>,
+    entities: Vec<RecordedEntity>,
 }
 
 impl RecordingWriter {
@@ -701,6 +706,7 @@ impl RecordingWriter {
             world: HashMap::new(),
             blocks: Vec::new(),
             chests: Vec::new(),
+            entities: Vec::new(),
         }
     }
 
@@ -735,6 +741,16 @@ impl PieceWriter for RecordingWriter {
 
     fn set_chest(&mut self, pos: BlockPos, _chest: &TemplateChest, loot_seed: u64) {
         self.chests.push((pos, loot_seed));
+    }
+
+    fn set_entity(&mut self, placed: &PlacedEntity<'_>) {
+        self.entities.push((
+            placed.block,
+            placed.position,
+            placed.yaw,
+            placed.pitch,
+            placed.claim.clone(),
+        ));
     }
 }
 
@@ -1452,6 +1468,178 @@ fn real_element(cache: &Path, blocks: &BlockRegistry, pool: &str, index: usize) 
     }
 }
 
+/// `place_piece` places a template's entities under every rotation, with the
+/// pinned `transform(Vec3, ...)` image, the authored pitch untouched, the yaw
+/// rotated, and the entity dropped by the piece's bounding box.
+///
+/// The entity's double position is the `[2.25, 3.0, -1.5]` point of
+/// [`ENTITY_POSITION_REFERENCE`], so each rotation's expected image is the
+/// reference's own row rather than a restatement of the module under test. The
+/// block the bounding box tests is `[0, 1, 0]`, whose block transform is
+/// `[0, 1, 0]` under all four rotations — the difference between the two
+/// overloads is exactly what this test exists for.
+#[test]
+fn place_piece_places_template_entities_under_every_rotation() {
+    let fixture = Fixture::new();
+    let semantics = fixture.semantics();
+    let owner = identifier("test:village/plains/villagers");
+    let template = StructureTemplate::new([1, 1, 1], Vec::new()).with_entities(vec![
+        TemplateEntity {
+            entity_type: "minecraft:villager".to_owned(),
+            position: [2.25, 3.0, -1.5],
+            block_position: [0, 1, 0],
+            yaw: 48.821_632,
+            pitch: -25.827_711,
+            villager: Some(TemplateVillagerData {
+                kind: "plains".to_owned(),
+                profession: "none".to_owned(),
+                level: 1,
+                age: 0,
+            }),
+        },
+        TemplateEntity {
+            entity_type: "minecraft:villager".to_owned(),
+            position: [99.0, 3.0, -1.5],
+            block_position: [99, 1, 0],
+            yaw: 0.0,
+            pitch: 0.0,
+            villager: None,
+        },
+    ]);
+    let position = BlockPos {
+        x: 100,
+        y: 64,
+        z: -200,
+    };
+    // The clip the jigsaw path passes is the chunk's box; here it keeps the
+    // piece's own column and the 99-blocks-away villager out of it.
+    let clip = Some(BlockClip::new([100, 64, -200], [115, 319, -185]));
+
+    for (rotation, expected) in [
+        (Rotation::None, [2.25, 3.0, -1.5]),
+        (Rotation::Clockwise90, [2.5, 3.0, 2.25]),
+        (Rotation::Clockwise180, [-1.25, 3.0, 2.5]),
+        (Rotation::CounterClockwise90, [-1.5, 3.0, -1.25]),
+    ] {
+        let mut settings =
+            piece_settings(position, rotation, PieceElement::LegacySingle, &[], &owner);
+        settings.clip = clip;
+        let mut writer = fixture.writer();
+        place_piece(&semantics, &template, &settings, &mut writer, None)
+            .expect("a template of entities and no blocks places");
+
+        assert_eq!(
+            writer.entities.len(),
+            1,
+            "the 99-blocks-away villager is outside the clip under {rotation:?}",
+        );
+        let (block, position, yaw, pitch, claim) = &writer.entities[0];
+        assert_eq!(
+            *block,
+            BlockPos {
+                x: 100,
+                y: 65,
+                z: -200
+            },
+            "the block transform of [0, 1, 0] is the same under {rotation:?}",
+        );
+        assert_eq!(
+            *position,
+            [
+                100.0 + expected[0],
+                64.0 + expected[1],
+                -200.0 + expected[2]
+            ],
+            "the entity position under {rotation:?}",
+        );
+        let turns = match rotation {
+            Rotation::None => 0.0,
+            Rotation::Clockwise90 => 90.0,
+            Rotation::Clockwise180 => 180.0,
+            Rotation::CounterClockwise90 => 270.0,
+        };
+        assert_eq!(*yaw, 48.821_632 + turns, "the yaw under {rotation:?}");
+        assert_eq!(
+            *pitch, -25.827_711,
+            "vanilla never rotates the pitch ({rotation:?})",
+        );
+        assert_eq!(claim, "test:village/plains/villagers@100:64:-200#0");
+    }
+}
+
+/// The real cache's villager templates author exactly the entity data the lane
+/// reads: `id`, `pos`, `blockPos`, `VillagerData`, `Age` and both `Rotation`
+/// components, with the pitch in index 1 — the baby templates author
+/// `Rotation = [0.0, -25.827711]`, not a yaw.
+#[test]
+fn real_cache_villager_templates_carry_their_entities() {
+    let Some(cache) = content_cache() else {
+        println!(
+            "SKIP real_cache_villager_templates_carry_their_entities: no vanilla content cache at \
+             /tmp/jdk-cold2 or $SOLARIS_CONTENT_CACHE"
+        );
+        return;
+    };
+    let fixture = Fixture::new();
+    let load = |name: &str| {
+        let path = cache
+            .join("data")
+            .join("minecraft")
+            .join("structure")
+            .join("village/plains/villagers")
+            .join(name)
+            .with_extension("nbt");
+        StructureTemplate::from_nbt_file(&path, &fixture.blocks)
+            .unwrap_or_else(|error| panic!("{} loads: {error}", path.display()))
+    };
+
+    let unemployed = load("unemployed");
+    let [entity] = unemployed.entities() else {
+        panic!("the unemployed villager template authors one entity");
+    };
+    assert_eq!(entity.entity_type, "minecraft:villager");
+    assert_eq!(
+        entity.position,
+        [0.720_498_619_085_589_1, 1.0, 0.631_455_289_898_156]
+    );
+    assert_eq!(entity.block_position, [0, 1, 0]);
+    assert_eq!(entity.yaw, 48.821_632);
+    assert_eq!(entity.pitch, 0.0);
+    let villager = entity.villager.as_ref().expect("a villager entity");
+    assert_eq!(
+        (villager.kind.as_str(), villager.profession.as_str()),
+        ("plains", "none")
+    );
+    assert_eq!((villager.level, villager.age), (1, 0));
+
+    let baby = load("baby");
+    let [entity] = baby.entities() else {
+        panic!("the baby villager template authors one entity");
+    };
+    assert_eq!(entity.block_position, [0, 1, 1]);
+    assert_eq!(
+        (entity.yaw, entity.pitch),
+        (0.0, -25.827_711),
+        "the baby authors a pitch, not a yaw",
+    );
+    let villager = entity.villager.as_ref().expect("a villager entity");
+    assert_eq!(villager.profession, "none");
+    assert_eq!(villager.age, -21_359, "a baby's `Age` is negative");
+
+    let nitwit = load("nitwit");
+    let [entity] = nitwit.entities() else {
+        panic!("the nitwit villager template authors one entity");
+    };
+    assert_eq!(
+        entity
+            .villager
+            .as_ref()
+            .expect("a villager entity")
+            .profession,
+        "nitwit"
+    );
+}
+
 #[test]
 fn real_cache_places_the_desert_town_centre() {
     let Some(cache) = content_cache() else {
@@ -1569,4 +1757,293 @@ fn real_cache_places_the_desert_town_centre() {
             if inside { "inside" } else { "outside" },
         );
     }
+}
+
+/// `StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)` at a zero
+/// pivot, exactly as the real 26.1.2 class printed it: a scratch probe over the
+/// bundled jar (`StructureTemplate.transform` is public and static, so no world
+/// is needed) printed all three mirrors × four rotations for three points — the
+/// unemployed villager template's authored `pos`, the origin, and a point with
+/// negative and fractional coordinates.
+///
+/// This is the overload a template *entity*'s double position goes through, not
+/// the block one: it mirrors with `1.0 - coordinate` and carries the `+ 1` term
+/// in the rotated branches. The village lane passes `Mirror.None`, but the
+/// mirror rows are pinned too, because the function is the transcription and a
+/// silent mirror regression would otherwise be invisible.
+const ENTITY_POSITION_REFERENCE: &[([f64; 3], Mirror, Rotation, [f64; 3])] = &[
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::None,
+        Rotation::None,
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::None,
+        Rotation::Clockwise90,
+        [-0.06979621172871475, 1.0, 0.36605308557818717],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::None,
+        Rotation::Clockwise180,
+        [0.6339469144218128, 1.0, -0.06979621172871475],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::None,
+        Rotation::CounterClockwise90,
+        [1.0697962117287148, 1.0, 0.6339469144218128],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::LeftRight,
+        Rotation::None,
+        [0.36605308557818717, 1.0, -0.06979621172871475],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::LeftRight,
+        Rotation::Clockwise90,
+        [1.0697962117287148, 1.0, 0.36605308557818717],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::LeftRight,
+        Rotation::Clockwise180,
+        [0.6339469144218128, 1.0, 1.0697962117287148],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::LeftRight,
+        Rotation::CounterClockwise90,
+        [-0.06979621172871475, 1.0, 0.6339469144218128],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::FrontBack,
+        Rotation::None,
+        [0.6339469144218128, 1.0, 1.0697962117287148],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::FrontBack,
+        Rotation::Clockwise90,
+        [-0.06979621172871475, 1.0, 0.6339469144218128],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::FrontBack,
+        Rotation::Clockwise180,
+        [0.36605308557818717, 1.0, -0.06979621172871475],
+    ),
+    (
+        [0.36605308557818717, 1.0, 1.0697962117287148],
+        Mirror::FrontBack,
+        Rotation::CounterClockwise90,
+        [1.0697962117287148, 1.0, 0.36605308557818717],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::None,
+        Rotation::None,
+        [0.0, 0.0, 0.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::None,
+        Rotation::Clockwise90,
+        [1.0, 0.0, 0.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::None,
+        Rotation::Clockwise180,
+        [1.0, 0.0, 1.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::None,
+        Rotation::CounterClockwise90,
+        [0.0, 0.0, 1.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::LeftRight,
+        Rotation::None,
+        [0.0, 0.0, 1.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::LeftRight,
+        Rotation::Clockwise90,
+        [0.0, 0.0, 0.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::LeftRight,
+        Rotation::Clockwise180,
+        [1.0, 0.0, 0.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::LeftRight,
+        Rotation::CounterClockwise90,
+        [1.0, 0.0, 1.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::FrontBack,
+        Rotation::None,
+        [1.0, 0.0, 0.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::FrontBack,
+        Rotation::Clockwise90,
+        [1.0, 0.0, 1.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::FrontBack,
+        Rotation::Clockwise180,
+        [0.0, 0.0, 1.0],
+    ),
+    (
+        [0.0, 0.0, 0.0],
+        Mirror::FrontBack,
+        Rotation::CounterClockwise90,
+        [0.0, 0.0, 0.0],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::None,
+        Rotation::None,
+        [2.25, 3.0, -1.5],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::None,
+        Rotation::Clockwise90,
+        [2.5, 3.0, 2.25],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::None,
+        Rotation::Clockwise180,
+        [-1.25, 3.0, 2.5],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::None,
+        Rotation::CounterClockwise90,
+        [-1.5, 3.0, -1.25],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::LeftRight,
+        Rotation::None,
+        [2.25, 3.0, 2.5],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::LeftRight,
+        Rotation::Clockwise90,
+        [-1.5, 3.0, 2.25],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::LeftRight,
+        Rotation::Clockwise180,
+        [-1.25, 3.0, -1.5],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::LeftRight,
+        Rotation::CounterClockwise90,
+        [2.5, 3.0, -1.25],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::FrontBack,
+        Rotation::None,
+        [-1.25, 3.0, -1.5],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::FrontBack,
+        Rotation::Clockwise90,
+        [2.5, 3.0, -1.25],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::FrontBack,
+        Rotation::Clockwise180,
+        [2.25, 3.0, 2.5],
+    ),
+    (
+        [2.25, 3.0, -1.5],
+        Mirror::FrontBack,
+        Rotation::CounterClockwise90,
+        [-1.5, 3.0, 2.25],
+    ),
+];
+
+#[test]
+fn template_entity_positions_transform_like_vanilla() {
+    for (position, mirror, rotation, expected) in ENTITY_POSITION_REFERENCE {
+        assert_eq!(
+            transform_position(*position, *mirror, *rotation),
+            *expected,
+            "{position:?} {mirror:?} {rotation:?}",
+        );
+    }
+}
+
+/// `StructureTemplate.placeEntities`'s yaw,
+/// `entity.rotate(rotation) + entity.mirror(mirror) - entity.getYRot()`.
+///
+/// The three terms come from the real bodies: `Entity.rotate` is
+/// `Mth.wrapDegrees(getYRot()) + {0, 90, 180, 270}` and `Entity.mirror` is
+/// `wrapDegrees(getYRot())` negated for `LEFT_RIGHT` and `180 - it` for
+/// `FRONT_BACK`, while `getYRot` is the yaw the entity's NBT carried — the raw
+/// value, because `Entity.load` sets it with a plain `setYRot` and `snapTo`
+/// stores what it is given. The cases below therefore include an out-of-range
+/// authored yaw, where vanilla's own arithmetic answers outside `-180..180`:
+/// the village templates author in-range yaws, and nothing here rescales a value
+/// vanilla does not.
+#[test]
+fn template_entity_yaw_rotates_and_mirrors_the_authored_yaw() {
+    let villager_yaw = -25.827_711_f32;
+    assert_eq!(
+        entity_yaw(villager_yaw, Mirror::None, Rotation::None),
+        villager_yaw,
+    );
+    let cases = [
+        (Rotation::Clockwise90, 64.172_29_f32),
+        (Rotation::Clockwise180, 154.172_29),
+        (Rotation::CounterClockwise90, 244.172_29),
+    ];
+    for (rotation, expected) in cases {
+        assert_eq!(
+            entity_yaw(villager_yaw, Mirror::None, rotation),
+            expected,
+            "{rotation:?}",
+        );
+    }
+    assert_eq!(
+        entity_yaw(villager_yaw, Mirror::LeftRight, Rotation::None),
+        villager_yaw + (-villager_yaw - villager_yaw),
+    );
+    assert_eq!(
+        entity_yaw(villager_yaw, Mirror::FrontBack, Rotation::None),
+        villager_yaw + (180.0 - villager_yaw - villager_yaw),
+    );
+    // `Mth.wrapDegrees` in `rotate`/`mirror`, but not in `getYRot`.
+    assert_eq!(wrap_degrees(200.0), -160.0);
+    assert_eq!(
+        entity_yaw(200.0, Mirror::None, Rotation::None),
+        -160.0 + (-160.0 - 200.0),
+    );
 }

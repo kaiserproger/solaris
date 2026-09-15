@@ -1021,6 +1021,13 @@ pub(super) struct SettlementInhabitantSpawn {
     entity_type_id: i32,
     entity_type_name: String,
     position: Vec3,
+    /// The yaw the marker was placed with; the spawn snaps the entity to it.
+    yaw: f32,
+    /// The pitch the template authored; the spawn clamps it the way the entity's
+    /// own `setXRot` does.
+    pitch: f32,
+    /// The entity's `Age`, negative for a baby.
+    age: i32,
     villager: mc_entity::VillagerData,
     villager_brain: mc_entity::villager_26_1_2::VillagerBrainState,
     villager_merchant: Option<mc_entity::villager_merchant_26_1_2::VillagerMerchantState>,

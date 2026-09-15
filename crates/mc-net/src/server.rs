@@ -4147,11 +4147,19 @@ async fn bind_internal(
                             "the settlement profile requires the world's terrain generator",
                         )
                     })?;
+                    // The world's own generator answers the village sites:
+                    // the same object the terrain generates from, so a listed
+                    // village is the village the world will place.
+                    let village_sites = Some(Arc::new(
+                        crate::script::storage::GeneratorVillageSites::new(Arc::clone(&ground)),
+                    )
+                        as Arc<dyn crate::script::storage::VillageSiteGround>);
                     let runtime = Arc::new(deployment.runtime(
                         config.random_tick.seed as i64,
                         &world_identity,
                         [0, 0],
                         ground,
+                        village_sites,
                     ));
                     let read = world.lock().await.read_view();
                     info!(
@@ -4163,6 +4171,7 @@ async fn bind_internal(
                     let adapter = crate::settlement::LiveSettlementWorld::new(
                         read,
                         Arc::clone(&config.blocks),
+                        Arc::clone(&config.tags),
                         script_zones.clone(),
                         simulation.clone(),
                     );
@@ -4360,6 +4369,7 @@ async fn bind_internal(
                 format!("pending campfire output recovery failed: {error}"),
             )
         })?;
+    sessions.declare_manifest_view_kinds(config.loader_manifest.as_deref());
     Ok(BoundServer {
         listener,
         config: Arc::new(config),

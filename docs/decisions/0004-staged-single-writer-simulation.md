@@ -307,6 +307,42 @@ with no observation at all when the publication does not pass through that path,
 so the rule cannot silently regress into publishing a container whose
 after-image is not journaled.
 
+## Warehouse inventory transfer, worker principal (landed 2026-09-15)
+
+The same composite serves a deposit whose second participant is not a player
+session. A worker's `Haul` work order names a bound warehouse as its
+destination; its other half is the worker's own canonical record, which lives in
+the plugin ledger and not in the world. Two rules make that reuse safe rather
+than a second authority:
+
+- **One container half, one ordering.** `commit_container_half`
+  (`crates/mc-net/src/play/session/transactions.rs`) holds the state-id fence,
+  the conditional `commit_chests_conditionally`, the state-id bump and the
+  `ChestSlots` publication for *both* the menu path and the server-owned path;
+  only which actor the publication excludes and how each names a refusal stay
+  caller-specific, so the publication order cannot drift between them.
+- **The actor is optional, the receipt is not.** `CommitChest` carries
+  `actor_session: Option<SessionId>` and `player: Option<Box<ContainerPlayerPlan>>`.
+  A deposit with no player participant is enqueued through
+  `enqueue_with_fence(None, …)` exactly like every other server-owned command;
+  the session-authored menu shape is refused by the validator when it is missing
+  its session or its player plan. The second participant is the record change
+  inside the encoded receipt, so the container's after-image and the worker's
+  cargo are durable together or not at all - the batch's `order` change is
+  applied by the same projection (`append_inventory_projection`) the player's
+  recovery after-image uses, and a receipt-bearing batch is still admitted only
+  to a journaled regional run.
+
+A record participant makes `PreparedStorageBatch::validate_inventory_participant`
+accept a decision whose participants are the receipt and a non-empty `order`
+change, which is what lets the same decision replay through
+`WorldChunkJournal` recovery for a worker as it does for a player.
+
+One consequence is recorded deliberately: a haul is directed. `Haul { source,
+destination }` is no longer reordered by `ScriptResidentWorkOrder::canonicalize`
+(which is gone); a directional pair is not a set, and the previous swap turned a
+deposit into a withdrawal.
+
 ## Remaining migration
 
 The staged boundary is not a claim that all world state has one owner. Current

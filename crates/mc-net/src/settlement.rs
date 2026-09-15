@@ -38,6 +38,7 @@ use crate::play::owned_inventory::{WarehouseTransferOutcome, WarehouseTransferRe
 use crate::script::PluginZoneAdapter;
 use crate::script::storage::{
     ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
+    VillageInhabitantReading, VillagePoiReading, VillageReading, village_poi_kind,
 };
 
 /// Manifest feature that owns settlement site discovery.
@@ -167,13 +168,16 @@ impl SettlementDeployment {
     /// Build the deterministic runtime for one world.
     ///
     /// `ground` is the terrain generator the world itself generates from, so a
-    /// settlement's base rows come from the terrain players stand on.
+    /// settlement's base rows come from the terrain players stand on, and
+    /// `village_sites` is the same generator's vanilla village enumeration, so
+    /// a generated village is described by the world that generates it.
     pub(crate) fn runtime(
         &self,
         seed: i64,
         world_identity: &str,
         start_cell: [i32; 2],
         ground: Arc<dyn mc_world::ChunkGenerator>,
+        village_sites: Option<Arc<dyn crate::script::storage::VillageSiteGround>>,
     ) -> SettlementRuntime {
         SettlementRuntime::new(
             SettlementSelector::new(seed, self.profile_revision),
@@ -181,6 +185,7 @@ impl SettlementDeployment {
             world_identity,
             start_cell,
             ground,
+            village_sites,
         )
     }
 }
@@ -355,6 +360,9 @@ fn catalog_profile_revision(catalog: &BlueprintCatalog) -> u64 {
 pub(crate) struct LiveSettlementWorld {
     read: WorldReadView,
     blocks: Arc<BlockRegistry>,
+    /// The world's block tags: the bed tag `PoiTypes.HOME` registers against is
+    /// data, so a home is a block the world's own tag names.
+    tags: Arc<mc_data::tags::TagsData>,
     zones: Option<PluginZoneAdapter>,
     /// The single server-owned simulation handle structure portions commit
     /// through, owned by the same server that constructs this world.
@@ -369,12 +377,14 @@ impl LiveSettlementWorld {
     pub(crate) fn new(
         read: WorldReadView,
         blocks: Arc<BlockRegistry>,
+        tags: Arc<mc_data::tags::TagsData>,
         zones: Option<PluginZoneAdapter>,
         simulation: SimulationHandle,
     ) -> Self {
         Self {
             read,
             blocks,
+            tags,
             zones,
             simulation,
             revision: AtomicU64::new(0),
@@ -460,7 +470,6 @@ impl LiveSettlementWorld {
             .is_some_and(|state| state.block.id.path() == "water")
     }
 
-    /// Biome string at a world position, if the chunk carries a palette.
     fn biome_at(chunk: &Chunk, x: i32, y: i32, z: i32) -> String {
         let geometry = chunk.geometry();
         let local_y = y - geometry.min_y();
@@ -476,6 +485,21 @@ impl LiveSettlementWorld {
         let cell_z = ((z.rem_euclid(CHUNK_AXIS)) / 4) as u8;
         section.get(cell_x, cell_y, cell_z).to_string()
     }
+}
+
+/// Whether one entity position lies inside a bounded reading region.
+///
+/// The floor of each coordinate is the block the entity stands in, which is the
+/// same comparison the site's footprint uses.
+fn block_inside(bounds: ScriptSurveyBounds, position: [f64; 3]) -> bool {
+    let block = [
+        position[0].floor() as i32,
+        position[1].floor() as i32,
+        position[2].floor() as i32,
+    ];
+    (bounds.min[0]..=bounds.max[0]).contains(&block[0])
+        && (bounds.min[1]..=bounds.max[1]).contains(&block[1])
+        && (bounds.min[2]..=bounds.max[2]).contains(&block[2])
 }
 
 impl SettlementWorld for LiveSettlementWorld {
@@ -719,6 +743,95 @@ impl SettlementWorld for LiveSettlementWorld {
                 Ok(None) | Err(_) => Err(ScriptOperationFailure::RuntimeUnavailable),
             }
         })
+    }
+    fn village_pois(
+        &self,
+        bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillagePoiReading>, ScriptOperationFailure> {
+        let positions = Self::chunk_positions(bounds);
+        let snapshot = self.read.snapshot_chunks(&positions);
+        if positions
+            .iter()
+            .any(|position| !snapshot.contains_chunk(*position))
+        {
+            return Ok(VillageReading::Unloaded);
+        }
+        // The scan is bounded by the site's own box: its columns, and only the
+        // height band the village's pieces occupy, so one query reads one
+        // village rather than a column of the world.
+        let bed_tag = mc_data::Identifier::parse("minecraft:beds".to_owned())
+            .expect("a static identifier parses");
+        let mut pois = Vec::new();
+        for x in bounds.min[0]..=bounds.max[0] {
+            for z in bounds.min[2]..=bounds.max[2] {
+                let position = ChunkPos {
+                    x: x.div_euclid(CHUNK_AXIS),
+                    z: z.div_euclid(CHUNK_AXIS),
+                };
+                let chunk = snapshot
+                    .chunk_ref(position)
+                    .expect("the reading covered this chunk");
+                let local_x = x.rem_euclid(CHUNK_AXIS) as u8;
+                let local_z = z.rem_euclid(CHUNK_AXIS) as u8;
+                for y in bounds.min[1]..=bounds.max[1] {
+                    let Some(state) = chunk.get_block(local_x, y, local_z) else {
+                        continue;
+                    };
+                    let Some(block) = self.blocks.by_id(state) else {
+                        continue;
+                    };
+                    let is_bed = self.tags.contains_raw_id(
+                        "minecraft:block",
+                        bed_tag.as_str(),
+                        block.block.raw_id,
+                    );
+                    if let Some(kind) = village_poi_kind(&block.block.id, is_bed) {
+                        pois.push(VillagePoiReading {
+                            at: [x, y, z],
+                            kind,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(VillageReading::Loaded(pois))
+    }
+
+    fn village_inhabitants(
+        &self,
+        bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillageInhabitantReading>, ScriptOperationFailure> {
+        let positions = Self::chunk_positions(bounds);
+        let snapshot = self.read.snapshot_chunks(&positions);
+        if positions
+            .iter()
+            .any(|position| !snapshot.contains_chunk(*position))
+        {
+            return Ok(VillageReading::Unloaded);
+        }
+        let mut inhabitants = Vec::new();
+        for position in positions {
+            let chunk = snapshot
+                .chunk_ref(position)
+                .expect("the reading covered this chunk");
+            for marker in chunk.settlement_inhabitants() {
+                // A chunk can carry the markers of a village that reaches into
+                // it from outside the site's own box; only the placements inside
+                // the box belong to this site.
+                if !block_inside(bounds, marker.position) {
+                    continue;
+                }
+                inhabitants.push(VillageInhabitantReading {
+                    entity_uuid: crate::settlement_identity::settlement_entity_uuid(&marker.claim)
+                        .to_string(),
+                    claim: marker.claim,
+                    position: marker.position,
+                    age: marker.age,
+                });
+            }
+        }
+        inhabitants.sort_unstable_by(|left, right| left.claim.cmp(&right.claim));
+        Ok(VillageReading::Loaded(inhabitants))
     }
 }
 

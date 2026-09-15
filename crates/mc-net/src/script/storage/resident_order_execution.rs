@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use mc_data::items::ItemRegistry;
+use mc_data::{Identifier, ItemStack};
 use mc_entity::{
     EntityItemStack, EntitySnapshot, FormationKind, FormationPlacement, FormationSlots, GoalState,
     GroupAdmission, GroupMemberObservation, RegionKey, Vec3,
@@ -31,6 +32,7 @@ use super::resident_orders::{
     DurableResidentStack, DurableResidentWork, DurableTargetRef, TARGET_REF_TTL_REVISIONS,
     item_changes, member_fence, place_formation, target_policy,
 };
+use super::world_inventory::{ResidentDepositCommit, ResidentWarehouseDeposit};
 use super::{PluginStorage, PluginStorageMutationError, ScriptStoragePrepareOutcome};
 use crate::play::resident_work::{RESIDENT_WORLD_DIMENSION, ResidentDrop, ResidentWorld};
 use crate::play::{ResidentAttack, ResidentGoal};
@@ -64,12 +66,6 @@ struct ItemLedger {
 impl ItemLedger {
     fn add(&mut self, item_id: &str, delta: i64) {
         *self.changes.entry(item_id.to_owned()).or_default() += delta;
-    }
-
-    fn extend_drops(&mut self, drops: &[ResidentDrop]) {
-        for drop in drops {
-            self.add(&drop.item_id, i64::from(drop.count));
-        }
     }
 
     fn into_changes(self) -> Vec<mc_script::ScriptItemChange> {
@@ -246,6 +242,7 @@ impl super::InventoryRuntime {
         let mut next = record.clone();
         let mut ledger = ItemLedger::default();
         let planned = work_units.min(MAX_WORK_CELLS);
+        let mut staged: Option<ResidentWarehouseDeposit> = None;
         let (done, reason) = self
             .run_resident_work(
                 storage,
@@ -255,6 +252,7 @@ impl super::InventoryRuntime {
                 planned,
                 resumed.unwrap_or(0),
                 &mut ledger,
+                &mut staged,
             )
             .await;
         let state = match reason {
@@ -262,37 +260,106 @@ impl super::InventoryRuntime {
             None if done >= planned => ScriptWorkState::Committed,
             None => ScriptWorkState::Running,
         };
-        next.work = Some(Box::new(DurableResidentWork {
-            revision: 0,
-            work: work.clone(),
-            planned: work_units,
-            done,
-            state,
-            reason,
-        }));
-        let assignment = ScriptWorkAssignment::new(
-            handle.to_owned(),
-            state,
-            reason,
-            done,
-            work_units,
-            ledger.into_changes(),
-            0,
-        );
-        let payload = ScriptOperationPayload::ResidentOrder {
+        let assignment = |done: u64,
+                          state: ScriptWorkState,
+                          reason: Option<ScriptWorkPauseReason>,
+                          ledger: ItemLedger| {
+            ScriptWorkAssignment::new(
+                handle.to_owned(),
+                state,
+                reason,
+                done,
+                work_units,
+                ledger.into_changes(),
+                0,
+            )
+        };
+        let payload = |assignment: ScriptWorkAssignment| ScriptOperationPayload::ResidentOrder {
             result: Box::new(ScriptResidentOrderResult::Work {
                 assignment: Box::new(assignment),
             }),
         };
-        self.commit_resident_order(
-            storage,
-            plugin_id,
-            request,
-            payload,
-            vec![DurableResidentOrderChange::Record {
-                record: Box::new(next.clone()),
-            }],
-        )?;
+        match staged {
+            None => {
+                next.work = Some(Box::new(DurableResidentWork {
+                    revision: 0,
+                    work: work.clone(),
+                    planned: work_units,
+                    done,
+                    state,
+                    reason,
+                }));
+                self.commit_resident_order(
+                    storage,
+                    plugin_id,
+                    request,
+                    payload(assignment(done, state, reason, ledger)),
+                    vec![DurableResidentOrderChange::Record {
+                        record: Box::new(next),
+                    }],
+                )?;
+            }
+            Some(deposit) => {
+                // The deposit's record change and the container move under one
+                // decision: the work assignment that reports the moved units
+                // rides the container's own journal append, so a worker never
+                // reports cargo the container did not take, and never takes
+                // cargo it does not report.
+                for (item_id, count) in &deposit.moved {
+                    ledger.add(item_id, i64::try_from(*count).unwrap_or(i64::MAX));
+                }
+                let mut committed = (*deposit.record).clone();
+                committed.work = Some(Box::new(DurableResidentWork {
+                    revision: 0,
+                    work: work.clone(),
+                    planned: work_units,
+                    done,
+                    state,
+                    reason,
+                }));
+                let commit = self
+                    .commit_resident_warehouse_deposit(
+                        storage,
+                        plugin_id,
+                        request,
+                        Box::new(committed),
+                        payload(assignment(done, state, reason, ledger)),
+                        &deposit.container,
+                    )
+                    .await?;
+                if commit == ResidentDepositCommit::Refused {
+                    // Nothing is durable: the worker keeps its cargo, and the
+                    // step reports the storage pause on the record it started
+                    // from.
+                    let done = resumed.unwrap_or(0);
+                    let mut reverted = record.clone();
+                    reverted.work = Some(Box::new(DurableResidentWork {
+                        revision: 0,
+                        work: work.clone(),
+                        planned: work_units,
+                        done,
+                        state: ScriptWorkState::Paused,
+                        reason: Some(ScriptWorkPauseReason::NoStorage),
+                    }));
+                    self.commit_resident_order(
+                        storage,
+                        plugin_id,
+                        request,
+                        payload(assignment(
+                            done,
+                            ScriptWorkState::Paused,
+                            Some(ScriptWorkPauseReason::NoStorage),
+                            ItemLedger::default(),
+                        )),
+                        vec![DurableResidentOrderChange::Record {
+                            record: Box::new(reverted),
+                        }],
+                    )?;
+                }
+            }
+        }
+        let next = resident_order_record(storage, plugin_id, handle)
+            .expect("the committed work assignment remains installed");
         self.project_resident_held_item(&next).await;
         Ok(self
             .resident_order_receipt_outcome(storage, plugin_id, request)
@@ -342,7 +409,9 @@ impl super::InventoryRuntime {
     }
 
     /// Execute one bounded step of a work assignment. Returns the committed work
-    /// units and, when the step stopped, its typed reason.
+    /// units and, when the step stopped, its typed reason. A haul into a bound
+    /// warehouse is planned into `staged` instead of moved in place, because its
+    /// container half commits with the record change the caller is building.
     #[allow(clippy::too_many_arguments)]
     async fn run_resident_work(
         &self,
@@ -353,6 +422,7 @@ impl super::InventoryRuntime {
         planned: u64,
         already_done: u64,
         ledger: &mut ItemLedger,
+        staged: &mut Option<ResidentWarehouseDeposit>,
     ) -> (u64, Option<ScriptWorkPauseReason>) {
         let remaining = planned.saturating_sub(already_done);
         if remaining == 0 {
@@ -388,9 +458,33 @@ impl super::InventoryRuntime {
                     if !is_harvestable_crop(&block.path) {
                         continue;
                     }
+                    let drops = match world.preview_break(
+                        &area.dimension,
+                        cell,
+                        block.state,
+                        Some(&tool),
+                    ) {
+                        Ok(drops) => drops,
+                        Err(failure) => {
+                            return (done, Some(work_failure_reason(failure)));
+                        }
+                    };
+                    // The worker must be able to hold the loot *before* the
+                    // crop leaves the world: a full worker leaves the field
+                    // standing instead of harvesting into nothing.
+                    if !self.drops_fit(record, &drops) {
+                        let reason = if done == already_done {
+                            ScriptWorkPauseReason::NoStorage
+                        } else {
+                            return (done, None);
+                        };
+                        return (done, Some(reason));
+                    }
                     match world.break_block(&area.dimension, cell, block.state, Some(&tool)) {
-                        Ok(drops) => {
-                            ledger.extend_drops(&drops);
+                        Ok(committed) => {
+                            if !self.deposit_drops(record, &committed, ledger) {
+                                return (done, Some(ScriptWorkPauseReason::NoStorage));
+                            }
                             wear_tool(record, &tool, ledger, 1);
                             done += 1;
                         }
@@ -483,9 +577,28 @@ impl super::InventoryRuntime {
                     if !rooted {
                         continue;
                     }
+                    let drops = match world.preview_break(
+                        &area.dimension,
+                        cell,
+                        block.state,
+                        Some(&tool),
+                    ) {
+                        Ok(drops) => drops,
+                        Err(failure) => {
+                            return (done, Some(work_failure_reason(failure)));
+                        }
+                    };
+                    if !self.drops_fit(record, &drops) {
+                        if done == already_done {
+                            return (done, Some(ScriptWorkPauseReason::NoStorage));
+                        }
+                        return (done, None);
+                    }
                     match world.break_block(&area.dimension, cell, block.state, Some(&tool)) {
-                        Ok(drops) => {
-                            ledger.extend_drops(&drops);
+                        Ok(committed) => {
+                            if !self.deposit_drops(record, &committed, ledger) {
+                                return (done, Some(ScriptWorkPauseReason::NoStorage));
+                            }
                             wear_tool(record, &tool, ledger, 1);
                             done += 1;
                         }
@@ -523,9 +636,28 @@ impl super::InventoryRuntime {
                     if !is_ore_path(&block.path) {
                         continue;
                     }
+                    let drops = match world.preview_break(
+                        &area.dimension,
+                        cell,
+                        block.state,
+                        Some(&tool),
+                    ) {
+                        Ok(drops) => drops,
+                        Err(failure) => {
+                            return (done, Some(work_failure_reason(failure)));
+                        }
+                    };
+                    if !self.drops_fit(record, &drops) {
+                        if done == already_done {
+                            return (done, Some(ScriptWorkPauseReason::NoStorage));
+                        }
+                        return (done, None);
+                    }
                     match world.break_block(&area.dimension, cell, block.state, Some(&tool)) {
-                        Ok(drops) => {
-                            ledger.extend_drops(&drops);
+                        Ok(committed) => {
+                            if !self.deposit_drops(record, &committed, ledger) {
+                                return (done, Some(ScriptWorkPauseReason::NoStorage));
+                            }
                             wear_tool(record, &tool, ledger, 1);
                             done += 1;
                         }
@@ -557,13 +689,29 @@ impl super::InventoryRuntime {
                 // One canonical catch per real water column: the bounded water in
                 // the named area is the only source.
                 let catchable = u64::try_from(columns.len()).unwrap_or(0).min(remaining);
+                let catch_id = resource_item(RESIDENT_FISHING_CATCH);
+                let mut caught = 0_u64;
                 for _ in 0..catchable {
-                    ledger.add(RESIDENT_FISHING_CATCH, 1);
+                    // The catch is canonical, not a roll: one cod per water
+                    // column, and it only counts when the worker can hold it.
+                    let drops = [ResidentDrop {
+                        item_id: catch_id.clone(),
+                        count: 1,
+                    }];
+                    if !self.drops_fit(record, &drops) {
+                        break;
+                    }
+                    if !self.deposit_drops(record, &drops, ledger) {
+                        break;
+                    }
+                    caught += 1;
                 }
-                if catchable > 0 {
+                if caught > 0 {
                     wear_tool(record, &tool, ledger, 1);
+                } else if catchable > 0 {
+                    return (already_done, Some(ScriptWorkPauseReason::NoStorage));
                 }
-                (already_done + catchable, None)
+                (already_done + caught, None)
             }
             ScriptResidentWorkOrder::TendLivestock { area, feed } => {
                 let feed_item = resource_item(feed);
@@ -604,7 +752,27 @@ impl super::InventoryRuntime {
             ScriptResidentWorkOrder::Haul {
                 source,
                 destination,
-            } => self.haul_resident_items(record, source, destination, remaining, ledger),
+            } => {
+                // A haul into a bound warehouse container is not a move inside
+                // the worker's own record: its other half is a real container,
+                // and it commits with this step's record change as one decision.
+                if matches!(destination, ScriptInventoryEndpoint::Warehouse { .. }) {
+                    let (moved, reason) = self.stage_warehouse_haul(
+                        storage,
+                        plugin_id,
+                        record,
+                        source,
+                        destination,
+                        remaining,
+                        staged,
+                    );
+                    (already_done + moved, reason)
+                } else {
+                    let (moved, reason) =
+                        self.haul_resident_items(record, source, destination, remaining, ledger);
+                    (already_done + moved, reason)
+                }
+            }
             ScriptResidentWorkOrder::Craft { recipe, count } => {
                 self.craft_resident_items(record, recipe, *count, remaining, ledger)
             }
@@ -626,6 +794,52 @@ impl super::InventoryRuntime {
             // The closed work union is non-exhaustive to plugins.
             _ => (already_done, Some(ScriptWorkPauseReason::Unsupported)),
         }
+    }
+
+    /// Plan one haul whose destination is a bound warehouse container.
+    ///
+    /// The step moves nothing by itself: it stages the worker's record
+    /// after-image and the container images it read, and the caller commits
+    /// both together under one durable decision. A container core cannot
+    /// resolve, or one that cannot take the cargo, stops the job with
+    /// `no_storage` and leaves the worker holding every item.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_warehouse_haul(
+        &self,
+        storage: &PluginStorage,
+        plugin_id: &str,
+        record: &DurableResidentOrderRecord,
+        source: &ScriptInventoryEndpoint,
+        destination: &ScriptInventoryEndpoint,
+        limit: u64,
+        staged: &mut Option<ResidentWarehouseDeposit>,
+    ) -> (u64, Option<ScriptWorkPauseReason>) {
+        let deposit = match self.plan_resident_warehouse_deposit(
+            storage,
+            plugin_id,
+            source,
+            destination,
+            record,
+            limit,
+        ) {
+            Ok(deposit) => deposit,
+            Err(failure) => {
+                let reason = match failure {
+                    // A bound container the worker cannot deposit into is a
+                    // storage refusal: the cargo stays with the worker.
+                    ScriptOperationFailure::Capacity
+                    | ScriptOperationFailure::NotFound
+                    | ScriptOperationFailure::Unloaded
+                    | ScriptOperationFailure::Blocked
+                    | ScriptOperationFailure::Forbidden => ScriptWorkPauseReason::NoStorage,
+                    failure => work_failure_reason(failure),
+                };
+                return (0, Some(reason));
+            }
+        };
+        let units = deposit.units();
+        *staged = Some(deposit);
+        (units, None)
     }
 
     /// Move real items between the worker's canonical resident endpoints through
@@ -751,16 +965,17 @@ impl super::InventoryRuntime {
                 // Put back the ingredients of the incomplete craft; nothing was
                 // committed for it.
                 for item_id in taken {
-                    put_resident_item(record, &item_id, 1);
+                    let max_stack = self.drop_max_stack(&item_id);
+                    put_resident_item(record, &item_id, 1, max_stack);
                     ledger.add(&item_id, 1);
                 }
                 break;
             }
-            put_resident_item(
-                record,
-                &result_name,
-                u64::try_from(result.count).unwrap_or(0),
-            );
+            let max_stack = self.drop_max_stack(&result_name);
+            let produced = u64::try_from(result.count).unwrap_or(0);
+            if !put_resident_item(record, &result_name, produced, max_stack) {
+                return (done, Some(ScriptWorkPauseReason::NoStorage));
+            }
             ledger.add(&result_name, i64::from(result.count));
             done += 1;
         }
@@ -1862,6 +2077,77 @@ impl super::InventoryRuntime {
         };
         let _ = storage.append_resident_order_change(change);
     }
+    /// One item's own stack size, so a deposit never creates an illegal stack.
+    fn drop_max_stack(&self, item_id: &str) -> u32 {
+        let Ok(name) = Identifier::parse(item_id.to_owned()) else {
+            return 1;
+        };
+        let Some(id) = self.items().id_of(&name) else {
+            return 1;
+        };
+        let stack = ItemStack::new(id, 1);
+        let max = mc_data::item_semantics_26_1_2::max_stack_for_stack(
+            self.item_facts(),
+            self.items(),
+            &stack,
+        );
+        u32::try_from(max.max(1)).unwrap_or(1)
+    }
+
+    /// Whether the worker's own slots can hold every drop of one break.
+    ///
+    /// Computed before the block is broken, so a worker who cannot hold the loot
+    /// leaves the world alone instead of producing items nobody owns.
+    fn drops_fit(&self, record: &DurableResidentOrderRecord, drops: &[ResidentDrop]) -> bool {
+        let mut free = free_resident_slots(record);
+        let mut needed: BTreeMap<&str, u64> = BTreeMap::new();
+        for drop in drops {
+            *needed.entry(drop.item_id.as_str()).or_default() += u64::from(drop.count);
+        }
+        for (item_id, count) in needed {
+            let max_stack = u64::from(self.drop_max_stack(item_id));
+            let room: u64 = record
+                .carry
+                .iter()
+                .chain(record.equipment.iter())
+                .flatten()
+                .filter(|stack| mergeable_stack(stack, item_id))
+                .map(|stack| max_stack.saturating_sub(u64::from(stack.count)))
+                .sum();
+            let mut remaining = count.saturating_sub(room);
+            while remaining > 0 {
+                if free == 0 {
+                    return false;
+                }
+                free -= 1;
+                remaining = remaining.saturating_sub(max_stack);
+            }
+        }
+        true
+    }
+
+    /// Deposit canonical loot into the worker's own slots and report the receipt.
+    ///
+    /// Returns `false` when the drops do not fit; the caller then reports the typed
+    /// storage pause and must not have broken the block yet.
+    fn deposit_drops(
+        &self,
+        record: &mut DurableResidentOrderRecord,
+        drops: &[ResidentDrop],
+        ledger: &mut ItemLedger,
+    ) -> bool {
+        if !self.drops_fit(record, drops) {
+            return false;
+        }
+        for drop in drops {
+            let max_stack = self.drop_max_stack(&drop.item_id);
+            if !put_resident_item(record, &drop.item_id, u64::from(drop.count), max_stack) {
+                return false;
+            }
+            ledger.add(&drop.item_id, i64::from(drop.count));
+        }
+        true
+    }
 }
 
 fn uuid_of(record: &DurableResidentOrderRecord) -> uuid::Uuid {
@@ -2234,32 +2520,79 @@ fn wear_gear_count(
     taken
 }
 
-fn put_resident_item(record: &mut DurableResidentOrderRecord, item_id: &str, count: u64) -> bool {
+fn put_resident_item(
+    record: &mut DurableResidentOrderRecord,
+    item_id: &str,
+    count: u64,
+    max_stack: u32,
+) -> bool {
     if count == 0 {
         return true;
     }
-    let Ok(count) = u32::try_from(count) else {
-        return false;
-    };
-    // Merge into an existing stack first, then take the first free slot: the
-    // canonical inventory never fragments one resource across slots.
-    if let Some(stack) = record
+    // Merge into an existing compatible stack first, then take free slots: the
+    // canonical inventory never fragments one resource beyond what one item's
+    // own stack size forces.
+    let mut remaining = count;
+    for slot in record
         .carry
         .iter_mut()
         .chain(record.equipment.iter_mut())
         .flatten()
-        .find(|stack| stack.item_id == item_id)
     {
-        stack.count = stack.count.saturating_add(count);
-        return true;
-    }
-    for slot in record.carry.iter_mut().chain(record.equipment.iter_mut()) {
-        if slot.is_none() {
-            *slot = Some(DurableResidentStack::new(item_id.to_owned(), count));
-            return true;
+        if remaining == 0 {
+            break;
         }
+        if !mergeable_stack(slot, item_id) {
+            continue;
+        }
+        let room = u64::from(max_stack.saturating_sub(slot.count));
+        let placed = remaining.min(room);
+        slot.count = slot
+            .count
+            .saturating_add(u32::try_from(placed).unwrap_or(u32::MAX));
+        remaining -= placed;
     }
-    false
+    while remaining > 0 {
+        let placed = remaining.min(u64::from(max_stack.max(1)));
+        let Some(slot) = record
+            .carry
+            .iter_mut()
+            .chain(record.equipment.iter_mut())
+            .find(|slot| slot.is_none())
+        else {
+            return false;
+        };
+        *slot = Some(DurableResidentStack::new(
+            item_id.to_owned(),
+            u32::try_from(placed).unwrap_or(u32::MAX),
+        ));
+        remaining -= placed;
+    }
+    true
+}
+
+/// Slots the worker can still fill: produced goods live in the same canonical
+/// slots as its tools and gear, so capacity is one inventory.
+fn free_resident_slots(record: &DurableResidentOrderRecord) -> usize {
+    record
+        .carry
+        .iter()
+        .chain(record.equipment.iter())
+        .filter(|slot| slot.is_none())
+        .count()
+}
+
+/// Whether one stack can absorb more of `item_id` without changing what it is.
+///
+/// Merging is by item identity *and* by components: a worn or enchanted stack
+/// is never a destination for plain loot, and a named or modelled stack keeps
+/// its own identity.
+fn mergeable_stack(stack: &DurableResidentStack, item_id: &str) -> bool {
+    stack.item_id == item_id
+        && stack.damage.unwrap_or(0) == 0
+        && stack.enchantments.is_empty()
+        && stack.custom_name.is_none()
+        && stack.item_model.is_none()
 }
 
 /// Wear one real tool by `ticks`; a tool that reaches its durability breaks and

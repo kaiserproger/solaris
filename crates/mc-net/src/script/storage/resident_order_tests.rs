@@ -16,12 +16,13 @@ use mc_data::{Identifier, ItemStack};
 use mc_entity::{SpawnEntity, Vec3};
 use mc_protocol::codec;
 use mc_script::{
-    ScriptBlockPosition, ScriptEngagementPolicy, ScriptFormation, ScriptFormationKind,
-    ScriptHostileCategory, ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome,
+    MAX_RESIDENT_CARRY_SLOTS, MAX_RESIDENT_EQUIPMENT_SLOTS, ScriptBlockPosition,
+    ScriptEngagementPolicy, ScriptFormation, ScriptFormationKind, ScriptHostileCategory,
+    ScriptInventoryEndpoint, ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome,
     ScriptOperationPayload, ScriptOperationRequest, ScriptOrderMemberState, ScriptOrderTargetRef,
-    ScriptResidentOrder, ScriptResidentOrderOperation, ScriptResidentOrderResult,
-    ScriptResidentWorkOrder, ScriptWorkArea, ScriptWorkPauseReason, ScriptWorkState,
-    resident_generation_id,
+    ScriptOwnedInventoryOperation, ScriptResidentOrder, ScriptResidentOrderOperation,
+    ScriptResidentOrderResult, ScriptResidentWorkOrder, ScriptWorkArea, ScriptWorkPauseReason,
+    ScriptWorkState, resident_generation_id,
 };
 use mc_world::{BlockPos, BlockStateId, Chunk, ChunkPos, WorldReadView, WorldStorage};
 use uuid::Uuid;
@@ -508,6 +509,230 @@ async fn harvest_requires_its_tool_and_commits_real_drops() {
             .any(|(item, count)| item == "minecraft:iron_hoe" && *count == 1),
         "the tool stays in the canonical slot"
     );
+}
+
+/// (R1) The harvested crop ends up in the worker's own cargo, and the receipt
+/// states exactly what it holds: a receipt delta with no owner was the defect.
+#[tokio::test]
+async fn harvest_deposits_the_real_crop_into_the_worker_cargo() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "harvest-cargo",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([2, 64, 2], [2, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                4,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert!(assignment.work_units_done >= 1);
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air")),
+        "the crop really left the world"
+    );
+
+    let carried: Vec<(String, u32)> = carry(&storage, &handle);
+    let wheat = carried
+        .iter()
+        .find(|(item, _)| item == "minecraft:wheat")
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+    assert!(
+        wheat >= 1,
+        "the worker owns the crop it harvested: {carried:?}"
+    );
+    for change in assignment.changes.iter().filter(|change| change.delta > 0) {
+        let held = carried
+            .iter()
+            .filter(|(item, _)| *item == change.item_id)
+            .map(|(_, count)| i64::from(*count))
+            .sum::<i64>();
+        assert!(
+            held >= change.delta,
+            "the receipt claims {} of {} but the cargo holds {held}",
+            change.delta,
+            change.item_id
+        );
+    }
+
+    // The observable read path agrees with the record: a plugin asks for the
+    // resident's carry and gets these stacks.
+    let snapshot = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &carry_request(&handle, None))
+        .await
+        .expect("the carry read reaches the durable boundary");
+    assert_eq!(snapshot.failure(), None, "{snapshot:?}");
+    let counted = carried_from(&snapshot);
+    assert!(
+        counted
+            .iter()
+            .any(|(item, count)| item == "minecraft:wheat" && *count == wheat),
+        "the carry snapshot shows the harvested crop: {counted:?}"
+    );
+}
+
+/// (R1) A worker who cannot hold the loot leaves the world alone: no block is
+/// broken to produce items nobody can own.
+#[tokio::test]
+async fn a_full_worker_reports_no_storage_and_leaves_the_crop_standing() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_CARRY_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    let mut revision = seed_gear_in(&mut storage, &handle, uuid, &fill, false);
+    let equipment: Vec<(&str, u32)> = (0..MAX_RESIDENT_EQUIPMENT_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    revision = seed_gear_in(&mut storage, &handle, uuid, &equipment, true).max(revision);
+    // The hoe takes the only slot a full worker would have had to spare.
+    revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]).max(revision);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "harvest-full",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([2, 64, 2], [2, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                4,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(
+        assignment.changes.iter().all(|change| change.delta <= 0),
+        "nothing was produced: {:?}",
+        assignment.changes
+    );
+    assert_ne!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air")),
+        "the crop stays because the worker could not hold it"
+    );
+}
+
+/// (R1) The same cargo path carries mined ore: one producer, one owner.
+#[tokio::test]
+async fn mined_ore_reaches_the_worker_cargo() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_pickaxe", 1)],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-cargo",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area([4, SURFACE_Y - 2, 4], [4, SURFACE_Y - 2, 4]),
+                    tool: "minecraft:iron_pickaxe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(assignment.work_units_done, 1);
+    let carried = carry(&storage, &handle);
+    assert!(
+        carried
+            .iter()
+            .any(|(item, count)| item == "minecraft:raw_iron" && *count >= 1),
+        "the mined ore is the worker's: {carried:?} changes {:?}",
+        assignment.changes
+    );
+    assert_eq!(
+        fixture.block(4, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "air")),
+        "the ore really left the world"
+    );
+}
+
+fn carry_request(handle: &str, expected_revision: Option<u64>) -> ScriptOperationRequest {
+    ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Inventory {
+            operation: ScriptOwnedInventoryOperation::Query {
+                endpoint: ScriptInventoryEndpoint::ResidentCarry {
+                    handle: handle.to_owned(),
+                },
+                expected_revision,
+            },
+        },
+    )
+    .expect("a carry query is a valid request")
+}
+
+/// Every non-empty stack one carry snapshot reports.
+fn carried_from(outcome: &ScriptOperationOutcome) -> Vec<(String, u32)> {
+    let ScriptOperationPayload::OwnedInventory { result } = outcome.payload() else {
+        panic!("expected an inventory payload, got {:?}", outcome.payload());
+    };
+    let mc_script::ScriptOwnedInventoryResult::Snapshot { inventory } = &**result else {
+        panic!("expected an inventory snapshot, got {result:?}");
+    };
+    inventory
+        .slots
+        .iter()
+        .filter_map(|slot| {
+            slot.item
+                .as_ref()
+                .map(|item| (item.resource_id.clone(), item.count))
+        })
+        .collect()
+}
+
+/// The stacks in the worker's own carry slots, equipment excluded.
+fn carry(storage: &PluginStorage, handle: &str) -> Vec<(String, u32)> {
+    storage
+        .resident_orders()
+        .record(handle)
+        .map(|record| {
+            record
+                .carry
+                .iter()
+                .flatten()
+                .map(|stack| (stack.item_id.clone(), stack.count))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// (A08) A craft without inputs commits nothing; with inputs it consumes real

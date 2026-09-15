@@ -233,27 +233,40 @@ pub(crate) fn container_chest_image(slots: &[ItemStack]) -> Option<mc_world::Che
     Some(mc_world::ChestBlockEntity { slots })
 }
 
+/// The player participant of one server-owned deposit.
+///
+/// Present when a real player's inventory moves with the container. Absent for
+/// a deposit whose other participant is a plugin-owned record (a worker's
+/// cargo): that record rides the encoded receipt instead, and no session is
+/// fenced or after-imaged.
+#[derive(Debug, Clone)]
+pub(crate) struct WarehousePlayerParticipant {
+    pub(crate) actor_id: u64,
+    /// The actor's expected and planned canonical inventory.
+    pub(crate) expected_inventory: Vec<ItemStack>,
+    pub(crate) expected_carried_item: ItemStack,
+    pub(crate) updated_inventory: Vec<ItemStack>,
+    pub(crate) updated_carried_item: ItemStack,
+}
+
 /// One planned server-owned warehouse deposit, as its caller observed it.
 ///
 /// The caller has already resolved the durable warehouse binding, read the
 /// loaded container through the same projection a warehouse snapshot uses, and
-/// planned the move against the actor's canonical inventory; this carries only
-/// what the composite fences and commits, so the world half stays an adapter
-/// over the ordered container command.
+/// planned the move against every other participant; this carries only what the
+/// composite fences and commits, so the world half stays an adapter over the
+/// ordered container command.
 #[derive(Debug, Clone)]
 pub(crate) struct WarehouseTransferRequest {
-    pub(crate) actor_id: u64,
     pub(crate) position: mc_world::BlockPos,
     /// The container's canonical state id, as the caller observed it.
     pub(crate) expected_state_id: i32,
     /// The container's expected and planned 27-slot canonical images.
     pub(crate) expected_container: Vec<ItemStack>,
     pub(crate) updated_container: Vec<ItemStack>,
-    /// The actor's expected and planned canonical inventory.
-    pub(crate) expected_inventory: Vec<ItemStack>,
-    pub(crate) expected_carried_item: ItemStack,
-    pub(crate) updated_inventory: Vec<ItemStack>,
-    pub(crate) updated_carried_item: ItemStack,
+    /// The player whose inventory moves with this deposit, or `None` when the
+    /// second participant is inside the receipt.
+    pub(crate) player: Option<WarehousePlayerParticipant>,
     /// The encoded plugin operation receipt that rides the container's own
     /// world-journal decision.
     pub(crate) receipt: Vec<u8>,
@@ -372,6 +385,147 @@ pub(crate) fn owned_inventory_snapshot(
     let fence = ScriptInventoryFence::try_new(revision, format!("{:x}", hash.finalize()))
         .map_err(|_| ScriptOperationFailure::InvalidRequest)?;
     Ok(ScriptOwnedInventorySnapshot::new(endpoint, fence, slots))
+}
+
+/// One planned worker deposit into one bound container.
+#[derive(Debug, Clone)]
+pub(crate) struct WarehouseDepositPlan {
+    /// The worker's own endpoint slots after the move.
+    pub(crate) updated_source: Vec<ItemStack>,
+    /// The container's canonical slots after the move.
+    pub(crate) updated_container: Vec<ItemStack>,
+    /// The resource ids that entered the container, with their unit counts.
+    pub(crate) moved: BTreeMap<String, u64>,
+}
+
+/// Plan one worker cargo deposit into one bound container.
+///
+/// The worker hauls up to `limit` units out of its own endpoint into the
+/// container in slot order, merging into compatible partial stacks and filling
+/// free slots. Every step is applied through [`plan_owned_item_transfers`], so
+/// the deposit can never state a stack that planner would reject: what the
+/// container cannot take is left with the worker.
+///
+/// A container with no room for a worker that holds something answers
+/// [`ScriptOperationFailure::Capacity`], and a worker with nothing to haul
+/// answers [`ScriptOperationFailure::InsufficientItems`], so the caller's
+/// `no_storage` and `missing_input` pauses stay distinct.
+pub(crate) fn plan_warehouse_deposit(
+    source: &ScriptInventoryEndpoint,
+    destination: &ScriptInventoryEndpoint,
+    source_slots: &[ItemStack],
+    container_slots: &[ItemStack],
+    limit: u64,
+    items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
+) -> Result<WarehouseDepositPlan, ScriptOperationFailure> {
+    if limit == 0 {
+        return Err(ScriptOperationFailure::InvalidRequest);
+    }
+    let mut working = BTreeMap::from([
+        (source.clone(), source_slots.to_vec()),
+        (destination.clone(), container_slots.to_vec()),
+    ]);
+    let mut moved: BTreeMap<String, u64> = BTreeMap::new();
+    let mut remaining = limit;
+    'source: for source_slot in 0..source_slots.len() {
+        let source_index =
+            u8::try_from(source_slot).map_err(|_| ScriptOperationFailure::InvalidRequest)?;
+        loop {
+            if remaining == 0 {
+                break 'source;
+            }
+            let stack = slot(&working, source, source_index)?.clone();
+            if stack.is_empty() {
+                continue 'source;
+            }
+            let max_stack = item_max_stack(item_facts, items, &stack);
+            let name = items
+                .name_of(stack.item_id)
+                .ok_or(ScriptOperationFailure::InvalidRequest)?
+                .as_str()
+                .to_owned();
+            // The first destination slot with room for this stack decides how
+            // much of it moves; a container that offers none leaves the rest
+            // with the worker.
+            let mut filled = false;
+            for destination_slot in 0..container_slots.len() {
+                let destination_index = u8::try_from(destination_slot)
+                    .map_err(|_| ScriptOperationFailure::InvalidRequest)?;
+                let room = deposit_room(
+                    &stack,
+                    slot(&working, destination, destination_index)?,
+                    max_stack,
+                );
+                let count = room
+                    .min(u32::try_from(stack.count).unwrap_or(u32::MAX))
+                    .min(u32::try_from(remaining).unwrap_or(u32::MAX));
+                if count == 0 {
+                    continue;
+                }
+                let transfer = ScriptOwnedItemTransfer::new(
+                    source.clone(),
+                    source_index,
+                    destination.clone(),
+                    destination_index,
+                    count,
+                );
+                let Ok(updated) = plan_owned_item_transfers(
+                    std::slice::from_ref(&transfer),
+                    &working,
+                    items,
+                    item_facts,
+                ) else {
+                    // The planner refuses this destination for this stack; the
+                    // next slot may still take it.
+                    continue;
+                };
+                working = updated;
+                *moved.entry(name.clone()).or_default() += u64::from(count);
+                remaining -= u64::from(count);
+                filled = true;
+                break;
+            }
+            if !filled {
+                // Nothing in the container takes this stack, so the rest of the
+                // worker's cargo stays where it is.
+                break 'source;
+            }
+        }
+    }
+    if moved.is_empty() {
+        let holds_something = source_slots.iter().any(|stack| !stack.is_empty());
+        return Err(if holds_something {
+            ScriptOperationFailure::Capacity
+        } else {
+            ScriptOperationFailure::InsufficientItems
+        });
+    }
+    Ok(WarehouseDepositPlan {
+        updated_source: working
+            .remove(source)
+            .expect("planned source inventory remains"),
+        updated_container: working
+            .remove(destination)
+            .expect("planned destination inventory remains"),
+        moved,
+    })
+}
+
+/// Room one container slot offers one moving stack.
+///
+/// An empty slot takes a whole stack; an occupied slot takes the rest of a
+/// compatible one. This is exactly the predicate the transfer planner applies
+/// to a destination, so a planned move is never one it would refuse.
+fn deposit_room(stack: &ItemStack, destination: &ItemStack, max_stack: i32) -> u32 {
+    let room = if destination.is_empty() {
+        max_stack
+    } else if can_stack(stack, destination) {
+        max_stack - destination.count
+    } else {
+        0
+    };
+    u32::try_from(room.max(0)).unwrap_or(0)
 }
 
 /// Plan and apply every transfer against the involved canonical inventories.

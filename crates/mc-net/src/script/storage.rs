@@ -40,6 +40,7 @@ mod scan;
 mod settlement;
 #[cfg(test)]
 mod settlement_tests;
+mod settlement_village_sites;
 pub(crate) mod world_inventory;
 use operations::{
     DurableOperationReceipt, OP_OPERATION_DELIVERED, OP_SNAPSHOT_OPERATION, OperationDeliveryAck,
@@ -51,8 +52,13 @@ use resident_orders::{
 use residents::{DurableResidentChange, ResidentLedger, decode_resident_change};
 pub(crate) use settlement::{
     ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
+    VillageInhabitantReading, VillagePoiReading, VillageReading,
 };
 use settlement::{DurableSettlementChange, SettlementLedger, decode_settlement_change};
+pub(crate) use settlement_village_sites::{
+    GeneratorVillageSites, VillageSiteGround, cell_chunk_bounds, village_poi_capacity,
+    village_poi_kind, village_site_id, village_site_start_chunk,
+};
 use world_inventory::InventoryRuntime;
 
 const STORAGE_DIRECTORY: &str = "solaris/plugin-storage-v1";

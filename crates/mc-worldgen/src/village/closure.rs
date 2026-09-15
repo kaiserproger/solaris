@@ -103,7 +103,34 @@ impl VillageClosure {
     pub fn piece(&self, piece: &Identifier) -> Option<&StructureTemplate> {
         self.pieces.get(piece)
     }
+
+    /// The entity types the closure's pieces place that the village lane does
+    /// not spawn, in ascending id order.
+    ///
+    /// The lane spawns a piece's `minecraft:villager` as a chunk inhabitant
+    /// marker ([`SPAWNED_PIECE_MOB`]). Every other entity a village authors — the
+    /// zombie villager of a zombie village's houses, the animal pens' livestock
+    /// and their cats, the meeting point's iron golem, a desert camel, an armour
+    /// stand — would need its own entity state and spawn path, so the lane leaves
+    /// them unplaced and startup reports them by name.
+    #[must_use]
+    pub fn unspawned_piece_mobs(&self) -> Vec<&str> {
+        let mut mobs = self
+            .pieces
+            .values()
+            .flat_map(StructureTemplate::entities)
+            .map(|entity| entity.entity_type.as_str())
+            .filter(|entity_type| *entity_type != SPAWNED_PIECE_MOB)
+            .collect::<Vec<_>>();
+        mobs.sort_unstable();
+        mobs.dedup();
+        mobs
+    }
 }
+
+/// The one entity type the village lane spawns: a piece template's villager
+/// becomes a chunk inhabitant marker, which the runtime turns into a villager.
+pub const SPAWNED_PIECE_MOB: &str = "minecraft:villager";
 
 #[derive(Debug, Error)]
 pub enum ClosureError {

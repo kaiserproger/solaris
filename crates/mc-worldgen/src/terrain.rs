@@ -826,6 +826,29 @@ impl TerrainGenerator {
         self.base_surface_y(world_x, world_z).saturating_add(1)
     }
 
+    /// Every vanilla village whose start chunk lies in the inclusive chunk
+    /// rectangle `min_chunk..=max_chunk`, as the plans this generator generates
+    /// them from.
+    ///
+    /// The two column queries the plan enumeration reads are this generator's
+    /// own plan-free ones ([`TerrainGenerator::first_free_height`] and
+    /// [`TerrainGenerator::base_biome`]), so a listed village is the village a
+    /// later chunk fill will actually place, and listing one generates nothing.
+    /// A generator with no village plans lists nothing.
+    #[must_use]
+    pub fn village_sites_in_region(
+        &self,
+        min_chunk: (i32, i32),
+        max_chunk: (i32, i32),
+    ) -> Vec<mc_world::GeneratedVillageSite> {
+        let Some(source) = self.village_plans.as_ref() else {
+            return Vec::new();
+        };
+        let free_height = |x, z| self.first_free_height(x, z);
+        let biome_at = |x, z| self.base_biome(x, z);
+        source.sites_in_region(min_chunk, max_chunk, &free_height, &biome_at)
+    }
+
     /// The plans the chunk being filled reads its pieces and beard columns
     /// from: a single on-demand lookup per generated chunk.
     fn village_plans_for_chunk(&self, pos: ChunkPos) -> Option<VillagePlanSet> {
@@ -2250,6 +2273,11 @@ impl TerrainGenerator {
                                     f64::from(origin_y),
                                     f64::from(center_z) + 0.5,
                                 ]),
+                                // The settlement plan authors adults with no
+                                // rotation of their own.
+                                age: 0,
+                                yaw: 0.0,
+                                pitch: 0.0,
                             }
                         },
                     )
@@ -2547,6 +2575,14 @@ fn paste_template(
 }
 
 impl ChunkGenerator for TerrainGenerator {
+    fn village_sites_in_region(
+        &self,
+        min_chunk: (i32, i32),
+        max_chunk: (i32, i32),
+    ) -> Vec<mc_world::GeneratedVillageSite> {
+        TerrainGenerator::village_sites_in_region(self, min_chunk, max_chunk)
+    }
+
     fn surface_height(&self, world_x: i32, world_z: i32) -> Option<i32> {
         Some(Self::surface_height(self, world_x, world_z))
     }

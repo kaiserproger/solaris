@@ -821,6 +821,7 @@ mod loader_mutation_tests {
                 content: vec![LoaderContentKind::Blocks],
                 permissions: vec![LoaderPermission::RegisterBlocks],
                 cache_key: format!("{owner}:ruby/1/{}", "a".repeat(64)),
+                view_kinds: Vec::new(),
                 source_path: None,
                 artifact_bytes: None,
                 block_id: Some(format!("{owner}:ruby_block")),

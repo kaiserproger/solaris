@@ -43,7 +43,7 @@ pub mod solver;
 
 pub use beard::{BeardColumn, BeardContribution};
 pub use closure::{
-    ClosureElement, ClosureError, ClosurePool, ClosureStructure, VillageClosure,
+    ClosureElement, ClosureError, ClosurePool, ClosureStructure, SPAWNED_PIECE_MOB, VillageClosure,
     load_village_closure,
 };
 pub use decor::{DecorError, VillageDecor};

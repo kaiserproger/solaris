@@ -88,7 +88,9 @@ enum RegionalMutationJob {
         expected_state_id: i32,
         expected: Vec<ChestBlockEntity>,
         updated: Vec<ChestBlockEntity>,
-        player: Box<ContainerPlayerPlan>,
+        /// The player participant, or `None` for a server-owned deposit whose
+        /// second participant rides the plugin receipt.
+        player: Option<Box<ContainerPlayerPlan>>,
         /// Present for a server-owned deposit: the encoded plugin receipt the
         /// run journals beside the container's after-image.
         plugin_receipt: Option<Vec<u8>>,
@@ -698,7 +700,7 @@ impl SimulationOwner {
                                                     expected_state_id,
                                                     expected: &expected,
                                                     updated: &updated,
-                                                    player: &player,
+                                                    player: player.as_deref(),
                                                 },
                                             )
                                         },
@@ -785,9 +787,8 @@ impl SimulationOwner {
                                         dispatches,
                                     }
                                 } else {
-                                    let outcome = transaction.map_or(
-                                        Err(SimulationRequestError::StaleSession),
-                                        |transaction| {
+                                    let outcome = match (transaction, player.as_deref()) {
+                                        (Some(transaction), Some(player)) => {
                                             transaction.commit(
                                                 &mutation,
                                                 ChestTransactionRequest {
@@ -796,15 +797,21 @@ impl SimulationOwner {
                                                     expected_state_id,
                                                     expected: &expected,
                                                     updated: &updated,
-                                                    player: &player,
+                                                    player: Some(player),
                                                 },
                                             )
-                                        },
-                                    );
+                                        }
+                                        (None, _) => Err(SimulationRequestError::StaleSession),
+                                        // The command validator refuses a menu
+                                        // commit without its player plan.
+                                        (Some(_), None) => {
+                                            Err(SimulationRequestError::InvalidCommand)
+                                        }
+                                    };
                                     RegionalBlockEditJobResult::Chest {
                                         sequence: job.sequence,
                                         outcome: Box::new(outcome),
-                                        drops: player.drops.clone(),
+                                        drops: player.map(|player| player.drops.clone()).unwrap_or_default(),
                                     }
                                 }
                             }

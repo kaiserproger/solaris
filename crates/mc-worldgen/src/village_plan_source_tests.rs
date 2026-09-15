@@ -22,7 +22,7 @@ use mc_data::village_data::{
 use mc_world::chunk::OVERWORLD_GEOMETRY;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, Chunk, ChunkGenerator, ChunkPos};
 
-use crate::structures::{StructureTemplate, TemplateBlock};
+use crate::structures::{StructureTemplate, TemplateBlock, TemplateEntity, TemplateVillagerData};
 use crate::terrain::TerrainGenerator;
 use crate::vanilla_features::{
     BiomeTagIndex, BlockSemantics, BlockTagIndex, FeatureLevel, RandomSource, XoroshiroRandom,
@@ -33,6 +33,7 @@ use crate::village::closure::{ClosureElement, ClosurePool, ClosureStructure, Vil
 use crate::village::load_village_closure;
 use crate::village::placement::RandomSpreadPlacement;
 use crate::village::plan_source::{NEIGHBOURHOOD_CHUNK_RADIUS, VillagePlanSet, VillagePlanSource};
+use crate::village::solver::Rotation;
 
 fn identifier(value: &str) -> Identifier {
     Identifier::parse(value.to_owned()).unwrap()
@@ -111,11 +112,24 @@ fn synthetic_source_with_grid(
     size: [i32; 3],
     placement: RandomSpreadPlacement,
 ) -> (Arc<VillagePlanSource>, Arc<BlockRegistry>) {
+    synthetic_source_with_pieces(seed, size, placement, Vec::new())
+}
+
+/// The same synthetic village whose centre template also places `entities`, in
+/// template-local coordinates.
+fn synthetic_source_with_pieces(
+    seed: i64,
+    size: [i32; 3],
+    placement: RandomSpreadPlacement,
+    entities: Vec<TemplateEntity>,
+) -> (Arc<VillagePlanSource>, Arc<BlockRegistry>) {
     let blocks = required_registry();
     let marker = marker_state(&blocks);
-    let template_id = identifier("test:village/center");
-    let template = StructureTemplate::new(
+    synthetic_source_with_template(
+        seed,
         size,
+        placement,
+        entities,
         vec![
             TemplateBlock {
                 pos: [0, 0, size[2] - 1],
@@ -130,7 +144,20 @@ fn synthetic_source_with_grid(
                 state: marker,
             },
         ],
-    );
+    )
+}
+
+/// The same synthetic village over explicit template blocks.
+fn synthetic_source_with_template(
+    seed: i64,
+    size: [i32; 3],
+    placement: RandomSpreadPlacement,
+    entities: Vec<TemplateEntity>,
+    template_blocks: Vec<TemplateBlock>,
+) -> (Arc<VillagePlanSource>, Arc<BlockRegistry>) {
+    let blocks = required_registry();
+    let template_id = identifier("test:village/center");
+    let template = StructureTemplate::new(size, template_blocks).with_entities(entities);
     let pool_id = identifier("test:village/centers");
     let processor_id = identifier("test:village/processors");
     let structure_id = identifier("test:village_plains");
@@ -254,6 +281,72 @@ fn plan_set(
     let free_height = |x: i32, z: i32| plain.surface_height(x, z).saturating_add(1);
     let biome_at = |x: i32, z: i32| plain.base_biome(x, z);
     source.plans_for_chunk(chunk.0, chunk.1, &free_height, &biome_at)
+}
+
+/// The region scan reports the same village the per-chunk lookup finds — with
+/// its start chunk, region, pieces and the gate's biome tag — and reports
+/// nothing in a region the placement formula starts nothing in.
+///
+/// This is the enumeration a settlement owner lists sites from, so it must
+/// agree with the lookup the generator itself generates from: the region scan
+/// is the placement formula over a bounded rectangle, not a second derivation.
+#[test]
+fn region_scan_reports_the_villages_the_chunk_lookup_finds() {
+    let (source, blocks) = synthetic_source(4242);
+    let plain = synthetic_generator(4242, &blocks, None);
+    let (chunk_x, chunk_z) = placement_chunk(&source);
+    let set = plan_set(&source, &plain, (chunk_x, chunk_z))
+        .expect("the placement chunk holds a synthetic village");
+    let expected: Vec<_> = set.plans().iter().map(|plan| plan.site()).collect();
+
+    let free_height = |x: i32, z: i32| plain.surface_height(x, z).saturating_add(1);
+    let biome_at = |x: i32, z: i32| plain.base_biome(x, z);
+    let scanned = source.sites_in_region(
+        (chunk_x - 3, chunk_z - 3),
+        (chunk_x + 3, chunk_z + 3),
+        &free_height,
+        &biome_at,
+    );
+    assert_eq!(
+        scanned, expected,
+        "a bounded region scan must report exactly the plans the chunk lookup assembles"
+    );
+    let site = &scanned[0];
+    assert_eq!(site.start_chunk, (chunk_x, chunk_z));
+    assert_eq!(site.pieces.len(), set.plans()[0].pieces().len());
+    assert_eq!(
+        site.min,
+        set.plans()[0].affected_box().0,
+        "the site region is the plan's own affected box"
+    );
+    assert_eq!(
+        site.pieces[0].template.as_deref(),
+        Some("test:village/center")
+    );
+
+    // A rectangle that names no candidate chunk enumerates nothing: absence is
+    // an empty list, never an error and never an invented site.
+    let empty = source.sites_in_region(
+        (chunk_x + 1, chunk_z + 1),
+        (chunk_x + 2, chunk_z + 2),
+        &free_height,
+        &biome_at,
+    );
+    assert!(
+        empty.is_empty(),
+        "a rectangle that names no village must enumerate no site"
+    );
+    // And an inverted rectangle is empty rather than a panic or a full scan.
+    assert!(
+        source
+            .sites_in_region(
+                (chunk_x, chunk_z),
+                (chunk_x - 1, chunk_z - 1),
+                &free_height,
+                &biome_at
+            )
+            .is_empty()
+    );
 }
 
 /// Every block of a chunk, in `(y, lz, lx)` order: `Chunk` carries no
@@ -825,6 +918,306 @@ fn content_cache_selection_ignores_directories_without_a_cache() {
             empty.path().to_path_buf(),
         ]),
         Some(empty.path().to_path_buf()),
+    );
+}
+
+/// A piece's template villagers become the chunk's inhabitant markers, with
+/// vanilla's transform and the same per-chunk box the blocks are clipped to.
+///
+/// Three template entities at the piece's local origin column: a villager that
+/// lands in the chunk being filled, a villager whose transformed *block* position
+/// is 40 blocks away (vanilla's `BoundingBox.isInside` drops it, and no chunk
+/// places it — the marker list is per chunk), and a zombie villager, which the
+/// lane does not spawn.
+#[test]
+fn village_pieces_place_their_villagers_as_chunk_inhabitants() {
+    let seed = 7;
+    // The authoring follows the real templates: the baby authors
+    // `Rotation = [0.0, -25.827711]` and `Age = -21359`, the adults author
+    // `Rotation = [48.821632, 0.0]` and `Age = 0`. The position is the
+    // `2.25, 3.0, -1.5` point of the pinned transform table, whose four rotated
+    // images differ, so the expectation below cannot pass by accident under
+    // `Rotation::None` alone.
+    let villager = |block_position: [i32; 3], yaw: f32, pitch: f32, age: i32| TemplateEntity {
+        entity_type: "minecraft:villager".to_owned(),
+        position: [
+            f64::from(block_position[0]) + 2.25,
+            3.0,
+            f64::from(block_position[2]) - 1.5,
+        ],
+        block_position,
+        yaw,
+        pitch,
+        villager: Some(TemplateVillagerData {
+            kind: "desert".to_owned(),
+            profession: "nitwit".to_owned(),
+            level: 1,
+            age,
+        }),
+    };
+    let (source, blocks) = synthetic_source_with_pieces(
+        seed,
+        [3, 4, 3],
+        RandomSpreadPlacement {
+            spacing: 34,
+            separation: 8,
+            salt: 10_387_312,
+            triangular: false,
+        },
+        vec![
+            villager([0, 1, 0], 0.0, -25.827_711, -21_359),
+            villager([40, 1, 0], 48.821_632, 0.0, 0),
+            TemplateEntity {
+                entity_type: "minecraft:zombie_villager".to_owned(),
+                position: [0.5, 1.0, 0.5],
+                block_position: [0, 1, 0],
+                yaw: 0.0,
+                pitch: 0.0,
+                villager: Some(TemplateVillagerData {
+                    kind: "plains".to_owned(),
+                    profession: "none".to_owned(),
+                    level: 1,
+                    age: 0,
+                }),
+            },
+        ],
+    );
+    let chunk = placement_chunk(&source);
+    let generator = synthetic_generator(seed, &blocks, Some(&source));
+    let plan = plan_set(&source, &synthetic_generator(seed, &blocks, None), chunk)
+        .expect("the placement chunk holds a plan");
+    let piece = &plan.plans()[0].pieces()[0];
+    // The entity's double position is `transform(Vec3, mirror, rotation, pivot)`
+    // of `[2.25, 3.0, -1.5]` plus the piece's origin: the four rotated images
+    // below are the real class's own outputs for that point (three of the four
+    // differ, which is exactly what the Vec3 overload exists for — the block
+    // transform of the entity's *block* position is `[0, 1, 0]` under all four
+    // rotations, so a block-derived expectation could not see the difference).
+    let rotated = match piece.rotation {
+        Rotation::None => [2.25, 3.0, -1.5],
+        Rotation::Clockwise90 => [2.5, 3.0, 2.25],
+        Rotation::Clockwise180 => [-1.25, 3.0, 2.5],
+        Rotation::CounterClockwise90 => [-1.5, 3.0, -1.25],
+    };
+
+    let placed = generator.generate(ChunkPos {
+        x: chunk.0,
+        z: chunk.1,
+    });
+    let markers = placed.settlement_inhabitants();
+    assert_eq!(markers.len(), 1, "one villager is placed, one clipped away");
+    let marker = &markers[0];
+    assert_eq!(marker.entity_type, "minecraft:villager");
+    assert_eq!(marker.villager_kind, "desert");
+    assert_eq!(marker.profession, "nitwit");
+    assert_eq!(marker.level, 1);
+    assert_eq!(marker.age, -21_359);
+    assert_eq!(
+        marker.claim,
+        format!(
+            "test:village/centers@{}:{}:{}#0",
+            piece.position.x, piece.position.y, piece.position.z
+        ),
+    );
+    assert_eq!(
+        marker.position,
+        [
+            f64::from(piece.position.x) + rotated[0],
+            f64::from(piece.position.y) + rotated[1],
+            f64::from(piece.position.z) + rotated[2],
+        ],
+        "the entity position follows the piece's rotation under {:?}",
+        piece.rotation,
+    );
+    // The yaw is the authored yaw with the piece's rotation added, the way
+    // `Entity.rotate` adds it; `Mirror.None` leaves the mirror term at zero. The
+    // pitch is the authored one, which vanilla never rotates.
+    let turns = match piece.rotation {
+        Rotation::None => 0.0,
+        Rotation::Clockwise90 => 90.0,
+        Rotation::Clockwise180 => 180.0,
+        Rotation::CounterClockwise90 => 270.0,
+    };
+    assert_eq!(marker.yaw, turns);
+    assert_eq!(marker.pitch, -25.827_711);
+    // The templates author no POI, so the marker carries the core's answer for
+    // that case (`default_villager_pois`): the placement's own position is the
+    // home and the meeting point, and a working profession would get a job site
+    // there — this entity's is `nitwit`, which works nowhere.
+    assert_eq!(marker.home, Some(marker.position));
+    assert_eq!(marker.meeting_point, Some(marker.position));
+    assert_eq!(marker.job_site, None);
+
+    // The clipped villager is not placed anywhere, and a chunk that holds none
+    // of them carries no markers: skipping the block clip would put the
+    // 40-block-away villager here.
+    for offset in 1..=3 {
+        let neighbour = generator.generate(ChunkPos {
+            x: chunk.0 + offset,
+            z: chunk.1,
+        });
+        assert!(
+            neighbour.settlement_inhabitants().is_empty(),
+            "chunk ({}, {}) holds no villager",
+            chunk.0 + offset,
+            chunk.1,
+        );
+    }
+}
+
+/// Live proof over the real cache: a generated village carries its piece
+/// villagers as chunk inhabitant markers, and the closure reports the mobs the
+/// lane does not spawn.
+///
+/// The chunks the villager pieces land in are generated one at a time and their
+/// markers collected; generation is bounded to the pieces whose templates carry
+/// entities, so the test pays for the villager pieces only.
+#[test]
+fn live_village_populates_its_pieces_villagers() {
+    let Some(cache) = content_cache() else {
+        println!(
+            "SKIP live_village_populates_its_pieces_villagers: no vanilla content cache found \
+             (set SOLARIS_CONTENT_CACHE, or run with /tmp/jdk-cold2 present)"
+        );
+        return;
+    };
+    let seed = 4242;
+    let Some((source, blocks)) = live_source(&cache, seed) else {
+        println!(
+            "SKIP live_village_populates_its_pieces_villagers: the village closure did not load \
+             from {}",
+            cache.display()
+        );
+        return;
+    };
+    let plain = synthetic_generator(seed, &blocks, None);
+    let generator = synthetic_generator(seed, &blocks, Some(&source));
+
+    let mut found = None;
+    for chunk in placement_chunks(&source, 8) {
+        if let Some(set) = live_plan(&source, &plain, chunk) {
+            found = Some(set);
+            break;
+        }
+    }
+    let set = found.expect("a placement chunk places a village in the first 8x8 cells");
+
+    let mut generated: BTreeSet<(i32, i32)> = BTreeSet::new();
+    let mut markers = Vec::new();
+    let mut villager_pieces = 0usize;
+    for plan in set.plans() {
+        for piece in plan.pieces() {
+            let crate::village::plan_source::PlanElement::Single { template, .. } = &piece.element
+            else {
+                continue;
+            };
+            let template = source
+                .closure()
+                .piece(template)
+                .expect("every planned piece is in the closure");
+            if template.entities().is_empty() {
+                continue;
+            }
+            villager_pieces += 1;
+            let chunk = (
+                piece.position.x.div_euclid(16),
+                piece.position.z.div_euclid(16),
+            );
+            if !generated.insert(chunk) {
+                continue;
+            }
+            markers.extend(
+                generator
+                    .generate(ChunkPos {
+                        x: chunk.0,
+                        z: chunk.1,
+                    })
+                    .settlement_inhabitants(),
+            );
+        }
+    }
+
+    println!(
+        "{villager_pieces} pieces carry template entities; {} villagers placed",
+        markers.len()
+    );
+    assert!(
+        villager_pieces > 0,
+        "a real village's growth must reach the villager pools",
+    );
+    assert!(
+        !markers.is_empty(),
+        "the villager pieces' chunks must carry inhabitant markers",
+    );
+    let mut claims = BTreeSet::new();
+    for marker in &markers {
+        assert_eq!(marker.entity_type, "minecraft:villager");
+        assert!(
+            ["plains", "desert", "savanna", "snow", "taiga"]
+                .contains(&marker.villager_kind.as_str()),
+            "a village type the core does not carry: {}",
+            marker.villager_kind,
+        );
+        assert!(
+            ["none", "nitwit"].contains(&marker.profession.as_str()),
+            "a village profession the core does not carry: {}",
+            marker.profession,
+        );
+        assert_eq!(marker.level, 1);
+        // The two rotations the village templates author: the adults'
+        // `Rotation = [48.821632, 0.0]` and the babies' `[0.0, -25.827711]`. A
+        // placed marker is that yaw plus the piece's own quarter turn, and the
+        // pitch is the authored one untouched.
+        let (authored_yaw, authored_pitch) = if marker.age < 0 {
+            (0.0, -25.827_711)
+        } else {
+            (48.821_632, 0.0)
+        };
+        assert!(
+            (marker.pitch - authored_pitch).abs() < 1e-4,
+            "a pitch the villager templates do not author: {}",
+            marker.pitch,
+        );
+        let turns = (marker.yaw - authored_yaw).rem_euclid(360.0);
+        assert!(
+            [0.0, 90.0, 180.0, 270.0]
+                .iter()
+                .any(|quarter| (turns - quarter).abs() < 1e-3),
+            "a yaw that is not the authored yaw plus a quarter turn: {}",
+            marker.yaw,
+        );
+        assert!(
+            claims.insert(marker.claim.clone()),
+            "two villagers share the claim {}",
+            marker.claim,
+        );
+        // The POI answer for a template that authors none: the placement is the
+        // home and the meeting point, and `none`/`nitwit` work nowhere.
+        assert_eq!(marker.home, Some(marker.position));
+        assert_eq!(marker.meeting_point, Some(marker.position));
+        assert_eq!(
+            marker.job_site, None,
+            "the village templates author no working profession",
+        );
+    }
+
+    // The mobs the lane does not spawn are reported, not silently missing: the
+    // closure reaches them through the zombie town centres, the animal pens, the
+    // butcher shops, the meeting-point golems and the desert camel.
+    let unspawned = source.closure().unspawned_piece_mobs();
+    for mob in [
+        "minecraft:cat",
+        "minecraft:iron_golem",
+        "minecraft:zombie_villager",
+    ] {
+        assert!(
+            unspawned.contains(&mob),
+            "{mob} must be reported as unspawned; got {unspawned:?}",
+        );
+    }
+    assert!(
+        !unspawned.contains(&"minecraft:villager"),
+        "the villager is the one mob the lane does spawn",
     );
 }
 

@@ -22,8 +22,9 @@ use mc_script::{
     ScriptOperationRequest, ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult,
     ScriptOwnedItemTransfer, ScriptResidentSiteReservation, ScriptSettlementBuilding,
     ScriptSettlementOperation, ScriptSettlementResult, ScriptSettlementSite, ScriptSitePoiKind,
-    ScriptSitePoiState, ScriptStructureReceipt, ScriptStructureSnapshot, ScriptStructureState,
-    ScriptSurveyBounds, ScriptSurveyPurpose, ScriptWarehouseBinding, resident_generation_id,
+    ScriptSitePoiState, ScriptSiteProvenance, ScriptSiteVariant, ScriptStructureReceipt,
+    ScriptStructureSnapshot, ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose,
+    ScriptWarehouseBinding, resident_generation_id,
 };
 use mc_world::BlockRegistry;
 use mc_worldgen::{BlueprintCatalog, SettlementSelector};
@@ -39,7 +40,7 @@ use super::PreparedStorageBatch;
 use super::ScriptStoragePrepareOutcome;
 use super::settlement::{
     ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
-    journal_test_warehouse_transfer,
+    VillageInhabitantReading, VillagePoiReading, VillageReading, journal_test_warehouse_transfer,
 };
 use super::world_inventory::InventoryRuntime;
 
@@ -175,6 +176,33 @@ impl SettlementWorld for FakeWorld {
             chunk_availability: *self.availability.lock().unwrap(),
             revision: self.revision.load(Ordering::Relaxed),
         })
+    }
+
+    /// A fake world holds no generated village of its own: the settlement tests
+    /// exercise the authored lane, and a generated site is supplied by
+    /// [`FakeVillageGround`]. What it does hold is the marker record of the
+    /// inhabitant the generated village placed, which is what the descriptor
+    /// reports.
+    fn village_pois(
+        &self,
+        _bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillagePoiReading>, ScriptOperationFailure> {
+        Ok(VillageReading::Loaded(Vec::new()))
+    }
+
+    fn village_inhabitants(
+        &self,
+        _bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillageInhabitantReading>, ScriptOperationFailure> {
+        Ok(VillageReading::Loaded(vec![VillageInhabitantReading {
+            claim: VILLAGE_INHABITANT_CLAIM.to_owned(),
+            entity_uuid: crate::settlement_identity::settlement_entity_uuid(
+                VILLAGE_INHABITANT_CLAIM,
+            )
+            .to_string(),
+            position: [48.5, 64.0, 80.5],
+            age: 0,
+        }]))
     }
 
     fn observe_footprint(&self, _bounds: ScriptSurveyBounds) -> u64 {
@@ -406,6 +434,7 @@ fn runtime_at_with(
             WORLD_IDENTITY,
             START_CELL,
             Arc::new(FlatGround),
+            None,
         )));
     }
     if adapter {
@@ -882,6 +911,236 @@ async fn prepared_cottage(
         "a prepared structure holds no reservation yet"
     );
     (structure, token)
+}
+
+/// The generated village a fixture's runtime knows about.
+///
+/// Two pieces, one template each, in a region the site cell `[0, 0]` contains;
+/// the facade the generator would place is not part of a site descriptor.
+fn generated_village() -> mc_world::GeneratedVillageSite {
+    mc_world::GeneratedVillageSite {
+        start_chunk: (3, 5),
+        min: mc_world::BlockPos {
+            x: 48,
+            y: 64,
+            z: 80,
+        },
+        max: mc_world::BlockPos {
+            x: 79,
+            y: 72,
+            z: 111,
+        },
+        pieces: vec![
+            mc_world::GeneratedVillagePiece {
+                template: Some("minecraft:village/plains/houses/plains_small_house_1".to_owned()),
+                position: mc_world::BlockPos {
+                    x: 48,
+                    y: 64,
+                    z: 80,
+                },
+                rotation: 1,
+            },
+            // A `feature_pool_element` places no template and is not a building.
+            mc_world::GeneratedVillagePiece {
+                template: None,
+                position: mc_world::BlockPos {
+                    x: 60,
+                    y: 70,
+                    z: 96,
+                },
+                rotation: 0,
+            },
+        ],
+    }
+}
+
+/// The claim one generated village placement carries.
+///
+/// The generator records it with the chunk (`Chunk::settlement_inhabitants`) and
+/// the spawn lane mints the villager's UUID from it, so this is the identity a
+/// descriptor must publish for that villager and the identity `claim_resident`
+/// takes back.
+const VILLAGE_INHABITANT_CLAIM: &str =
+    "minecraft:village/plains/houses/plains_small_house_1@48:64:80#0";
+
+/// The generator's enumeration, reduced to the one village a test knows about.
+struct FakeVillageGround {
+    village: mc_world::GeneratedVillageSite,
+}
+
+impl crate::script::storage::VillageSiteGround for FakeVillageGround {
+    fn village_sites_in_region(
+        &self,
+        min_chunk: (i32, i32),
+        max_chunk: (i32, i32),
+    ) -> Vec<mc_world::GeneratedVillageSite> {
+        let start = self.village.start_chunk;
+        let inside = (min_chunk.0..=max_chunk.0).contains(&start.0)
+            && (min_chunk.1..=max_chunk.1).contains(&start.1);
+        inside.then(|| self.village.clone()).into_iter().collect()
+    }
+}
+
+/// A fixture whose runtime knows one generated vanilla village.
+fn fixture_with_generated_village() -> Fixture {
+    let root = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(catalog());
+    let world = Arc::new(FakeWorld::new());
+    let runtime = runtime_with_generated_village(Arc::clone(&world));
+    Fixture {
+        root,
+        runtime,
+        world,
+        catalog,
+        sessions: None,
+    }
+}
+
+/// The same runtime the other fixtures build, with the generated village.
+fn runtime_with_generated_village(world: Arc<FakeWorld>) -> InventoryRuntime {
+    InventoryRuntime::new(
+        None,
+        &ShutdownHandle::default(),
+        Arc::new(SessionRegistry::new()),
+        Arc::new(solaris_required_items()),
+        Arc::new(solaris_required_item_facts()),
+    )
+    .with_settlement_runtime(Arc::new(SettlementRuntime::new(
+        SettlementSelector::new(SEED, PROFILE_REVISION),
+        Arc::new(catalog()),
+        WORLD_IDENTITY,
+        START_CELL,
+        Arc::new(FlatGround),
+        Some(Arc::new(FakeVillageGround {
+            village: generated_village(),
+        })),
+    )))
+    .with_settlement_world(world as Arc<dyn SettlementWorld>)
+}
+
+/// A generated vanilla village is a site of the same page: its identity, region
+/// and pieces come from the generator's own plan, and the id the page mints is
+/// the id a query reverses.
+#[tokio::test]
+async fn a_generated_village_is_listed_and_queried_by_its_own_id() {
+    let fixture = fixture_with_generated_village();
+    let mut storage = fixture.storage();
+    let village = generated_village();
+    let expected_id = crate::script::storage::village_site_id(
+        WORLD_IDENTITY,
+        "minecraft:overworld",
+        village.start_chunk,
+    );
+
+    assert!(
+        fixture.runtime.settlement_runtime().is_some(),
+        "the fixture installs a settlement runtime"
+    );
+    assert!(
+        fixture.runtime.settlement_world().is_some(),
+        "the fixture installs a settlement world"
+    );
+    let listed = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &settlement(ScriptSettlementOperation::ListSites {
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await;
+    assert_eq!(
+        listed.failure(),
+        None,
+        "the page must be answered, not rejected"
+    );
+    let (sites, _) = page_of(&listed);
+    let site = sites
+        .iter()
+        .find(|site| site.site_id == expected_id)
+        .unwrap_or_else(|| panic!("the generated village is a site of the page: {sites:?}"));
+    assert_eq!(site.provenance, ScriptSiteProvenance::VanillaVillage);
+    assert_eq!(site.variant, ScriptSiteVariant::Village);
+    assert_eq!(site.footprint_origin, [48, 64, 80]);
+    assert_eq!(site.footprint_size, [32, 9, 32]);
+    assert!(
+        site.contents_known,
+        "the fixture's world answers its readings, so the contents are known"
+    );
+    assert_eq!(
+        site.inhabitant_generation_ids,
+        vec![
+            crate::settlement_identity::settlement_entity_uuid(VILLAGE_INHABITANT_CLAIM)
+                .to_string()
+        ],
+        "a generated site publishes the entity identity its placement mints, which is the id \
+         `claim_resident` adopts"
+    );
+    assert_eq!(
+        site.buildings.len(),
+        1,
+        "only the piece that places a template is a building"
+    );
+    assert_eq!(
+        site.buildings[0].blueprint_id,
+        "minecraft:village/plains/houses/plains_small_house_1"
+    );
+    assert_eq!(site.buildings[0].origin, [48, 64, 80]);
+    assert_eq!(
+        site.buildings[0].rotation, 90,
+        "the descriptor reports the plan's quarter turn in degrees"
+    );
+
+    let queried = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &settlement(ScriptSettlementOperation::QuerySite {
+                site_id: expected_id.clone(),
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await;
+    assert_eq!(
+        site_of(&queried).site_id,
+        expected_id,
+        "a site id the page minted is the id a query reverses"
+    );
+
+    // An id of the right shape that names no village the generator places is not
+    // a site: enumeration answers from the generator, never from the id alone.
+    let forged = format!("{}ff", &expected_id[..expected_id.len() - 2]);
+    let unknown = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &settlement(ScriptSettlementOperation::QuerySite {
+                site_id: forged,
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await;
+    assert_eq!(unknown.failure(), Some(ScriptOperationFailure::NotFound));
+
+    // A well-formed id for another chunk of the same world is also absent,
+    // because that chunk holds no village.
+    let elsewhere =
+        crate::script::storage::village_site_id(WORLD_IDENTITY, "minecraft:overworld", (4, 5));
+    let absent = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &settlement(ScriptSettlementOperation::QuerySite {
+                site_id: elsewhere,
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await;
+    assert_eq!(absent.failure(), Some(ScriptOperationFailure::NotFound));
 }
 
 #[tokio::test]
@@ -2273,6 +2532,7 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
         let adapter = crate::settlement::LiveSettlementWorld::new(
             read,
             Arc::clone(&blocks),
+            Arc::new(mc_data::tags::TagsData::default()),
             None,
             simulation,
         );
@@ -2289,6 +2549,7 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
             WORLD_IDENTITY,
             START_CELL,
             Arc::new(FlatGround),
+            None,
         )))
         .with_settlement_world(Arc::new(adapter) as Arc<dyn SettlementWorld>);
 
@@ -2521,6 +2782,7 @@ async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_positio
     let adapter = crate::settlement::LiveSettlementWorld::new(
         read,
         Arc::clone(&blocks),
+        Arc::new(mc_data::tags::TagsData::default()),
         None,
         simulation.clone(),
     );
@@ -2537,6 +2799,7 @@ async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_positio
         WORLD_IDENTITY,
         START_CELL,
         Arc::new(FlatGround),
+        None,
     )))
     .with_settlement_world(Arc::new(adapter) as Arc<dyn SettlementWorld>);
     let mut storage = PluginStorage::open(plugin_root.path()).unwrap();
@@ -3609,12 +3872,19 @@ async fn warehouse_transfer_commits_both_participants_under_one_decision() {
     // and the actor's durable revision is the decision the composite journaled:
     // the fence a later transfer round-trips.
     let accepted = fixture.world.last_warehouse_request();
-    assert_eq!(accepted.actor_id, actor);
+    let participant = accepted
+        .player
+        .as_ref()
+        .expect("the deposit moves the actor's own inventory");
+    assert_eq!(participant.actor_id, actor);
     assert_eq!(
-        accepted.expected_inventory[9],
+        participant.expected_inventory[9],
         ItemStack::new(BIRCH_LOG, 10)
     );
-    assert_eq!(accepted.updated_inventory[9], ItemStack::new(BIRCH_LOG, 6));
+    assert_eq!(
+        participant.updated_inventory[9],
+        ItemStack::new(BIRCH_LOG, 6)
+    );
     assert_eq!(accepted.updated_container[1], ItemStack::new(BIRCH_LOG, 4));
     let (_after, after_revision) = fixture.actor_inventory(actor);
     let sessions = fixture.sessions.as_ref().unwrap();

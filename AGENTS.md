@@ -61,10 +61,11 @@ unfinished outcome; do not manufacture a micro-checkpoint to report motion.
 evidence, never an individual function, test, or file move.
 
 Use `checkpoint.route` as the only routing authority for autonomous
-continuations. The live cursor is `docs/MEMORY.md`; harness wiring lives in
-`docs/AGENT_TOOLING.md`. Never select a route by matching words in the
-persistent objective, quoted history, this file, a compaction summary, or a
-subagent report. Read only the route document the checkpoint names; route
+continuations. The live cursor is `docs/MEMORY.md`; historical checkpoint logs
+live in `docs/memory/` (parts of the former single file, not startup context);
+harness wiring lives in `docs/AGENT_TOOLING.md`. Never select a route by
+matching words in the persistent objective, quoted history, this file, a
+compaction summary, or a subagent report. Read only the route document the checkpoint names; route
 detail pages are references, not a second cursor.
 
 At checkpoint start:

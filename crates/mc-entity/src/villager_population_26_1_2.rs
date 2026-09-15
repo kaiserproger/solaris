@@ -272,6 +272,24 @@ impl VillagerPopulationState {
         }
     }
 
+    /// The state a template-spawned village baby starts in.
+    ///
+    /// `age_ticks` is the `Age` the structure's template authored (negative for
+    /// a baby — the village babies spawn partway through childhood, not at
+    /// [`VILLAGER_BABY_START_AGE_TICKS`]). `claimed_home` is the claim the
+    /// villager was spawned under: a generated village is not a settlement site,
+    /// so it has no home claim of its own, and a baby's home is its placement's
+    /// own identity — the runtime's persistence contract requires a baby to name
+    /// the home it was born into (`crates/mc-net/src/play/persistence.rs`).
+    #[must_use]
+    pub fn village_baby(age_ticks: i32, claimed_home: impl Into<String>) -> Self {
+        Self {
+            age_ticks,
+            claimed_home: Some(claimed_home.into()),
+            ..Self::adult()
+        }
+    }
+
     #[must_use]
     pub fn baby(claimed_home: String) -> Self {
         Self {

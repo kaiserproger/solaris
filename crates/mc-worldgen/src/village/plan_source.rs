@@ -90,7 +90,10 @@ use std::sync::Mutex;
 
 use mc_data::Identifier;
 use mc_data::village_data::{HeightmapType, ProcessorRef, Projection, StructureProcessorSpec};
-use mc_world::{BlockPos, BlockRegistry, BlockStateId, Chunk};
+use mc_world::{
+    BlockPos, BlockRegistry, BlockStateId, Chunk, GeneratedVillagePiece, GeneratedVillageSite,
+    SettlementInhabitantMarker,
+};
 
 use crate::structures::{StructureLoot, TemplateChest};
 use crate::vanilla_features::{
@@ -102,7 +105,7 @@ use crate::village::beard::{
 use crate::village::closure::{ClosureElement, VillageClosure};
 use crate::village::decor::VillageDecor;
 use crate::village::piece::{
-    BlockClip, Mirror, PieceError, PieceSettings, PieceWriter, place_piece,
+    BlockClip, Mirror, PieceError, PieceSettings, PieceWriter, PlacedEntity, place_piece,
 };
 use crate::village::processors::{PieceElement, ProcessLevel};
 use crate::village::solver::{PlacedElement, Rotation, VillageAssembly, assemble_village};
@@ -249,6 +252,33 @@ impl VillagePlan {
     #[must_use]
     pub fn beard_source(&self) -> BeardSource<'_> {
         (&self.assembly.beard_pieces, &self.junctions)
+    }
+
+    /// This plan as the generated village a settlement owner adopts: the start
+    /// chunk, the region the plan reaches, and one entry per placed piece.
+    ///
+    /// The gate's biome tag and the stub position stay in the plan; a consumer
+    /// that adopts a village asks about the village, not about the structure the
+    /// gate resolved.
+    #[must_use]
+    pub fn site(&self) -> GeneratedVillageSite {
+        GeneratedVillageSite {
+            start_chunk: self.start_chunk(),
+            min: self.affected_min,
+            max: self.affected_max,
+            pieces: self
+                .pieces
+                .iter()
+                .map(|piece| GeneratedVillagePiece {
+                    template: match &piece.element {
+                        PlanElement::Single { template, .. } => Some(template.to_string()),
+                        PlanElement::Feature { .. } => None,
+                    },
+                    position: piece.position,
+                    rotation: piece.rotation.quarter_turns(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -527,6 +557,48 @@ impl VillagePlanSource {
             affected_min,
             affected_max,
         })
+    }
+
+    /// Every village whose start chunk lies in the inclusive chunk rectangle
+    /// `min_chunk..=max_chunk`, in ascending start-chunk order.
+    ///
+    /// One [`Self::plan_for_start_chunk`] per chunk in the rectangle: a chunk
+    /// the `random_spread` grid does not name costs the placement formula and
+    /// nothing else. The enumeration generates no chunk and reads no world
+    /// state beyond the two column queries the caller supplies, so a settlement
+    /// owner can list the villages a region will hold — and adopt one — before
+    /// any of its chunks exist, exactly as the generator's own lookup agrees
+    /// with it later.
+    ///
+    /// `free_height` and `biome_at` are the generator's plan-free queries, the
+    /// same pair [`Self::plans_for_chunk`] takes; a caller that answers
+    /// differently for one column than the world's terrain does would describe a
+    /// village the world will not generate.
+    ///
+    /// The rectangle is the caller's bound: this walks every chunk in it, so a
+    /// caller scans one bounded page of candidate cells rather than a world.
+    #[must_use]
+    pub fn sites_in_region(
+        &self,
+        min_chunk: (i32, i32),
+        max_chunk: (i32, i32),
+        free_height: &dyn Fn(i32, i32) -> i32,
+        biome_at: &dyn Fn(i32, i32) -> Identifier,
+    ) -> Vec<GeneratedVillageSite> {
+        if min_chunk.0 > max_chunk.0 || min_chunk.1 > max_chunk.1 {
+            return Vec::new();
+        }
+        let mut sites = Vec::new();
+        for chunk_z in min_chunk.1..=max_chunk.1 {
+            for chunk_x in min_chunk.0..=max_chunk.0 {
+                let Some(plan) = self.plan_for_start_chunk(chunk_x, chunk_z, free_height, biome_at)
+                else {
+                    continue;
+                };
+                sites.push(plan.site());
+            }
+        }
+        sites
     }
 
     /// The plans whose affected boxes cover `(world_x, world_z)`, for callers
@@ -886,6 +958,10 @@ impl VillagePlanSource {
             [writable.1.x, writable.1.y, writable.1.z],
         );
         let mut placed = 0;
+        // The villagers the pieces put in this chunk. One list for the whole
+        // chunk, written after every plan: `set_settlement_inhabitants` replaces
+        // the chunk's list, so a per-piece call would drop the previous plans'.
+        let mut inhabitants = Vec::new();
         // One random per structure, seeded the way `applyBiomeDecoration` seeds
         // the structure it is about to place: the stream rolls the `LootTableSeed`
         // of every container the structure's pieces write *and* runs the
@@ -912,6 +988,7 @@ impl VillagePlanSource {
                 loot,
                 air,
                 registry: self.blocks.as_ref(),
+                inhabitants: &mut inhabitants,
             };
             for piece in plan.pieces() {
                 if !intersects(piece.bounds_min, piece.bounds_max, writable) {
@@ -974,6 +1051,9 @@ impl VillagePlanSource {
                     }
                 }
             }
+        }
+        if !inhabitants.is_empty() {
+            chunk.set_settlement_inhabitants(&inhabitants);
         }
         Ok(placed)
     }
@@ -1055,6 +1135,12 @@ struct ChunkPieceWriter<'a, 'b> {
     /// The registry the decor lane resolves a block state against when it asks
     /// whether a position is a water source.
     registry: &'a BlockRegistry,
+    /// The villagers the placed pieces put in this chunk, in placement order.
+    ///
+    /// They leave as the chunk's inhabitant markers: the core's one
+    /// generation-to-runtime entity handoff, which `mc-net`'s chunk stream turns
+    /// into spawned villagers.
+    inhabitants: &'a mut Vec<SettlementInhabitantMarker>,
 }
 
 impl ChunkPieceWriter<'_, '_> {
@@ -1098,6 +1184,57 @@ impl PieceWriter for ChunkPieceWriter<'_, '_> {
         let contents = chest.resolve_contents(self.loot, loot_seed);
         self.chunk.chests.insert(pos, contents);
     }
+
+    /// The village lane's entity step, as the chunk's inhabitant markers.
+    ///
+    /// `VillagerData` and `Age` come from the template entity. The templates
+    /// author no home, job site or meeting point, and this engine does not model
+    /// vanilla's own POI acquisition (a villager claiming a bed, a workstation or
+    /// the bell from the blocks around it), so the marker carries the core's
+    /// existing answer for a villager with no authored POI: the entity's own
+    /// placed position stands in for all three — it is the home it was placed
+    /// into, a working profession gets its job site there, and every villager has
+    /// somewhere to meet. That is the shape
+    /// [`default_villager_pois`](mc_entity::villager_26_1_2::default_villager_pois)
+    /// defines and the shape the settlement lane's markers also carry, filled
+    /// from its plan.
+    fn set_entity(&mut self, placed: &PlacedEntity<'_>) {
+        let Some(villager) = placed.entity.villager.as_ref() else {
+            return;
+        };
+        // Only the villager is spawnable here. A zombie villager or one of the
+        // mobs a village authors (cats, the animal pens' livestock, the iron
+        // golem, a camel, an armour stand) would have to become a different
+        // entity with its own retained state; the closure reports what a village
+        // authors so the gap is visible instead of silently missing.
+        if placed.entity.entity_type != crate::village::closure::SPAWNED_PIECE_MOB {
+            return;
+        }
+        self.inhabitants.push(SettlementInhabitantMarker {
+            claim: placed.claim.clone(),
+            entity_type: placed.entity.entity_type.clone(),
+            position: placed.position,
+            villager_kind: villager.kind.clone(),
+            profession: villager.profession.clone(),
+            level: villager.level,
+            home: Some(placed.position),
+            // `default_villager_pois` gives a job site to every profession but
+            // `none`; the village templates' other profession is `nitwit`, which
+            // works nowhere, so the working set is named rather than inferred
+            // from "not none".
+            job_site: is_working_profession(&villager.profession).then_some(placed.position),
+            meeting_point: Some(placed.position),
+            age: villager.age,
+            yaw: placed.yaw,
+            pitch: placed.pitch,
+        });
+    }
+}
+
+/// Whether a template entity's `VillagerData.profession` path is one that works:
+/// `none` and `nitwit` have no job site, every other profession does.
+fn is_working_profession(profession: &str) -> bool {
+    !matches!(profession, "none" | "nitwit")
 }
 
 /// The same chunk view serves the decor lane: `minecraft`'s `WorldGenLevel`

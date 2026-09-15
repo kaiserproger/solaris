@@ -246,8 +246,9 @@ are not additional callable host functions.
 `rules.lua` is a separate startup data contract, not another runtime host
 namespace. No durable resident handle, physical worker/order API or
 settlement-contract operation is available merely because it appears in a
-proposal; the schema-2 declarative view API exists but no shipped package
-declares `[client]`, so it stays unused.
+proposal; the schema-2 declarative view API is shipped and one package
+(`solaris-settlements`) declares `[client]`, so its settlement overview is the
+surface that exercises it.
 
 ## Package And Manifest
 
@@ -538,7 +539,12 @@ geometry fail activation. The implemented widget set is `paged_table`, `tabs`,
 `input_number`, `input_text`, `select_enum`, `resource_panel`, `action_button`
 and `world_marker`; there is no HTML/JS, arbitrary Java, filesystem access or
 client-side scripting. Screens declare one of the six kinds `settlement`,
-`construction`, `economy`, `garrison`, `army` or `hud`. The index accepts one
+`construction`, `economy`, `garrison`, `army` or `hud`, and every content id —
+screen, block, model, item, preview, asset, sound — must be owner-prefixed
+(`plugin-id:name`). A bundle that declares `views` requires `present_views` and
+at least one screen: the server reads those screens at startup to route a
+key-driven `view_request` of that kind to their owner, so a views bundle with no
+screen or an unknown kind fails closed instead of shipping a dead surface. The index accepts one
 owned `blocks` entry (`id`, `model`, `name`), up to 128 owned `items` (`id`,
 `base_item`, `name`), up to 64 `world_previews` (`id`, `blueprint_id`, 64-hex
 `content_hash`, one quarter-turn `rotation`, `size_x/y/z` at most 64, and at
@@ -628,11 +634,13 @@ against authoritative pose, line of sight, range, claims and affiliation. A
 marker whose `preview_id` does not resolve to a verified `world_previews` entry
 of the same bundle blocks preview/confirm instead of approximating.
 
-**No shipped package declares `[client]` today.** The whole view surface is
-implemented and unit-tested in core but unused: nothing Loader-facing becomes
-enabled for a package until a package opts in. The corresponding Loader side is
-`solaris-loader` (wire 3, schema 2); there is no server-only fallback for a
-package that requires it.
+**The shipped settlement package declares `[client]`.** Its verified artifact
+index is what the server routes on: at bind time the server reads each views
+bundle's `screens` and declares those kinds for that owner, so a key-driven
+`view_request` resolves to the plugin that ships the screen. Nothing
+Loader-facing becomes enabled for a package that does not opt in. The
+corresponding Loader side is `solaris-loader` (wire 3, schema 2); there is no
+server-only fallback for a package that requires it.
 
 A plugin can play or stop its activated owner sound for one player:
 A plugin can play or stop its activated owner sound for one player:

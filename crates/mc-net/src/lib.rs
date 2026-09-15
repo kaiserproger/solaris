@@ -39,6 +39,7 @@ mod script;
 mod server;
 mod session_auth;
 mod settlement;
+mod settlement_identity;
 #[cfg(test)]
 mod settlement_tests;
 mod status;

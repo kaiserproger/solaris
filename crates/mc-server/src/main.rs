@@ -1478,6 +1478,18 @@ fn village_plan_source_for_startup(
     )
     .context("validating the vanilla village against the block registry")?;
     let source = Arc::new(source);
+    let unspawned_mobs = source.closure().unspawned_piece_mobs();
+    if !unspawned_mobs.is_empty() {
+        // The lane spawns the villagers a piece template places and nothing
+        // else: the other entities a village authors need their own entity
+        // state, so they are reported rather than silently missing. See
+        // `docs/VILLAGE_GENERATION.md`.
+        tracing::warn!(
+            code = "village_piece_mobs_other_than_villagers_are_not_spawned",
+            mobs = ?unspawned_mobs,
+            "the vanilla village lane spawns piece villagers only; these template entities are not spawned",
+        );
+    }
     tracing::info!(
         structure_set = %structure_set,
         structures = source.closure().structures.len(),
@@ -2293,15 +2305,26 @@ mod tests {
             source.display()
         );
         let destination = destination_root.join(name);
-        std::fs::create_dir(&destination).expect("create deployed plugin directory");
-        for file in ["plugin.toml", "main.lua"] {
-            std::fs::copy(source.join(file), destination.join(file))
-                .unwrap_or_else(|error| panic!("copy sibling {name}/{file}: {error}"));
-        }
-        let config = source.join("config.toml");
-        if config.is_file() {
-            std::fs::copy(&config, destination.join("config.toml"))
-                .unwrap_or_else(|error| panic!("copy sibling {name}/config.toml: {error}"));
+        copy_sibling_package(&source, &destination);
+    }
+
+    /// The whole package, so a shipped client artifact is deployed with it.
+    fn copy_sibling_package(source: &Path, destination: &Path) {
+        std::fs::create_dir(destination).expect("create deployed plugin directory");
+        for entry in std::fs::read_dir(source).expect("read sibling plugin directory") {
+            let entry = entry.expect("read sibling plugin entry");
+            let target = destination.join(entry.file_name());
+            if entry
+                .file_type()
+                .expect("sibling plugin entry type")
+                .is_dir()
+            {
+                copy_sibling_package(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap_or_else(|error| {
+                    panic!("copy sibling {}: {error}", entry.path().display())
+                });
+            }
         }
     }
 

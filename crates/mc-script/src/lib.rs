@@ -99,8 +99,8 @@ pub use settlement_operations::{
     MAX_SURVEY_BOUNDS_AXIS, MAX_SURVEY_TAGS, MAX_SURVEY_TOKEN_BYTES, MAX_WORLD_COMMIT_PORTION,
     ScriptChunkAvailability, ScriptResidentSiteReservation, ScriptSettlementBuilding,
     ScriptSettlementOperation, ScriptSettlementPoi, ScriptSettlementResult, ScriptSettlementSite,
-    ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteVariant,
-    ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
+    ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteProvenance,
+    ScriptSiteVariant, ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
     ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose,
     ScriptSurveySnapshot, ScriptWarehouseBinding, warehouse_handle,
 };

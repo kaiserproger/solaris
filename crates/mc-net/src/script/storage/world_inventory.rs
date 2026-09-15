@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_script::{
@@ -15,7 +16,8 @@ use mc_script::{
 use crate::play::SessionRegistry;
 use crate::play::owned_inventory::{
     OwnedInventoryCommit, OwnedInventoryPrepare, ResidentEndpointState, ResidentGearStack,
-    ResidentGearUpdate, WarehouseTransferRequest, owned_inventory_fingerprint,
+    ResidentGearUpdate, WarehousePlayerParticipant, WarehouseTransferRequest, gear_slots_to_items,
+    items_to_gear_slots, owned_inventory_fingerprint,
 };
 use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::play::world_journal::{WorldChunkJournal, WorldChunkJournalError};
@@ -59,14 +61,17 @@ impl PreparedStorageBatch {
     }
 
     fn validate_inventory_participant(&self) -> Result<(), PluginStorageStartError> {
-        if self.inventory.is_none()
-            && !self.operation.as_ref().is_some_and(|receipt| {
-                matches!(
-                    receipt.outcome.payload(),
-                    mc_script::ScriptOperationPayload::OwnedInventory { .. }
-                )
-            })
-        {
+        // A plugin-ledger decision carries at least one non-ledger participant:
+        // a player's canonical inventory, a plugin-owned record that rode the
+        // receipt (a worker's cargo), or the receipt's own owned-inventory
+        // projection.
+        let receipt_participates = self.operation.as_ref().is_some_and(|receipt| {
+            matches!(
+                receipt.outcome.payload(),
+                mc_script::ScriptOperationPayload::OwnedInventory { .. }
+            )
+        });
+        if self.inventory.is_none() && self.order.is_empty() && !receipt_participates {
             return Err(PluginStorageStartError::Malformed(
                 "inventory decision has no inventory participant",
             ));
@@ -542,6 +547,195 @@ fn append_inventory_projection(
 }
 
 impl InventoryRuntime {
+    /// Plan one worker's haul into one bound warehouse container.
+    ///
+    /// The worker hauls out of its own canonical endpoint into the container's
+    /// loaded slots; the durable binding resolves the handle, and a foreign,
+    /// inactive, unresolvable or unloaded container stays the typed refusal
+    /// that keeps the worker from depositing into something core cannot see.
+    pub(super) fn plan_resident_warehouse_deposit(
+        &self,
+        storage: &PluginStorage,
+        plugin_id: &str,
+        source: &ScriptInventoryEndpoint,
+        destination: &ScriptInventoryEndpoint,
+        record: &DurableResidentOrderRecord,
+        limit: u64,
+    ) -> Result<ResidentWarehouseDeposit, ScriptOperationFailure> {
+        let ScriptInventoryEndpoint::Warehouse { handle } = destination else {
+            return Err(ScriptOperationFailure::InvalidRequest);
+        };
+        let slots = match source {
+            ScriptInventoryEndpoint::ResidentCarry { handle: resident }
+                if resident == &record.handle =>
+            {
+                &record.carry
+            }
+            ScriptInventoryEndpoint::ResidentEquipment { handle: resident }
+                if resident == &record.handle =>
+            {
+                &record.equipment
+            }
+            _ => return Err(ScriptOperationFailure::InvalidRequest),
+        };
+        let container = self.resolve_warehouse_container(storage, plugin_id, handle)?;
+        let gear: Vec<Option<ResidentGearStack>> = slots
+            .iter()
+            .map(|stack| stack.as_ref().map(gear_from_stack))
+            .collect();
+        let source_slots = gear_slots_to_items(&gear, &self.items)?;
+        let planned = crate::play::owned_inventory::plan_warehouse_deposit(
+            source,
+            destination,
+            &source_slots,
+            &container.items,
+            limit,
+            &self.items,
+            &self.item_facts,
+        )?;
+        let planned_gear = items_to_gear_slots(&planned.updated_source, &self.items)?;
+        let updated: Vec<Option<DurableResidentStack>> = planned_gear
+            .iter()
+            .map(|stack| stack.as_ref().map(stack_from_gear))
+            .collect();
+        let mut record = record.clone();
+        match source {
+            ScriptInventoryEndpoint::ResidentCarry { .. } => record.carry = updated,
+            ScriptInventoryEndpoint::ResidentEquipment { .. } => record.equipment = updated,
+            _ => return Err(ScriptOperationFailure::InvalidRequest),
+        }
+        Ok(ResidentWarehouseDeposit {
+            record: Box::new(record),
+            container: ResidentDepositContainer {
+                position: container.position,
+                expected: container.items,
+                updated: planned.updated_container,
+            },
+            moved: planned.moved,
+        })
+    }
+
+    /// Commit one planned worker deposit: the container's canonical slots and
+    /// the worker's record change move together, and the container's
+    /// after-image and the caller's encoded receipt ride one journal decision.
+    ///
+    /// `record` is the record after-image the caller is committing, which is
+    /// the plan's own record plus the work assignment it recorded.
+    pub(super) async fn commit_resident_warehouse_deposit(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+        record: Box<DurableResidentOrderRecord>,
+        payload: ScriptOperationPayload,
+        container: &ResidentDepositContainer,
+    ) -> Result<ResidentDepositCommit, PluginStorageMutationError> {
+        let Some(world) = self.settlement_world() else {
+            return Ok(ResidentDepositCommit::Refused);
+        };
+        // Both halves must be able to land before either may: a container whose
+        // receipt has nowhere to go is not recoverable with its record.
+        let Some((root, journal)) = &self.world else {
+            return Ok(ResidentDepositCommit::Refused);
+        };
+        let _save_guard = self.save_coordinator.lock().await;
+        let prepared = match storage.prepare_resident_order_operation_batch(
+            plugin_id,
+            request,
+            payload,
+            vec![DurableResidentOrderChange::Record { record }],
+        ) {
+            Ok(ScriptStoragePrepareOutcome::Prepared(prepared)) => prepared,
+            Ok(ScriptStoragePrepareOutcome::Rejected) => {
+                return Ok(ResidentDepositCommit::Refused);
+            }
+            Err(error) => return Err(error),
+        };
+        let encoded = prepared.encode_world_inventory()?;
+        let position = mc_world::BlockPos {
+            x: container.position[0],
+            y: container.position[1],
+            z: container.position[2],
+        };
+        let decision_id = match world
+            .commit_warehouse_transfer(WarehouseTransferRequest {
+                position,
+                expected_state_id: self.sessions.chest_state_id(position),
+                expected_container: container.expected.clone(),
+                updated_container: container.updated.clone(),
+                player: None,
+                receipt: encoded,
+            })
+            .await
+        {
+            Ok(decision_id) => decision_id,
+            // A moved container fence, an absent container and an engine that
+            // could not take the command all leave the worker's cargo where it
+            // was: the prepared batch is dropped unappended.
+            Err(_) => return Ok(ResidentDepositCommit::Refused),
+        };
+        let mut batch = prepared;
+        let projection = inventory_ledger_frame(&mut batch)?;
+        storage.compact_before_append_if_needed(projection.len())?;
+        if let Err(error) =
+            append_inventory_projection(storage, root, decision_id, batch, &projection)
+        {
+            return Err(match error {
+                error @ PluginStorageMutationError::DurabilityUnknown(_) => error,
+                error => {
+                    PluginStorageMutationError::DurabilityUnknown(std::io::Error::other(error))
+                }
+            });
+        }
+        journal
+            .mark_inventory_projected(decision_id)
+            .expect("unacknowledged inventory decision remains retained");
+        Ok(ResidentDepositCommit::Committed)
+    }
+}
+
+/// One planned worker deposit into a bound container.
+///
+/// The plan is computed against the container the worker's own work step read
+/// and the record it started from; nothing is mutated. The caller commits the
+/// record after-image and the container images under one durable decision, or
+/// neither.
+pub(super) struct ResidentWarehouseDeposit {
+    /// The worker's record with the moved items already removed.
+    pub(super) record: Box<DurableResidentOrderRecord>,
+    /// The container half the commit fences.
+    pub(super) container: ResidentDepositContainer,
+    /// Resource id -> units that enter the container.
+    pub(super) moved: BTreeMap<String, u64>,
+}
+
+impl ResidentWarehouseDeposit {
+    /// The work units this deposit moves.
+    pub(super) fn units(&self) -> u64 {
+        self.moved.values().copied().sum()
+    }
+}
+
+/// The container half of one planned worker deposit, as the worker read it.
+#[derive(Debug, Clone)]
+pub(super) struct ResidentDepositContainer {
+    pub(super) position: [i32; 3],
+    /// The container's expected and planned 27-slot canonical images.
+    pub(super) expected: Vec<ItemStack>,
+    pub(super) updated: Vec<ItemStack>,
+}
+
+/// What one worker deposit left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResidentDepositCommit {
+    /// The record and the container are durable under one journal decision.
+    Committed,
+    /// Nothing changed: the container fence moved, it is not there, or the
+    /// engine refused the command.
+    Refused,
+}
+
+impl InventoryRuntime {
     /// Execute one `solaris.*_owned_inventory` / reservation request. Queries
     /// answer from live session state; every mutation reserves one world journal
     /// decision and commits the plugin operation receipt together with the
@@ -950,15 +1144,17 @@ impl InventoryRuntime {
         };
         let decision_id = match world
             .commit_warehouse_transfer(WarehouseTransferRequest {
-                actor_id,
                 position,
                 expected_state_id: self.sessions.chest_state_id(position),
                 expected_container: container.items.clone(),
                 updated_container: planned_container,
-                expected_inventory: actor.inventory,
-                expected_carried_item: actor.carried_item.clone(),
-                updated_inventory: planned_player,
-                updated_carried_item: actor.carried_item,
+                player: Some(WarehousePlayerParticipant {
+                    actor_id,
+                    expected_inventory: actor.inventory,
+                    expected_carried_item: actor.carried_item.clone(),
+                    updated_inventory: planned_player,
+                    updated_carried_item: actor.carried_item,
+                }),
                 receipt: encoded,
             })
             .await

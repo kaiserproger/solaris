@@ -29,6 +29,7 @@ async fn sound_commands_cannot_cross_owner_permission_or_live_session_boundaries
             content: vec![LoaderContentKind::Sounds],
             permissions: vec![LoaderPermission::PlaySounds],
             cache_key: format!("example:sound/1/{}", "a".repeat(64)),
+            view_kinds: Vec::new(),
             source_path: None,
             artifact_bytes: None,
             block_id: None,

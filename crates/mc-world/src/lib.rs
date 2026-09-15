@@ -20,10 +20,11 @@ pub use block::{Block, BlockRegistry, BlockState, BlockStateId, RegistryError};
 pub use chunk::{
     BIOME_DIM, BIOME_VOLUME, BiomeSection, BlockMutationToken, BlockPos, ChestBlockEntity, Chunk,
     ChunkGenerator, ChunkGeometry, ChunkLightSourceToken, ChunkMemoryProfile, ChunkPos,
-    FurnaceBlockEntity, FurnaceSlot, HEIGHTMAP_BITS, HEIGHTMAP_LEN, Heightmap, HopperBlockEntity,
-    LIGHT_LAYER_BYTES, LightSection, MAX_Y, MIN_SECTION_Y, MIN_Y, OVERWORLD_GEOMETRY,
-    SECTION_COUNT, ScheduledBlockTick, ScheduledFluidTick, SectionLight,
-    SettlementInhabitantMarker, SettlementVacantHomeMarker, chunk_rectangle_for_world_bounds,
+    FurnaceBlockEntity, FurnaceSlot, GeneratedVillagePiece, GeneratedVillageSite, HEIGHTMAP_BITS,
+    HEIGHTMAP_LEN, Heightmap, HopperBlockEntity, LIGHT_LAYER_BYTES, LightSection, MAX_Y,
+    MIN_SECTION_Y, MIN_Y, OVERWORLD_GEOMETRY, SECTION_COUNT, ScheduledBlockTick,
+    ScheduledFluidTick, SectionLight, SettlementInhabitantMarker, SettlementVacantHomeMarker,
+    chunk_rectangle_for_world_bounds,
 };
 pub use resident::{
     JournalStampResult, ResidentAppliedBlockEdit, ResidentBlockEdit, ResidentBlockEditBatchResult,

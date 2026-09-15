@@ -37,6 +37,7 @@ fn loader_manifest() -> LoaderManifest {
             content: vec![LoaderContentKind::Blocks],
             permissions: vec![LoaderPermission::RegisterBlocks],
             cache_key: format!("example:block/1/{}", "a".repeat(64)),
+            view_kinds: Vec::new(),
             source_path: None,
             artifact_bytes: None,
             block_id: Some("example:ruby_block".to_owned()),

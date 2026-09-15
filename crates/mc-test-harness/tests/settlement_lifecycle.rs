@@ -22,8 +22,8 @@ use mc_script::{
     ScriptOperationOutcome, ScriptOperationPayload, ScriptPlayerContext, ScriptPlayerId,
     ScriptResidentOperation, ScriptResidentSiteReservation, ScriptSettlementOperation,
     ScriptSettlementPoi, ScriptSettlementResult, ScriptSettlementSite, ScriptSitePoiKind,
-    ScriptSitePoiState, ScriptSiteVariant, ScriptStorageChange, ScriptStorageMutation,
-    ScriptSurveyBounds, ScriptSurveySnapshot,
+    ScriptSitePoiState, ScriptSiteProvenance, ScriptSiteVariant, ScriptStorageChange,
+    ScriptStorageMutation, ScriptSurveyBounds, ScriptSurveySnapshot,
 };
 
 const PLUGIN: &str = "solaris-settlements";
@@ -1007,10 +1007,30 @@ fn copy_plugin(destination_root: &Path) {
         source.display()
     );
     let destination = destination_root.join(PLUGIN);
-    std::fs::create_dir(&destination).expect("create copied plugin directory");
-    for file in ["plugin.toml", "main.lua", "config.toml"] {
-        std::fs::copy(source.join(file), destination.join(file))
-            .unwrap_or_else(|error| panic!("copy shipped {PLUGIN}/{file}: {error}"));
+    copy_directory(&source, &destination);
+}
+
+/// The whole package, so a shipped client artifact is deployed with it and a
+/// new package file cannot silently fall out of this gate.
+fn copy_directory(source: &Path, destination: &Path) {
+    std::fs::create_dir(destination).expect("create copied plugin directory");
+    for entry in std::fs::read_dir(source).expect("read shipped plugin directory") {
+        let entry = entry.expect("read shipped plugin entry");
+        let target = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .expect("shipped plugin entry type")
+            .is_dir()
+        {
+            copy_directory(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap_or_else(|error| {
+                panic!(
+                    "copy shipped {PLUGIN}/{}: {error}",
+                    entry.file_name().display()
+                )
+            });
+        }
     }
 }
 
@@ -1021,8 +1041,10 @@ fn player_context() -> ScriptPlayerContext {
 fn site_fixture() -> ScriptSettlementSite {
     ScriptSettlementSite::new(
         SITE_ID.to_owned(),
+        ScriptSiteProvenance::Authored,
         ScriptSiteVariant::Hamlet,
         1,
+        true,
         [0, 64, 0],
         [16, 8, 16],
         Vec::new(),

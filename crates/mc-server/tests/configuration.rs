@@ -103,6 +103,7 @@ fn loader_manifest() -> mc_net::LoaderManifest {
             content: vec![mc_net::LoaderContentKind::Views],
             permissions: vec![mc_net::LoaderPermission::PresentViews],
             cache_key: format!("example:screen/1/{}", "a".repeat(64)),
+            view_kinds: Vec::new(),
             source_path: None,
             artifact_bytes: None,
             block_id: None,

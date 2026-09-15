@@ -21,13 +21,18 @@ goal_checkpoint:
       (no cadence/LOD/cohort/physics-skip cheats unless owner approves).
     - Focused tests + fmt + code-health green on the final tree; skipped
       gates recorded exactly.
-  primary_context: docs/MEMORY.md  # "Profile in flight" cursor bullet
+  primary_context: docs/memory/log-06-checkpoints-09-12-to-09-14.md  # last measured perf checkpoints
 ```
 
 ## Loop
 
-1. Read the cursor bullet in `docs/MEMORY.md`. It names the log dir holding
-   the latest fixed profile.
+1. Read the live cursor in `docs/MEMORY.md`, then the perf checkpoints in
+   `docs/memory/log-05-performance-and-worldgen.md` and
+   `docs/memory/log-06-checkpoints-09-12-to-09-14.md`. The "Profile in flight"
+   cursor bullet this route was written against no longer exists (it was gone
+   before the log split, and `.analysis/bench/` holds no run directory), so if
+   the cursor names no log dir, the route starts by running the fixed profile
+   into a fresh `OUT_DIR` instead of reading one.
 2. Own the CPU: at most one profile run at a time. If relaunching, kill any
    stale `load_scenarios` run first and use a fresh `OUT_DIR`
    (`.analysis/bench/living-world-100k-<slice>`).

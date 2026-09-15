@@ -98,6 +98,58 @@ impl ScriptSitePoiKind {
     }
 }
 
+/// Who authored the settlement a site describes.
+///
+/// A site is either one the settlement owner laid out itself from its own
+/// authoring catalog, or one core generated as a vanilla village. The two carry
+/// the same description; the provenance is what makes an identity an authored
+/// generation id or a generated entity's UUID, so a caller never has to guess
+/// which it is holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ScriptSiteProvenance {
+    /// The settlement owner's own catalog laid this site out.
+    Authored,
+    /// Core generated this site as a vanilla village.
+    VanillaVillage,
+}
+
+impl ScriptSiteProvenance {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::VanillaVillage => "vanilla_village",
+        }
+    }
+}
+
+/// One entity identity: a canonical lowercase hyphenated UUID.
+///
+/// A generated village's site descriptor names the inhabitants that already
+/// exist, and their generation mints entity UUIDs (`settlement_uuid` over the
+/// placement's claim), so the identity a site reports for such an inhabitant is
+/// that UUID and nothing else — never a position-derived stand-in.
+fn validate_entity_uuid(value: &str) -> Result<(), ScriptDtoError> {
+    let bytes = value.as_bytes();
+    let shaped = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+            }
+        });
+    if !shaped {
+        return Err(ScriptDtoError::InvalidId {
+            field: "inhabitant entity identity",
+            actual_bytes: bytes.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Occupancy state of one settlement point of interest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,8 +303,18 @@ impl ScriptSettlementPoi {
 #[non_exhaustive]
 pub struct ScriptSettlementSite {
     pub site_id: String,
+    pub provenance: ScriptSiteProvenance,
     pub variant: ScriptSiteVariant,
     pub revision: u64,
+    /// Whether the point-of-interest and inhabitant lists are the site's
+    /// contents.
+    ///
+    /// An authored site always describes its own layout, and a generated
+    /// village describes itself once core can read its chunks. Until then the
+    /// two lists are empty because the contents are *unknown*, not because the
+    /// village holds nothing: a caller must not read an ungenerated village as
+    /// an empty one (`ACC-05`).
+    pub contents_known: bool,
     pub footprint_origin: [i32; 3],
     pub footprint_size: [i32; 3],
     pub buildings: Vec<ScriptSettlementBuilding>,
@@ -263,10 +325,13 @@ pub struct ScriptSettlementSite {
 impl ScriptSettlementSite {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         site_id: String,
+        provenance: ScriptSiteProvenance,
         variant: ScriptSiteVariant,
         revision: u64,
+        contents_known: bool,
         footprint_origin: [i32; 3],
         footprint_size: [i32; 3],
         buildings: Vec<ScriptSettlementBuilding>,
@@ -275,8 +340,10 @@ impl ScriptSettlementSite {
     ) -> Self {
         Self {
             site_id,
+            provenance,
             variant,
             revision,
+            contents_known,
             footprint_origin,
             footprint_size,
             buildings,
@@ -320,7 +387,13 @@ impl ScriptSettlementSite {
         }
         let mut generation_ids = BTreeSet::new();
         for generation_id in &self.inhabitant_generation_ids {
-            validate_generation_id(generation_id)?;
+            match self.provenance {
+                ScriptSiteProvenance::Authored => validate_generation_id(generation_id)?,
+                // A generated village's inhabitants already exist, so the site
+                // names their entity identities: the UUIDs the generator's own
+                // placements minted, and the ids `claim_resident` takes.
+                ScriptSiteProvenance::VanillaVillage => validate_entity_uuid(generation_id)?,
+            }
             if !generation_ids.insert(generation_id.as_str()) {
                 return Err(ScriptDtoError::InvalidBounds);
             }

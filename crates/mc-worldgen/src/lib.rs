@@ -91,7 +91,14 @@ pub use terrain::{
 /// the data-driven feature executor on the `FEATURES` step's own random
 /// ([`village::decor`]). Every change moves village geometry or adds blocks, so
 /// revision-22 worlds are refused with the fresh-`world_dir` message.
-pub const WORLDGEN_REVISION: u32 = 23;
+///
+/// 24: a village is populated — every piece template's `minecraft:villager` is
+/// placed as a chunk inhabitant marker (`StructureTemplate.placeEntities`'s
+/// transform of the template's entity list), which is what the runtime spawns
+/// villagers from. Revision-23 chunks carry no markers, so a village would stay
+/// empty when they are reloaded; the mismatch is refused with the
+/// fresh-`world_dir` message instead.
+pub const WORLDGEN_REVISION: u32 = 24;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

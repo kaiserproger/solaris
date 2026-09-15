@@ -81,6 +81,17 @@ impl Rotation {
         }
     }
 
+    /// The rotation's quarter turns, i.e. `Rotation.getIndex()`: `0` for
+    /// [`Rotation::None`], `1` for a clockwise quarter turn, and so on.
+    ///
+    /// The site lane reports a generated piece's rotation with this, so a
+    /// consumer that only needs the quarter turn does not re-derive the mapping
+    /// from the placement lane.
+    #[must_use]
+    pub const fn quarter_turns(self) -> u16 {
+        self.turns() as u16
+    }
+
     /// `Rotation.getRandom(random)`.
     #[must_use]
     pub fn get_random(random: &mut impl RandomSource) -> Self {

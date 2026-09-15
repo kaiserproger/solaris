@@ -1111,6 +1111,7 @@ mod tests {
                 content: vec![LoaderContentKind::Views],
                 permissions: vec![LoaderPermission::PresentViews],
                 cache_key: format!("example:screen/1/{}", "a".repeat(64)),
+                view_kinds: Vec::new(),
                 source_path: None,
                 artifact_bytes: None,
                 block_id: None,

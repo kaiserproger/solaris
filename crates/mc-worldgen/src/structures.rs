@@ -71,6 +71,7 @@ pub struct StructureTemplate {
     chests: Vec<TemplateChest>,
     villager_markers: Vec<[i32; 3]>,
     jigsaws: Vec<TemplateJigsaw>,
+    entities: Vec<TemplateEntity>,
 }
 
 /// `minecraft:jigsaw` joint type.
@@ -445,6 +446,7 @@ impl StructureTemplate {
             chests: Vec::new(),
             villager_markers: Vec::new(),
             jigsaws: Vec::new(),
+            entities: Vec::new(),
         }
     }
 
@@ -519,6 +521,19 @@ impl StructureTemplate {
         &self.jigsaws
     }
 
+    /// The entities the template places, in template-local coordinates: vanilla
+    /// `StructureTemplate.load`'s `entities` list.
+    #[must_use]
+    pub fn entities(&self) -> &[TemplateEntity] {
+        &self.entities
+    }
+
+    #[must_use]
+    pub fn with_entities(mut self, entities: Vec<TemplateEntity>) -> Self {
+        self.entities = entities;
+        self
+    }
+
     fn from_tag(path: &str, root: &Tag, registry: &BlockRegistry) -> Result<Self, StructureError> {
         let compound = expect_compound(path, root, "root")?;
         let size = expect_int_triplet(path, require(compound, path, "size")?, "size")?;
@@ -527,6 +542,7 @@ impl StructureTemplate {
         let mut template = Self::new(size, parsed.blocks);
         template.villager_markers = parsed.villager_markers;
         template.jigsaws = parsed.jigsaws;
+        template.entities = parse_entities(path, compound)?;
         Ok(template)
     }
 
@@ -535,6 +551,7 @@ impl StructureTemplate {
         let mut blocks = Vec::new();
         let mut chests = Vec::new();
         let mut villager_markers = Vec::new();
+        let mut entities = Vec::new();
         for (part, offset) in parts {
             for axis in 0..3 {
                 size[axis] = size[axis].max(offset[axis] + part.size[axis]);
@@ -557,6 +574,15 @@ impl StructureTemplate {
                 }
                 marker
             }));
+            entities.extend(part.entities.into_iter().map(|mut entity| {
+                for (coordinate, delta) in entity.position.iter_mut().zip(offset.iter()) {
+                    *coordinate += f64::from(*delta);
+                }
+                for (coordinate, delta) in entity.block_position.iter_mut().zip(offset.iter()) {
+                    *coordinate += delta;
+                }
+                entity
+            }));
         }
         Self {
             size,
@@ -564,6 +590,7 @@ impl StructureTemplate {
             chests,
             villager_markers,
             jigsaws: Vec::new(),
+            entities,
         }
     }
 }
@@ -1004,6 +1031,233 @@ fn parse_properties(path: &str, tag: &Tag) -> Result<Vec<(String, String)>, Stru
             ))
         })
         .collect()
+}
+
+/// One entity a structure template places, in template-local coordinates.
+///
+/// `StructureTemplate.load`'s `entities` list: `pos` (the double position the
+/// entity is moved to) and `blockPos` (the block the piece's bounding box is
+/// tested with), both defaulting to zero when absent, plus the `nbt` compound
+/// the entity is created from. Vanilla drops an entry whose `nbt` is missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemplateEntity {
+    /// The NBT `id`, e.g. `minecraft:villager`.
+    pub entity_type: String,
+    /// The NBT `pos`, in template-local doubles.
+    pub position: [f64; 3],
+    /// The NBT `blockPos`, in template-local blocks.
+    pub block_position: [i32; 3],
+    /// The NBT `Rotation`'s yaw (`Rotation[0]`, `Entity.getYRot` for a freshly
+    /// created entity), `0.0` when the template omits it.
+    pub yaw: f32,
+    /// The NBT `Rotation`'s pitch (`Rotation[1]`), `0.0` when the template omits
+    /// it. Vanilla clamps it when the entity loads it, not when the piece places
+    /// it, so the authored value is kept here.
+    pub pitch: f32,
+    /// The entity's `VillagerData` and `Age`, when its NBT carries them.
+    pub villager: Option<TemplateVillagerData>,
+}
+
+/// The villager state a template entity's `nbt` authors.
+///
+/// The names stay the NBT's own (`VillagerData.type`/`profession` paths, e.g.
+/// `plains`/`none`): the core's marker layer is where they are resolved, and the
+/// closure keeps what the data says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateVillagerData {
+    /// `VillagerData.type`'s path, e.g. `plains`.
+    pub kind: String,
+    /// `VillagerData.profession`'s path, e.g. `none` or `nitwit`.
+    pub profession: String,
+    /// `VillagerData.level`.
+    pub level: u8,
+    /// `Age`: negative for a baby, `0` for an adult.
+    pub age: i32,
+}
+
+/// Read one template's `entities` list. An absent list is no entities; a
+/// malformed entry is a load failure, named by its field.
+fn parse_entities(
+    path: &str,
+    root: &[(String, Tag)],
+) -> Result<Vec<TemplateEntity>, StructureError> {
+    let Some(tag) = root
+        .iter()
+        .find(|(key, _)| key == "entities")
+        .map(|(_, v)| v)
+    else {
+        return Ok(Vec::new());
+    };
+    let list = expect_list(path, tag, "entities")?;
+    let mut entities = Vec::with_capacity(list.elements.len());
+    for entry in &list.elements {
+        let compound = expect_compound(path, entry, "entities[]")?;
+        // `getDoubleOr`/`getIntOr`: a short or absent list reads as zeros, and a
+        // missing `nbt` drops the entry outright.
+        let position = optional_double_triplet(path, compound, "pos")?;
+        let block_position = optional_int_triplet(path, compound, "blockPos")?;
+        let Some(nbt) = compound
+            .iter()
+            .find(|(key, _)| key == "nbt")
+            .map(|(_, tag)| tag)
+            .and_then(|tag| match tag {
+                Tag::Compound(fields) => Some(fields),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let entity_type = nbt
+            .iter()
+            .find(|(key, _)| key == "id")
+            .and_then(|(_, tag)| match tag {
+                Tag::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| StructureError::InvalidField {
+                path: path.to_string(),
+                field: "entities[].nbt.id",
+            })?;
+        // `Rotation` is `Vec2(yRot, xRot)`: `Entity.load` sets the yaw from index
+        // 0 and the pitch from index 1, each defaulting to zero when the list is
+        // short.
+        let (yaw, pitch) = match nbt.iter().find(|(key, _)| key == "Rotation") {
+            None => (0.0, 0.0),
+            Some((_, Tag::List(rotation))) => {
+                let component = |index: usize| match rotation.elements.get(index) {
+                    None => Ok(0.0),
+                    Some(Tag::Float(value)) => Ok(*value),
+                    Some(_) => Err(StructureError::InvalidField {
+                        path: path.to_string(),
+                        field: "entities[].nbt.Rotation[]",
+                    }),
+                };
+                (component(0)?, component(1)?)
+            }
+            Some(_) => {
+                return Err(StructureError::InvalidField {
+                    path: path.to_string(),
+                    field: "entities[].nbt.Rotation",
+                });
+            }
+        };
+        let villager = nbt
+            .iter()
+            .find(|(key, _)| key == "VillagerData")
+            .map(|(_, tag)| -> Result<TemplateVillagerData, StructureError> {
+                let data = expect_compound(path, tag, "entities[].nbt.VillagerData")?;
+                let text = |field: &'static str| -> Result<String, StructureError> {
+                    data.iter()
+                        .find(|(key, _)| key == field)
+                        .and_then(|(_, tag)| match tag {
+                            Tag::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| StructureError::InvalidField {
+                            path: path.to_string(),
+                            field: "entities[].nbt.VillagerData",
+                        })
+                };
+                // Vanilla reads `level` through `VillagerData.CODEC`, whose
+                // range is 1..=5 (`VillagerData.MIN_LEVEL`/`MAX_LEVEL`); a value
+                // outside it is a data error, not something to clamp.
+                let level = expect_int(
+                    path,
+                    require(data, path, "level")?,
+                    "entities[].nbt.VillagerData.level",
+                )?;
+                let level = u8::try_from(level)
+                    .ok()
+                    .filter(|level| (1..=5).contains(level))
+                    .ok_or_else(|| StructureError::InvalidField {
+                        path: path.to_string(),
+                        field: "entities[].nbt.VillagerData.level",
+                    })?;
+                Ok(TemplateVillagerData {
+                    kind: Identifier::parse(text("type")?)
+                        .map_err(|_| StructureError::InvalidField {
+                            path: path.to_string(),
+                            field: "entities[].nbt.VillagerData.type",
+                        })?
+                        .path()
+                        .to_owned(),
+                    profession: Identifier::parse(text("profession")?)
+                        .map_err(|_| StructureError::InvalidField {
+                            path: path.to_string(),
+                            field: "entities[].nbt.VillagerData.profession",
+                        })?
+                        .path()
+                        .to_owned(),
+                    level,
+                    // `Age` is the entity's own tag, next to `VillagerData`:
+                    // negative for a baby. A template that omits it authors an
+                    // adult.
+                    age: match nbt.iter().find(|(key, _)| key == "Age") {
+                        None => 0,
+                        Some((_, tag)) => expect_int(path, tag, "entities[].nbt.Age")?,
+                    },
+                })
+            })
+            .transpose()?;
+        entities.push(TemplateEntity {
+            entity_type,
+            position,
+            block_position,
+            yaw,
+            pitch,
+            villager,
+        });
+    }
+    Ok(entities)
+}
+
+/// An optional NBT double list, read as `[f64; 3]`. `NbtUtils`' `getDoubleOr`
+/// answers `0.0` for a missing index, so a short list reads as zeros.
+fn optional_double_triplet(
+    path: &str,
+    compound: &[(String, Tag)],
+    field: &'static str,
+) -> Result<[f64; 3], StructureError> {
+    let Some((_, tag)) = compound.iter().find(|(key, _)| key == field) else {
+        return Ok([0.0; 3]);
+    };
+    let list = expect_list(path, tag, field)?;
+    let invalid = || StructureError::InvalidField {
+        path: path.to_string(),
+        field,
+    };
+    let mut out = [0.0; 3];
+    for (slot, element) in list.elements.iter().take(3).enumerate() {
+        match element {
+            Tag::Double(value) => out[slot] = *value,
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(out)
+}
+
+/// An optional NBT int list, read as `[i32; 3]` (`getIntOr`).
+fn optional_int_triplet(
+    path: &str,
+    compound: &[(String, Tag)],
+    field: &'static str,
+) -> Result<[i32; 3], StructureError> {
+    let Some((_, tag)) = compound.iter().find(|(key, _)| key == field) else {
+        return Ok([0; 3]);
+    };
+    let list = expect_list(path, tag, field)?;
+    let invalid = || StructureError::InvalidField {
+        path: path.to_string(),
+        field,
+    };
+    let mut out = [0; 3];
+    for (slot, element) in list.elements.iter().take(3).enumerate() {
+        match element {
+            Tag::Int(value) => out[slot] = *value,
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(out)
 }
 
 /// What one piece's `blocks` list yields.

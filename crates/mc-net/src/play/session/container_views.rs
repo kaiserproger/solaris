@@ -500,7 +500,7 @@ impl SessionRegistry {
 
     pub(in crate::play) fn prepare_chest_transaction(
         &self,
-        actor_session: SessionId,
+        actor_session: Option<SessionId>,
         position: mc_world::BlockPos,
     ) -> Option<ChestTransaction> {
         #[cfg(test)]
@@ -510,20 +510,28 @@ impl SessionRegistry {
             .expect("test lock poisoned")
             .clone();
         let inner = self.lock_inner("prepare regional chest commit");
-        if !inner.sessions.contains_key(&actor_session) {
-            return None;
-        }
-        inner
-            .player_persistence
-            .get(&actor_session)
-            .cloned()
-            .map(|player_state| ChestTransaction {
-                actor_session,
-                containers: self.containers.shard_arc(position),
-                player_state,
-                #[cfg(test)]
-                commit_probe,
-            })
+        let player_state = match actor_session {
+            Some(actor_session) => {
+                if !inner.sessions.contains_key(&actor_session) {
+                    return None;
+                }
+                match inner.player_persistence.get(&actor_session).cloned() {
+                    Some(player_state) => Some(player_state),
+                    None => return None,
+                }
+            }
+            // A server-owned composite has no session to look up and no player
+            // to fence: the container half is all it needs, and its second
+            // participant rides the encoded plugin receipt.
+            None => None,
+        };
+        Some(ChestTransaction {
+            actor_session,
+            containers: self.containers.shard_arc(position),
+            player_state,
+            #[cfg(test)]
+            commit_probe,
+        })
     }
 
     pub(in crate::play) fn prepare_furnace_transaction(

@@ -67,6 +67,10 @@ pub struct LoaderBundle {
     pub content: Vec<LoaderContentKind>,
     pub permissions: Vec<LoaderPermission>,
     pub cache_key: String,
+    /// Screen kinds this bundle's verified artifact index declares. Server-local
+    /// routing input; never crosses the wire and never replaces the artifact.
+    #[serde(skip)]
+    pub view_kinds: Vec<mc_script::ScriptClientViewRequestKind>,
     /// Canonical server-local source; never crosses the wire.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
@@ -95,7 +99,23 @@ impl LoaderManifest {
         let bundles = bundles
             .iter()
             .map(|bundle| {
-                let block = read_declared_block(bundle)?;
+                let index = read_declared_index(bundle)?;
+                let block = match index.as_ref().filter(|_| {
+                    bundle
+                        .content()
+                        .contains(&mc_script::LuaClientContentKind::Blocks)
+                }) {
+                    Some(index) => Some(verify_declared_block(index, bundle.owner_plugin_id())?),
+                    None => None,
+                };
+                let view_kinds = match index.as_ref().filter(|_| {
+                    bundle
+                        .content()
+                        .contains(&mc_script::LuaClientContentKind::Views)
+                }) {
+                    Some(index) => declared_screen_kinds(index, bundle.owner_plugin_id())?,
+                    None => Vec::new(),
+                };
                 Ok(LoaderBundle {
                     owner: bundle.owner_plugin_id().to_owned(),
                     id: bundle.id().to_owned(),
@@ -166,6 +186,7 @@ impl LoaderManifest {
                         })
                         .collect(),
                     cache_key: bundle.cache_key(),
+                    view_kinds,
                     source_path: Some(bundle.artifact_path().to_path_buf()),
                     artifact_bytes: Some(bundle.artifact_bytes_arc()),
                     block_id: block.as_ref().map(|block| block.id.clone()),
@@ -624,22 +645,25 @@ impl LoaderSession {
     }
 }
 
+/// The part of one schema-2 artifact index the server routes on. The Loader
+/// validates and activates the rest (previews, items, assets, sounds) from the
+/// same artifact, so unknown fields are tolerated here rather than re-owned.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LoaderArtifactIndex {
     schema: u16,
     #[serde(default)]
-    screens: Vec<serde_json::Value>,
-    #[serde(default)]
-    world_previews: Vec<serde_json::Value>,
+    screens: Vec<LoaderArtifactScreen>,
     #[serde(default)]
     blocks: Vec<LoaderArtifactBlock>,
-    #[serde(default)]
-    items: Vec<serde_json::Value>,
-    #[serde(default)]
-    assets: Vec<serde_json::Value>,
-    #[serde(default)]
-    sounds: Vec<serde_json::Value>,
+}
+
+/// The routing identity of one declared screen. The Loader owns the rest of the
+/// screen contract (title, widgets); the server only needs to know which plugin
+/// answers a key-driven request of this kind.
+#[derive(Deserialize)]
+struct LoaderArtifactScreen {
+    id: String,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -656,32 +680,92 @@ struct VerifiedLoaderBlock {
     name: String,
 }
 
-fn read_declared_block(
+fn read_declared_index(
     bundle: &mc_script::LuaClientBundle,
-) -> Result<Option<VerifiedLoaderBlock>, LoaderHandshakeError> {
-    if !bundle
-        .content()
-        .contains(&mc_script::LuaClientContentKind::Blocks)
+) -> Result<Option<LoaderArtifactIndex>, LoaderHandshakeError> {
+    let declared = |content| bundle.content().contains(&content);
+    if !declared(mc_script::LuaClientContentKind::Blocks)
+        && !declared(mc_script::LuaClientContentKind::Views)
     {
         return Ok(None);
     }
-    read_block_from_artifact_bytes(
+    read_index_from_artifact_bytes(
         bundle.artifact_bytes(),
         bundle.artifact_path(),
-        bundle.owner_plugin_id(),
         bundle.size_bytes(),
         bundle.sha256(),
     )
     .map(Some)
 }
 
-fn read_block_from_artifact_bytes(
+/// The one block identity a block bundle declares, verified against its owner.
+fn verify_declared_block(
+    index: &LoaderArtifactIndex,
+    owner: &str,
+) -> Result<VerifiedLoaderBlock, LoaderHandshakeError> {
+    let [block] = index.blocks.as_slice() else {
+        return Err(LoaderHandshakeError::ArtifactIndex(
+            "block bundle must declare exactly one block identity".to_owned(),
+        ));
+    };
+    require_owned_block_id(&block.id, owner)?;
+    if block.model.is_empty()
+        || block.name.is_empty()
+        || block.name.len() > MAX_LOADER_BLOCK_NAME_BYTES
+    {
+        return Err(LoaderHandshakeError::ArtifactIndex(format!(
+            "Loader block model must be non-empty and name must contain 1..={MAX_LOADER_BLOCK_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(VerifiedLoaderBlock {
+        id: block.id.clone(),
+        name: block.name.clone(),
+    })
+}
+
+/// The view kinds a view bundle's screens let the server route to their owner.
+///
+/// The Loader refuses a bundle whose `views` content and screen index disagree,
+/// so a views bundle with no screens is already invalid there; the server
+/// rejects it at startup for the same reason instead of shipping a package
+/// whose key-driven screens can never be opened.
+fn declared_screen_kinds(
+    index: &LoaderArtifactIndex,
+    owner: &str,
+) -> Result<Vec<mc_script::ScriptClientViewRequestKind>, LoaderHandshakeError> {
+    if index.screens.is_empty() {
+        return Err(LoaderHandshakeError::ArtifactIndex(
+            "view bundle must declare at least one screen".to_owned(),
+        ));
+    }
+    let mut kinds = Vec::with_capacity(index.screens.len());
+    for screen in &index.screens {
+        if !screen.id.starts_with(&format!("{owner}:")) || screen.id.len() == owner.len() + 1 {
+            return Err(LoaderHandshakeError::ArtifactIndex(format!(
+                "Loader screen identity {:?} must be owned by {owner}",
+                screen.id
+            )));
+        }
+        let Some(kind) = mc_script::ScriptClientViewRequestKind::from_contract_name(&screen.kind)
+        else {
+            return Err(LoaderHandshakeError::ArtifactIndex(format!(
+                "Loader screen {:?} declares unsupported kind {:?}",
+                screen.id, screen.kind
+            )));
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    Ok(kinds)
+}
+
+fn read_index_from_artifact_bytes(
     bytes: &[u8],
     artifact_path: &Path,
-    owner: &str,
     expected_size: u64,
     expected_sha256: &str,
-) -> Result<VerifiedLoaderBlock, LoaderHandshakeError> {
+) -> Result<LoaderArtifactIndex, LoaderHandshakeError> {
     if bytes.len() as u64 != expected_size
         || format!("{:x}", Sha256::digest(bytes)) != expected_sha256
     {
@@ -728,39 +812,13 @@ fn read_block_from_artifact_bytes(
     }
     let index: LoaderArtifactIndex = serde_json::from_slice(&bytes)
         .map_err(|error| LoaderHandshakeError::ArtifactIndex(error.to_string()))?;
-    let LoaderArtifactIndex {
-        schema,
-        screens,
-        world_previews,
-        blocks,
-        items,
-        assets,
-        sounds,
-    } = index;
-    let _ = (screens, world_previews, items, assets, sounds);
-    if schema != 2 {
+    if index.schema != 2 {
         return Err(LoaderHandshakeError::ArtifactIndex(format!(
-            "unsupported Loader artifact index schema {schema}"
+            "unsupported Loader artifact index schema {}",
+            index.schema
         )));
     }
-    let [block] = blocks.as_slice() else {
-        return Err(LoaderHandshakeError::ArtifactIndex(
-            "block bundle must declare exactly one block identity".to_owned(),
-        ));
-    };
-    require_owned_block_id(&block.id, owner)?;
-    if block.model.is_empty()
-        || block.name.is_empty()
-        || block.name.len() > MAX_LOADER_BLOCK_NAME_BYTES
-    {
-        return Err(LoaderHandshakeError::ArtifactIndex(format!(
-            "Loader block model must be non-empty and name must contain 1..={MAX_LOADER_BLOCK_NAME_BYTES} bytes"
-        )));
-    }
-    Ok(VerifiedLoaderBlock {
-        id: block.id.clone(),
-        name: block.name.clone(),
-    })
+    Ok(index)
 }
 
 fn require_owned_block_id(id: &str, owner: &str) -> Result<(), LoaderHandshakeError> {
@@ -1134,6 +1192,20 @@ pub(crate) fn loader_view_action_channel() -> &'static Identifier {
 impl LoaderManifest {
     /// True when `plugin_id` owns a bundle declaring both the content kind and
     /// its permission pair. Permission revocation re-runs this check per action.
+    /// Every screen kind a verified bundle lets this owner answer, with its
+    /// owner. This is the server's routing table for key-driven client view
+    /// requests; the artifact index stays the single authority it is read from.
+    pub fn declared_view_kinds(
+        &self,
+    ) -> impl Iterator<Item = (&str, mc_script::ScriptClientViewRequestKind)> + '_ {
+        self.bundles.iter().flat_map(|bundle| {
+            bundle
+                .view_kinds
+                .iter()
+                .map(move |kind| (bundle.owner.as_str(), *kind))
+        })
+    }
+
     pub(crate) fn plugin_grants(
         &self,
         plugin_id: &str,
@@ -1207,6 +1279,7 @@ mod tests {
                     LoaderPermission::SendViewActions,
                 ],
                 cache_key: format!("example:rich-content/1/{}", "a".repeat(64)),
+                view_kinds: Vec::new(),
                 source_path: None,
                 artifact_bytes: None,
                 block_id: None,
@@ -1440,6 +1513,69 @@ mod tests {
         );
     }
 
+    /// One schema-2 artifact whose index is its first entry, as the Loader
+    /// requires.
+    fn artifact_index_bytes(directory: &Path, index: &str) -> (Vec<u8>, PathBuf, u64, String) {
+        let path = directory.join("index.bundle");
+        let file = File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file(
+                LOADER_ARTIFACT_INDEX_PATH,
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(index.as_bytes()).unwrap();
+        archive.finish().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let size = bytes.len() as u64;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        (bytes, path, size, sha256)
+    }
+
+    /// A view index the server refuses is a package that can never open its
+    /// screen, so it fails at startup instead of shipping dead content.
+    #[test]
+    fn view_index_routing_fails_closed_on_unroutable_screens() {
+        let directory = tempfile::tempdir().unwrap();
+        let declared = |index: &str| {
+            let (bytes, path, size, sha256) = artifact_index_bytes(directory.path(), index);
+            read_index_from_artifact_bytes(&bytes, &path, size, &sha256)
+                .and_then(|index| declared_screen_kinds(&index, "example"))
+                .map_err(|error| error.to_string())
+        };
+
+        assert_eq!(
+            declared(r#"{"schema":2,"screens":[]}"#).unwrap_err(),
+            "loader artifact index is invalid: view bundle must declare at least one screen"
+        );
+        assert!(declared(
+            r#"{"schema":2,"screens":[{"id":"example:overview","kind":"siege","title":"Siege"}]}"#
+        )
+        .unwrap_err()
+        .contains("unsupported kind \"siege\""));
+        assert!(declared(
+            r#"{"schema":2,"screens":[{"id":"other:overview","kind":"settlement","title":"Other"}]}"#
+        )
+        .unwrap_err()
+        .contains("must be owned by example"));
+        // Two screens of one kind are one routing entry, not an ambiguous owner.
+        assert_eq!(
+            declared(
+                r#"{"schema":2,"screens":[{"id":"example:overview","kind":"settlement","title":"One"},{"id":"example:roster","kind":"settlement","title":"Two"}]}"#
+            )
+            .unwrap(),
+            vec![mc_script::ScriptClientViewRequestKind::Settlement]
+        );
+        assert_eq!(
+            declared(
+                r#"{"schema":2,"screens":[{"id":"example:army","kind":"army","title":"Army"}]}"#
+            )
+            .unwrap(),
+            vec![mc_script::ScriptClientViewRequestKind::Army]
+        );
+    }
+
     #[test]
     fn artifact_index_supplies_one_exact_owner_block_identity() {
         let directory = tempfile::tempdir().unwrap();
@@ -1462,18 +1598,21 @@ mod tests {
         let size = bytes.len() as u64;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
+        let index = read_index_from_artifact_bytes(&bytes, &path, size, &sha256).unwrap();
         assert_eq!(
-            read_block_from_artifact_bytes(&bytes, &path, "example", size, &sha256)
-                .unwrap()
-                .id,
+            verify_declared_block(&index, "example").unwrap().id,
             "example:ruby_block"
         );
+        assert_eq!(
+            declared_screen_kinds(&index, "example").unwrap(),
+            vec![mc_script::ScriptClientViewRequestKind::Settlement]
+        );
         assert!(matches!(
-            read_block_from_artifact_bytes(&bytes, &path, "other", size, &sha256),
+            verify_declared_block(&index, "other"),
             Err(LoaderHandshakeError::ArtifactIndex(_))
         ));
         assert!(matches!(
-            read_block_from_artifact_bytes(&bytes, &path, "example", size, &"0".repeat(64)),
+            read_index_from_artifact_bytes(&bytes, &path, size, &"0".repeat(64)),
             Err(LoaderHandshakeError::ArtifactIndex(_))
         ));
     }

@@ -78,7 +78,7 @@ use mc_data::village_data::{Projection, StructureProcessorSpec};
 use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use thiserror::Error;
 
-use crate::structures::{StructureTemplate, TemplateChest};
+use crate::structures::{StructureTemplate, TemplateChest, TemplateEntity};
 use crate::vanilla_features::{BlockSemantics, CompileError, RandomSource};
 use crate::village::processors::{
     PieceBlock, PieceElement, ProcessLevel, apply_processors, piece_processors,
@@ -474,6 +474,39 @@ pub trait PieceWriter: ProcessLevel {
     /// places the structure's decor, so the writer can roll the real table with
     /// its own [`crate::structures::StructureLoot`].
     fn set_chest(&mut self, pos: BlockPos, chest: &TemplateChest, loot_seed: u64);
+
+    /// Vanilla's entity step for one entity the template places.
+    ///
+    /// A writer that keeps nothing — the startup validation probe — implements
+    /// nothing here: placing an entity is a world write like placing a block.
+    fn set_entity(&mut self, _placed: &PlacedEntity<'_>) {}
+}
+
+/// One template entity [`place_piece`] places, resolved into the world.
+///
+/// Vanilla's `StructureEntityInfo` after `StructureTemplate.placeEntities` has
+/// transformed it: the position the entity is moved to, the block position the
+/// piece's bounding box was tested with, and the yaw it is snapped to. The
+/// `UUID` vanilla strips from the template's NBT is replaced by [`Self::claim`],
+/// a deterministic identity for the placement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedEntity<'a> {
+    /// The template entity this placement came from.
+    pub entity: &'a TemplateEntity,
+    /// `transform(blockPos, mirror, rotation, pivot).offset(position)` and the
+    /// block the bounding box dropped it by.
+    pub block: BlockPos,
+    /// `transform(pos, mirror, rotation, pivot).add(position)`.
+    pub position: [f64; 3],
+    /// `entity.rotate(rotation) + entity.mirror(mirror) - entity.getYRot()`.
+    pub yaw: f32,
+    /// The pitch vanilla snaps the entity to: `entity.getXRot()`, the template's
+    /// authored `Rotation[1]`. It is *not* rotated or mirrored — vanilla passes
+    /// the entity's own pitch straight to `snapTo`.
+    pub pitch: f32,
+    /// The source pool element's id, the piece's world origin and the entity's
+    /// index within its template.
+    pub claim: String,
 }
 
 #[derive(Debug, Error)]
@@ -594,7 +627,113 @@ pub fn place_piece(
             writer.set_chest(block.pos, &template.chests()[*index], loot_seed);
         }
     }
+    // `placeInWorld`'s entity step runs after the whole block and block-entity
+    // loop (`settings.isIgnoreEntities()` is false for every jigsaw piece), and
+    // draws nothing: the placement order of the two steps is observable only
+    // through the blocks above.
+    for placed in placed_entities(template, settings) {
+        writer.set_entity(&placed);
+    }
     Ok(written)
+}
+
+/// The entities [`place_piece`] places, in world coordinates.
+///
+/// Vanilla `StructureTemplate.placeEntities`: the template's entity list is
+/// transformed by the piece's mirror, rotation and pivot, offset by the piece's
+/// own world position, and an entity whose *block* position falls outside the
+/// piece's bounding box is dropped — the same per-chunk clip the blocks go
+/// through.
+fn placed_entities<'a>(
+    template: &'a StructureTemplate,
+    settings: &PieceSettings<'_>,
+) -> Vec<PlacedEntity<'a>> {
+    template
+        .entities()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entity)| {
+            let block = world_position(entity.block_position, settings);
+            if let Some(clip) = settings.clip
+                && !clip.contains(block)
+            {
+                return None;
+            }
+            let [x, y, z] = transform_position(entity.position, settings.mirror, settings.rotation);
+            Some(PlacedEntity {
+                entity,
+                block,
+                position: [
+                    x + f64::from(settings.position.x),
+                    y + f64::from(settings.position.y),
+                    z + f64::from(settings.position.z),
+                ],
+                yaw: entity_yaw(entity.yaw, settings.mirror, settings.rotation),
+                pitch: entity.pitch,
+                claim: format!(
+                    "{}@{}:{}:{}#{}",
+                    settings.owner,
+                    settings.position.x,
+                    settings.position.y,
+                    settings.position.z,
+                    index
+                ),
+            })
+        })
+        .collect()
+}
+
+/// `StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)`: the
+/// double-precision sibling of [`transform`], with the `1.0 -` mirroring and the
+/// `+ 1` term vanilla's `Vec3` overload carries. Every jigsaw piece passes a
+/// zero rotation pivot, so the pivot is not a parameter here.
+pub(crate) fn transform_position(pos: [f64; 3], mirror: Mirror, rotation: Rotation) -> [f64; 3] {
+    let [mut x, y, mut z] = pos;
+    let mut mirrored = true;
+    match mirror {
+        Mirror::LeftRight => z = 1.0 - z,
+        Mirror::FrontBack => x = 1.0 - x,
+        Mirror::None => mirrored = false,
+    }
+    match rotation {
+        Rotation::CounterClockwise90 => [z, y, 1.0 - x],
+        Rotation::Clockwise90 => [1.0 - z, y, x],
+        Rotation::Clockwise180 => [1.0 - x, y, 1.0 - z],
+        Rotation::None if mirrored => [x, y, z],
+        Rotation::None => pos,
+    }
+}
+
+/// `Mth.wrapDegrees`: Java's truncating `%` into `-180..180`.
+pub(crate) fn wrap_degrees(value: f32) -> f32 {
+    let mut value = value % 360.0;
+    if value >= 180.0 {
+        value -= 360.0;
+    }
+    if value < -180.0 {
+        value += 360.0;
+    }
+    value
+}
+
+/// The yaw vanilla snaps a placed entity to:
+/// `entity.rotate(rotation) + entity.mirror(mirror) - entity.getYRot()`, where
+/// `getYRot` is the yaw the entity's own NBT carried. `rotate` and `mirror` wrap
+/// their input; `getYRot` does not, which is why the raw yaw appears twice.
+pub(crate) fn entity_yaw(yaw: f32, mirror: Mirror, rotation: Rotation) -> f32 {
+    let angle = wrap_degrees(yaw);
+    let rotated = match rotation {
+        Rotation::None => angle,
+        Rotation::Clockwise90 => angle + 90.0,
+        Rotation::Clockwise180 => angle + 180.0,
+        Rotation::CounterClockwise90 => angle + 270.0,
+    };
+    let mirrored = match mirror {
+        Mirror::None => angle,
+        Mirror::LeftRight => -angle,
+        Mirror::FrontBack => 180.0 - angle,
+    };
+    rotated + (mirrored - yaw)
 }
 
 /// `calculateRelativePosition(settings, pos).offset(position)`, with the

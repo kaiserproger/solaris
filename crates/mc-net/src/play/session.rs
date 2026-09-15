@@ -137,7 +137,7 @@ mod script_teleport_endpoint;
 mod script_teleport_endpoint_tests;
 mod session_lifecycle;
 mod settlement_authority;
-pub(super) use settlement_authority::toolsmith_merchant_state;
+pub(super) use settlement_authority::{settlement_inhabitant_spawn, toolsmith_merchant_state};
 #[cfg(test)]
 mod goal_cadence_tests;
 mod simulation_input_publication;

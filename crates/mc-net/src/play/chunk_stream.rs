@@ -1,7 +1,7 @@
 use super::campfire::campfire_cooking_states_from_chunk;
 use super::session::{
     PreparedChunkClaim, PreparedChunkClaimResult, SessionPreparedChunkClaimResult,
-    toolsmith_merchant_state,
+    settlement_inhabitant_spawn,
 };
 use super::*;
 use mc_protocol::packets::play::SetChunkCacheRadius;
@@ -1773,49 +1773,7 @@ impl ChunkStreamState {
                             .settlement_inhabitants()
                             .into_iter()
                             .filter_map(|marker| {
-                                let entity_type =
-                                    Identifier::parse(marker.entity_type.clone()).ok()?;
-                                let entity_type_id =
-                                    i32::try_from(self.entity_types.id_of(&entity_type)?).ok()?;
-                                let villager_kind = match marker.villager_kind.as_str() {
-                                    "plains" => mc_entity::VillagerKind::Plains,
-                                    _ => return None,
-                                };
-                                let profession = match marker.profession.as_str() {
-                                    "none" => mc_entity::VillagerProfession::None,
-                                    "toolsmith" => mc_entity::VillagerProfession::Toolsmith,
-                                    _ => return None,
-                                };
-                                let to_vec3 = |position: Option<[f64; 3]>| {
-                                    position.map(|[x, y, z]| Vec3::new(x, y, z))
-                                };
-                                Some(SettlementInhabitantSpawn {
-                                    claim: marker.claim,
-                                    entity_type_id,
-                                    entity_type_name: entity_type.to_string(),
-                                    position: Vec3::new(
-                                        marker.position[0],
-                                        marker.position[1],
-                                        marker.position[2],
-                                    ),
-                                    villager: mc_entity::VillagerData::new(
-                                        villager_kind,
-                                        profession,
-                                        marker.level,
-                                    ),
-                                    villager_brain:
-                                        mc_entity::villager_26_1_2::VillagerBrainState::adult(
-                                            mc_entity::villager_26_1_2::VillagerPoiSet {
-                                                home: to_vec3(marker.home),
-                                                job_site: to_vec3(marker.job_site),
-                                                meeting_point: to_vec3(marker.meeting_point),
-                                            },
-                                        ),
-                                    villager_merchant: (profession
-                                        == mc_entity::VillagerProfession::Toolsmith)
-                                        .then(|| toolsmith_merchant_state(&self.items))
-                                        .flatten(),
-                                })
+                                settlement_inhabitant_spawn(marker, &self.entity_types, &self.items)
                             })
                             .collect()
                     });

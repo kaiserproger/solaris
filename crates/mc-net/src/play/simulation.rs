@@ -465,10 +465,14 @@ pub(super) enum SimulationCommand {
         primary_position: BlockPos,
         positions: Vec<BlockPos>,
         expected_state_id: i32,
-        actor_session: SessionId,
+        /// The acting session, or `None` for a server-owned deposit that acts
+        /// for no player.
+        actor_session: Option<SessionId>,
         expected: Vec<ChestBlockEntity>,
         updated: Vec<ChestBlockEntity>,
-        player: Box<ContainerPlayerPlan>,
+        /// The player participant, or `None` for a server-owned deposit whose
+        /// second participant rides the plugin receipt.
+        player: Option<Box<ContainerPlayerPlan>>,
         /// The encoded plugin operation receipt a server-owned deposit journals
         /// beside the container's after-image, or `None` for the menu path. A
         /// receipt makes the command server-owned: it drops the open-menu fence
@@ -1127,18 +1131,27 @@ fn command_can_use_regional_mutation(
         positions,
         expected,
         updated,
+        actor_session,
         player,
+        plugin_receipt,
         ..
     } = command
     {
         let mut unique = HashSet::with_capacity(positions.len());
+        // The menu path is session-authored: it has one acting session and the
+        // plan that session's inventory moves with. A server-owned composite
+        // may carry neither, and the player plan is validated whenever it is
+        // present.
+        if plugin_receipt.is_none() && (actor_session.is_none() || player.is_none()) {
+            return false;
+        }
         return !positions.is_empty()
             && positions.len() <= 2
             && positions.first() == Some(primary_position)
             && positions.len() == expected.len()
             && positions.len() == updated.len()
             && positions.iter().all(|position| unique.insert(*position))
-            && valid_container_player_plan(player)
+            && player.as_deref().is_none_or(valid_container_player_plan)
             && command_single_owner_region(command).is_some()
             && positions
                 .iter()
@@ -1374,10 +1387,12 @@ struct ChestCommitRequest<'a> {
     primary_position: BlockPos,
     positions: &'a [BlockPos],
     expected_state_id: i32,
-    actor_session: SessionId,
+    actor_session: Option<SessionId>,
     expected: &'a [ChestBlockEntity],
     updated: &'a [ChestBlockEntity],
-    player: &'a ContainerPlayerPlan,
+    /// The player participant, present for the menu path and for a deposit that
+    /// moves a player's own inventory.
+    player: Option<&'a ContainerPlayerPlan>,
     /// Present when the envelope is a server-owned composite; the menu path
     /// never reaches it, because that mode only travels through a journaled
     /// regional run.
@@ -2881,10 +2896,10 @@ impl SimulationHandle {
             primary_position,
             positions,
             expected_state_id,
-            actor_session,
+            actor_session: Some(actor_session),
             expected,
             updated,
-            player: Box::new(player),
+            player: Some(Box::new(player)),
             plugin_receipt: None,
         })?;
         match receiver.await {
@@ -2897,27 +2912,26 @@ impl SimulationHandle {
     }
 
     /// Commit one server-owned warehouse deposit: the container's canonical
-    /// slots and the actor's inventory move together, and the container's
-    /// after-image and the caller's encoded plugin receipt ride the same world
-    /// journal decision.
+    /// slots and - when a player participates - that player's inventory move
+    /// together, and the container's after-image and the caller's encoded
+    /// plugin receipt ride the same world journal decision.
     ///
-    /// The command is the menu chest composite with the plugin receipt
-    /// attached, enqueued under the actor's session fence; the owner turn owns
-    /// the fences, the journal append and the publication.
+    /// A deposit with no player participant (a worker's cargo, whose other
+    /// participant is a plugin-owned record inside the receipt) is enqueued
+    /// with no session fence, exactly like every other server-owned command;
+    /// one that moves a player's inventory is enqueued under that player's
+    /// session fence. The owner turn owns the fences, the journal append and
+    /// the publication in both cases.
     pub(crate) async fn commit_warehouse_transfer(
         &self,
         request: WarehouseTransferRequest,
     ) -> Result<WarehouseTransferOutcome, SimulationRequestError> {
         let WarehouseTransferRequest {
-            actor_id,
             position,
             expected_state_id,
             expected_container,
             updated_container,
-            expected_inventory,
-            expected_carried_item,
-            updated_inventory,
-            updated_carried_item,
+            player,
             receipt,
         } = request;
         let Some(expected) = container_chest_image(&expected_container) else {
@@ -2926,39 +2940,61 @@ impl SimulationHandle {
         let Some(updated) = container_chest_image(&updated_container) else {
             return Err(SimulationRequestError::InvalidCommand);
         };
-        let (Ok(expected_inventory), Ok(updated_inventory)) = (
-            <[ItemStack; 46]>::try_from(expected_inventory),
-            <[ItemStack; 46]>::try_from(updated_inventory),
-        ) else {
-            return Err(SimulationRequestError::InvalidCommand);
-        };
-        let player = ContainerPlayerPlan {
-            expected_inventory: PlayerInventory {
-                slots: expected_inventory,
-            },
-            expected_carried_item,
-            updated_inventory: PlayerInventory {
-                slots: updated_inventory,
-            },
-            updated_carried_item,
-            crafting_table_input: None,
-            enchanting_table_input: None,
-            merchant_input: None,
-            drops: Vec::new(),
-            xp_orb: None,
-        };
-        let receiver =
-            self.for_session(actor_id)
-                .enqueue_player_command(SimulationCommand::CommitChest {
+        let receiver = match player {
+            Some(participant) => {
+                let (Ok(expected_inventory), Ok(updated_inventory)) = (
+                    <[ItemStack; 46]>::try_from(participant.expected_inventory),
+                    <[ItemStack; 46]>::try_from(participant.updated_inventory),
+                ) else {
+                    return Err(SimulationRequestError::InvalidCommand);
+                };
+                let plan = ContainerPlayerPlan {
+                    expected_inventory: PlayerInventory {
+                        slots: expected_inventory,
+                    },
+                    expected_carried_item: participant.expected_carried_item,
+                    updated_inventory: PlayerInventory {
+                        slots: updated_inventory,
+                    },
+                    updated_carried_item: participant.updated_carried_item,
+                    crafting_table_input: None,
+                    enchanting_table_input: None,
+                    merchant_input: None,
+                    drops: Vec::new(),
+                    xp_orb: None,
+                };
+                let handle = self.for_session(participant.actor_id);
+                let receiver = handle.enqueue_player_command(SimulationCommand::CommitChest {
                     primary_position: position,
                     positions: vec![position],
                     expected_state_id,
-                    actor_session: actor_id,
+                    actor_session: Some(participant.actor_id),
                     expected: vec![expected],
                     updated: vec![updated],
-                    player: Box::new(player),
+                    player: Some(Box::new(plan)),
                     plugin_receipt: Some(receipt),
                 })?;
+                receiver
+            }
+            None => {
+                if self.session_fence.is_some() {
+                    return Err(SimulationRequestError::InvalidCommand);
+                }
+                self.enqueue_with_fence(
+                    None,
+                    SimulationCommand::CommitChest {
+                        primary_position: position,
+                        positions: vec![position],
+                        expected_state_id,
+                        actor_session: None,
+                        expected: vec![expected],
+                        updated: vec![updated],
+                        player: None,
+                        plugin_receipt: Some(receipt),
+                    },
+                )?
+            }
+        };
         match receiver.await {
             Ok(Ok(SimulationResponse::WarehouseTransfer(Ok(outcome)))) => Ok(outcome),
             Ok(Ok(SimulationResponse::WarehouseTransfer(Err(error)))) => Err(error),
@@ -4717,6 +4753,12 @@ impl SimulationOwner {
             // could not admit it, and nothing may mutate.
             return Err(SimulationRequestError::WorldMutationFailed);
         }
+        let (Some(actor_session), Some(player)) = (actor_session, player) else {
+            // The menu fallback is session-authored end to end: a command
+            // without a player participant is a composite, and a composite
+            // belongs to the journaled regional lane above.
+            return Err(SimulationRequestError::InvalidCommand);
+        };
         if positions.is_empty()
             || positions.len() > 2
             || positions.first() != Some(&primary_position)
@@ -6514,7 +6556,7 @@ impl SimulationOwner {
                         actor_session: *actor_session,
                         expected,
                         updated,
-                        player,
+                        player: player.as_deref(),
                         plugin_receipt: plugin_receipt.as_deref(),
                     },
                 ),
@@ -16298,10 +16340,10 @@ mod tests {
                 primary_position: position,
                 positions: vec![position],
                 expected_state_id: 1,
-                actor_session: actor,
+                actor_session: Some(actor),
                 expected: vec![initial.clone()],
                 updated: vec![first_update.clone()],
-                player: Box::new(player.clone()),
+                player: Some(Box::new(player.clone())),
                 plugin_receipt: None,
             })
             .unwrap();
@@ -16310,10 +16352,10 @@ mod tests {
                 primary_position: position,
                 positions: vec![position],
                 expected_state_id: 1,
-                actor_session: actor,
+                actor_session: Some(actor),
                 expected: vec![initial],
                 updated: vec![stale_update],
-                player: Box::new(player),
+                player: Some(Box::new(player)),
                 plugin_receipt: None,
             })
             .unwrap();
@@ -16416,10 +16458,10 @@ mod tests {
                         primary_position: position,
                         positions: vec![position],
                         expected_state_id: 1,
-                        actor_session: actor,
+                        actor_session: Some(actor),
                         expected: vec![initial.clone()],
                         updated: vec![updated.clone()],
-                        player: Box::new(empty_container_player_plan()),
+                        player: Some(Box::new(empty_container_player_plan())),
                         plugin_receipt: None,
                     })
                     .unwrap()
@@ -16537,10 +16579,10 @@ mod tests {
                 primary_position: pos,
                 positions: vec![pos],
                 expected_state_id: 1,
-                actor_session: actor,
+                actor_session: Some(actor),
                 expected: vec![initial.clone()],
                 updated: vec![first_update.clone()],
-                player: Box::new(player.clone()),
+                player: Some(Box::new(player.clone())),
                 plugin_receipt: None,
             })
             .unwrap();
@@ -16549,10 +16591,10 @@ mod tests {
                 primary_position: pos,
                 positions: vec![pos],
                 expected_state_id: 1,
-                actor_session: actor,
+                actor_session: Some(actor),
                 expected: vec![initial],
                 updated: vec![stale_update],
-                player: Box::new(player),
+                player: Some(Box::new(player)),
                 plugin_receipt: None,
             })
             .unwrap();
@@ -18038,7 +18080,6 @@ mod tests {
         let mut updated_inventory = PlayerInventory::empty();
         updated_inventory.slots[9] = ItemStack::new(item_id, 6);
         let request = WarehouseTransferRequest {
-            actor_id: depositor,
             position,
             expected_state_id: registry.chest_state_id(position),
             expected_container: chest
@@ -18051,10 +18092,13 @@ mod tests {
                 .iter()
                 .map(crate::play::owned_inventory::container_slot_to_item)
                 .collect(),
-            expected_inventory: inventory.slots.to_vec(),
-            expected_carried_item: carried_item.clone(),
-            updated_inventory: updated_inventory.slots.to_vec(),
-            updated_carried_item: carried_item,
+            player: Some(crate::play::owned_inventory::WarehousePlayerParticipant {
+                actor_id: depositor,
+                expected_inventory: inventory.slots.to_vec(),
+                expected_carried_item: carried_item.clone(),
+                updated_inventory: updated_inventory.slots.to_vec(),
+                updated_carried_item: carried_item,
+            }),
             receipt,
         };
 
@@ -18306,15 +18350,17 @@ mod tests {
              expected_container: Vec<ItemStack>,
              expected_inventory: Vec<ItemStack>,
              expected_carried_item: ItemStack| WarehouseTransferRequest {
-                actor_id: depositor,
                 position,
                 expected_state_id,
                 expected_container,
                 updated_container: container_items(&updated_chest),
-                expected_inventory,
-                expected_carried_item,
-                updated_inventory: updated_inventory.slots.to_vec(),
-                updated_carried_item: ItemStack::EMPTY,
+                player: Some(crate::play::owned_inventory::WarehousePlayerParticipant {
+                    actor_id: depositor,
+                    expected_inventory,
+                    expected_carried_item,
+                    updated_inventory: updated_inventory.slots.to_vec(),
+                    updated_carried_item: ItemStack::EMPTY,
+                }),
                 receipt: receipt(&registry),
             };
         let live_state_id = registry.chest_state_id(position);

@@ -72,6 +72,21 @@ pub(crate) trait ResidentWorld: Send + Sync {
     ) -> bool;
     /// Canonical block state id for one block path, when it is registered.
     fn state_for(&self, block_path: &str) -> Option<u32>;
+    /// Canonical loot of one conditional break, computed **without** touching
+    /// the world.
+    ///
+    /// Loot depends only on the block state, the held tool and the block
+    /// position's own seed, so a preview and the commit that follows it agree
+    /// exactly. It exists so a caller can refuse to break a block whose loot
+    /// nobody can hold, instead of removing the block and losing the drops.
+    fn preview_break(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+        expected_state: u32,
+        tool: Option<&str>,
+    ) -> Result<Vec<ResidentDrop>, ScriptOperationFailure>;
+
     /// Commit one conditional break and return the canonical loot.
     fn break_block(
         &self,
@@ -170,6 +185,39 @@ impl LiveResidentWorld {
         })?;
         let path = self.block_path(state)?;
         Some((state, path))
+    }
+
+    /// The canonical loot one break of `state` at `pos` with `tool` yields.
+    ///
+    /// Both the preview and the commit read it, so a caller's capacity decision
+    /// and the committed drops can never disagree.
+    fn break_loot(&self, pos: [i32; 3], state: u32, tool: Option<&str>) -> Vec<ResidentDrop> {
+        let held = tool.and_then(|path| self.item_stack(path));
+        let stacks = block_drop_stacks_with_tool_and_facts_from_seeded(
+            mc_data::loot::builtin(),
+            &self.items,
+            &self.item_facts,
+            &self.blocks,
+            BlockStateId(state),
+            held.as_ref(),
+            block_break_seed(pos, state),
+        );
+        let mut drops = Vec::with_capacity(stacks.len());
+        for stack in stacks {
+            let Some(name) = self.items.name_of(stack.item_id) else {
+                continue;
+            };
+            let Ok(count) = u32::try_from(stack.count) else {
+                continue;
+            };
+            if count > 0 {
+                drops.push(ResidentDrop {
+                    item_id: name.as_str().to_owned(),
+                    count,
+                });
+            }
+        }
+        drops
     }
 
     /// Apply one conditional edit through the shared world storage kernel.
@@ -320,6 +368,22 @@ impl ResidentWorld for LiveResidentWorld {
         self.blocks.block(&name).map(|block| block.default.0)
     }
 
+    fn preview_break(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+        expected_state: u32,
+        tool: Option<&str>,
+    ) -> Result<Vec<ResidentDrop>, ScriptOperationFailure> {
+        let Some((current, _)) = self.loaded_block(dimension, pos) else {
+            return Err(ScriptOperationFailure::Unloaded);
+        };
+        if current.0 != expected_state {
+            return Err(ScriptOperationFailure::StaleRevision);
+        }
+        Ok(self.break_loot(pos, expected_state, tool))
+    }
+
     fn break_block(
         &self,
         dimension: &str,
@@ -337,32 +401,7 @@ impl ResidentWorld for LiveResidentWorld {
             return Err(ScriptOperationFailure::StaleRevision);
         }
         self.commit_edit(pos, BlockStateId(expected_state), air)?;
-        let held = tool.and_then(|path| self.item_stack(path));
-        let stacks = block_drop_stacks_with_tool_and_facts_from_seeded(
-            mc_data::loot::builtin(),
-            &self.items,
-            &self.item_facts,
-            &self.blocks,
-            BlockStateId(expected_state),
-            held.as_ref(),
-            block_break_seed(pos, expected_state),
-        );
-        let mut drops = Vec::with_capacity(stacks.len());
-        for stack in stacks {
-            let Some(name) = self.items.name_of(stack.item_id) else {
-                continue;
-            };
-            let Ok(count) = u32::try_from(stack.count) else {
-                continue;
-            };
-            if count > 0 {
-                drops.push(ResidentDrop {
-                    item_id: name.as_str().to_owned(),
-                    count,
-                });
-            }
-        }
-        Ok(drops)
+        Ok(self.break_loot(pos, expected_state, tool))
     }
 
     fn place_block(
@@ -382,8 +421,17 @@ impl ResidentWorld for LiveResidentWorld {
 }
 
 impl LiveResidentWorld {
-    fn item_stack(&self, block_path: &str) -> Option<ItemStack> {
-        let name = codec::Identifier::parse(format!("minecraft:{block_path}")).ok()?;
+    /// One held item as the engine's own stack, from a resource id or a bare
+    /// path. A work order names tools as `minecraft:iron_pickaxe`; resolving
+    /// that as another `minecraft:` path would silently leave the worker
+    /// empty-handed, and a tool-gated block would drop nothing.
+    fn item_stack(&self, item: &str) -> Option<ItemStack> {
+        let name = if item.contains(':') {
+            codec::Identifier::parse(item.to_owned())
+        } else {
+            codec::Identifier::parse(format!("minecraft:{item}"))
+        }
+        .ok()?;
         let item_id = self.items.id_of(&name)?;
         let mut stack = ItemStack::EMPTY;
         stack.item_id = item_id;

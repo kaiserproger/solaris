@@ -185,6 +185,13 @@ pub struct SettlementInhabitantMarker {
     pub home: Option<[f64; 3]>,
     pub job_site: Option<[f64; 3]>,
     pub meeting_point: Option<[f64; 3]>,
+    /// The entity's `Age`: negative for a baby, `0` for an adult. A marker
+    /// written before this field existed reads as an adult.
+    pub age: i32,
+    /// The yaw the entity is placed with. Absent reads as `0.0`.
+    pub yaw: f32,
+    /// The pitch the entity's template authored. Absent reads as `0.0`.
+    pub pitch: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -803,6 +810,33 @@ fn tag_heap_bytes(tag: &Tag) -> usize {
 ///
 /// `Send + Sync` because the world is shared across the network
 /// listener's connection tasks via `Arc<Mutex<WorldStorage>>`.
+/// One generated vanilla village, as the generator that places it describes it.
+///
+/// Plain data: the generator's own answer about a bounded chunk region, with no
+/// world state and no identity — a caller that needs an id mints it from the
+/// world it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedVillageSite {
+    /// The chunk the placement formula started this village in.
+    pub start_chunk: (i32, i32),
+    /// The region the plan reaches, in world blocks, inclusive.
+    pub min: BlockPos,
+    pub max: BlockPos,
+    /// Every placed piece, in placement order.
+    pub pieces: Vec<GeneratedVillagePiece>,
+}
+
+/// One piece of a generated village: the template it places at its rotation, or
+/// a placed feature, which places no template.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedVillagePiece {
+    /// The template the piece places; `None` for a `feature_pool_element`.
+    pub template: Option<String>,
+    pub position: BlockPos,
+    /// The piece's quarter turns, i.e. `Rotation.getIndex()`.
+    pub rotation: u16,
+}
+
 pub trait ChunkGenerator: Send + Sync {
     /// Build a brand-new `Chunk` for the given position. Generated
     /// chunks must come back with `dirty = true` so the M6 flush
@@ -820,6 +854,22 @@ pub trait ChunkGenerator: Send + Sync {
     /// instead of inventing a level.
     fn surface_height(&self, _world_x: i32, _world_z: i32) -> Option<i32> {
         None
+    }
+
+    /// Every vanilla village whose start chunk lies in the inclusive chunk
+    /// rectangle, in ascending start-chunk order.
+    ///
+    /// The answer is the generator's own placement decision over a bounded
+    /// region: no chunk is generated and no world state is read, so a caller can
+    /// enumerate the villages a region holds before any of them exists. A
+    /// generator that places no villages returns an empty list; it is not an
+    /// error.
+    fn village_sites_in_region(
+        &self,
+        _min_chunk: (i32, i32),
+        _max_chunk: (i32, i32),
+    ) -> Vec<GeneratedVillageSite> {
+        Vec::new()
     }
 }
 
@@ -1053,6 +1103,23 @@ impl Chunk {
                         Tag::String(inhabitant.profession.clone()),
                     ),
                     ("Level".into(), Tag::Int(i32::from(inhabitant.level))),
+                    ("Age".into(), Tag::Int(inhabitant.age)),
+                    (
+                        "Yaw".into(),
+                        Tag::Float(if inhabitant.yaw.is_finite() {
+                            inhabitant.yaw
+                        } else {
+                            0.0
+                        }),
+                    ),
+                    (
+                        "Pitch".into(),
+                        Tag::Float(if inhabitant.pitch.is_finite() {
+                            inhabitant.pitch
+                        } else {
+                            0.0
+                        }),
+                    ),
                 ];
                 let mut push_position = |prefix: &str, position: Option<[f64; 3]>| {
                     if let Some([x, y, z]) = position
@@ -1123,6 +1190,26 @@ impl Chunk {
                         })
                         .filter(|value| (1..=5).contains(value))
                 });
+                let integer = |name: &str| {
+                    fields.iter().find_map(|(key, value)| {
+                        (key == name)
+                            .then_some(value)
+                            .and_then(|value| match value {
+                                Tag::Int(value) => Some(*value),
+                                _ => None,
+                            })
+                    })
+                };
+                let float = |name: &str| {
+                    fields.iter().find_map(|(key, value)| {
+                        (key == name)
+                            .then_some(value)
+                            .and_then(|value| match value {
+                                Tag::Float(value) if value.is_finite() => Some(*value),
+                                _ => None,
+                            })
+                    })
+                };
                 let position = |prefix: &str| {
                     Some([
                         double(&format!("{prefix}X"))?,
@@ -1140,6 +1227,9 @@ impl Chunk {
                     home: position("Home"),
                     job_site: position("Job"),
                     meeting_point: position("Meeting"),
+                    age: integer("Age").unwrap_or(0),
+                    yaw: float("Yaw").unwrap_or(0.0),
+                    pitch: float("Pitch").unwrap_or(0.0),
                 })
             })
             .collect()
@@ -1869,6 +1959,9 @@ mod tests {
             home: Some([72.5, 66.0, 8.5]),
             job_site: Some([73.5, 66.0, 8.5]),
             meeting_point: Some([72.5, 65.0, 8.5]),
+            age: -21_359,
+            yaw: 0.0,
+            pitch: -25.827_711,
         };
 
         chunk.set_settlement_inhabitants(std::slice::from_ref(&marker));
@@ -1937,6 +2030,9 @@ mod tests {
                 home: None,
                 job_site: None,
                 meeting_point: None,
+                age: 0,
+                yaw: 0.0,
+                pitch: 0.0,
             }]
         );
     }

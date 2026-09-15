@@ -30,11 +30,12 @@ use mc_script::{
     ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload,
     ScriptOperationRequest, ScriptResidentSiteReservation, ScriptSettlementBuilding,
     ScriptSettlementOperation, ScriptSettlementPoi, ScriptSettlementResult, ScriptSettlementSite,
-    ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteVariant,
-    ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
+    ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteProvenance,
+    ScriptSiteVariant, ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
     ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds, ScriptSurveySnapshot,
     ScriptWarehouseBinding, resident_generation_id, warehouse_handle,
 };
+use mc_world::GeneratedVillageSite;
 use mc_worldgen::{
     BlockEntitySeedKind, BlueprintBlock, BlueprintCatalog, BlueprintInstance, PoiKind, QuarterTurn,
     SITE_CELL_BLOCKS, SettlementSelector, SiteCandidate, SiteLayout, SiteVariant,
@@ -44,7 +45,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     DurableOperationReceipt, PluginStorage, PluginStorageMutationError, PluginStorageStartError,
-    PreparedStorageBatch, ScriptStoragePrepareOutcome,
+    PreparedStorageBatch, ScriptStoragePrepareOutcome, VillageSiteGround, cell_chunk_bounds,
+    village_poi_capacity, village_site_id, village_site_start_chunk,
 };
 use crate::play::owned_inventory::{
     WarehouseTransferRequest, owned_inventory_fingerprint, resource_plan_hash,
@@ -52,6 +54,14 @@ use crate::play::owned_inventory::{
 
 /// Storage transactions one survey token stays valid for.
 const SURVEY_TOKEN_TTL_TRANSACTIONS: u64 = 64;
+/// The dimension a generated vanilla village belongs to.
+///
+/// The settlement lane's v1 profile owns overworld terrain only — the live
+/// world adapter refuses a survey of any other dimension — so a generated site
+/// is an overworld site and its id is minted for that dimension.
+const VILLAGE_DIMENSION: &str = "minecraft:overworld";
+/// Blocks along one chunk axis.
+const CHUNK_AXIS: i32 = 16;
 /// Domain separator for every deterministic settlement identity.
 const SETTLEMENT_DOMAIN: &[u8] = b"solaris.settlement.v1";
 /// Stage name of a blueprint that authors no construction stages.
@@ -862,6 +872,39 @@ pub(crate) enum ContainerReading {
     Loaded(Vec<ItemStack>),
 }
 
+/// One bounded reading of a generated village's contents.
+///
+/// The variant is what keeps "the village holds none of these" distinct from
+/// "core cannot see the village's chunks": an unloaded site reports no contents
+/// at all, so a caller never mistakes a region nobody has generated for a
+/// village with nothing in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VillageReading<T> {
+    Unloaded,
+    Loaded(Vec<T>),
+}
+
+/// One point of interest the generated world actually holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VillagePoiReading {
+    pub at: [i32; 3],
+    pub kind: ScriptSitePoiKind,
+}
+
+/// One generated inhabitant, as the placement that spawned it recorded it.
+///
+/// `claim` is the generator's own identity for the placement and `entity_uuid`
+/// is the entity identity it mints; the marker is stored with the chunk, so
+/// this is the record of what was generated rather than a reading of wherever a
+/// villager happens to stand now.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VillageInhabitantReading {
+    pub claim: String,
+    pub entity_uuid: String,
+    pub position: [f64; 3],
+    pub age: i32,
+}
+
 /// The world facing half of the settlement runtime.
 ///
 /// Core installs one adapter over live world storage; tests install an
@@ -931,6 +974,28 @@ pub(crate) trait SettlementWorld: Send + Sync {
         structure_id: &'a str,
         blocks: &'a [StructureBlockPlacement],
     ) -> Pin<Box<dyn Future<Output = Result<(), ScriptOperationFailure>> + Send + 'a>>;
+    /// The points of interest a generated village's blocks hold.
+    ///
+    /// Read from the materialized chunks inside `bounds`: a bed, a bell and the
+    /// job-site blocks as they actually exist, classified by
+    /// [`village_poi_kind`]. A region whose chunks are not generated answers
+    /// [`VillageReading::Unloaded`] rather than an empty list.
+    ///
+    /// [`village_poi_kind`]: super::settlement_village_sites::village_poi_kind
+    fn village_pois(
+        &self,
+        bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillagePoiReading>, ScriptOperationFailure>;
+    /// The inhabitants a generated village placed, from its stored markers.
+    ///
+    /// The marker is the placement's own record — the claim, the entity
+    /// identity it mints and where the generator put it — so a village that is
+    /// partly generated reports the part that exists and a village whose chunks
+    /// are gone answers [`VillageReading::Unloaded`].
+    fn village_inhabitants(
+        &self,
+        bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillageInhabitantReading>, ScriptOperationFailure>;
 }
 
 /// One bounded terrain survey reading.
@@ -961,6 +1026,13 @@ pub(crate) struct SettlementRuntime {
     world_identity: String,
     start_cell: [i32; 2],
     ground: Arc<dyn mc_world::ChunkGenerator>,
+    /// The generator's vanilla village enumeration, when the world has one.
+    ///
+    /// A world whose generator places no villages (a worldgen mode without the
+    /// `minecraft:villages` set, or a generator that is not the terrain
+    /// generator) lists no generated sites and every settlement call keeps
+    /// answering about the authored catalog alone.
+    village_sites: Option<Arc<dyn VillageSiteGround>>,
 }
 
 impl SettlementRuntime {
@@ -975,6 +1047,7 @@ impl SettlementRuntime {
         world_identity: impl Into<String>,
         start_cell: [i32; 2],
         ground: Arc<dyn mc_world::ChunkGenerator>,
+        village_sites: Option<Arc<dyn VillageSiteGround>>,
     ) -> Self {
         Self {
             selector,
@@ -982,7 +1055,22 @@ impl SettlementRuntime {
             world_identity: world_identity.into(),
             start_cell,
             ground,
+            village_sites,
         }
+    }
+
+    /// The generated villages whose start chunk lies in one site cell.
+    ///
+    /// The page walk and this scan share the cell grid, so one page of cells is
+    /// one region for the authored selector and the generator alike, and a
+    /// world without a village generator answers with no sites rather than an
+    /// error.
+    pub(crate) fn village_sites_in_cell(&self, cell: [i32; 2]) -> Vec<GeneratedVillageSite> {
+        let Some(ground) = self.village_sites.as_ref() else {
+            return Vec::new();
+        };
+        let (min_chunk, max_chunk) = cell_chunk_bounds(cell);
+        ground.village_sites_in_region(min_chunk, max_chunk)
     }
 
     pub(crate) fn ground(&self) -> &Arc<dyn mc_world::ChunkGenerator> {
@@ -1053,6 +1141,23 @@ impl SettlementRuntime {
 }
 
 impl super::InventoryRuntime {
+    /// The site descriptor of one generated vanilla village.
+    fn village_site_snapshot(
+        &self,
+        runtime: &SettlementRuntime,
+        storage: &PluginStorage,
+        plugin_id: &str,
+        village: &GeneratedVillageSite,
+    ) -> ScriptSettlementSite {
+        village_site_snapshot(
+            runtime,
+            storage,
+            self.settlement_world(),
+            plugin_id,
+            village,
+        )
+    }
+
     /// Execute one settlement request. Queries answer from the deterministic
     /// selector and the durable ledger; every mutation commits its receipt
     /// together with the ledger change it decided.
@@ -1070,13 +1175,20 @@ impl super::InventoryRuntime {
         };
         match operation {
             ScriptSettlementOperation::ListSites { cursor, limit } => {
-                Ok(self.list_sites(storage, runtime, cursor.as_deref(), *limit))
+                Ok(self.list_sites(storage, runtime, plugin_id, cursor.as_deref(), *limit))
             }
             ScriptSettlementOperation::QuerySite {
                 site_id,
                 cursor,
                 limit,
-            } => Ok(self.query_site(storage, runtime, site_id, cursor.as_deref(), *limit)),
+            } => Ok(self.query_site(
+                storage,
+                runtime,
+                plugin_id,
+                site_id,
+                cursor.as_deref(),
+                *limit,
+            )),
             ScriptSettlementOperation::Status { structure_id } => {
                 Ok(self.structure_status(storage, plugin_id, structure_id))
             }
@@ -1193,6 +1305,7 @@ impl super::InventoryRuntime {
         &self,
         storage: &PluginStorage,
         runtime: &SettlementRuntime,
+        plugin_id: &str,
         cursor: Option<&str>,
         limit: u8,
     ) -> ScriptOperationOutcome {
@@ -1205,16 +1318,39 @@ impl super::InventoryRuntime {
         };
         let limit = usize::from(limit).min(MAX_SETTLEMENT_SITE_PAGE);
         let mut sites = Vec::new();
-        for candidate in runtime.selector().discover(start, limit) {
-            match layout_of(runtime, &candidate)
-                .and_then(|layout| site_snapshot(runtime, storage, &candidate, &layout))
-            {
-                Ok(site) => sites.push(site),
-                Err(failure) => return rejected(failure),
+        let mut next = scan_cell(start, limit);
+        for cell in runtime.selector().page_cells(start, limit) {
+            let mut cell_sites = Vec::new();
+            if let Some(candidate) = runtime.selector().candidate(cell) {
+                match layout_of(runtime, &candidate)
+                    .and_then(|layout| site_snapshot(runtime, storage, &candidate, &layout))
+                {
+                    Ok(site) => cell_sites.push(site),
+                    Err(failure) => return rejected(failure),
+                }
             }
+            // A cell holds at most the one authored candidate the selector
+            // mints and the villages the generator starts inside it; both are
+            // sites of the same page, so one cursor covers the region.
+            for village in runtime.village_sites_in_cell(cell) {
+                cell_sites.push(self.village_site_snapshot(runtime, storage, plugin_id, &village));
+            }
+            // A page holds at most `MAX_SETTLEMENT_SITE_PAGE` sites, and a cell
+            // is taken whole or not at all: taking part of one would either
+            // duplicate the sites a later page re-reads from the same cell or
+            // drop them silently. The walk therefore stops *before* the cell it
+            // cannot fit and leaves the cursor on it, so the next page starts
+            // exactly there. A cell's own count is bounded well below the page
+            // bound — one authored candidate plus the villages the placement
+            // grid starts inside 32 chunks — so the first cell of a page always
+            // fits and the walk always progresses.
+            if !sites.is_empty() && sites.len() + cell_sites.len() > MAX_SETTLEMENT_SITE_PAGE {
+                next = cell;
+                break;
+            }
+            sites.extend(cell_sites);
         }
-        let mut page =
-            ScriptSettlementSitePage::new(sites, Some(encode_cursor(scan_cell(start, limit))));
+        let mut page = ScriptSettlementSitePage::new(sites, Some(encode_cursor(next)));
         page.canonicalize();
         settled_outcome(
             storage.revision,
@@ -1228,10 +1364,49 @@ impl super::InventoryRuntime {
         &self,
         storage: &PluginStorage,
         runtime: &SettlementRuntime,
+        plugin_id: &str,
         site_id: &str,
         cursor: Option<&str>,
         limit: u8,
     ) -> ScriptOperationOutcome {
+        if let Some(start_chunk) =
+            village_site_start_chunk(runtime.world_identity(), VILLAGE_DIMENSION, site_id)
+        {
+            let cell = [
+                start_chunk.0.div_euclid(SITE_CELL_BLOCKS / CHUNK_AXIS),
+                start_chunk.1.div_euclid(SITE_CELL_BLOCKS / CHUNK_AXIS),
+            ];
+            let village = runtime
+                .village_sites_in_cell(cell)
+                .into_iter()
+                .find(|village| village.start_chunk == start_chunk);
+            let Some(village) = village else {
+                return rejected(ScriptOperationFailure::NotFound);
+            };
+            let mut site = self.village_site_snapshot(runtime, storage, plugin_id, &village);
+            let start = match cursor {
+                Some(cursor) => match site
+                    .pois
+                    .binary_search_by(|poi| poi.poi_id.as_str().cmp(cursor))
+                {
+                    Ok(index) => index + 1,
+                    Err(_) => return rejected(ScriptOperationFailure::CursorExpired),
+                },
+                None => 0,
+            };
+            site.pois = site
+                .pois
+                .into_iter()
+                .skip(start)
+                .take(usize::from(limit))
+                .collect();
+            return settled_outcome(
+                storage.revision,
+                ScriptSettlementResult::Site {
+                    site: Box::new(site),
+                },
+            );
+        }
         let Some(cell) = runtime.selector().cell_from_site_id(site_id) else {
             return rejected(ScriptOperationFailure::NotFound);
         };
@@ -2144,6 +2319,145 @@ fn layout_of(
 /// One site snapshot. The generator's variant footprint is reported verbatim: a
 /// site is reserved territory, not a building, so it is never squeezed into the
 /// per-building blueprint bound.
+/// The site descriptor of one generated vanilla village.
+///
+/// The identity, the region and the pieces come from the generator's own plan;
+/// the points of interest and the inhabitants come from the chunks the world
+/// actually generated. Those are the two authorities the settlement lane
+/// already has — the plan decides what the world will hold, the world decides
+/// what it does hold — so a village whose chunks are not generated is described
+/// by its identity and region with `contents_known` false, never as a village
+/// that carries nothing (`ACC-05`).
+///
+/// A placed `feature_pool_element` places no template and is not a building; the
+/// pieces that do place one are reported with the template's id, its world
+/// origin and its quarter turn.
+fn village_site_snapshot(
+    runtime: &SettlementRuntime,
+    storage: &PluginStorage,
+    world: Option<&dyn SettlementWorld>,
+    plugin_id: &str,
+    village: &GeneratedVillageSite,
+) -> ScriptSettlementSite {
+    let bounds = ScriptSurveyBounds::new(
+        [village.min.x, village.min.y, village.min.z],
+        [village.max.x, village.max.y, village.max.z],
+    )
+    .ok();
+    let pois_reading = world
+        .zip(bounds)
+        .map(|(world, bounds)| world.village_pois(bounds));
+    let inhabitants_reading = world
+        .zip(bounds)
+        .map(|(world, bounds)| world.village_inhabitants(bounds));
+    let (pois, inhabitants, contents_known) = match (pois_reading, inhabitants_reading) {
+        (Some(Ok(VillageReading::Loaded(pois))), Some(Ok(VillageReading::Loaded(inhabitants)))) => {
+            (pois, inhabitants, true)
+        }
+        // A world that is absent or cannot see the village's chunks leaves the
+        // contents unknown: nothing is reported as an empty village.
+        _ => (Vec::new(), Vec::new(), false),
+    };
+    let held = resident_owned_pois(storage, plugin_id);
+    let site_id = village_site_id(
+        runtime.world_identity(),
+        VILLAGE_DIMENSION,
+        village.start_chunk,
+    );
+    let ledger = storage.settlements().site(&site_id);
+    let mut reported_pois = Vec::with_capacity(pois.len());
+    for poi in &pois {
+        let poi_id = village_poi_id(poi.at);
+        let state = if held.contains(&poi_id) {
+            ScriptSitePoiState::Occupied
+        } else {
+            poi_state(storage, ledger, &poi_id)
+        };
+        reported_pois.push(ScriptSettlementPoi::new(
+            poi_id,
+            poi.kind,
+            poi.at,
+            village_poi_capacity(poi.kind),
+            state,
+        ));
+    }
+    let buildings = village
+        .pieces
+        .iter()
+        .filter_map(|piece| {
+            piece.template.as_ref().map(|template| {
+                ScriptSettlementBuilding::new(
+                    template.clone(),
+                    [piece.position.x, piece.position.y, piece.position.z],
+                    // The plan carries quarter turns; the descriptor's rotation
+                    // is degrees, the unit every authored placement uses.
+                    piece.rotation * 90,
+                )
+            })
+        })
+        .collect();
+    let mut site = ScriptSettlementSite::new(
+        site_id,
+        ScriptSiteProvenance::VanillaVillage,
+        // A generated village is a village. How large it is in the settlement
+        // lane's own terms is the owner's measured `size_class`, not a
+        // generation fact.
+        ScriptSiteVariant::Village,
+        // Nothing durable describes a generated village: it is the generator's
+        // own answer until an owner adopts it.
+        0,
+        contents_known,
+        [village.min.x, village.min.y, village.min.z],
+        [
+            village.max.x - village.min.x + 1,
+            village.max.y - village.min.y + 1,
+            village.max.z - village.min.z + 1,
+        ],
+        buildings,
+        reported_pois,
+        inhabitants
+            .into_iter()
+            .map(|inhabitant| inhabitant.entity_uuid)
+            .collect(),
+    );
+    site.canonicalize();
+    site
+}
+
+/// The point-of-interest id of one generated village block.
+///
+/// The handle names the block, so two sites never share one and an owner that
+/// assigns it to a resident reads the same string back on the next query.
+fn village_poi_id(at: [i32; 3]) -> String {
+    format!("village_poi_{}_{}_{}", at[0], at[1], at[2])
+}
+
+/// Every point-of-interest handle this plugin's residents hold.
+///
+/// A generated village's occupancy is what its owner assigned: the resident
+/// ledger records the handles a resident sleeps, works and gathers at, and the
+/// descriptor mints the same handles, so the two agree without a second
+/// occupancy ledger.
+fn resident_owned_pois(storage: &PluginStorage, plugin_id: &str) -> BTreeSet<String> {
+    let mut held = BTreeSet::new();
+    for handle in storage.residents().handles_for_plugin(plugin_id) {
+        let Some(record) = storage.residents().record(&handle) else {
+            continue;
+        };
+        for poi in [
+            record.pois.home.as_ref(),
+            record.pois.work.as_ref(),
+            record.pois.meeting.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            held.insert(poi.clone());
+        }
+    }
+    held
+}
+
 fn site_snapshot(
     runtime: &SettlementRuntime,
     storage: &PluginStorage,
@@ -2178,8 +2492,13 @@ fn site_snapshot(
     }
     let mut site = ScriptSettlementSite::new(
         candidate.site_id.clone(),
+        ScriptSiteProvenance::Authored,
         site_variant(candidate.variant),
         ledger.map_or(0, |site| site.revision),
+        // An authored site's points of interest and inhabitants come from the
+        // catalog that laid it out, so they are its contents as soon as it is
+        // described.
+        true,
         layout.candidate.origin,
         layout.candidate.size,
         layout

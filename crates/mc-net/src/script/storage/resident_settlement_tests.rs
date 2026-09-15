@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use mc_data::Identifier;
+use mc_data::ItemStack;
 use mc_data::blocks::{BlockReport, BlockStateReport};
 use mc_data::item_components::solaris_required_item_facts;
 use mc_data::items::solaris_required_items;
@@ -22,7 +23,8 @@ use mc_script::{
     ScriptResidentOrder, ScriptResidentOrderOperation, ScriptResidentOrderResult,
     ScriptResidentProfile, ScriptResidentWorkOrder, ScriptSettlementOperation,
     ScriptSettlementResult, ScriptSettlementSite, ScriptSitePoiKind, ScriptSitePoiState,
-    ScriptStructureSnapshot, ScriptSurveyBounds, ScriptWorkState, resident_generation_id,
+    ScriptStructureSnapshot, ScriptSurveyBounds, ScriptWorkPauseReason, ScriptWorkState,
+    resident_generation_id,
 };
 use mc_world::BlockRegistry;
 use mc_worldgen::{BlueprintCatalog, PoiKind, SettlementSelector};
@@ -32,12 +34,12 @@ use crate::play::owned_inventory::{
     WarehouseTransferRequest, resource_plan_hash, resource_plan_totals,
 };
 use crate::play::resident_work::{ResidentBlock, ResidentDrop, ResidentWorld};
-use crate::server::ShutdownHandle;
 
 use super::PluginStorage;
 use super::ScriptStoragePrepareOutcome;
 use super::settlement::{
     ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
+    VillageInhabitantReading, VillagePoiReading, VillageReading,
 };
 use super::world_inventory::InventoryRuntime;
 
@@ -49,22 +51,61 @@ const START_CELL: [i32; 2] = [0, 0];
 const ANCHOR_Y: i32 = 64;
 /// The staged structure the construct test builds.
 const COTTAGE: &str = "solaris:cottage";
+/// The authored warehouse the deposit tests bind a container through.
+const WAREHOUSE: &str = "solaris:warehouse";
 /// The player endpoint the test reservation is held against.
 const PLAYER: u64 = 7;
 
 /// Deterministic world fake: it records every committed structure block and
-/// answers every resident work/route probe as open flat terrain.
+/// answers every resident work/route probe as open flat terrain. It also holds
+/// the loaded containers a warehouse binding resolves to, and journals every
+/// deposit it accepts onto the fixture's own world journal.
 #[derive(Default)]
 pub(crate) struct TestWorld {
     applied: Mutex<BTreeMap<String, Vec<[i32; 3]>>>,
     /// Whether point-of-interest cells refuse a standing body.
     unstandable: Mutex<bool>,
+    /// The loaded containers this world reads.
+    containers: Mutex<BTreeMap<[i32; 3], Vec<ItemStack>>>,
+    /// The deposits this world half accepted, so a test can assert the plan and
+    /// the count of real moves.
+    deposits: Mutex<Vec<WarehouseTransferRequest>>,
+    /// The registry whose world journal an accepted deposit appends to; absent
+    /// in fixtures that own no journal, where a deposit is `runtime_unavailable`.
+    sessions: Option<Arc<SessionRegistry>>,
 }
 
 impl TestWorld {
     /// Make every cell refuse a standing body, as terrain above a point does.
     pub(crate) fn refuse_standing(&self) {
         *self.unstandable.lock().unwrap() = true;
+    }
+
+    /// Let this fake stand in for the server-owned composite's world half: an
+    /// accepted deposit journals its encoded receipt on the fixture's journal.
+    fn journal_warehouse_transfers(mut self, sessions: Arc<SessionRegistry>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Seed one loaded container at a world position.
+    fn set_container(&self, position: [i32; 3], items: Vec<ItemStack>) {
+        self.containers.lock().unwrap().insert(position, items);
+    }
+
+    /// The container's current canonical slots.
+    fn container(&self, position: [i32; 3]) -> Vec<ItemStack> {
+        self.containers
+            .lock()
+            .unwrap()
+            .get(&position)
+            .cloned()
+            .expect("the container is loaded")
+    }
+
+    /// Every deposit this world half accepted.
+    fn deposits(&self) -> Vec<WarehouseTransferRequest> {
+        self.deposits.lock().unwrap().clone()
     }
 }
 
@@ -122,20 +163,34 @@ impl SettlementWorld for TestWorld {
 
     fn container_reading(
         &self,
-        _position: [i32; 3],
+        position: [i32; 3],
     ) -> Result<ContainerReading, ScriptOperationFailure> {
-        // This fake never holds a container: a warehouse bind against it stays
-        // a typed not-found rather than an invented empty container.
-        Ok(ContainerReading::Missing)
+        Ok(match self.containers.lock().unwrap().get(&position) {
+            Some(items) => ContainerReading::Loaded(items.clone()),
+            None => ContainerReading::Missing,
+        })
     }
 
     fn commit_warehouse_transfer(
         &self,
-        _request: WarehouseTransferRequest,
+        request: WarehouseTransferRequest,
     ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + '_>> {
-        // This fake holds no container and owns no world journal, so a
-        // warehouse deposit has nothing to commit against.
-        Box::pin(async { Err(ScriptOperationFailure::RuntimeUnavailable) })
+        Box::pin(async move {
+            let Some(sessions) = self.sessions.as_ref() else {
+                // This fake owns no journal, so a deposit has nowhere to ride.
+                return Err(ScriptOperationFailure::RuntimeUnavailable);
+            };
+            let decision_id = super::settlement::journal_test_warehouse_transfer(
+                sessions,
+                request.receipt.clone(),
+            )?;
+            self.containers.lock().unwrap().insert(
+                [request.position.x, request.position.y, request.position.z],
+                request.updated_container.clone(),
+            );
+            self.deposits.lock().unwrap().push(request);
+            Ok(decision_id)
+        })
     }
 
     fn apply_structure_portion<'a>(
@@ -153,6 +208,22 @@ impl SettlementWorld for TestWorld {
                 .extend(blocks.iter().map(|block| block.pos));
             Ok(())
         })
+    }
+
+    /// A fake world holds no generated village: these tests exercise the
+    /// authored lane, and a village site answers through its own fixtures.
+    fn village_pois(
+        &self,
+        _bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillagePoiReading>, ScriptOperationFailure> {
+        Ok(VillageReading::Loaded(Vec::new()))
+    }
+
+    fn village_inhabitants(
+        &self,
+        _bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<VillageInhabitantReading>, ScriptOperationFailure> {
+        Ok(VillageReading::Loaded(Vec::new()))
     }
 }
 
@@ -192,6 +263,16 @@ impl ResidentWorld for TestWorld {
 
     fn state_for(&self, _block_path: &str) -> Option<u32> {
         Some(0)
+    }
+
+    fn preview_break(
+        &self,
+        _dimension: &str,
+        _pos: [i32; 3],
+        _expected_state: u32,
+        _tool: Option<&str>,
+    ) -> Result<Vec<ResidentDrop>, ScriptOperationFailure> {
+        Ok(Vec::new())
     }
 
     fn break_block(
@@ -292,8 +373,21 @@ fn catalog() -> BlueprintCatalog {
             "structures/tower.toml".to_owned(),
             building_toml("tower", "guard", 3, &[]),
         ),
+        ("structures/warehouse.toml".to_owned(), warehouse_toml()),
     ];
     BlueprintCatalog::from_files(&stub_registry(), "solaris", &files).unwrap()
+}
+
+/// The authored warehouse the resident deposit test binds: the shared building
+/// shape plus two empty containers at `[1, 1, 1]` and `[2, 2, 2]`, which is what
+/// `bind_warehouse` resolves a handle through.
+fn warehouse_toml() -> String {
+    let mut text = building_toml("warehouse", "work", 0, &[("body", &[([0, 1, 0], 0)])]);
+    text.push_str(
+        "[[block_entity]]\nat = [1, 1, 1]\nkind = \"empty_container\"\n\
+         [[block_entity]]\nat = [2, 2, 2]\nkind = \"empty_container\"\n",
+    );
+    text
 }
 
 struct Fixture {
@@ -327,11 +421,11 @@ impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let catalog = Arc::new(catalog());
-        let world = Arc::new(TestWorld::default());
         let sessions = Arc::new(SessionRegistry::new());
-        let runtime = InventoryRuntime::new(
-            None,
-            &ShutdownHandle::default(),
+        let world =
+            Arc::new(TestWorld::default().journal_warehouse_transfers(Arc::clone(&sessions)));
+        let runtime = InventoryRuntime::player_only_for_test(
+            root.path(),
             Arc::clone(&sessions),
             Arc::new(solaris_required_items()),
             Arc::new(solaris_required_item_facts()),
@@ -342,6 +436,7 @@ impl Fixture {
             WORLD_IDENTITY,
             START_CELL,
             Arc::new(FlatGround),
+            None,
         )))
         .with_settlement_world(Arc::clone(&world) as Arc<dyn SettlementWorld>)
         .with_resident_world(Arc::clone(&world) as Arc<dyn ResidentWorld>);
@@ -353,6 +448,20 @@ impl Fixture {
             selector: SettlementSelector::new(SEED, PROFILE_REVISION),
             sessions,
         }
+    }
+
+    /// The anchor every prepared structure of this fixture is placed at.
+    fn anchor(&self) -> [i32; 3] {
+        let candidate = self.candidate();
+        [candidate.origin[0], ANCHOR_Y, candidate.origin[2]]
+    }
+
+    /// World position of the `offset`-th authored container of a rotation-zero
+    /// warehouse placed at this fixture's anchor; the blueprint authors them at
+    /// `[1, 1, 1]` and `[2, 2, 2]`.
+    fn container_position(&self, offset: i32) -> [i32; 3] {
+        let anchor = self.anchor();
+        [anchor[0] + offset, anchor[1] + offset, anchor[2] + offset]
     }
 
     fn storage(&self) -> PluginStorage {
@@ -451,6 +560,18 @@ impl Fixture {
         storage: &mut PluginStorage,
         operation_id: &str,
     ) -> ScriptStructureSnapshot {
+        self.prepared_structure(storage, operation_id, COTTAGE)
+            .await
+    }
+
+    /// Survey the fixture's first site and prepare one staged structure inside
+    /// it.
+    async fn prepared_structure(
+        &self,
+        storage: &mut PluginStorage,
+        operation_id: &str,
+        blueprint_id: &str,
+    ) -> ScriptStructureSnapshot {
         let bounds = ScriptSurveyBounds::new([0, 0, 0], [7, 3, 7]).unwrap();
         let survey = ScriptOperationRequest::try_new(
             "request",
@@ -475,14 +596,13 @@ impl Fixture {
             },
             other => panic!("expected a settlement payload, got {other:?}"),
         };
-        let candidate = self.candidate();
-        let anchor = [candidate.origin[0], ANCHOR_Y, candidate.origin[2]];
+        let anchor = self.anchor();
         let prepare = ScriptOperationRequest::try_new(
             "request",
             ScriptOperation::Settlement {
                 operation: mc_script::ScriptSettlementOperation::PrepareStructure {
                     operation_id: operation_id.to_owned(),
-                    blueprint_id: COTTAGE.to_owned(),
+                    blueprint_id: blueprint_id.to_owned(),
                     anchor,
                     rotation: 0,
                     survey_token: token,
@@ -571,6 +691,112 @@ fn work_of(outcome: &ScriptOperationOutcome) -> mc_script::ScriptWorkAssignment 
         ScriptResidentOrderResult::Work { assignment } => (**assignment).clone(),
         other => panic!("expected a work result, got {other:?}"),
     }
+}
+
+/// The warehouse binding one `bind_warehouse` outcome carries.
+fn warehouse_of(outcome: &ScriptOperationOutcome) -> mc_script::ScriptWarehouseBinding {
+    let ScriptOperationPayload::Settlement { result } = outcome.payload() else {
+        panic!("expected a settlement payload, got {outcome:?}");
+    };
+    match &**result {
+        ScriptSettlementResult::Warehouse { binding } => binding.as_ref().clone(),
+        other => panic!("expected a warehouse binding, got {other:?}"),
+    }
+}
+
+fn bind_warehouse_request(
+    operation_id: &str,
+    structure_id: &str,
+    container_id: u32,
+) -> ScriptOperationRequest {
+    ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Settlement {
+            operation: mc_script::ScriptSettlementOperation::BindWarehouse {
+                operation_id: operation_id.to_owned(),
+                structure_id: structure_id.to_owned(),
+                container_id,
+            },
+        },
+    )
+    .expect("valid bind request")
+}
+
+fn warehouse_query_request(handle: &str) -> ScriptOperationRequest {
+    ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Inventory {
+            operation: mc_script::ScriptOwnedInventoryOperation::Query {
+                endpoint: ScriptInventoryEndpoint::Warehouse {
+                    handle: handle.to_owned(),
+                },
+                expected_revision: None,
+            },
+        },
+    )
+    .expect("valid warehouse query")
+}
+
+/// The canonical snapshot one warehouse query answered with.
+fn owned_snapshot_of(outcome: &ScriptOperationOutcome) -> mc_script::ScriptOwnedInventorySnapshot {
+    let ScriptOperationPayload::OwnedInventory { result } = outcome.payload() else {
+        panic!("expected an owned inventory payload, got {outcome:?}");
+    };
+    match &**result {
+        mc_script::ScriptOwnedInventoryResult::Snapshot { inventory } => inventory.clone(),
+        other => panic!("expected an owned inventory snapshot, got {other:?}"),
+    }
+}
+
+/// Seed the worker's own canonical carry slots through the durable order
+/// ledger, and answer the revision the next assignment must fence with.
+fn seed_carry(
+    storage: &mut PluginStorage,
+    handle: &str,
+    entity_uuid: uuid::Uuid,
+    carry: &[(&str, u32)],
+) -> u64 {
+    // Gear is one field of the resident's durable record; a resident that has
+    // not served an order yet gets the record every other ledger change uses.
+    let mut record = storage
+        .resident_orders()
+        .record(handle)
+        .cloned()
+        .unwrap_or_else(|| {
+            super::resident_orders::DurableResidentOrderRecord::empty(
+                handle.to_owned(),
+                OWNER.to_owned(),
+                entity_uuid.to_string(),
+                super::resident_orders::DurableAssignment::Civilian,
+            )
+        });
+    for (index, (item, count)) in carry.iter().enumerate() {
+        record.carry[index] = Some(super::resident_orders::DurableResidentStack::new(
+            (*item).to_owned(),
+            *count,
+        ));
+    }
+    storage
+        .append_resident_order_change(super::resident_orders::DurableResidentOrderChange::Record {
+            record: Box::new(record),
+        })
+        .expect("seeded cargo is durable")
+}
+
+/// The worker's canonical carry, as `(resource id, count)` pairs.
+fn carry_of(storage: &PluginStorage, handle: &str) -> Vec<(String, u32)> {
+    storage
+        .resident_orders()
+        .record(handle)
+        .map(|record| {
+            record
+                .carry
+                .iter()
+                .flatten()
+                .map(|stack| (stack.item_id.clone(), stack.count))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The reserved quantity of one resource, or a panic when it is not reserved.
@@ -1186,4 +1412,265 @@ async fn release_refuses_a_home_the_resident_ledger_already_binds() {
         .await
         .expect("release reaches the durable boundary");
     assert_eq!(outcome.failure(), Some(ScriptOperationFailure::Blocked));
+}
+/// (R1-B) A worker's haul into a bound warehouse container really moves its
+/// cargo: the container's own slots and the worker's record change commit under
+/// ONE journal decision, the worker's carry ends empty, and a warehouse query
+/// reads the deposited items back from the container core committed them into.
+#[tokio::test]
+async fn worker_haul_deposits_its_cargo_into_the_bound_warehouse() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    // The container is loaded before the binding: a bind only accepts a
+    // container core can really read.
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(
+        solaris_required_items()
+            .id_of(&Identifier::parse("minecraft:birch_log").unwrap())
+            .expect("birch log is a required item"),
+        12,
+    );
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    assert_eq!(bind.failure(), None, "bind: {bind:?}");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(&mut storage, &handle, uuid, &[("minecraft:birch_log", 3)]);
+
+    let haul = ScriptResidentWorkOrder::Haul {
+        source: ScriptInventoryEndpoint::ResidentCarry {
+            handle: handle.clone(),
+        },
+        destination: ScriptInventoryEndpoint::Warehouse {
+            handle: binding.handle.clone(),
+        },
+    };
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request("haul-warehouse", &handle, haul, 4, revision),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(assignment.work_units_done, 3, "three units really moved");
+    assert_eq!(assignment.state, ScriptWorkState::Running);
+    assert_eq!(
+        assignment
+            .changes
+            .iter()
+            .map(|change| (change.item_id.as_str(), change.delta))
+            .collect::<Vec<_>>(),
+        vec![("minecraft:birch_log", 3)],
+        "the receipt reports exactly what entered the container"
+    );
+
+    // The container took the cargo, merged into the stack it already held.
+    let container = fixture.world.container(position);
+    assert_eq!(container[0].count, 15);
+    assert_eq!(container[1], ItemStack::EMPTY);
+    assert!(carry_of(&storage, &handle).is_empty(), "the carry emptied");
+
+    // The world half saw the container's observed and planned images, and the
+    // deposit carries no player participant.
+    let deposits = fixture.world.deposits();
+    assert_eq!(deposits.len(), 1, "one deposit, one real move");
+    assert_eq!(deposits[0].expected_container[0].count, 12);
+    assert_eq!(deposits[0].updated_container[0].count, 15);
+    assert!(deposits[0].player.is_none());
+
+    // ONE decision carries the container and the worker's record, and the
+    // plugin's own receipt is durable with it.
+    let journal = fixture
+        .sessions
+        .world_chunk_journal()
+        .expect("the fixture owns a journal");
+    let pending = journal.pending_decisions_for_test();
+    assert_eq!(pending.len(), 1, "one deposit, one decision");
+    assert!(
+        pending[0].inventory_batch().unwrap().is_some(),
+        "the worker's record change rides the container's own decision"
+    );
+    assert!(storage.operation_receipt(OWNER, "haul-warehouse").is_some());
+
+    // A warehouse query reads the committed container back.
+    let read = fixture
+        .runtime
+        .execute_owned_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle),
+        )
+        .await
+        .expect("the query reaches the durable boundary");
+    let snapshot = owned_snapshot_of(&read);
+    let slot = snapshot.slots[0]
+        .item
+        .as_ref()
+        .expect("the merged stack is in the container");
+    assert_eq!(slot.resource_id, "minecraft:birch_log");
+    assert_eq!(slot.count, 15);
+}
+
+/// (R1-B) A container with no room takes nothing: the worker keeps every item,
+/// the record reports `no_storage`, and no decision is spent.
+#[tokio::test]
+async fn a_full_container_leaves_the_cargo_with_the_worker() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let log = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log is a required item");
+    // Every slot is full of the very item the worker hauls, so no slot offers
+    // room and none can merge.
+    let position = fixture.container_position(1);
+    let full = vec![ItemStack::new(log, 64); 27];
+    fixture.world.set_container(position, full.clone());
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(&mut storage, &handle, uuid, &[("minecraft:birch_log", 3)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "haul-full",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    destination: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle.clone(),
+                    },
+                },
+                4,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(assignment.changes.is_empty());
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:birch_log".to_owned(), 3)],
+        "the worker keeps its cargo"
+    );
+    assert_eq!(
+        fixture.world.container(position),
+        full,
+        "the container is untouched"
+    );
+    assert!(
+        fixture.world.deposits().is_empty(),
+        "a container that cannot take the cargo is never asked to"
+    );
+    let journal = fixture
+        .sessions
+        .world_chunk_journal()
+        .expect("the fixture owns a journal");
+    assert!(
+        journal.pending_decisions_for_test().is_empty(),
+        "a refused deposit spends no decision"
+    );
+}
+
+/// (R1-B, REC-02 shape) Replaying the same work operation deposits once: the
+/// stored receipt answers, and neither the container nor the record moves again.
+#[tokio::test]
+async fn a_replayed_haul_deposits_once() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let position = fixture.container_position(1);
+    fixture
+        .world
+        .set_container(position, vec![ItemStack::EMPTY; 27]);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(&mut storage, &handle, uuid, &[("minecraft:birch_log", 3)]);
+
+    let request = work_request(
+        "haul-replay",
+        &handle,
+        ScriptResidentWorkOrder::Haul {
+            source: ScriptInventoryEndpoint::ResidentCarry {
+                handle: handle.clone(),
+            },
+            destination: ScriptInventoryEndpoint::Warehouse {
+                handle: binding.handle.clone(),
+            },
+        },
+        4,
+        revision,
+    );
+    let first = fixture.execute(&mut storage, &request).await;
+    assert_eq!(first.failure(), None, "first deposit: {first:?}");
+    let replay = fixture.execute(&mut storage, &request).await;
+    assert_eq!(replay.failure(), None, "replay: {replay:?}");
+    assert_eq!(
+        work_of(&replay),
+        work_of(&first),
+        "the replay answers the stored receipt"
+    );
+    assert_eq!(
+        fixture.world.deposits().len(),
+        1,
+        "one deposit, one real move"
+    );
+    assert_eq!(fixture.world.container(position)[0].count, 3);
+    assert!(carry_of(&storage, &handle).is_empty());
+    assert_eq!(
+        fixture
+            .sessions
+            .world_chunk_journal()
+            .expect("the fixture owns a journal")
+            .pending_decisions_for_test()
+            .len(),
+        1,
+        "one deposit, one decision"
+    );
 }

@@ -93,10 +93,23 @@ fn view_is_owned(plugin_id: &str, view_id: &str) -> bool {
 }
 
 impl SessionRegistry {
-    /// Declare the view kinds one plugin may be asked to open. Production
-    /// population comes from a loaded plugin's verified bundle; no shipped
-    /// package declares `[client]` yet, so this stays empty by default.
-    #[allow(dead_code)]
+    /// Declare the view kinds every verified bundle may be asked to open.
+    ///
+    /// Called once when the server binds, from the same manifest the
+    /// Configuration handshake sends, so a key-driven client request resolves
+    /// to the plugin that actually ships that screen. The kinds come from the
+    /// verified artifact index; nothing is declared for a bundle that ships no
+    /// screens.
+    pub(crate) fn declare_manifest_view_kinds(&self, manifest: Option<&LoaderManifest>) {
+        for (owner, kind) in manifest
+            .iter()
+            .flat_map(|manifest| manifest.declared_view_kinds())
+        {
+            self.declare_loader_view_kinds(owner, core::iter::once(kind));
+        }
+    }
+
+    /// Declare the view kinds one plugin may be asked to open.
     pub(crate) fn declare_loader_view_kinds(
         &self,
         owner: &str,
@@ -108,10 +121,12 @@ impl SessionRegistry {
         }
     }
 
-    /// Drop every view and selection context of one plugin (permission
-    /// revocation). No shipped package declares `[client]` yet, so the
-    /// production revocation hook has nothing to revoke; the contract path is
-    /// implemented and unit-tested through the registry.
+    /// Drop every view and selection context of one plugin.
+    ///
+    /// Nothing revokes a live Loader grant yet: a session's accepted
+    /// permissions are fixed by its Configuration acknowledgement, so the
+    /// production hook has no caller. The contract path is implemented and
+    /// unit-tested through the registry.
     #[allow(dead_code)]
     pub(crate) fn revoke_loader_views(&self, owner: &str) {
         let mut inner = self.lock_inner("revoke loader views");

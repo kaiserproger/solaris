@@ -36,12 +36,21 @@ pub(in crate::play) enum ServerEntityWireMove {
 }
 
 fn villager_entity_data(data: mc_entity::VillagerData) -> EntityDataValue {
-    // Protocol ids come from the bundled 26.1.2 registries report.
+    // Protocol ids come from the bundled 26.1.2 registries report: the
+    // `villager_type` registry in its bootstrap order (`desert` 0, `jungle` 1,
+    // `plains` 2, `savanna` 3, `snow` 4, `swamp` 5, `taiga` 6) and
+    // `villager_profession` (`none` 0, `armorer` 1, ..., `nitwit` 11,
+    // `shepherd` 12, `toolsmith` 13, `weaponsmith` 14).
     let villager_type = match data.kind {
+        mc_entity::VillagerKind::Desert => 0,
         mc_entity::VillagerKind::Plains => 2,
+        mc_entity::VillagerKind::Savanna => 3,
+        mc_entity::VillagerKind::Snow => 4,
+        mc_entity::VillagerKind::Taiga => 6,
     };
     let profession = match data.profession {
         mc_entity::VillagerProfession::None => 0,
+        mc_entity::VillagerProfession::Nitwit => 11,
         mc_entity::VillagerProfession::Toolsmith => 13,
     };
     EntityDataValue::VillagerData {

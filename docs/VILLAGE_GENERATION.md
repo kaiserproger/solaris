@@ -13,10 +13,10 @@ Village assembly follows the placed-feature executor
 (`crates/mc-worldgen/src/village/`) and its data loaders
 (`crates/mc-data/src/village_data.rs`) are active library code: the default
 `settlement_profile` builds a village plan source from the derived content cache
-at startup, `WORLDGEN_REVISION` is 23, and the interim
-`settlement_profile_vanilla_generates_no_villages` warning is retired. The one
-notice a vanilla village world still carries is the terrain-adaptation analogue
-below.
+at startup, `WORLDGEN_REVISION` is 24, and the interim
+`settlement_profile_vanilla_generates_no_villages` warning is retired. The notices
+a vanilla village world still carries are the terrain-adaptation analogue and the
+mobs the lane does not spawn, both below.
 
 ## What generates a village
 
@@ -106,10 +106,15 @@ Code paths:
 - `crates/mc-worldgen/src/village/decor.rs` compiles the closure's
   `feature_pool_element` entries and seeds the random they run on.
 - `crates/mc-worldgen/src/village/plan_source.rs` is the one lookup both
-  consumers read, and writes both lanes into a chunk.
+  consumers read, and writes both lanes into a chunk, including the inhabitant
+  markers of the villagers the pieces place.
 - `crates/mc-worldgen/src/village/processors.rs` and
   `crates/mc-worldgen/src/structures.rs` execute the processor lists and the
-  piece templates.
+  piece templates; the template reader is also what reads each template's
+  `entities` list.
+- `crates/mc-net/src/play/session/settlement_authority.rs` resolves a chunk's
+  inhabitant markers into villagers and spawns them when the chunk is streamed
+  (see [Village inhabitants](#village-inhabitants)).
 
 ## Village decor
 
@@ -363,6 +368,75 @@ not affect blocks or draws; two villages of the same type reaching one chunk
 share one decor stream here in ascending start-chunk order, which is the one
 ordering assumption this page makes.
 
+## Village inhabitants
+
+A village's houses carry their population in the *template*, not in the pool: a
+house's `minecraft:bottom` jigsaw points at `minecraft:village/<type>/villagers`,
+whose elements are `legacy_single_pool_element`s over the one-block templates
+`village/<type>/villagers/{unemployed,nitwit,baby}`. Each of those templates
+authors one entity in its NBT `entities` list — a `minecraft:villager` with its
+`VillagerData` (`type`, `profession`, `level`) and `Age`, a `blockPos` and a
+double `pos`.
+
+Solaris reads that list and places the villagers the way vanilla's
+`StructureTemplate.placeEntities` does: the entity's `blockPos` goes through the
+piece's block transform, and it is dropped when the transformed block is outside
+the chunk being filled — the same per-chunk box the piece's blocks are clipped to,
+so an entity that belongs to the neighbouring chunk is placed when *that* chunk
+is generated. The double `pos` goes through `transform(Vec3, ...)`, which mirrors
+with `1.0 - coordinate` and carries the `+ 1` term in the rotated branches; the
+yaw is `entity.rotate(rotation) + entity.mirror(mirror) - entity.getYRot()` on the
+yaw the template authored (`Rotation[0]`), and the pitch is the entity's own
+(`Rotation[1]`), which vanilla never rotates. Those functions are pinned against
+the real 26.1.2 classes (`crates/mc-worldgen/src/village_piece_tests.rs`), and so
+are the templates' own values: the adult villager templates author
+`Rotation = [48.821632, 0.0]` and `Age = 0`, the baby templates
+`Rotation = [0.0, -25.827711]` and `Age = -21359`.
+
+The placement does not spawn an entity at generation time. It writes a **chunk
+inhabitant marker** (the `SolarisSettlementInhabitants` entry in the chunk's
+extras, `mc_world::SettlementInhabitantMarker`), which is the core's one
+generation-to-runtime entity handoff: when the chunk is streamed to a client,
+`mc-net` resolves each marker against the entity registry — the village types
+`plains`/`desert`/`savanna`/`snow`/`taiga` and the professions `none`/`nitwit` —
+and spawns the villager, with its authored `Age` (a negative `Age` selects the
+baby brain schedule), the yaw its placement computed and the pitch its template
+authored (clamped the way `Entity.setXRot` clamps it: `clamp(pitch % 360, -90,
+90)`). The marker's claim
+(`<pool element>@<piece x>:<piece y>:<piece z>#<entity index>`) is the villager's
+identity in place of the `UUID` vanilla strips from the template: it seeds a
+deterministic UUID and prevents a second spawn when the chunk is streamed again.
+Restarting the server does not respawn a villager whose claim is already known.
+
+The village lane spawns **villagers only**. A village also authors the
+meeting-point iron golem, the animal pens' livestock, their cats, a desert camel,
+a butcher shop's animals, an armour stand and the zombie villagers of the
+weight-1 zombie town centres; those need their own entity state and spawn path,
+so they are not placed, and startup reports exactly which ids the loaded closure
+reaches (`village_piece_mobs_other_than_villagers_are_not_spawned`) rather than
+leaving them silently absent.
+
+The templates author **no POIs** for their villagers, and vanilla's own
+behaviour — a villager claiming a bed, a workstation or the bell from the blocks
+around it — is not modelled here. A marker therefore carries the core's existing
+answer for that case (`default_villager_pois`, the shape the runtime already
+applies to a villager with no brain state): the entity's own placed position is
+its home, its meeting point, and the job site of a working profession. So a
+generated village's villagers rest and gather where they were placed rather than
+claiming the bed or workstation next to them, and the templates' two professions
+(`none` and `nitwit`) work nowhere at all. That is a divergence from vanilla — the
+shape of a village day survives, the POIs are the placement rather than the
+furniture — not a reading of the template.
+
+A village **baby** does carry one home-shaped field: the core's entity storage
+contract requires a baby to name the home it was born into
+(`villager_population_state_is_valid`), and a generated village has no settlement
+home to name, so the baby records its own placement claim (the same string as the
+villager's identity) as that home. It is not a settlement home claim and no
+settlement site can be blocked by it — the two claim shapes never collide — but an
+operator reading `entities.dat` will see a village baby whose home is its
+placement rather than a bed.
+
 ## World identity and reusing a world
 
 Every generated Solaris world persists `solaris/world.json`, which fences
@@ -380,6 +454,10 @@ shape, the priority queue, the stub-position biome gate, and the decor lane).
 All are generation changes, so all are fenced by `WORLDGEN_REVISION` in
 `crates/mc-worldgen/src/lib.rs`.
 
+The revision is **24**: village chunks now carry their inhabitants (see
+[Village inhabitants](#village-inhabitants)), so a revision-23 chunk would
+generate without them if it were reused.
+
 What to expect as an operator:
 
 - Reusing an existing world with the new binary is **refused**, not silently
@@ -395,33 +473,44 @@ What to expect as an operator:
   generation: Solaris does not generate villages into missing chunks of an
   import.
 
-**No real-client run was made for revision 23.** The checkpoint's evidence is the
+**No real-client run was made for revision 24.** The checkpoint's evidence is the
 Rust gates (workspace tests, `fmt`, `code-health`, strict clippy) plus the Java
-probe over the real 26.1.2 classes for the decor stream, not a graphical client:
-no PrismLauncher walk, no harness real-client profile. What that leaves
-unexercised is exactly what a client would show — a village's silhouette on
-generated terrain, the chest contents a player opens, and the decor a player
-walks through — so a village walk (or the villager-from-markers work that follows
-it) is the first thing that would test this revision visually.
+probe over the real 26.1.2 classes for the entity transform and the decor stream,
+not a graphical client: no PrismLauncher walk, no harness real-client profile.
+What that leaves unexercised is exactly what a client would show — a village's
+silhouette on generated terrain, the villagers standing in it, the chest contents
+a player opens, and the decor a player walks through — so a village walk is the
+first thing that would test this revision visually.
 
-`WORLDGEN_REVISION` is 23: revision-22 worlds carry villages assembled from the
-pre-26.1.2-fidelity solver and no decor, and are refused with the
-fresh-`world_dir` message above. The
+`WORLDGEN_REVISION` is 24: revision-22 and revision-23 worlds carry villages
+assembled from earlier solver fidelity (23) with no inhabitants and no decor
+(22), and are refused with the fresh-`world_dir` message above. The
 `settlement_profile_vanilla_generates_no_villages` warning is retired — the
-default profile now has villages to report — and the terrain-adaptation analogue
-notice is the one a village world carries.
+default profile now has villages to report — and the notices a village world
+carries are the terrain-adaptation analogue and the mobs the lane does not spawn
+below.
 
 ## Not implemented
 
 These are the places village generation still fails closed or does nothing, and
 they are deliberate:
 
-- **Village inhabitants.** A piece template's entity markers (the villagers a
-  village's houses place) are loaded by the template reader but not spawned by
-  the vanilla lane, so a generated village has buildings, streets, decor and
-  loot but no population. Villager behaviour, raids, patrols and the trade
-  economy are outside this page entirely, and `spawn_overrides` is parsed and
-  carried but consumed by nothing.
+- **Village mobs other than the villager.** A piece template's *villagers* are
+  placed (see [Village inhabitants](#village-inhabitants)); the rest of what a
+  village authors is not: the meeting-point iron golem, the animal pens'
+  livestock and their cats, a butcher shop's animals, a desert camel, a taiga
+  armorer's armour stand, and the zombie villagers of the weight-1 zombie town
+  centres. Each would need its own entity state and spawn path (a cat's variant,
+  a horse's markings, an armour stand's pose). The closure reports every id it
+  reaches that the lane does not spawn, and startup logs it, so the gap is
+  visible instead of silently missing. `spawn_overrides` is parsed and carried
+  but consumed by nothing.
+- **Villager behaviour beyond the placement's own POIs.** A village villager is
+  spawned with its authored `VillagerData` and `Age` and the placement-derived POI
+  set above, so it keeps the schedule its age selects — resting and meeting where
+  it was placed, never claiming the bed, workstation or bell next to it. Vanilla's
+  POI acquisition, breeding, trading, raids and patrols are outside this page
+  entirely.
 - **Non-village structures.** Only the `minecraft:villages` structure set is
   assembled. The other structure sets in the content cache (ancient cities,
   mineshafts, ocean monuments, ruined portals, strongholds, mansions, and the

@@ -2,9 +2,10 @@ use crate::{
     ScriptChunkAvailability, ScriptDtoError, ScriptResidentSiteReservation,
     ScriptSettlementBuilding, ScriptSettlementOperation, ScriptSettlementPoi,
     ScriptSettlementResult, ScriptSettlementSite, ScriptSettlementSitePage, ScriptSitePoiKind,
-    ScriptSitePoiState, ScriptSiteVariant, ScriptStructureMaterial, ScriptStructureReceipt,
-    ScriptStructureSnapshot, ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds,
-    ScriptSurveyPurpose, ScriptSurveySnapshot, ScriptWarehouseBinding, warehouse_handle,
+    ScriptSitePoiState, ScriptSiteProvenance, ScriptSiteVariant, ScriptStructureMaterial,
+    ScriptStructureReceipt, ScriptStructureSnapshot, ScriptStructureStagePlan,
+    ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose, ScriptSurveySnapshot,
+    ScriptWarehouseBinding, warehouse_handle,
 };
 
 const GENERATION_ID_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -27,8 +28,10 @@ fn poi(poi_id: &str) -> ScriptSettlementPoi {
 fn site(site_id: &str) -> ScriptSettlementSite {
     ScriptSettlementSite {
         site_id: site_id.to_owned(),
+        provenance: ScriptSiteProvenance::Authored,
         variant: ScriptSiteVariant::Village,
         revision: 7,
+        contents_known: true,
         footprint_origin: [0, 64, 0],
         footprint_size: [32, 16, 32],
         buildings: vec![building("settlement:house")],

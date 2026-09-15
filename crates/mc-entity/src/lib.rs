@@ -912,14 +912,29 @@ impl VillagerData {
     }
 }
 
+/// `VillagerType`, limited to the types the content cache's village pools
+/// author: the five village structures' biome types. The variant order is not
+/// the wire order — [`crate::VillagerKind`]'s protocol ids come from the
+/// registry report (`desert` 0, `jungle` 1, `plains` 2, `savanna` 3, `snow` 4,
+/// `swamp` 5, `taiga` 6; jungle and swamp have no village type here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VillagerKind {
+    Desert,
     Plains,
+    Savanna,
+    Snow,
+    Taiga,
 }
 
+/// `VillagerProfession`, limited to the professions the village templates and
+/// the settlement plan author: `none`, `nitwit` (the village templates' nitwit
+/// pieces) and `toolsmith` (the settlement plan's smith and the smithing-table
+/// job site). Protocol ids come from the registry report: `none` 0, `nitwit`
+/// 11, `toolsmith` 13.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VillagerProfession {
     None,
+    Nitwit,
     Toolsmith,
 }
 

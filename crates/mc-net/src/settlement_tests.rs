@@ -191,6 +191,7 @@ fn runtime_for(deployment: &SettlementDeployment) -> InventoryRuntime {
         WORLD_IDENTITY,
         [0, 0],
         Arc::new(FlatGround),
+        None,
     )))
 }
 
@@ -580,6 +581,48 @@ async fn one_home_poi_binds_at_most_one_resident_site() {
     assert_eq!(outcome.failure(), None, "re-reservation: {outcome:?}");
 }
 
+/// The vanilla block report the shipped catalog is validated against.
+///
+/// The search order is the server's own (`crates/mc-server/src/content_cache.rs`,
+/// `ContentSearch::candidates`): an explicit `SOLARIS_CONTENT_CACHE` first — an
+/// operator who names a cache does not want another standing in for it — then the
+/// standard managed cache (`$XDG_DATA_HOME`/`~/.local/share` +
+/// `solaris/content/<release>`), then the workspace sidecar `data/vanilla`. This
+/// helper only looks for `reports/blocks.json`, so unlike the server it does not
+/// re-run `validate_content_cache`'s completeness check; a machine with no cache
+/// is told exactly that instead of failing on a missing path.
+fn vanilla_blocks_report(repository: &Path) -> Vec<BlockReport> {
+    let mut roots = Vec::new();
+    if let Ok(dir) = std::env::var("SOLARIS_CONTENT_CACHE") {
+        roots.push(std::path::PathBuf::from(dir));
+    }
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
+        })
+    {
+        roots.push(
+            data_home
+                .join("solaris/content")
+                .join(mc_protocol::TARGET_RELEASE),
+        );
+    }
+    roots.push(repository.join("data/vanilla"));
+    let Some(path) = roots
+        .iter()
+        .map(|root| root.join("reports/blocks.json"))
+        .find(|path| path.is_file())
+    else {
+        panic!(
+            "no vanilla block report to validate the shipped catalog against; checked {roots:?} \
+             (run `mc-server content import` or tools/extract-vanilla-data.sh, or set \
+             SOLARIS_CONTENT_CACHE)"
+        );
+    };
+    mc_data::blocks::load_blocks_report(path).expect("the vanilla block report parses")
+}
+
 /// The shipped first-party package must pass the frozen loader unchanged.
 ///
 /// Skipped only when the sibling plugin checkout is absent: the core repository
@@ -593,9 +636,7 @@ async fn shipped_settlement_package_is_accepted() {
     if !package_dir.is_dir() {
         return;
     }
-    let report =
-        mc_data::blocks::load_blocks_report(repository.join("data/vanilla/reports/blocks.json"))
-            .expect("the repository ships the vanilla block report");
+    let report = vanilla_blocks_report(&repository);
     let registry = BlockRegistry::from_report(&report).unwrap();
     let deployed = LuaPluginPackage::new(
         "solaris-settlements",
