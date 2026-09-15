@@ -34,7 +34,7 @@
 
 **What landed.**
 
-- **Loader wire 3 / schema 2** (`solaris-loader`, uncommitted there): `PROTOCOL_VERSION = 3`, `INDEX_SCHEMA = 2`, content kinds `views`/`view_actions`/`world_previews`/`world_selection`, the eight schema-2 widget types with their bounds, the `solaris:loader/view` and `solaris:loader/view_action` wire-3 messages, the protocol-3 sound channel, and the view screen in `loader-platform-common`. Verified by my own forced run (`:loader-core:cleanTest … :forge:test`) — 94 tests, 0 failures, 0 skipped across 27 suites; the earlier all-up-to-date run proved nothing and was superseded.
+- **Loader wire 3 / schema 2** (`solaris-loader`, pushed as `0972926`): `PROTOCOL_VERSION = 3`, `INDEX_SCHEMA = 2`, content kinds `views`/`view_actions`/`world_previews`/`world_selection`, the eight schema-2 widget types with their bounds, the `solaris:loader/view` and `solaris:loader/view_action` wire-3 messages, the protocol-3 sound channel, and the view screen in `loader-platform-common`. Verified by my own forced run (`:loader-core:cleanTest … :forge:test`) — 94 tests, 0 failures, 0 skipped across 27 suites; the earlier all-up-to-date run proved nothing and was superseded.
 - **A generated vanilla village is a settlement site** (`crates/mc-net/src/script/storage/settlement_village_sites.rs`): identity minted from world identity + dimension + the generator's start chunk (`village_<x>_<z>_<hash8>`, reversible with digest re-derivation), listed in the same page and cursor space as authored sites, queryable by that id, `provenance = vanilla_village`.
 - **Contents come from the materialized world, identity from generation.** POIs are read from the placed blocks (beds by the `minecraft:beds` tag, `minecraft:bell`, and the sixteen job-site blocks pinned from the decompiled 26.1.2 `PoiTypes.bootstrap`; receipt at `.analysis/codex-logs/settlement-village-bridge/poi-types-registration.txt`), occupancy from the handles residents hold. Inhabitants come from the chunk's stored `SettlementInhabitantMarker`s, and the entity identity published is the one the spawn lane mints from the placement's claim. A village whose chunks are not generated reports `contents_known = false` rather than an empty village (`ACC-05`).
 - **Adoption is the existing `claim_resident`.** `a_generated_inhabitant_is_adopted_by_the_identity_its_placement_mints` proves the chain: marker → spawned villager → descriptor identity → `claim_resident` → one resident; the same operation replays to the same resident, and reopening the storage keeps exactly one. This is the first coverage `claim_resident` has had at all.
@@ -56,7 +56,7 @@
 
 **Acceptance: deferred by the owner.** The R0 evidence runs (`ACC-01…06`, `CLIENT-01…03`, `REC-01`) are explicitly postponed ("приёмку через харнесс позже проведём"); what exists instead is the code-level half — the Loader activation test above, the core routing tests, and the green gates below. The real-client profiles additionally need `SOLARIS_CLIENT_JAR` and client credentials this machine does not have. **Nothing in R0 is claimed as client-verified.**
 
-## R1-A: worker production becomes real cargo (landed 2026-09-15, uncommitted)
+## R1-A: worker production becomes real cargo (landed 2026-09-15, committed with the R1-B core in `84de0bf9`)
 
 **Why.** R0's overview can only be truthful about a warehouse if something really puts items there. The read-only R1 map showed the first blocking defect: `ItemLedger::extend_drops` only summed a per-item delta for the receipt, so `Harvest`, `CutTree`, `Mine` and `Fish` removed real blocks, rolled real canonical loot, and left it owned by nobody. Every later step of R1 — haul, warehouse stock, food, construction consumption — had nothing real to move.
 
@@ -162,11 +162,11 @@ So the missing capability is a **container + receipt commit with no player parti
 
 ### Next action
 
-1. **Plugin half of R1-B** (never started): `../solaris-default-plugins/solaris-settlements` — give the `hauling` job a bound-warehouse destination, and replace the category-like tool ids in the job table (`minecraft:hoe`/`axe`/`pickaxe` are not items, so `gear_has` never matches and farm/forestry/mining pause as `missing_tool`) with the real tools the production chain expects. That repository is uncommitted and load-bearing; do not run git operations there without the owner.
+1. **Plugin half of R1-B** (never started): `../solaris-default-plugins/solaris-settlements` — give the `hauling` job a bound-warehouse destination, and replace the category-like tool ids in the job table (`minecraft:hoe`/`axe`/`pickaxe` are not items, so `gear_has` never matches and farm/forestry/mining pause as `missing_tool`) with the real tools the production chain expects. The package itself is now committed and pushed (`08e4c3d`), so the next session works from a clean tree there.
 2. Then the R1-B items deliberately left out: worker *withdrawal* from a warehouse, reserved-stock withdrawal for construction (BUILD-02/03), and the construction composite (REC-03).
 
 ### Machine rules for whoever continues
 
 - Bounded heavy runs only: `CARGO_BUILD_JOBS=2`, one gate at a time, **no `nice`** (it starves the Lua host's 10 ms/50 ms wall budget, `crates/mc-script/src/lua.rs:53`), nothing else heavy in flight. An unbounded workspace run already OOM-killed this machine once.
 - Never widen a test bound or add a retry to force green; if a gate is red, record it with its receipt.
-- No git operations in `../solaris-default-plugins`; its uncommitted package state is load-bearing.
+- Both sibling repositories are now committed and pushed at the revisions this cursor names: `../solaris-loader` `0972926`, `../solaris-default-plugins` `08e4c3d`. The loader still carries two untracked local-only directories that its `.gitignore` does **not** cover - `.cache/` (ForgeGradle JiJ jars) and `config/fml.toml` (a generated client run config). They are deliberately unstaged; if a future change adds `.cache/` or `config/` to that repo's `.gitignore`, do it there, never by committing the jars.
