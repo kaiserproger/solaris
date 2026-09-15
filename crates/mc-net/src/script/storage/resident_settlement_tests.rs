@@ -1674,3 +1674,89 @@ async fn a_replayed_haul_deposits_once() {
         "one deposit, one decision"
     );
 }
+
+/// (R1-B) A stack the container cannot take does not stall the rest of the
+/// cargo: the worker deposits what fits, keeps what does not, and reports the
+/// units it really moved.
+#[tokio::test]
+async fn a_haul_deposits_past_a_stack_the_container_refuses() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let items = solaris_required_items();
+    let stone = items
+        .id_of(&Identifier::parse("minecraft:stone").unwrap())
+        .expect("stone is a required item");
+    let log = items
+        .id_of(&Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log is a required item");
+    // Every slot is full of stone, except one that is four logs short of a full
+    // birch-log stack: wheat fits nowhere, the logs still do.
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::new(stone, 64); 27];
+    chest[0] = ItemStack::new(log, 60);
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:wheat", 3), ("minecraft:birch_log", 3)],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "haul-mixed",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    destination: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle.clone(),
+                    },
+                },
+                8,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(
+        assignment.work_units_done, 3,
+        "the logs moved although the wheat could not"
+    );
+    assert_eq!(
+        assignment
+            .changes
+            .iter()
+            .map(|change| (change.item_id.as_str(), change.delta))
+            .collect::<Vec<_>>(),
+        vec![("minecraft:birch_log", 3)],
+        "the receipt names only what entered the container"
+    );
+    let container = fixture.world.container(position);
+    assert_eq!(container[0].count, 63);
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:wheat".to_owned(), 3)],
+        "the stack that fit nowhere stays with the worker"
+    );
+}

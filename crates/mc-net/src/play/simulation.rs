@@ -1139,10 +1139,13 @@ fn command_can_use_regional_mutation(
     {
         let mut unique = HashSet::with_capacity(positions.len());
         // The menu path is session-authored: it has one acting session and the
-        // plan that session's inventory moves with. A server-owned composite
-        // may carry neither, and the player plan is validated whenever it is
-        // present.
-        if plugin_receipt.is_none() && (actor_session.is_none() || player.is_none()) {
+        // plan that session's inventory moves with. A session and a player plan
+        // travel together in every shape, so a command carrying one without the
+        // other is refused rather than committed without the player fence.
+        if actor_session.is_some() != player.is_some() {
+            return false;
+        }
+        if plugin_receipt.is_none() && actor_session.is_none() {
             return false;
         }
         return !positions.is_empty()

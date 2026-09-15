@@ -326,17 +326,32 @@ than a second authority:
   A deposit with no player participant is enqueued through
   `enqueue_with_fence(None, …)` exactly like every other server-owned command;
   the session-authored menu shape is refused by the validator when it is missing
-  its session or its player plan. The second participant is the record change
-  inside the encoded receipt, so the container's after-image and the worker's
-  cargo are durable together or not at all - the batch's `order` change is
-  applied by the same projection (`append_inventory_projection`) the player's
-  recovery after-image uses, and a receipt-bearing batch is still admitted only
-  to a journaled regional run.
+  its session or its player plan. The session and the player plan travel
+  together in every shape the validator admits
+  (`actor_session.is_some() == player.is_some()`), so a plan can never move a
+  player's items past the state that fences and after-images them; the
+  transaction asserts the same invariant against the state it actually holds.
+  The second participant is the record change inside the encoded receipt, so the
+  container's after-image and the worker's cargo are durable together or not at
+  all - the batch's `order` change is applied by the same projection
+  (`append_inventory_projection`) the player's recovery after-image uses, and a
+  receipt-bearing batch is still admitted only to a journaled regional run.
+- **One deposit tail, one ordering.** `InventoryRuntime::commit_prepared_deposit`
+  (`crates/mc-net/src/script/storage/world_inventory.rs`) owns everything after a
+  caller has prepared its batch: encode the receipt, fence and commit the
+  container, project the ledger frame, acknowledge the decision. The player's
+  inventory and a worker's record differ only in how their batch was prepared and
+  in whether a player participant travels with it, so both callers keep their own
+  fencing and planning and share this tail; the alternative - a resident entry
+  point that re-implements the sequence - is exactly the drift this section
+  exists to prevent.
 
-A record participant makes `PreparedStorageBatch::validate_inventory_participant`
-accept a decision whose participants are the receipt and a non-empty `order`
-change, which is what lets the same decision replay through
-`WorldChunkJournal` recovery for a worker as it does for a player.
+A worker haul also carries a planning rule worth naming, because it decides
+whether a settled storage state can progress at all: the deposit moves what fits
+and leaves what does not, slot by slot. A container that cannot take the worker's
+first stack but can take a later one deposits the later one rather than refusing
+the whole cargo and stalling the job on the same stack every cycle; only a cargo
+that fits nowhere answers `capacity`.
 
 One consequence is recorded deliberately: a haul is directed. `Haul { source,
 destination }` is no longer reordered by `ScriptResidentWorkOrder::canonicalize`

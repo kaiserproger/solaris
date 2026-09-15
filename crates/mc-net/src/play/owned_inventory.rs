@@ -487,9 +487,11 @@ pub(crate) fn plan_warehouse_deposit(
                 break;
             }
             if !filled {
-                // Nothing in the container takes this stack, so the rest of the
-                // worker's cargo stays where it is.
-                break 'source;
+                // Nothing in the container takes this stack, so it stays with
+                // the worker and the next one is tried: a container that still
+                // has room for a later stack must not stall the whole haul on
+                // the first one it cannot take.
+                continue 'source;
             }
         }
     }

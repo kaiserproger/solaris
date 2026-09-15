@@ -230,6 +230,12 @@ impl ChestTransaction {
         mutation: &mc_world::WorldMutationView,
         request: ChestTransactionRequest<'_>,
     ) -> Result<ServerOwnedChestCommit, SimulationRequestError> {
+        // A player participant is fenced by its durable state or not admitted
+        // at all: a plan that moved a player's items without the state that
+        // fences and after-images them is never a legal deposit.
+        if request.player.is_some() != self.player_state.is_some() {
+            return Err(SimulationRequestError::InvalidCommand);
+        }
         let state_id_increment = chest_state_id_increment(&request);
         let container_wait_started = Instant::now();
         let container_guard = lock_authoritative_mutex(&self.containers, "play.container_registry");
