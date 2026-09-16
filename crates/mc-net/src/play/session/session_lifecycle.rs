@@ -420,3 +420,46 @@ impl SessionRegistry {
         dispatches
     }
 }
+
+/// The live connection of a player registered by
+/// [`SessionRegistry::register_joined_player_for_test`].
+///
+/// Holding it keeps that player connected; dropping it ends the connection
+/// exactly as a connection task dropping its outbound receiver does. The
+/// registry keeps the session until its owner tears it down, so a test can tell
+/// "still connected" from "left" without driving the wire.
+#[cfg(test)]
+pub(crate) struct TestPlayerConnection {
+    _outbound: mpsc::Receiver<OutboundCommand>,
+}
+
+#[cfg(test)]
+impl SessionRegistry {
+    /// Register one player called `name` as connected, with a live outbound
+    /// lane, and hand back the connection whose lifetime is that player's
+    /// session.
+    ///
+    /// The identity is the uuid an offline-mode join gives `name`, exactly as
+    /// [`Self::register_owned_inventory_test_session`] builds it, so a caller
+    /// reads the identity the registry advertises for this player from the
+    /// online-player snapshot rather than rebuilding it.
+    pub(crate) fn register_joined_player_for_test(
+        &self,
+        name: &str,
+    ) -> (SessionId, TestPlayerConnection) {
+        let profile = LoggedInProfile {
+            uuid: crate::login::offline_uuid(name),
+            name: name.to_owned(),
+        };
+        let (tx, rx) = mpsc::channel(8);
+        let (id, _) = self.register(
+            &profile,
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        (id, TestPlayerConnection { _outbound: rx })
+    }
+}

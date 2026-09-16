@@ -6,7 +6,7 @@ Checkpoint base: `ef982c6e8c20007a50f56cf534400eed16a8bc69`
 
 ## Scope
 
-This checkpoint closes `PUBLIC_ALPHA_PLAN.md` Phase 1 item 2 by inspecting
+This checkpoint closes `docs/milestones/public-alpha-plan.md` Phase 1 item 2 by inspecting
 first-party Rust, Java, Kotlin, Python, and shell test sources for progress
 that depends on wall-clock sleeps, scheduler yields, or repeated state
 sampling. It classifies the remaining loop candidates by the event that

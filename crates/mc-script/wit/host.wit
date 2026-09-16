@@ -1,0 +1,17 @@
+// The host services a plugin may call while one of its callbacks runs.
+//
+// Deliberately small: logging and reading the invocation context the host
+// already prepared. Everything that reads or changes the world is a command
+// the host admits and applies through an existing game owner, so no import here
+// may take a world lock, wait for a chunk, or block on I/O.
+interface host {
+    use types.{log-level};
+
+    /// One diagnostic line. The host truncates long messages and rate-limits a
+    /// plugin that logs too much; a guest must not rely on a line being kept.
+    log: func(level: log-level, message: string);
+
+    /// The plugin id the host bound to this instance. Present for correlation
+    /// and for reading its own configuration; it grants nothing.
+    plugin-id: func() -> string;
+}

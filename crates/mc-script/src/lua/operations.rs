@@ -6,8 +6,8 @@ use mlua::{Lua, LuaSerdeExt, LuaString, Table, Value};
 use super::{
     DiskManifest, InvocationState, bounded_lua_string, bounded_script_id, dto_error,
     lua_input_error, parse_storage_mutations, push_command, raw_bounded_string_field,
-    raw_i32_field, raw_table_entry, raw_u8_field, raw_u16_field, raw_u32_field, raw_u64_field,
-    validate_record_shape, validate_sequence_shape,
+    raw_i32_field, raw_optional_bounded_string_field, raw_table_entry, raw_u8_field, raw_u16_field,
+    raw_u32_field, raw_u64_field, validate_record_shape, validate_sequence_shape,
 };
 use crate::{
     MAX_BLUEPRINT_ID_BYTES, MAX_INVENTORY_RESOURCE_TYPES, MAX_INVENTORY_WORK_PORTIONS,
@@ -1152,7 +1152,11 @@ fn parse_work_order(table: &Table) -> mlua::Result<ScriptResidentWorkOrder> {
             })
         }
         "haul" => {
-            validate_record_shape(table, &["kind", "source", "destination"], "work_order")?;
+            validate_record_shape(
+                table,
+                &["kind", "source", "destination", "item"],
+                "work_order",
+            )?;
             Ok(ScriptResidentWorkOrder::Haul {
                 source: parse_inventory_endpoint(&raw_named_table(
                     table,
@@ -1164,6 +1168,13 @@ fn parse_work_order(table: &Table) -> mlua::Result<ScriptResidentWorkOrder> {
                     "destination",
                     "work_destination",
                 )?)?,
+                item: raw_optional_bounded_string_field(
+                    table,
+                    "item",
+                    "work_item",
+                    MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?,
             })
         }
         "craft" => {

@@ -756,6 +756,20 @@ fn seed_carry(
     entity_uuid: uuid::Uuid,
     carry: &[(&str, u32)],
 ) -> u64 {
+    seed_gear(storage, handle, entity_uuid, carry, |record| {
+        &mut record.carry
+    })
+}
+
+fn seed_gear(
+    storage: &mut PluginStorage,
+    handle: &str,
+    entity_uuid: uuid::Uuid,
+    gear: &[(&str, u32)],
+    endpoint: fn(
+        &mut super::resident_orders::DurableResidentOrderRecord,
+    ) -> &mut Vec<Option<super::resident_orders::DurableResidentStack>>,
+) -> u64 {
     // Gear is one field of the resident's durable record; a resident that has
     // not served an order yet gets the record every other ledger change uses.
     let mut record = storage
@@ -770,8 +784,8 @@ fn seed_carry(
                 super::resident_orders::DurableAssignment::Civilian,
             )
         });
-    for (index, (item, count)) in carry.iter().enumerate() {
-        record.carry[index] = Some(super::resident_orders::DurableResidentStack::new(
+    for (index, (item, count)) in gear.iter().enumerate() {
+        endpoint(&mut record)[index] = Some(super::resident_orders::DurableResidentStack::new(
             (*item).to_owned(),
             *count,
         ));
@@ -785,12 +799,25 @@ fn seed_carry(
 
 /// The worker's canonical carry, as `(resource id, count)` pairs.
 fn carry_of(storage: &PluginStorage, handle: &str) -> Vec<(String, u32)> {
+    gear_of(storage, handle, false)
+}
+
+/// The worker's canonical equipment, as `(resource id, count)` pairs.
+fn equipment_of(storage: &PluginStorage, handle: &str) -> Vec<(String, u32)> {
+    gear_of(storage, handle, true)
+}
+
+fn gear_of(storage: &PluginStorage, handle: &str, equipment: bool) -> Vec<(String, u32)> {
     storage
         .resident_orders()
         .record(handle)
         .map(|record| {
-            record
-                .carry
+            let slots = if equipment {
+                &record.equipment
+            } else {
+                &record.carry
+            };
+            slots
                 .iter()
                 .flatten()
                 .map(|stack| (stack.item_id.clone(), stack.count))
@@ -1458,6 +1485,7 @@ async fn worker_haul_deposits_its_cargo_into_the_bound_warehouse() {
         destination: ScriptInventoryEndpoint::Warehouse {
             handle: binding.handle.clone(),
         },
+        item: None,
     };
     let outcome = fixture
         .execute(
@@ -1571,6 +1599,7 @@ async fn a_full_container_leaves_the_cargo_with_the_worker() {
                     destination: ScriptInventoryEndpoint::Warehouse {
                         handle: binding.handle.clone(),
                     },
+                    item: None,
                 },
                 4,
                 revision,
@@ -1643,6 +1672,7 @@ async fn a_replayed_haul_deposits_once() {
             destination: ScriptInventoryEndpoint::Warehouse {
                 handle: binding.handle.clone(),
             },
+            item: None,
         },
         4,
         revision,
@@ -1731,6 +1761,7 @@ async fn a_haul_deposits_past_a_stack_the_container_refuses() {
                     destination: ScriptInventoryEndpoint::Warehouse {
                         handle: binding.handle.clone(),
                     },
+                    item: None,
                 },
                 8,
                 revision,
@@ -1758,5 +1789,525 @@ async fn a_haul_deposits_past_a_stack_the_container_refuses() {
         carry_of(&storage, &handle),
         vec![("minecraft:wheat".to_owned(), 3)],
         "the stack that fit nowhere stays with the worker"
+    );
+}
+
+/// (CP-003) A worker issued an item out of a bound warehouse really takes that
+/// item: the named resource is the one that moves even when it sits behind
+/// another stack, the container's own slots and the worker's record commit
+/// under ONE journal decision, and the assignment reports the units the
+/// container gave up - consumed, not produced.
+#[tokio::test]
+async fn worker_withdraws_the_named_item_from_the_bound_warehouse() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let items = solaris_required_items();
+    let axe = items
+        .id_of(&Identifier::parse("minecraft:iron_axe").unwrap())
+        .expect("an iron axe is a required item");
+    let log = items
+        .id_of(&Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log is a required item");
+    // The item the worker was issued sits behind a stack it did not ask for:
+    // storage order alone would hand it the logs.
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(log, 10);
+    chest[1] = ItemStack::new(axe, 5);
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    assert_eq!(bind.failure(), None, "bind: {bind:?}");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(&mut storage, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "withdraw-warehouse",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle.clone(),
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_axe".to_owned()),
+                },
+                2,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(assignment.work_units_done, 2, "two units really moved");
+    assert_eq!(
+        assignment.state,
+        ScriptWorkState::Committed,
+        "the whole plan is done"
+    );
+    assert_eq!(
+        assignment
+            .changes
+            .iter()
+            .map(|change| (change.item_id.as_str(), change.delta))
+            .collect::<Vec<_>>(),
+        vec![("minecraft:iron_axe", -2)],
+        "the receipt reports what left the container"
+    );
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:iron_axe".to_owned(), 1); 2],
+        "the worker holds the item it was issued, and only it - one slot per axe, \
+         because a tool does not stack"
+    );
+
+    let container = fixture.world.container(position);
+    assert_eq!(container[0].count, 10, "the stack it did not ask for stays");
+    assert_eq!(container[1].count, 3, "the container gave up two axes");
+
+    // The container half fences the observed and planned images, and the move
+    // carries no player participant.
+    let transfers = fixture.world.deposits();
+    assert_eq!(transfers.len(), 1, "one transfer, one real move");
+    assert_eq!(transfers[0].expected_container[1].count, 5);
+    assert_eq!(transfers[0].updated_container[1].count, 3);
+    assert!(transfers[0].player.is_none());
+
+    // ONE decision carries the container and the worker's record, and the
+    // plugin's own receipt is durable with it.
+    let journal = fixture
+        .sessions
+        .world_chunk_journal()
+        .expect("the fixture owns a journal");
+    let pending = journal.pending_decisions_for_test();
+    assert_eq!(pending.len(), 1, "one transfer, one decision");
+    assert!(
+        pending[0].inventory_batch().unwrap().is_some(),
+        "the worker's record change rides the container's own decision"
+    );
+    assert!(
+        storage
+            .operation_receipt(OWNER, "withdraw-warehouse")
+            .is_some()
+    );
+
+    // A warehouse query reads the container the worker was issued from.
+    let read = fixture
+        .runtime
+        .execute_owned_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle),
+        )
+        .await
+        .expect("the query reaches the durable boundary");
+    let snapshot = owned_snapshot_of(&read);
+    let slot = snapshot.slots[1]
+        .item
+        .as_ref()
+        .expect("the remaining axes are still in the container");
+    assert_eq!(slot.resource_id, "minecraft:iron_axe");
+    assert_eq!(slot.count, 3);
+}
+
+/// (CP-003) The same withdrawal can land in the worker's own equipment: the
+/// issued tool reaches the endpoint a worker really uses it from.
+#[tokio::test]
+async fn worker_withdraws_into_its_own_equipment() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let hoe = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:iron_hoe").unwrap())
+        .expect("an iron hoe is a required item");
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(hoe, 4);
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(&mut storage, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "withdraw-equipment",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle.clone(),
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentEquipment {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_hoe".to_owned()),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(assignment.work_units_done, 1);
+    assert_eq!(
+        assignment
+            .changes
+            .iter()
+            .map(|change| (change.item_id.as_str(), change.delta))
+            .collect::<Vec<_>>(),
+        vec![("minecraft:iron_hoe", -1)]
+    );
+    assert_eq!(
+        equipment_of(&storage, &handle),
+        vec![("minecraft:iron_hoe".to_owned(), 1)],
+        "the issued hoe is in the worker's equipment"
+    );
+    assert!(carry_of(&storage, &handle).is_empty());
+    assert_eq!(fixture.world.container(position)[0].count, 3);
+}
+
+/// (CP-003) An item the container does not hold stops the job with
+/// `missing_input`: nothing moves, the worker's record is untouched, and no
+/// decision is spent.
+#[tokio::test]
+async fn a_withdrawal_of_an_item_the_container_does_not_hold_pauses_with_missing_input() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let log = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log is a required item");
+    let position = fixture.container_position(1);
+    let chest = vec![
+        ItemStack::new(log, 10),
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+        ItemStack::EMPTY,
+    ];
+    fixture.world.set_container(position, chest.clone());
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(&mut storage, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "withdraw-absent",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle.clone(),
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_axe".to_owned()),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::MissingInput));
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(assignment.changes.is_empty());
+    assert!(carry_of(&storage, &handle).is_empty());
+    assert_eq!(
+        fixture.world.container(position),
+        chest,
+        "the container is untouched"
+    );
+    assert!(
+        fixture.world.deposits().is_empty(),
+        "a warehouse that holds nothing to issue is never asked to move anything"
+    );
+    assert!(
+        fixture
+            .sessions
+            .world_chunk_journal()
+            .expect("the fixture owns a journal")
+            .pending_decisions_for_test()
+            .is_empty(),
+        "a refused withdrawal spends no decision"
+    );
+}
+
+/// (CP-003) A worker with no room left for the issued item pauses the step as
+/// interrupted - the item stays in the container until the worker has room -
+/// rather than reporting storage that is really there.
+#[tokio::test]
+async fn a_withdrawal_into_a_full_carry_leaves_the_warehouse_untouched() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let axe = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:iron_axe").unwrap())
+        .expect("an iron axe is a required item");
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(axe, 5);
+    fixture.world.set_container(position, chest.clone());
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    // Every carry slot is full of another item the axe cannot merge into.
+    let revision = seed_carry(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:birch_log", 64); 8],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "withdraw-full",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle.clone(),
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_axe".to_owned()),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::Interrupted));
+    assert_eq!(assignment.work_units_done, 0);
+    assert_eq!(
+        fixture.world.container(position),
+        chest,
+        "the warehouse keeps the item it could not hand over"
+    );
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:birch_log".to_owned(), 64); 8],
+        "the worker's own slots are exactly as they were"
+    );
+    assert!(fixture.world.deposits().is_empty());
+    assert!(
+        fixture
+            .sessions
+            .world_chunk_journal()
+            .expect("the fixture owns a journal")
+            .pending_decisions_for_test()
+            .is_empty(),
+        "a step with nowhere to put the item spends no decision"
+    );
+}
+
+/// (CP-003) A handle core cannot resolve is `no_storage`, not a silent move:
+/// the worker keeps its hands off a warehouse it cannot see.
+#[tokio::test]
+async fn a_withdrawal_through_an_unknown_handle_pauses_with_no_storage() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(
+        solaris_required_items()
+            .id_of(&Identifier::parse("minecraft:iron_axe").unwrap())
+            .expect("an iron axe is a required item"),
+        5,
+    );
+    fixture.world.set_container(position, chest.clone());
+    let revision = seed_carry(&mut storage, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "withdraw-unknown",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: "warehouse:settlement:nobody:0".to_owned(),
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_axe".to_owned()),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(carry_of(&storage, &handle).is_empty());
+    assert_eq!(fixture.world.container(position), chest);
+    assert!(fixture.world.deposits().is_empty());
+    // The pause itself is durable: a worker that could not see the warehouse
+    // stays paused with the storage reason until the next assignment.
+    let record = storage
+        .resident_orders()
+        .record(&handle)
+        .cloned()
+        .expect("the worker's record is durable");
+    let work = record.work.expect("the paused assignment is durable");
+    assert_eq!(work.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(work.done, 0);
+    assert_eq!(work.state, ScriptWorkState::Paused);
+}
+
+/// (CP-003, REC-02 shape) Replaying the same withdrawal takes the item once:
+/// the stored receipt answers, and neither the container nor the record moves
+/// again.
+#[tokio::test]
+async fn a_replayed_withdrawal_takes_the_item_once() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let axe = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:iron_axe").unwrap())
+        .expect("an iron axe is a required item");
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(axe, 5);
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry(&mut storage, &handle, uuid, &[]);
+
+    let request = work_request(
+        "withdraw-replay",
+        &handle,
+        ScriptResidentWorkOrder::Haul {
+            source: ScriptInventoryEndpoint::Warehouse {
+                handle: binding.handle.clone(),
+            },
+            destination: ScriptInventoryEndpoint::ResidentCarry {
+                handle: handle.clone(),
+            },
+            item: Some("minecraft:iron_axe".to_owned()),
+        },
+        2,
+        revision,
+    );
+    let first = fixture.execute(&mut storage, &request).await;
+    assert_eq!(first.failure(), None, "first withdrawal: {first:?}");
+    let replay = fixture.execute(&mut storage, &request).await;
+    assert_eq!(replay.failure(), None, "replay: {replay:?}");
+    assert_eq!(
+        work_of(&replay),
+        work_of(&first),
+        "the replay answers the stored receipt"
+    );
+    assert_eq!(
+        fixture.world.deposits().len(),
+        1,
+        "one transfer, one real move"
+    );
+    assert_eq!(fixture.world.container(position)[0].count, 3);
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:iron_axe".to_owned(), 1); 2]
     );
 }

@@ -1,4 +1,7 @@
 /target/
+# The guest SDK is its own workspace and builds its fixtures here; those bytes
+# are reproducible from `sdk/rust` and never belong in a commit.
+/sdk/rust/target/
 /.gradle/
 **/.gradle/
 **/build/

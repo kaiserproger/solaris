@@ -1,0 +1,82 @@
+// Durable plugin storage: the values a plugin keeps across restarts.
+//
+// The server's world-backed storage owns the data; the contract only names it.
+// Both calls are requests, so a plugin never blocks on I/O and never reads a
+// value the durability layer has not committed: the answer arrives as an event
+// with the same request id. A plugin cannot name another plugin's keys - the
+// host binds the owner, exactly as it binds the plugin id.
+interface storage {
+    /// What one key holds plus the revision a later compare-and-swap must name.
+    /// Absent `value` means the key holds nothing, and then `version` is absent
+    /// too: a plugin cannot swap against a revision it invented.
+    record storage-record {
+        value: option<string>,
+        version: option<u64>,
+    }
+
+    /// One compare-and-swap of one key inside a storage batch.
+    record storage-cas-mutation {
+        /// 1..128 bytes, unique inside its batch.
+        key: string,
+        /// The revision the swap expects. Absent means "only if the key holds
+        /// nothing"; a plugin never picks the revision it creates.
+        expected-version: option<u64>,
+        /// 1..4096 bytes.
+        value: string,
+    }
+
+    /// One deletion inside a storage batch.
+    record storage-delete-mutation {
+        /// 1..128 bytes, unique inside its batch.
+        key: string,
+        /// The revision the deletion expects. The server removes only a key that
+        /// holds exactly this revision, so a deletion always names one: an absent
+        /// version matches no key at all and the whole batch is refused with
+        /// `stale-revision` rather than deleting whatever is there now.
+        expected-version: option<u64>,
+    }
+
+    /// One mutation of one storage batch. A batch applies every mutation it
+    /// lists or none of them, at one revision.
+    variant storage-mutation {
+        cas(storage-cas-mutation),
+        delete(storage-delete-mutation),
+    }
+
+    /// One key a committed batch changed, as the server reports the commit back:
+    /// the keys it wrote and the keys it removed, never the values.
+    record storage-change {
+        /// 1..128 bytes.
+        key: string,
+        /// Whether the commit removed the key. `false` means the batch wrote it
+        /// and it now holds the value the batch named, at the commit's revision.
+        deleted: bool,
+    }
+
+    /// Why storage could not answer at all. The two are different operator
+    /// problems: one server has no world-backed storage, the other stopped
+    /// storing after a durability failure.
+    enum storage-failure {
+        unavailable,
+        durability-failed,
+    }
+
+    /// The answer to one `storage-get`.
+    variant storage-get-outcome {
+        read(storage-record),
+        failed(storage-failure),
+    }
+
+    /// The answer to one `storage-cas`. A swap that did not commit reports no
+    /// reason beyond `refused`: the server does not tell a plugin whether the
+    /// revision had moved, the plugin was over its quota, the revision would
+    /// overflow, or the request id was reused for a different mutation. The
+    /// plugin re-reads the key and decides again; a retry with fresh state is the
+    /// plugin's own decision, never an automatic one.
+    variant storage-cas-outcome {
+        /// Committed, and the key now holds this revision.
+        committed(u64),
+        refused,
+        failed(storage-failure),
+    }
+}

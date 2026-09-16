@@ -32,7 +32,7 @@ use super::resident_orders::{
     DurableResidentStack, DurableResidentWork, DurableTargetRef, TARGET_REF_TTL_REVISIONS,
     item_changes, member_fence, place_formation, target_policy,
 };
-use super::world_inventory::{ResidentDepositCommit, ResidentWarehouseDeposit};
+use super::world_inventory::{ResidentDepositCommit, ResidentWarehouseMove};
 use super::{PluginStorage, PluginStorageMutationError, ScriptStoragePrepareOutcome};
 use crate::play::resident_work::{RESIDENT_WORLD_DIMENSION, ResidentDrop, ResidentWorld};
 use crate::play::{ResidentAttack, ResidentGoal};
@@ -242,7 +242,7 @@ impl super::InventoryRuntime {
         let mut next = record.clone();
         let mut ledger = ItemLedger::default();
         let planned = work_units.min(MAX_WORK_CELLS);
-        let mut staged: Option<ResidentWarehouseDeposit> = None;
+        let mut staged: Option<ResidentWarehouseMove> = None;
         let (done, reason) = self
             .run_resident_work(
                 storage,
@@ -300,13 +300,13 @@ impl super::InventoryRuntime {
                 )?;
             }
             Some(deposit) => {
-                // The deposit's record change and the container move under one
-                // decision: the work assignment that reports the moved units
-                // rides the container's own journal append, so a worker never
-                // reports cargo the container did not take, and never takes
-                // cargo it does not report.
+                // The record change and the container move under one decision:
+                // the work assignment that reports the moved units rides the
+                // container's own journal append, so a worker never reports a
+                // move the container did not make - and a withdrawal reports
+                // what the container gave up.
                 for (item_id, count) in &deposit.moved {
-                    ledger.add(item_id, i64::try_from(*count).unwrap_or(i64::MAX));
+                    ledger.add(item_id, deposit.container_delta(*count));
                 }
                 let mut committed = (*deposit.record).clone();
                 committed.work = Some(Box::new(DurableResidentWork {
@@ -318,7 +318,7 @@ impl super::InventoryRuntime {
                     reason,
                 }));
                 let commit = self
-                    .commit_resident_warehouse_deposit(
+                    .commit_resident_warehouse_move(
                         storage,
                         plugin_id,
                         request,
@@ -422,7 +422,7 @@ impl super::InventoryRuntime {
         planned: u64,
         already_done: u64,
         ledger: &mut ItemLedger,
-        staged: &mut Option<ResidentWarehouseDeposit>,
+        staged: &mut Option<ResidentWarehouseMove>,
     ) -> (u64, Option<ScriptWorkPauseReason>) {
         let remaining = planned.saturating_sub(already_done);
         if remaining == 0 {
@@ -752,24 +752,35 @@ impl super::InventoryRuntime {
             ScriptResidentWorkOrder::Haul {
                 source,
                 destination,
+                item,
             } => {
-                // A haul into a bound warehouse container is not a move inside
-                // the worker's own record: its other half is a real container,
-                // and it commits with this step's record change as one decision.
-                if matches!(destination, ScriptInventoryEndpoint::Warehouse { .. }) {
-                    let (moved, reason) = self.stage_warehouse_haul(
+                // A haul with a bound warehouse on either side is not a move
+                // inside the worker's own record: its other half is a real
+                // container, and it commits with this step's record change as one
+                // decision.
+                if matches!(source, ScriptInventoryEndpoint::Warehouse { .. })
+                    || matches!(destination, ScriptInventoryEndpoint::Warehouse { .. })
+                {
+                    let (moved, reason) = self.stage_warehouse_move(
                         storage,
                         plugin_id,
                         record,
                         source,
                         destination,
+                        item.as_deref(),
                         remaining,
                         staged,
                     );
                     (already_done + moved, reason)
                 } else {
-                    let (moved, reason) =
-                        self.haul_resident_items(record, source, destination, remaining, ledger);
+                    let (moved, reason) = self.haul_resident_items(
+                        record,
+                        source,
+                        destination,
+                        item.as_deref(),
+                        remaining,
+                        ledger,
+                    );
                     (already_done + moved, reason)
                 }
             }
@@ -796,60 +807,75 @@ impl super::InventoryRuntime {
         }
     }
 
-    /// Plan one haul whose destination is a bound warehouse container.
+    /// Plan one haul that has a bound warehouse container on either side.
     ///
     /// The step moves nothing by itself: it stages the worker's record
     /// after-image and the container images it read, and the caller commits
     /// both together under one durable decision. A container core cannot
-    /// resolve, or one that cannot take the cargo, stops the job with
-    /// `no_storage` and leaves the worker holding every item.
+    /// resolve, or one that cannot take the cargo (deposit) or does not hold
+    /// what was asked for (withdrawal), stops the job with the reason its
+    /// failure family names and leaves every item where it was.
     #[allow(clippy::too_many_arguments)]
-    fn stage_warehouse_haul(
+    fn stage_warehouse_move(
         &self,
         storage: &PluginStorage,
         plugin_id: &str,
         record: &DurableResidentOrderRecord,
         source: &ScriptInventoryEndpoint,
         destination: &ScriptInventoryEndpoint,
+        item: Option<&str>,
         limit: u64,
-        staged: &mut Option<ResidentWarehouseDeposit>,
+        staged: &mut Option<ResidentWarehouseMove>,
     ) -> (u64, Option<ScriptWorkPauseReason>) {
-        let deposit = match self.plan_resident_warehouse_deposit(
+        let planned = match self.plan_resident_warehouse_move(
             storage,
             plugin_id,
             source,
             destination,
+            item,
             record,
             limit,
         ) {
-            Ok(deposit) => deposit,
+            Ok(planned) => planned,
             Err(failure) => {
                 let reason = match failure {
-                    // A bound container the worker cannot deposit into is a
-                    // storage refusal: the cargo stays with the worker.
-                    ScriptOperationFailure::Capacity
-                    | ScriptOperationFailure::NotFound
+                    // A container the worker cannot move through is a storage
+                    // refusal: every item stays where it was.
+                    ScriptOperationFailure::NotFound
                     | ScriptOperationFailure::Unloaded
                     | ScriptOperationFailure::Blocked
                     | ScriptOperationFailure::Forbidden => ScriptWorkPauseReason::NoStorage,
+                    // A destination with no room is a storage refusal when the
+                    // storage is the container. A worker taking items out of a
+                    // container has no storage problem - its own slots are full -
+                    // and the opposite move (a deposit back into the container)
+                    // is what frees room, so that step is interrupted rather
+                    // than refused.
+                    ScriptOperationFailure::Capacity
+                        if !matches!(source, ScriptInventoryEndpoint::Warehouse { .. }) =>
+                    {
+                        ScriptWorkPauseReason::NoStorage
+                    }
                     failure => work_failure_reason(failure),
                 };
                 return (0, Some(reason));
             }
         };
-        let units = deposit.units();
-        *staged = Some(deposit);
+        let units = planned.units();
+        *staged = Some(planned);
         (units, None)
     }
 
     /// Move real items between the worker's canonical resident endpoints through
-    /// the same slot semantics C1 defines. A warehouse endpoint core cannot
-    /// resolve stops the job with `no_storage` and moves nothing.
+    /// the same slot semantics C1 defines, taking only the named item when the
+    /// order names one. A warehouse endpoint core cannot resolve stops the job
+    /// with `no_storage` and moves nothing.
     fn haul_resident_items(
         &self,
         record: &mut DurableResidentOrderRecord,
         source: &ScriptInventoryEndpoint,
         destination: &ScriptInventoryEndpoint,
+        item: Option<&str>,
         limit: u64,
         ledger: &mut ItemLedger,
     ) -> (u64, Option<ScriptWorkPauseReason>) {
@@ -878,6 +904,11 @@ impl super::InventoryRuntime {
                     break;
                 };
                 if stack.count == 0 {
+                    break;
+                }
+                if item.is_some_and(|wanted| stack.item_id.as_str() != wanted) {
+                    // The order named an item this slot does not hold: it stays
+                    // where it is and the next source slot is tried.
                     break;
                 }
                 if resident_slot(record, destination, destination_index).is_some() {

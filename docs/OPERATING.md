@@ -177,13 +177,14 @@ those values requires an empty/new `world_dir`; do not delete only the contract
 file or combine region files from two contracts. Back up the complete directory
 before upgrading an alpha.
 
-Worldgen revision 21 keeps rivers wall-to-wall with seeded width variation,
+Worldgen revision 24 keeps rivers wall-to-wall with seeded width variation,
 shallow banks and varying channel beds, tapers headwater rivers at their source,
-litters river beds with gravel bars, and restricts beaches to columns that
-actually touch water. Revision 21 is not compatible with earlier generated
-worlds: select a fresh `world_dir` to use the new terrain. Existing chunks are
-not retroactively reshaped, and editing `world.json` to bypass the revision
-check would mix incompatible terrain.
+litters river beds with gravel bars, restricts beaches to columns that actually
+touch water, and generates the five vanilla village structures with their decor
+(see [`VILLAGE_GENERATION.md`](VILLAGE_GENERATION.md)). Revision 24 is not
+compatible with earlier generated worlds: select a fresh `world_dir` to use the
+current terrain. Existing chunks are not retroactively reshaped, and editing
+`world.json` to bypass the revision check would mix incompatible terrain.
 
 Plugin worldgen declarations are startup-only and become part of this contract.
 An unversioned vanilla Anvil import cannot use Solaris plugin worldgen to fill
@@ -301,6 +302,15 @@ rates. Use `--check` to inspect `effective_chunk_pipeline` and
 `effective_autoscale`. The old `scale_*_after_ticks` keys are removed; replace
 them with the seconds-based keys rather than carrying short observation counts
 into a new config.
+
+Worker capacity stays derived from the process CPU limit unless the operator
+sets `[chunk_pipeline] worker_threads`. That key is an absolute bound, not a
+percentage: it caps the shared chunk/entity CPU pool (the region owner lanes
+size themselves from the same number), fixes the chunk IO pool at one thread,
+and is the number the startup chunk bake uses instead of the CPU count. Set it
+on a small host, or when several servers share one machine, so a single server
+cannot claim every core; leave it out (or `0`) to derive the split as before.
+Performance profiles that set their own workload knobs are unaffected.
 
 ## Plugins
 

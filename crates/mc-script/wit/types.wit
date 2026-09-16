@@ -1,0 +1,60 @@
+// Shared value types of the `solaris:plugin` contract.
+//
+// These are the values a plugin may name and receive. They carry no authority:
+// every identifier is validated by the host, and holding one never proves a
+// right to the object it names. Stable player identity is separated from the
+// session that is currently connected - a message addressed to a session never
+// reaches the player's next session.
+/// One stable player identity. Survives reconnect.
+/// One live connection of a player. Dies with the connection.
+/// One absolute position, with the coordinates the server's own validator accepts.
+/// One server tick, in the tick counter of the owner that produced the value.
+/// Ordered position of one event inside the batch that carried it.
+/// Why a guest call failed. The host reports the same variants to the operator,
+/// so a plugin's own failures stay distinguishable from a host refusal.
+/// One log line a plugin may emit. The host owns rate and size limits.
+interface types {
+    type player-id = string;
+
+    type session-id = u64;
+
+    /// One absolute position inside one dimension.
+    ///
+    /// The server's own position validator is what defines it: every coordinate
+    /// finite, `|x|` and `|z|` at most 30 000 000, `|y|` at most 20 000 000. The
+    /// host never clamps a coordinate a plugin sent and never substitutes a
+    /// default for one it cannot read: a request outside these ranges is refused
+    /// as the plugin's own malformed answer.
+    record position {
+        x: f64,
+        y: f64,
+        z: f64,
+    }
+
+    type tick = u64;
+
+    type sequence = u64;
+
+    enum plugin-error {
+        /// The guest asked for something its manifest does not grant.
+        denied,
+        /// The guest's answer violated the contract (size, range, tag, encoding).
+        invalid,
+        /// The guest exceeded a budget of its instance.
+        budget,
+        /// The named object is gone or never existed.
+        not-found,
+        /// The call was made in a phase that does not allow it.
+        unexpected,
+        /// The guest itself reported a failure.
+        failed,
+    }
+
+    enum log-level {
+        error,
+        warn,
+        info,
+        debug,
+        trace,
+    }
+}

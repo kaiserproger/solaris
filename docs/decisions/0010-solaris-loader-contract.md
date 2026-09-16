@@ -2,6 +2,9 @@
 
 **Date:** 2026-07-23
 **Status:** Accepted, staged implementation
+**Current wire contract:** Loader wire **3** with artifact index schema **2**
+(`crates/mc-net/src/loader.rs`); the protocol numbers quoted in this ADR's
+staged-boundary narrative are the ones it was written against.
 
 ## Problem
 

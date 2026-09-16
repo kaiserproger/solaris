@@ -1,6 +1,6 @@
 # Phase 4 multiplayer authority / publication evidence — 2026-08-21
 
-Target: Phase 4 item 4 in `docs/PUBLIC_ALPHA_PLAN.md`: prove shared-state authority and publication with at least two real protocol clients for shared blocks, containers, combat, pickups, entity visibility, disconnect, and reconnect.
+Target: Phase 4 item 4 in `docs/milestones/public-alpha-plan.md`: prove shared-state authority and publication with at least two real protocol clients for shared blocks, containers, combat, pickups, entity visibility, disconnect, and reconnect.
 
 Tests marked ignored by default because they require local 26.1.2 sidecar/data fixtures were executed explicitly with `--ignored`; an ignored default listing is not treated as evidence by itself.
 

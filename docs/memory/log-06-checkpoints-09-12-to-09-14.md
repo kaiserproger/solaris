@@ -185,7 +185,7 @@ grouped disk sync and failure signal. Gameplay acknowledges RAM acceptance;
 the owner explicitly accepts losing the unflushed tail on a crash. Save-all,
 background/pressure dirty flush and clean shutdown fence accepted work before
 acknowledging durable storage. The writer owns the world lease until shutdown.
-The contract is in [ADR 0005](decisions/0005-regional-simulation.md#journal-durability).
+The contract is in [ADR 0005](../decisions/0005-regional-simulation.md#journal-durability).
 
 - Removed synchronous reservation rewrites, separate journal workers and obsolete
   persistence bypasses. Moved the substantial journal tests to a sibling file;

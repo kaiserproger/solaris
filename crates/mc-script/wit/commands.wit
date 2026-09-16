@@ -1,0 +1,274 @@
+// Commands a plugin asks the host to perform.
+//
+// A command is a request, never an effect: the host validates the whole batch a
+// callback returned, checks the plugin's grants and the admission budget, and
+// only then hands it to the existing game owners, which re-check it before they
+// change anything. A command that names a player addresses the stable identity;
+// a command that must not survive a reconnect addresses the session it was
+// issued for.
+interface commands {
+    use types.{player-id, position, session-id};
+    use storage.{storage-mutation};
+
+    /// Where one message goes. A player target reaches whichever session that
+    /// player has when the host applies the command, so it survives a reconnect;
+    /// a session target is dropped when that exact connection is gone. A line
+    /// meant for the operator log is the `host.log` import, not a command: it
+    /// changes nothing in the game and needs no admission.
+    variant message-target {
+        player(player-id),
+        session(session-id),
+    }
+
+    /// One line of chat or one operator log line.
+    record send-message {
+        target: message-target,
+        text: string,
+    }
+
+    /// One read of this plugin's own durable storage. The host binds the owner;
+    /// a plugin cannot name another plugin's key.
+    record storage-get {
+        /// The plugin's correlation id, 1..64 bytes of lowercase letters, digits,
+        /// `_` and `-`. The answer names it back, so a plugin may keep several
+        /// reads in flight.
+        request: string,
+        /// 1..128 bytes.
+        key: string,
+    }
+
+    /// One compare-and-swap of this plugin's own durable storage.
+    record storage-cas {
+        /// The plugin's correlation id, 1..64 bytes, as in `storage-get`.
+        request: string,
+        /// 1..128 bytes.
+        key: string,
+        /// The revision the swap expects. Absent means "only if the key holds
+        /// nothing"; a plugin never picks the revision it creates.
+        expected-version: option<u64>,
+        /// 1..4096 bytes.
+        value: string,
+    }
+
+    /// One bounded read of the players who are connected right now.
+    record list-online-players {
+        /// The plugin's correlation id, 1..64 bytes, as in `storage-get`.
+        request: string,
+        /// How many players the plugin wants at most, 1..256. The server answers
+        /// fewer and sets `truncated` when more were connected.
+        limit: u32,
+    }
+
+    /// One authoritative teleport of one connected player, inside the dimension
+    /// that player is already in.
+    ///
+    /// The request names the *session*, not the stable identity, because a
+    /// teleport is an effect on one live connection: a request the server
+    /// receives after that connection ended is refused with
+    /// `player-unavailable` instead of moving whoever holds the identity now.
+    /// There is no dimension member - cross-dimension transfer is not part of
+    /// this contract.
+    ///
+    /// A package may send it only when its manifest declares the
+    /// `player_teleport` capability; the host converts a batch under the
+    /// package's own grants, so an undeclared capability is refused before the
+    /// server sees the command.
+    ///
+    /// Bounds: this record carries no list and no text, so the host-call budget
+    /// is not what bounds it. Its correlation id is the contract's 64-byte
+    /// script id and its coordinates are the `position` bounds, both enforced
+    /// when the host converts the record into the server's own DTO - a request
+    /// outside them is refused, never clamped.
+    record teleport-player {
+        /// The plugin's correlation id, 1..64 bytes, as in `storage-get`. The
+        /// answer event carries it back, so a plugin may keep several teleports
+        /// in flight.
+        request: string,
+        /// The connection to move.
+        session: session-id,
+        /// Where the player goes. The server's own position validator bounds
+        /// every coordinate as `position` documents; the host refuses a request
+        /// outside those bounds rather than clamping it.
+        position: position,
+    }
+
+    /// One atomic batch of mutations of this plugin's own durable storage.
+    ///
+    /// A batch is all-or-nothing: it changes every key it names at one revision,
+    /// or it changes nothing. Canonicalization, replication and durability belong
+    /// to the server's storage owner; a plugin only asks.
+    ///
+    /// A plugin names the operation twice and both names survive the contract. The
+    /// `request` correlates the answer with this call. The `operation-id` is the
+    /// durable name the server records the commit under, which is what a later
+    /// `operation-status` addresses: a plugin that never saw its answer, or that
+    /// restarted, or that wants the outcome of a commit it made long ago, re-probes
+    /// by that id instead of re-applying the batch.
+    ///
+    /// A package may send it only when its manifest declares the
+    /// `storage_batches` capability, and that same name has to be listed in the
+    /// manifest's `required_features`, which is where the server's own feature
+    /// check (`FEATURE_CAPABILITIES`) insists on it. The host converts a callback's
+    /// commands under the package's own grants, so an undeclared capability is
+    /// refused by name before the server sees anything.
+    ///
+    /// Bounds: this record's list is the one the server's own operation DTO
+    /// already validates, and its bounds are that DTO's - at most
+    /// `mc_script::MAX_INVENTORY_STORAGE_MUTATIONS` (16) mutations, each key
+    /// 1..`MAX_PLUGIN_STORAGE_KEY_BYTES` (128) bytes and unique inside the batch,
+    /// each value 1..`MAX_PLUGIN_STORAGE_VALUE_BYTES` (4096) bytes, each expected
+    /// revision at most `MAX_SCRIPT_WORLD_TIME`, and at least one mutation. They are
+    /// enforced by `mc_script`'s storage-mutation validator when the host converts
+    /// this record into the DTO: a batch outside them is refused as the plugin's
+    /// own malformed answer, never clamped, and never truncated afterwards. The
+    /// whole answer is additionally bounded before Wasmtime copies anything out of
+    /// guest memory by `PluginLimits::hostcall_bytes`.
+    record storage-batch-cas {
+        /// The plugin's correlation id, 1..64 bytes, as in `storage-get`. The
+        /// answer carries it back, so a plugin may keep several batches in flight.
+        request: string,
+        /// The durable operation id, 1..64 bytes in the same alphabet. A batch
+        /// that repeats an operation id with byte-identical content replays the
+        /// outcome the server recorded and applies nothing; one that reuses an id
+        /// for different content is refused with `operation-conflict`.
+        operation-id: string,
+        /// The mutations to apply, as one atomic batch.
+        mutations: list<storage-mutation>,
+    }
+
+    /// One probe of a durable operation this plugin already named.
+    ///
+    /// It reads the outcome the server recorded for that operation id and applies
+    /// nothing, which is why it is the safe thing a plugin does when it does not
+    /// know whether an earlier batch committed. An id the server never recorded is
+    /// answered `not-found`: a lookup that found nothing, not evidence that the
+    /// operation was refused.
+    ///
+    /// A package may send it only when its manifest declares the
+    /// `storage_batches` capability, exactly as for `storage-batch-cas`.
+    ///
+    /// Bounds: the record carries no list and no text beyond its two ids, each the
+    /// contract's 64-byte script id, so it is the host-call budget
+    /// (`PluginLimits::hostcall_bytes`) that bounds what lifting it costs.
+    record operation-status {
+        /// The plugin's correlation id, 1..64 bytes.
+        request: string,
+        /// The durable operation id to look up, 1..64 bytes.
+        operation-id: string,
+    }
+
+    /// One unprotected zone: a bounded box of finite coordinates and nothing else.
+    ///
+    /// The owner derives membership, lifecycle and protection from the box it was
+    /// given, so no other shape of region exists in this contract and a plugin
+    /// cannot declare one it does not own: the owner keys every zone by the plugin
+    /// that defined it. The owner admits every edit inside this box, which is what
+    /// a zone with no protection record means - not "protection to be decided
+    /// later"; a plugin that wants the owner to protect the box sends
+    /// `upsert-protected-zone` instead.
+    ///
+    /// A package may send it only when its manifest declares the `zones`
+    /// capability; the host converts a callback's commands under the package's own
+    /// grants, so an undeclared capability is refused by name before the server
+    /// sees the command.
+    ///
+    /// The answer is `zone-command-answered`, naming the zone this command named:
+    /// a zone command carries no correlation id, because the server's own zone
+    /// answer names the zone rather than a request.
+    ///
+    /// Bounds: this record carries no list and no text of the plugin's own, so the
+    /// host-call budget (`PluginLimits::hostcall_bytes`) is not what bounds it. Its
+    /// `zone` is the contract's script id and its `dimension` a contract resource
+    /// id, and both are enforced - with the two corners - by `mc_script`'s own zone
+    /// validator (`ScriptAxisAlignedZone::try_new`) when the host converts this
+    /// record into the server's DTO: an id, a dimension or a coordinate the
+    /// validator cannot accept is refused as the plugin's own malformed answer,
+    /// never clamped, truncated or defaulted. A box whose minimum corner is past
+    /// its maximum is refused the same way, because the server has no zone to make
+    /// of it.
+    record upsert-zone {
+        /// The zone's id, 1..`mc_script::MAX_SCRIPT_ID_BYTES` (64) bytes of
+        /// lowercase letters, digits, `_` and `-`, in the same alphabet as
+        /// `storage-get`'s request id. The owner's answer names it back.
+        zone: string,
+        /// The dimension the box lives in, 1..`mc_script::MAX_SCRIPT_RESOURCE_ID_BYTES`
+        /// (128) bytes as a contract resource id, for example `minecraft:overworld`.
+        dimension: string,
+        /// The box's lower corner, with every coordinate inside the `position`
+        /// bounds.
+        minimum: position,
+        /// The box's upper corner. Every coordinate is at or past the matching one
+        /// of `minimum`.
+        maximum: position,
+    }
+
+    /// One protected zone: the same box as `upsert-zone`, plus the one protection
+    /// record that belongs to it.
+    ///
+    /// The protection record names the one actor whose edits inside the box the
+    /// owner admits, whoever runs it; an operator of the server is admitted either
+    /// way. Naming nobody is not a way to build an unprotectable box - a zone the
+    /// owner cannot protect is refused, and a plugin that wants no protection sends
+    /// `upsert-zone` instead.
+    ///
+    /// `zone`, `dimension`, `minimum` and `maximum` are `upsert-zone`'s own four
+    /// fields under the bounds documented there, and the same `zones` capability
+    /// admits this command. The protection record is one player uuid of at most
+    /// `mc_script::MAX_SCRIPT_PLAYER_UUID_BYTES` (64) bytes, enforced by
+    /// `ScriptZoneProtection::try_actor_or_operator` when the host converts this
+    /// record: a value the server's validator cannot accept is refused as the
+    /// plugin's own malformed answer, never clamped and never replaced with a
+    /// default actor. The answer is `zone-command-answered`, as for `upsert-zone`.
+    record upsert-protected-zone {
+        /// The zone's id, 1..`mc_script::MAX_SCRIPT_ID_BYTES` (64) bytes.
+        zone: string,
+        /// The dimension the box lives in, 1..`mc_script::MAX_SCRIPT_RESOURCE_ID_BYTES`
+        /// (128) bytes as a contract resource id.
+        dimension: string,
+        /// The uuid of the one actor the owner admits inside the box, 1..64 bytes.
+        /// The owner normalizes it the way it normalizes every player uuid, so a
+        /// uuid the server accepts is the same actor however it is written.
+        allowed-actor-uuid: string,
+        /// The box's lower corner, with every coordinate inside the `position`
+        /// bounds.
+        minimum: position,
+        /// The box's upper corner. Every coordinate is at or past the matching one
+        /// of `minimum`.
+        maximum: position,
+    }
+
+    /// One removal of a zone this plugin owns.
+    ///
+    /// A removal is idempotent in the owner: an id the owner does not hold is
+    /// applied as nothing to remove, not refused. The answer says which of the two
+    /// the owner did, by naming the zone and whether it took the command.
+    ///
+    /// A package may send it only when its manifest declares the `zones`
+    /// capability, exactly as for `upsert-zone`; the owner removes only zones the
+    /// plugin itself defined, so a removal never reaches another package's box.
+    ///
+    /// Bounds: the record carries this contract's script id and nothing else, which
+    /// `mc_script`'s own command validator enforces when the host converts it: an
+    /// id the validator cannot accept is refused as the plugin's own malformed
+    /// answer.
+    record remove-zone {
+        /// The zone to remove, 1..`mc_script::MAX_SCRIPT_ID_BYTES` (64) bytes.
+        zone: string,
+    }
+
+    /// One request from a plugin to the server. New members are added by the
+    /// phases that implement the game operation behind them; no member exists
+    /// here before its operation does.
+    variant command {
+        send-message(send-message),
+        storage-get(storage-get),
+        storage-cas(storage-cas),
+        list-online-players(list-online-players),
+        teleport-player(teleport-player),
+        storage-batch-cas(storage-batch-cas),
+        operation-status(operation-status),
+        upsert-zone(upsert-zone),
+        upsert-protected-zone(upsert-protected-zone),
+        remove-zone(remove-zone),
+    }
+}

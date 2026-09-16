@@ -635,53 +635,80 @@ impl InventoryRuntime {
 }
 
 impl InventoryRuntime {
-    /// Plan one worker's haul into one bound warehouse container.
+    /// Plan one worker's move between its own endpoint and the bound warehouse.
     ///
-    /// The worker hauls out of its own canonical endpoint into the container's
-    /// loaded slots; the durable binding resolves the handle, and a foreign,
-    /// inactive, unresolvable or unloaded container stays the typed refusal
-    /// that keeps the worker from depositing into something core cannot see.
-    pub(super) fn plan_resident_warehouse_deposit(
+    /// The worker moves items between its own canonical endpoint and the bound
+    /// container's loaded slots, in either direction; the durable binding
+    /// resolves the handle, and a foreign, inactive, unresolvable or unloaded
+    /// container stays the typed refusal that keeps the worker from moving
+    /// anything core cannot see.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_resident_warehouse_move(
         &self,
         storage: &PluginStorage,
         plugin_id: &str,
         source: &ScriptInventoryEndpoint,
         destination: &ScriptInventoryEndpoint,
+        item: Option<&str>,
         record: &DurableResidentOrderRecord,
         limit: u64,
-    ) -> Result<ResidentWarehouseDeposit, ScriptOperationFailure> {
-        let ScriptInventoryEndpoint::Warehouse { handle } = destination else {
-            return Err(ScriptOperationFailure::InvalidRequest);
-        };
-        let slots = match source {
-            ScriptInventoryEndpoint::ResidentCarry { handle: resident }
-                if resident == &record.handle =>
-            {
-                &record.carry
-            }
-            ScriptInventoryEndpoint::ResidentEquipment { handle: resident }
-                if resident == &record.handle =>
-            {
-                &record.equipment
-            }
+    ) -> Result<ResidentWarehouseMove, ScriptOperationFailure> {
+        // Exactly one side is the container; the other is the worker's own
+        // endpoint, and which one is which decides what "updated" means below.
+        let (resident_slots, handle) = match (source, destination) {
+            (
+                ScriptInventoryEndpoint::ResidentCarry { handle: resident }
+                | ScriptInventoryEndpoint::ResidentEquipment { handle: resident },
+                ScriptInventoryEndpoint::Warehouse { handle },
+            ) if resident == &record.handle => (
+                match source {
+                    ScriptInventoryEndpoint::ResidentCarry { .. } => &record.carry,
+                    _ => &record.equipment,
+                },
+                handle,
+            ),
+            (
+                ScriptInventoryEndpoint::Warehouse { handle },
+                ScriptInventoryEndpoint::ResidentCarry { handle: resident }
+                | ScriptInventoryEndpoint::ResidentEquipment { handle: resident },
+            ) if resident == &record.handle => (
+                match destination {
+                    ScriptInventoryEndpoint::ResidentCarry { .. } => &record.carry,
+                    _ => &record.equipment,
+                },
+                handle,
+            ),
             _ => return Err(ScriptOperationFailure::InvalidRequest),
         };
         let container = self.resolve_warehouse_container(storage, plugin_id, handle)?;
-        let gear: Vec<Option<ResidentGearStack>> = slots
+        let gear: Vec<Option<ResidentGearStack>> = resident_slots
             .iter()
             .map(|stack| stack.as_ref().map(gear_from_stack))
             .collect();
-        let source_slots = gear_slots_to_items(&gear, &self.items)?;
+        let resident_items = gear_slots_to_items(&gear, &self.items)?;
+        let (source_slots, destination_slots) = match source {
+            ScriptInventoryEndpoint::Warehouse { .. } => (&container.items, &resident_items),
+            _ => (&resident_items, &container.items),
+        };
         let planned = crate::play::owned_inventory::plan_warehouse_deposit(
             source,
             destination,
-            &source_slots,
-            &container.items,
+            source_slots,
+            destination_slots,
             limit,
             &self.items,
             &self.item_facts,
+            item,
         )?;
-        let planned_gear = items_to_gear_slots(&planned.updated_source, &self.items)?;
+        // The planner reports both sides; the worker's is whichever endpoint it
+        // was, and the container's is the other one.
+        let (updated_resident, updated_container) = match source {
+            ScriptInventoryEndpoint::Warehouse { .. } => {
+                (planned.updated_destination, planned.updated_source)
+            }
+            _ => (planned.updated_source, planned.updated_destination),
+        };
+        let planned_gear = items_to_gear_slots(&updated_resident, &self.items)?;
         let updated: Vec<Option<DurableResidentStack>> = planned_gear
             .iter()
             .map(|stack| stack.as_ref().map(stack_from_gear))
@@ -690,25 +717,30 @@ impl InventoryRuntime {
         match source {
             ScriptInventoryEndpoint::ResidentCarry { .. } => record.carry = updated,
             ScriptInventoryEndpoint::ResidentEquipment { .. } => record.equipment = updated,
-            _ => return Err(ScriptOperationFailure::InvalidRequest),
+            _ => match destination {
+                ScriptInventoryEndpoint::ResidentCarry { .. } => record.carry = updated,
+                _ => record.equipment = updated,
+            },
         }
-        Ok(ResidentWarehouseDeposit {
+        Ok(ResidentWarehouseMove {
             record: Box::new(record),
             container: PreparedDepositContainer {
                 position: container.position,
                 expected: container.items,
-                updated: planned.updated_container,
+                updated: updated_container,
             },
             moved: planned.moved,
+            withdraws: matches!(source, ScriptInventoryEndpoint::Warehouse { .. }),
         })
     }
 
-    /// Commit one planned worker deposit: the container's canonical slots and
-    /// the worker's record change ride one journal decision.
+    /// Commit one planned worker move: the container's canonical slots and the
+    /// worker's record change ride one journal decision, whether the worker
+    /// deposited into the container or was issued from it.
     ///
     /// `record` is the record after-image the caller is committing, which is
     /// the plan's own record plus the work assignment it recorded.
-    pub(super) async fn commit_resident_warehouse_deposit(
+    pub(super) async fn commit_resident_warehouse_move(
         &self,
         storage: &mut PluginStorage,
         plugin_id: &str,
@@ -754,29 +786,39 @@ impl InventoryRuntime {
     }
 }
 
-/// One planned worker deposit into a bound container.
+/// One planned worker move against a bound container, in either direction.
 ///
 /// The plan is computed against the container the worker's own work step read
 /// and the record it started from; nothing is mutated. The caller commits the
 /// record after-image and the container images under one durable decision, or
 /// neither.
-pub(super) struct ResidentWarehouseDeposit {
-    /// The worker's record with the moved items already removed.
+pub(super) struct ResidentWarehouseMove {
+    /// The worker's record with the moved items already added or removed.
     pub(super) record: Box<DurableResidentOrderRecord>,
     /// The container half the commit fences.
     pub(super) container: PreparedDepositContainer,
-    /// Resource id -> units that enter the container.
+    /// Resource id -> units that entered the container (deposit) or left it
+    /// (withdrawal).
     pub(super) moved: BTreeMap<String, u64>,
+    /// The moved units left the container: the assignment reports them as
+    /// consumed rather than produced.
+    pub(super) withdraws: bool,
 }
 
-impl ResidentWarehouseDeposit {
-    /// The work units this deposit moves.
+impl ResidentWarehouseMove {
+    /// The work units this move transfers.
     pub(super) fn units(&self) -> u64 {
         self.moved.values().copied().sum()
     }
+
+    /// Unit signed like the receipt reports it: the container's own change.
+    pub(super) fn container_delta(&self, units: u64) -> i64 {
+        let units = i64::try_from(units).unwrap_or(i64::MAX);
+        if self.withdraws { -units } else { units }
+    }
 }
 
-/// What one worker deposit left behind.
+/// What one worker move left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResidentDepositCommit {
     /// The record and the container are durable under one journal decision.

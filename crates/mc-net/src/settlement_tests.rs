@@ -16,7 +16,7 @@ use mc_data::item_components::solaris_required_item_facts;
 use mc_data::items::solaris_required_items;
 use mc_data::{Identifier, items::ItemRegistry};
 use mc_script::{
-    LuaPluginPackage, ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome,
+    PluginPackage, ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome,
     ScriptOperationPayload, ScriptOperationRequest, ScriptResidentSiteReservation,
     ScriptSettlementOperation, ScriptSettlementResult, ScriptSettlementSite, ScriptSitePoiKind,
     ScriptSitePoiState,
@@ -145,8 +145,8 @@ fn deploy_package(dir: &Path, files: &[(String, String)]) {
     }
 }
 
-fn package(dir: &Path, features: &[&str]) -> LuaPluginPackage {
-    LuaPluginPackage::new(
+fn package(dir: &Path, features: &[&str]) -> PluginPackage {
+    PluginPackage::new(
         OWNER,
         dir,
         features
@@ -160,7 +160,7 @@ fn settlement_features() -> Vec<&'static str> {
     vec!["world_sites", "structure_operations"]
 }
 
-fn deploy(dir: &Path, features: &[&str], files: &[(String, String)]) -> LuaPluginPackage {
+fn deploy(dir: &Path, features: &[&str], files: &[(String, String)]) -> PluginPackage {
     deploy_package(dir, files);
     package(dir, features)
 }
@@ -638,7 +638,7 @@ async fn shipped_settlement_package_is_accepted() {
     }
     let report = vanilla_blocks_report(&repository);
     let registry = BlockRegistry::from_report(&report).unwrap();
-    let deployed = LuaPluginPackage::new(
+    let deployed = PluginPackage::new(
         "solaris-settlements",
         package_dir,
         vec!["world_sites".to_owned(), "structure_operations".to_owned()],

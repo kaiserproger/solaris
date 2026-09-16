@@ -42,7 +42,8 @@ is not full vanilla parity, a performance result or release readiness.
   other workspace failures remain unresolved. Details and identities are in
   [MEMORY.md](../MEMORY.md). Do not relabel those gates through documentation.
 - Owner terrain `ACCEPT` is still absent. The alpha acceptance contract remains
-  [PUBLIC_ALPHA3_PLAN.md](../PUBLIC_ALPHA3_PLAN.md); no alpha closure is claimed.
+  [public-alpha3 plan](../milestones/public-alpha3-plan.md); no alpha closure is
+  claimed.
 
 Historical evidence remains in `docs/evidence/` and version history. Superseded
 memory archives and execution prompts are not current routing authorities.

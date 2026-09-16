@@ -81,13 +81,15 @@ seed = 0
 # Optional Earth-scale terrain profile. Changing it requires a fresh world_dir.
 worldgen_mode = "tellus_like"
 # Optional built-in settlement profile, used when no deployed plugin supplies a
-# settlement plan. The default "vanilla" places no villages: Solaris core does
-# not implement vanilla village generation, and startup warns about that gap.
-# "plains_village_prototype" is the explicit opt-in: it combines the three
-# vanilla plains village templates (fountain, small house, toolsmith) into one
-# bounded composite on the vanilla plains village spacing and requires
-# vanilla_data_dir (see tools/extract-vanilla-data.sh). It is not full vanilla
-# village generation and places no desert, savanna, snowy, or taiga villages.
+# settlement plan. The default "vanilla" generates the five vanilla village
+# structures (plains, desert, savanna, snowy, taiga) with their decor from the
+# derived content cache; the notice a vanilla village world carries is the
+# declared terrain-adaptation analogue, not a missing-village gap.
+# "plains_village_prototype" opts into the interim bounded Solaris composite
+# (fountain, small house, toolsmith) on the vanilla plains village spacing; it
+# attaches no core villages and requires vanilla_data_dir (see
+# tools/extract-vanilla-data.sh). A deployed Luau settlement plan owns
+# settlement content instead and suppresses the core lane.
 # Changing it requires a fresh world_dir.
 # settlement_profile = "plains_village_prototype"
 
@@ -123,6 +125,12 @@ chunk_prepare_budget_ms = 0
 chunk_prepare_batch_size = 8
 chunk_result_queue_size = 64
 region_cache_size = 9
+# Optional absolute bound on this pipeline's own worker threads, and on the
+# startup chunk bake. Omit it (0) to derive the split from the process CPU
+# limit; set it on a small host, or when several servers share one machine, so a
+# single server cannot claim every core. It is a cap, not a percentage:
+# performance profiles set their own workload knobs and are unaffected.
+# worker_threads = 2
 # Optional zlib level for compressed protocol frames. Omit for flate2's
 # fast default; values above 9 are clamped.
 # compression_level = 1

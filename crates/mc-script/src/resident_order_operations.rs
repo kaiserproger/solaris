@@ -321,6 +321,14 @@ pub enum ScriptResidentWorkOrder {
     Haul {
         source: ScriptInventoryEndpoint,
         destination: ScriptInventoryEndpoint,
+        /// The exact item this move takes from the source.
+        ///
+        /// `None` moves whatever the source holds first, in slot order. A
+        /// withdrawal from a settlement warehouse names the item it takes -
+        /// a worker that needs a hoe must not receive whatever happened to be
+        /// in the first slot - so the plugin states the selection instead of
+        /// relying on storage order.
+        item: Option<String>,
     },
     Craft {
         recipe: String,
@@ -355,6 +363,7 @@ impl ScriptResidentWorkOrder {
             Self::Haul {
                 source,
                 destination,
+                item,
             } => {
                 source.validate()?;
                 destination.validate()?;
@@ -362,6 +371,9 @@ impl ScriptResidentWorkOrder {
                     return Err(ScriptDtoError::InconsistentResult {
                         field: "haul endpoints",
                     });
+                }
+                if let Some(item) = item {
+                    check_contract_resource_id(item)?;
                 }
                 Ok(())
             }

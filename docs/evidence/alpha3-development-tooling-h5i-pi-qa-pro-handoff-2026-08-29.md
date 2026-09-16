@@ -87,7 +87,7 @@ checks plus the upstream CodexPro smoke. Patch dry-run against a freshly packed
 4. one bounded adversarial exploratory pass;
 5. severity-ranked criticism even when the requested scenario passes.
 
-The infrastructure smoke itself proved the critical path instead of returning a ceremonial PASS. Run `.ai-bridge/pi-agents/20260829015734-1ec74354` reached Play under Xvfb and captured graphical evidence, then reported `QA_RESULT=CHANGES`, including 14 authoritative `SweptCollision` corrections during ordinary sprint+jump movement. `docs/PUBLIC_ALPHA3_PLAN.md` therefore reopens the collision P0 and its final real-client closeout row.
+The infrastructure smoke itself proved the critical path instead of returning a ceremonial PASS. Run `.ai-bridge/pi-agents/20260829015734-1ec74354` reached Play under Xvfb and captured graphical evidence, then reported `QA_RESULT=CHANGES`, including 14 authoritative `SweptCollision` corrections during ordinary sprint+jump movement. `docs/milestones/public-alpha3-plan.md` therefore reopens the collision P0 and its final real-client closeout row.
 
 ## Pro whole-core planning audit
 

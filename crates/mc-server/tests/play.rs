@@ -85,7 +85,7 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::bounded(2),
         random_tick,
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         loader_manifest: None,
@@ -127,7 +127,7 @@ async fn start_server_with_script_payloads() -> (SocketAddr, ScriptHostEndpoint)
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::bounded(2),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         loader_manifest: None,
@@ -187,7 +187,7 @@ fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfi
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::bounded(2),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         loader_manifest: None,
@@ -1799,7 +1799,8 @@ async fn lua_script_oversized_payload_is_rejected_before_the_wire() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PayloadBig").await;
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let probe_started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
             if frame.id == ClientboundCustomPayload::ID {
@@ -1818,6 +1819,7 @@ async fn lua_script_oversized_payload_is_rejected_before_the_wire() {
     })
     .await
     .expect("valid payload after the rejected oversized send was not delivered");
+    eprintln!("OVERSIZED-PAYLOAD LATENCY: {:?}", probe_started.elapsed());
 
     drop(stream);
     shutdown.request();

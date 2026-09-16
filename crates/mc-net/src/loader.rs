@@ -94,7 +94,7 @@ pub struct LoaderManifest {
 
 impl LoaderManifest {
     pub fn from_script_bundles(
-        bundles: &[mc_script::LuaClientBundle],
+        bundles: &[mc_script::ClientBundle],
     ) -> Result<Self, LoaderHandshakeError> {
         let bundles = bundles
             .iter()
@@ -103,7 +103,7 @@ impl LoaderManifest {
                 let block = match index.as_ref().filter(|_| {
                     bundle
                         .content()
-                        .contains(&mc_script::LuaClientContentKind::Blocks)
+                        .contains(&mc_script::ClientContentKind::Blocks)
                 }) {
                     Some(index) => Some(verify_declared_block(index, bundle.owner_plugin_id())?),
                     None => None,
@@ -111,7 +111,7 @@ impl LoaderManifest {
                 let view_kinds = match index.as_ref().filter(|_| {
                     bundle
                         .content()
-                        .contains(&mc_script::LuaClientContentKind::Views)
+                        .contains(&mc_script::ClientContentKind::Views)
                 }) {
                     Some(index) => declared_screen_kinds(index, bundle.owner_plugin_id())?,
                     None => Vec::new(),
@@ -127,9 +127,9 @@ impl LoaderManifest {
                         .loaders()
                         .iter()
                         .map(|loader| match loader {
-                            mc_script::LuaClientLoader::Fabric => LoaderPlatform::Fabric,
-                            mc_script::LuaClientLoader::NeoForge => LoaderPlatform::NeoForge,
-                            mc_script::LuaClientLoader::Forge => LoaderPlatform::Forge,
+                            mc_script::ClientLoader::Fabric => LoaderPlatform::Fabric,
+                            mc_script::ClientLoader::NeoForge => LoaderPlatform::NeoForge,
+                            mc_script::ClientLoader::Forge => LoaderPlatform::Forge,
                             _ => unreachable!("validated client loader"),
                         })
                         .collect(),
@@ -137,20 +137,20 @@ impl LoaderManifest {
                         .content()
                         .iter()
                         .map(|content| match content {
-                            mc_script::LuaClientContentKind::Blocks => LoaderContentKind::Blocks,
-                            mc_script::LuaClientContentKind::Items => LoaderContentKind::Items,
-                            mc_script::LuaClientContentKind::Views => LoaderContentKind::Views,
-                            mc_script::LuaClientContentKind::ViewActions => {
+                            mc_script::ClientContentKind::Blocks => LoaderContentKind::Blocks,
+                            mc_script::ClientContentKind::Items => LoaderContentKind::Items,
+                            mc_script::ClientContentKind::Views => LoaderContentKind::Views,
+                            mc_script::ClientContentKind::ViewActions => {
                                 LoaderContentKind::ViewActions
                             }
-                            mc_script::LuaClientContentKind::Assets => LoaderContentKind::Assets,
-                            mc_script::LuaClientContentKind::WorldPreviews => {
+                            mc_script::ClientContentKind::Assets => LoaderContentKind::Assets,
+                            mc_script::ClientContentKind::WorldPreviews => {
                                 LoaderContentKind::WorldPreviews
                             }
-                            mc_script::LuaClientContentKind::WorldSelection => {
+                            mc_script::ClientContentKind::WorldSelection => {
                                 LoaderContentKind::WorldSelection
                             }
-                            mc_script::LuaClientContentKind::Sounds => LoaderContentKind::Sounds,
+                            mc_script::ClientContentKind::Sounds => LoaderContentKind::Sounds,
                             _ => unreachable!("validated client content kind"),
                         })
                         .collect(),
@@ -158,30 +158,26 @@ impl LoaderManifest {
                         .permissions()
                         .iter()
                         .map(|permission| match permission {
-                            mc_script::LuaClientPermission::RegisterBlocks => {
+                            mc_script::ClientPermission::RegisterBlocks => {
                                 LoaderPermission::RegisterBlocks
                             }
-                            mc_script::LuaClientPermission::RegisterItems => {
+                            mc_script::ClientPermission::RegisterItems => {
                                 LoaderPermission::RegisterItems
                             }
-                            mc_script::LuaClientPermission::PresentViews => {
+                            mc_script::ClientPermission::PresentViews => {
                                 LoaderPermission::PresentViews
                             }
-                            mc_script::LuaClientPermission::SendViewActions => {
+                            mc_script::ClientPermission::SendViewActions => {
                                 LoaderPermission::SendViewActions
                             }
-                            mc_script::LuaClientPermission::LoadAssets => {
-                                LoaderPermission::LoadAssets
-                            }
-                            mc_script::LuaClientPermission::PresentWorldPreviews => {
+                            mc_script::ClientPermission::LoadAssets => LoaderPermission::LoadAssets,
+                            mc_script::ClientPermission::PresentWorldPreviews => {
                                 LoaderPermission::PresentWorldPreviews
                             }
-                            mc_script::LuaClientPermission::SendWorldSelection => {
+                            mc_script::ClientPermission::SendWorldSelection => {
                                 LoaderPermission::SendWorldSelection
                             }
-                            mc_script::LuaClientPermission::PlaySounds => {
-                                LoaderPermission::PlaySounds
-                            }
+                            mc_script::ClientPermission::PlaySounds => LoaderPermission::PlaySounds,
                             _ => unreachable!("validated client permission"),
                         })
                         .collect(),
@@ -681,11 +677,11 @@ struct VerifiedLoaderBlock {
 }
 
 fn read_declared_index(
-    bundle: &mc_script::LuaClientBundle,
+    bundle: &mc_script::ClientBundle,
 ) -> Result<Option<LoaderArtifactIndex>, LoaderHandshakeError> {
     let declared = |content| bundle.content().contains(&content);
-    if !declared(mc_script::LuaClientContentKind::Blocks)
-        && !declared(mc_script::LuaClientContentKind::Views)
+    if !declared(mc_script::ClientContentKind::Blocks)
+        && !declared(mc_script::ClientContentKind::Views)
     {
         return Ok(None);
     }

@@ -44,7 +44,7 @@ regresses.
 
 ## Verdict handling
 
-Record the verdict verbatim in `docs/PUBLIC_ALPHA3_PLAN.md` (world
+Record the verdict verbatim in `docs/milestones/public-alpha3-plan.md` (world
 generation section). ACCEPT closes the section; REJECT names the concrete
 field defect and becomes the next worldgen checkpoint's contract. Tagging
 `v0.0.3-alpha.1` waits for this verdict.

@@ -51,6 +51,11 @@ chunk_prepare_budget_ms = 0
 chunk_prepare_batch_size = 8
 chunk_result_queue_size = 64
 region_cache_size = 9
+# Dev/field profile: two shared CPU workers and one IO worker. The startup bake
+# uses the same number, so one server on a development box - or several servers
+# in one gate run - cannot claim every core. 0 (or omitting the key) derives the
+# split from the process CPU limit.
+worker_threads = 2
 # compression_level = 1
 
 [autoscale]

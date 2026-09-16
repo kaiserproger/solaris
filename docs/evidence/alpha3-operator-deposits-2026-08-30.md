@@ -86,7 +86,7 @@ PASS
 ```
 
 This closes the operator and optional deposits rows in
-`docs/PUBLIC_ALPHA3_PLAN.md`. It does not claim final alpha release readiness:
+`docs/milestones/public-alpha3-plan.md`. It does not claim final alpha release readiness:
 the optional dashboard and standard plugin pack remain open, the owner terrain
 review for seed `712816` remains explicit, and the final workspace/release-host
 and owner-run survival gates are still required before any release tag.

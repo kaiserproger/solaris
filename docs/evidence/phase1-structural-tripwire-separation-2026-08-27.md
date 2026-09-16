@@ -2,7 +2,7 @@
 
 ## Scope
 
-This checkpoint closes Phase-1 item 4 in `PUBLIC_ALPHA_PLAN.md`:
+This checkpoint closes Phase-1 item 4 in `docs/milestones/public-alpha-plan.md`:
 
 > Separate behavioral tests from structural tripwires. Structural checks may enforce crate ownership and dependency direction, but may not assert Rust statement order or source-text layout.
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This checkpoint closes Phase 4 item 6 and the separate graphical natural-spawn acceptance gate in `docs/PUBLIC_ALPHA_PLAN.md`. It uses the repo-native graphical Minecraft Java 26.1.2 client, a fresh isolated world on seed `712816`, default natural-spawn configuration, no operator list and no debug-command setup.
+This checkpoint closes Phase 4 item 6 and the separate graphical natural-spawn acceptance gate in `docs/milestones/public-alpha-plan.md`. It uses the repo-native graphical Minecraft Java 26.1.2 client, a fresh isolated world on seed `712816`, default natural-spawn configuration, no operator list and no debug-command setup.
 
 Scenario: `playable-04-twenty-minute-survival-loop`, followed by runner-managed clean server restart and `playable-03-save-restart-after` against the same world.
 
@@ -103,4 +103,4 @@ After startup, the client connected, completed the 20-minute scenario, reconnect
 
 The fresh-world 20-minute no-operator survival + natural-spawn + death/respawn + clean restart/reconnect gate is **PASS**.
 
-This closes Phase 4 item 6 and the graphical natural-spawn acceptance checkbox. It does not by itself satisfy the separate subjective owner terrain/playability disposition for seed `712816`; that boundary remains separate wherever `PUBLIC_ALPHA_PLAN.md` still requires it.
+This closes Phase 4 item 6 and the graphical natural-spawn acceptance checkbox. It does not by itself satisfy the separate subjective owner terrain/playability disposition for seed `712816`; that boundary remains separate wherever `docs/milestones/public-alpha-plan.md` still requires it.

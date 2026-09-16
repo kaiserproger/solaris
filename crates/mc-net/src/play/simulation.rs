@@ -2966,18 +2966,17 @@ impl SimulationHandle {
                     drops: Vec::new(),
                     xp_orb: None,
                 };
-                let handle = self.for_session(participant.actor_id);
-                let receiver = handle.enqueue_player_command(SimulationCommand::CommitChest {
-                    primary_position: position,
-                    positions: vec![position],
-                    expected_state_id,
-                    actor_session: Some(participant.actor_id),
-                    expected: vec![expected],
-                    updated: vec![updated],
-                    player: Some(Box::new(plan)),
-                    plugin_receipt: Some(receipt),
-                })?;
-                receiver
+                self.for_session(participant.actor_id)
+                    .enqueue_player_command(SimulationCommand::CommitChest {
+                        primary_position: position,
+                        positions: vec![position],
+                        expected_state_id,
+                        actor_session: Some(participant.actor_id),
+                        expected: vec![expected],
+                        updated: vec![updated],
+                        player: Some(Box::new(plan)),
+                        plugin_receipt: Some(receipt),
+                    })?
             }
             None => {
                 if self.session_fence.is_some() {

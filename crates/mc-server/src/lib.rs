@@ -4,7 +4,7 @@
 //!
 //! Part of the Solaris engine.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -151,11 +151,11 @@ pub struct TabListSection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettlementProfile {
-    /// Core stock world. Solaris core does not implement vanilla village
-    /// generation, so this profile places no villages at all; startup reports
-    /// the gap instead of quietly generating none. Villages reach a world only
-    /// through a deployed plugin settlement plan or the explicit
-    /// [`Self::PlainsVillagePrototype`] opt-in.
+    /// Core stock world: Solaris generates the five vanilla village structures
+    /// (plains, desert, savanna, snowy, taiga) and their decor from the derived
+    /// content cache, so this profile places villages. A deployed Luau
+    /// settlement plan owns settlement content instead and suppresses this
+    /// lane; [`Self::PlainsVillagePrototype`] attaches no core villages either.
     #[default]
     Vanilla,
     /// Bounded Solaris prototype, not full vanilla village generation: the
@@ -201,11 +201,11 @@ pub struct DataSection {
     #[serde(default)]
     pub worldgen_mode: WorldgenMode,
     /// Built-in settlement profile used when no deployed plugin supplies a
-    /// settlement plan. The default `vanilla` places no villages because core
-    /// vanilla village generation is not implemented, and startup reports that
-    /// gap; `plains_village_prototype` opts into the bounded Solaris plains
-    /// prototype (fountain, small house, toolsmith on vanilla plains village
-    /// spacing) and needs `vanilla_data_dir`.
+    /// settlement plan. The default `vanilla` generates the five vanilla
+    /// village structures from the derived content cache;
+    /// `plains_village_prototype` opts into the interim bounded Solaris
+    /// composite (fountain, small house, toolsmith on vanilla plains village
+    /// spacing) and attaches no core villages, and needs `vanilla_data_dir`.
     #[serde(default)]
     pub settlement_profile: SettlementProfile,
     /// Lowest generated world Y, inclusive.
@@ -291,6 +291,18 @@ pub struct ChunkPipelineSection {
     pub compression_threshold: i32,
     #[serde(default)]
     pub compression_level: Option<u32>,
+    /// Optional absolute bound on the pipeline's own worker threads.
+    ///
+    /// `0` (the default) derives capacity from the process CPU limit: the
+    /// chunk IO pool takes a quarter of it and the shared chunk/entity CPU pool
+    /// half. A positive value is the operator's explicit bound for that shared
+    /// CPU pool, and the startup chunk bake uses the same number instead of the
+    /// process CPU count, so a small host - or a gate run that starts several
+    /// servers side by side - can stop one server from claiming every core.
+    /// This is a bound, not a percentage, and it is never applied to
+    /// performance profiles that set their own workload knobs.
+    #[serde(default)]
+    pub worker_threads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,7 +321,12 @@ pub struct SimulationSection {
     #[serde(default = "default_hostile_spawn_chunk_budget")]
     pub hostile_spawn_chunk_budget: usize,
 }
-/// Optional external Luau plugins, loaded from a deployed plugin directory.
+/// Optional external plugins, loaded from a deployed plugin directory.
+///
+/// One deployment runs one runtime: `luau` is the path still in production while
+/// the component host is finished, `wasm` selects the WebAssembly components of
+/// the `solaris:plugin` contract. The two are never started together, so a
+/// directory cannot be half-read by one runtime and half by the other.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginSection {
@@ -319,6 +336,42 @@ pub struct PluginSection {
     pub strict: bool,
     #[serde(default)]
     pub expected: Vec<String>,
+    #[serde(default)]
+    pub runtime: PluginRuntime,
+    /// Operator grants per plugin id. A capability a package requests must be
+    /// granted here when the deployment requires grants; the package is refused
+    /// otherwise instead of running with fewer rights than it asked for.
+    #[serde(default)]
+    pub grants: BTreeMap<String, PluginGrantSection>,
+}
+
+/// Which runtime a plugin directory belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntime {
+    /// Strict Luau sources (`main.lua`, optional `rules.lua`).
+    #[default]
+    Luau,
+    /// WebAssembly components of the `solaris:plugin` contract (`plugin.wasm`).
+    Wasm,
+}
+
+impl PluginRuntime {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Luau => "luau",
+            Self::Wasm => "wasm",
+        }
+    }
+}
+
+/// What one operator grants one plugin id.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginGrantSection {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1128,6 +1181,7 @@ impl Default for ChunkPipelineSection {
             region_cache_size: policy.region_cache_size,
             compression_threshold: policy.compression_threshold,
             compression_level: policy.compression_level,
+            worker_threads: 0,
         }
     }
 }
@@ -1136,14 +1190,24 @@ impl ChunkPipelineSection {
     #[must_use]
     pub fn to_network(&self) -> mc_net::ChunkPipelinePolicy {
         let worker_defaults = mc_net::ChunkPipelinePolicy::default();
+        // An explicit bound replaces the derived split; one IO thread is kept so
+        // region reads and writes are never serialized behind chunk work.
+        let (chunk_io_threads, chunk_worker_threads) = if self.worker_threads == 0 {
+            (
+                worker_defaults.chunk_io_threads,
+                worker_defaults.chunk_worker_threads,
+            )
+        } else {
+            (1, self.worker_threads.max(1))
+        };
         mc_net::ChunkPipelinePolicy {
             chunk_send_rate: self.chunk_send_rate.max(1),
             chunk_load_rate: self.chunk_load_rate.max(1),
             chunk_generate_rate: self.chunk_generate_rate.max(1),
             chunk_prepare_budget_ms: self.chunk_prepare_budget_ms,
             chunk_prepare_batch_size: self.chunk_prepare_batch_size.max(1),
-            chunk_io_threads: worker_defaults.chunk_io_threads,
-            chunk_worker_threads: worker_defaults.chunk_worker_threads,
+            chunk_io_threads,
+            chunk_worker_threads,
             chunk_result_queue_size: self.chunk_result_queue_size.max(1),
             region_cache_size: self.region_cache_size.max(1),
             compression_threshold: self.compression_threshold.max(0),
@@ -1872,6 +1936,7 @@ mod tests {
             region_cache_size: 0,
             compression_threshold: -1,
             compression_level: Some(99),
+            worker_threads: 0,
         };
         let policy = section.to_network();
         assert_eq!(policy.chunk_send_rate, 1);
@@ -1885,6 +1950,31 @@ mod tests {
         assert_eq!(policy.region_cache_size, 1);
         assert_eq!(policy.compression_threshold, 0);
         assert_eq!(policy.compression_level, Some(9));
+    }
+
+    #[test]
+    fn chunk_worker_threads_bound_replaces_the_derived_split() {
+        let defaults = mc_net::ChunkPipelinePolicy::default();
+        let derived = ChunkPipelineSection::default().to_network();
+        assert_eq!(derived.chunk_io_threads, defaults.chunk_io_threads);
+        assert_eq!(derived.chunk_worker_threads, defaults.chunk_worker_threads);
+
+        let bounded = ChunkPipelineSection {
+            worker_threads: 2,
+            ..ChunkPipelineSection::default()
+        }
+        .to_network();
+        assert_eq!(bounded.chunk_worker_threads, 2);
+        assert_eq!(bounded.chunk_io_threads, 1);
+        assert_eq!(bounded.chunk_send_rate, derived.chunk_send_rate);
+
+        // A zero bound is the derived split, not a one-thread pipeline.
+        let zero = ChunkPipelineSection {
+            worker_threads: 0,
+            ..ChunkPipelineSection::default()
+        }
+        .to_network();
+        assert_eq!(zero.chunk_worker_threads, defaults.chunk_worker_threads);
     }
 
     #[test]

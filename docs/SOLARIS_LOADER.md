@@ -39,8 +39,8 @@ To build instead, use
 [`solaris-loader`](https://github.com/kaiserproger/solaris-loader). Its Git
 history and release version are independent of core: a server tag is not a
 Loader revision. Alpha protocol and bundle contracts can change between
-revisions. Current Loader wire protocol is **2**, with no protocol-1
-compatibility path; plugin API is still `0.6.0`.
+revisions. Current Loader wire protocol is **3** with artifact index schema 2,
+with no protocol-1/2 compatibility path; plugin API is still `0.6.0`.
 Declared keyboard actions leave vanilla movement, menus, screenshots and
 fullscreen handling intact. They are suppressed in menus/overlays or without
 window focus; bindings reset on reconnect. Rebinding, chords and mouse/gamepad

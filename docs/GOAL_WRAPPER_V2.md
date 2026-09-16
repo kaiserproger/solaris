@@ -64,7 +64,7 @@ need to be repeated in every model turn.
 <goal_checkpoint version="2" north_star_ref="solaris-v1">
 id: PLAY-P1-03
 route: playable
-outcome: Close Phase 1 item 3 of docs/PUBLIC_ALPHA_PLAN.md as one
+outcome: Close Phase 1 item 3 of docs/milestones/public-alpha-plan.md as one
   feature-sized test-ownership checkpoint.
 
 done_when:

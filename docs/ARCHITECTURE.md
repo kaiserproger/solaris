@@ -123,9 +123,18 @@ work and isolation, not a hard real-time guarantee against OS or hardware stalls
 
 ## One addon contract, server and client
 
-Keep strict Luau unless a measured requirement justifies replacing it. Reuse the
-existing common Loader implementation with thin Fabric/NeoForge/Forge adapters;
-do not build a second independent client stack.
+The server plugin runtime is being migrated from strict Luau to WebAssembly
+components (Wasmtime) behind a versioned WIT contract (`solaris:plugin@0.7.0`,
+`crates/mc-script/wit`) with an out-of-tree Rust guest SDK (`sdk/rust/`) and one
+host crate (`crates/mc-plugin-host`). Luau is the *migration-only* path from here
+on: it stays until the WASM host covers the operations the shipped packages use,
+and is then deleted with its `lua-runtime` feature, `mlua` and `luaur`
+dependencies. Do not start new plugin-facing work on the Luau path, and do not
+run both paths in one production deployment. Isolation, budgets and the
+single admission boundary stay Solaris' own responsibility: the WASM sandbox
+replaces the VM, not the contract, the world owners, or the durability rules.
+Reuse the existing common Loader implementation with thin
+Fabric/NeoForge/Forge adapters; do not build a second independent client stack.
 
 The common API uses owned values, opaque generation-checked handles, immutable
 observations, bounded requests, and typed completion/rejection. A plugin sees
@@ -148,7 +157,7 @@ literal text, not general client scripting or an arbitrary layout engine.
 
 Implemented keyboard input extends the same owned `interactions` resource and
 `on_loader_interaction` event with trigger/press/release phases, under Loader
-wire protocol 2. Shared bounded held state and one native keyboard HEAD hook
+wire protocol 3. Shared bounded held state and one native keyboard HEAD hook
 preserve vanilla input and release on focus loss; activation/logout fences
 bindings to the exact connection. This is fixed declared keyboard input, not
 rebinding, arbitrary client scripts, or the complete target API.

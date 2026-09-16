@@ -13,13 +13,7 @@ workspace = true
 
 [features]
 default = []
-lua-runtime = [
-    "dep:luaur",
-    "dep:mlua",
-    "dep:tempfile",
-    "dep:toml",
-    "dep:tracing",
-]
+lua-runtime = ["dep:luaur", "dep:mlua", "dep:tempfile", "dep:tracing"]
 
 [dependencies]
 # crates.io luaur 0.1.8 hardcodes signed i8 at translated C char boundaries; this exact-release fork carries only the AArch64 c_char portability fix.
@@ -31,7 +25,10 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { version = "3", optional = true }
 tokio = { workspace = true }
-toml = { workspace = true, optional = true }
+# The rule-plan fingerprint is sha256 over canonical TOML: a core contract
+# derivation, not a Lua-runtime-only behavior, for the same reason `sha2` is not
+# optional. The component (WASM) path needs it without the Luau host compiled in.
+toml = { workspace = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]

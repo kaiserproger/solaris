@@ -90,7 +90,7 @@ are explicit.
 
 ### Deterministic loot/drop policy still in scoped paths
 
-- Historical review: `docs/M67_VANILLA_DIVERGENCES.md`.
+- Historical review: `docs/milestones/M67-vanilla-divergences.md`.
 - Owners: current block/crop/mob drop helpers and the repo-owned/fallback loot tables in
   `mc-data`/`mc-net`.
 - Deliberate boundary: remaining scoped crop/cocoa/sweet-berry/mob/block fallback paths
@@ -100,7 +100,7 @@ are explicit.
 
 ### Deterministic plant/tree lifecycle in scoped paths
 
-- Historical review: `docs/M67_VANILLA_DIVERGENCES.md`.
+- Historical review: `docs/milestones/M67-vanilla-divergences.md`.
 - Owners: current plant support/growth helpers and generated-tree logic.
 - Deliberate boundary: supported saplings use Solaris-owned deterministic tree shapes;
   several crop/vertical-plant/stem/cocoa/sweet-berry growth and yield paths intentionally
@@ -109,7 +109,7 @@ are explicit.
 
 ## Superseded M67 rows
 
-`docs/M67_VANILLA_DIVERGENCES.md` is a historical review and must not be read as the
+`docs/milestones/M67-vanilla-divergences.md` is a historical review and must not be read as the
 current Phase-4 blocker list. In particular:
 
 - the old **Beds: sleeping/time-skip absent** row is superseded by later sleep/time

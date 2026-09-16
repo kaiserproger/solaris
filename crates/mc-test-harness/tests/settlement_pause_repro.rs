@@ -47,6 +47,15 @@ const MATERIALS: &[(&str, i32)] = &[
 
 #[tokio::test]
 async fn settlement_fund_reserves_materials_and_answers_the_player() {
+    // The script host reports a plugin it had to disable with `warn!`, and that
+    // line is the difference between "the package is slow" and "the package was
+    // stopped". libtest captures it and prints it for a failing test, so a
+    // timeout arrives with its reason instead of only a chat dump.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_owned()),
+        ))
+        .try_init();
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     copy_settlement_package(plugins.path());
     let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
@@ -87,7 +96,7 @@ async fn settlement_fund_reserves_materials_and_answers_the_player() {
         )),
         entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::bounded(2),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new([PLAYER], false),
         loader_manifest: None,

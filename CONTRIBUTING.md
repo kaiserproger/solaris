@@ -1,44 +1,44 @@
 # Contributing to Solaris
 
-This is currently a solo project in early bootstrap (M0). External contributions
-are not yet being accepted; the structure below describes the intended workflow
-once the project opens up.
+Solaris is developed by the owner; `AGENTS.md` is the working contract for
+every change, human or agent.
 
-## Workflow
+## Before you change anything
 
-- `main` is always green — CI must pass before merge.
-- Feature work happens on `dev/MX-name` branches per milestone, where `MX`
-  matches the milestone in [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) §9.
-- Milestones are tagged on `main`: `m0`, `m1`, …, `v1.0`.
+- Read [`AGENTS.md`](AGENTS.md) — owner contract, validation tiers, and the
+  project invariants.
+- Read [`docs/AGENT_ROUTES.md`](docs/AGENT_ROUTES.md) to see which document owns
+  the area you touch.
+- Core builds must never require the sibling repositories; integration gates
+  explicitly need the one they exercise.
 
-## Commit style
+## Local checks
 
-Conventional commits:
-
-- `feat:` new functionality
-- `fix:` bug fix
-- `refactor:` no behavior change
-- `test:` tests only
-- `docs:` documentation only
-- `chore:` tooling, build config
-
-## Local checks before opening a PR
+Every gate runs through the canonical harness from the repository root, which
+leaves a receipt under `.analysis/validation/`:
 
 ```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+python3 -m tools.harness list
+python3 -m tools.harness run correctness   # L2: fmt, code-health, clippy, workspace tests
 ```
 
-These checks are only the cargo baseline. For milestone closeouts,
-replacement-readiness claims, gameplay parity, performance work, or
-multithreading changes, also follow
-[`docs/DEFINITION_OF_DONE.md`](docs/DEFINITION_OF_DONE.md): run the
-autonomous preflight, label the state as `draft`, `stabilization`, or
-`release-ready`, and record the evidence matrix.
+Focused development runs the affected crate's own tests instead of the
+workspace scope. Graphical, oracle, and scale gates run only for the scope they
+cover; see [`docs/AGENT_TOOLING.md`](docs/AGENT_TOOLING.md) before launching
+one. Do not hand-roll the flags the harness owns, and do not widen a bound or
+add a retry to turn a red gate green.
 
-## Architectural decisions
+## Commits
 
-Nontrivial decisions are recorded as ADRs under `docs/decisions/`. If a change
-affects something documented in `PROJECT_SPEC.md`, update the spec in the same
-PR.
+Conventional Commits, one revertible commit per completed checkpoint. Never
+push, merge to `main`, or tag without explicit owner authorization, and never
+skip hooks or signing.
+
+## Documentation
+
+`docs/` root holds the documents that describe current behaviour; dated
+evidence, milestone logs, and phase reviews live under `docs/milestones/`,
+`docs/evidence/`, `docs/memory/`, and `docs/performance/`. Update the owning
+document — architecture, ADR, or operator guide — in the same change as the
+behaviour it describes, and delete what the change supersedes instead of
+leaving a second version behind.

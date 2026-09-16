@@ -24,7 +24,7 @@ Instead, `mc-script` keeps the public boundary unchanged and changes only the pr
 - same worldgen settlement-plan contract;
 - same client bundle owner/id/version/hash/size/loaders/content/permissions.
 
-Source, `config.toml`, subscriptions and command capabilities may change because they are runtime-local host behavior. A restart-only contract change returns `LuaReloadError::StartupContractChanged` before the request enters the host queue.
+Source, `config.toml`, subscriptions and command capabilities may change because they are runtime-local host behavior. A restart-only contract change returns `PluginReloadError::StartupContractChanged` before the request enters the host queue.
 
 This prevents reload from silently changing world generation, Solaris Loader/client content, or command-root topology that other server components may have snapshotted at startup.
 
@@ -48,7 +48,7 @@ A closed command consumer is a non-normal host condition: the reload caller rece
 
 On successful replacement:
 
-- previous-generation runtime-disable diagnostics move exactly once into `LuaReloadReport`;
+- previous-generation runtime-disable diagnostics move exactly once into `PluginReloadReport`;
 - the new generation starts with a fresh fault set;
 - runtime-local state such as plugin timers is intentionally reset;
 - a previously faulted plugin can regain the **same declared** player-command root through the atomic ownership replacement;

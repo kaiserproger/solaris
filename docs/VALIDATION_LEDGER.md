@@ -1595,6 +1595,5 @@ draft-debt, accepted-divergence, and non-goal rows do not count.
 | Gap to 80% | 37 rows |
 
 Status breakdown: 30 `partial`, 4 `blocked`, 3 `unknown`, 7 `draft debt`, 2
-`accepted divergence`, and 0 `ready`. See
-[`VALIDATION_COVERAGE_AUDIT.md`](VALIDATION_COVERAGE_AUDIT.md) for the M95
-snapshot and counting rule.
+`accepted divergence`, and 0 `ready`. The M95 section above carries the
+snapshot and the counting rule.

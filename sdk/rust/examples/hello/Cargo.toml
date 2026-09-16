@@ -1,0 +1,13 @@
+[package]
+name = "solaris-hello-plugin"
+description = "Example Solaris plugin: greets a joining player and answers /hello."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+solaris-plugin-sdk.workspace = true
+wit-bindgen.workspace = true

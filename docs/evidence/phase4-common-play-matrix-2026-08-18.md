@@ -1,6 +1,6 @@
 # Phase 4 common-play evidence matrix — 2026-08-18
 
-Status: Phase-4 item-2 inventory/evidence closeout. This matrix maps every common-play domain named in `PUBLIC_ALPHA_PLAN.md` to executable evidence and an explicit remaining boundary. A row being present here is **not** a claim that every vanilla mechanic in that category is complete.
+Status: Phase-4 item-2 inventory/evidence closeout. This matrix maps every common-play domain named in `docs/milestones/public-alpha-plan.md` to executable evidence and an explicit remaining boundary. A row being present here is **not** a claim that every vanilla mechanic in that category is complete.
 
 Target: unmodified Minecraft Java Edition 26.1.2 behavior used in an ordinary multiplayer survival session.
 

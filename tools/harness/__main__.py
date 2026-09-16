@@ -16,6 +16,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -340,6 +341,187 @@ def cmd_run(argv: list[str]) -> int:
     return finish(status, spec["scope"], details, None, artifact_dir, 0, ctx)
 
 
+CPU_SCOPE_ENV = "SOLARIS_HARNESS_CPU_SCOPE"
+CPU_QUOTA_ENV = "SOLARIS_HARNESS_CPU_QUOTA"
+MEMORY_HIGH_ENV = "SOLARIS_HARNESS_MEMORY_HIGH"
+MEMORY_MAX_ENV = "SOLARIS_HARNESS_MEMORY_MAX"
+MEMORY_SWAP_ENV = "SOLARIS_HARNESS_MEMORY_SWAP_MAX"
+TEST_THREADS_ENV = "SOLARIS_HARNESS_TEST_THREADS"
+"""What one harness run may use, as systemd cgroup properties. A workspace test
+run starts about a dozen test binaries at once, each with its own in-process
+server and Lua host; unbounded, that evicts the desktop into swap and the run
+stalls on page-in instead of on CPU, so every ``run``/``client`` invocation is
+placed in one bounded scope first. Every knob takes a systemd value or ``off``:
+``SOLARIS_HARNESS_CPU_QUOTA`` (default ``600%``), ``SOLARIS_HARNESS_MEMORY_HIGH``
+(default ``3G``), ``SOLARIS_HARNESS_MEMORY_MAX`` (default ``4G``),
+``SOLARIS_HARNESS_MEMORY_SWAP_MAX`` (default ``1G``).
+
+The cap has to leave the session room, not just bound the run: ``systemd-oomd``
+monitors the whole ``user@1000.service`` tree with a memory-pressure limit (50%
+of PSI here), and when the tree crosses it oomd kills the biggest units in it -
+which on 2026-09-16 was both the run's scope *and* an interactive terminal
+scope, because a 7G allowance on a 15.7G machine whose session already held
+11.2G cannot be satisfied without reclaiming the session. Three decisions follow
+from the two kills and the measurement of the successful runs. Throttling is
+switched off (``MemoryHigh=off``): ``MemoryHigh`` makes the kernel reclaim
+*inside* the scope, and that reclaim is itself the pressure signal oomd acts on,
+so a throttled scope is what feeds the kill rather than what avoids it.
+``MemoryMax`` stays at ``4G``, three times the 1.13 GiB a full ``test`` phase was
+measured to peak at, so it is a hard wall rather than a working limit. And
+``_exec_in_scope`` refuses to start while the machine has less free memory than
+the run is allowed to take."""
+DEFAULT_CPU_QUOTA = "600%"
+DEFAULT_MEMORY_HIGH = "off"
+DEFAULT_MEMORY_MAX = "4G"
+DEFAULT_MEMORY_SWAP_MAX = "1G"
+_OFF = {"", "off", "none", "0", "max"}
+
+_MEMORY_UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def _parse_bytes(value: str) -> int | None:
+    """A systemd memory value in bytes, or ``None`` when it is not one.
+
+    ``infinity`` and the knobs' own off-words mean "no limit", which this cannot
+    compare against free memory, so both answer ``None``.
+    """
+    text = value.strip()
+    if not text or text.lower() in _OFF or text.lower() == "infinity":
+        return None
+    multiplier = 1
+    if text[-1].upper() in _MEMORY_UNITS:
+        multiplier = _MEMORY_UNITS[text[-1].upper()]
+        text = text[:-1]
+    if not text.isdigit():
+        return None
+    return int(text) * multiplier
+
+
+def _available_bytes() -> int | None:
+    """The machine's ``MemAvailable``, or ``None`` when it cannot be read."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _limit(value: str, env: str) -> str | None:
+    """One enabled cgroup limit, or ``None`` when the knob is disabled."""
+    value = value.strip()
+    if value.lower() in _OFF and not (env == MEMORY_HIGH_ENV and value == ""):
+        return None
+    return value or None
+
+
+def _test_threads(quota: str) -> int:
+    """libtest concurrency that matches the CPU the run is allowed.
+
+    Cargo's test harness defaults to one test thread per CPU of the *machine*
+    while the run is confined to a CPU quota, so a binary's whole test set would
+    fight over the bound - and every concurrent test carries its own server and
+    Lua host, which is most of the memory a run holds. Derived from the quota
+    unless ``SOLARIS_HARNESS_TEST_THREADS`` names a value.
+    """
+    explicit = os.environ.get(TEST_THREADS_ENV, "").strip()
+    if explicit.isdigit() and int(explicit) > 0:
+        return int(explicit)
+    percent = quota.strip().rstrip("%")
+    if percent.isdigit() and int(percent) > 0:
+        return max(1, int(percent) // 100)
+    return max(1, os.cpu_count() or 1)
+
+
+def _scope_command(quota: str) -> list[str] | None:
+    """The command that re-runs this harness inside one bounded scope."""
+    if shutil.which("systemd-run") is None:
+        return None
+    probe = subprocess.run(
+        ["systemctl", "--user", "is-system-running"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.stdout.strip() not in {"running", "degraded"}:
+        return None
+    properties = ["-p", f"CPUQuota={quota}", "-p", "CPUWeight=50"]
+    for env, default, name in (
+        (MEMORY_HIGH_ENV, DEFAULT_MEMORY_HIGH, "MemoryHigh"),
+        (MEMORY_MAX_ENV, DEFAULT_MEMORY_MAX, "MemoryMax"),
+        (MEMORY_SWAP_ENV, DEFAULT_MEMORY_SWAP_MAX, "MemorySwapMax"),
+    ):
+        value = _limit(os.environ.get(env, default), env)
+        if value is not None:
+            properties += ["-p", f"{name}={value}"]
+    return [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        *properties,
+        sys.executable,
+        "-m",
+        "tools.harness",
+        *sys.argv[1:],
+    ]
+
+
+def _exec_in_scope() -> int | None:
+    """Run this invocation in one bounded scope, at most once.
+
+    Every cargo, test, server and client process the run starts inherits the
+    cgroup, so one bound covers the whole run instead of giving each child its
+    own. Answers the scope's exit code when the run happened there, and ``None``
+    when this process is already inside the scope, or no user scope is available.
+    """
+    if os.environ.get(CPU_SCOPE_ENV):
+        return None
+    quota = os.environ.get(CPU_QUOTA_ENV, DEFAULT_CPU_QUOTA).strip()
+    if quota.lower() in _OFF:
+        return None
+    memory_max = os.environ.get(MEMORY_MAX_ENV, DEFAULT_MEMORY_MAX)
+    # A run that cannot fit in the machine's free memory is not bounded by its
+    # own cap: the kernel reclaims the rest of the session instead, and
+    # `systemd-oomd` then kills whichever unit in the user slice is largest. That
+    # is how a 7G scope took an interactive terminal down with it, so the run is
+    # refused while the machine is that loaded, and the operator either frees
+    # memory or raises the cap deliberately.
+    wanted = _parse_bytes(memory_max)
+    available = _available_bytes()
+    if wanted is not None and available is not None and available < wanted + 1024**3:
+        print(
+            f"[harness] refusing to start: the run may take up to {memory_max} but only "
+            f"{available // 1024**2} MiB is available (free memory, or lower "
+            f"{MEMORY_MAX_ENV}, or set it to `off` to run unbounded)",
+            file=sys.stderr,
+        )
+        return 1
+    command = _scope_command(quota)
+    if command is None:
+        print(
+            "[harness] warning: no user systemd scope; running without bounds",
+            file=sys.stderr,
+        )
+        return None
+    environment = dict(os.environ, **{CPU_SCOPE_ENV: "1"})
+    environment.setdefault("RUST_TEST_THREADS", str(_test_threads(quota)))
+    print(
+        f"[harness] scope CPUQuota={quota} MemoryHigh={os.environ.get(MEMORY_HIGH_ENV, DEFAULT_MEMORY_HIGH)} "
+        f"MemoryMax={memory_max} test-threads={environment['RUST_TEST_THREADS']}"
+    )
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+    )
+    return completed.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m tools.harness")
     parser.add_argument("command", nargs="?", choices=["list", "run", "client", "mcp"])
@@ -347,6 +529,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "list":
         return cmd_list()
+    if args.command in {"run", "client"}:
+        scoped = _exec_in_scope()
+        if scoped is not None:
+            return scoped
     if args.command == "run":
         if not args.rest:
             print("harness run: expected PROFILE", file=sys.stderr)

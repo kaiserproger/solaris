@@ -324,7 +324,7 @@ fn startup_rule_reload_fences_resolved_values_not_source_formatting() {
     fs::write(package.join("rules.lua"), source).unwrap();
     fs::write(package.join("config.toml"), "spacing = 97").unwrap();
     let initial = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
-    let contract = super::LuaReloadContract::from_prepared(&initial);
+    let contract = super::PluginReloadContract::from_prepared(&initial);
     fs::write(
         package.join("rules.lua"),
         format!("{source}\n-- formatting only"),
@@ -332,13 +332,13 @@ fn startup_rule_reload_fences_resolved_values_not_source_formatting() {
     .unwrap();
     let equivalent = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
     assert_eq!(
-        contract.incompatibility(&super::LuaReloadContract::from_prepared(&equivalent)),
+        contract.incompatibility(&super::PluginReloadContract::from_prepared(&equivalent)),
         None
     );
     fs::write(package.join("config.toml"), "spacing = 113").unwrap();
     let changed = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
     assert_eq!(
-        contract.incompatibility(&super::LuaReloadContract::from_prepared(&changed)),
+        contract.incompatibility(&super::PluginReloadContract::from_prepared(&changed)),
         Some("worldgen")
     );
 }

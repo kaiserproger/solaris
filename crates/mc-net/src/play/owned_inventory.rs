@@ -390,44 +390,51 @@ pub(crate) fn owned_inventory_snapshot(
 /// One planned worker deposit into one bound container.
 #[derive(Debug, Clone)]
 pub(crate) struct WarehouseDepositPlan {
-    /// The worker's own endpoint slots after the move.
+    /// The source endpoint's slots after the move.
     pub(crate) updated_source: Vec<ItemStack>,
-    /// The container's canonical slots after the move.
-    pub(crate) updated_container: Vec<ItemStack>,
-    /// The resource ids that entered the container, with their unit counts.
+    /// The destination endpoint's slots after the move.
+    pub(crate) updated_destination: Vec<ItemStack>,
+    /// The resource ids that entered the destination, with their unit counts.
     pub(crate) moved: BTreeMap<String, u64>,
 }
 
-/// Plan one worker cargo deposit into one bound container.
+/// Plan one bounded move between a worker's own endpoint and a bound container,
+/// in either direction.
 ///
-/// The worker hauls up to `limit` units out of its own endpoint into the
-/// container in slot order, merging into compatible partial stacks and filling
-/// free slots. Every step is applied through [`plan_owned_item_transfers`], so
-/// the deposit can never state a stack that planner would reject: what the
-/// container cannot take is left with the worker.
+/// Up to `limit` units move out of the source into the destination in slot
+/// order, merging into compatible partial stacks and filling free slots. Every
+/// step is applied through [`plan_owned_item_transfers`], so a planned move can
+/// never state a stack that planner would reject: what the destination cannot
+/// take stays where it was. When `item` names a resource, only stacks of that
+/// item are considered - a withdrawal takes what the caller asked for instead of
+/// whatever the source happens to hold first.
 ///
-/// A container with no room for a worker that holds something answers
-/// [`ScriptOperationFailure::Capacity`], and a worker with nothing to haul
-/// answers [`ScriptOperationFailure::InsufficientItems`], so the caller's
-/// `no_storage` and `missing_input` pauses stay distinct.
+/// A destination with no room for a source that holds something answers
+/// [`ScriptOperationFailure::Capacity`], and a source that holds nothing to move
+/// answers [`ScriptOperationFailure::InsufficientItems`] - including a filter
+/// no source stack matches, so the caller's `no_storage` and `missing_input`
+/// pauses stay distinct.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_warehouse_deposit(
     source: &ScriptInventoryEndpoint,
     destination: &ScriptInventoryEndpoint,
     source_slots: &[ItemStack],
-    container_slots: &[ItemStack],
+    destination_slots: &[ItemStack],
     limit: u64,
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
+    item: Option<&str>,
 ) -> Result<WarehouseDepositPlan, ScriptOperationFailure> {
     if limit == 0 {
         return Err(ScriptOperationFailure::InvalidRequest);
     }
     let mut working = BTreeMap::from([
         (source.clone(), source_slots.to_vec()),
-        (destination.clone(), container_slots.to_vec()),
+        (destination.clone(), destination_slots.to_vec()),
     ]);
     let mut moved: BTreeMap<String, u64> = BTreeMap::new();
     let mut remaining = limit;
+    let mut filter_matches = false;
     'source: for source_slot in 0..source_slots.len() {
         let source_index =
             u8::try_from(source_slot).map_err(|_| ScriptOperationFailure::InvalidRequest)?;
@@ -439,17 +446,23 @@ pub(crate) fn plan_warehouse_deposit(
             if stack.is_empty() {
                 continue 'source;
             }
-            let max_stack = item_max_stack(item_facts, items, &stack);
             let name = items
                 .name_of(stack.item_id)
                 .ok_or(ScriptOperationFailure::InvalidRequest)?
                 .as_str()
                 .to_owned();
+            if item.is_some_and(|wanted| wanted != name) {
+                // A filtered move takes the named item only; a stack it did not
+                // ask for stays where it is and the next slot is tried.
+                continue 'source;
+            }
+            filter_matches = true;
+            let max_stack = item_max_stack(item_facts, items, &stack);
             // The first destination slot with room for this stack decides how
-            // much of it moves; a container that offers none leaves the rest
-            // with the worker.
+            // much of it moves; a destination that offers none leaves the rest
+            // where it was.
             let mut filled = false;
-            for destination_slot in 0..container_slots.len() {
+            for destination_slot in 0..destination_slots.len() {
                 let destination_index = u8::try_from(destination_slot)
                     .map_err(|_| ScriptOperationFailure::InvalidRequest)?;
                 let room = deposit_room(
@@ -487,17 +500,21 @@ pub(crate) fn plan_warehouse_deposit(
                 break;
             }
             if !filled {
-                // Nothing in the container takes this stack, so it stays with
-                // the worker and the next one is tried: a container that still
-                // has room for a later stack must not stall the whole haul on
-                // the first one it cannot take.
+                // Nothing in the destination takes this stack, so it stays where
+                // it was and the next one is tried: a destination that still has
+                // room for a later stack must not stall the whole move on the
+                // first one it cannot take.
                 continue 'source;
             }
         }
     }
     if moved.is_empty() {
-        let holds_something = source_slots.iter().any(|stack| !stack.is_empty());
-        return Err(if holds_something {
+        // The source held the named item and the destination could not take it
+        // (capacity); otherwise there was nothing of what the caller asked for
+        // (a missing input, which a filter makes exact).
+        let source_holds = filter_matches
+            || (item.is_none() && source_slots.iter().any(|stack| !stack.is_empty()));
+        return Err(if source_holds {
             ScriptOperationFailure::Capacity
         } else {
             ScriptOperationFailure::InsufficientItems
@@ -507,7 +524,7 @@ pub(crate) fn plan_warehouse_deposit(
         updated_source: working
             .remove(source)
             .expect("planned source inventory remains"),
-        updated_container: working
+        updated_destination: working
             .remove(destination)
             .expect("planned destination inventory remains"),
         moved,

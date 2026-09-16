@@ -69,7 +69,7 @@ permissions = [
 
     assert_eq!(bundle.owner_plugin_id(), "loader-test");
     assert_eq!(plugin.id(), "loader-test");
-    assert_eq!(plugin.deployment(), LuaPluginDeployment::ServerAndClient);
+    assert_eq!(plugin.deployment(), PluginDeployment::ServerAndClient);
     assert_eq!(plugin.supported_loaders(), &["fabric", "forge", "neoforge"]);
     assert_eq!(
         plugin.permissions(),
@@ -102,19 +102,19 @@ permissions = [
     assert_eq!(
         bundle.loaders(),
         &[
-            LuaClientLoader::Fabric,
-            LuaClientLoader::NeoForge,
-            LuaClientLoader::Forge
+            ClientLoader::Fabric,
+            ClientLoader::NeoForge,
+            ClientLoader::Forge
         ]
     );
     assert_eq!(
         bundle.content(),
         &[
-            LuaClientContentKind::Blocks,
-            LuaClientContentKind::Items,
-            LuaClientContentKind::Views,
-            LuaClientContentKind::ViewActions,
-            LuaClientContentKind::Assets,
+            ClientContentKind::Blocks,
+            ClientContentKind::Items,
+            ClientContentKind::Views,
+            ClientContentKind::ViewActions,
+            ClientContentKind::Assets,
         ]
     );
     assert_eq!(
@@ -143,7 +143,7 @@ fn plugin_without_client_bundles_is_discovered_as_server_only() {
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].id(), "loader-test");
-    assert_eq!(plugins[0].deployment(), LuaPluginDeployment::ServerOnly);
+    assert_eq!(plugins[0].deployment(), PluginDeployment::ServerOnly);
     assert!(plugins[0].supported_loaders().is_empty());
     assert!(plugins[0].permissions().is_empty());
     assert_eq!(plugins[0].total_artifact_bytes(), 0);

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This package collects the already-green automated and visual evidence for the only remaining Phase-4 item-1 boundary in `docs/PUBLIC_ALPHA_PLAN.md`: the owner's subjective terrain/playability disposition for a fresh `tellus_like` world on seed `712816`.
+This package collects the already-green automated and visual evidence for the only remaining Phase-4 item-1 boundary in `docs/milestones/public-alpha-plan.md`: the owner's subjective terrain/playability disposition for a fresh `tellus_like` world on seed `712816`.
 
 It does **not** turn agent observations into an owner verdict. The three remaining open checkboxes in the public-alpha plan all refer to this same disposition boundary.
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This checkpoint advances Phase-1 item 5 in `docs/PUBLIC_ALPHA_PLAN.md` with one complete active-feature route for bucket/block-resync behavior. The route deliberately crosses the four validation layers named by the plan instead of relying on whichever test or real-client scenario happened to run most recently.
+This checkpoint advances Phase-1 item 5 in `docs/milestones/public-alpha-plan.md` with one complete active-feature route for bucket/block-resync behavior. The route deliberately crosses the four validation layers named by the plan instead of relying on whichever test or real-client scenario happened to run most recently.
 
 The new entrypoint is:
 

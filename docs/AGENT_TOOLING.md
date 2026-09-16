@@ -5,14 +5,20 @@ contains the rules; this file contains the local wiring.
 
 ## Current Tools
 
+The paths below are the ones a working checkout actually has. Entries marked
+*(owner workstation)* come from the owner's opencode setup: this repository does
+not require them, and on a checkout without `~/.config/opencode` those commands
+and MCP plugins are simply absent — normal work then uses the repository rules,
+the harness, and the agent's own tools.
+
 | Tool | Status | Use |
 |---|---|---|
 | CodeGraph | installed globally via npm as `@colbymchenry/codegraph@1.2.0`; Codex MCP server `codegraph` registered; omp user-wide MCP `~/.omp/agent/mcp.json` exposes `codegraph_explore` (the v1.2.0 MCP surface is explore-only; `callers`/`callees`/`impact` stay CLI); rust-analyzer via omp `lsp.yml` answers hover/references; telemetry disabled; Solaris index lives in ignored `.codegraph/` | Targeted symbol graph questions: callers/callees, mutation paths, lock holders, affected tests, and blast-radius checks. Refresh with `codegraph sync .` after edits before relying on it. |
-| Serena | enabled globally through opencode MCP | Optional targeted Rust symbol search/editing and project memories; do not use it as mandatory startup context. |
-| Context7 | enabled globally through opencode MCP and verified 2026-06-11 | External library/framework docs. Use `resolve-library-id` before `query-docs`. |
-| RTK | installed at `/home/kaiserroman/.cargo/bin/rtk` | Compact shell output. OpenCode plugin installed globally at `~/.config/opencode/plugins/rtk.ts`; restart opencode before relying on auto-rewrite. |
-| Headroom | installed by `uv tool install "headroom-ai[all]"` at `/home/kaiserroman/.local/bin/headroom` | Optional context compression/proxy/MCP/learning. Do not route opencode provider traffic through Headroom unless explicitly asked. |
-| Agent harness | installed globally under `~/.config/opencode/bin/agent-harness` | Optional opencode workflow only when explicitly requested; normal Codex work uses the repo rules and exactly one final reviewer. |
+| Serena *(owner workstation)* | enabled globally through opencode MCP | Optional targeted Rust symbol search/editing and project memories; do not use it as mandatory startup context. |
+| Context7 *(owner workstation)* | enabled globally through opencode MCP and verified 2026-06-11 | External library/framework docs. Use `resolve-library-id` before `query-docs`. |
+| RTK | installed at `~/.local/bin/rtk` (verified 2026-09-16) | Compact shell output, called explicitly. The OpenCode auto-rewrite plugin the owner's machine has at `~/.config/opencode/plugins/rtk.ts` is not installed everywhere. |
+| Headroom | installed by `uv tool install "headroom-ai[all]"` at `~/.local/bin/headroom` | Optional context compression/proxy/MCP/learning. Do not route opencode provider traffic through Headroom unless explicitly asked. |
+| Agent harness *(owner workstation)* | installed globally under `~/.config/opencode/bin/agent-harness` | Optional opencode workflow only when explicitly requested; normal Codex work uses the repo rules and exactly one final reviewer. |
 | Minecraft client MCP | embedded in the repo's Fabric 26.1.2 development client; optional Loader clients also support NeoForge and Forge; loopback Streamable HTTP endpoint | Structured real-client observation, connection, inventory/entity waits, input, selected-item drop, and reusable multi-client core gates without screenshot assertions. |
 
 ## Validation Harness
@@ -36,6 +42,71 @@ Normal server runs write tracing events only to `logs/latest.log` and
 `SOLARIS_HARNESS_LOG_STDOUT=1` for its subprocesses, adding an INFO stdout layer
 so existing readiness events and per-run captured server logs remain available.
 Do not enable this variable for ordinary operator launches.
+
+### CPU and memory bound on every run
+
+`run` and `client` put the whole invocation into one bounded systemd user scope
+before doing any work, so a workspace test run cannot take the machine away from
+the session the owner is working in. Cargo, every test binary, the harness's own
+server/client/Xvfb children and the private backends all inherit that one
+cgroup, so each bound is a total, not a per-process, allowance.
+
+| Property | Default | Env |
+| --- | --- | --- |
+| `CPUQuota` (+`CPUWeight=50`) | `600%` | `SOLARIS_HARNESS_CPU_QUOTA` |
+| `MemoryHigh` | `off` (no throttle) | `SOLARIS_HARNESS_MEMORY_HIGH` |
+| `MemoryMax` | `4G` | `SOLARIS_HARNESS_MEMORY_MAX` |
+| `MemorySwapMax` | `1G` | `SOLARIS_HARNESS_MEMORY_SWAP_MAX` |
+| libtest threads (`RUST_TEST_THREADS`) | quota ÷ 100 | `SOLARIS_HARNESS_TEST_THREADS` |
+
+```sh
+python3 -m tools.harness run correctness              # the defaults above
+SOLARIS_HARNESS_CPU_QUOTA=150% python3 -m tools.harness run test
+SOLARIS_HARNESS_MEMORY_MAX=12G python3 -m tools.harness client   # heavier client runs
+SOLARIS_HARNESS_CPU_QUOTA=off  python3 -m tools.harness run test  # unbounded, opt-out
+```
+
+A memory cap only protects the session if the run fits in what the machine has
+free: on 2026-09-16 a `correctness` run under the then-defaults (`5G`/`7G`, ~11 GiB
+already held by the desktop) was killed by `systemd-oomd`, which acts on the
+*whole* `user@1000.service` tree's 50% memory-pressure limit and then picks the
+largest units in it — the run's scope *and*, in the first kill, an interactive
+terminal scope. A cgroup cap does not stop that, because oomd never looks at the
+scope's own limit. Measured afterwards: a full `test` phase peaks at **1.13 GiB**
+(483 samples of the scope's `memory.current`), so the runs never needed the
+allowance they had — the tree was already near its limit and the run's share
+tipped it. Two consequences. The defaults are `3G`/`4G`, three times the measured
+need, and `run`/`client` refuse to start when `MemAvailable` is less than
+`MemoryMax` + 1 GiB, naming the knob to change:
+
+```text
+[harness] refusing to start: the run may take up to 20G but only 12701 MiB is available
+```
+
+That refusal is not acceptance evidence — it means the gate did not run, and the
+receipt is the harness's own message rather than a profile result. Beyond it, an
+over-large run is killed inside its own scope (`oomd`/cgroup OOM) instead of
+dragging the desktop into swap: the run fails loudly, the session keeps running.
+Test threads follow the CPU quota because cargo's default is one thread per
+*machine* CPU while the run holds a fraction of them; each concurrent test
+carries its own in-process server and Lua host, so oversubscribing costs both
+wall time and most of the run's memory.
+
+The CPU default keeps half the machine for the session and the memory caps are
+what actually protect it: measured on the owner workstation (12 CPUs, 15 GiB),
+the freezes were memory pressure and writeback (PSI `cpu full` stayed at 0), so
+the quota is generous while `MemoryMax` is the hard wall. Twelve spinners in a 4 s
+window consume 45.6 CPU-seconds unbounded, 24.6 under `CPUQuota=600%` and 4.1
+under `CPUQuota=100%`; a full `test` phase peaks at 1.13 GiB (483 one-second
+samples of the scope's `memory.current`), which is what `MemoryMax` is sized from.
+The thread default
+is matched to the quota so each concurrent test keeps the same CPU share it has
+unbounded (quota ÷ 100 threads): a *tighter* quota with unmatched threads starves
+every individual test, which is how fixed 5 s packet waits start failing on
+machines that pass unbounded. A run without a user systemd scope prints a warning
+and continues unbounded rather than failing closed, because the scope is a
+machine protection, not acceptance evidence; the receipt records the profile's
+own result either way.
 
 ### Prerequisites
 
@@ -302,7 +373,7 @@ Do not enable that automatically in this repo because the global opencode setup
 uses provider auth/plugins and a forced proxy can break model access.
 
 Headroom MCP is not enabled in `opencode.json`. If the owner asks for it, use
-`/home/kaiserroman/.local/bin/headroom mcp serve` as the local command and
+`~/.local/bin/headroom mcp serve` as the local command and
 check startup cost before leaving it enabled.
 
 ## Session Logs
@@ -314,7 +385,7 @@ than dumped into model context.
 | Source | Command |
 |---|---|
 | Codex CLI JSONL | inspect `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`; verify `session_meta.payload.cwd` first |
-| OpenCode session list | `opencode session list` from `/home/kaiserroman/solaris` |
+| OpenCode session list | `opencode session list` from the repository root |
 | OpenCode SQLite DB | `sqlite3 ~/.local/share/opencode/opencode.db` |
 | Text parts | Query `part` joined with `message`/`session`; useful content is usually in `part.data` where `$.type == "text"`. |
 

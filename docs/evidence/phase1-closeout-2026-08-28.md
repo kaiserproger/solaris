@@ -2,7 +2,7 @@
 
 ## Scope
 
-This checkpoint closes the remaining Phase-1 test-trust work in `docs/PUBLIC_ALPHA_PLAN.md`: the final aggregate `mc-net::play` test ownership cleanup (item 3) and the phase L2 closeout (item 6). Items 1, 2, 4, and 5 already have their own linked inventories/evidence.
+This checkpoint closes the remaining Phase-1 test-trust work in `docs/milestones/public-alpha-plan.md`: the final aggregate `mc-net::play` test ownership cleanup (item 3) and the phase L2 closeout (item 6). Items 1, 2, 4, and 5 already have their own linked inventories/evidence.
 
 ## Final focused-test extraction
 

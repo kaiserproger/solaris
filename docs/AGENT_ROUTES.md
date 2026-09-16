@@ -7,9 +7,9 @@ subagent output.
 | Route | Primary document | Code and evidence entrypoints |
 | --- | --- | --- |
 | `playable` | `docs/playable/ACTIVE.md` after `docs/playable/README.md` | `crates/mc-net/src/play/`, focused `mc-test-harness` path, then named real-client scenario |
-| `plugins` | `docs/PLUGINS.md` | `crates/mc-script/`, `crates/mc-net/src/script/`, focused session endpoint, `tests/plugin_*.rs` |
+| `plugins` | `docs/PLUGINS.md` | `crates/mc-script/`, `crates/mc-net/src/script/`, focused session endpoint, `crates/mc-test-harness/tests/plugin_*.rs` |
 | `parity` | exact `docs/PROJECT_SPEC.md` or active milestone section | ADR 0002, local protocol dump/oracle, exact harness comparison |
-| `scaling` | exact active milestone and ADR 0004/0005 | measured benchmark/profile only; metric definitions in `docs/M52_OPERATOR_PERFORMANCE_NOTES.md` |
+| `scaling` | exact active milestone and ADR 0004/0005 | measured benchmark/profile only; metric definitions in `docs/milestones/M52-operator-performance-notes.md` |
 | `architecture` | `docs/ARCHITECTURE.md`, then the ADR owning the touched runtime constraint | exact modules/callers; new target and current implementation must remain distinct |
 
 Additional exact surfaces:
@@ -42,7 +42,10 @@ checkpoint explicitly requests readiness.
 - `crates/` - Cargo workspace members.
 - `crates/mc-test-harness/tests/` - wire/integration gates.
 - `../solaris-loader/` - independent reusable client MCP and scenarios.
-- `docs/` - canonical contracts, ADRs, milestone/evidence records.
+- `docs/` - canonical contracts, ADRs, and process documents.
+- `docs/milestones/` - milestone logs and their milestone-scoped reviews.
+- `docs/evidence/`, `docs/performance/`, `docs/memory/`, `docs/playable/` - dated
+  records; read them only when a checkpoint names that era.
 - `tools/` - vanilla extraction, protocol, and client runner scripts.
 - `example.toml` / `playable.toml` - documented debug runtime profiles.
 

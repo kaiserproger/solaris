@@ -1325,6 +1325,73 @@ impl OperatorFactsHandle {
     }
 }
 
+/// The live sessions of whichever bound server has published them.
+///
+/// The caller that must resolve a stable player identity to the session that
+/// identity holds right now - a component host, which needs its lookup before
+/// the server that owns the sessions exists - creates this handle first, keeps
+/// a clone of it, and publishes a bound server into it with
+/// [`BoundServer::register_player_sessions`]. Queries then answer from that
+/// server's own session registry, which is the authority that also answers
+/// `list-online-players`, so the two can never disagree.
+///
+/// The handle keeps no session table of its own: it never invents a session and
+/// never re-derives one from anything but the published registry.
+///
+/// * An unpublished handle, and a handle whose published registry is no longer
+///   alive, answers nobody.
+/// * After a re-bind, it answers the server published last, not the one it
+///   answered before.
+/// * A player who is not connected right now is answered as absent, never with
+///   the session they used to hold, including in the window between a
+///   connection ending and the registry tearing its session down.
+/// * Two connected players cannot share an identity: the registry refuses a
+///   second session for a uuid or name it already holds, so one identity never
+///   resolves to a choice of sessions.
+#[derive(Clone, Debug)]
+pub struct PlayerSessionsHandle {
+    published: Arc<arc_swap::ArcSwap<Option<std::sync::Weak<play::SessionRegistry>>>>,
+}
+
+impl PlayerSessionsHandle {
+    /// An empty handle: it answers nobody until a server publishes into it.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            published: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        }
+    }
+
+    /// The session `player` holds right now, or `None` when that player is not
+    /// connected or no server publishes live sessions through this handle.
+    ///
+    /// `player` is the stable identity a plugin addresses - the player uuid the
+    /// server hands out in its player contexts, not a username and not a
+    /// session id.
+    #[must_use]
+    pub fn session_of(&self, player: &str) -> Option<u64> {
+        let published = self.published.load();
+        let sessions = match published.as_ref() {
+            Some(sessions) => sessions.upgrade()?,
+            None => return None,
+        };
+        sessions.script_session_of_identity(player)
+    }
+
+    /// Answer from `sessions` from now on, replacing whichever server was
+    /// published before it.
+    fn publish(&self, sessions: &Arc<play::SessionRegistry>) {
+        self.published
+            .store(Arc::new(Some(Arc::downgrade(sessions))));
+    }
+}
+
+impl Default for PlayerSessionsHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SaveAllReport {
     pub players_saved: usize,
@@ -1543,6 +1610,19 @@ impl BoundServer {
         OperatorFactsHandle {
             sessions: Arc::clone(&self.sessions),
         }
+    }
+
+    /// Publish this server's live sessions through `handle` from now on,
+    /// replacing whichever server `handle` answered for before it.
+    ///
+    /// The handle is created before this server exists - the component host
+    /// that reads it is started before the network binds - so the composition
+    /// root publishes the bound server's registry here. A command a plugin
+    /// addresses to a stable player identity is then answered with the session
+    /// that identity holds right now, read from the same registry that answers
+    /// `list-online-players`.
+    pub fn register_player_sessions(&self, handle: &PlayerSessionsHandle) {
+        handle.publish(&self.sessions);
     }
     #[must_use]
     pub fn runtime_telemetry_handle(&self) -> RuntimeTelemetryHandle {
@@ -5045,6 +5125,10 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 #[cfg(test)]
 #[path = "server_collision_tests.rs"]
 mod server_collision_tests;
+
+#[cfg(test)]
+#[path = "server_player_sessions_tests.rs"]
+mod server_player_sessions_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

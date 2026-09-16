@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mc_script::{
-    LuaPluginPackage, MAX_WORLD_COMMIT_PORTION, ScriptChunkAvailability, ScriptOperationFailure,
+    MAX_WORLD_COMMIT_PORTION, PluginPackage, ScriptChunkAvailability, ScriptOperationFailure,
     ScriptSurveyBounds,
 };
 use mc_world::{BlockPos, BlockRegistry, Chunk, ChunkPos, WorldReadView};
@@ -195,7 +195,7 @@ impl SettlementDeployment {
 ///
 /// A violation is returned as a typed error; the caller must fail startup.
 pub(crate) fn discover_settlement_deployment(
-    packages: &[LuaPluginPackage],
+    packages: &[PluginPackage],
     registry: &BlockRegistry,
 ) -> Result<Option<SettlementDeployment>, SettlementStartupError> {
     discover_settlement_deployment_with_hashes(packages, registry, &BTreeMap::new())
@@ -205,7 +205,7 @@ pub(crate) fn discover_settlement_deployment(
 /// content hash the deployment records. A mismatch is rejected like any other
 /// catalog violation.
 pub(crate) fn discover_settlement_deployment_with_hashes(
-    packages: &[LuaPluginPackage],
+    packages: &[PluginPackage],
     registry: &BlockRegistry,
     expected_hashes: &BTreeMap<String, String>,
 ) -> Result<Option<SettlementDeployment>, SettlementStartupError> {

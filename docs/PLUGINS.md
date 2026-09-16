@@ -243,6 +243,54 @@ are not additional callable host functions.
 | Loader presentation | `play_client_sound`, `stop_client_sound` | [Client content](#client-content-manifest) |
 | Loader blocks | `place_loader_block`, `grant_loader_block_item` | [Commands](#commands) |
 
+The runtime contract is moving to WebAssembly components
+(`crates/mc-script/wit`, `solaris:plugin@0.7.0`, host in
+`crates/mc-plugin-host`, guest SDK in `sdk/rust/`). Everything documented below
+describes the Luau deployment that is still the production path while that
+migration runs; the WASM contract is the target and P0 of it - a real component
+that loads, answers events and is stopped by its budgets - is implemented and
+tested. Do not start new plugin-facing work against the Luau API.
+
+What the WASM contract covers today, and nothing more: lifecycle
+(`configure`/`init`/`shutdown`), join/leave/chat/command events, `send-message`,
+durable storage (`storage-get`, `storage-cas`) with the server's typed
+results correlated by the plugin's own request id, and `list-online-players`.
+Both storage calls keep the Luau semantics exactly: a swap without an expected
+version applies only when the key holds nothing, a refusal says only that the
+swap did not commit, a failure is `unavailable` or `durability-failed` and is
+never flattened into "the key holds nothing", and the host binds the owner, so a
+plugin cannot name another plugin's key. A plugin package is `plugin.toml` plus
+`plugin.wasm`; discovery enforces `strict`/`expected` and operator grants, and
+`mc-server --check` loads a component deployment without touching a world or
+storage. Every other row in the tables below is still the Luau surface, and the
+operations the shipped packages use are the ones P3 moves.
+
+What the host bounds, on both sides of the boundary: the guest's instructions
+(fuel), its wall clock (an epoch watchdog on a thread the guest cannot block), its
+memories, tables and instances (the store limiter), and - the one limit that
+bounds the *host* - the bytes one answer may transfer out of guest memory
+(`PluginLimits::hostcall_bytes`). That last bound exists because lifting an answer
+allocates on the host's side and nothing else constrains it; Wasmtime's own
+default for it is 2 GiB, which is a number a hostile package would otherwise
+choose. A guest past it is refused during the transfer and the instance is
+retired, exactly as for a trap. The fuel and memory numbers are still
+uncalibrated starting points; P7 measures them against the ported packages.
+
+The composition root runs either runtime, one per deployment: `[plugins] runtime
+= "luau" | "wasm"` selects it, a deployment directory configured for one is never
+read by the other, and a component deployment's `configure` phase is what supplies
+the startup rules the world is opened with (validated in the host, fingerprinted
+through the same `GameplayRules::contract_name()` the Luau path uses, so the same
+effective plan keeps the same world contract). A deployment that declares rules
+the host refuses stops startup, and two packages that each declare rules refuse
+the deployment, because the world contract records one plan. What a component
+deployment cannot declare yet is an ore profile, a settlement plan or a client
+bundle — the WIT contract has no record for them — so it records the same values a
+server with no plugin directory records, and `serve()` logs that fact rather than
+leaving it implicit. SIGHUP reload is Luau-only until the component host has a
+reload contract; a component deployment logs that the reload was ignored and never
+reports one as performed.
+
 `rules.lua` is a separate startup data contract, not another runtime host
 namespace. No durable resident handle, physical worker/order API or
 settlement-contract operation is available merely because it appears in a
@@ -828,7 +876,7 @@ swap the plugin generation, and publish the staged startup commands. Compile,
 `server.started`, command-queue/admission, or command-ownership failure before that
 point leaves the current generation and its ownership intact.
 
-Previous-generation fault diagnostics are returned in `LuaReloadReport`; runtime-local
+Previous-generation fault diagnostics are returned in `PluginReloadReport`; runtime-local
 state such as timers starts fresh in the new generation. Host commands already emitted
 before the reload barrier remain valid committed output. Once a reload request is
 admitted to the host queue it is commit intent; cancelling the caller does not cancel
@@ -1315,16 +1363,21 @@ solaris.demobilize_resident(request_id, operation_id, handle, expected_revision)
 `haul`, `craft`, `fish`, `tend_livestock`, `construct`. Each names a concrete
 bounded `area` (dimension, min/max block corners, at most 16 per axis), the
 required tool/feed/recipe (a namespaced item id or recipe id), and the endpoint
-that receives the produce. `haul` moves items between two of the plugin's own
-resident endpoints. `construct` names a prepared `structure_id`, one authored
-`stage` and the expected structure revision, and drives that stage through the
-structure's committed reservation. A job is executed through the existing
-gathering, recipe, inventory and movement mechanics — not a passive resource
-generator — so a missing tool, missing input, protected plot, unloaded chunk or
-blocked route pauses the job with a typed reason (`missing_tool`, `missing_input`,
+that receives the produce. `haul` moves items between one of the plugin's own
+resident endpoints and either another resident endpoint or a warehouse container
+the plugin bound with `solaris.bind_warehouse`, in either direction, and takes an
+optional `item` naming the resource it moves - a withdrawal from a settlement
+warehouse states what it needs instead of receiving whatever storage holds first.
+`construct` names a prepared `structure_id`, one authored `stage` and the expected
+structure revision, and drives that stage through the structure's committed
+reservation. A job is executed through the existing gathering, recipe, inventory
+and movement mechanics — not a passive resource generator — so a missing tool,
+missing input, protected plot, unloaded chunk or blocked route pauses the job with
+a typed reason (`missing_tool`, `missing_input`,
 `protected`, `unloaded`, `blocked_route`, `no_storage`, `unsupported`) and
 reports zero committed work. The result carries only the work units and
-inventory deltas that were actually committed.
+inventory deltas that were actually committed, signed for the container a haul
+moved through: a deposit reports what entered it, a withdrawal what left it.
 
 `order` is a closed tagged union: `follow` (an authenticated player id),
 `move` (dimension, anchor, heading, formation), `hold` (anchor, heading,

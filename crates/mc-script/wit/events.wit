@@ -1,0 +1,301 @@
+// Events the host delivers to a plugin, and the context that describes where a
+// batch came from.
+//
+// Events are immutable snapshots of something that already happened. A plugin
+// reads them and answers with commands; it never observes a live world and
+// never sees a value the host did not already validate.
+interface events {
+    use types.{player-id, plugin-error, position, session-id, sequence, tick};
+    use commands.{command};
+    use storage.{storage-cas-outcome, storage-change, storage-get-outcome};
+
+    /// What one event says about its own origin. A batch carries the tick and
+    /// the owner of the events in it, so a plugin can order its own work without
+    /// assuming a global order the server does not promise.
+    record event-context {
+        /// The owner tick the events were produced at.
+        tick: tick,
+        /// Sequence of the first event of this batch inside that tick.
+        first-sequence: sequence,
+        /// Number of events in the batch.
+        count: u32,
+    }
+
+    /// One player joined. The player may already own a stable identity from an
+    /// earlier session; `session` is the connection that just opened.
+    record player-joined {
+        player: player-id,
+        session: session-id,
+        name: string,
+    }
+
+    /// One player left. `session` is the connection that ended, which the host
+    /// never reuses for a later session of the same player.
+    ///
+    /// The stable identity is absent on purpose: the server's own leave event
+    /// carries only the connection, and a host that kept a session -> identity map
+    /// would lose it on its own restart and then guess. A plugin correlates a
+    /// leave with the join it already saw for that session.
+    record player-left {
+        session: session-id,
+    }
+
+    /// One chat line a player sent, already filtered by the server's own rules.
+    record chat-sent {
+        player: player-id,
+        session: session-id,
+        message: string,
+    }
+
+    /// One player ran one of the plugin's own commands.
+    record command-invoked {
+        player: player-id,
+        session: session-id,
+        /// The command name as the manifest declared it, without the prefix.
+        name: string,
+        /// The remaining arguments, split on whitespace and bounded by the host.
+        arguments: list<string>,
+    }
+
+    /// The answer to one `storage-get` this plugin issued, correlated by the
+    /// request id it chose.
+    record storage-get-answered {
+        request: string,
+        outcome: storage-get-outcome,
+    }
+
+    /// The answer to one `storage-cas` this plugin issued, correlated by the
+    /// request id it chose.
+    record storage-cas-answered {
+        request: string,
+        outcome: storage-cas-outcome,
+    }
+
+    /// One connected player, as the server sees them at the moment of the query.
+    /// The stable identity is the one a command addresses; `session` is the
+    /// connection, which a later message to the identity may no longer reach.
+    record player-snapshot {
+        player: player-id,
+        session: session-id,
+        name: string,
+        dimension: string,
+    }
+
+    /// The answer to one `list-online-players`. `truncated` says the server held
+    /// back players beyond the requested limit; it is not an error.
+    record online-players-answered {
+        request: string,
+        /// At most the requested limit, and never more than 256.
+        players: list<player-snapshot>,
+        truncated: bool,
+    }
+
+    /// Why an admitted teleport did not commit. A plugin reads the server's own
+    /// reason instead of parsing text, and learns that the world did not change
+    /// at all.
+    enum player-teleport-failure {
+        /// The connection the request named is gone: it disconnected, or it was
+        /// replaced and that exact session no longer exists. The world did not
+        /// change.
+        player-unavailable,
+        /// That connection still holds a position confirmation the server has
+        /// not seen answered, so the request is refused before anything moves.
+        teleport-pending,
+        /// The simulation owner could not take the commit. The world did not
+        /// change.
+        runtime-unavailable,
+    }
+
+    /// What one admitted teleport ended in. The two shapes are exclusive: one
+    /// carries the pose the owner committed, the other the server's reason for
+    /// refusing, and only the committed shape means the world moved.
+    variant player-teleport-outcome {
+        /// The simulation owner committed the exact pose the plugin requested. It
+        /// does not mean the client confirmed the teleport, received every
+        /// destination chunk, or completed a socket write.
+        committed,
+        refused(player-teleport-failure),
+    }
+
+    /// The answer to one `teleport-player`, correlated by the request id the
+    /// plugin chose. It echoes that id, the connection and the exact
+    /// coordinates, so a plugin matches an answer to its own request without
+    /// trusting an order the server does not promise.
+    ///
+    /// The answer carries no list and no text: the only bounded value in it is
+    /// the correlation id, which the contract bounds at 64 bytes and the
+    /// server's own event validator enforces when it builds the result, so the
+    /// host-call budget is not what bounds this event.
+    record player-teleport-answered {
+        request: string,
+        session: session-id,
+        position: position,
+        outcome: player-teleport-outcome,
+    }
+
+    /// Why an operation the plugin issued did not commit.
+    ///
+    /// Every member is a reason the server's own operation outcome already
+    /// reports, so a plugin reads the server's vocabulary instead of parsing a
+    /// string, and the reasons stay distinguishable: a batch refused for a stale
+    /// revision is not the same operator problem as one refused for a reused
+    /// operation id, and neither is a lookup that found nothing.
+    enum operation-failure {
+        /// The plugin's own request was not a valid operation for the owner it
+        /// reached.
+        invalid-request,
+        /// The package does not hold what the operation needs.
+        forbidden,
+        /// A mutation expected a revision a key no longer holds. Nothing changed.
+        stale-revision,
+        /// The operation named something that does not exist, including a durable
+        /// operation id the server never recorded.
+        not-found,
+        /// The owner that would apply the operation is not loaded.
+        unloaded,
+        /// The owner is not in a state that admits the operation.
+        blocked,
+        /// The owner does not hold the items the operation needs.
+        insufficient-items,
+        /// The owner has no room for the operation.
+        capacity,
+        /// The owner is already applying an operation on the same object.
+        busy,
+        /// The owner could not take the commit at all: storage that is unavailable,
+        /// or an actor that stopped after a durability failure.
+        runtime-unavailable,
+        /// The operation id is already recorded for different content, so the
+        /// server refused the substituted request instead of applying it.
+        operation-conflict,
+        /// A cursor the operation named has expired.
+        cursor-expired,
+        /// The server refused, and this contract does not name its reason yet. The
+        /// operation did not commit, exactly as for every other member here.
+        unknown,
+    }
+
+    /// What one committed operation changed, one member per operation family.
+    ///
+    /// The union grows with the operations the contract carries; a family the
+    /// contract does not carry yet has no member here, and no second union exists.
+    variant operation-payload {
+        /// One storage batch: every key it wrote and every key it removed. A key
+        /// of a `cas` mutation appears once with `deleted: false`, one of a
+        /// `delete` mutation once with `deleted: true`.
+        ///
+        /// The server's own outcome validator bounds the list at 16 changes of at
+        /// most 128 bytes per key, which is the same bound the batch that produced
+        /// it was admitted under.
+        storage-batch(list<storage-change>),
+    }
+
+    /// One operation the server durably committed.
+    record operation-committed {
+        /// The revision the commit landed at. The plugin never picks it, and one
+        /// batch leaves every key it changed at this same revision.
+        revision: u64,
+        /// What the commit changed, in the shape that operation's family declares.
+        payload: operation-payload,
+    }
+
+    /// What one operation the plugin issued ended in. The two shapes are
+    /// exclusive: one carries the commit the server recorded, the other the
+    /// server's own reason for recording none, and only the committed shape means
+    /// anything changed.
+    variant operation-outcome {
+        /// The server durably applied the operation. It does not mean a client or
+        /// another owner has observed the change yet.
+        committed(operation-committed),
+        /// The server applied nothing: an operation is all-or-nothing, so no part
+        /// of a refused batch is half-applied.
+        refused(operation-failure),
+    }
+
+    /// The answer to one operation this plugin issued.
+    ///
+    /// The answer is correlated twice, on purpose. `request` is the id the plugin
+    /// chose for this call, so it matches the answer to the request it made
+    /// without trusting an order the server does not promise. `operation-id` is
+    /// the durable id the plugin named, and it is the id a later `operation-status`
+    /// addresses: a plugin re-probes by it instead of re-applying a batch whose
+    /// outcome it never saw.
+    ///
+    /// The answer carries no list of its own beyond the commit's changed keys: its
+    /// only bounded values are the two 64-byte ids, the revision, and that key
+    /// list, which the server's own outcome validator bounds at 16 keys of 128
+    /// bytes. The host-call budget bounds what lifting one answer costs.
+    record operation-answered {
+        /// The request id of the operation being answered.
+        request: string,
+        /// The durable operation id the plugin named for it.
+        operation-id: string,
+        outcome: operation-outcome,
+    }
+
+    /// What the server's zone owner did with one zone command it was handed.
+    ///
+    /// The owner's own answer is one bit: it took the command, or it refused it.
+    /// The finer vocabulary behind that bit - a registry at one of its four
+    /// capacity bounds, a registry that is closed, a registry the owner cannot read
+    /// at all - belongs to the server's zone owner and stays behind the script
+    /// boundary, so this contract does not invent a reason of its own and a plugin
+    /// never parses one out of a wording the server did not send. A member is added
+    /// here by the change that makes the server carry a reason, not by a guess made
+    /// before it.
+    enum zone-command-outcome {
+        /// The owner holds the zone with the definition the command carried, or -
+        /// for a removal - no longer holds a zone by that id. This includes the
+        /// idempotent case on purpose: a definition the owner already holds and a
+        /// removal of a zone it never held are applied as nothing to change, the
+        /// owner does not distinguish them from a change, and a plugin must not read
+        /// more out of this answer than the owner put into it.
+        applied,
+        /// The owner did not apply the command: the definition the plugin sent is
+        /// not what the owner holds now, and for a removal the zone is still
+        /// registered. A plugin that announced protection before this answer must
+        /// take that announcement back.
+        refused,
+    }
+
+    /// The answer to one `upsert-zone`, `upsert-protected-zone` or `remove-zone`
+    /// this plugin issued.
+    ///
+    /// This is the contract's one answer keyed by the object it acted on rather
+    /// than by a request id the plugin chose, and the reason is the server's own:
+    /// a zone command carries no request, and the owner's answer names the zone it
+    /// acted on. The host therefore adds no correlation id the server never sent -
+    /// inventing one would need a map from zone to request that promises an
+    /// attribution the server's answer cannot support - and a plugin matches an
+    /// answer to its command by the zone it named, exactly as the Lua API's
+    /// `on_zone_command_result` does. The second correlation style is deliberate
+    /// and one field wide.
+    ///
+    /// The answer carries no list and no text beyond that id, which the server's
+    /// own event validator bounds at the contract's script id when it builds the
+    /// result, so the host-call budget (`PluginLimits::hostcall_bytes`) is not what
+    /// bounds this event.
+    record zone-command-answered {
+        /// The zone the command named, 1..`mc_script::MAX_SCRIPT_ID_BYTES` (64)
+        /// bytes, echoed unchanged.
+        zone: string,
+        outcome: zone-command-outcome,
+    }
+
+    variant event {
+        player-joined(player-joined),
+        player-left(player-left),
+        chat-sent(chat-sent),
+        command-invoked(command-invoked),
+        storage-get-answered(storage-get-answered),
+        storage-cas-answered(storage-cas-answered),
+        online-players-answered(online-players-answered),
+        player-teleport-answered(player-teleport-answered),
+        operation-answered(operation-answered),
+        zone-command-answered(zone-command-answered),
+    }
+
+    /// One batch of events for the plugin, in delivery order for this plugin.
+    /// The batch is bounded: the host never hands a plugin more events than its
+    /// configured budget, and the remainder arrives in a later batch.
+    on-events: func(context: event-context, events: list<event>) -> result<list<command>, plugin-error>;
+}

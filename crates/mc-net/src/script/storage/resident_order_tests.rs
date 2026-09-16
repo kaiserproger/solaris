@@ -825,6 +825,7 @@ async fn haul_moves_items_between_canonical_resident_endpoints() {
         destination: mc_script::ScriptInventoryEndpoint::ResidentCarry {
             handle: handle.clone(),
         },
+        item: None,
     };
     let outcome = fixture
         .execute(
@@ -872,6 +873,117 @@ async fn haul_moves_items_between_canonical_resident_endpoints() {
     assert_eq!(
         record.carry[0].as_ref().map(|stack| stack.count),
         Some(moved)
+    );
+}
+
+/// (CP-003) A haul that names an item moves only that item: the stack the order
+/// did not ask for stays in the source, and the receipt reports the item that
+/// really moved.
+#[tokio::test]
+async fn a_named_item_haul_leaves_every_other_stack_where_it_is() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    // Two stacks are in the canonical source, and the order names the second
+    // one, so storage order alone would move the wrong item.
+    let revision = seed_gear_in(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:oak_log", 3), ("minecraft:wheat", 5)],
+        true,
+    );
+    let haul = ScriptResidentWorkOrder::Haul {
+        source: mc_script::ScriptInventoryEndpoint::ResidentEquipment {
+            handle: handle.clone(),
+        },
+        destination: mc_script::ScriptInventoryEndpoint::ResidentCarry {
+            handle: handle.clone(),
+        },
+        item: Some("minecraft:wheat".to_owned()),
+    };
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request("haul-named", &handle, haul, 8, revision),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(assignment.work_units_done, 5, "the whole wheat stack moved");
+    assert_eq!(
+        assignment
+            .changes
+            .iter()
+            .map(|change| (change.item_id.as_str(), change.delta))
+            .collect::<Vec<_>>(),
+        vec![("minecraft:wheat", 5)],
+        "the receipt names the item the order asked for"
+    );
+    // Read each endpoint on its own: the concatenated view cannot tell which
+    // side a stack sits on.
+    let record = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("the move is durable");
+    assert_eq!(
+        record.equipment[0]
+            .as_ref()
+            .map(|stack| stack.item_id.as_str()),
+        Some("minecraft:oak_log"),
+        "the stack the order did not ask for stayed in the source"
+    );
+    assert_eq!(
+        record.carry[0]
+            .as_ref()
+            .map(|stack| (stack.item_id.as_str(), stack.count)),
+        Some(("minecraft:wheat", 5)),
+        "the named item landed in the destination"
+    );
+    assert_eq!(record.equipment[1], None, "no third stack appeared");
+}
+
+/// (CP-003) An order that names an item the source does not hold pauses as
+/// `missing_input` and moves nothing, even when the source is not empty.
+#[tokio::test]
+async fn a_named_item_haul_of_an_absent_item_moves_nothing() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear_in(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:oak_log", 3)],
+        true,
+    );
+    let haul = ScriptResidentWorkOrder::Haul {
+        source: mc_script::ScriptInventoryEndpoint::ResidentEquipment {
+            handle: handle.clone(),
+        },
+        destination: mc_script::ScriptInventoryEndpoint::ResidentCarry {
+            handle: handle.clone(),
+        },
+        item: Some("minecraft:wheat".to_owned()),
+    };
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request("haul-absent", &handle, haul, 4, revision),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::MissingInput));
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(assignment.changes.is_empty());
+    assert_eq!(
+        gear(&storage, &handle),
+        vec![("minecraft:oak_log".to_owned(), 3)],
+        "the source is exactly as it was"
     );
 }
 

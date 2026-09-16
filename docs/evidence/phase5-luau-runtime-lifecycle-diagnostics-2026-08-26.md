@@ -2,7 +2,7 @@
 
 ## Scope
 
-This checkpoint advances Phase 5 item 2 in `docs/PUBLIC_ALPHA_PLAN.md` without claiming that the whole item is complete. The existing API `0.6.0` runtime already had one sandboxed Luau VM per plugin, fixed memory and instruction limits, wall-clock interruption, capability-gated command admission, bounded event/command queues, and per-plugin failure isolation. The missing boundary addressed here was lifecycle observability: a plugin could be disabled correctly while the composition root later learned only whether the host thread panicked.
+This checkpoint advances Phase 5 item 2 in `docs/milestones/public-alpha-plan.md` without claiming that the whole item is complete. The existing API `0.6.0` runtime already had one sandboxed Luau VM per plugin, fixed memory and instruction limits, wall-clock interruption, capability-gated command admission, bounded event/command queues, and per-plugin failure isolation. The missing boundary addressed here was lifecycle observability: a plugin could be disabled correctly while the composition root later learned only whether the host thread panicked.
 
 The slice is intentionally limited to `mc-script` lifecycle reporting and `mc-server` shutdown diagnostics. It does not add hot reload, new gameplay authority, direct world/entity handles, or a new Luau API surface.
 

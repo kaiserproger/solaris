@@ -16,9 +16,7 @@ use tracing::{info, warn};
 
 mod gameplay_rules;
 mod operations;
-pub use gameplay_rules::{
-    LuaBiomeSpawns, LuaClayRule, LuaGameplayRules, LuaSpawnEntry, LuaSpawnPlacement, LuaTreeRule,
-};
+use crate::gameplay_rules::GameplayRules;
 
 #[cfg(test)]
 mod authoring_tests;
@@ -183,20 +181,20 @@ impl std::error::Error for LuaHostError {}
 pub struct LuaHost {
     loaded_plugins: usize,
     reload_sender: tokio::sync::mpsc::WeakSender<ScriptHostInput>,
-    reload_contract: LuaReloadContract,
+    reload_contract: PluginReloadContract,
     thread: thread::JoinHandle<LuaHostExitReport>,
 }
 
 /// Stage that permanently disabled one plugin while keeping the host alive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum LuaPluginDisableStage {
+pub enum PluginDisableStage {
     Handler,
     BatchRejectionHandler,
     CommandAdmission,
 }
 
-impl LuaPluginDisableStage {
+impl PluginDisableStage {
     #[must_use]
     pub const fn contract_name(self) -> &'static str {
         match self {
@@ -209,14 +207,14 @@ impl LuaPluginDisableStage {
 
 /// Actionable terminal diagnostic retained for a plugin disabled at runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LuaPluginDisableDiagnostic {
+pub struct PluginDisableDiagnostic {
     plugin_id: String,
-    stage: LuaPluginDisableStage,
+    stage: PluginDisableStage,
     message: String,
 }
 
-impl LuaPluginDisableDiagnostic {
-    fn new(plugin_id: String, stage: LuaPluginDisableStage, message: String) -> Self {
+impl PluginDisableDiagnostic {
+    fn new(plugin_id: String, stage: PluginDisableStage, message: String) -> Self {
         Self {
             plugin_id,
             stage,
@@ -230,7 +228,7 @@ impl LuaPluginDisableDiagnostic {
     }
 
     #[must_use]
-    pub const fn stage(&self) -> LuaPluginDisableStage {
+    pub const fn stage(&self) -> PluginDisableStage {
         self.stage
     }
 
@@ -268,14 +266,14 @@ impl LuaHostExitReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaHostExitReport {
     loaded_plugins: usize,
-    disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
+    disabled_plugins: Vec<PluginDisableDiagnostic>,
     exit_reason: LuaHostExitReason,
 }
 
 impl LuaHostExitReport {
     fn new(
         loaded_plugins: usize,
-        disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
+        disabled_plugins: Vec<PluginDisableDiagnostic>,
         exit_reason: LuaHostExitReason,
     ) -> Self {
         Self {
@@ -297,7 +295,7 @@ impl LuaHostExitReport {
     }
 
     #[must_use]
-    pub fn disabled_plugins(&self) -> &[LuaPluginDisableDiagnostic] {
+    pub fn disabled_plugins(&self) -> &[PluginDisableDiagnostic] {
         &self.disabled_plugins
     }
 
@@ -310,7 +308,7 @@ impl LuaHostExitReport {
 /// Why a prepared Luau replacement could not become the active host generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum LuaReloadError {
+pub enum PluginReloadError {
     HostClosed,
     StartupContractChanged { field: &'static str },
     CandidatePlugin { plugin_id: String, message: String },
@@ -320,7 +318,7 @@ pub enum LuaReloadError {
     CommandOwnership { message: String },
 }
 
-impl fmt::Display for LuaReloadError {
+impl fmt::Display for PluginReloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HostClosed => formatter.write_str("Luau host is no longer accepting reloads"),
@@ -352,20 +350,17 @@ impl fmt::Display for LuaReloadError {
     }
 }
 
-impl std::error::Error for LuaReloadError {}
+impl std::error::Error for PluginReloadError {}
 
 /// Successful in-place replacement of one complete Luau host generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LuaReloadReport {
+pub struct PluginReloadReport {
     loaded_plugins: usize,
-    replaced_disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
+    replaced_disabled_plugins: Vec<PluginDisableDiagnostic>,
 }
 
-impl LuaReloadReport {
-    fn new(
-        loaded_plugins: usize,
-        replaced_disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
-    ) -> Self {
+impl PluginReloadReport {
+    fn new(loaded_plugins: usize, replaced_disabled_plugins: Vec<PluginDisableDiagnostic>) -> Self {
         Self {
             loaded_plugins,
             replaced_disabled_plugins,
@@ -379,58 +374,58 @@ impl LuaReloadReport {
 
     /// Fault diagnostics from the generation that was successfully replaced.
     #[must_use]
-    pub fn replaced_disabled_plugins(&self) -> &[LuaPluginDisableDiagnostic] {
+    pub fn replaced_disabled_plugins(&self) -> &[PluginDisableDiagnostic] {
         &self.replaced_disabled_plugins
     }
 }
 
-pub(crate) struct LuaReloadRequest {
+pub(crate) struct PluginReloadRequest {
     prepared: PreparedLuaPlugins,
-    response: tokio::sync::oneshot::Sender<Result<LuaReloadReport, LuaReloadError>>,
+    response: tokio::sync::oneshot::Sender<Result<PluginReloadReport, PluginReloadError>>,
 }
 
-impl LuaReloadRequest {
+impl PluginReloadRequest {
     fn new(
         prepared: PreparedLuaPlugins,
-        response: tokio::sync::oneshot::Sender<Result<LuaReloadReport, LuaReloadError>>,
+        response: tokio::sync::oneshot::Sender<Result<PluginReloadReport, PluginReloadError>>,
     ) -> Self {
         Self { prepared, response }
     }
 
     pub(crate) fn reject_host_unavailable(self) {
-        let _ = self.response.send(Err(LuaReloadError::HostClosed));
+        let _ = self.response.send(Err(PluginReloadError::HostClosed));
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LuaReloadPluginContract {
+struct PluginReloadPluginContract {
     plugin_id: String,
     player_command_roots: Vec<String>,
     operator_command_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LuaReloadClientBundleContract {
+struct PluginReloadClientBundleContract {
     owner_plugin_id: String,
     id: String,
     version: String,
     sha256: String,
     size_bytes: u64,
-    loaders: Vec<LuaClientLoader>,
-    content: Vec<LuaClientContentKind>,
-    permissions: Vec<LuaClientPermission>,
+    loaders: Vec<ClientLoader>,
+    content: Vec<ClientContentKind>,
+    permissions: Vec<ClientPermission>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LuaReloadContract {
-    plugins: Vec<LuaReloadPluginContract>,
+struct PluginReloadContract {
+    plugins: Vec<PluginReloadPluginContract>,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_contract: Option<String>,
     gameplay_rules_contract: Option<String>,
-    client_bundles: Vec<LuaReloadClientBundleContract>,
+    client_bundles: Vec<PluginReloadClientBundleContract>,
 }
 
-impl LuaReloadContract {
+impl PluginReloadContract {
     fn from_prepared(prepared: &PreparedLuaPlugins) -> Self {
         let plugins = prepared
             .sources
@@ -440,7 +435,7 @@ impl LuaReloadContract {
                 player_command_roots.sort();
                 let mut operator_command_roots = source.manifest.operator_command_roots().to_vec();
                 operator_command_roots.sort();
-                LuaReloadPluginContract {
+                PluginReloadPluginContract {
                     plugin_id: source.manifest.plugin_id().to_owned(),
                     player_command_roots,
                     operator_command_roots,
@@ -450,7 +445,7 @@ impl LuaReloadContract {
         let mut client_bundles = prepared
             .client_bundles
             .iter()
-            .map(|bundle| LuaReloadClientBundleContract {
+            .map(|bundle| PluginReloadClientBundleContract {
                 owner_plugin_id: bundle.owner_plugin_id().to_owned(),
                 id: bundle.id().to_owned(),
                 version: bundle.version().to_owned(),
@@ -471,9 +466,7 @@ impl LuaReloadContract {
                 .worldgen_settlement_plan
                 .as_ref()
                 .map(LuaSettlementPlan::contract_name),
-            gameplay_rules_contract: prepared
-                .gameplay_rules()
-                .map(LuaGameplayRules::contract_name),
+            gameplay_rules_contract: prepared.gameplay_rules().map(GameplayRules::contract_name),
             client_bundles,
         }
     }
@@ -515,13 +508,13 @@ pub enum LuaWorldgenSettlementProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum LuaClientLoader {
+pub enum ClientLoader {
     Fabric,
     NeoForge,
     Forge,
 }
 
-impl LuaClientLoader {
+impl ClientLoader {
     #[must_use]
     pub const fn contract_name(self) -> &'static str {
         match self {
@@ -534,7 +527,7 @@ impl LuaClientLoader {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum LuaClientContentKind {
+pub enum ClientContentKind {
     Blocks,
     Items,
     Views,
@@ -545,7 +538,7 @@ pub enum LuaClientContentKind {
     Sounds,
 }
 
-impl LuaClientContentKind {
+impl ClientContentKind {
     #[must_use]
     pub const fn contract_name(self) -> &'static str {
         match self {
@@ -560,23 +553,23 @@ impl LuaClientContentKind {
         }
     }
 
-    const fn required_permission(self) -> LuaClientPermission {
+    const fn required_permission(self) -> ClientPermission {
         match self {
-            Self::Blocks => LuaClientPermission::RegisterBlocks,
-            Self::Items => LuaClientPermission::RegisterItems,
-            Self::Views => LuaClientPermission::PresentViews,
-            Self::ViewActions => LuaClientPermission::SendViewActions,
-            Self::Assets => LuaClientPermission::LoadAssets,
-            Self::WorldPreviews => LuaClientPermission::PresentWorldPreviews,
-            Self::WorldSelection => LuaClientPermission::SendWorldSelection,
-            Self::Sounds => LuaClientPermission::PlaySounds,
+            Self::Blocks => ClientPermission::RegisterBlocks,
+            Self::Items => ClientPermission::RegisterItems,
+            Self::Views => ClientPermission::PresentViews,
+            Self::ViewActions => ClientPermission::SendViewActions,
+            Self::Assets => ClientPermission::LoadAssets,
+            Self::WorldPreviews => ClientPermission::PresentWorldPreviews,
+            Self::WorldSelection => ClientPermission::SendWorldSelection,
+            Self::Sounds => ClientPermission::PlaySounds,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum LuaClientPermission {
+pub enum ClientPermission {
     RegisterBlocks,
     RegisterItems,
     PresentViews,
@@ -587,7 +580,7 @@ pub enum LuaClientPermission {
     PlaySounds,
 }
 
-impl LuaClientPermission {
+impl ClientPermission {
     #[must_use]
     pub const fn contract_name(self) -> &'static str {
         match self {
@@ -604,7 +597,7 @@ impl LuaClientPermission {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LuaClientBundle {
+pub struct ClientBundle {
     owner_plugin_id: String,
     id: String,
     version: String,
@@ -613,20 +606,20 @@ pub struct LuaClientBundle {
     size_bytes: u64,
     artifact_path: PathBuf,
     artifact_bytes: Arc<[u8]>,
-    loaders: Vec<LuaClientLoader>,
-    content: Vec<LuaClientContentKind>,
-    permissions: Vec<LuaClientPermission>,
+    loaders: Vec<ClientLoader>,
+    content: Vec<ClientContentKind>,
+    permissions: Vec<ClientPermission>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum LuaPluginDeployment {
+pub enum PluginDeployment {
     ServerOnly,
     ServerAndClient,
 }
 
-impl LuaPluginDeployment {
+impl PluginDeployment {
     #[must_use]
     pub const fn contract_name(self) -> &'static str {
         match self {
@@ -637,7 +630,7 @@ impl LuaPluginDeployment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LuaClientBundleDiscovery<'a> {
+pub struct ClientBundleDiscovery<'a> {
     id: &'a str,
     version: &'a str,
     artifact: &'a str,
@@ -648,7 +641,7 @@ pub struct LuaClientBundleDiscovery<'a> {
     permissions: Vec<&'static str>,
 }
 
-impl<'a> LuaClientBundleDiscovery<'a> {
+impl<'a> ClientBundleDiscovery<'a> {
     #[must_use]
     pub const fn id(&self) -> &'a str {
         self.id
@@ -691,23 +684,23 @@ impl<'a> LuaClientBundleDiscovery<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LuaPluginDiscovery<'a> {
+pub struct PluginDiscovery<'a> {
     id: &'a str,
-    deployment: LuaPluginDeployment,
+    deployment: PluginDeployment,
     supported_loaders: Vec<&'static str>,
     permissions: Vec<&'static str>,
     total_artifact_bytes: u64,
-    client_bundles: Vec<LuaClientBundleDiscovery<'a>>,
+    client_bundles: Vec<ClientBundleDiscovery<'a>>,
 }
 
-impl<'a> LuaPluginDiscovery<'a> {
+impl<'a> PluginDiscovery<'a> {
     #[must_use]
     pub const fn id(&self) -> &'a str {
         self.id
     }
 
     #[must_use]
-    pub const fn deployment(&self) -> LuaPluginDeployment {
+    pub const fn deployment(&self) -> PluginDeployment {
         self.deployment
     }
 
@@ -727,12 +720,12 @@ impl<'a> LuaPluginDiscovery<'a> {
     }
 
     #[must_use]
-    pub fn client_bundles(&self) -> &[LuaClientBundleDiscovery<'a>] {
+    pub fn client_bundles(&self) -> &[ClientBundleDiscovery<'a>] {
         &self.client_bundles
     }
 }
 
-impl LuaClientBundle {
+impl ClientBundle {
     #[must_use]
     pub fn owner_plugin_id(&self) -> &str {
         &self.owner_plugin_id
@@ -779,17 +772,17 @@ impl LuaClientBundle {
     }
 
     #[must_use]
-    pub fn loaders(&self) -> &[LuaClientLoader] {
+    pub fn loaders(&self) -> &[ClientLoader] {
         &self.loaders
     }
 
     #[must_use]
-    pub fn content(&self) -> &[LuaClientContentKind] {
+    pub fn content(&self) -> &[ClientContentKind] {
         &self.content
     }
 
     #[must_use]
-    pub fn permissions(&self) -> &[LuaClientPermission] {
+    pub fn permissions(&self) -> &[ClientPermission] {
         &self.permissions
     }
 
@@ -1037,14 +1030,14 @@ pub struct PreparedLuaPlugins {
     sources: Vec<PluginSource>,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_plan: Option<LuaSettlementPlan>,
-    gameplay_rules: Option<Arc<LuaGameplayRules>>,
-    client_bundles: Vec<LuaClientBundle>,
+    gameplay_rules: Option<Arc<GameplayRules>>,
+    client_bundles: Vec<ClientBundle>,
     strict_startup: bool,
 }
 
 impl PreparedLuaPlugins {
     #[must_use]
-    pub fn gameplay_rules(&self) -> Option<&LuaGameplayRules> {
+    pub fn gameplay_rules(&self) -> Option<&GameplayRules> {
         self.gameplay_rules.as_deref()
     }
 
@@ -1067,7 +1060,7 @@ impl PreparedLuaPlugins {
     }
 
     #[must_use]
-    pub fn client_bundles(&self) -> &[LuaClientBundle] {
+    pub fn client_bundles(&self) -> &[ClientBundle] {
         &self.client_bundles
     }
 
@@ -1077,13 +1070,13 @@ impl PreparedLuaPlugins {
         self
     }
 
-    pub fn discovered_plugins(&self) -> impl ExactSizeIterator<Item = LuaPluginDiscovery<'_>> + '_ {
+    pub fn discovered_plugins(&self) -> impl ExactSizeIterator<Item = PluginDiscovery<'_>> + '_ {
         self.sources.iter().map(|source| {
             let supported_loaders = source
                 .client_bundles
                 .iter()
                 .flat_map(|bundle| bundle.loaders.iter().copied())
-                .map(LuaClientLoader::contract_name)
+                .map(ClientLoader::contract_name)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -1091,19 +1084,19 @@ impl PreparedLuaPlugins {
                 .client_bundles
                 .iter()
                 .flat_map(|bundle| bundle.permissions.iter().copied())
-                .map(LuaClientPermission::contract_name)
+                .map(ClientPermission::contract_name)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
             let total_artifact_bytes = source
                 .client_bundles
                 .iter()
-                .map(LuaClientBundle::size_bytes)
+                .map(ClientBundle::size_bytes)
                 .sum();
             let client_bundles = source
                 .client_bundles
                 .iter()
-                .map(|bundle| LuaClientBundleDiscovery {
+                .map(|bundle| ClientBundleDiscovery {
                     id: bundle.id(),
                     version: bundle.version(),
                     artifact: bundle.artifact(),
@@ -1113,29 +1106,29 @@ impl PreparedLuaPlugins {
                         .loaders()
                         .iter()
                         .copied()
-                        .map(LuaClientLoader::contract_name)
+                        .map(ClientLoader::contract_name)
                         .collect(),
                     content: bundle
                         .content()
                         .iter()
                         .copied()
-                        .map(LuaClientContentKind::contract_name)
+                        .map(ClientContentKind::contract_name)
                         .collect(),
                     permissions: bundle
                         .permissions()
                         .iter()
                         .copied()
-                        .map(LuaClientPermission::contract_name)
+                        .map(ClientPermission::contract_name)
                         .collect(),
                 })
                 .collect();
 
-            LuaPluginDiscovery {
+            PluginDiscovery {
                 id: source.manifest.plugin_id(),
                 deployment: if source.client_bundles.is_empty() {
-                    LuaPluginDeployment::ServerOnly
+                    PluginDeployment::ServerOnly
                 } else {
-                    LuaPluginDeployment::ServerAndClient
+                    PluginDeployment::ServerAndClient
                 },
                 supported_loaders,
                 permissions,
@@ -1168,23 +1161,25 @@ impl LuaHost {
     pub async fn reload(
         &self,
         prepared: PreparedLuaPlugins,
-    ) -> Result<LuaReloadReport, LuaReloadError> {
-        let candidate_contract = LuaReloadContract::from_prepared(&prepared);
+    ) -> Result<PluginReloadReport, PluginReloadError> {
+        let candidate_contract = PluginReloadContract::from_prepared(&prepared);
         if let Some(field) = self.reload_contract.incompatibility(&candidate_contract) {
-            return Err(LuaReloadError::StartupContractChanged { field });
+            return Err(PluginReloadError::StartupContractChanged { field });
         }
         let Some(sender) = self.reload_sender.upgrade() else {
-            return Err(LuaReloadError::HostClosed);
+            return Err(PluginReloadError::HostClosed);
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         sender
-            .send(ScriptHostInput::LuaReload(LuaReloadRequest::new(
+            .send(ScriptHostInput::PluginReload(PluginReloadRequest::new(
                 prepared,
                 response_tx,
             )))
             .await
-            .map_err(|_| LuaReloadError::HostClosed)?;
-        response_rx.await.map_err(|_| LuaReloadError::HostClosed)?
+            .map_err(|_| PluginReloadError::HostClosed)?;
+        response_rx
+            .await
+            .map_err(|_| PluginReloadError::HostClosed)?
     }
 
     pub fn join(self) -> thread::Result<LuaHostExitReport> {
@@ -1285,7 +1280,7 @@ pub fn start_prepared_lua_host(
         .sources
         .iter()
         .map(|source| {
-            crate::LuaPluginPackage::new(
+            crate::PluginPackage::new(
                 source.manifest.plugin_id(),
                 source.package_dir.clone(),
                 source.required_features.clone(),
@@ -1294,7 +1289,7 @@ pub fn start_prepared_lua_host(
         .collect::<Vec<_>>()
         .into();
     let reload_sender = boundary.event_admission.weak_sender.clone();
-    let reload_contract = LuaReloadContract::from_prepared(&prepared);
+    let reload_contract = PluginReloadContract::from_prepared(&prepared);
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
     let strict_startup = prepared.strict_startup;
     let thread = thread::Builder::new()
@@ -1337,8 +1332,8 @@ struct PluginSource {
     required_features: Vec<String>,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_plan: Option<LuaSettlementPlan>,
-    gameplay_rules: Option<Arc<LuaGameplayRules>>,
-    client_bundles: Vec<LuaClientBundle>,
+    gameplay_rules: Option<Arc<GameplayRules>>,
+    client_bundles: Vec<ClientBundle>,
 }
 
 fn order_plugin_sources(sources: Vec<PluginSource>) -> Result<Vec<PluginSource>, LuaHostError> {
@@ -1834,8 +1829,12 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
         manifest = manifest.declare_permission(permission);
     }
     for capability in disk.capabilities {
-        manifest = declare_disk_capability(manifest, &capability)
-            .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
+        manifest = manifest.declare_capability(&capability).map_err(|_| {
+            PluginSourceError::new(
+                format!("unknown plugin capability {capability:?}"),
+                startup_contract_declared,
+            )
+        })?;
     }
     let manifest = manifest.validate().map_err(|error| {
         PluginSourceError::new(
@@ -1898,7 +1897,7 @@ fn materialize_client_bundles(
     plugin_directory: &Path,
     owner_plugin_id: &str,
     client: Option<DiskClient>,
-) -> Result<Vec<LuaClientBundle>, String> {
+) -> Result<Vec<ClientBundle>, String> {
     let Some(client) = client else {
         return Ok(Vec::new());
     };
@@ -1950,23 +1949,23 @@ fn materialize_client_bundles(
 
         let loaders = unique_client_values(
             bundle.loaders.into_iter().map(|loader| match loader {
-                DiskClientLoader::Fabric => LuaClientLoader::Fabric,
-                DiskClientLoader::NeoForge => LuaClientLoader::NeoForge,
-                DiskClientLoader::Forge => LuaClientLoader::Forge,
+                DiskClientLoader::Fabric => ClientLoader::Fabric,
+                DiskClientLoader::NeoForge => ClientLoader::NeoForge,
+                DiskClientLoader::Forge => ClientLoader::Forge,
             }),
             "loaders",
             &bundle.id,
         )?;
         let content = unique_client_values(
             bundle.content.into_iter().map(|content| match content {
-                DiskClientContentKind::Blocks => LuaClientContentKind::Blocks,
-                DiskClientContentKind::Items => LuaClientContentKind::Items,
-                DiskClientContentKind::Views => LuaClientContentKind::Views,
-                DiskClientContentKind::ViewActions => LuaClientContentKind::ViewActions,
-                DiskClientContentKind::Assets => LuaClientContentKind::Assets,
-                DiskClientContentKind::WorldPreviews => LuaClientContentKind::WorldPreviews,
-                DiskClientContentKind::WorldSelection => LuaClientContentKind::WorldSelection,
-                DiskClientContentKind::Sounds => LuaClientContentKind::Sounds,
+                DiskClientContentKind::Blocks => ClientContentKind::Blocks,
+                DiskClientContentKind::Items => ClientContentKind::Items,
+                DiskClientContentKind::Views => ClientContentKind::Views,
+                DiskClientContentKind::ViewActions => ClientContentKind::ViewActions,
+                DiskClientContentKind::Assets => ClientContentKind::Assets,
+                DiskClientContentKind::WorldPreviews => ClientContentKind::WorldPreviews,
+                DiskClientContentKind::WorldSelection => ClientContentKind::WorldSelection,
+                DiskClientContentKind::Sounds => ClientContentKind::Sounds,
             }),
             "content",
             &bundle.id,
@@ -1976,18 +1975,18 @@ fn materialize_client_bundles(
                 .permissions
                 .into_iter()
                 .map(|permission| match permission {
-                    DiskClientPermission::RegisterBlocks => LuaClientPermission::RegisterBlocks,
-                    DiskClientPermission::RegisterItems => LuaClientPermission::RegisterItems,
-                    DiskClientPermission::PresentViews => LuaClientPermission::PresentViews,
-                    DiskClientPermission::SendViewActions => LuaClientPermission::SendViewActions,
-                    DiskClientPermission::LoadAssets => LuaClientPermission::LoadAssets,
+                    DiskClientPermission::RegisterBlocks => ClientPermission::RegisterBlocks,
+                    DiskClientPermission::RegisterItems => ClientPermission::RegisterItems,
+                    DiskClientPermission::PresentViews => ClientPermission::PresentViews,
+                    DiskClientPermission::SendViewActions => ClientPermission::SendViewActions,
+                    DiskClientPermission::LoadAssets => ClientPermission::LoadAssets,
                     DiskClientPermission::PresentWorldPreviews => {
-                        LuaClientPermission::PresentWorldPreviews
+                        ClientPermission::PresentWorldPreviews
                     }
                     DiskClientPermission::SendWorldSelection => {
-                        LuaClientPermission::SendWorldSelection
+                        ClientPermission::SendWorldSelection
                     }
-                    DiskClientPermission::PlaySounds => LuaClientPermission::PlaySounds,
+                    DiskClientPermission::PlaySounds => ClientPermission::PlaySounds,
                 }),
             "permissions",
             &bundle.id,
@@ -2010,7 +2009,7 @@ fn materialize_client_bundles(
             &bundle.sha256,
         )?;
 
-        bundles.push(LuaClientBundle {
+        bundles.push(ClientBundle {
             owner_plugin_id: owner_plugin_id.to_owned(),
             id: bundle.id,
             version: bundle.version,
@@ -2456,36 +2455,6 @@ fn read_utf8_file_limited(path: &Path, max_bytes: usize) -> Result<String, Strin
     }
     String::from_utf8(bytes).map_err(|error| format!("{} is not UTF-8: {error}", path.display()))
 }
-
-fn declare_disk_capability(
-    manifest: ScriptPluginManifest,
-    capability: &str,
-) -> Result<ScriptPluginManifest, String> {
-    match capability {
-        "storage" => Ok(manifest.declare_plugin_storage()),
-        "storage_batches" => Ok(manifest.declare_storage_batches()),
-        "inventory_transfers" => Ok(manifest.declare_inventory_transfers()),
-        "persistent_residents" => Ok(manifest.declare_persistent_residents()),
-        "resident_work" => Ok(manifest.declare_resident_work()),
-        "resident_orders" => Ok(manifest.declare_resident_orders()),
-        "world_sites" => Ok(manifest.declare_world_sites()),
-        "structure_operations" => Ok(manifest.declare_structure_operations()),
-        "inventory_menus" => Ok(manifest.declare_inventory_menus()),
-        "inventory_storage_transactions" => Ok(manifest.declare_inventory_storage_transactions()),
-        "player_inventory" => Ok(manifest.declare_player_inventory()),
-        "zones" => Ok(manifest.declare_zones()),
-        "player_teleport" => Ok(manifest.declare_player_teleport()),
-        "player_queries" => Ok(manifest.declare_player_queries()),
-        "entity_damage" => Ok(manifest.declare_entity_damage()),
-        "world_time" => Ok(manifest.declare_world_time()),
-        "world_blocks" => Ok(manifest.declare_world_blocks()),
-        channel if channel.starts_with("custom_payload:") => {
-            Ok(manifest.declare_custom_payload_channel(&channel["custom_payload:".len()..]))
-        }
-        _ => Err(format!("unknown plugin capability {capability:?}")),
-    }
-}
-
 fn parse_api_version(value: &str) -> Result<ScriptApiVersion, String> {
     if value.len() > MAX_API_VERSION_BYTES {
         return Err(format!("api version exceeds {MAX_API_VERSION_BYTES} bytes"));
@@ -2582,7 +2551,7 @@ fn bounded_plugin_disable_diagnostic(mut message: String) -> String {
     message
 }
 
-struct LuaReloadCandidate {
+struct PluginReloadCandidate {
     plugins: Vec<LuaPlugin>,
     manifests: Vec<ValidatedScriptPluginManifest>,
     startup_batches: Vec<(HostCommandAdmission, CommandBatch)>,
@@ -2590,16 +2559,17 @@ struct LuaReloadCandidate {
 
 fn build_lua_reload_candidate(
     prepared: PreparedLuaPlugins,
-) -> Result<LuaReloadCandidate, LuaReloadError> {
+) -> Result<PluginReloadCandidate, PluginReloadError> {
     let mut plugins = Vec::with_capacity(prepared.sources.len());
     let mut manifests = Vec::with_capacity(prepared.sources.len());
     for source in prepared.sources {
         let plugin_id = source.manifest.plugin_id().to_owned();
         let manifest = source.manifest.clone();
-        let plugin = LuaPlugin::new(source).map_err(|message| LuaReloadError::CandidatePlugin {
-            plugin_id,
-            message: bounded_plugin_disable_diagnostic(message),
-        })?;
+        let plugin =
+            LuaPlugin::new(source).map_err(|message| PluginReloadError::CandidatePlugin {
+                plugin_id,
+                message: bounded_plugin_disable_diagnostic(message),
+            })?;
         manifests.push(manifest);
         plugins.push(plugin);
     }
@@ -2615,13 +2585,13 @@ fn build_lua_reload_candidate(
     for (position, index) in eligible.iter().copied().enumerate() {
         let remaining_plugins = eligible.len() - position;
         let Some(slot) = event_budget.next_slot(remaining_plugins) else {
-            return Err(LuaReloadError::Reinitialization {
+            return Err(PluginReloadError::Reinitialization {
                 plugin_id: plugins[index].id.clone(),
                 message: "aggregate server.started wall-clock budget exhausted".to_owned(),
             });
         };
         let Some(timeout) = slot.remaining() else {
-            return Err(LuaReloadError::Reinitialization {
+            return Err(PluginReloadError::Reinitialization {
                 plugin_id: plugins[index].id.clone(),
                 message: "server.started wall-clock budget exhausted before invocation".to_owned(),
             });
@@ -2629,14 +2599,14 @@ fn build_lua_reload_candidate(
         let plugin = &mut plugins[index];
         let batch = plugin
             .handle_event(&startup_event, timeout)
-            .map_err(|error| LuaReloadError::Reinitialization {
+            .map_err(|error| PluginReloadError::Reinitialization {
                 plugin_id: plugin.id.clone(),
                 message: bounded_plugin_disable_diagnostic(format!("{error:?}")),
             })?;
         startup_batches.push((plugin.admission.clone(), batch));
     }
 
-    Ok(LuaReloadCandidate {
+    Ok(PluginReloadCandidate {
         plugins,
         manifests,
         startup_batches,
@@ -2767,8 +2737,8 @@ fn run_lua_host_inner(
         };
         let event = match input {
             ScriptHostInput::Event(event) => event,
-            ScriptHostInput::LuaReload(request) => {
-                let LuaReloadRequest { prepared, response } = request;
+            ScriptHostInput::PluginReload(request) => {
+                let PluginReloadRequest { prepared, response } = request;
                 let candidate = match build_lua_reload_candidate(prepared) {
                     Ok(candidate) => candidate,
                     Err(error) => {
@@ -2776,7 +2746,7 @@ fn run_lua_host_inner(
                         continue;
                     }
                 };
-                let LuaReloadCandidate {
+                let PluginReloadCandidate {
                     plugins: candidate_plugins,
                     manifests,
                     startup_batches,
@@ -2791,17 +2761,17 @@ fn run_lua_host_inner(
                 match commit {
                     Ok(()) => {
                         info!(loaded = reloaded_plugins, "Lua plugin generation reloaded");
-                        let _ = response.send(Ok(LuaReloadReport::new(
+                        let _ = response.send(Ok(PluginReloadReport::new(
                             reloaded_plugins,
                             replaced_disabled_plugins
                                 .expect("successful reload records replaced diagnostics"),
                         )));
                     }
                     Err(ScriptReloadCommitError::QueueFull) => {
-                        let _ = response.send(Err(LuaReloadError::CommandQueueFull));
+                        let _ = response.send(Err(PluginReloadError::CommandQueueFull));
                     }
                     Err(ScriptReloadCommitError::QueueClosed) => {
-                        let _ = response.send(Err(LuaReloadError::HostClosed));
+                        let _ = response.send(Err(PluginReloadError::HostClosed));
                         return LuaHostExitReport::new(
                             loaded_plugins,
                             disabled_plugins,
@@ -2809,12 +2779,12 @@ fn run_lua_host_inner(
                         );
                     }
                     Err(ScriptReloadCommitError::Rejected { error }) => {
-                        let _ = response.send(Err(LuaReloadError::CommandRejected {
+                        let _ = response.send(Err(PluginReloadError::CommandRejected {
                             message: format!("{error:?}"),
                         }));
                     }
                     Err(ScriptReloadCommitError::Ownership { error }) => {
-                        let _ = response.send(Err(LuaReloadError::CommandOwnership {
+                        let _ = response.send(Err(PluginReloadError::CommandOwnership {
                             message: format!("{error:?}"),
                         }));
                     }
@@ -2855,9 +2825,9 @@ fn run_lua_host_inner(
                     warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after handler failure");
                     endpoint.unregister_plugin_routes(&plugin.id);
                     plugin.disabled = true;
-                    disabled_plugins.push(LuaPluginDisableDiagnostic::new(
+                    disabled_plugins.push(PluginDisableDiagnostic::new(
                         plugin.id.clone(),
-                        LuaPluginDisableStage::Handler,
+                        PluginDisableStage::Handler,
                         bounded_plugin_disable_diagnostic(format!("{error:?}")),
                     ));
                     continue;
@@ -2881,9 +2851,9 @@ fn run_lua_host_inner(
                         warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after batch-rejection handler failure");
                         endpoint.unregister_plugin_routes(&plugin.id);
                         plugin.disabled = true;
-                        disabled_plugins.push(LuaPluginDisableDiagnostic::new(
+                        disabled_plugins.push(PluginDisableDiagnostic::new(
                             plugin.id.clone(),
-                            LuaPluginDisableStage::BatchRejectionHandler,
+                            PluginDisableStage::BatchRejectionHandler,
                             bounded_plugin_disable_diagnostic(format!("{error:?}")),
                         ));
                     }
@@ -2904,9 +2874,9 @@ fn run_lua_host_inner(
                     warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after command admission rejection");
                     endpoint.unregister_plugin_routes(&plugin.id);
                     plugin.disabled = true;
-                    disabled_plugins.push(LuaPluginDisableDiagnostic::new(
+                    disabled_plugins.push(PluginDisableDiagnostic::new(
                         plugin.id.clone(),
-                        LuaPluginDisableStage::CommandAdmission,
+                        PluginDisableStage::CommandAdmission,
                         bounded_plugin_disable_diagnostic(format!("{error:?}")),
                     ));
                 }
@@ -8023,7 +7993,7 @@ capabilities = ["entity_damage"]
         assert_eq!(report.disabled_plugins().len(), 1);
         let disabled = &report.disabled_plugins()[0];
         assert_eq!(disabled.plugin_id(), "test-plugin");
-        assert_eq!(disabled.stage(), LuaPluginDisableStage::Handler);
+        assert_eq!(disabled.stage(), PluginDisableStage::Handler);
         assert!(disabled.message().contains("broken plugin"));
     }
 
@@ -8188,7 +8158,7 @@ capabilities = ["entity_damage"]
         assert_eq!(diagnostic.plugin_id(), "test-plugin");
         assert_eq!(
             diagnostic.stage(),
-            LuaPluginDisableStage::BatchRejectionHandler
+            PluginDisableStage::BatchRejectionHandler
         );
         assert!(diagnostic.message().contains("broken rejection callback"));
     }
@@ -8256,7 +8226,7 @@ capabilities = ["entity_damage"]
         assert_eq!(report.enabled_plugins_at_exit(), 0);
         let diagnostic = &report.disabled_plugins()[0];
         assert_eq!(diagnostic.plugin_id(), "test-plugin");
-        assert_eq!(diagnostic.stage(), LuaPluginDisableStage::CommandAdmission);
+        assert_eq!(diagnostic.stage(), PluginDisableStage::CommandAdmission);
         assert!(diagnostic.message().contains("AdmissionUnavailable"));
     }
 
@@ -8370,7 +8340,7 @@ capabilities = ["entity_damage"]
 
         assert!(matches!(
             host.reload(replacement).await,
-            Err(LuaReloadError::Reinitialization { plugin_id, message })
+            Err(PluginReloadError::Reinitialization { plugin_id, message })
                 if plugin_id == "test-plugin" && message.contains("reload startup failed")
         ));
         boundary
@@ -8422,7 +8392,7 @@ capabilities = ["entity_damage"]
 
         assert_eq!(
             host.reload(replacement).await,
-            Err(LuaReloadError::CommandQueueFull)
+            Err(PluginReloadError::CommandQueueFull)
         );
         for _ in 0..COMMAND_QUEUE_CAPACITY {
             let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
@@ -8465,7 +8435,7 @@ capabilities = ["entity_damage"]
 
         assert!(matches!(
             host.reload(broken).await,
-            Err(LuaReloadError::CandidatePlugin { plugin_id, .. }) if plugin_id == "test-plugin"
+            Err(PluginReloadError::CandidatePlugin { plugin_id, .. }) if plugin_id == "test-plugin"
         ));
         boundary
             .try_enqueue_event(ScriptEvent::server_tick(1))
@@ -8501,7 +8471,7 @@ capabilities = ["entity_damage"]
 
         assert_eq!(
             host.reload(incompatible).await,
-            Err(LuaReloadError::StartupContractChanged {
+            Err(PluginReloadError::StartupContractChanged {
                 field: "plugin_order_or_player_commands"
             })
         );
@@ -8557,7 +8527,7 @@ capabilities = ["entity_damage"]
         assert_eq!(reload.replaced_disabled_plugins().len(), 1);
         let replaced = &reload.replaced_disabled_plugins()[0];
         assert_eq!(replaced.plugin_id(), "test-plugin");
-        assert_eq!(replaced.stage(), LuaPluginDisableStage::Handler);
+        assert_eq!(replaced.stage(), PluginDisableStage::Handler);
         assert!(replaced.message().contains("broken generation"));
         assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
 
@@ -8599,7 +8569,7 @@ capabilities = ["entity_damage"]
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         drop(response_rx);
         sender
-            .send(ScriptHostInput::LuaReload(LuaReloadRequest::new(
+            .send(ScriptHostInput::PluginReload(PluginReloadRequest::new(
                 replacement,
                 response_tx,
             )))
@@ -8633,7 +8603,7 @@ capabilities = ["entity_damage"]
         drop(boundary);
         assert_eq!(
             host.reload(prepared()).await,
-            Err(LuaReloadError::HostClosed)
+            Err(PluginReloadError::HostClosed)
         );
         let exit = tokio::task::spawn_blocking(move || host.join())
             .await

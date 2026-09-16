@@ -56,6 +56,25 @@ impl Default for ChunkPipelinePolicy {
     }
 }
 
+impl ChunkPipelinePolicy {
+    /// A policy whose pools are capped to `workers` shared CPU workers and one
+    /// IO worker, with every other knob at its derived default.
+    ///
+    /// Used by in-process servers that already share a machine with other
+    /// workgroups - a test binary that starts several servers, or a host that
+    /// bounded the process on purpose. It never changes the derived default
+    /// itself: a production deployment keeps `Default` unless the operator sets
+    /// an explicit bound.
+    #[must_use]
+    pub fn bounded(workers: usize) -> Self {
+        Self {
+            chunk_io_threads: 1,
+            chunk_worker_threads: workers.max(1),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ChunkPipelineResources {
     io_permits: Arc<Semaphore>,

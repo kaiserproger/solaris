@@ -86,8 +86,9 @@ pub use script::PluginStorageStartError;
 pub use server::{
     BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OperatorControlHandle,
     OperatorFactsHandle, OperatorWeather, OutboundPressureHandle, OutboundPressureSnapshot,
-    RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle,
-    ServerConfig, ShutdownHandle, TabListConfig, WorldHandle, bind, bind_with_scripts, run,
+    PlayerSessionsHandle, RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport,
+    SaveAllTimings, SaveHandle, ServerConfig, ShutdownHandle, TabListConfig, WorldHandle, bind,
+    bind_with_scripts, run,
 };
 #[cfg(feature = "load-bench")]
 pub use server::{

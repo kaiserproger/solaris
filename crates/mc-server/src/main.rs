@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mc_server::{OperatorFileOperation, ServerConfig};
+use mc_server::{OperatorFileOperation, PluginRuntime, ServerConfig};
 
 mod startup_validation;
 
@@ -147,9 +147,208 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
 }
 
+/// The deployment one plugin directory describes, in the host's own terms.
+///
+/// One runtime per deployment: a directory configured as `wasm` is read by the
+/// component host and a `luau` directory by the Luau host, never by both, so a
+/// package cannot be half-validated against one contract and run under another.
+fn component_deployment(config: &ServerConfig) -> Result<Option<mc_plugin_host::DeploymentConfig>> {
+    if config.plugins.runtime != PluginRuntime::Wasm {
+        return Ok(None);
+    }
+    let Some(directory) = config.plugins.directory.clone() else {
+        return Ok(None);
+    };
+    if !config.plugins.strict && !config.plugins.expected.is_empty() {
+        bail!("plugins.expected requires plugins.strict = true");
+    }
+    let mode = if config.plugins.strict {
+        mc_plugin_host::DiscoveryMode::Strict
+    } else {
+        mc_plugin_host::DiscoveryMode::Permissive
+    };
+    let grants = config
+        .plugins
+        .grants
+        .iter()
+        .map(|(id, grant)| (id.clone(), grant.capabilities.clone()))
+        .collect();
+    Ok(Some(mc_plugin_host::DeploymentConfig {
+        root: directory,
+        mode,
+        expected: config.plugins.expected.clone(),
+        grants,
+        // A strict production deployment must have granted what it runs; local
+        // iteration may run without operator grants, as the Luau path does.
+        require_grants: config.plugins.strict,
+    }))
+}
+
+/// Whatever runtime `[plugins]` names, prepared.
+///
+/// One runtime per deployment: the Luau loader and the component host never read
+/// the same directory, so a package cannot be half-validated against one contract
+/// and run under another.
+enum PreparedPlugins {
+    Luau(mc_script::PreparedLuaPlugins),
+    Component(PreparedComponent),
+}
+
+/// A started component deployment and what the world needs from it.
+///
+/// The host is started here rather than next to the network bind because its
+/// `configure` phase is what produces the startup rules the world is opened with,
+/// and because it owns the boundary the network binds to. Nothing is bound yet at
+/// this point: the host's opening commands wait in the boundary queue exactly as
+/// the Luau host's do.
+struct PreparedComponent {
+    /// The running host, stopped by whoever finishes with it.
+    host: mc_plugin_host::PluginHost,
+    /// The ids this deployment discovered, in the host's own order.
+    plugin_ids: Vec<String>,
+    /// The validated startup rules, or `None` when no package declared any.
+    rules: Option<mc_script::GameplayRules>,
+    /// The server's live sessions. The host holds the lookup before the server
+    /// exists; the server fills it when it binds.
+    sessions: mc_net::PlayerSessionsHandle,
+}
+
+/// The component host's view of this server's live sessions.
+///
+/// The host addresses a player by stable identity; the server owns which session
+/// that identity holds right now, so this is a pass-through with no table of its
+/// own. A player who is offline resolves to nothing and their command is refused,
+/// never delivered to whoever holds that runtime id next.
+struct ServerSessions(mc_net::PlayerSessionsHandle);
+
+impl mc_plugin_host::PlayerSessions for ServerSessions {
+    fn session_of(&self, player: &str) -> Option<u64> {
+        self.0.session_of(player)
+    }
+}
+
+/// Prepare whatever runtime `[plugins]` names, or nothing when no directory is set.
+async fn prepare_configured_plugins(config: &ServerConfig) -> Result<Option<PreparedPlugins>> {
+    match config.plugins.runtime {
+        PluginRuntime::Luau => {
+            Ok(prepare_configured_luau_plugins(config)?.map(PreparedPlugins::Luau))
+        }
+        PluginRuntime::Wasm => Ok(prepare_component_deployment(config)
+            .await?
+            .map(PreparedPlugins::Component)),
+    }
+}
+
+/// Discover, start and read back one component deployment.
+///
+/// Failure modes are all startup failures: a directory that cannot be read in
+/// strict mode, a package that asks for rights the operator did not grant, a
+/// package whose `configure` never returns, and a rule plan the host refuses. A
+/// deployment that declared rules it cannot get would run a world it did not
+/// configure, so a refusal stops the server instead of being logged.
+async fn prepare_component_deployment(config: &ServerConfig) -> Result<Option<PreparedComponent>> {
+    let Some(deployment) = component_deployment(config)? else {
+        return Ok(None);
+    };
+    // The plan's numbers come from measurement (P7); until then a component
+    // deployment runs on the host's documented defaults rather than on an
+    // operator surface nobody has calibrated.
+    let limits = mc_plugin_host::PluginLimits::default();
+    let discovered = mc_plugin_host::discover(&deployment, &limits).with_context(|| {
+        format!(
+            "reading the configured component plugins from {}",
+            deployment.root.display()
+        )
+    })?;
+    for skipped in discovered.skipped() {
+        // Permissive mode skips an ordinary broken package; strict mode fails in
+        // `discover` instead. An operator has to see which one was left out.
+        tracing::warn!(
+            path = %skipped.path.display(),
+            message = skipped.message,
+            "component plugin skipped"
+        );
+    }
+    let packages = discovered.into_packages();
+    let plugin_ids = packages
+        .iter()
+        .map(|package| package.manifest().plugin_id().to_owned())
+        .collect::<Vec<_>>();
+    let sessions = mc_net::PlayerSessionsHandle::new();
+    let host = mc_plugin_host::start_deployment(
+        packages,
+        limits,
+        mc_plugin_host::HostQueues::default(),
+        std::sync::Arc::new(ServerSessions(sessions.clone())),
+    )
+    .map_err(|error| anyhow::anyhow!("starting the component plugin host: {error}"))?;
+
+    // Read the contribution before anything else can fail, and stop the host on
+    // every refusal: a server that opens a world and then refuses the rules it
+    // was configured with has already changed durable state.
+    let refusal = host
+        .contribution()
+        .refusal()
+        .map(|(id, refusal)| (id.to_owned(), refusal.to_string()));
+    let declared = host
+        .contribution()
+        .rules()
+        .map(|(id, rules)| (id.to_owned(), rules.clone()))
+        .collect::<Vec<_>>();
+    if let Some((id, refusal)) = refusal {
+        stop_component_host(host).await?;
+        bail!("component plugin {id} declared a rule plan the host refused: {refusal}");
+    }
+    let rules = match declared.len() {
+        0 => None,
+        1 => Some(declared.into_iter().next().expect("one entry").1),
+        _ => {
+            let owners = declared
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            stop_component_host(host).await?;
+            bail!(
+                "component plugins {owners} each declare startup rules; the world contract records one plan, so exactly one package may declare them"
+            );
+        }
+    };
+    Ok(Some(PreparedComponent {
+        host,
+        plugin_ids,
+        rules,
+        sessions,
+    }))
+}
+
+/// Stop a component host and report what it owned, off the runtime's thread.
+async fn stop_component_host(host: mc_plugin_host::PluginHost) -> Result<()> {
+    let counters = tokio::task::spawn_blocking(move || host.stop())
+        .await
+        .context("stopping the component plugin host")?;
+    for (plugin_id, diagnostics) in counters {
+        tracing::info!(
+            plugin_id,
+            calls = diagnostics.calls,
+            events_delivered = diagnostics.events_delivered,
+            commands_submitted = diagnostics.commands_submitted,
+            commands_refused = diagnostics.commands_refused,
+            "component plugin stopped"
+        );
+    }
+    Ok(())
+}
+
 fn prepare_configured_luau_plugins(
     config: &ServerConfig,
 ) -> Result<Option<mc_script::PreparedLuaPlugins>> {
+    if config.plugins.runtime != PluginRuntime::Luau {
+        bail!(
+            "plugins.runtime = {} is not the Luau loader; use the component host for it",
+            config.plugins.runtime.name()
+        );
+    }
     if !config.plugins.strict && !config.plugins.expected.is_empty() {
         bail!("plugins.expected requires plugins.strict = true");
     }
@@ -222,6 +421,32 @@ fn check_config(path: &Path) -> Result<()> {
         cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
     }
     validate_runtime_config(&cfg)?;
+    if let Some(deployment) = component_deployment(&cfg)? {
+        // `--check` of a component deployment compiles every selected component
+        // and runs its startup phases against a boundary nobody drains: it
+        // reports the contract, the artifacts and the startup answers it really
+        // exercised, and touches no world, storage or listener.
+        let report =
+            mc_plugin_host::check_deployment(&deployment, &mc_plugin_host::PluginLimits::default())
+                .map_err(|error| anyhow::anyhow!("checking component plugins: {error}"))?;
+        // A check validates the whole selection: a package the deployment skipped
+        // is a package it could not validate, so the check fails instead of
+        // reporting success for a deployment it did not read end to end.
+        if let Some(skipped) = report.skipped().first() {
+            bail!(
+                "checking component plugins: {} was refused ({})",
+                skipped.path.display(),
+                skipped.message
+            );
+        }
+        let ids = report
+            .checked()
+            .iter()
+            .map(|checked| checked.id.clone())
+            .collect::<Vec<_>>();
+        println!("component plugins checked: {}", ids.join(", "));
+        return Ok(());
+    }
     let prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
     let effective = EffectiveConfig::with_plugins(&cfg, prepared_plugins.as_ref());
     let rendered = serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
@@ -233,7 +458,7 @@ fn check_config(path: &Path) -> Result<()> {
 struct EffectiveConfig<'a> {
     #[serde(flatten)]
     config: &'a ServerConfig,
-    discovered_plugins: Vec<mc_script::LuaPluginDiscovery<'a>>,
+    discovered_plugins: Vec<mc_script::PluginDiscovery<'a>>,
     effective_chunk_pipeline: EffectiveChunkPipeline,
     effective_autoscale: EffectiveAutoscale,
     operator_warnings: Vec<OperatorWarning>,
@@ -688,9 +913,17 @@ async fn serve(
     let configured_geometry = cfg.data.chunk_geometry().map_err(anyhow::Error::msg)?;
     let world_dir = required_world_dir(&cfg)?;
     let worldgen_mode = cfg.data.worldgen_mode.to_worldgen();
-    let mut prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
+    let mut component_deployment_prepared: Option<PreparedComponent> = None;
+    let mut luau_plugins = match prepare_configured_plugins(&cfg).await? {
+        None => None,
+        Some(PreparedPlugins::Luau(prepared)) => Some(prepared),
+        Some(PreparedPlugins::Component(component)) => {
+            component_deployment_prepared = Some(component);
+            None
+        }
+    };
     let mut dashboard_plugin_ids = Vec::new();
-    for plugin in prepared_plugins
+    for plugin in luau_plugins
         .as_ref()
         .into_iter()
         .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
@@ -707,10 +940,29 @@ async fn serve(
             "Luau plugin discovered"
         );
     }
-    let plugin_ore_profile = prepared_plugins
+    if let Some(component) = component_deployment_prepared.as_ref() {
+        for id in &component.plugin_ids {
+            dashboard_plugin_ids.push(id.clone());
+            tracing::info!(
+                plugin_id = id,
+                runtime = "wasm",
+                "component plugin discovered"
+            );
+        }
+        // A component package cannot declare an ore profile, a settlement plan or
+        // a client bundle yet - the contract has no record for them - so the world
+        // contract records what a server with no plugin directory records. That is
+        // a named limit of this stage, not a silent default, and it is stated here
+        // because this is where the declaration would have to be read.
+        tracing::info!(
+            declares_startup_rules = component.rules.is_some(),
+            "component plugin deployment declares no ore profile, settlement plan or client bundle"
+        );
+    }
+    let plugin_ore_profile = luau_plugins
         .as_ref()
         .and_then(mc_script::PreparedLuaPlugins::worldgen_ore_profile);
-    let plugin_settlement_plan = prepared_plugins
+    let plugin_settlement_plan = luau_plugins
         .as_ref()
         .and_then(mc_script::PreparedLuaPlugins::worldgen_settlement_plan)
         .cloned();
@@ -722,7 +974,7 @@ async fn serve(
         .map(mc_script::LuaSettlementPlan::contract_name)
         .unwrap_or_else(|| cfg.data.settlement_profile.name().to_owned());
 
-    let loader_manifest = prepared_plugins
+    let loader_manifest = luau_plugins
         .as_ref()
         .map(|plugins| mc_net::LoaderManifest::from_script_bundles(plugins.client_bundles()))
         .transpose()
@@ -781,9 +1033,17 @@ async fn serve(
         chest_loot,
         village_plans,
     )?;
-    let gameplay_rules = prepared_plugins
-        .as_ref()
-        .and_then(mc_script::PreparedLuaPlugins::gameplay_rules);
+    // The rules the world is opened with, from the one runtime this deployment
+    // runs. A component deployment's plan was converted and validated while its
+    // host started, so a refusal has already failed the server by now.
+    let gameplay_rules = match (
+        luau_plugins.as_ref(),
+        component_deployment_prepared.as_ref(),
+    ) {
+        (Some(prepared), _) => prepared.gameplay_rules(),
+        (None, Some(component)) => component.rules.as_ref(),
+        (None, None) => None,
+    };
     if let Some(rules) = gameplay_rules {
         startup_rules::apply(
             rules,
@@ -791,9 +1051,9 @@ async fn serve(
             Arc::make_mut(&mut biome_spawns),
             &entity_types,
         )
-        .context("materializing startup Luau rules")?;
+        .context("materializing startup rules")?;
     }
-    let gameplay_rules_contract = gameplay_rules.map(mc_script::LuaGameplayRules::contract_name);
+    let gameplay_rules_contract = gameplay_rules.map(mc_script::GameplayRules::contract_name);
     let configured_spawn = if world_requires_solaris_spawn(world_dir)? {
         let located = terrain_generator
             .locate_safe_spawn()
@@ -976,7 +1236,8 @@ async fn serve(
     );
 
     let shutdown_handle = net.shutdown.clone();
-    let (bound, lua_host) = if let Some(prepared) = prepared_plugins.take() {
+    let mut component_host = None;
+    let (bound, lua_host) = if let Some(prepared) = luau_plugins.take() {
         let (boundary, host) = mc_script::start_prepared_lua_host(prepared)
             .context("starting configured Luau plugins")?;
         tracing::info!(
@@ -988,6 +1249,35 @@ async fn serve(
             Ok(bound) => (bound, Some(host)),
             Err(error) => {
                 join_lua_host(host).await?;
+                return Err(error).context("network bind");
+            }
+        }
+    } else if let Some(prepared) = component_deployment_prepared.take() {
+        // The component host is already running: it was started before the world
+        // was opened, because that is when its `configure` phase produced the
+        // rules the world was opened with.
+        let PreparedComponent {
+            host,
+            plugin_ids,
+            sessions,
+            ..
+        } = prepared;
+        tracing::info!(
+            plugin_directory = ?cfg.plugins.directory.as_deref(),
+            loaded = plugin_ids.len(),
+            "component plugin host started"
+        );
+        match mc_net::bind_with_scripts(net, host.boundary().clone()).await {
+            Ok(bound) => {
+                // The server now owns the sessions the host holds the lookup for,
+                // which is what makes a plugin's uuid-addressed command reach the
+                // connection that identity has right now.
+                bound.register_player_sessions(&sessions);
+                component_host = Some(host);
+                (bound, None)
+            }
+            Err(error) => {
+                stop_component_host(host).await?;
                 return Err(error).context("network bind");
             }
         }
@@ -1035,11 +1325,16 @@ async fn serve(
                 interactive,
             }
         });
+    let plugin_host = match (lua_host.as_ref(), component_host.as_ref()) {
+        (Some(host), _) => Some(RunningPluginHost::Luau(host)),
+        (None, Some(_)) => Some(RunningPluginHost::Component),
+        (None, None) => None,
+    };
     let result = run_bound_server(
         bound,
         shutdown_handle,
         path,
-        lua_host.as_ref(),
+        plugin_host,
         cfg.plugins.strict,
         terminal_console,
     )
@@ -1049,6 +1344,9 @@ async fn serve(
     }
     if let Some(host) = lua_host {
         join_lua_host(host).await?;
+    }
+    if let Some(host) = component_host {
+        stop_component_host(host).await?;
     }
     result
 }
@@ -1102,7 +1400,7 @@ async fn reload_configured_luau_plugins(
     path: PathBuf,
     startup_strict: bool,
     host: &mc_script::LuaHost,
-) -> Result<mc_script::LuaReloadReport> {
+) -> Result<mc_script::PluginReloadReport> {
     let prepared =
         tokio::task::spawn_blocking(move || prepare_configured_luau_reload(&path, startup_strict))
             .await
@@ -1112,11 +1410,26 @@ async fn reload_configured_luau_plugins(
         .context("committing prepared Luau plugin reload")
 }
 
+/// The plugin host a bound server runs with, if any.
+///
+/// One runtime per deployment, so this is a choice rather than a list, and the
+/// reload arm below is the only thing that has to know which one it has: the host
+/// values themselves live in `serve()` and are stopped after the run returns. A
+/// component deployment is carried as a marker rather than a reference because the
+/// value the arm needs is the *distinction* - a host that exists and has no reload
+/// contract yet is a different answer from no host at all, and only the first may
+/// never be reported as reloaded.
+#[derive(Clone, Copy)]
+enum RunningPluginHost<'a> {
+    Luau(&'a mc_script::LuaHost),
+    Component,
+}
+
 async fn run_bound_server(
     bound: mc_net::BoundServer,
     shutdown_handle: mc_net::ShutdownHandle,
     config_path: &Path,
-    lua_host: Option<&mc_script::LuaHost>,
+    plugin_host: Option<RunningPluginHost<'_>>,
     startup_plugin_strict: bool,
     terminal_console: Option<console::Console<console::server_commands::ServerCommands>>,
 ) -> Result<()> {
@@ -1163,8 +1476,8 @@ async fn run_bound_server(
                 return result;
             }
             () = plugin_reload.recv() => {
-                let Some(host) = lua_host else {
-                    tracing::warn!("SIGHUP plugin reload ignored because no Luau host is configured");
+                let Some(host) = plugin_host else {
+                    tracing::warn!("SIGHUP plugin reload ignored because no plugin host is configured");
                     continue;
                 };
                 if !startup_plugin_strict {
@@ -1173,6 +1486,14 @@ async fn run_bound_server(
                     );
                     continue;
                 }
+                let RunningPluginHost::Luau(host) = host else {
+                    // The component host has no reload contract yet (plan P6). A
+                    // reload that swapped nothing is never reported as performed.
+                    tracing::warn!(
+                        "SIGHUP plugin reload ignored because the component plugin host has no reload contract yet"
+                    );
+                    continue;
+                };
                 tracing::info!(config = %config_path.display(), "SIGHUP plugin reload requested");
                 let mut reload = Box::pin(reload_configured_luau_plugins(
                     config_path.to_path_buf(),
@@ -1538,11 +1859,17 @@ fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
     width * width
 }
 
+/// The startup bake's worker count: the configured bound wins, and `0` means the
+/// process CPU count. The bake must not raise a bound the operator set - that is
+/// exactly the number a constrained host uses to keep one server off every core.
 fn startup_chunk_worker_threads(configured_workers: usize) -> usize {
-    let available = std::thread::available_parallelism()
+    if configured_workers > 0 {
+        return configured_workers;
+    }
+    std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
-    configured_workers.max(available).max(1)
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn startup_light_bake_worker_threads(chunk_workers: usize) -> usize {
@@ -2326,6 +2653,177 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// The example component plugin's bytes, built from the SDK.
+    ///
+    /// The build runs once per test process. P7 owns moving this recipe somewhere
+    /// shared - the component host's own test suite builds the same fixture - but
+    /// what matters here is that the deployment under test is a real component of
+    /// the contract rather than a hand-written module or a stub.
+    fn component_plugin_bytes() -> &'static [u8] {
+        static BYTES: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .expect("repository root");
+            let sdk = root.join("sdk/rust");
+            let status = std::process::Command::new(env!("CARGO"))
+                .args([
+                    "build",
+                    "--manifest-path",
+                    sdk.join("Cargo.toml").to_str().expect("utf-8 path"),
+                    "--target",
+                    "wasm32-unknown-unknown",
+                    "--release",
+                    "-p",
+                    "solaris-hello-plugin",
+                ])
+                .status()
+                .expect("the guest build starts");
+            assert!(status.success(), "the component fixture must build");
+            let module = std::fs::read(
+                sdk.join("target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm"),
+            )
+            .expect("the guest module exists");
+            wit_component::ComponentEncoder::default()
+                .module(&module)
+                .expect("the guest module carries its component types")
+                .validate(true)
+                .encode()
+                .expect("the guest module encodes as a component")
+        });
+        BYTES.as_slice()
+    }
+
+    /// Deploy the fixture under `id`, configured with `config` as its `config.toml`.
+    fn deploy_component_fixture(root: &Path, id: &str, config: &str) {
+        let directory = root.join(id);
+        std::fs::create_dir(&directory).expect("plugin directory");
+        std::fs::write(
+            directory.join("plugin.toml"),
+            format!(
+                "id = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\napi = \"0.7.0\"\nevents = [\"player.joined\"]\nplayer_commands = [\"hello\"]\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(directory.join("plugin.wasm"), component_plugin_bytes()).expect("artifact");
+        std::fs::write(directory.join("config.toml"), config).expect("config");
+    }
+
+    fn component_config(root: &Path) -> ServerConfig {
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "Components"
+                motd = "Components"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+
+                [plugins]
+                runtime = "wasm"
+                strict = true
+            "#,
+        )
+        .unwrap();
+        config.plugins.directory = Some(root.to_path_buf());
+        config
+    }
+
+    /// The same, expecting exactly `expected` to be discovered.
+    fn component_config_expecting(root: &Path, expected: &[&str]) -> ServerConfig {
+        let mut config = component_config(root);
+        config.plugins.expected = expected.iter().map(|id| (*id).to_owned()).collect();
+        config
+    }
+
+    #[tokio::test]
+    async fn a_component_deployment_starts_its_host_and_carries_its_rules() {
+        let root = tempfile::tempdir().expect("deployment root");
+        deploy_component_fixture(root.path(), "hello", "mode = \"placement\"\n");
+        let config = component_config_expecting(root.path(), &["hello"]);
+
+        let prepared = prepare_configured_plugins(&config)
+            .await
+            .expect("the deployment prepares")
+            .expect("a configured directory prepares a deployment");
+        let PreparedPlugins::Component(component) = prepared else {
+            panic!("runtime = wasm must prepare the component host");
+        };
+        assert_eq!(component.plugin_ids, vec!["hello".to_owned()]);
+        assert_eq!(
+            component.host.boundary().player_command_roots(),
+            vec!["hello".to_owned()],
+            "the started deployment really claims the command its manifest declares"
+        );
+
+        // The rules came from the *running host*, which is what stops a
+        // deployment from opening a world it did not configure, and they carry
+        // what the package declared rather than a default. The cross-runtime
+        // fingerprint invariant is pinned next to the converter
+        // (`crates/mc-plugin-host/tests/startup_contribution.rs`); what this case
+        // adds is that the composition root is really wired to that contribution.
+        let rules = component.rules.expect("the fixture declared a plan");
+        let placement = rules
+            .placement
+            .as_ref()
+            .expect("the fixture's plan is a placement");
+        assert_eq!(
+            (
+                placement.land_spacing,
+                placement.water_attempts,
+                placement.water_depth
+            ),
+            (2, 8, 4),
+            "the plan the world would be opened with is the package's own"
+        );
+        rules.validate().expect("the fixture's plan is valid");
+        stop_component_host(component.host)
+            .await
+            .expect("the host stops");
+    }
+
+    #[tokio::test]
+    async fn a_component_deployment_without_rules_prepares_none() {
+        let root = tempfile::tempdir().expect("deployment root");
+        deploy_component_fixture(root.path(), "hello", "greeting = \"Hi\"\n");
+        let config = component_config_expecting(root.path(), &["hello"]);
+
+        let prepared = prepare_configured_plugins(&config)
+            .await
+            .expect("the deployment prepares")
+            .expect("a configured directory prepares a deployment");
+        let PreparedPlugins::Component(component) = prepared else {
+            panic!("runtime = wasm must prepare the component host");
+        };
+        assert_eq!(component.plugin_ids, vec!["hello".to_owned()]);
+        assert!(
+            component.rules.is_none(),
+            "a package that declares no plan contributes none"
+        );
+        stop_component_host(component.host)
+            .await
+            .expect("the host stops");
+    }
+
+    #[tokio::test]
+    async fn two_component_packages_declaring_rules_refuse_the_deployment() {
+        let root = tempfile::tempdir().expect("deployment root");
+        deploy_component_fixture(root.path(), "first", "mode = \"placement\"\n");
+        deploy_component_fixture(root.path(), "second", "mode = \"placement\"\n");
+        let config = component_config_expecting(root.path(), &["first", "second"]);
+
+        let error = prepare_configured_plugins(&config)
+            .await
+            .err()
+            .expect("two declarers must refuse the deployment");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("first") && message.contains("second"),
+            "the refusal names both declaring packages: {message}"
+        );
     }
 
     fn config_with_deployed_plugins(names: &[&str]) -> (tempfile::TempDir, ServerConfig) {
@@ -3112,7 +3610,11 @@ mod tests {
 
         assert_eq!(startup_chunk_worker_threads(0), available.max(1));
         assert_eq!(startup_chunk_worker_threads(available + 3), available + 3);
+        // A configured bound is the operator's number even when it is below the
+        // process CPU count: the bake must not raise it back to every core.
+        assert_eq!(startup_chunk_worker_threads(2), 2);
         assert_eq!(startup_light_bake_worker_threads(0), 1);
+        assert_eq!(startup_light_bake_worker_threads(2), 4);
         assert_eq!(
             startup_light_bake_worker_threads(available + 3),
             ((available + 3) * 2).min(STARTUP_LIGHT_BAKE_WORKER_CAP)

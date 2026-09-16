@@ -38,8 +38,8 @@ plus separate vanilla oracle or real-client evidence.
 The M95 conservative coverage audit reports 46 in-scope rows, 0 countable
 `ready` rows, and 0.00% current conservative coverage. The result is
 reproducible with `cargo run -p mc-test-harness --bin coverage-audit --
-docs/VALIDATION_LEDGER.md` and summarized in
-[VALIDATION_COVERAGE_AUDIT.md](VALIDATION_COVERAGE_AUDIT.md). Unit-only,
+docs/VALIDATION_LEDGER.md`, and the ledger's own M95 section carries the
+snapshot and the counting rule. Unit-only,
 Solaris-only, wire-probe-only, protocol-metadata-only, negated, partial,
 blocked, unknown, draft-debt, accepted-divergence, and non-goal rows do not
 count toward the 80% target.

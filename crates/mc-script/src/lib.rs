@@ -10,9 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
-#[cfg(any(test, feature = "lua-runtime"))]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
 
@@ -108,6 +106,11 @@ pub use settlement_operations::{
 #[cfg(feature = "lua-runtime")]
 mod lua;
 
+mod gameplay_rules;
+pub use gameplay_rules::{
+    BiomeSpawns, ClayRule, GameplayRules, GameplayRulesError, SpawnEntry, SpawnPlacement, TreeRule,
+};
+
 #[cfg(test)]
 mod custom_payload_tests;
 #[cfg(test)]
@@ -137,14 +140,13 @@ mod tick_delivery_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{
-    LuaBiomeSpawns, LuaClayRule, LuaClientBundle, LuaClientBundleDiscovery, LuaClientContentKind,
-    LuaClientLoader, LuaClientPermission, LuaGameplayRules, LuaHost, LuaHostConfig, LuaHostError,
-    LuaHostExitReason, LuaHostExitReport, LuaPluginDeployment, LuaPluginDisableDiagnostic,
-    LuaPluginDisableStage, LuaPluginDiscovery, LuaReloadError, LuaReloadReport,
+    ClientBundle, ClientBundleDiscovery, ClientContentKind, ClientLoader, ClientPermission,
+    LuaHost, LuaHostConfig, LuaHostError, LuaHostExitReason, LuaHostExitReport,
     LuaSettlementBuilding, LuaSettlementBuildingRole, LuaSettlementBuildingTemplate,
     LuaSettlementExtension, LuaSettlementInhabitant, LuaSettlementInhabitantKind, LuaSettlementJob,
-    LuaSettlementPlan, LuaSpawnEntry, LuaSpawnPlacement, LuaTreeRule, LuaWorldgenOreProfile,
-    LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_lua_plugins, start_lua_host,
+    LuaSettlementPlan, LuaWorldgenOreProfile, LuaWorldgenSettlementProfile, PluginDeployment,
+    PluginDisableDiagnostic, PluginDisableStage, PluginDiscovery, PluginReloadError,
+    PluginReloadReport, PreparedLuaPlugins, prepare_lua_plugins, start_lua_host,
     start_prepared_lua_host,
 };
 
@@ -184,6 +186,10 @@ pub const MAX_PLUGIN_VERSION_BYTES: usize = 64;
 pub const MAX_MANIFEST_EVENT_SUBSCRIPTIONS: usize = 64;
 pub const MAX_MANIFEST_DEPENDENCIES: usize = 64;
 pub const MAX_MANIFEST_CAPABILITIES: usize = 128;
+/// Largest accepted `plugin.toml`, for either runtime.
+pub const MAX_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
+/// Largest accepted `api = "MAJOR.MINOR.PATCH"` string.
+pub const MAX_API_VERSION_BYTES: usize = 16;
 pub const MAX_MANIFEST_PERMISSIONS: usize = 64;
 pub const MAX_MANIFEST_FIELD_BYTES: usize = 128;
 
@@ -293,6 +299,27 @@ pub const fn supports_script_api_version(requested: ScriptApiVersion) -> bool {
     requested.major == SCRIPT_API_VERSION.major
         && requested.minor == SCRIPT_API_VERSION.minor
         && requested.patch == SCRIPT_API_VERSION.patch
+}
+
+/// The API version a WebAssembly component package must request.
+///
+/// It is the version of the `solaris:plugin` WIT package (`crates/mc-script/wit`)
+/// and is deliberately independent of [`SCRIPT_API_VERSION`]: the Luau packages
+/// keep requesting the Luau contract while the component host is built, and the
+/// package, storage-format, Loader-wire and world-contract versions are separate
+/// numbers again. A manifest is validated *for* one expected version, so
+/// admitting component packages never loosens what a Luau package may request.
+pub const COMPONENT_PLUGIN_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 7, 0);
+
+/// Whether `requested` is exactly the expected plugin API version.
+#[must_use]
+pub const fn supports_plugin_api_version(
+    requested: ScriptApiVersion,
+    expected: ScriptApiVersion,
+) -> bool {
+    requested.major == expected.major
+        && requested.minor == expected.minor
+        && requested.patch == expected.patch
 }
 
 /// Stable player identifier snapshot for script-visible DTOs.
@@ -3433,7 +3460,6 @@ impl ScriptCommandProvenance {
         }
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     fn for_issued_host_plugin(
         plugin_id: Arc<str>,
         nonce: u64,
@@ -3476,13 +3502,11 @@ struct HostAdmissionRecord {
 
 #[derive(Debug, Default)]
 struct HostAdmissionLedger {
-    #[cfg(any(test, feature = "lua-runtime"))]
     next_nonce: AtomicU64,
     pending: StdMutex<BTreeMap<u64, HostAdmissionRecord>>,
 }
 
 impl HostAdmissionLedger {
-    #[cfg(any(test, feature = "lua-runtime"))]
     fn issue(
         self: &Arc<Self>,
         plugin_id: Arc<str>,
@@ -4371,20 +4395,42 @@ impl ScriptCommand {
     }
 }
 
+/// The identity one plugin instance's commands are admitted under.
+///
+/// The host builds it from the validated manifest and keeps it for the life of
+/// the instance; a plugin never names its own identity, and this type is the only
+/// way to reach the admission ledger.
 #[derive(Debug, Clone)]
-#[cfg(any(test, feature = "lua-runtime"))]
-pub(crate) struct HostCommandAdmission {
+pub struct HostCommandAdmission {
     plugin_id: Arc<str>,
     capabilities: Arc<CommandCapabilities>,
 }
 
-#[cfg(any(test, feature = "lua-runtime"))]
 impl HostCommandAdmission {
-    pub(crate) fn from_manifest(manifest: &ValidatedScriptPluginManifest) -> Self {
+    /// The admission of one validated manifest: its id and its granted
+    /// capabilities.
+    #[must_use]
+    pub fn from_manifest(manifest: &ValidatedScriptPluginManifest) -> Self {
         Self {
             plugin_id: Arc::from(manifest.plugin_id()),
             capabilities: Arc::new(manifest.to_command_capabilities()),
         }
+    }
+
+    /// The plugin id these commands will be attributed to.
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    /// What the manifest behind this admission is allowed to command.
+    ///
+    /// Exposed so a runtime host can convert a guest's batch against the same
+    /// grants the boundary will check again: the answer is what the package
+    /// declared, never what a guest claims at call time.
+    #[must_use]
+    pub fn capabilities(&self) -> &CommandCapabilities {
+        &self.capabilities
     }
 }
 
@@ -4411,9 +4457,13 @@ pub enum ScriptCommandSubmissionError {
     QueueClosed,
 }
 
+/// Why a plugin's already-validated batch did not reach the command queue.
+///
+/// The batch comes back inside the error, so a caller can report exactly which
+/// commands were refused instead of losing them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(any(test, feature = "lua-runtime"))]
-pub(crate) enum ScriptBatchSubmissionError {
+#[non_exhaustive]
+pub enum ScriptBatchSubmissionError {
     Full(CommandBatch),
     Closed(CommandBatch),
     Rejected {
@@ -4434,7 +4484,7 @@ pub(crate) enum ScriptReloadCommitError {
 pub(crate) enum ScriptHostInput {
     Event(ScriptEvent),
     #[cfg(feature = "lua-runtime")]
-    LuaReload(lua::LuaReloadRequest),
+    PluginReload(lua::PluginReloadRequest),
 }
 
 /// One deployed package the script host discovered.
@@ -4443,13 +4493,13 @@ pub(crate) enum ScriptHostInput {
 /// needs to trigger authored-data subsystems (an authored catalog directory and
 /// the manifest's declared required features) without a second manifest reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LuaPluginPackage {
+pub struct PluginPackage {
     plugin_id: String,
     package_dir: PathBuf,
     required_features: Vec<String>,
 }
 
-impl LuaPluginPackage {
+impl PluginPackage {
     #[must_use]
     pub fn new(
         plugin_id: impl Into<String>,
@@ -4493,7 +4543,7 @@ pub struct ScriptBoundary {
     command_rx: Arc<Mutex<mpsc::Receiver<ScriptCommand>>>,
     plugin_routes: PluginRouteAuthority,
     host_admissions: Arc<HostAdmissionLedger>,
-    deployed_packages: Arc<[LuaPluginPackage]>,
+    deployed_packages: Arc<[PluginPackage]>,
 }
 
 #[derive(Debug)]
@@ -4609,7 +4659,7 @@ impl ScriptBoundary {
 
     /// Every deployed package the host discovered, with its manifest facts.
     #[must_use]
-    pub fn deployed_packages(&self) -> &[LuaPluginPackage] {
+    pub fn deployed_packages(&self) -> &[PluginPackage] {
         &self.deployed_packages
     }
 
@@ -4728,7 +4778,6 @@ pub struct ScriptHostEndpoint {
     highest_delivered_tick: Option<u64>,
     command_tx: mpsc::Sender<ScriptCommand>,
     plugin_routes: PluginRouteAuthority,
-    #[cfg(any(test, feature = "lua-runtime"))]
     host_admissions: Arc<HostAdmissionLedger>,
 }
 
@@ -4742,7 +4791,7 @@ impl ScriptHostEndpoint {
             match self.recv_input().await? {
                 ScriptHostInput::Event(event) => return Some(event),
                 #[cfg(feature = "lua-runtime")]
-                ScriptHostInput::LuaReload(request) => request.reject_host_unavailable(),
+                ScriptHostInput::PluginReload(request) => request.reject_host_unavailable(),
             }
         }
     }
@@ -4754,7 +4803,7 @@ impl ScriptHostEndpoint {
             match self.recv_input_blocking()? {
                 ScriptHostInput::Event(event) => return Some(event),
                 #[cfg(feature = "lua-runtime")]
-                ScriptHostInput::LuaReload(request) => request.reject_host_unavailable(),
+                ScriptHostInput::PluginReload(request) => request.reject_host_unavailable(),
             }
         }
     }
@@ -4836,7 +4885,7 @@ impl ScriptHostEndpoint {
                 .accept_monotonic_event(event)
                 .map(ScriptHostInput::Event),
             #[cfg(feature = "lua-runtime")]
-            ScriptHostInput::LuaReload(request) => Some(ScriptHostInput::LuaReload(request)),
+            ScriptHostInput::PluginReload(request) => Some(ScriptHostInput::PluginReload(request)),
         }
     }
 
@@ -4876,11 +4925,17 @@ impl ScriptHostEndpoint {
             })
     }
 
-    /// Attach the currently executing Lua plugin identity before crossing into
-    /// server-owned command handling. This is intentionally unavailable outside
-    /// this crate: a plugin must never choose its own provenance.
-    #[cfg(any(test, feature = "lua-runtime"))]
-    pub(crate) fn try_submit_plugin_batch(
+    /// Attach the identity of the plugin instance whose callback produced this
+    /// batch, then cross into server-owned command handling.
+    ///
+    /// The identity comes from the [`HostCommandAdmission`] the host built for
+    /// the instance, never from the guest: a command that already claims
+    /// provenance is rejected here, and every command of the batch is checked
+    /// against the admission's capabilities before a single one is queued. This
+    /// is the one path a runtime-independent plugin host submits through; a
+    /// server-side caller with no plugin identity uses
+    /// [`Self::try_submit_command`] instead.
+    pub fn try_submit_plugin_batch(
         &self,
         admission: &HostCommandAdmission,
         batch: CommandBatch,
@@ -5382,7 +5437,6 @@ pub fn script_boundary_pair(
             highest_delivered_tick: None,
             command_tx,
             plugin_routes,
-            #[cfg(any(test, feature = "lua-runtime"))]
             host_admissions,
         },
     )
@@ -5679,6 +5733,63 @@ impl ScriptPluginManifest {
     pub fn with_load_phase(mut self, load_phase: ScriptPluginLoadPhase) -> Self {
         self.load_phase = load_phase;
         self
+    }
+
+    /// Declare one capability by the name a manifest writes.
+    ///
+    /// The vocabulary is part of the contract, not of one runtime's loader: the
+    /// Luau and component deployments name the same capabilities, and an unknown
+    /// name is refused instead of being ignored.
+    pub fn declare_capability(self, capability: &str) -> Result<Self, ScriptPluginManifestError> {
+        match capability {
+            "storage" => Ok(self.declare_plugin_storage()),
+            "storage_batches" => Ok(self.declare_storage_batches()),
+            "inventory_transfers" => Ok(self.declare_inventory_transfers()),
+            "persistent_residents" => Ok(self.declare_persistent_residents()),
+            "resident_work" => Ok(self.declare_resident_work()),
+            "resident_orders" => Ok(self.declare_resident_orders()),
+            "world_sites" => Ok(self.declare_world_sites()),
+            "structure_operations" => Ok(self.declare_structure_operations()),
+            "inventory_menus" => Ok(self.declare_inventory_menus()),
+            "inventory_storage_transactions" => Ok(self.declare_inventory_storage_transactions()),
+            "player_inventory" => Ok(self.declare_player_inventory()),
+            "zones" => Ok(self.declare_zones()),
+            "player_teleport" => Ok(self.declare_player_teleport()),
+            "player_queries" => Ok(self.declare_player_queries()),
+            "entity_damage" => Ok(self.declare_entity_damage()),
+            "world_time" => Ok(self.declare_world_time()),
+            "world_blocks" => Ok(self.declare_world_blocks()),
+            channel if channel.starts_with("custom_payload:") => {
+                Ok(self.declare_custom_payload_channel(&channel["custom_payload:".len()..]))
+            }
+            _ => Err(ScriptPluginManifestError::InvalidField {
+                field: "capability",
+            }),
+        }
+    }
+
+    /// Parse an `api = "MAJOR.MINOR.PATCH"` string.
+    pub fn parse_api_version(value: &str) -> Result<ScriptApiVersion, ScriptPluginManifestError> {
+        if value.len() > MAX_API_VERSION_BYTES {
+            return Err(ScriptPluginManifestError::InvalidField { field: "api" });
+        }
+        let mut parts = value.split('.');
+        let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(ScriptPluginManifestError::InvalidField { field: "api" });
+        };
+        if parts.next().is_some() {
+            return Err(ScriptPluginManifestError::InvalidField { field: "api" });
+        }
+        let parse = |part: &str| {
+            part.parse::<u16>()
+                .map_err(|_| ScriptPluginManifestError::InvalidField { field: "api" })
+        };
+        Ok(ScriptApiVersion::new(
+            parse(major)?,
+            parse(minor)?,
+            parse(patch)?,
+        ))
     }
 
     /// Declare interest in one Solaris-native script event name.
@@ -5987,7 +6098,22 @@ impl ScriptPluginManifest {
     }
 
     /// Validate and normalize this manifest for trusted host-side use.
+    /// Validate this manifest against the Luau contract version.
     pub fn validate(&self) -> Result<ValidatedScriptPluginManifest, ScriptPluginManifestError> {
+        self.validate_for(SCRIPT_API_VERSION)
+    }
+
+    /// Validate this manifest against the contract version the caller runs.
+    ///
+    /// The expected version is a parameter because the two runtimes have their
+    /// own versions: a Luau package is validated for [`SCRIPT_API_VERSION`] and a
+    /// component package for [`COMPONENT_PLUGIN_API_VERSION`], while everything
+    /// else about the manifest - ids, bounds, capabilities, routes, dependencies -
+    /// is one contract.
+    pub fn validate_for(
+        &self,
+        expected_api_version: ScriptApiVersion,
+    ) -> Result<ValidatedScriptPluginManifest, ScriptPluginManifestError> {
         if let Some(error) = &self.preflight_error {
             return Err(error.clone());
         }
@@ -6101,10 +6227,10 @@ impl ScriptPluginManifest {
             return Err(ScriptPluginManifestError::InvalidField { field: "version" });
         }
 
-        if !supports_script_api_version(self.requested_api_version) {
+        if !supports_plugin_api_version(self.requested_api_version, expected_api_version) {
             return Err(ScriptPluginManifestError::UnsupportedScriptApiVersion {
                 requested: self.requested_api_version,
-                supported: SCRIPT_API_VERSION,
+                supported: expected_api_version,
             });
         }
 
@@ -6327,7 +6453,6 @@ impl ValidatedScriptPluginManifest {
 
     /// Trusted host-side conversion from validated manifest declarations to
     /// executable command capabilities.
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn to_command_capabilities(&self) -> CommandCapabilities {
         let mut capabilities = CommandCapabilities::none();
         for capability in &self.declared_command_capabilities {
@@ -6551,7 +6676,6 @@ impl CommandCapabilities {
         Self::default()
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_spawn_entity_type(mut self, entity_type: impl AsRef<str>) -> Self {
         let entity_type = entity_type.as_ref().to_owned();
         if !self
@@ -6564,108 +6688,90 @@ impl CommandCapabilities {
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_entity_damage(mut self) -> Self {
         self.entity_damage = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_plugin_storage(mut self) -> Self {
         self.plugin_storage = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_storage_batches(mut self) -> Self {
         self.storage_batches = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_inventory_transfers(mut self) -> Self {
         self.inventory_transfers = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_persistent_residents(mut self) -> Self {
         self.persistent_residents = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_resident_work(mut self) -> Self {
         self.resident_work = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_resident_orders(mut self) -> Self {
         self.resident_orders = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_world_sites(mut self) -> Self {
         self.world_sites = true;
         self
     }
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_structure_operations(mut self) -> Self {
         self.structure_operations = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_inventory_menus(mut self) -> Self {
         self.inventory_menus = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_inventory_storage_transactions(mut self) -> Self {
         self.inventory_storage_transactions = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_player_inventory(mut self) -> Self {
         self.player_inventory = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_zones(mut self) -> Self {
         self.zones = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_player_teleport(mut self) -> Self {
         self.player_teleport = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_player_queries(mut self) -> Self {
         self.player_queries = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_world_time(mut self) -> Self {
         self.world_time = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_world_blocks(mut self) -> Self {
         self.world_blocks = true;
         self
     }
 
-    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_custom_payload_channel(mut self, channel: impl AsRef<str>) -> Self {
         let channel = channel.as_ref().to_owned();
         if !self

@@ -641,7 +641,7 @@ fixed.
 
 The owner stopped implementation and explicitly requested an immediate single
 commit and push to `main`, with unfinished work documented for another agent.
-Read [FIELD_TEST_HANDOFF.md](../FIELD_TEST_HANDOFF.md) first: it contains all twelve
+Read [field-test-handoff-2026-09-10.md](../evidence/field-test-handoff-2026-09-10.md) first: it contains all twelve
 reported issues, evidence, source entrypoints, partial changes and acceptance
 steps. Do not treat this snapshot as a release or a completed gameplay fix.
 

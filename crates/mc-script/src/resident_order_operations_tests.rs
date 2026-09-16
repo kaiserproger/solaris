@@ -6,7 +6,7 @@ use crate::{
     ScriptInventoryEndpoint, ScriptOperation, ScriptOperationOutcome, ScriptOperationPayload,
     ScriptOperationRequest, ScriptOrderTargetRef, ScriptResidentOrder,
     ScriptResidentOrderOperation, ScriptResidentOrderResult, ScriptResidentWorkOrder,
-    ScriptWorkArea,
+    ScriptWorkArea, warehouse_handle,
 };
 
 fn area(extent: i32) -> ScriptWorkArea {
@@ -83,6 +83,68 @@ fn work_orders_require_a_concrete_bounded_target() {
             },
         );
         assert!(request.is_err(), "invalid work order {work:?} was accepted");
+    }
+}
+
+#[test]
+fn a_haul_names_either_endpoint_and_one_real_item() {
+    // A haul is a move between two distinct endpoints, and the item it takes is
+    // a resource id - the same contract every other named resource obeys.
+    let endpoints = (
+        ScriptInventoryEndpoint::ResidentCarry {
+            handle: "a".repeat(32),
+        },
+        ScriptInventoryEndpoint::Warehouse {
+            handle: warehouse_handle("plugin", &"b".repeat(32), 0).expect("warehouse handle"),
+        },
+    );
+    let haul = |source: ScriptInventoryEndpoint,
+                destination: ScriptInventoryEndpoint,
+                item: Option<String>| {
+        ScriptOperationRequest::try_new(
+            "request",
+            ScriptOperation::ResidentOrder {
+                operation: ScriptResidentOrderOperation::AssignWork {
+                    operation_id: "work-3".to_owned(),
+                    handle: "a".repeat(32),
+                    work: ScriptResidentWorkOrder::Haul {
+                        source,
+                        destination,
+                        item,
+                    },
+                    work_units: 4,
+                    expected_revision: 0,
+                },
+            },
+        )
+    };
+    // Either direction is a real order, with or without a named item.
+    assert!(
+        haul(endpoints.0.clone(), endpoints.1.clone(), None).is_ok(),
+        "a worker's haul into a bound container is a move core can plan"
+    );
+    assert!(
+        haul(
+            endpoints.1.clone(),
+            endpoints.0.clone(),
+            Some("minecraft:iron_hoe".to_owned())
+        )
+        .is_ok(),
+        "a withdrawal of one named item is a move core can plan"
+    );
+    // The same endpoint on both sides is not a move, and a name that is not a
+    // resource id is not an item.
+    assert!(haul(endpoints.0.clone(), endpoints.0.clone(), None).is_err());
+    for item in ["Iron_Hoe", "minecraft:", "minecraft:iron hoe", ""] {
+        assert!(
+            haul(
+                endpoints.1.clone(),
+                endpoints.0.clone(),
+                Some(item.to_owned())
+            )
+            .is_err(),
+            "item {item:?} was accepted"
+        );
     }
 }
 

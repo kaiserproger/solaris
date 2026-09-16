@@ -71,4 +71,4 @@ The top-level observations result is `passed`.
 
 The automated exact-seed traversal/restart/rejoin gate is **PASS**. This is stronger than the earlier graphical spawn-only preflight because it exercises ordinary movement, natural block break/drop/pickup, recipes, table placement/menu opening, clean persistence, server restart and rejoin on the same generated world.
 
-This does **not** substitute for the separate subjective owner terrain/playability disposition requested by `PUBLIC_ALPHA_PLAN.md`, and it does not replace the 20-minute no-operator natural-spawn survival soak. Those remain separate acceptance boundaries until explicitly closed.
+This does **not** substitute for the separate subjective owner terrain/playability disposition requested by `docs/milestones/public-alpha-plan.md`, and it does not replace the 20-minute no-operator natural-spawn survival soak. Those remain separate acceptance boundaries until explicitly closed.

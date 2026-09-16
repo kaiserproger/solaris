@@ -6,7 +6,7 @@ You are the planning/audit model for Solaris, a Rust Minecraft Java Edition 26.1
 
 Walk the entire current core and produce the next high-confidence engineering program for autonomous agents. Find concrete improvement opportunities, latent correctness defects, incomplete vanilla parity, architectural debt, measurable performance risks, missing observability/operator surfaces, test/QA blind spots, and release-engineering gaps. The goal is not to invent speculative rewrites; it is to turn evidence from the current repository into a finite, prioritized, dependency-aware backlog that other agents can execute without having to rediscover the system.
 
-Treat current `AGENTS.md`, `docs/PUBLIC_ALPHA3_PLAN.md`, architecture/decision docs, current git state, existing evidence, tests and runtime tooling as source of truth. Preserve already-closed gates unless you find an actual regression or evidence contradiction.
+Treat current `AGENTS.md`, `docs/milestones/public-alpha3-plan.md`, architecture/decision docs, current git state, existing evidence, tests and runtime tooling as source of truth. Preserve already-closed gates unless you find an actual regression or evidence contradiction.
 
 ## Required audit dimensions
 

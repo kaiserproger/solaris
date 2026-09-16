@@ -1836,3 +1836,71 @@ fn pregenerate_cannot_be_combined_with_check() {
             "--check cannot be combined with the pregenerate subcommand",
         ));
 }
+
+#[test]
+fn check_refuses_a_component_deployment_whose_package_asks_for_the_luau_contract() {
+    // One runtime per deployment: a directory declared as `wasm` is read by the
+    // component host, and a package that requests the Luau contract version is
+    // refused there rather than silently loaded by the wrong loader.
+    let root = tempfile::tempdir().expect("plugin root");
+    let plugins = root.path().join("plugins");
+    let legacy = plugins.join("legacy");
+    std::fs::create_dir_all(&legacy).expect("create package directory");
+    std::fs::write(
+        legacy.join("plugin.toml"),
+        r#"
+            id = "legacy"
+            name = "Legacy"
+            version = "0.1.0"
+            api = "0.6.0"
+        "#,
+    )
+    .expect("write manifest");
+    std::fs::write(legacy.join("plugin.wasm"), b"not a component").expect("write artifact");
+    let world = root.path().join("world");
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+                [server]
+                name = "Component Deployment Check"
+                motd = "Hello"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 30001
+
+                [data]
+                world_dir = "{}"
+
+                [plugins]
+                directory = "{}"
+                runtime = "wasm"
+
+                [plugins.grants.legacy]
+                capabilities = ["player_inventory"]
+            "#,
+            world.display(),
+            plugins.display()
+        ),
+    )
+    .expect("write config");
+
+    let assertion = Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("legacy"),
+        "the refusal names the package it refused, saw {stderr}"
+    );
+    assert!(
+        stderr.contains("manifest"),
+        "the refusal names what was wrong, saw {stderr}"
+    );
+}

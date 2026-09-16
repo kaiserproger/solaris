@@ -4,11 +4,11 @@ use mc_data::{
     biomes::{BiomeSpawnEntry, BiomeSpawnRules, SpawnPlacement},
     entity_types::EntityTypeRegistry,
 };
-use mc_script::LuaGameplayRules;
+use mc_script::GameplayRules;
 use mc_worldgen::{ClayRule, TerrainGenerator, TreeRule};
 
 pub(super) fn apply(
-    plan: &LuaGameplayRules,
+    plan: &GameplayRules,
     generator: &mut TerrainGenerator,
     spawns: &mut BiomeSpawnRules,
     entity_types: &EntityTypeRegistry,

@@ -38,7 +38,7 @@ set `SOLARIS_INSTALL_DIR` to override that destination. Windows and macOS do
 not currently have prebuilt archives.
 
 **Upgrading from alpha-3:** back up the existing world and configuration first.
-Alpha-4 uses Solaris world-contract schema 4 and worldgen revision 19; an older
+Alpha-4 uses Solaris world-contract schema 4 and worldgen revision 24; an older
 Solaris world contract is rejected rather than silently mixing generation.
 Use a fresh `[data].world_dir`. Do not delete or hand-edit the old world's
 contract to bypass the check. Changing an effective startup `rules.lua` plan
@@ -162,30 +162,28 @@ requested permissions.
 Solaris Loader is not needed for a server whose selected plugins are all
 `server_only`. `solaris --check --config server.toml` reports each discovered
 plugin's deployment, supported loaders, requested permissions, bundle identity,
-and artifact size.
+and artifact size. Core declares Loader wire **3** with artifact index schema
+**2**; a Loader build that speaks an older wire is refused rather than silently
+served reduced content.
 
 ## Current alpha boundaries
 
-Ordinary survival, persistence, multiplayer, entities, trading, and plugins are
-implemented far enough for active field testing, not full vanilla parity. Rare
-redstone/vehicle behavior, species-specific behavior, broad production
-performance envelopes, and parts of village behavior remain incomplete.
+Ordinary survival, persistence, multiplayer, entities, trading, plugins, and
+core vanilla village generation are implemented far enough for active field
+testing, not full vanilla parity. Rare redstone/vehicle behavior,
+species-specific behavior, and broad production performance envelopes remain
+incomplete.
 
-Known honest limits as of 2026-09-06: the full twenty-minute playable survival
-loop is **blocked** after natural spruce pickup/crafting because the scenario
-found no dry crafting-table placement target. This is not proof that survival
-works on other terrain. Stop tuning one fixed seed: owner field testing comes
-first, followed by varied-seed graphical exploration with seeds recorded for
-reproduction. The frozen load matrix remains 20 PASS / 22 FAIL with no owner
-terrain `ACCEPT`; the full core redesign is incomplete.
+The owner defers real-client acceptance of the settlements work (R0/R1) by
+explicit decision, so no client-verified claim is made for it: what exists is
+the code-level half plus the Rust gates. The load-sensitive red in
+`mc-test-harness --test settlement_pause_repro` is recorded as a known gate
+failure, not silently retried away; `docs/MEMORY.md` carries its receipts.
 
-Alpha-4's reported-seed graphical survey confirmed natural cod/squid, separated
-herds, nearby trees, forest and mountain terrain, and natural clay in two
-water sites. It used operator travel and does not close the blocked no-debug
-survival scenario above. Startup Luau gameplay rules and the interactive server
-console are documented in the [plugin guide](docs/PLUGINS.md) and console
-section above. [Solaris Loader v0.1.0](https://github.com/kaiserproger/solaris-loader/releases/tag/v0.1.0)
-provides matching protocol-2 player adapters.
+One fixed seed proves nothing about a world: owner field testing comes first,
+followed by varied-seed graphical exploration with the seeds recorded for
+reproduction. Solaris has no released compatibility surface, so superseded
+Solaris APIs and schemas are deleted rather than carried.
 
 Do not assume an existing Solaris world will remain compatible with a newer
 alpha. Solaris can read supported vanilla Anvil data, but unversioned imports
@@ -211,13 +209,25 @@ release/checkpoint scopes; see
 [`docs/AGENT_TOOLING.md`](docs/AGENT_TOOLING.md#validation-harness) before
 launching a graphical or twenty-minute profile.
 
-## More documentation
+## Documentation map
+
+`docs/` root holds what describes current behaviour and current process.
+Milestone logs, dated evidence, phase reviews, and the session archive live in
+`docs/milestones/`, `docs/evidence/`, `docs/performance/`, `docs/memory/`,
+`docs/playable/`, and `docs/releases/`; open those only when a task asks for
+that era.
 
 - [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — design and compatibility scope
-- [Current preliminary release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.6) — binaries and checksums; [changelog](docs/releases/v0.0.6.md)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — target runtime design
+- [`docs/OPERATING.md`](docs/OPERATING.md) — network, auth, world, operator, and check output
+- [`docs/PLUGINS.md`](docs/PLUGINS.md) — Luau API `0.6.0` reference
+- [`docs/SOLARIS_LOADER.md`](docs/SOLARIS_LOADER.md) — client Loader installation
+- [`docs/VILLAGE_GENERATION.md`](docs/VILLAGE_GENERATION.md) — vanilla village generation and its declared divergence
 - [`docs/MEMORY.md`](docs/MEMORY.md) — current work and evidence cursor
-- [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) — replacement-readiness limits
-- [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — recorded evidence
+- [`docs/DEFINITION_OF_DONE.md`](docs/DEFINITION_OF_DONE.md) — readiness labels and the evidence matrix
+- [`docs/AGENT_TOOLING.md`](docs/AGENT_TOOLING.md) — harness wiring, profiles, and receipts
+- [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) and [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — the readiness claim and the recorded evidence behind it
+- [Current preliminary release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.6) — binaries and checksums; [changelog](docs/releases/v0.0.6.md)
 
 ## Repository layout
 
