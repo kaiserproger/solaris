@@ -3,14 +3,16 @@ use std::time::Instant;
 
 use mc_data::ItemStack;
 
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::SimulationAuthority;
+use mc_protocol::packets::play::{ClientboundBlockEvent, pack_block_pos};
 
 use super::container_state::{
     ContainerCommitContext, ContainerStateCommitError, ContainerViewer, chest_recipients,
     furnace_recipients, furnace_recipients_except,
 };
-use super::outbound::{OutboundCommand, VisibilityDispatch};
+use super::outbound::{OutboundCommand, SessionRecipient, VisibilityDispatch};
 use super::transactions::{ChestTransaction, FurnaceTransaction};
 use super::visibility::visibility_dispatches;
 use super::{SessionId, SessionRegistry};
@@ -63,11 +65,21 @@ impl SessionRegistry {
             .unwrap_or(1)
     }
 
+    #[cfg(test)]
     pub(in crate::play) fn register_chest_viewer(
         &self,
         id: SessionId,
         position: mc_world::BlockPos,
     ) -> i32 {
+        self.register_chest_viewer_with_lid_transition(id, position)
+            .0
+    }
+
+    pub(in crate::play) fn register_chest_viewer_with_lid_transition(
+        &self,
+        id: SessionId,
+        position: mc_world::BlockPos,
+    ) -> (i32, bool) {
         let inner = self.lock_inner("register chest viewer");
         let endpoint = inner
             .sessions
@@ -76,29 +88,38 @@ impl SessionRegistry {
         let mut containers = self.lock_containers(position, "register chest viewer");
         let state_id = *containers.chest_state_ids.entry(position).or_insert(1);
         let Some((tx, pressure)) = endpoint else {
-            return state_id;
+            return (state_id, false);
         };
-        containers
-            .chest_viewers
-            .entry(position)
-            .or_default()
-            .insert(id, ContainerViewer { tx, pressure });
-        state_id
+        let viewers = containers.chest_viewers.entry(position).or_default();
+        let lid_opened = viewers.is_empty();
+        viewers.insert(id, ContainerViewer { tx, pressure });
+        (state_id, lid_opened)
     }
 
+    #[cfg(test)]
     pub(in crate::play) fn unregister_chest_viewer(
         &self,
         id: SessionId,
         position: mc_world::BlockPos,
     ) {
+        let _ = self.unregister_chest_viewer_with_lid_transition(id, position);
+    }
+
+    pub(in crate::play) fn unregister_chest_viewer_with_lid_transition(
+        &self,
+        id: SessionId,
+        position: mc_world::BlockPos,
+    ) -> bool {
         let mut containers = self.lock_containers(position, "unregister chest viewer");
-        if let Some(viewers) = containers.chest_viewers.get_mut(&position) {
-            viewers.remove(&id);
-            if viewers.is_empty() {
-                containers.chest_viewers.remove(&position);
-                containers.chest_state_ids.remove(&position);
-            }
+        let Some(viewers) = containers.chest_viewers.get_mut(&position) else {
+            return false;
+        };
+        if viewers.remove(&id).is_none() || !viewers.is_empty() {
+            return false;
         }
+        containers.chest_viewers.remove(&position);
+        containers.chest_state_ids.remove(&position);
+        true
     }
 
     /// The container's canonical menu generation, the fence a caller observes
@@ -112,6 +133,38 @@ impl SessionRegistry {
             .get(&position)
             .copied()
             .unwrap_or(1)
+    }
+
+    pub(in crate::play) fn chest_lid_event_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        block_type: i32,
+        opener_count: u8,
+    ) -> Vec<VisibilityDispatch> {
+        let chunk = (position.x.div_euclid(16), position.z.div_euclid(16));
+        let recipients = {
+            let inner = self.lock_inner("chest lid event recipients");
+            inner
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.loaded.contains(&chunk))
+                .map(|(&id, session)| {
+                    SessionRecipient::unordered(
+                        id,
+                        session.tx.clone(),
+                        Arc::clone(&session.pressure),
+                    )
+                })
+                .collect()
+        };
+        visibility_dispatches(recipients, || {
+            OutboundCommand::BlockEvent(ClientboundBlockEvent {
+                position: pack_block_pos(position.x, position.y, position.z),
+                action: 1,
+                parameter: opener_count,
+                block_type,
+            })
+        })
     }
 
     #[cfg(test)]
@@ -509,6 +562,12 @@ impl SessionRegistry {
             .lock()
             .expect("test lock poisoned")
             .clone();
+        let warehouse_reservation_floors = lock_authoritative_mutex(
+            &self.warehouse_reservation_floors,
+            "play.warehouse_reservation_floors",
+        )
+        .clone();
+        let warehouse_reservation_admission = self.warehouse_reservation_admission_for(position);
         let inner = self.lock_inner("prepare regional chest commit");
         let player_state = match actor_session {
             Some(actor_session) => {
@@ -529,6 +588,8 @@ impl SessionRegistry {
             actor_session,
             containers: self.containers.shard_arc(position),
             player_state,
+            warehouse_reservation_floors,
+            warehouse_reservation_admission,
             #[cfg(test)]
             commit_probe,
         })

@@ -7,19 +7,21 @@ use super::simulation::{
 };
 use super::*;
 use crate::lock_policy::lock_authoritative_mutex;
-#[cfg(test)]
-use mc_entity::RegionKey;
 use mc_entity::{
-    EntityDamageRequest, EntityKinematics, EntityMotionState, EntitySnapshot, RegionalOwnerHandle,
-    RegionalOwnerRuntime, RegionalOwnerStatus, VersionedEntitySnapshots,
+    EntityDamageRequest, EntityKinematics, EntityMotionState, EntitySnapshot, RegionKey,
+    RegionalOwnerHandle, RegionalOwnerRuntime, RegionalOwnerStatus, VersionedEntitySnapshots,
 };
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+type WarehouseReservationFloors =
+    Arc<arc_swap::ArcSwap<HashMap<mc_world::BlockPos, BTreeMap<u32, u64>>>>;
+type WarehouseReservationAdmissions = Arc<Mutex<HashMap<RegionKey, Arc<tokio::sync::Mutex<()>>>>>;
 
 mod campfire_authority;
 mod chunk_view_authority;
@@ -36,6 +38,7 @@ mod entity_goal_defaults;
 mod entity_lifecycle;
 mod entity_owner;
 pub(crate) use entity_owner::entity_owner_fatal_from_panic;
+pub(super) mod damage_precommit;
 mod dragon_authority;
 #[cfg(test)]
 #[path = "session/dragon_authority_tests.rs"]
@@ -450,6 +453,7 @@ struct SessionRegistryInner {
     simulation_inputs: Arc<SimulationInputPublication>,
     entity_movement_trackers: Arc<EntityMovementTrackers>,
     arrow_tick_scratch: projectiles::ArrowTickScratch,
+    pending_projectile_damage: HashMap<EntityId, Instant>,
     #[cfg(test)]
     spawned_entity_chunks: HashSet<(i32, i32)>,
     natural_spawn_templates: HashMap<(i32, i32), Vec<HerdSpawn>>,
@@ -597,7 +601,12 @@ pub(crate) struct SessionRegistry {
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
     world_chunk_journal_failure: tokio::sync::watch::Sender<bool>,
     script_commit_event_monitor: Arc<ScriptCommitEventMonitor>,
+    precommit_boundary: OnceLock<mc_script::ScriptBoundary>,
+    damage_precommit_handle: OnceLock<super::simulation::SimulationHandle>,
     containers: ContainerRegistryShards,
+    warehouse_reservation_floors: Mutex<Option<WarehouseReservationFloors>>,
+    /// A reservation excludes chest commits only in its own 8×8-chunk region.
+    warehouse_reservation_admission: WarehouseReservationAdmissions,
     campfire_cooking: Arc<Mutex<HashMap<mc_world::BlockPos, CampfireCookingState>>>,
     pressure_observation: Arc<SessionPressureObservation>,
     outbound_pressure: Arc<OutboundPressureMetrics>,
@@ -955,8 +964,12 @@ impl SessionRegistry {
             world_chunk_journal: Mutex::new(None),
             world_chunk_journal_failure: tokio::sync::watch::channel(false).0,
             script_commit_event_monitor: Arc::new(ScriptCommitEventMonitor::default()),
+            precommit_boundary: OnceLock::new(),
+            damage_precommit_handle: OnceLock::new(),
             containers: ContainerRegistryShards::default(),
             campfire_cooking: Arc::new(Mutex::new(HashMap::new())),
+            warehouse_reservation_floors: Mutex::new(None),
+            warehouse_reservation_admission: Arc::new(Mutex::new(HashMap::new())),
             pressure_observation,
             outbound_pressure: Arc::new(OutboundPressureMetrics::default()),
             world_time: AtomicU64::new(0),
@@ -1201,6 +1214,91 @@ impl SessionRegistry {
             "persistence.world_chunk_journal_handle",
         )
         .clone()
+    }
+
+    /// Install the live physical floor projection for bound warehouse
+    /// containers. The inventory runtime owns and refreshes this cache after
+    /// durable reservation state changes; simulation only reads it while
+    /// admitting vanilla chest commits.
+    pub(crate) fn install_warehouse_reservation_floors(
+        &self,
+        floors: Arc<arc_swap::ArcSwap<HashMap<mc_world::BlockPos, BTreeMap<u32, u64>>>>,
+    ) {
+        *lock_authoritative_mutex(
+            &self.warehouse_reservation_floors,
+            "play.warehouse_reservation_floors",
+        ) = Some(floors);
+    }
+
+    /// Acquire exclusive admission to reserve from a physical warehouse. The
+    /// owned guard is `Send`, so the storage actor keeps it through the durable
+    /// decision while chest commands in the same region fail closed instead of
+    /// racing the floor. Other regions continue independently.
+    pub(crate) async fn lock_warehouse_reservation_admission(
+        &self,
+        position: mc_world::BlockPos,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.warehouse_reservation_admission_for(position)
+            .lock_owned()
+            .await
+    }
+
+    /// A chest transaction may not wait in the simulation owner. When a
+    /// reservation admission is live in the same region, it resyncs and the
+    /// client retries against the subsequent authoritative chest image.
+    pub(in crate::play) fn try_lock_warehouse_reservation_admission(
+        &self,
+        position: mc_world::BlockPos,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.warehouse_reservation_admission_for(position)
+            .try_lock_owned()
+            .ok()
+    }
+
+    fn warehouse_reservation_admission_for(
+        &self,
+        position: mc_world::BlockPos,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let region = RegionKey::from_chunk(position.x.div_euclid(16), position.z.div_euclid(16));
+        lock_authoritative_mutex(
+            &self.warehouse_reservation_admission,
+            "play.warehouse_reservation_admission",
+        )
+        .entry(region)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+    }
+
+    /// A vanilla chest after-image may not consume stock durable construction
+    /// reservations still hold on any currently bound physical container.
+    pub(crate) fn warehouse_reservation_stock_survives(
+        &self,
+        positions: &[mc_world::BlockPos],
+        updated: &[mc_world::ChestBlockEntity],
+    ) -> bool {
+        let floors = lock_authoritative_mutex(
+            &self.warehouse_reservation_floors,
+            "play.warehouse_reservation_floors",
+        )
+        .clone();
+        let Some(floors) = floors else {
+            return true;
+        };
+        let floors = floors.load();
+        positions.iter().zip(updated).all(|(position, chest)| {
+            let Some(required) = floors.get(position) else {
+                return true;
+            };
+            let mut available = BTreeMap::new();
+            for slot in &chest.slots {
+                if let Ok(count) = u64::try_from(slot.count) {
+                    *available.entry(slot.item_id).or_insert(0) += count;
+                }
+            }
+            required.iter().all(|(item_id, quantity)| {
+                available.get(item_id).copied().unwrap_or(0) >= *quantity
+            })
+        })
     }
 
     pub(crate) fn world_chunk_journal_watermark(&self) -> Option<u64> {
@@ -1832,6 +1930,35 @@ impl SessionRegistry {
 
     pub(crate) fn subscribe_simulation_ticks(&self) -> tokio::sync::watch::Receiver<u64> {
         self.simulation_tick_sender.subscribe()
+    }
+
+    pub(crate) fn install_precommit_boundary(&self, boundary: mc_script::ScriptBoundary) {
+        self.precommit_boundary
+            .set(boundary)
+            .expect("precommit boundary may only be installed once");
+    }
+
+    pub(crate) fn precommit_boundary(&self) -> Option<&mc_script::ScriptBoundary> {
+        self.precommit_boundary.get()
+    }
+    pub(crate) fn install_damage_precommit_handle(
+        &self,
+        handle: super::simulation::SimulationHandle,
+    ) {
+        self.damage_precommit_handle
+            .set(handle)
+            .expect("damage precommit handle may only be installed once");
+    }
+
+    pub(crate) fn damage_precommit_handle(&self) -> Option<&super::simulation::SimulationHandle> {
+        self.damage_precommit_handle.get()
+    }
+
+    pub(crate) fn player_uuid(&self, id: SessionId) -> Option<String> {
+        self.lock_inner("session.player_uuid")
+            .sessions
+            .get(&id)
+            .map(|session| session.uuid.to_string())
     }
 
     pub(crate) fn install_script_commit_event_outbox(&self) -> ScriptCommitEventReceiver {

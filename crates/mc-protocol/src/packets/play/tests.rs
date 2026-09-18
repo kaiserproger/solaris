@@ -210,6 +210,30 @@ fn block_entity_data_id_and_layout_match_protocol_dump() {
 }
 
 #[test]
+fn block_event_id_and_layout_match_local_vanilla_codec() {
+    assert_eq!(ClientboundBlockEvent::ID, 0x07);
+    let packet = ClientboundBlockEvent {
+        position: pack_block_pos(-1, 64, 2),
+        action: 1,
+        parameter: 2,
+        block_type: 300,
+    };
+    let mut body = Vec::new();
+    packet.encode(&mut body).unwrap();
+
+    let mut expected = Vec::new();
+    expected.write_i64(packet.position);
+    expected.write_u8(1);
+    expected.write_u8(2);
+    expected.write_varint(300);
+    assert_eq!(body, expected);
+
+    let mut cursor: &[u8] = &body;
+    assert_eq!(ClientboundBlockEvent::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn open_sign_editor_id_and_layout_match_protocol_dump() {
     assert_eq!(ClientboundOpenSignEditor::ID, 0x3C);
     let packet = ClientboundOpenSignEditor {

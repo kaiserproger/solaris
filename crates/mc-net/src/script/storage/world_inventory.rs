@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,24 +7,12 @@ use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_script::{
     MAX_RESIDENT_CARRY_SLOTS, MAX_RESIDENT_EQUIPMENT_SLOTS, ScriptInventoryEndpoint,
-    ScriptInventoryExpectedRevision, ScriptInventoryStorageTransaction, ScriptOperation,
+    ScriptInventoryExpectedRevision, ScriptInventoryReservationQuantity,
+    ScriptInventoryReservationSnapshot, ScriptInventoryStorageTransaction, ScriptOperation,
     ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload, ScriptOperationRequest,
     ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult, ScriptOwnedItemTransfer,
     ScriptStorageMutation,
 };
-
-use crate::play::SessionRegistry;
-use crate::play::owned_inventory::{
-    OwnedInventoryCommit, OwnedInventoryPrepare, ResidentEndpointState, ResidentGearStack,
-    ResidentGearUpdate, WarehousePlayerParticipant, WarehouseTransferRequest, gear_slots_to_items,
-    items_to_gear_slots, owned_inventory_fingerprint,
-};
-use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
-use crate::play::world_journal::{WorldChunkJournal, WorldChunkJournalError};
-use crate::play::{
-    ScriptStorageCommitError, ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
-};
-use crate::server::ShutdownHandle;
 
 use super::resident_orders::{
     DurableAssignment, DurableResidentOrderChange, DurableResidentOrderRecord, DurableResidentStack,
@@ -34,30 +22,45 @@ use super::{
     PluginStorageStartError, PreparedStorageBatch, decode_storage_batch, encode_storage_batch,
     frame,
 };
+use crate::play::SessionRegistry;
+use crate::play::owned_inventory::{
+    OwnedInventoryCommit, OwnedInventoryPrepare, ResidentEndpointState, ResidentGearStack,
+    ResidentGearUpdate, WarehousePlayerParticipant, WarehouseTransferRequest, gear_slots_to_items,
+    items_to_gear_slots, owned_inventory_fingerprint,
+};
+use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
+use crate::play::resident_work::ResidentWorldEdit;
+use crate::play::world_journal::{WorldChunkJournal, WorldChunkJournalError};
+use crate::play::{
+    ScriptStorageCommitError, ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
+};
+use crate::server::ShutdownHandle;
 
 impl PreparedStorageBatch {
     pub(crate) const MAX_ENCODED_BYTES: usize = MAX_TRANSACTION_FRAME_BYTES;
 
-    pub(crate) fn encode_world_inventory(&self) -> Result<Vec<u8>, PluginStorageMutationError> {
-        self.validate_inventory_participant()
-            .map_err(|_| PluginStorageMutationError::QuotaExceeded)?;
+    /// Encode any prepared plugin storage projection for one world-journal
+    /// decision. A world decision may carry a settlement portion rather than an
+    /// inventory participant.
+    pub(crate) fn encode_world_decision(&self) -> Result<Vec<u8>, PluginStorageMutationError> {
         encode_storage_batch(self)
     }
 
-    pub(crate) fn decode_world_inventory(payload: &[u8]) -> Result<Self, PluginStorageStartError> {
+    pub(crate) fn encode_world_inventory(&self) -> Result<Vec<u8>, PluginStorageMutationError> {
+        self.validate_inventory_participant()
+            .map_err(|_| PluginStorageMutationError::QuotaExceeded)?;
+        self.encode_world_decision()
+    }
+
+    /// Decode any plugin storage projection recovered from a world decision.
+    pub(crate) fn decode_world_decision(payload: &[u8]) -> Result<Self, PluginStorageStartError> {
         let Some((&OP_STORAGE_BATCH, body)) = payload.split_first() else {
-            return Err(PluginStorageStartError::Malformed(
-                "inventory decision batch",
-            ));
+            return Err(PluginStorageStartError::Malformed("world decision batch"));
         };
         if payload.len() > MAX_TRANSACTION_FRAME_BYTES {
-            return Err(PluginStorageStartError::Malformed(
-                "inventory decision size",
-            ));
+            return Err(PluginStorageStartError::Malformed("world decision size"));
         }
-        let batch = decode_storage_batch(body)?;
-        batch.validate_inventory_participant()?;
-        Ok(batch)
+        decode_storage_batch(body)
     }
 
     fn validate_inventory_participant(&self) -> Result<(), PluginStorageStartError> {
@@ -89,6 +92,8 @@ pub(crate) struct InventoryRuntime {
     settlement: Option<Arc<super::settlement::SettlementRuntime>>,
     settlement_world: Option<Arc<dyn super::settlement::SettlementWorld>>,
     resident_world: Option<Arc<dyn crate::play::resident_work::ResidentWorld>>,
+    warehouse_reservation_floors:
+        Arc<arc_swap::ArcSwap<HashMap<mc_world::BlockPos, BTreeMap<u32, u64>>>>,
 }
 
 impl InventoryRuntime {
@@ -118,6 +123,9 @@ impl InventoryRuntime {
         let world = world_root
             .zip(sessions.world_chunk_journal())
             .map(|(root, journal)| (root.to_owned(), journal));
+        let warehouse_reservation_floors =
+            Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new()));
+        sessions.install_warehouse_reservation_floors(Arc::clone(&warehouse_reservation_floors));
         Self {
             world,
             sessions,
@@ -127,6 +135,7 @@ impl InventoryRuntime {
             settlement: None,
             settlement_world: None,
             resident_world: None,
+            warehouse_reservation_floors,
         }
     }
 
@@ -181,32 +190,88 @@ impl InventoryRuntime {
         &self,
         storage: &mut PluginStorage,
     ) -> Result<(), PluginStorageStartError> {
-        let Some((root, journal)) = &self.world else {
-            return Ok(());
-        };
-        journal
-            .recover_inventory_decisions(|id, mut batch| {
-                let player = batch.inventory.take();
-                if batch.transaction_id > storage.revision {
-                    if storage.revision.checked_add(1) != Some(batch.transaction_id)
-                        || !storage.batch_preconditions_match(&batch)
-                    {
-                        return Err(WorldChunkJournalError::InventoryDecision(
-                            "stale inventory storage projection".to_owned(),
-                        ));
+        if let Some((root, journal)) = &self.world {
+            journal
+                .recover_inventory_decisions(|id, mut batch| {
+                    let player = batch.inventory.take();
+                    if batch.transaction_id > storage.revision {
+                        if storage.revision.checked_add(1) != Some(batch.transaction_id)
+                            || !storage.batch_preconditions_match(&batch)
+                        {
+                            return Err(WorldChunkJournalError::InventoryDecision(
+                                "stale inventory storage projection".to_owned(),
+                            ));
+                        }
+                        storage.commit_batch(batch).map_err(|error| {
+                            WorldChunkJournalError::InventoryDecision(error.to_string())
+                        })?;
                     }
-                    storage.commit_batch(batch).map_err(|error| {
-                        WorldChunkJournalError::InventoryDecision(error.to_string())
-                    })?;
+                    if let Some(player) = player {
+                        player.recover(root, id).map_err(|error| {
+                            WorldChunkJournalError::InventoryDecision(error.to_string())
+                        })?;
+                    }
+                    Ok(())
+                })
+                .map_err(std::io::Error::other)?;
+        }
+        self.refresh_warehouse_reservation_floors(storage);
+        Ok(())
+    }
+
+    /// Rebuild the physical reservation floor cache from durable reservations.
+    /// Unloaded bindings retain their exact durable source position; missing,
+    /// stale, or destroyed bindings contribute no physical chest floor.
+    pub(crate) fn refresh_warehouse_reservation_floors(&self, storage: &PluginStorage) {
+        let mut floors: HashMap<mc_world::BlockPos, BTreeMap<u32, u64>> = HashMap::new();
+        for (plugin_id, reservation_ref) in storage.reservations.keys() {
+            let Some((_, reservation)) = storage.settlement_reservation(plugin_id, reservation_ref)
+            else {
+                continue;
+            };
+            if reservation.released {
+                continue;
+            }
+            let ScriptInventoryEndpoint::Warehouse { handle } = &reservation.endpoint else {
+                continue;
+            };
+            let position = match self.resolve_warehouse_container(storage, plugin_id, handle) {
+                Ok(container) => container.position,
+                Err(ScriptOperationFailure::Unloaded) => {
+                    let Ok(position) = self.unloaded_warehouse_position(storage, plugin_id, handle)
+                    else {
+                        continue;
+                    };
+                    position
                 }
-                if let Some(player) = player {
-                    player.recover(root, id).map_err(|error| {
-                        WorldChunkJournalError::InventoryDecision(error.to_string())
-                    })?;
+                Err(_) => continue,
+            };
+            let floor = floors
+                .entry(mc_world::BlockPos {
+                    x: position[0],
+                    y: position[1],
+                    z: position[2],
+                })
+                .or_default();
+            for quantity in reservation.quantities {
+                if quantity.remaining == 0 {
+                    continue;
                 }
-                Ok(())
-            })
-            .map_err(|error| std::io::Error::other(error).into())
+                let Ok(resource_id) = mc_data::Identifier::parse(&quantity.resource_id) else {
+                    continue;
+                };
+                let Some(item_id) = self.items.id_of(&resource_id) else {
+                    continue;
+                };
+                let total = floor
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(quantity.remaining);
+                floor.insert(item_id, total);
+            }
+        }
+        self.warehouse_reservation_floors.store(Arc::new(floors));
     }
 
     pub(crate) async fn commit_storage(
@@ -564,6 +629,15 @@ pub(super) enum PreparedDepositCommit {
     Refused(ScriptOperationFailure),
 }
 
+/// What one prepared structure portion's world half answered.
+pub(super) enum PreparedStructurePortionCommit {
+    /// The block after-images and settlement receipt are durable together, and
+    /// the plugin ledger projection has been installed.
+    Committed,
+    /// The world half refused before a decision was accepted.
+    Refused(ScriptOperationFailure),
+}
+
 impl InventoryRuntime {
     /// Commit one prepared deposit: the container's canonical slots and the
     /// receipt's own second participant move under ONE world-journal decision.
@@ -631,6 +705,115 @@ impl InventoryRuntime {
             .mark_inventory_projected(decision_id)
             .expect("unacknowledged inventory decision remains retained");
         Ok(PreparedDepositCommit::Committed(decision_id))
+    }
+}
+
+impl InventoryRuntime {
+    /// Commit a finite construction portion: its server-owned block edits and
+    /// settlement receipt share one world-journal decision, then the receipt
+    /// projects into the plugin ledger from that same decision.
+    pub(super) async fn commit_prepared_structure_portion(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        structure_id: &str,
+        blocks: &[super::settlement::StructureBlockPlacement],
+        prepared: PreparedStorageBatch,
+    ) -> Result<PreparedStructurePortionCommit, PluginStorageMutationError> {
+        let Some(world) = self.settlement_world() else {
+            return Ok(PreparedStructurePortionCommit::Refused(
+                ScriptOperationFailure::RuntimeUnavailable,
+            ));
+        };
+        let Some((root, journal)) = &self.world else {
+            return Ok(PreparedStructurePortionCommit::Refused(
+                ScriptOperationFailure::RuntimeUnavailable,
+            ));
+        };
+        let mut batch = prepared;
+        let projection = inventory_ledger_frame(&mut batch)?;
+        storage.compact_before_append_if_needed(projection.len())?;
+        let encoded = batch.encode_world_decision()?;
+        let decision_id = match world
+            .commit_structure_portion(plugin_id, structure_id, blocks, encoded)
+            .await
+        {
+            Ok(decision_id) => decision_id,
+            Err(failure) => return Ok(PreparedStructurePortionCommit::Refused(failure)),
+        };
+        if let Err(error) =
+            append_inventory_projection(storage, root, decision_id, batch, &projection)
+        {
+            return Err(match error {
+                error @ PluginStorageMutationError::DurabilityUnknown(_) => error,
+                error => {
+                    PluginStorageMutationError::DurabilityUnknown(std::io::Error::other(error))
+                }
+            });
+        }
+        journal
+            .mark_inventory_projected(decision_id)
+            .expect("unacknowledged structure decision remains retained");
+        self.refresh_warehouse_reservation_floors(storage);
+        Ok(PreparedStructurePortionCommit::Committed)
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum PreparedResidentEditCommit {
+    /// Both the conditional block images and resident receipt are durable.
+    Committed,
+    /// No source image or journal decision was accepted.
+    Refused(ScriptOperationFailure),
+}
+
+impl InventoryRuntime {
+    /// Commit previewed resident world edits, cargo after-image and work
+    /// watermark in one world-journal decision. The receipt contains canonical
+    /// break loot; the world only consumes the exact preview preconditions.
+    pub(super) async fn commit_prepared_resident_edits(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        dimension: &str,
+        edits: &[ResidentWorldEdit],
+        prepared: PreparedStorageBatch,
+    ) -> Result<PreparedResidentEditCommit, PluginStorageMutationError> {
+        let Some(world) = self.resident_world() else {
+            return Ok(PreparedResidentEditCommit::Refused(
+                ScriptOperationFailure::RuntimeUnavailable,
+            ));
+        };
+        let Some((root, journal)) = &self.world else {
+            return Ok(PreparedResidentEditCommit::Refused(
+                ScriptOperationFailure::RuntimeUnavailable,
+            ));
+        };
+        let mut batch = prepared;
+        let projection = inventory_ledger_frame(&mut batch)?;
+        storage.compact_before_append_if_needed(projection.len())?;
+        let encoded = batch.encode_world_decision()?;
+        let decision_id = match world
+            .commit_world_edits(plugin_id, dimension, edits, encoded)
+            .await
+        {
+            Ok(decision_id) => decision_id,
+            Err(failure) => return Ok(PreparedResidentEditCommit::Refused(failure)),
+        };
+        if let Err(error) =
+            append_inventory_projection(storage, root, decision_id, batch, &projection)
+        {
+            return Err(match error {
+                error @ PluginStorageMutationError::DurabilityUnknown(_) => error,
+                error => {
+                    PluginStorageMutationError::DurabilityUnknown(std::io::Error::other(error))
+                }
+            });
+        }
+        journal
+            .mark_inventory_projected(decision_id)
+            .expect("unacknowledged resident edit decision remains retained");
+        Ok(PreparedResidentEditCommit::Committed)
     }
 }
 
@@ -995,6 +1178,20 @@ impl InventoryRuntime {
                         ScriptOperationFailure::Busy,
                     ));
                 };
+                if let ScriptInventoryEndpoint::Warehouse { .. } = endpoint {
+                    return self
+                        .commit_warehouse_reservation(
+                            storage,
+                            plugin_id,
+                            request,
+                            operation_id,
+                            endpoint,
+                            resource_plan,
+                            expected_revision,
+                            &reservation_ref,
+                        )
+                        .await;
+                }
                 let reserved = storage.reserved_quantities(endpoint);
                 let reserved = &reserved;
                 self.commit_owned_decision(
@@ -1021,6 +1218,153 @@ impl InventoryRuntime {
                 ScriptOperationFailure::InvalidRequest,
             )),
         }
+    }
+
+    /// Reserve material from one caller-owned live bound warehouse. Unlike a
+    /// player endpoint, the stock is the resolved physical container snapshot;
+    /// the binding revision is therefore the reservation's admission fence.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_warehouse_reservation(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+        operation_id: &str,
+        endpoint: &ScriptInventoryEndpoint,
+        resource_plan: &mc_script::ScriptInventoryResourcePlan,
+        expected_revision: &mc_script::ScriptInventoryFence,
+        reservation_ref: &str,
+    ) -> Result<ScriptOperationOutcome, PluginStorageMutationError> {
+        let ScriptInventoryEndpoint::Warehouse { handle } = endpoint else {
+            unreachable!("warehouse reservation dispatch")
+        };
+        let container = match self.resolve_warehouse_container(storage, plugin_id, handle) {
+            Ok(container) => container,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let position = mc_world::BlockPos {
+            x: container.position[0],
+            y: container.position[1],
+            z: container.position[2],
+        };
+        let _admission = self
+            .sessions
+            .lock_warehouse_reservation_admission(position)
+            .await;
+        let container = match self.resolve_warehouse_container(storage, plugin_id, handle) {
+            Ok(container) => container,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let snapshot = match crate::play::owned_inventory::owned_inventory_snapshot(
+            endpoint.clone(),
+            container.revision,
+            &container.items,
+            &self.items,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        if &snapshot.fence != expected_revision {
+            return Ok(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::StaleRevision,
+            ));
+        }
+        let totals = match crate::play::owned_inventory::resource_plan_totals(resource_plan) {
+            Ok(totals) => totals,
+            Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+        };
+        let reserved = storage.reserved_quantities(endpoint);
+        for (resource_id, quantity) in &totals {
+            let stock = match crate::play::owned_inventory::inventory_resource_stock(
+                &container.items,
+                &self.items,
+                resource_id,
+            ) {
+                Ok(stock) => stock,
+                Err(failure) => return Ok(ScriptOperationOutcome::rejected(failure)),
+            };
+            if stock
+                < reserved
+                    .get(resource_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*quantity)
+            {
+                return Ok(ScriptOperationOutcome::rejected(
+                    ScriptOperationFailure::InsufficientItems,
+                ));
+            }
+        }
+        let previous_floors = self.warehouse_reservation_floors.load_full();
+        let mut next_floors = (*previous_floors).clone();
+        let floor = next_floors
+            .entry(mc_world::BlockPos {
+                x: container.position[0],
+                y: container.position[1],
+                z: container.position[2],
+            })
+            .or_default();
+        for (resource_id, quantity) in &totals {
+            let resource = mc_data::Identifier::parse(resource_id)
+                .expect("live warehouse stock validation accepted the resource identifier");
+            let item_id = self
+                .items
+                .id_of(&resource)
+                .expect("live warehouse stock validation found the resource item");
+            *floor.entry(item_id).or_insert(0) += quantity;
+        }
+        // Publish the pending floor before the first await. The exclusive
+        // admission gate then makes concurrent chest clicks resync until either
+        // this decision becomes durable or the prior projection is restored.
+        self.warehouse_reservation_floors
+            .store(Arc::new(next_floors));
+        let quantities = totals
+            .into_iter()
+            .map(|(resource_id, quantity)| {
+                ScriptInventoryReservationQuantity::new(resource_id, quantity, 0, 0, quantity)
+            })
+            .collect();
+        let reservation = ScriptInventoryReservationSnapshot::new(
+            reservation_ref.to_owned(),
+            endpoint.clone(),
+            crate::play::owned_inventory::resource_plan_hash(resource_plan),
+            quantities,
+            None,
+            false,
+            0,
+        );
+        let payload = ScriptOperationPayload::OwnedInventory {
+            result: Box::new(ScriptOwnedInventoryResult::Reservation { reservation }),
+        };
+        let outcome = self
+            .commit_owned_decision(
+                storage,
+                plugin_id,
+                operation_id,
+                move |commit, _decision_id| {
+                    let prepared = match commit.prepare_owned(plugin_id, request, payload, None)? {
+                        ScriptStoragePrepareOutcome::Prepared(prepared) => prepared,
+                        ScriptStoragePrepareOutcome::Rejected => {
+                            return Ok(OwnedInventoryCommit::Rejected(
+                                ScriptOperationOutcome::rejected(ScriptOperationFailure::Busy),
+                            ));
+                        }
+                    };
+                    match commit.commit_owned(prepared) {
+                        Ok(_) => Ok(OwnedInventoryCommit::Committed),
+                        Err(ScriptStorageCommitError::NotCommitted(error)) => Err(error),
+                        Err(ScriptStorageCommitError::DurabilityUnknown(error)) => Err(error),
+                    }
+                },
+            )
+            .await;
+        if outcome
+            .as_ref()
+            .map_or(true, |outcome| outcome.failure().is_some())
+        {
+            self.warehouse_reservation_floors.store(previous_floors);
+        }
+        outcome
     }
 
     /// Execute one `transfer_owned_items` that names a bound warehouse

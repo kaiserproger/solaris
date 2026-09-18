@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
@@ -32,7 +32,6 @@ proptest = "1"
 bevy_ecs = { version = "0.18.1", default-features = false, features = ["std"] }
 bytemuck = "1"
 wide = "1.5"
-mlua = { version = "0.12", default-features = false, features = ["luau"] }
 rayon = "1"
 crc32fast = "1"
 aes = "0.9"

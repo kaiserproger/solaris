@@ -178,6 +178,8 @@ pub(crate) use script_inventory_transaction::{
 #[cfg(test)]
 mod script_inventory_transaction_tests;
 mod session;
+/// Maximum conditional edits a single receipt-bearing simulation decision admits.
+pub(crate) const MAX_BLOCK_EDIT_COMMAND_EDITS: usize = 512;
 mod simulation;
 pub(crate) use simulation::SimulationWorldAccess;
 mod spawn;
@@ -217,14 +219,14 @@ pub(crate) use chunk_stream::{
     passive_entity_passable_blocks, passive_herd_fallback_surface_blocks,
 };
 use combat::{
-    ActiveShield, PlayerDamageKind, ShieldUseState, begin_player_attack_attempt,
-    damage_active_shield_slots, damage_held_weapon_stack, player_horizontal_look_direction,
-    shield_blocks_damage, shield_hand_slot, shield_use_flags, shield_use_from_stack,
-    shield_use_matches, stack_is_shield, weapon_attacks_damage_held_item,
+    ActiveShield, PlayerDamageKind, PlayerDamageRequest, ShieldUseState,
+    begin_player_attack_attempt, damage_active_shield_slots, damage_held_weapon_stack,
+    player_horizontal_look_direction, shield_blocks_damage, shield_hand_slot, shield_use_flags,
+    shield_use_from_stack, shield_use_matches, stack_is_shield, weapon_attacks_damage_held_item,
 };
 #[cfg(test)]
 use combat::{
-    PlayerDamageRequest, PlayerHurtResistance, PlayerHurtResolution, SHIELD_ACTIVATION_DELAY_TICKS,
+    PlayerHurtResistance, PlayerHurtResolution, SHIELD_ACTIVATION_DELAY_TICKS,
     SHIELD_FALLBACK_MAX_DAMAGE, attack_damage_for_item, held_attack_damage,
     held_attack_damage_at_tick, held_attack_speed, melee_knockback, shield_block_knockback,
     shield_durability_damage,
@@ -253,6 +255,13 @@ use simulation::{
     ZombieVillagerCurePlan,
 };
 pub use simulation::{EntityEffectHandle, EntityEffectRequestError};
+
+/// The one native before-damage decision a damage plan commits against.
+///
+/// Connection-side damage producers attach a live approval to the plan that
+/// carries the damage; every non-damage plan (costs, healing, food, regen,
+/// respawn, enchanting) carries `None` and keeps the direct native path.
+pub(in crate::play) type HookApproval = mc_script::precommit::Approval;
 
 /// One accepted attack as observed by the simulation authority.
 ///
@@ -410,9 +419,12 @@ use movement::{
 #[cfg(test)]
 use persistence::PersistedEntityRecord;
 use persistence::{PersistedEntityCheckpoint, PlayerPersistedState, XpState, load_player_state};
+#[cfg(test)]
+use player_damage_adapter::apply_unhooked_player_damage_for_test;
 use player_damage_adapter::{
-    PlayerDamageApplication, apply_contact_block_damage, apply_fall_damage, apply_player_damage,
-    apply_player_damage_publication, player_melee_knockback,
+    PlayerDamageApplication, admit_connection_player_damage, apply_contact_block_damage,
+    apply_fall_damage, apply_player_damage, apply_player_damage_publication,
+    player_melee_knockback,
 };
 use player_teleport::apply_script_player_teleport;
 #[cfg(test)]
@@ -442,6 +454,7 @@ use scheduled_blocks::{
     insert_hopper_stack_into_campfire,
 };
 use script_gameplay_events::ScriptGameplayEventPublisher;
+use session::damage_precommit::PlayerDamageSource;
 use session::{
     EntityAttackOutcome, OutboundCommand, OutboundLightUpdate, PlayerAttackResult,
     PlayerEntitySnapshot, ScriptMenuCloseRequest, ScriptMenuOpenRequest, ServerEntityMove,
@@ -1494,7 +1507,7 @@ impl BlockPlanningRead for SnapshotPlanningWorld<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct PlayerPose {
     x: f64,
     y: f64,
@@ -3654,9 +3667,18 @@ where
     store_active_container(state, player_pose).await?;
     let container_id = next_container_id(state);
     let mut window = ChestWindow::new(positions, container_id);
-    window.state_id = state
-        .sessions
-        .register_chest_viewer(state.session_id, window.position());
+    let primary_position = window.position();
+    for position in &window.positions {
+        let (state_id, lid_opened) = state
+            .sessions
+            .register_chest_viewer_with_lid_transition(state.session_id, *position);
+        if *position == primary_position {
+            window.state_id = state_id;
+        }
+        if lid_opened {
+            containers::dispatch_chest_lid_event(state, *position, 1);
+        }
+    }
     let (view, state_id) = load_chest_commit_snapshot(state, &window).await?;
     window.state_id = state_id;
     write_packet(
@@ -5079,10 +5101,11 @@ async fn commit_player_survival_update<W>(
     writer: &mut W,
     survival_state: &mut SurvivalState,
     xp_state: &mut XpState,
-    expected_inventory: PlayerInventory,
+    expected_inventory: Box<PlayerInventory>,
     updated_survival: SurvivalState,
     updated_xp: XpState,
     enchanting_table_input: Option<EnchantingTableInputPlan>,
+    hook_approval: Option<HookApproval>,
     write_health: bool,
     player_pose: PlayerPose,
 ) -> Result<bool, ConnectionError>
@@ -5100,6 +5123,7 @@ where
             updated_xp,
             None,
             enchanting_table_input,
+            hook_approval,
             write_health,
             player_pose,
         )
@@ -5119,11 +5143,12 @@ async fn commit_player_survival_update_with_shield<W>(
     writer: &mut W,
     survival_state: &mut SurvivalState,
     xp_state: &mut XpState,
-    expected_inventory: PlayerInventory,
+    expected_inventory: Box<PlayerInventory>,
     updated_survival: SurvivalState,
     updated_xp: XpState,
     active_shield: Option<ActiveShieldTransition>,
     enchanting_table_input: Option<EnchantingTableInputPlan>,
+    hook_approval: Option<HookApproval>,
     write_health: bool,
     player_pose: PlayerPose,
 ) -> Result<PlayerSurvivalUpdateOutcome, ConnectionError>
@@ -5135,42 +5160,45 @@ where
     let shield_transition_requested = active_shield.is_some();
     let committed = match state
         .simulation
-        .commit_player_survival(PlayerSurvivalPlan {
+        .commit_player_survival(Box::new(PlayerSurvivalPlan {
             expected_survival,
             updated_survival,
-            expected_inventory: expected_inventory.clone(),
+            expected_inventory: (*expected_inventory).clone(),
             updated_inventory: state.inventory.clone(),
             expected_carried_item: state.carried_item.clone(),
             expected_xp: expected_xp.clone(),
             updated_xp,
             active_shield,
             enchanting_table_input,
+            hook_approval,
             item_entity_type_id: item_entity_type_id(&state.entity_types),
             xp_orb_entity_type_id: xp_orb_entity_type_id(&state.entity_types),
             keep_inventory: state.sessions.keep_inventory(),
             position: Vec3::new(player_pose.x, player_pose.y, player_pose.z),
-        })
+        }))
         .await
     {
-        Ok(Some(PlayerSurvivalCommitOutcome::Committed(committed))) => committed,
-        Ok(Some(PlayerSurvivalCommitOutcome::Rejected(authoritative))) => {
-            if shield_transition_requested {
-                restore_authoritative_shield_state(state, authoritative);
-            } else {
-                state.inventory = expected_inventory;
-                refresh_shield_use_state(state);
+        Ok(Some(outcome)) => match *outcome {
+            PlayerSurvivalCommitOutcome::Committed(committed) => committed,
+            PlayerSurvivalCommitOutcome::Rejected(authoritative) => {
+                if shield_transition_requested {
+                    restore_authoritative_shield_state(state, *authoritative);
+                } else {
+                    state.inventory = *expected_inventory;
+                    refresh_shield_use_state(state);
+                }
+                debug!("player survival transition rejected because owner state changed");
+                return Ok(PlayerSurvivalUpdateOutcome::Rejected);
             }
-            debug!("player survival transition rejected because owner state changed");
-            return Ok(PlayerSurvivalUpdateOutcome::Rejected);
-        }
+        },
         Ok(None) => {
-            state.inventory = expected_inventory;
+            state.inventory = *expected_inventory;
             refresh_shield_use_state(state);
             debug!("player survival transition rejected because owner state changed");
             return Ok(PlayerSurvivalUpdateOutcome::Rejected);
         }
         Err(error) => {
-            state.inventory = expected_inventory;
+            state.inventory = *expected_inventory;
             refresh_shield_use_state(state);
             debug!(?error, "simulation player survival request rejected");
             return Ok(PlayerSurvivalUpdateOutcome::Rejected);
@@ -6262,7 +6290,7 @@ where
             &mut updated_xp,
             offer,
         ) {
-            let expected_inventory = state.inventory.clone();
+            let expected_inventory = Box::new(state.inventory.clone());
             if commit_player_survival_update(
                 state,
                 writer,
@@ -6275,6 +6303,7 @@ where
                     expected: enchanting_table_input_projection(&window.inputs),
                     updated: enchanting_table_input_projection(&updated_inputs),
                 }),
+                None,
                 false,
                 player_pose,
             )
@@ -6711,7 +6740,7 @@ where
         return Ok(());
     }
 
-    let targets = animal_feed_targets(&state.tags, expected_held.item_id);
+    let targets = AnimalFeedTargets::from_tags(&state.tags, expected_held.item_id);
     if expected_held.is_empty() || targets.is_empty() {
         debug!(
             entity_id = packet.entity_id,
@@ -6783,27 +6812,6 @@ fn sheep_shear_plan(
     })
 }
 
-fn animal_feed_targets(tags: &TagsData, item_id: u32) -> AnimalFeedTargets {
-    let Ok(item_id) = i32::try_from(item_id) else {
-        return AnimalFeedTargets::default();
-    };
-    let item_registry = Identifier::parse("minecraft:item").expect("static item registry id");
-    let Some(item_tags) = tags.registries.get(&item_registry) else {
-        return AnimalFeedTargets::default();
-    };
-    let contains = |tag_name: &str| {
-        Identifier::parse(tag_name)
-            .ok()
-            .and_then(|tag| item_tags.get(&tag))
-            .is_some_and(|entries| entries.contains(&item_id))
-    };
-    AnimalFeedTargets {
-        cow: contains("minecraft:cow_food"),
-        sheep: contains("minecraft:sheep_food"),
-        chicken: contains("minecraft:chicken_food"),
-    }
-}
-
 async fn damage_held_weapon_after_attack<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -6838,7 +6846,7 @@ where
         let packet_changed = updated_survival
             .add_exhaustion(mc_entity::player_survival_26_1_2::ENTITY_ATTACK_EXHAUSTION);
         if updated_survival != *survival_state {
-            let expected_inventory = state.inventory.clone();
+            let expected_inventory = Box::new(state.inventory.clone());
             commit_player_survival_update(
                 state,
                 writer,
@@ -6847,6 +6855,7 @@ where
                 expected_inventory,
                 updated_survival,
                 xp_state.clone(),
+                None,
                 None,
                 packet_changed,
                 player_pose,
@@ -7095,6 +7104,7 @@ fn player_attack_cost_plan(
         updated_xp: xp.clone(),
         active_shield: None,
         enchanting_table_input: None,
+        hook_approval: None,
         item_entity_type_id: None,
         xp_orb_entity_type_id: None,
         keep_inventory: false,
@@ -11687,6 +11697,7 @@ async fn schedule_fluid_ticks_for_interaction(
 async fn handle_use_item<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     survival_state: &mut SurvivalState,
     player_pose: PlayerPose,
@@ -11727,7 +11738,7 @@ where
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
-    if handle_bucket_use(state, writer, game_mode, player_pose, action).await? {
+    if handle_bucket_use(state, writer, script_events, game_mode, player_pose, action).await? {
         return Ok(());
     }
 
@@ -11897,6 +11908,9 @@ struct PlayerMovementIngressContext<'a, W> {
     writer: &'a mut W,
     compression: Compression,
     interaction: Option<&'a mut InteractionState>,
+    sessions: &'a SessionRegistry,
+    session_id: SessionId,
+    dimension: &'a str,
     chunk_stream: &'a mut Option<ChunkStreamState>,
     simulation: &'a SimulationHandle,
     script_zone_observer: &'a mut Option<ScriptZoneObserver>,
@@ -11919,10 +11933,13 @@ where
     let PlayerMovementIngressContext {
         writer,
         compression,
-        mut interaction,
+        sessions,
+        session_id,
+        dimension,
         chunk_stream,
-        simulation,
+        mut interaction,
         script_zone_observer,
+        simulation,
         survival_state,
         xp_state,
         game_mode,
@@ -11999,6 +12016,9 @@ where
     }
     if game_mode == GameMode::Survival {
         apply_fall_damage(
+            sessions,
+            session_id,
+            dimension,
             interaction.as_deref_mut(),
             writer,
             compression,
@@ -12317,6 +12337,7 @@ where
                 handle_use_item(
                     state,
                     writer,
+                    script_gameplay_events,
                     game_mode,
                     survival_state,
                     player_pose,
@@ -12491,7 +12512,8 @@ where
         ServerboundContainerClick::ID => {
             let click = ServerboundContainerClick::decode(&mut body)?;
             if let Some(state) = interaction.as_deref_mut() {
-                handle_container_click(
+                // Keep the large click future out of the enclosing ingress/play-loop frames.
+                Box::pin(handle_container_click(
                     state,
                     writer,
                     ContainerClickContext {
@@ -12510,7 +12532,7 @@ where
                         ),
                     },
                     click,
-                )
+                ))
                 .await?;
             } else {
                 debug!(
@@ -12898,6 +12920,7 @@ struct ChatCommandIngressContext<'a, W> {
     compression: Compression,
     scripts: Option<&'a ScriptEventSink>,
     session_id: SessionId,
+    dimension: &'a str,
     player_uuid: &'a str,
     player_name: &'a str,
     permissions: CommandPermissions,
@@ -12968,6 +12991,7 @@ where
         compression,
         scripts,
         session_id,
+        dimension,
         player_uuid,
         player_name,
         permissions,
@@ -13078,13 +13102,13 @@ where
                     &command.command,
                 ) {
                     mc_script::PlayerCommandAdmission::Enqueued => {
-                        debug!(command = %command.command, "player command routed to Lua plugin");
+                        debug!(command = %command.command, "player command routed to component plugin");
                         return Ok(());
                     }
                     mc_script::PlayerCommandAdmission::Dropped => {
                         debug!(
                             command = %command.command,
-                            "player command dropped because the Lua event queue is full"
+                            "player command dropped because the component event queue is full"
                         );
                         return Ok(());
                     }
@@ -13110,6 +13134,8 @@ where
                 xp_state,
                 config,
                 sessions,
+                session_id,
+                dimension,
                 simulation,
                 interaction,
                 player_pose,
@@ -13236,9 +13262,14 @@ async fn settle_disconnected_inventory(
                 .unregister_furnace_viewer(interaction.session_id, window.position);
         }
         Some(ActiveContainer::Chest(window)) => {
-            interaction
-                .sessions
-                .unregister_chest_viewer(interaction.session_id, window.position());
+            for position in &window.positions {
+                if interaction
+                    .sessions
+                    .unregister_chest_viewer_with_lid_transition(interaction.session_id, *position)
+                {
+                    containers::dispatch_chest_lid_event(interaction, *position, 0);
+                }
+            }
         }
         _ => {}
     }
@@ -14069,6 +14100,7 @@ where
 struct PlaySimulationTickContext<'a, W> {
     sessions: &'a SessionRegistry,
     session_id: SessionId,
+    dimension: &'a str,
     interaction: Option<&'a mut InteractionState>,
     writer: &'a mut W,
     compression: Compression,
@@ -14094,6 +14126,7 @@ where
     let PlaySimulationTickContext {
         sessions,
         session_id,
+        dimension,
         mut interaction,
         writer,
         compression,
@@ -14132,16 +14165,15 @@ where
         player_can_drown(game_mode, survival_state.is_dead()),
     );
     let client_has_loaded = client_load.has_loaded();
-    let breathing_requires_damage_commit =
-        client_has_loaded && breathing_tick.drowning_damage > 0.0;
-    if !breathing_requires_damage_commit {
+    let drowning_damage_pending = client_has_loaded && breathing_tick.drowning_damage > 0.0;
+    if !drowning_damage_pending {
         *breathing_state = next_breathing;
         if breathing_tick.air_changed {
             publish_player_air_supply(sessions, session_id, *breathing_state);
         }
     }
 
-    let mut breathing_damage_committed = false;
+    let mut drowning_damage_committed = false;
     if matches!(game_mode, GameMode::Survival | GameMode::Adventure) {
         let mut updated_survival = *survival_state;
         let health_tick = if game_mode == GameMode::Survival {
@@ -14150,37 +14182,25 @@ where
             *food_tick_timer = 0;
             SurvivalHealthTick::Unchanged
         };
-        if client_has_loaded && let SurvivalHealthTick::StarvationDamage(amount) = health_tick {
-            updated_survival.apply_damage(survival_damage_after_equipment(
-                interaction.as_deref(),
-                amount,
-                PlayerDamageKind::Starvation,
-            ));
-        }
-        if client_has_loaded && breathing_tick.drowning_damage > 0.0 {
-            updated_survival.apply_damage(survival_damage_after_equipment(
-                interaction.as_deref(),
-                breathing_tick.drowning_damage,
-                PlayerDamageKind::Drowning,
-            ));
-        }
-        let health_changed = match health_tick {
-            SurvivalHealthTick::Unchanged => false,
-            SurvivalHealthTick::StarvationDamage(_) => client_has_loaded,
-            _ => true,
-        };
-        if health_changed || breathing_requires_damage_commit {
+        let starvation_damage = client_has_loaded
+            .then_some(match health_tick {
+                SurvivalHealthTick::StarvationDamage(amount) => Some(amount),
+                _ => None,
+            })
+            .flatten();
+        let health_changed = matches!(health_tick, SurvivalHealthTick::Changed);
+        if health_changed {
             if let Some(state) = interaction.as_deref_mut() {
-                let expected_inventory = state.inventory.clone();
-                let updated_xp = xp_state.clone();
-                breathing_damage_committed = commit_player_survival_update(
+                let expected_inventory = Box::new(state.inventory.clone());
+                commit_player_survival_update(
                     state,
                     writer,
                     survival_state,
                     xp_state,
                     expected_inventory,
                     updated_survival,
-                    updated_xp,
+                    xp_state.clone(),
+                    None,
                     None,
                     true,
                     player_pose,
@@ -14189,11 +14209,79 @@ where
             } else {
                 *survival_state = updated_survival;
                 write_packet(writer, &survival_state.as_packet(), compression).await?;
-                breathing_damage_committed = true;
+            }
+        }
+        if let Some(amount) = starvation_damage {
+            let request = PlayerDamageRequest {
+                kind: PlayerDamageKind::Starvation,
+                amount,
+                source_origin: None,
+            };
+            if player_damage_adapter::player_damage_can_apply(game_mode, survival_state, &request)
+                && let Some(admitted) = admit_connection_player_damage(
+                    sessions,
+                    session_id,
+                    dimension,
+                    request,
+                    Vec3::new(player_pose.x, player_pose.y, player_pose.z),
+                    PlayerDamageSource::Environment,
+                )
+                .await
+            {
+                apply_player_damage(
+                    interaction.as_deref_mut(),
+                    writer,
+                    compression,
+                    survival_state,
+                    xp_state,
+                    game_mode,
+                    PlayerDamageApplication {
+                        player_pose,
+                        request,
+                    },
+                    admitted,
+                )
+                .await?;
+            }
+        }
+        if drowning_damage_pending {
+            let request = PlayerDamageRequest {
+                kind: PlayerDamageKind::Drowning,
+                amount: breathing_tick.drowning_damage,
+                source_origin: None,
+            };
+            if player_damage_adapter::player_damage_can_apply(game_mode, survival_state, &request)
+                && let Some(admitted) = admit_connection_player_damage(
+                    sessions,
+                    session_id,
+                    dimension,
+                    request,
+                    Vec3::new(player_pose.x, player_pose.y, player_pose.z),
+                    PlayerDamageSource::Environment,
+                )
+                .await
+            {
+                drowning_damage_committed = apply_player_damage(
+                    interaction.as_deref_mut(),
+                    writer,
+                    compression,
+                    survival_state,
+                    xp_state,
+                    game_mode,
+                    PlayerDamageApplication {
+                        player_pose,
+                        request,
+                    },
+                    admitted,
+                )
+                .await?;
             }
         }
         if client_has_loaded && game_mode == GameMode::Survival && current_tick.is_multiple_of(20) {
             apply_contact_block_damage(
+                sessions,
+                session_id,
+                dimension,
                 interaction.as_deref_mut(),
                 writer,
                 compression,
@@ -14207,7 +14295,7 @@ where
     } else {
         *food_tick_timer = 0;
     }
-    if breathing_requires_damage_commit && breathing_damage_committed {
+    if drowning_damage_pending && drowning_damage_committed {
         *breathing_state = next_breathing;
         publish_player_air_supply(sessions, session_id, *breathing_state);
     }
@@ -14411,14 +14499,27 @@ where
                         write_packet(writer, &EntityEvent { entity_id, event_id }, compression)
                             .await?;
                     }
+                    Some(OutboundCommand::BlockEvent(event)) => {
+                        write_packet(writer, &event, compression).await?;
+                    }
                     Some(OutboundCommand::EntityHurt { entity_id }) => {
                         send_entity_hurt(writer, compression, entity_id, &config.data).await?;
                     }
                     Some(OutboundCommand::LevelEvent(event)) => {
                         write_packet(writer, &event, compression).await?;
                     }
-                    Some(OutboundCommand::DamagePlayer { damage }) => {
-                        if sessions.player_accepts_damage(session_id) {
+                    Some(OutboundCommand::DamagePlayer { damage, source }) => {
+                        if sessions.player_accepts_damage(session_id)
+                            && let Some(admitted) = admit_connection_player_damage(
+                                &*sessions,
+                                session_id,
+                                respawn.dimension_name.as_str(),
+                                damage,
+                                Vec3::new(player_pose.x, player_pose.y, player_pose.z),
+                                source,
+                            )
+                            .await
+                        {
                             apply_player_damage(
                                 interaction.as_deref_mut(),
                                 writer,
@@ -14430,6 +14531,7 @@ where
                                     player_pose,
                                     request: damage,
                                 },
+                                admitted,
                             )
                             .await?;
                         }
@@ -14707,6 +14809,7 @@ where
                     PlaySimulationTickContext {
                         sessions: &sessions,
                         session_id,
+                        dimension: respawn.dimension_name.as_str(),
                         interaction: interaction.as_deref_mut(),
                         writer,
                         compression,
@@ -14775,6 +14878,9 @@ where
                             writer,
                             compression,
                             interaction: interaction.as_deref_mut(),
+                            sessions: &sessions,
+                            session_id,
+                            dimension: respawn.dimension_name.as_str(),
                             chunk_stream: &mut chunk_stream,
                             simulation: &simulation,
                             script_zone_observer: &mut script_zone_observer,
@@ -14898,6 +15004,7 @@ where
                             compression,
                             scripts: scripts.as_ref(),
                             session_id,
+                            dimension: respawn.dimension_name.as_str(),
                             player_uuid: &player_uuid,
                             player_name: &player_name,
                             permissions,

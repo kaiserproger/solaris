@@ -523,11 +523,14 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 ),
             );
         let entity_goals_us = elapsed_us(started);
+        simulation_owner.tick_animal_temptation(&entity_sessions, &entity_config.tags);
         let started = Instant::now();
-        simulation_owner.tick_hostile_attacks(
+        simulation_owner.tick_hostile_attacks_with_world_sight(
             &entity_sessions,
             tick,
             play::air_state_id(&entity_config.blocks),
+            entity_world_read.as_ref(),
+            entity_config.blocks.as_ref(),
         );
         let hostile_attacks_us = elapsed_us(started);
         if tick.is_multiple_of(u64::from(ANIMAL_BREEDING_TICK_INTERVAL_TICKS)) {

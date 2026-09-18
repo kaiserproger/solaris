@@ -1245,6 +1245,40 @@ impl Packet for ClientboundBlockEntityData {
     }
 }
 
+/// `ClientboundBlockEventPacket` (CB), used by containers to synchronize lid
+/// animation state without changing the block state itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundBlockEvent {
+    pub position: i64,
+    pub action: u8,
+    pub parameter: u8,
+    pub block_type: i32,
+}
+
+impl Packet for ClientboundBlockEvent {
+    // The cached 26.1.2 packet report assigns minecraft:block_event game-CB
+    // id 0x07. Local javap of ClientboundBlockEventPacket.write confirms:
+    // BlockPos, byte b0, byte b1, then BLOCK registry VarInt.
+    const ID: i32 = 0x07;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(self.position);
+        buf.write_u8(self.action);
+        buf.write_u8(self.parameter);
+        buf.write_varint(self.block_type);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            position: buf.read_i64()?,
+            action: buf.read_u8()?,
+            parameter: buf.read_u8()?,
+            block_type: buf.read_varint()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientboundOpenSignEditor {
     pub position: i64,

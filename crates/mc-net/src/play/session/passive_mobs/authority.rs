@@ -471,6 +471,97 @@ impl SessionRegistry {
         (birth_count, dispatches)
     }
 
+    /// Assign live passive animals to the nearest active player holding their
+    /// tagged food. Courtship owns animals already in love; every other active
+    /// cow, sheep or chicken returns to normal wandering when no food remains.
+    pub(in crate::play) fn tick_animal_temptation(&self, tags: &mc_data::tags::TagsData) -> usize {
+        let active_entity_ids = self.simulation_inputs.active_entity_candidates().1;
+        if active_entity_ids.is_empty() {
+            return 0;
+        }
+        let player_states = {
+            let inner = self.lock_inner("snapshot animal temptation players");
+            inner
+                .sessions
+                .iter()
+                .filter_map(|(id, session)| {
+                    inner.player_persistence.get(id).map(|state| {
+                        (
+                            Vec3::new(session.pose.x, session.pose.y, session.pose.z),
+                            state.clone(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut food_holders = Vec::with_capacity(player_states.len() * 2);
+        for (position, state) in player_states {
+            let state =
+                crate::lock_policy::lock_authoritative_mutex(&state, "play.player_persistence");
+            if state.game_mode == GameMode::Spectator || state.survival.is_dead() {
+                continue;
+            }
+            for slot in [
+                PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot),
+                PlayerInventory::OFFHAND_SLOT,
+            ] {
+                let held = &state.inventory.slots[slot];
+                let targets =
+                    crate::play::simulation::AnimalFeedTargets::from_tags(tags, held.item_id);
+                if !held.is_empty() && !targets.is_empty() {
+                    food_holders.push((position, targets));
+                }
+            }
+        }
+        let mut entities = self.lock_entities("plan animal temptation");
+        let mut updates = Vec::new();
+        entities.visit_simulation_entities_for_ids(&active_entity_ids, |entity| {
+            let Some(animal) = entity.animal else {
+                return;
+            };
+            if entity.lifecycle != EntityLifecycle::Alive
+                || animal.love_ticks != 0
+                || !matches!(
+                    entity.goal,
+                    GoalState::Wander { .. } | GoalState::FollowPosition { .. }
+                )
+            {
+                return;
+            }
+            let target = food_holders
+                .iter()
+                .filter(|(_, targets)| targets.accepts(entity.type_name))
+                .filter_map(|(position, _)| {
+                    let dx = position.x - entity.position.x;
+                    let dy = position.y - entity.position.y;
+                    let dz = position.z - entity.position.z;
+                    let distance_sq = dx.mul_add(dx, dy.mul_add(dy, dz * dz));
+                    (distance_sq <= 100.0).then_some((distance_sq, *position))
+                })
+                .min_by(|left, right| left.0.total_cmp(&right.0))
+                .map(|(_, position)| position);
+            let speed = entity
+                .attributes
+                .base(&mc_entity::AttributeKind::MovementSpeed)
+                .unwrap_or(0.2)
+                * 10.0;
+            let next = match target {
+                Some(target) => GoalState::FollowPosition { target, speed },
+                None => GoalState::Wander {
+                    speed,
+                    period_ticks: 80,
+                },
+            };
+            if *entity.goal != next {
+                updates.push((entity.id, next));
+            }
+        });
+        let count = updates.len();
+        let applied = entities.set_goals_deferred_journal(updates);
+        debug_assert_eq!(applied, count);
+        applied
+    }
+
     pub(in crate::play) fn plan_sheep_grazing(
         &self,
         _authority: &SimulationAuthority,

@@ -46,7 +46,11 @@ tempfile = "3"
 flate2 = { workspace = true }
 mc-entity = { path = "../mc-entity" }
 mc-net = { path = "../mc-net", features = ["load-bench"] }
-mc-script = { path = "../mc-script", features = ["lua-runtime"] }
+mc-plugin-host = { path = "../mc-plugin-host" }
+mc-script = { path = "../mc-script" }
 mc-world = { path = "../mc-world" }
 mc-worldgen = { path = "../mc-worldgen" }
 toml = { workspace = true }
+# `tests/wasm_storage_compat.rs` includes the component fixture source the host
+# tests share, and that fixture encodes the real guest module with `wit-component`.
+wit-component = "0.259"

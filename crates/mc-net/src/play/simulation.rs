@@ -31,6 +31,7 @@ use super::owned_inventory::{
 use super::persistence::PersistedEntityCheckpoint;
 #[cfg(test)]
 use super::session::EntityKillRewards;
+use super::session::resident_orders::{ResidentAttack, ResidentHit};
 use super::session::{
     BucketUseTransaction, CampfireUseTransaction, ChestTransaction, ChestTransactionRequest,
     ContainerCommitContext, ContainerStateCommitError, CreditedArrowPickup,
@@ -45,15 +46,15 @@ use super::{
     AppliedBlockEdit, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition,
     BlockMutationSnapshot, CAMPFIRE_BLOCK_ENTITY_TYPE_ID, CampfireCookingState, ChestCommitOutcome,
     ChestView, ContainerDropPlan, ContainerPlayerPlan, ContainerXpPlan, FurnaceCommitOutcome,
-    GameMode, PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose,
-    SharedContainerCommit, SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
-    chest_menu_state_change_count, chest_slot_stacks, furnace_output_was_taken,
-    furnace_slot_stacks, is_campfire_block, schedule_fluid_ticks_near_applied,
-    schedule_leaf_ticks_near_applied,
+    GameMode, MAX_BLOCK_EDIT_COMMAND_EDITS, PendingCampfireOutput, PlayerInventoryCommitOutcome,
+    PlayerPose, SharedContainerCommit, SurvivalState, WorldHandle, air_state_id,
+    block_edit_changes_light, chest_menu_state_change_count, chest_slot_stacks,
+    furnace_output_was_taken, furnace_slot_stacks, is_campfire_block,
+    schedule_fluid_ticks_near_applied, schedule_leaf_ticks_near_applied,
 };
-use mc_data::ItemStack;
 use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
+use mc_data::{Identifier, ItemStack, tags::TagsData};
 use mc_entity::runtime_26_1_2::TargetKind;
 use mc_entity::villager_population_26_1_2::VillagerFoodItemIds;
 use mc_entity::{
@@ -92,8 +93,13 @@ mod regional_mutation;
 mod request_wait;
 mod save_barrier;
 
+/// The native owner's side of the pre-commit hooks: the questions a build asks
+/// and the one ticket it spends at the commit.
+pub(in crate::play) mod precommit;
+
 #[allow(unused_imports)]
 pub(crate) use queue::SIMULATION_COMMAND_QUEUE_CAPACITY;
+pub(in crate::play) use queue::SimulationResponseSender;
 #[cfg(test)]
 pub(crate) use queue::simulation_channel;
 #[cfg(test)]
@@ -107,7 +113,6 @@ pub(crate) type SimulationQueueSnapshot = queue::SimulationQueueSnapshot;
 
 const MAX_SURVIVAL_BREAK_EDITS: usize = 512;
 const MAX_SURVIVAL_BREAK_DROPS: usize = 512;
-const MAX_BLOCK_EDIT_COMMAND_EDITS: usize = 512;
 const SIMULATION_QUEUE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
 const SIMULATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -201,6 +206,10 @@ pub(crate) enum SimulationRequestError {
     WorldMutationFailed,
     CrossRegion,
     InvalidCommand,
+    /// A before-build or before-damage chain refused the frozen effect.  Preserve
+    /// the native reason so callers can treat cancellation, expiry and stale
+    /// tickets as terminal refusals rather than retrying a gameplay action.
+    Precommit(mc_script::precommit::HookFailure),
     StaleSession,
     PlayerMovementRejected(PlayerMovementRejection),
 }
@@ -389,6 +398,17 @@ pub(super) enum SimulationCommand {
         attacker_costs: Option<Box<PlayerSurvivalPlan>>,
         cooldown_tick: u64,
     },
+    /// A detached before-damage completion.  The target owner validates and
+    /// consumes its frozen ticket; this command never waits on guest code.
+    ResumePlayerDamagePrecommit(Box<super::session::damage_precommit::PlayerDamagePrecommitResume>),
+    ResumeEntityDamagePrecommit(Box<super::session::damage_precommit::EntityDamagePrecommitResume>),
+    /// The owner derives the exact break batch under its current world fence,
+    /// then resolves before-build off the owner turn and resumes that batch.
+    BeginPrecommitSurvivalBreak(Box<HookedSurvivalBreakCommand>),
+    BeginPrecommitSurvivalPlacement(Box<HookedSurvivalPlacementCommand>),
+    BeginPrecommitBucketUse(Box<HookedBucketUseCommand>),
+    PrecommitSurvivalPlacementFailure(mc_script::precommit::HookFailure),
+    PrecommitBucketUseFailure(mc_script::precommit::HookFailure),
     ApplyServerEntityEffect(Box<ServerEntityEffectCommand>),
     #[cfg(test)]
     AttackServerEntity {
@@ -405,6 +425,11 @@ pub(super) enum SimulationCommand {
     DamageScriptEntity {
         entity_id: EntityId,
         damage: f32,
+        plugin_id: String,
+    },
+    DamageResidentEntity {
+        attack: Box<ResidentAttack>,
+        plugin_id: String,
     },
     SetWorldTime {
         world_time: u64,
@@ -419,10 +444,24 @@ pub(super) enum SimulationCommand {
         spawns: Vec<SettlementInhabitantSpawn>,
     },
     ApplyBlockEdits {
+        /// A current protection-image fence for a server-owned programmatic
+        /// build.  Player paths carry their own permission checks; a changed
+        /// image refuses before the approval or world mutation is consumed.
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
         actor_session: Option<SessionId>,
         edits: Vec<BlockEdit>,
         preconditions: Vec<BlockEditPrecondition>,
         scheduled_block_ticks: Vec<ScheduledBlockTick>,
+        /// Whether this batch schedules neighbouring leaf decay after an
+        /// applied edit. Resident crop and ore breaks leave this false.
+        leaf_trigger: bool,
+        /// The chain's ticket for this batch, spent by the owner before it
+        /// applies anything. `None` is every batch committed without a
+        /// registered `before-build` handler.
+        hook_approval: Option<mc_script::precommit::Approval>,
+        /// The encoded plugin receipt a server-owned structure portion journals
+        /// beside its block after-images. Ordinary block edits carry none.
+        plugin_receipt: Option<Vec<u8>>,
     },
     CommitBlockDrops {
         actor_session: SessionId,
@@ -514,11 +553,19 @@ impl SimulationCommand {
             Self::ClaimExperiencePickup { .. } => "claim_experience_pickup",
             Self::PickupArrowIntoInventory { .. } => "pickup_arrow_into_inventory",
             Self::PlayerAttackServerEntity { .. } => "player_attack_server_entity",
+            Self::ResumePlayerDamagePrecommit(_) => "resume_player_damage_precommit",
+            Self::ResumeEntityDamagePrecommit(_) => "resume_entity_damage_precommit",
+            Self::BeginPrecommitSurvivalBreak(_) => "begin_precommit_survival_break",
             Self::ApplyServerEntityEffect(_) => "apply_server_entity_effect",
+            Self::BeginPrecommitSurvivalPlacement(_) => "begin_precommit_survival_placement",
+            Self::BeginPrecommitBucketUse(_) => "begin_precommit_bucket_use",
+            Self::PrecommitSurvivalPlacementFailure(_) => "precommit_survival_placement_failure",
+            Self::PrecommitBucketUseFailure(_) => "precommit_bucket_use_failure",
             #[cfg(test)]
             Self::AttackServerEntity { .. } => "attack_server_entity",
             Self::SpawnCommandEntity { .. } => "spawn_command_entity",
             Self::DamageScriptEntity { .. } => "damage_script_entity",
+            Self::DamageResidentEntity { .. } => "damage_resident_entity",
             Self::SetWorldTime { .. } => "set_world_time",
             #[cfg(test)]
             Self::EnsureChunkHerd { .. } => "ensure_chunk_herd",
@@ -598,7 +645,7 @@ fn regular_player_pose_command(command: &SimulationCommand) -> Option<PlayerPose
 }
 
 #[derive(Debug)]
-pub(super) enum SimulationResponse {
+pub(in crate::play) enum SimulationResponse {
     SaveSnapshot(Result<Box<SimulationSaveSnapshot>, SimulationRequestError>),
     BlockSnapshot(Result<Option<BlockMutationSnapshot>, SimulationRequestError>),
     ChestSnapshot(Result<Box<ChestReadSnapshot>, SimulationRequestError>),
@@ -610,12 +657,18 @@ pub(super) enum SimulationResponse {
     ArrowPickupCredit(Option<Box<CreditedArrowPickup>>),
     PlayerAttack(PlayerAttackResult),
     EntityEffect(EntityEffectResult),
+    /// A detached precommit continuation applied its own publications.
+    DamagePrecommit,
     #[cfg(test)]
     EntityAttack(Option<Box<EntityAttackOutcome>>),
+    ResidentDamage(Option<ResidentHit>),
     EntitySpawn(Vec<VisibilityDispatch>),
     ScriptEntityDamage(Option<ScriptEntityDamageCommit>),
     WorldTimeSet,
     BlockEdits(Result<Box<Option<BlockEditBatchOutcome>>, SimulationRequestError>),
+    /// A server-owned structure portion whose world after-images and plugin
+    /// receipt were accepted in one world-journal decision.
+    SettlementPortion(Result<Option<u64>, SimulationRequestError>),
     BlockDrops(Result<Box<Option<BlockEditBatchOutcome>>, SimulationRequestError>),
     FluidTicksScheduled,
     SurvivalBreak(Result<Option<Box<CommittedSurvivalBreak>>, SimulationRequestError>),
@@ -799,7 +852,10 @@ fn command_requires_world(command: &SimulationCommand) -> bool {
             | SimulationCommand::CommitBlockDrops { .. }
             | SimulationCommand::ScheduleFluidTicksNearApplied { .. }
             | SimulationCommand::CommitSurvivalBreak(_)
+            | SimulationCommand::BeginPrecommitSurvivalBreak(_)
             | SimulationCommand::CommitSurvivalPlacement(_)
+            | SimulationCommand::BeginPrecommitSurvivalPlacement(_)
+            | SimulationCommand::BeginPrecommitBucketUse(_)
             | SimulationCommand::CommitBucketUse(_)
             | SimulationCommand::CommitChest { .. }
             | SimulationCommand::CommitFurnace { .. }
@@ -817,7 +873,10 @@ fn command_requires_world(command: &SimulationCommand) -> bool {
 fn command_needs_world_journal(command: &SimulationCommand) -> bool {
     matches!(
         command,
-        SimulationCommand::CommitChest {
+        SimulationCommand::ApplyBlockEdits {
+            plugin_receipt: Some(_),
+            ..
+        } | SimulationCommand::CommitChest {
             plugin_receipt: Some(_),
             ..
         }
@@ -919,12 +978,32 @@ fn command_single_owner_region(command: &SimulationCommand) -> Option<RegionKey>
                 ),
             ),
             SurvivalBreakRequest::Block(plan) => Box::new(std::iter::once(plan.position)),
+            SurvivalBreakRequest::PrecommitFailure(_) => return None,
         };
         let first = positions.next()?;
         let owner = RegionKey::from_chunk(first.x.div_euclid(16), first.z.div_euclid(16));
         return positions
             .all(|pos| RegionKey::from_chunk(pos.x.div_euclid(16), pos.z.div_euclid(16)) == owner)
             .then_some(owner);
+    }
+    if let SimulationCommand::BeginPrecommitSurvivalBreak(command) = command {
+        return Some(RegionKey::from_chunk(
+            command.plan.position.x.div_euclid(16),
+            command.plan.position.z.div_euclid(16),
+        ));
+    }
+    if let SimulationCommand::BeginPrecommitSurvivalPlacement(command) = command {
+        let position = command.plan.edits.first()?.pos;
+        return Some(RegionKey::from_chunk(
+            position.x.div_euclid(16),
+            position.z.div_euclid(16),
+        ));
+    }
+    if let SimulationCommand::BeginPrecommitBucketUse(command) = command {
+        return Some(RegionKey::from_chunk(
+            command.plan.edit.pos.x.div_euclid(16),
+            command.plan.edit.pos.z.div_euclid(16),
+        ));
     }
     if let SimulationCommand::CommitBucketUse(command) = command {
         return Some(RegionKey::from_chunk(
@@ -1009,16 +1088,22 @@ fn command_can_use_resident_mutation(
         edits,
         preconditions,
         scheduled_block_ticks,
+        zone_fence,
+        hook_approval,
+        plugin_receipt,
         ..
     } = command
     else {
         return false;
     };
-    // A server-owned batch has no writer session, so it never runs the writer's
-    // `finalize_visible_block_edit_outcome` pass that clears the cooking state
-    // of a campfire it replaced. Keep every such batch on the canonical staged
-    // path, which owns that eviction, instead of a session fast lane.
-    if actor_session.is_none() {
+    let journaled_server_portion = actor_session.is_none() && plugin_receipt.is_some();
+    // Ordinary server-owned batches stay on the canonical path because only it
+    // owns their campfire eviction. A receipt-bearing construction portion is
+    // different: its regional worker rechecks its zone fence and spends its
+    // build approval immediately before appending the shared world decision.
+    if !journaled_server_portion
+        && (actor_session.is_none() || zone_fence.is_some() || hook_approval.is_some())
+    {
         return false;
     }
     let Some(world_read) = world_read else {
@@ -1041,10 +1126,9 @@ fn command_can_use_resident_mutation(
     }
     let mut seen = HashSet::with_capacity(edits.len());
     for edit in edits {
-        if !seen.insert(edit.pos)
-            || matches!(edit.pos.x.rem_euclid(8 * 16), 0 | 127)
-            || matches!(edit.pos.z.rem_euclid(8 * 16), 0 | 127)
-        {
+        let at_regional_edge = matches!(edit.pos.x.rem_euclid(8 * 16), 0 | 127)
+            || matches!(edit.pos.z.rem_euclid(8 * 16), 0 | 127);
+        if !seen.insert(edit.pos) || (!journaled_server_portion && at_regional_edge) {
             return false;
         }
         if light_inert_only && let Some(table) = block_light {
@@ -1102,6 +1186,7 @@ fn command_can_use_regional_mutation(
         let valid = match &break_command.request {
             SurvivalBreakRequest::Prepared(plan) => valid_survival_break_plan(plan),
             SurvivalBreakRequest::Block(plan) => valid_survival_block_break_plan(plan),
+            SurvivalBreakRequest::PrecommitFailure(_) => false,
         };
         let Some(region) = command_single_owner_region(command) else {
             return false;
@@ -1109,6 +1194,7 @@ fn command_can_use_regional_mutation(
         let root = match &break_command.request {
             SurvivalBreakRequest::Prepared(plan) => plan.edits.first().map(|edit| edit.pos),
             SurvivalBreakRequest::Block(plan) => Some(plan.position),
+            SurvivalBreakRequest::PrecommitFailure(_) => None,
         };
         return valid
             && root.is_some_and(|position| {
@@ -1465,6 +1551,11 @@ pub(super) struct SurvivalBlockBreakPlan {
     pub(super) loader_block_drop: Option<ItemStack>,
     pub(super) held: SurvivalBreakHeldItem,
     pub(super) drop_items: bool,
+    /// The chain's ticket for this edit, spent at the commit. `None` is the
+    /// ordinary path: this deployment registers no `before-build` handler.
+    pub(super) hook_approval: Option<mc_script::precommit::Approval>,
+    /// The player-zone definition image that admitted this break.
+    pub(super) zone_fence: Option<crate::script::ZoneProtectionFence>,
 }
 
 impl std::fmt::Debug for SurvivalBlockBreakPlan {
@@ -1495,6 +1586,10 @@ pub(super) struct SurvivalBreakPlan {
     pub(super) falling_block_entity_type_id: Option<i32>,
     pub(super) held: SurvivalBreakHeldItem,
     pub(super) drops: Vec<SurvivalBreakDrop>,
+    /// The player-zone definition image carried from the original break request.
+    pub(super) zone_fence: Option<crate::script::ZoneProtectionFence>,
+    /// The chain's ticket for this batch, spent at the commit.
+    pub(super) hook_approval: Option<mc_script::precommit::Approval>,
 }
 
 impl std::fmt::Debug for SurvivalBreakPlan {
@@ -1519,10 +1614,44 @@ pub(super) struct SurvivalBreakCommand {
     request: SurvivalBreakRequest,
 }
 
+pub(super) struct HookedSurvivalBreakCommand {
+    actor_session: SessionId,
+    plan: SurvivalBlockBreakPlan,
+    boundary: mc_script::ScriptBoundary,
+    resume_handle: SimulationHandle,
+}
+
+impl std::fmt::Debug for HookedSurvivalBreakCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HookedSurvivalBreakCommand")
+            .field("actor_session", &self.actor_session)
+            .field("plan", &self.plan)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct HookedSurvivalPlacementCommand {
+    actor_session: SessionId,
+    plan: SurvivalPlacementPlan,
+    boundary: mc_script::ScriptBoundary,
+    resume_handle: SimulationHandle,
+}
+
+#[derive(Debug)]
+pub(super) struct HookedBucketUseCommand {
+    actor_session: SessionId,
+    plan: BucketUsePlan,
+    boundary: mc_script::ScriptBoundary,
+    resume_handle: SimulationHandle,
+}
+
 #[derive(Debug, Clone)]
 enum SurvivalBreakRequest {
     Prepared(SurvivalBreakPlan),
     Block(SurvivalBlockBreakPlan),
+    PrecommitFailure(mc_script::precommit::HookFailure),
 }
 
 #[derive(Debug)]
@@ -1631,6 +1760,11 @@ pub(super) struct SurvivalPlacementPlan {
     pub(super) block_facts: Arc<mc_data::block_facts::BlockFactsTable>,
     pub(super) held: SurvivalPlacementHeldItem,
     pub(super) expected_game_mode: GameMode,
+    /// The chain's ticket for this placement, spent at the commit. `None` is the
+    /// ordinary path: this deployment registers no `before-build` handler.
+    pub(super) hook_approval: Option<mc_script::precommit::Approval>,
+    /// The player-zone definition image that admitted this placement.
+    pub(super) zone_fence: Option<crate::script::ZoneProtectionFence>,
 }
 
 pub(super) fn placement_inventory_debit(
@@ -1688,6 +1822,10 @@ pub(super) struct BucketUsePlan {
     pub(super) block_facts: Arc<mc_data::block_facts::BlockFactsTable>,
     pub(super) inventory: Option<BucketInventoryChange>,
     pub(super) schedule_fluid_ticks: bool,
+    /// The chain's ticket for this edit, spent at the commit.
+    pub(super) hook_approval: Option<mc_script::precommit::Approval>,
+    /// The player-zone definition image that admitted this bucket edit.
+    pub(super) zone_fence: Option<crate::script::ZoneProtectionFence>,
 }
 
 impl std::fmt::Debug for BucketUsePlan {
@@ -1765,6 +1903,28 @@ impl AnimalFeedTargets {
             "minecraft:sheep" => self.sheep,
             "minecraft:chicken" => self.chicken,
             _ => false,
+        }
+    }
+
+    /// Resolve the vanilla food tags shared by interaction and temptation.
+    pub(super) fn from_tags(tags: &TagsData, item_id: u32) -> Self {
+        let Ok(item_id) = i32::try_from(item_id) else {
+            return Self::default();
+        };
+        let item_registry = Identifier::parse("minecraft:item").expect("static item registry id");
+        let Some(item_tags) = tags.registries.get(&item_registry) else {
+            return Self::default();
+        };
+        let contains = |tag_name: &str| {
+            Identifier::parse(tag_name)
+                .ok()
+                .and_then(|tag| item_tags.get(&tag))
+                .is_some_and(|entries| entries.contains(&item_id))
+        };
+        Self {
+            cow: contains("minecraft:cow_food"),
+            sheep: contains("minecraft:sheep_food"),
+            chicken: contains("minecraft:chicken_food"),
         }
     }
 }
@@ -1901,6 +2061,10 @@ pub(super) struct PlayerSurvivalPlan {
     pub(super) xp_orb_entity_type_id: Option<i32>,
     pub(super) keep_inventory: bool,
     pub(super) position: Vec3,
+    /// The chain's ticket for the effect this plan commits. Damage owners set it
+    /// when a `before-damage` handler is registered and every other plan uses
+    /// `None`, which is the ordinary path.
+    pub(super) hook_approval: Option<mc_script::precommit::Approval>,
 }
 
 #[derive(Debug, Clone)]
@@ -1918,14 +2082,14 @@ pub(super) struct AuthoritativePlayerStateSnapshot {
 
 #[derive(Debug)]
 pub(super) enum PlayerSurvivalCommitOutcome {
-    Committed(CommittedPlayerSurvival),
-    Rejected(AuthoritativePlayerStateSnapshot),
+    Committed(Box<CommittedPlayerSurvival>),
+    Rejected(Box<AuthoritativePlayerStateSnapshot>),
 }
 
 #[derive(Debug)]
 pub(super) struct PlayerSurvivalCommand {
     actor_session: SessionId,
-    plan: PlayerSurvivalPlan,
+    plan: Box<PlayerSurvivalPlan>,
 }
 
 #[derive(Debug)]
@@ -1985,10 +2149,9 @@ pub(super) struct CommittedSelectedItemDrop {
     pub(super) changed_slots: Vec<(usize, ItemStack)>,
     pub(super) dispatches: Vec<VisibilityDispatch>,
 }
-
 type SimulationOutcome = Result<SimulationResponse, SimulationRequestError>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ServerEntityEffectCommand {
     entity_id: EntityId,
     expected: Option<Box<EntitySnapshot>>,
@@ -2038,6 +2201,7 @@ impl From<SimulationRequestError> for EntityEffectRequestError {
             | SimulationRequestError::WorldMutationFailed
             | SimulationRequestError::CrossRegion
             | SimulationRequestError::InvalidCommand
+            | SimulationRequestError::Precommit(_)
             | SimulationRequestError::StaleSession
             | SimulationRequestError::PlayerMovementRejected(_) => Self::Unavailable,
             #[cfg(test)]
@@ -2051,6 +2215,11 @@ pub(crate) struct SimulationHandle {
     sender: mpsc::Sender<SimulationCommandEnvelope>,
     metrics: Arc<SimulationQueueMetrics>,
     session_fence: Option<SessionId>,
+    /// The build chain this world asks before it commits, shared by every clone
+    /// of one handle: installed once from the deployment's own boundary, so a
+    /// programmatic or settlement build asks the same chain a player's build
+    /// does instead of having a path of its own around it.
+    precommit_boundary: Arc<std::sync::OnceLock<mc_script::ScriptBoundary>>,
 }
 
 impl SimulationHandle {
@@ -2098,14 +2267,14 @@ impl SimulationHandle {
             Err(_) => Err(SimulationRequestError::OwnerStopped),
         }
     }
-
     pub(super) async fn read_block_snapshot(
         &self,
         position: BlockPos,
     ) -> Result<Option<BlockMutationSnapshot>, SimulationRequestError> {
-        let receiver = self
-            .enqueue_player_command_wait(SimulationCommand::ReadBlockSnapshot { position })
-            .await?;
+        let receiver = self.enqueue_with_fence(
+            self.session_fence,
+            SimulationCommand::ReadBlockSnapshot { position },
+        )?;
         match receiver.await {
             Ok(Ok(SimulationResponse::BlockSnapshot(result))) => result,
             Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
@@ -2335,13 +2504,22 @@ impl SimulationHandle {
         &self,
         entity_id: EntityId,
         damage: f32,
+        plugin_id: &str,
     ) -> Result<Option<ScriptEntityDamageCommit>, SimulationRequestError> {
-        if self.session_fence.is_some() || !damage.is_finite() || damage <= 0.0 {
+        if self.session_fence.is_some()
+            || !damage.is_finite()
+            || damage <= 0.0
+            || plugin_id.is_empty()
+        {
             return Err(SimulationRequestError::InvalidCommand);
         }
         let receiver = self.enqueue_with_fence(
             None,
-            SimulationCommand::DamageScriptEntity { entity_id, damage },
+            SimulationCommand::DamageScriptEntity {
+                entity_id,
+                damage,
+                plugin_id: plugin_id.to_owned(),
+            },
         )?;
         match receiver.await {
             Ok(Ok(SimulationResponse::ScriptEntityDamage(result))) => Ok(result),
@@ -2351,6 +2529,28 @@ impl SimulationHandle {
         }
     }
 
+    pub(crate) async fn damage_resident_entity(
+        &self,
+        plugin_id: &str,
+        attack: ResidentAttack,
+    ) -> Result<Option<ResidentHit>, SimulationRequestError> {
+        if self.session_fence.is_some() || plugin_id.is_empty() {
+            return Err(SimulationRequestError::InvalidCommand);
+        }
+        let receiver = self.enqueue_with_fence(
+            None,
+            SimulationCommand::DamageResidentEntity {
+                attack: Box::new(attack),
+                plugin_id: plugin_id.to_owned(),
+            },
+        )?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::ResidentDamage(result))) => Ok(result),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
     #[cfg(test)]
     pub(super) async fn apply_block_edits(
         &self,
@@ -2367,13 +2567,19 @@ impl SimulationHandle {
         preconditions: Vec<BlockEditPrecondition>,
         scheduled_block_ticks: Vec<ScheduledBlockTick>,
     ) -> Result<Option<BlockEditBatchOutcome>, SimulationRequestError> {
-        let actor_session = self.session_id()?;
-        let receiver = self.enqueue_player_command(SimulationCommand::ApplyBlockEdits {
-            actor_session: Some(actor_session),
-            edits,
-            preconditions,
-            scheduled_block_ticks,
-        })?;
+        let receiver = self.enqueue_with_fence(
+            self.session_fence,
+            SimulationCommand::ApplyBlockEdits {
+                actor_session: self.session_fence,
+                edits,
+                preconditions,
+                scheduled_block_ticks,
+                leaf_trigger: true,
+                hook_approval: None,
+                plugin_receipt: None,
+                zone_fence: None,
+            },
+        )?;
         match receiver.await {
             Ok(Ok(SimulationResponse::BlockEdits(Ok(outcome)))) => Ok(*outcome),
             Ok(Ok(SimulationResponse::BlockEdits(Err(error)))) => Err(error),
@@ -2386,62 +2592,160 @@ impl SimulationHandle {
     /// Commit one server-owned block-edit batch (settlement structure
     /// placement) through the authoritative simulation pipeline.
     ///
-    /// The whole batch is submitted as exactly one
-    /// [`SimulationCommand::ApplyBlockEdits`] with no actor session, no
-    /// preconditions and no scheduled ticks, so a portion is never split by
-    /// region: multi-region batches stay one staged commit and one publication.
+    /// If a build chain is active, capture every authoritative precondition
+    /// before asking it and conditionally commit that exact image afterwards.
     pub(crate) async fn apply_server_owned_block_edits(
         &self,
+        plugin_id: &str,
         edits: Vec<BlockEdit>,
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
     ) -> Result<Option<BlockEditBatchOutcome>, SimulationRequestError> {
+        match self
+            .submit_server_owned_block_edits(plugin_id, edits, None, true, zone_fence, None)
+            .await?
+        {
+            SimulationResponse::BlockEdits(Ok(outcome)) => Ok(*outcome),
+            SimulationResponse::BlockEdits(Err(error)) => Err(error),
+            _ => Err(SimulationRequestError::ResponseMismatch),
+        }
+    }
+
+    /// Commit one server-owned block batch and plugin receipt under one
+    /// world-journal decision. The owner captures the exact source image before
+    /// admission.
+    pub(crate) async fn commit_server_owned_block_edits(
+        &self,
+        plugin_id: &str,
+        edits: Vec<BlockEdit>,
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
+        receipt: Vec<u8>,
+    ) -> Result<Option<u64>, SimulationRequestError> {
+        self.commit_server_owned_block_edits_with_preconditions(
+            plugin_id, edits, None, true, zone_fence, receipt,
+        )
+        .await
+    }
+
+    /// Commit a server-owned block batch against source images the caller
+    /// previewed. This keeps the world mutation attached to that previewed loot,
+    /// rather than recapturing a replacement block as a new harvest.
+    pub(crate) async fn commit_server_owned_block_edits_with_preconditions(
+        &self,
+        plugin_id: &str,
+        edits: Vec<BlockEdit>,
+        preconditions: Option<Vec<BlockEditPrecondition>>,
+        leaf_trigger: bool,
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
+        receipt: Vec<u8>,
+    ) -> Result<Option<u64>, SimulationRequestError> {
+        match self
+            .submit_server_owned_block_edits(
+                plugin_id,
+                edits,
+                preconditions,
+                leaf_trigger,
+                zone_fence,
+                Some(receipt),
+            )
+            .await?
+        {
+            SimulationResponse::SettlementPortion(outcome) => outcome,
+            _ => Err(SimulationRequestError::ResponseMismatch),
+        }
+    }
+
+    async fn submit_server_owned_block_edits(
+        &self,
+        plugin_id: &str,
+        edits: Vec<BlockEdit>,
+        expected_preconditions: Option<Vec<BlockEditPrecondition>>,
+        leaf_trigger: bool,
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
+        plugin_receipt: Option<Vec<u8>>,
+    ) -> Result<SimulationResponse, SimulationRequestError> {
         if self.session_fence.is_some() {
             return Err(SimulationRequestError::InvalidCommand);
         }
+        let has_build_hooks = self.precommit_boundary().is_some_and(|boundary| {
+            boundary.has_precommit_hooks(mc_script::precommit::HookKind::Build)
+        });
+        let (preconditions, hook_approval) = if plugin_receipt.is_some() || has_build_hooks {
+            let preconditions = match expected_preconditions {
+                Some(preconditions) => preconditions,
+                None => self.server_owned_block_preconditions(&edits).await?,
+            };
+            let approval = if has_build_hooks {
+                self.request_build_hook(
+                    mc_script::precommit::HookActor::Plugin(plugin_id.to_owned()),
+                    &edits,
+                    &preconditions,
+                )
+                .await
+                .map_err(SimulationRequestError::Precommit)?
+            } else {
+                None
+            };
+            (preconditions, approval)
+        } else {
+            (Vec::new(), None)
+        };
         let receiver = self.enqueue_with_fence(
             None,
             SimulationCommand::ApplyBlockEdits {
                 actor_session: None,
                 edits,
-                preconditions: Vec::new(),
+                preconditions,
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger,
+                hook_approval,
+                zone_fence,
+                plugin_receipt,
             },
         )?;
         match receiver.await {
-            Ok(Ok(SimulationResponse::BlockEdits(Ok(outcome)))) => Ok(*outcome),
-            Ok(Ok(SimulationResponse::BlockEdits(Err(error)))) => Err(error),
-            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Ok(response)) => Ok(response),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(SimulationRequestError::OwnerStopped),
         }
     }
 
+    async fn server_owned_block_preconditions(
+        &self,
+        edits: &[BlockEdit],
+    ) -> Result<Vec<BlockEditPrecondition>, SimulationRequestError> {
+        let mut preconditions = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let Some(snapshot) = self.read_block_snapshot(edit.pos).await? else {
+                return Err(SimulationRequestError::Precommit(
+                    mc_script::precommit::HookFailure::Stale,
+                ));
+            };
+            preconditions.push(BlockEditPrecondition {
+                pos: edit.pos,
+                expected_state: snapshot.state,
+                expected_token: snapshot.token,
+            });
+        }
+        Ok(preconditions)
+    }
+
     pub(crate) async fn place_loader_block_server_owned(
         &self,
+        plugin_id: &str,
         position: BlockPos,
         state: BlockStateId,
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
     ) -> Result<bool, SimulationRequestError> {
-        if self.session_fence.is_some() {
-            return Err(SimulationRequestError::InvalidCommand);
-        }
-        let receiver = self.enqueue_with_fence(
-            None,
-            SimulationCommand::ApplyBlockEdits {
-                actor_session: None,
-                edits: vec![BlockEdit {
-                    pos: position,
-                    new_state: state,
-                }],
-                preconditions: Vec::new(),
-                scheduled_block_ticks: Vec::new(),
-            },
-        )?;
-        match receiver.await {
-            Ok(Ok(SimulationResponse::BlockEdits(Ok(outcome)))) => Ok(outcome.is_some()),
-            Ok(Ok(SimulationResponse::BlockEdits(Err(error)))) => Err(error),
-            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(SimulationRequestError::OwnerStopped),
-        }
+        self.apply_server_owned_block_edits(
+            plugin_id,
+            vec![BlockEdit {
+                pos: position,
+                new_state: state,
+            }],
+            zone_fence,
+        )
+        .await
+        .map(|outcome| outcome.is_some())
     }
 
     pub(super) async fn commit_block_drops(
@@ -2533,12 +2837,23 @@ impl SimulationHandle {
         plan: SurvivalBlockBreakPlan,
     ) -> Result<Option<CommittedSurvivalBreak>, SimulationRequestError> {
         let actor_session = self.session_id()?;
-        let receiver = self.enqueue_player_command(SimulationCommand::CommitSurvivalBreak(
-            Box::new(SurvivalBreakCommand {
+        let command = if let Some(boundary) = self
+            .precommit_boundary()
+            .filter(|boundary| boundary.has_precommit_hooks(mc_script::precommit::HookKind::Build))
+        {
+            SimulationCommand::BeginPrecommitSurvivalBreak(Box::new(HookedSurvivalBreakCommand {
+                actor_session,
+                plan,
+                boundary: boundary.clone(),
+                resume_handle: self.clone(),
+            }))
+        } else {
+            SimulationCommand::CommitSurvivalBreak(Box::new(SurvivalBreakCommand {
                 actor_session,
                 request: SurvivalBreakRequest::Block(plan),
-            }),
-        ))?;
+            }))
+        };
+        let receiver = self.enqueue_player_command(command)?;
         match receiver.await {
             Ok(Ok(SimulationResponse::SurvivalBreak(Ok(committed)))) => {
                 Ok(committed.map(|committed| *committed))
@@ -2555,12 +2870,25 @@ impl SimulationHandle {
         plan: SurvivalPlacementPlan,
     ) -> Result<Option<CommittedSurvivalPlacement>, SimulationRequestError> {
         let actor_session = self.session_id()?;
-        let receiver = self.enqueue_player_command(SimulationCommand::CommitSurvivalPlacement(
-            Box::new(SurvivalPlacementCommand {
+        let command = if let Some(boundary) = self
+            .precommit_boundary()
+            .filter(|boundary| boundary.has_precommit_hooks(mc_script::precommit::HookKind::Build))
+        {
+            SimulationCommand::BeginPrecommitSurvivalPlacement(Box::new(
+                HookedSurvivalPlacementCommand {
+                    actor_session,
+                    plan,
+                    boundary: boundary.clone(),
+                    resume_handle: self.clone(),
+                },
+            ))
+        } else {
+            SimulationCommand::CommitSurvivalPlacement(Box::new(SurvivalPlacementCommand {
                 actor_session,
                 plan,
-            }),
-        ))?;
+            }))
+        };
+        let receiver = self.enqueue_player_command(command)?;
         match receiver.await {
             Ok(Ok(SimulationResponse::SurvivalPlacement(Ok(committed)))) => {
                 Ok(committed.map(|committed| *committed))
@@ -2577,12 +2905,23 @@ impl SimulationHandle {
         plan: BucketUsePlan,
     ) -> Result<Option<CommittedBucketUse>, SimulationRequestError> {
         let actor_session = self.session_id()?;
-        let receiver = self.enqueue_player_command(SimulationCommand::CommitBucketUse(
-            Box::new(BucketUseCommand {
+        let command = if let Some(boundary) = self
+            .precommit_boundary()
+            .filter(|boundary| boundary.has_precommit_hooks(mc_script::precommit::HookKind::Build))
+        {
+            SimulationCommand::BeginPrecommitBucketUse(Box::new(HookedBucketUseCommand {
                 actor_session,
                 plan,
-            }),
-        ))?;
+                boundary: boundary.clone(),
+                resume_handle: self.clone(),
+            }))
+        } else {
+            SimulationCommand::CommitBucketUse(Box::new(BucketUseCommand {
+                actor_session,
+                plan,
+            }))
+        };
+        let receiver = self.enqueue_player_command(command)?;
         match receiver.await {
             Ok(Ok(SimulationResponse::BucketUse(Ok(committed)))) => {
                 Ok(committed.map(|committed| *committed))
@@ -2703,8 +3042,8 @@ impl SimulationHandle {
 
     pub(super) async fn commit_player_survival(
         &self,
-        plan: PlayerSurvivalPlan,
-    ) -> Result<Option<PlayerSurvivalCommitOutcome>, SimulationRequestError> {
+        plan: Box<PlayerSurvivalPlan>,
+    ) -> Result<Option<Box<PlayerSurvivalCommitOutcome>>, SimulationRequestError> {
         let actor_session = self.session_id()?;
         let receiver = self.enqueue_player_command(SimulationCommand::CommitPlayerSurvival(
             Box::new(PlayerSurvivalCommand {
@@ -2713,9 +3052,7 @@ impl SimulationHandle {
             }),
         ))?;
         match receiver.await {
-            Ok(Ok(SimulationResponse::PlayerSurvival(Ok(committed)))) => {
-                Ok(committed.map(|committed| *committed))
-            }
+            Ok(Ok(SimulationResponse::PlayerSurvival(Ok(committed)))) => Ok(committed),
             Ok(Ok(SimulationResponse::PlayerSurvival(Err(error)))) => Err(error),
             Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
             Ok(Err(error)) => Err(error),
@@ -3662,6 +3999,14 @@ impl SimulationOwner {
         births
     }
 
+    pub(crate) fn tick_animal_temptation(
+        &self,
+        sessions: &SessionRegistry,
+        tags: &mc_data::tags::TagsData,
+    ) -> usize {
+        sessions.tick_animal_temptation(tags)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick_villager_population(
         &self,
@@ -3705,6 +4050,7 @@ impl SimulationOwner {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) fn tick_hostile_attacks(
         &self,
         sessions: &SessionRegistry,
@@ -3712,6 +4058,25 @@ impl SimulationOwner {
         air: BlockStateId,
     ) -> usize {
         let (attacks, dispatches) = sessions.tick_hostile_attacks(&self.authority, tick, air);
+        dispatch_visibility_commands(dispatches);
+        attacks
+    }
+
+    pub(crate) fn tick_hostile_attacks_with_world_sight(
+        &self,
+        sessions: &SessionRegistry,
+        tick: u64,
+        air: BlockStateId,
+        world: Option<&WorldReadView>,
+        blocks: &BlockRegistry,
+    ) -> usize {
+        let (attacks, dispatches) = sessions.tick_hostile_attacks_with_world_sight(
+            &self.authority,
+            tick,
+            air,
+            world,
+            blocks,
+        );
         dispatch_visibility_commands(dispatches);
         attacks
     }
@@ -4813,6 +5178,30 @@ impl SimulationOwner {
                 carried_item,
             }));
         }
+        let Some(_warehouse_reservation_admission) =
+            sessions.try_lock_warehouse_reservation_admission(primary_position)
+        else {
+            let (inventory, carried_item) = sessions
+                .player_container_state(actor_session)
+                .ok_or(SimulationRequestError::StaleSession)?;
+            return Ok(Box::new(SharedContainerCommit::Rejected {
+                state_id: sessions.chest_state_id(primary_position),
+                authoritative,
+                inventory,
+                carried_item,
+            }));
+        };
+        if !sessions.warehouse_reservation_stock_survives(positions, updated) {
+            let (inventory, carried_item) = sessions
+                .player_container_state(actor_session)
+                .ok_or(SimulationRequestError::StaleSession)?;
+            return Ok(Box::new(SharedContainerCommit::Rejected {
+                state_id: sessions.chest_state_id(primary_position),
+                authoritative,
+                inventory,
+                carried_item,
+            }));
+        }
         let before_view = ChestView {
             chests: expected.to_vec(),
         };
@@ -5308,6 +5697,7 @@ impl SimulationOwner {
                 amount: damage,
                 attacker_costs,
                 authority_tick,
+                hook_approval: None,
             },
         );
         if let PlayerAttackResult::Damaged(outcome) = &mut result
@@ -5330,6 +5720,7 @@ impl SimulationOwner {
         &self,
         sessions: &SessionRegistry,
         command: &ServerEntityEffectCommand,
+        response: &mut Option<queue::SimulationResponseSender>,
     ) -> SimulationResponse {
         let request = EntityEffectRequest {
             operation: command.operation.clone(),
@@ -5343,6 +5734,7 @@ impl SimulationOwner {
             command.expected.as_deref().cloned(),
             command.entity_id,
             request,
+            response,
         );
         match &result {
             EntityEffectResult::Applied(applied) => {
@@ -5396,9 +5788,11 @@ impl SimulationOwner {
         sessions: &SessionRegistry,
         entity_id: EntityId,
         damage: f32,
+        plugin_id: &str,
+        response: &mut Option<queue::SimulationResponseSender>,
     ) -> SimulationResponse {
         let result = sessions
-            .damage_script_entity(&self.authority, entity_id, damage)
+            .damage_script_entity(&self.authority, entity_id, damage, plugin_id, response)
             .map(|mut outcome| {
                 let (health, killed) = match &outcome {
                     EntityAttackOutcome::Damaged { damage, .. } => (damage.snapshot.health, false),
@@ -5792,9 +6186,159 @@ impl SimulationOwner {
                 processed += 1;
                 continue;
             }
-            let Some(envelope) = self.active_session_envelope(sessions, envelope) else {
+            let Some(mut envelope) = self.active_session_envelope(sessions, envelope) else {
                 continue;
             };
+            if let SimulationCommand::BeginPrecommitSurvivalBreak(command) = &envelope.command {
+                let actor_session = command.actor_session;
+                let prepared = if let Some(storage) = storage.as_deref_mut() {
+                    prepare_survival_block_break_plan(storage, &command.plan)
+                } else {
+                    self.record_world_access_error(world_error);
+                    envelope.respond(Ok(SimulationResponse::SurvivalBreak(Err(world_error))));
+                    processed += 1;
+                    self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let Some(plan) = prepared else {
+                    envelope.respond(Ok(SimulationResponse::SurvivalBreak(Ok(None))));
+                    processed += 1;
+                    self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let pending = precommit::player_actor(sessions, actor_session)
+                    .and_then(|actor| {
+                        precommit::build_context(actor, &plan.edits, &plan.preconditions)
+                    })
+                    .and_then(|context| command.boundary.begin_precommit(context));
+                let pending = match pending {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        envelope.respond(Ok(SimulationResponse::SurvivalBreak(Err(
+                            SimulationRequestError::Precommit(error),
+                        ))));
+                        processed += 1;
+                        self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let handle = command.resume_handle.clone();
+                let response = envelope.take_response();
+                handle.spawn_precommit_resume(
+                    pending,
+                    Some(actor_session),
+                    response,
+                    move |decision| {
+                        let request = match decision {
+                            Ok(approval) => {
+                                let mut plan = plan;
+                                plan.hook_approval = Some(approval);
+                                SurvivalBreakRequest::Prepared(plan)
+                            }
+                            Err(error) => SurvivalBreakRequest::PrecommitFailure(error),
+                        };
+                        SimulationCommand::CommitSurvivalBreak(Box::new(SurvivalBreakCommand {
+                            actor_session,
+                            request,
+                        }))
+                    },
+                );
+                processed += 1;
+                self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if let SimulationCommand::BeginPrecommitSurvivalPlacement(command) = &envelope.command {
+                let actor_session = command.actor_session;
+                let pending = precommit::player_actor(sessions, actor_session)
+                    .and_then(|actor| {
+                        precommit::build_context(
+                            actor,
+                            &command.plan.edits,
+                            &command.plan.preconditions,
+                        )
+                    })
+                    .and_then(|context| command.boundary.begin_precommit(context));
+                let pending = match pending {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        envelope.respond(Ok(SimulationResponse::SurvivalPlacement(Err(
+                            SimulationRequestError::Precommit(error),
+                        ))));
+                        processed += 1;
+                        self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let handle = command.resume_handle.clone();
+                let plan = command.plan.clone();
+                let response = envelope.take_response();
+                handle.spawn_precommit_resume(
+                    pending,
+                    Some(actor_session),
+                    response,
+                    move |decision| match decision {
+                        Ok(approval) => {
+                            let mut plan = plan;
+                            plan.hook_approval = Some(approval);
+                            SimulationCommand::CommitSurvivalPlacement(Box::new(
+                                SurvivalPlacementCommand {
+                                    actor_session,
+                                    plan,
+                                },
+                            ))
+                        }
+                        Err(error) => SimulationCommand::PrecommitSurvivalPlacementFailure(error),
+                    },
+                );
+                processed += 1;
+                self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if let SimulationCommand::BeginPrecommitBucketUse(command) = &envelope.command {
+                let actor_session = command.actor_session;
+                let pending = precommit::player_actor(sessions, actor_session)
+                    .and_then(|actor| {
+                        precommit::build_context(
+                            actor,
+                            std::slice::from_ref(&command.plan.edit),
+                            std::slice::from_ref(&command.plan.precondition),
+                        )
+                    })
+                    .and_then(|context| command.boundary.begin_precommit(context));
+                let pending = match pending {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        envelope.respond(Ok(SimulationResponse::BucketUse(Err(
+                            SimulationRequestError::Precommit(error),
+                        ))));
+                        processed += 1;
+                        self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let handle = command.resume_handle.clone();
+                let plan = command.plan.clone();
+                let response = envelope.take_response();
+                handle.spawn_precommit_resume(
+                    pending,
+                    Some(actor_session),
+                    response,
+                    move |decision| match decision {
+                        Ok(approval) => {
+                            let mut plan = plan;
+                            plan.hook_approval = Some(approval);
+                            SimulationCommand::CommitBucketUse(Box::new(BucketUseCommand {
+                                actor_session,
+                                plan,
+                            }))
+                        }
+                        Err(error) => SimulationCommand::PrecommitBucketUseFailure(error),
+                    },
+                );
+                processed += 1;
+                self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if let Some(first_pose) = regular_player_pose_command(&envelope.command) {
                 processed += self
                     .process_regular_player_pose_batch(sessions, envelope, first_pose, &mut batch);
@@ -5943,8 +6487,37 @@ impl SimulationOwner {
                     attacker_costs.as_deref(),
                     *cooldown_tick,
                 ),
+                SimulationCommand::ResumePlayerDamagePrecommit(resume) => {
+                    let dispatches = sessions
+                        .resume_player_damage_precommit(&self.authority, (**resume).clone());
+                    dispatch_visibility_commands(dispatches);
+                    SimulationResponse::DamagePrecommit
+                }
+                SimulationCommand::ResumeEntityDamagePrecommit(resume) => {
+                    let (result, dispatches) = sessions
+                        .resume_entity_damage_precommit(&self.authority, (**resume).clone());
+                    dispatch_visibility_commands(dispatches);
+                    match result {
+                        super::session::damage_precommit::EntityDamagePrecommitResult::Direct
+                        | super::session::damage_precommit::EntityDamagePrecommitResult::Projectile => {
+                            SimulationResponse::DamagePrecommit
+                        }
+                        super::session::damage_precommit::EntityDamagePrecommitResult::Resident(
+                            result,
+                        ) => SimulationResponse::ResidentDamage(result),
+                        super::session::damage_precommit::EntityDamagePrecommitResult::Script(
+                            result,
+                        ) => SimulationResponse::ScriptEntityDamage(result.map(
+                            |(health, killed)| ScriptEntityDamageCommit { health, killed },
+                        )),
+                        super::session::damage_precommit::EntityDamagePrecommitResult::Effect(
+                            result,
+                        ) => SimulationResponse::EntityEffect(result),
+                    }
+                }
                 SimulationCommand::ApplyServerEntityEffect(command) => {
-                    self.entity_effect_response(sessions, command)
+                    let command = (**command).clone();
+                    self.entity_effect_response(sessions, &command, &mut envelope.response)
                 }
                 #[cfg(test)]
                 SimulationCommand::AttackServerEntity {
@@ -5973,8 +6546,25 @@ impl SimulationOwner {
                     entity_type_name,
                     *position,
                 ),
-                SimulationCommand::DamageScriptEntity { entity_id, damage } => {
-                    self.script_entity_damage_response(sessions, *entity_id, *damage)
+                SimulationCommand::DamageScriptEntity {
+                    entity_id,
+                    damage,
+                    plugin_id,
+                } => self.script_entity_damage_response(
+                    sessions,
+                    *entity_id,
+                    *damage,
+                    plugin_id,
+                    &mut envelope.response,
+                ),
+                SimulationCommand::DamageResidentEntity { attack, plugin_id } => {
+                    let response = &mut envelope.response;
+                    SimulationResponse::ResidentDamage(sessions.damage_resident_entity(
+                        &self.authority,
+                        (**attack).clone(),
+                        plugin_id,
+                        response,
+                    ))
                 }
                 SimulationCommand::SetWorldTime { world_time } => {
                     self.set_world_time_response(sessions, *world_time)
@@ -6006,13 +6596,26 @@ impl SimulationOwner {
                     edits,
                     preconditions,
                     scheduled_block_ticks,
+                    hook_approval,
+                    zone_fence,
+                    plugin_receipt,
+                    ..
                 } => {
+                    let settlement_portion = plugin_receipt.is_some();
                     let result = if !valid_block_edit_command(
                         edits,
                         preconditions,
                         scheduled_block_ticks,
                     ) {
                         Err(SimulationRequestError::InvalidCommand)
+                    } else if zone_fence.as_ref().is_some_and(|fence| !fence.is_current()) {
+                        Err(SimulationRequestError::Precommit(
+                            mc_script::precommit::HookFailure::PermissionDenied,
+                        ))
+                    } else if let Err(error) = precommit::refuse_build_approval(hook_approval) {
+                        Err(SimulationRequestError::Precommit(error))
+                    } else if settlement_portion {
+                        Err(SimulationRequestError::WorldMutationFailed)
                     } else if storage.is_some() || resident_mutation.is_some() {
                         let regional = storage.is_none();
                         let mut outcome = if let Some(storage) = storage.as_deref_mut() {
@@ -6100,7 +6703,11 @@ impl SimulationOwner {
                         self.record_world_access_error(world_error);
                         Err(world_error)
                     };
-                    SimulationResponse::BlockEdits(result)
+                    if settlement_portion {
+                        SimulationResponse::SettlementPortion(result.map(|_| None))
+                    } else {
+                        SimulationResponse::BlockEdits(result)
+                    }
                 }
                 SimulationCommand::CommitBlockDrops { .. } => {
                     self.record_world_access_error(world_error);
@@ -6135,278 +6742,40 @@ impl SimulationOwner {
                     }
                     SimulationResponse::FluidTicksScheduled
                 }
-                SimulationCommand::CommitSurvivalBreak(command) => {
-                    let result = if let Some(storage) = storage.as_deref_mut() {
-                        let request_is_valid = match &command.request {
-                            SurvivalBreakRequest::Prepared(_) => true,
-                            SurvivalBreakRequest::Block(plan) => {
-                                valid_survival_block_break_plan(plan)
-                            }
-                        };
-                        if !request_is_valid {
-                            Err(SimulationRequestError::InvalidCommand)
-                        } else {
-                            let prepared_plan = match &command.request {
-                                SurvivalBreakRequest::Prepared(_) => None,
-                                SurvivalBreakRequest::Block(plan) => {
-                                    prepare_survival_block_break_plan(storage, plan)
-                                }
-                            };
-                            let plan = match &command.request {
-                                SurvivalBreakRequest::Prepared(plan) => Some(plan),
-                                SurvivalBreakRequest::Block(_) => prepared_plan.as_ref(),
-                            };
-                            match plan {
-                                None => Ok(None),
-                                Some(plan) if !valid_survival_break_plan(plan) => {
-                                    Err(SimulationRequestError::InvalidCommand)
-                                }
-                                Some(plan) => sessions
-                                    .commit_survival_break(
-                                        &self.authority,
-                                        storage,
-                                        block_light,
-                                        command.actor_session,
-                                        plan,
-                                    )
-                                    .map(|committed| {
-                                        committed.map(|mut committed| {
-                                            if let Some(entity_type_id) =
-                                                plan.falling_block_entity_type_id
-                                            {
-                                                let air = air_state_id(&plan.blocks);
-                                                let start_plan = plan_falling_block_starts(
-                                                    &plan.blocks,
-                                                    &plan.block_facts,
-                                                    storage,
-                                                    &committed.block.applied,
-                                                    air,
-                                                );
-                                                let removal_edits = start_plan
-                                                    .starts
-                                                    .into_iter()
-                                                    .map(|start| BlockEdit {
-                                                        pos: start.pos,
-                                                        new_state: air,
-                                                    })
-                                                    .collect::<Vec<_>>();
-                                                if let Some(falling) =
-                                                    apply_block_edit_batch_to_storage_conditionally(
-                                                        storage,
-                                                        block_light,
-                                                        &removal_edits,
-                                                        &start_plan.preconditions,
-                                                    )
-                                                {
-                                                    for edit in &falling.applied {
-                                                        if !is_falling_block_state(
-                                                            &plan.blocks,
-                                                            edit.previous,
-                                                        ) {
-                                                            continue;
-                                                        }
-                                                        committed.dispatches.extend(
-                                                            sessions.spawn_falling_block_owned(
-                                                                &self.authority,
-                                                                entity_type_id,
-                                                                Vec3::new(
-                                                                    f64::from(edit.pos.x) + 0.5,
-                                                                    f64::from(edit.pos.y),
-                                                                    f64::from(edit.pos.z) + 0.5,
-                                                                ),
-                                                                edit.previous,
-                                                            ),
-                                                        );
-                                                    }
-                                                    append_block_edit_outcome(
-                                                        &mut committed.block,
-                                                        falling,
-                                                    );
-                                                }
-                                            }
-                                            for edit in &committed.block.applied {
-                                                if is_campfire_block(&plan.blocks, edit.previous)
-                                                    && !is_campfire_block(
-                                                        &plan.blocks,
-                                                        edit.new_state,
-                                                    )
-                                                    && sessions.clear_campfire_cooking(edit.pos)
-                                                {
-                                                    committed
-                                                        .block
-                                                        .cleared_campfires
-                                                        .push(edit.pos);
-                                                }
-                                            }
-                                            schedule_reactivity_near_applied(
-                                                storage,
-                                                sessions.simulation_tick(),
-                                                &committed.block.applied,
-                                            );
-                                            schedule_fluid_ticks_near_applied(
-                                                storage,
-                                                &plan.block_facts,
-                                                sessions.simulation_tick(),
-                                                &committed.block.applied,
-                                            );
-                                            if let Some(table) = block_light
-                                                && let Some(light_updates) = prepare_owner_relight(
-                                                    storage,
-                                                    table,
-                                                    &mut committed.block,
-                                                    pending_relight.is_some(),
-                                                )
-                                            {
-                                                let light_chunks = light_updates
-                                                    .iter()
-                                                    .map(|update| (update.pos.x, update.pos.z))
-                                                    .collect::<HashSet<_>>();
-                                                sessions.invalidate_prepared_chunks(&light_chunks);
-                                                committed.block.precomputed_light_updates =
-                                                    Some(light_updates);
-                                            }
-                                            sessions.invalidate_prepared_chunks(
-                                                &committed.block.edit_chunks,
-                                            );
-                                            let recipients = sessions.loaded_recipients_for_chunks(
-                                                &committed.block.edit_chunks,
-                                                Some(command.actor_session),
-                                            );
-                                            let mut dispatches = recipients
-                                                .iter()
-                                                .cloned()
-                                                .map(|recipient| VisibilityDispatch {
-                                                    recipient,
-                                                    command: OutboundCommand::BlockDeltas(
-                                                        committed.block.deltas.clone(),
-                                                    ),
-                                                })
-                                                .collect::<Vec<_>>();
-                                            if let Some(light_updates) =
-                                                committed.block.precomputed_light_updates.as_ref()
-                                                && !light_updates.is_empty()
-                                            {
-                                                let light_chunks = light_updates
-                                                    .iter()
-                                                    .map(|update| (update.pos.x, update.pos.z))
-                                                    .collect::<HashSet<_>>();
-                                                dispatches.extend(
-                                                    sessions
-                                                        .loaded_recipients_for_chunks(
-                                                            &light_chunks,
-                                                            Some(command.actor_session),
-                                                        )
-                                                        .into_iter()
-                                                        .map(|recipient| VisibilityDispatch {
-                                                            recipient,
-                                                            command: OutboundCommand::LightUpdates(
-                                                                light_updates.clone(),
-                                                            ),
-                                                        }),
-                                                );
-                                            }
-                                            dispatches.append(&mut committed.dispatches);
-                                            dispatch_visibility_commands(dispatches);
-                                            Box::new(committed)
-                                        })
-                                    }),
-                            }
-                        }
-                    } else {
-                        self.record_world_access_error(world_error);
-                        Err(world_error)
-                    };
-                    SimulationResponse::SurvivalBreak(result)
+                SimulationCommand::CommitSurvivalBreak(command) => self
+                    .commit_survival_break_response(
+                        sessions,
+                        storage.as_deref_mut(),
+                        block_light,
+                        pending_relight.as_deref_mut(),
+                        world_error,
+                        command,
+                    ),
+                SimulationCommand::BeginPrecommitSurvivalBreak(_) => {
+                    unreachable!("precommit break admission is handled before owner dispatch")
                 }
-                SimulationCommand::CommitSurvivalPlacement(command) => {
-                    let result = if !valid_survival_placement_plan(&command.plan) {
-                        Err(SimulationRequestError::InvalidCommand)
-                    } else if let Some(storage) = storage.as_deref_mut() {
-                        sessions
-                            .commit_survival_placement(
-                                &self.authority,
-                                storage,
-                                block_light,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|committed| {
-                                committed.map(|mut committed| {
-                                    schedule_reactivity_near_applied(
-                                        storage,
-                                        sessions.simulation_tick(),
-                                        &committed.block.applied,
-                                    );
-                                    schedule_fluid_ticks_near_applied(
-                                        storage,
-                                        &command.plan.block_facts,
-                                        sessions.simulation_tick(),
-                                        &committed.block.applied,
-                                    );
-                                    if let Some(table) = block_light
-                                        && let Some(light_updates) = prepare_owner_relight(
-                                            storage,
-                                            table,
-                                            &mut committed.block,
-                                            pending_relight.is_some(),
-                                        )
-                                    {
-                                        let light_chunks = light_updates
-                                            .iter()
-                                            .map(|update| (update.pos.x, update.pos.z))
-                                            .collect::<HashSet<_>>();
-                                        sessions.invalidate_prepared_chunks(&light_chunks);
-                                        committed.block.precomputed_light_updates =
-                                            Some(light_updates);
-                                    }
-                                    sessions
-                                        .invalidate_prepared_chunks(&committed.block.edit_chunks);
-                                    let recipients = sessions.loaded_recipients_for_chunks(
-                                        &committed.block.edit_chunks,
-                                        Some(command.actor_session),
-                                    );
-                                    let mut dispatches = recipients
-                                        .iter()
-                                        .cloned()
-                                        .map(|recipient| VisibilityDispatch {
-                                            recipient,
-                                            command: OutboundCommand::BlockDeltas(
-                                                committed.block.deltas.clone(),
-                                            ),
-                                        })
-                                        .collect::<Vec<_>>();
-                                    if let Some(light_updates) =
-                                        committed.block.precomputed_light_updates.as_ref()
-                                        && !light_updates.is_empty()
-                                    {
-                                        let light_chunks = light_updates
-                                            .iter()
-                                            .map(|update| (update.pos.x, update.pos.z))
-                                            .collect::<HashSet<_>>();
-                                        dispatches.extend(
-                                            sessions
-                                                .loaded_recipients_for_chunks(
-                                                    &light_chunks,
-                                                    Some(command.actor_session),
-                                                )
-                                                .into_iter()
-                                                .map(|recipient| VisibilityDispatch {
-                                                    recipient,
-                                                    command: OutboundCommand::LightUpdates(
-                                                        light_updates.clone(),
-                                                    ),
-                                                }),
-                                        );
-                                    }
-                                    dispatch_visibility_commands(dispatches);
-                                    Box::new(committed)
-                                })
-                            })
-                    } else {
-                        self.record_world_access_error(world_error);
-                        Err(world_error)
-                    };
-                    SimulationResponse::SurvivalPlacement(result)
+                SimulationCommand::PrecommitSurvivalPlacementFailure(error) => {
+                    SimulationResponse::SurvivalPlacement(Err(SimulationRequestError::Precommit(
+                        *error,
+                    )))
+                }
+                SimulationCommand::BeginPrecommitSurvivalPlacement(_) => {
+                    unreachable!("precommit placement admission is handled before owner dispatch")
+                }
+                SimulationCommand::CommitSurvivalPlacement(command) => self
+                    .commit_survival_placement_response(
+                        sessions,
+                        storage.as_deref_mut(),
+                        block_light,
+                        pending_relight.as_deref_mut(),
+                        world_error,
+                        command,
+                    ),
+                SimulationCommand::PrecommitBucketUseFailure(error) => {
+                    SimulationResponse::BucketUse(Err(SimulationRequestError::Precommit(*error)))
+                }
+                SimulationCommand::BeginPrecommitBucketUse(_) => {
+                    unreachable!("precommit bucket admission is handled before owner dispatch")
                 }
                 SimulationCommand::CommitBucketUse(command) => {
                     let result = if !valid_bucket_use_plan(&command.plan) {
@@ -6725,6 +7094,300 @@ impl SimulationOwner {
             ..SimulationTickReport::default()
         }
     }
+
+    fn commit_survival_break_response(
+        &mut self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        block_light: Option<&BlockLightTable>,
+        pending_relight: Option<&mut Option<PendingOwnerRelight>>,
+        world_error: SimulationRequestError,
+        command: &SurvivalBreakCommand,
+    ) -> SimulationResponse {
+        {
+            let result = if let SurvivalBreakRequest::PrecommitFailure(error) = &command.request {
+                Err(SimulationRequestError::Precommit(*error))
+            } else if let Some(storage) = storage {
+                let request_is_valid = match &command.request {
+                    SurvivalBreakRequest::Prepared(_) => true,
+                    SurvivalBreakRequest::Block(plan) => valid_survival_block_break_plan(plan),
+                    SurvivalBreakRequest::PrecommitFailure(_) => {
+                        unreachable!("precommit failure returns before native break validation")
+                    }
+                };
+                if !request_is_valid {
+                    Err(SimulationRequestError::InvalidCommand)
+                } else {
+                    let prepared_plan = match &command.request {
+                        SurvivalBreakRequest::Prepared(_) => None,
+                        SurvivalBreakRequest::Block(plan) => {
+                            prepare_survival_block_break_plan(storage, plan)
+                        }
+                        SurvivalBreakRequest::PrecommitFailure(_) => {
+                            unreachable!("precommit failure returns before break preparation")
+                        }
+                    };
+                    let plan = match &command.request {
+                        SurvivalBreakRequest::Prepared(plan) => Some(plan),
+                        SurvivalBreakRequest::Block(_) => prepared_plan.as_ref(),
+                        SurvivalBreakRequest::PrecommitFailure(_) => {
+                            unreachable!("precommit failure returns before break commit")
+                        }
+                    };
+                    match plan {
+                        None => Ok(None),
+                        Some(plan) if !valid_survival_break_plan(plan) => {
+                            Err(SimulationRequestError::InvalidCommand)
+                        }
+                        Some(plan) => sessions
+                            .commit_survival_break(
+                                &self.authority,
+                                storage,
+                                block_light,
+                                command.actor_session,
+                                plan,
+                            )
+                            .map(|committed| {
+                                committed.map(|mut committed| {
+                                    if let Some(entity_type_id) = plan.falling_block_entity_type_id
+                                    {
+                                        let air = air_state_id(&plan.blocks);
+                                        let start_plan = plan_falling_block_starts(
+                                            &plan.blocks,
+                                            &plan.block_facts,
+                                            storage,
+                                            &committed.block.applied,
+                                            air,
+                                        );
+                                        let removal_edits = start_plan
+                                            .starts
+                                            .into_iter()
+                                            .map(|start| BlockEdit {
+                                                pos: start.pos,
+                                                new_state: air,
+                                            })
+                                            .collect::<Vec<_>>();
+                                        if let Some(falling) =
+                                            apply_block_edit_batch_to_storage_conditionally(
+                                                storage,
+                                                block_light,
+                                                &removal_edits,
+                                                &start_plan.preconditions,
+                                            )
+                                        {
+                                            for edit in &falling.applied {
+                                                if !is_falling_block_state(
+                                                    &plan.blocks,
+                                                    edit.previous,
+                                                ) {
+                                                    continue;
+                                                }
+                                                committed.dispatches.extend(
+                                                    sessions.spawn_falling_block_owned(
+                                                        &self.authority,
+                                                        entity_type_id,
+                                                        Vec3::new(
+                                                            f64::from(edit.pos.x) + 0.5,
+                                                            f64::from(edit.pos.y),
+                                                            f64::from(edit.pos.z) + 0.5,
+                                                        ),
+                                                        edit.previous,
+                                                    ),
+                                                );
+                                            }
+                                            append_block_edit_outcome(
+                                                &mut committed.block,
+                                                falling,
+                                            );
+                                        }
+                                    }
+                                    for edit in &committed.block.applied {
+                                        if is_campfire_block(&plan.blocks, edit.previous)
+                                            && !is_campfire_block(&plan.blocks, edit.new_state)
+                                            && sessions.clear_campfire_cooking(edit.pos)
+                                        {
+                                            committed.block.cleared_campfires.push(edit.pos);
+                                        }
+                                    }
+                                    schedule_reactivity_near_applied(
+                                        storage,
+                                        sessions.simulation_tick(),
+                                        &committed.block.applied,
+                                    );
+                                    schedule_fluid_ticks_near_applied(
+                                        storage,
+                                        &plan.block_facts,
+                                        sessions.simulation_tick(),
+                                        &committed.block.applied,
+                                    );
+                                    if let Some(table) = block_light
+                                        && let Some(light_updates) = prepare_owner_relight(
+                                            storage,
+                                            table,
+                                            &mut committed.block,
+                                            pending_relight.is_some(),
+                                        )
+                                    {
+                                        let light_chunks = light_updates
+                                            .iter()
+                                            .map(|update| (update.pos.x, update.pos.z))
+                                            .collect::<HashSet<_>>();
+                                        sessions.invalidate_prepared_chunks(&light_chunks);
+                                        committed.block.precomputed_light_updates =
+                                            Some(light_updates);
+                                    }
+                                    sessions
+                                        .invalidate_prepared_chunks(&committed.block.edit_chunks);
+                                    let recipients = sessions.loaded_recipients_for_chunks(
+                                        &committed.block.edit_chunks,
+                                        Some(command.actor_session),
+                                    );
+                                    let mut dispatches = recipients
+                                        .iter()
+                                        .cloned()
+                                        .map(|recipient| VisibilityDispatch {
+                                            recipient,
+                                            command: OutboundCommand::BlockDeltas(
+                                                committed.block.deltas.clone(),
+                                            ),
+                                        })
+                                        .collect::<Vec<_>>();
+                                    if let Some(light_updates) =
+                                        committed.block.precomputed_light_updates.as_ref()
+                                        && !light_updates.is_empty()
+                                    {
+                                        let light_chunks = light_updates
+                                            .iter()
+                                            .map(|update| (update.pos.x, update.pos.z))
+                                            .collect::<HashSet<_>>();
+                                        dispatches.extend(
+                                            sessions
+                                                .loaded_recipients_for_chunks(
+                                                    &light_chunks,
+                                                    Some(command.actor_session),
+                                                )
+                                                .into_iter()
+                                                .map(|recipient| VisibilityDispatch {
+                                                    recipient,
+                                                    command: OutboundCommand::LightUpdates(
+                                                        light_updates.clone(),
+                                                    ),
+                                                }),
+                                        );
+                                    }
+                                    dispatches.append(&mut committed.dispatches);
+                                    dispatch_visibility_commands(dispatches);
+                                    Box::new(committed)
+                                })
+                            }),
+                    }
+                }
+            } else {
+                self.record_world_access_error(world_error);
+                Err(world_error)
+            };
+            SimulationResponse::SurvivalBreak(result)
+        }
+    }
+
+    fn commit_survival_placement_response(
+        &mut self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        block_light: Option<&BlockLightTable>,
+        pending_relight: Option<&mut Option<PendingOwnerRelight>>,
+        world_error: SimulationRequestError,
+        command: &SurvivalPlacementCommand,
+    ) -> SimulationResponse {
+        {
+            let result = if !valid_survival_placement_plan(&command.plan) {
+                Err(SimulationRequestError::InvalidCommand)
+            } else if let Some(storage) = storage {
+                sessions
+                    .commit_survival_placement(
+                        &self.authority,
+                        storage,
+                        block_light,
+                        command.actor_session,
+                        &command.plan,
+                    )
+                    .map(|committed| {
+                        committed.map(|mut committed| {
+                            schedule_reactivity_near_applied(
+                                storage,
+                                sessions.simulation_tick(),
+                                &committed.block.applied,
+                            );
+                            schedule_fluid_ticks_near_applied(
+                                storage,
+                                &command.plan.block_facts,
+                                sessions.simulation_tick(),
+                                &committed.block.applied,
+                            );
+                            if let Some(table) = block_light
+                                && let Some(light_updates) = prepare_owner_relight(
+                                    storage,
+                                    table,
+                                    &mut committed.block,
+                                    pending_relight.is_some(),
+                                )
+                            {
+                                let light_chunks = light_updates
+                                    .iter()
+                                    .map(|update| (update.pos.x, update.pos.z))
+                                    .collect::<HashSet<_>>();
+                                sessions.invalidate_prepared_chunks(&light_chunks);
+                                committed.block.precomputed_light_updates = Some(light_updates);
+                            }
+                            sessions.invalidate_prepared_chunks(&committed.block.edit_chunks);
+                            let recipients = sessions.loaded_recipients_for_chunks(
+                                &committed.block.edit_chunks,
+                                Some(command.actor_session),
+                            );
+                            let mut dispatches = recipients
+                                .iter()
+                                .cloned()
+                                .map(|recipient| VisibilityDispatch {
+                                    recipient,
+                                    command: OutboundCommand::BlockDeltas(
+                                        committed.block.deltas.clone(),
+                                    ),
+                                })
+                                .collect::<Vec<_>>();
+                            if let Some(light_updates) =
+                                committed.block.precomputed_light_updates.as_ref()
+                                && !light_updates.is_empty()
+                            {
+                                let light_chunks = light_updates
+                                    .iter()
+                                    .map(|update| (update.pos.x, update.pos.z))
+                                    .collect::<HashSet<_>>();
+                                dispatches.extend(
+                                    sessions
+                                        .loaded_recipients_for_chunks(
+                                            &light_chunks,
+                                            Some(command.actor_session),
+                                        )
+                                        .into_iter()
+                                        .map(|recipient| VisibilityDispatch {
+                                            recipient,
+                                            command: OutboundCommand::LightUpdates(
+                                                light_updates.clone(),
+                                            ),
+                                        }),
+                                );
+                            }
+                            dispatch_visibility_commands(dispatches);
+                            Box::new(committed)
+                        })
+                    })
+            } else {
+                self.record_world_access_error(world_error);
+                Err(world_error)
+            };
+            SimulationResponse::SurvivalPlacement(result)
+        }
+    }
 }
 
 fn valid_survival_block_break_plan(plan: &SurvivalBlockBreakPlan) -> bool {
@@ -6798,6 +7461,8 @@ fn prepare_survival_block_break_plan(
         falling_block_entity_type_id: request.falling_block_entity_type_id,
         held: request.held.clone(),
         drops,
+        hook_approval: request.hook_approval.clone(),
+        zone_fence: request.zone_fence.clone(),
     })
 }
 
@@ -7125,6 +7790,8 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
 
+    mod precommit_tests;
+
     #[test]
     fn explosion_support_cascade_pops_ground_plant_with_precondition() {
         let reports = vec![
@@ -7352,6 +8019,8 @@ mod tests {
                 position: Vec3::new(0.5, 64.5, 0.5),
                 stack: EntityItemStack::new(drop_item_id, 1),
             }],
+            hook_approval: None,
+            zone_fence: None,
         }
     }
 
@@ -7397,6 +8066,8 @@ mod tests {
                 max_damage: Some(10),
             },
             drop_items: true,
+            hook_approval: None,
+            zone_fence: None,
         }
     }
 
@@ -7433,6 +8104,8 @@ mod tests {
                 inventory_slot: PlayerInventory::HOTBAR_BASE,
                 expected: ItemStack::new(item_id, count),
             },
+            hook_approval: None,
+            zone_fence: None,
             expected_game_mode: GameMode::Survival,
         }
     }
@@ -7458,6 +8131,8 @@ mod tests {
                 replacement_max_stack: 16,
             }),
             schedule_fluid_ticks: true,
+            hook_approval: None,
+            zone_fence: None,
         }
     }
 
@@ -7783,6 +8458,10 @@ mod tests {
                     expected_token: token,
                 }],
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger: true,
+                hook_approval: None,
+                zone_fence: None,
+                plugin_receipt: None,
             })
             .unwrap();
 
@@ -7878,6 +8557,10 @@ mod tests {
                     expected_token: block_token,
                 }],
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger: true,
+                hook_approval: None,
+                zone_fence: None,
+                plugin_receipt: None,
             })
             .unwrap();
         let bytes = vec![10, 0, 0, 0];
@@ -7990,6 +8673,10 @@ mod tests {
                     expected_token: token,
                 }],
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger: true,
+                hook_approval: None,
+                zone_fence: None,
+                plugin_receipt: None,
             })
             .unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -8165,6 +8852,10 @@ mod tests {
                     expected_token: token,
                 }],
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger: true,
+                hook_approval: None,
+                zone_fence: None,
+                plugin_receipt: None,
             })
             .unwrap();
 
@@ -8209,12 +8900,20 @@ mod tests {
             edits: vec![edit],
             preconditions: Vec::new(),
             scheduled_block_ticks: Vec::new(),
+            leaf_trigger: true,
+            hook_approval: None,
+            zone_fence: None,
+            plugin_receipt: None,
         };
         let server_owned_batch = SimulationCommand::ApplyBlockEdits {
             actor_session: None,
             edits: vec![edit],
             preconditions: Vec::new(),
             scheduled_block_ticks: Vec::new(),
+            leaf_trigger: true,
+            hook_approval: None,
+            zone_fence: None,
+            plugin_receipt: None,
         };
 
         assert!(
@@ -8283,6 +8982,10 @@ mod tests {
                             expected_token: token,
                         }],
                         scheduled_block_ticks: Vec::new(),
+                        leaf_trigger: true,
+                        hook_approval: None,
+                        zone_fence: None,
+                        plugin_receipt: None,
                     })
                     .unwrap()
             })
@@ -8408,6 +9111,10 @@ mod tests {
                 expected_token: token,
             }],
             scheduled_block_ticks: Vec::new(),
+            leaf_trigger: true,
+            hook_approval: None,
+            zone_fence: None,
+            plugin_receipt: None,
         };
         let first = handle.enqueue(command()).unwrap();
         let stale = handle.enqueue(command()).unwrap();
@@ -8481,6 +9188,10 @@ mod tests {
                 expected_token: token,
             }],
             scheduled_block_ticks: Vec::new(),
+            leaf_trigger: true,
+            hook_approval: None,
+            zone_fence: None,
+            plugin_receipt: None,
         };
         let first = handle.enqueue(command(positions[0], tokens[0])).unwrap();
         let second = handle.enqueue(command(positions[1], tokens[1])).unwrap();
@@ -8821,6 +9532,7 @@ mod tests {
         let mut locally_updated_inventory = initial_inventory.clone();
         locally_updated_inventory.slots[shield_slot] = locally_damaged_stack;
         let local_plan = PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival: SurvivalState::FULL,
             updated_survival: SurvivalState::FULL,
             expected_inventory: initial_inventory,
@@ -8842,7 +9554,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let target_handle = handle.for_session(target);
         let attacker_handle = handle.for_session(attacker);
-        let mut local_commit = Box::pin(target_handle.commit_player_survival(local_plan));
+        let mut local_commit = Box::pin(target_handle.commit_player_survival(Box::new(local_plan)));
         assert_request_enqueued(local_commit.as_mut(), &handle).await;
         let mut pvp = Box::pin(
             attacker_handle
@@ -8861,7 +9573,7 @@ mod tests {
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
         assert!(matches!(
             local_commit.await.unwrap(),
-            Some(PlayerSurvivalCommitOutcome::Committed(_))
+            Some(outcome) if matches!(*outcome, PlayerSurvivalCommitOutcome::Committed(_))
         ));
         assert!(matches!(
             pvp.await.unwrap(),
@@ -8975,6 +9687,7 @@ mod tests {
             updated_survival
                 .add_exhaustion(mc_entity::player_survival_26_1_2::ENTITY_ATTACK_EXHAUSTION);
             PlayerSurvivalPlan {
+                hook_approval: None,
                 expected_survival: SurvivalState::FULL,
                 updated_survival,
                 expected_inventory: PlayerInventory::empty(),
@@ -11362,6 +12075,10 @@ mod tests {
                 5,
                 0,
             )],
+            leaf_trigger: true,
+            hook_approval: None,
+            zone_fence: None,
+            plugin_receipt: None,
         };
 
         assert_eq!(
@@ -13769,6 +14486,7 @@ mod tests {
         let mut updated_survival = expected_survival;
         updated_survival.apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
         let plan = PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival,
             updated_survival,
             expected_inventory: inventory.clone(),
@@ -13801,7 +14519,7 @@ mod tests {
                     .enqueue_player_command(SimulationCommand::CommitPlayerSurvival(Box::new(
                         PlayerSurvivalCommand {
                             actor_session: session,
-                            plan: plan.clone(),
+                            plan: Box::new(plan.clone()),
                         },
                     )))
                     .unwrap()
@@ -13813,7 +14531,7 @@ mod tests {
         for response in responses {
             match response.await.unwrap().unwrap() {
                 SimulationResponse::PlayerSurvival(Ok(Some(outcome))) => match *outcome {
-                    PlayerSurvivalCommitOutcome::Committed(outcome) => committed.push(outcome),
+                    PlayerSurvivalCommitOutcome::Committed(outcome) => committed.push(*outcome),
                     PlayerSurvivalCommitOutcome::Rejected(_) => {}
                 },
                 SimulationResponse::PlayerSurvival(Ok(None)) => {}
@@ -15085,6 +15803,8 @@ mod tests {
                 position: Vec3::new(1.5, 64.5, 1.5),
                 stack: EntityItemStack::new(42, 1),
             }],
+            hook_approval: None,
+            zone_fence: None,
         };
         let response = handle
             .for_session(session)
@@ -15834,7 +16554,8 @@ mod tests {
             vec![0, 15, 1, 15, 15],
             vec![true, false, false, false, false],
         );
-        let mut request = Box::pin(handle.place_loader_block_server_owned(pos, BlockStateId(4)));
+        let mut request =
+            Box::pin(handle.place_loader_block_server_owned("test", pos, BlockStateId(4), None));
         assert_request_enqueued(request.as_mut(), &handle).await;
 
         owner
@@ -15882,6 +16603,10 @@ mod tests {
                 expected_token: token,
             }],
             scheduled_block_ticks: Vec::new(),
+            leaf_trigger: true,
+            hook_approval: None,
+            zone_fence: None,
+            plugin_receipt: None,
         };
         let first = handle.enqueue(command()).unwrap();
         let stale = handle.enqueue(command()).unwrap();
@@ -15926,6 +16651,10 @@ mod tests {
                     expected_token: token,
                 }],
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger: true,
+                hook_approval: None,
+                zone_fence: None,
+                plugin_receipt: None,
             })
             .unwrap();
         let guard = world.try_lock().expect("test owns world lock");
@@ -16054,6 +16783,10 @@ mod tests {
                 }],
                 preconditions: Vec::new(),
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger: true,
+                hook_approval: None,
+                zone_fence: None,
+                plugin_receipt: None,
             })
             .unwrap();
         let restore = handle
@@ -16065,6 +16798,10 @@ mod tests {
                 }],
                 preconditions: Vec::new(),
                 scheduled_block_ticks: Vec::new(),
+                leaf_trigger: true,
+                hook_approval: None,
+                zone_fence: None,
+                plugin_receipt: None,
             })
             .unwrap();
 
@@ -16142,6 +16879,311 @@ mod tests {
         let persisted = persisted.lock().unwrap();
         assert!(persisted.inventory.slots.iter().all(ItemStack::is_empty));
         assert!(persisted.carried_item.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chest_commit_resyncs_when_a_warehouse_reservation_floor_would_be_consumed() {
+        let mut initial = mc_world::ChestBlockEntity::default();
+        initial.slots[0] = mc_world::FurnaceSlot {
+            item_id: 42,
+            count: 2,
+            damage: None,
+            enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
+            stew_effects: Vec::new(),
+        };
+        let mut updated = initial.clone();
+        updated.slots[0].count = 1;
+        let (mut storage, position) = test_container_storage();
+        storage
+            .set_chest_block_entity(position, initial.clone())
+            .unwrap();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let sessions = Arc::new(SessionRegistry::new());
+        let floors = Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::from([(
+            position,
+            std::collections::BTreeMap::from([(42_u32, 2_u64)]),
+        )])));
+        sessions.install_warehouse_reservation_floors(floors);
+        let actor = register_test_session(&sessions, "ReservedChestActor");
+        assert_eq!(sessions.register_chest_viewer(actor, position), 1);
+        let player = empty_container_player_plan();
+        let persisted =
+            register_test_player_state(&sessions, actor, player.expected_inventory.clone());
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let session_handle = handle.for_session(actor);
+        let mut request = Box::pin(session_handle.commit_chest(
+            position,
+            vec![position],
+            1,
+            vec![initial.clone()],
+            vec![updated],
+            player,
+        ));
+        assert_request_enqueued(request.as_mut(), &handle).await;
+        assert_eq!(
+            owner
+                .process_tick_with_world(&sessions, Some(&world), None, 1)
+                .processed,
+            1
+        );
+        assert!(matches!(
+            request.await.unwrap(),
+            SharedContainerCommit::Rejected { .. }
+        ));
+        assert_eq!(
+            world.lock().await.chest_block_entity(position).unwrap(),
+            Some(initial)
+        );
+        assert!(
+            persisted
+                .lock()
+                .unwrap()
+                .inventory
+                .slots
+                .iter()
+                .all(ItemStack::is_empty)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regional_chest_commit_resyncs_when_a_warehouse_floor_would_be_consumed() {
+        let mut initial = mc_world::ChestBlockEntity::default();
+        initial.slots[0] = mc_world::FurnaceSlot {
+            item_id: 42,
+            count: 2,
+            damage: None,
+            enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
+            stew_effects: Vec::new(),
+        };
+        let mut updated = initial.clone();
+        updated.slots[0].count = 1;
+        let (mut storage, position) = test_container_storage();
+        storage
+            .set_chest_block_entity(position, initial.clone())
+            .unwrap();
+        let read_view = storage.read_view();
+        let mutation_view = storage.mutation_view();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let sessions = Arc::new(SessionRegistry::new());
+        sessions.install_warehouse_reservation_floors(Arc::new(arc_swap::ArcSwap::from_pointee(
+            HashMap::from([(
+                position,
+                std::collections::BTreeMap::from([(42_u32, 2_u64)]),
+            )]),
+        )));
+        let actor = register_test_session(&sessions, "RegionalReservedChestActor");
+        assert_eq!(sessions.register_chest_viewer(actor, position), 1);
+        let player = empty_container_player_plan();
+        register_test_player_state(&sessions, actor, player.expected_inventory.clone());
+        let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let session_handle = handle.for_session(actor);
+        let mut request = Box::pin(session_handle.commit_chest(
+            position,
+            vec![position],
+            1,
+            vec![initial.clone()],
+            vec![updated],
+            player,
+        ));
+        assert_request_enqueued(request.as_mut(), &handle).await;
+        assert_eq!(
+            owner
+                .process_commands_with_world_views(
+                    &sessions,
+                    Some(&world),
+                    SimulationWorldAccess {
+                        read: Some(&read_view),
+                        mutation: Some(&mutation_view),
+                        cpu: Some(&resources),
+                        light: None,
+                    },
+                    None,
+                    1,
+                )
+                .await
+                .processed,
+            1
+        );
+        assert!(matches!(
+            request.await.unwrap(),
+            SharedContainerCommit::Rejected { .. }
+        ));
+        assert_eq!(
+            world.lock().await.chest_block_entity(position).unwrap(),
+            Some(initial)
+        );
+    }
+
+    #[test]
+    fn server_owned_chest_commit_preserves_the_warehouse_reservation_floor() {
+        let mut initial = mc_world::ChestBlockEntity::default();
+        initial.slots[0] = mc_world::FurnaceSlot {
+            item_id: 42,
+            count: 2,
+            damage: None,
+            enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
+            stew_effects: Vec::new(),
+        };
+        let mut updated = initial.clone();
+        updated.slots[0].count = 1;
+        let (mut storage, position) = test_container_storage();
+        storage
+            .set_chest_block_entity(position, initial.clone())
+            .unwrap();
+        let mutation = storage.mutation_view();
+        let registry = SessionRegistry::new();
+        registry.install_warehouse_reservation_floors(Arc::new(arc_swap::ArcSwap::from_pointee(
+            HashMap::from([(
+                position,
+                std::collections::BTreeMap::from([(42_u32, 2_u64)]),
+            )]),
+        )));
+        let transaction = registry
+            .prepare_chest_transaction(None, position)
+            .expect("server-owned chest transaction");
+
+        assert!(matches!(
+            transaction
+                .commit_server_owned(
+                    &mutation,
+                    ChestTransactionRequest {
+                        primary_position: position,
+                        positions: &[position],
+                        expected_state_id: registry.chest_state_id(position),
+                        expected: &[initial.clone()],
+                        updated: &[updated],
+                        player: None,
+                    },
+                )
+                .unwrap(),
+            ServerOwnedChestCommit::StaleContainer
+        ));
+        assert_eq!(storage.chest_block_entity(position).unwrap(), Some(initial));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn structure_portion_journals_block_after_image_with_its_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("region")).unwrap();
+        let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
+        let items = Arc::new(mc_data::items::solaris_required_items());
+        let mut storage = WorldStorage::open(temp.path(), Arc::clone(&blocks))
+            .unwrap()
+            .with_item_registry(Arc::clone(&items));
+        let chunk = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let position = BlockPos { x: 1, y: 64, z: 1 };
+        let read_view = storage.read_view();
+        let mutation_view = storage.mutation_view();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let registry = SessionRegistry::new();
+        let (journal, pending) = crate::play::world_journal::WorldChunkJournal::open_for_test(
+            temp.path(),
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+        )
+        .unwrap();
+        assert!(pending.is_empty());
+        registry.install_world_chunk_journal(journal);
+        let batch: crate::script::storage::PreparedStorageBatch =
+            serde_json::from_value(serde_json::json!({
+                "transaction_id": 1,
+                "plugin_id": "settlement",
+                "mutations": [{
+                    "kind": "compare_and_swap",
+                    "key": "structure-progress",
+                    "expected_version": null,
+                    "value": "1"
+                }]
+            }))
+            .unwrap();
+        let receipt = batch.encode_world_decision().unwrap();
+        let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let mut result = Box::pin(handle.commit_server_owned_block_edits(
+            "settlement",
+            vec![BlockEdit::new(position, BlockStateId(1))],
+            None,
+            receipt,
+        ));
+        // Receipt-bearing portions capture exact block tokens before their
+        // authoritative write, then enqueue the decided mutation.
+        assert_request_enqueued(result.as_mut(), &handle).await;
+        assert_eq!(
+            owner
+                .process_commands_with_world_views(
+                    &registry,
+                    Some(&world),
+                    SimulationWorldAccess {
+                        read: Some(&read_view),
+                        mutation: Some(&mutation_view),
+                        cpu: Some(&resources),
+                        light: None,
+                    },
+                    None,
+                    1,
+                )
+                .await
+                .processed,
+            1
+        );
+        assert_request_enqueued(result.as_mut(), &handle).await;
+        assert_eq!(
+            owner
+                .process_commands_with_world_views(
+                    &registry,
+                    Some(&world),
+                    SimulationWorldAccess {
+                        read: Some(&read_view),
+                        mutation: Some(&mutation_view),
+                        cpu: Some(&resources),
+                        light: None,
+                    },
+                    None,
+                    1,
+                )
+                .await
+                .processed,
+            1
+        );
+        assert_eq!(result.await.unwrap(), Some(1));
+        assert_eq!(
+            world.lock().await.get_cached_block(position),
+            Some(BlockStateId(1))
+        );
+        let journal = registry.world_chunk_journal().unwrap();
+        let mut recovered = 0;
+        journal
+            .recover_inventory_decisions(|decision_id, batch| {
+                assert_eq!(decision_id, 1);
+                assert_eq!(
+                    serde_json::to_value(batch).unwrap()["mutations"][0]["key"],
+                    "structure-progress"
+                );
+                recovered += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            recovered, 1,
+            "the block decision carries its plugin receipt"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -6,7 +6,9 @@ use mc_entity::Vec3;
 use mc_world::BlockStateId;
 use tokio::sync::mpsc;
 
-use super::hostile_authority::{HostileAttackKind, HostileAttackTickEntity, plan_bow_transition};
+use super::hostile_authority::{
+    HostileAttackKind, HostileAttackTickEntity, plan_bow_transition, skeleton_sight_cells_for_test,
+};
 use super::*;
 use crate::login::LoggedInProfile;
 fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
@@ -881,7 +883,7 @@ fn warden_sonic_boom_charges_damages_and_cools_down() {
     assert!(damage_dispatches.iter().any(|dispatch| {
         matches!(
             dispatch.command,
-            OutboundCommand::DamagePlayer { damage }
+            OutboundCommand::DamagePlayer { damage, .. }
                 if damage.kind == PlayerDamageKind::SonicBoom && damage.amount == 10.0
         )
     }));
@@ -1342,7 +1344,7 @@ fn evoker_fangs_warm_up_spawn_line_damage_and_expire() {
         saw_damage |= dispatches.iter().any(|dispatch| {
             matches!(
                 dispatch.command,
-                OutboundCommand::DamagePlayer { damage }
+                OutboundCommand::DamagePlayer { damage, .. }
                     if damage.kind == PlayerDamageKind::IndirectMagic && damage.amount == 6.0
             )
         });
@@ -1602,6 +1604,86 @@ fn blaze_close_melee_preserves_ranged_attack_step() {
             .blaze_attack,
         Some(mc_entity::EntityBlazeAttackState::new(3, 120)),
         "close melee reuses attackTime without resetting attackStep/charged"
+    );
+}
+
+#[test]
+fn skeleton_sight_fails_for_opaque_or_unloaded_cells() {
+    let shooter = Vec3::new(0.5, 65.5, 6.5);
+    let target = Vec3::new(0.5, 64.6, 0.5);
+
+    assert!(skeleton_sight_cells_for_test(shooter, target, |_| Some(
+        true
+    )));
+    assert!(!skeleton_sight_cells_for_test(shooter, target, |cell| {
+        (cell != [0, 65, 3]).then_some(true)
+    }));
+    assert!(!skeleton_sight_cells_for_test(
+        Vec3::new(0.5, 65.5, 0.5),
+        Vec3::new(2.5, 65.5, 1.5),
+        |cell| (cell != [1, 65, 1]).then_some(true),
+    ));
+    assert!(!skeleton_sight_cells_for_test(shooter, target, |_| None));
+}
+
+#[test]
+fn blocked_skeleton_sight_cancels_draw_without_arrow() {
+    let registry = SessionRegistry::new();
+    registry.configure_arrow_kill_rewards(
+        Some(2),
+        Some(3),
+        Some(77),
+        Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        Arc::new(mc_data::loot::LootTables::default()),
+    );
+    let player = register_test_session(&registry, "BlockedBowTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:skeleton".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+
+    let draw_tick = 5;
+    assert_eq!(
+        registry
+            .tick_hostile_attacks_with_skeleton_sight_for_test(
+                &SimulationAuthority::for_test(),
+                draw_tick,
+                BlockStateId(0),
+                |_, _| true,
+            )
+            .0,
+        0
+    );
+    assert!(
+        registry.persisted_entity_records()[0]
+            .snapshot
+            .retained
+            .bow_attack
+            .is_some()
+    );
+
+    let (attacks, dispatches) = registry.tick_hostile_attacks_with_skeleton_sight_for_test(
+        &SimulationAuthority::for_test(),
+        draw_tick + SKELETON_BOW_DRAW_TICKS,
+        BlockStateId(0),
+        |_, _| false,
+    );
+    assert_eq!(attacks, 0);
+    assert!(
+        dispatches
+            .iter()
+            .all(|dispatch| !matches!(dispatch.command, OutboundCommand::SpawnEntity(_)))
+    );
+    assert_eq!(
+        registry.persisted_entity_records()[0]
+            .snapshot
+            .retained
+            .bow_attack,
+        None
     );
 }
 

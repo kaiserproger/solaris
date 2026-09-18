@@ -3,11 +3,10 @@ use mc_data::recipes::{Ingredient, IngredientAlternative, RecipeKind};
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::login::GameProfileProperty;
-use mc_protocol::packets::play::PlayerInfoUpdate;
+use mc_protocol::packets::play::{ClientboundBlockEvent, PlayerInfoUpdate, pack_block_pos};
 use mc_script::{ScriptEventKind, ScriptGameMode};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Barrier, Mutex};
-use tokio::io::duplex;
 use tokio::sync::mpsc;
 
 use crate::connection::{ConnectionReader, PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout};
@@ -53,6 +52,7 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
         &SimulationAuthority::for_test(),
         session,
         &PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival,
             updated_survival: dead,
             expected_inventory: expected_inventory.clone(),
@@ -157,6 +157,7 @@ fn respawn_commit_clears_player_hurt_resistance() {
         &SimulationAuthority::for_test(),
         session,
         &PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival,
             updated_survival: SurvivalState::FULL,
             expected_inventory: expected_inventory.clone(),
@@ -911,6 +912,97 @@ fn idle_adult_animal_tick_does_not_rewrite_unchanged_state() {
     );
     assert_eq!(registry.breeding_state_update_count(), 0);
     assert_eq!(registry.breeding_commit_count(), 0);
+}
+
+#[test]
+fn adult_passive_mobs_follow_tagged_food_and_resume_wandering() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "TemptingAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    let mut player_state = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5));
+    player_state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(7, 1);
+    player_state.inventory.slots[PlayerInventory::OFFHAND_SLOT] = ItemStack::new(8, 1);
+    let player_state = Arc::new(Mutex::new(player_state));
+    registry.register_player_persistence(player, Arc::clone(&player_state));
+    registry.ensure_chunk_herd_legacy_for_test(
+        (0, 0),
+        &[
+            HerdSpawn {
+                chunk: (0, 0),
+                slot: 0,
+                entity_type_id: 4,
+                entity_type_name: "minecraft:cow".to_owned(),
+                position: Vec3::new(4.5, 64.0, 0.5),
+                hostile: false,
+                sheep_color: None,
+            },
+            HerdSpawn {
+                chunk: (0, 0),
+                slot: 1,
+                entity_type_id: 0,
+                entity_type_name: "minecraft:sheep".to_owned(),
+                position: Vec3::new(5.5, 64.0, 0.5),
+                hostile: false,
+                sheep_color: None,
+            },
+            HerdSpawn {
+                chunk: (0, 0),
+                slot: 2,
+                entity_type_id: 6,
+                entity_type_name: "minecraft:chicken".to_owned(),
+                position: Vec3::new(6.5, 64.0, 0.5),
+                hostile: false,
+                sheep_color: None,
+            },
+        ],
+    );
+    let entity_ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    registry.publish_active_simulation_entities_for_test(entity_ids);
+    let item_registry = mc_data::Identifier::parse("minecraft:item").expect("static item registry");
+    let tags = mc_data::tags::TagsData::from_registries(BTreeMap::from([(
+        item_registry,
+        BTreeMap::from([
+            (
+                mc_data::Identifier::parse("minecraft:cow_food").expect("static cow tag"),
+                vec![7],
+            ),
+            (
+                mc_data::Identifier::parse("minecraft:sheep_food").expect("static sheep tag"),
+                vec![7],
+            ),
+            (
+                mc_data::Identifier::parse("minecraft:chicken_food").expect("static chicken tag"),
+                vec![8],
+            ),
+        ]),
+    )]));
+
+    assert_eq!(registry.tick_animal_temptation(&tags), 3);
+    let entities = registry.lock_entities("inspect tempted animal goals");
+    assert!(entities.snapshots().all(|entity| {
+        matches!(
+            entity.goal,
+            GoalState::FollowPosition { target, .. } if target == Vec3::new(0.5, 64.0, 0.5)
+        )
+    }));
+    drop(entities);
+    {
+        let mut state = player_state.lock().expect("player state remains available");
+        state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::EMPTY;
+        state.inventory.slots[PlayerInventory::OFFHAND_SLOT] = ItemStack::EMPTY;
+    }
+
+    assert_eq!(registry.tick_animal_temptation(&tags), 3);
+    assert!(
+        registry
+            .lock_entities("inspect animals after food is removed")
+            .snapshots()
+            .all(|entity| matches!(entity.goal, GoalState::Wander { .. }))
+    );
 }
 
 #[test]
@@ -2272,7 +2364,7 @@ fn guardian_beam_warms_up_publishes_target_then_deals_ordered_damage() {
     let damage = dispatches
         .iter()
         .filter_map(|dispatch| match &dispatch.command {
-            OutboundCommand::DamagePlayer { damage } => Some((damage.kind, damage.amount)),
+            OutboundCommand::DamagePlayer { damage, .. } => Some((damage.kind, damage.amount)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2478,7 +2570,7 @@ fn elder_guardian_uses_sixty_tick_beam_and_easy_magic_bonus() {
     let damage = dispatches
         .iter()
         .filter_map(|dispatch| match &dispatch.command {
-            OutboundCommand::DamagePlayer { damage } => Some((damage.kind, damage.amount)),
+            OutboundCommand::DamagePlayer { damage, .. } => Some((damage.kind, damage.amount)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -3845,6 +3937,54 @@ fn chest_slot_dispatches_claim_expected_state_exactly_once() {
     registry.unregister_chest_viewer(bob, position);
     registry.unregister_chest_viewer(charlie, position);
     assert_eq!(registry.chest_state_id(position), 1);
+}
+
+#[test]
+fn chest_lid_events_publish_only_on_first_open_and_last_close() {
+    let registry = SessionRegistry::new();
+    let alice = register_test_session(&registry, "ChestLidAlice");
+    let bob = register_test_session(&registry, "ChestLidBob");
+    let position = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let _ = registry.mark_loaded(alice, (0, 0));
+    let _ = registry.mark_loaded(bob, (0, 0));
+
+    assert_eq!(
+        registry.register_chest_viewer_with_lid_transition(alice, position),
+        (1, true)
+    );
+    assert_eq!(
+        registry.register_chest_viewer_with_lid_transition(bob, position),
+        (1, false)
+    );
+    let opened = registry.chest_lid_event_dispatches(position, 42, 1);
+    assert_eq!(opened.len(), 2);
+    assert!(opened.iter().all(|dispatch| {
+        matches!(
+            dispatch.command,
+            OutboundCommand::BlockEvent(ClientboundBlockEvent {
+                position: event_position,
+                action: 1,
+                parameter: 1,
+                block_type: 42,
+            }) if event_position == pack_block_pos(position.x, position.y, position.z)
+        )
+    }));
+
+    assert!(!registry.unregister_chest_viewer_with_lid_transition(alice, position));
+    assert!(registry.unregister_chest_viewer_with_lid_transition(bob, position));
+    let closed = registry.chest_lid_event_dispatches(position, 42, 0);
+    assert_eq!(closed.len(), 2);
+    assert!(closed.iter().all(|dispatch| {
+        matches!(
+            dispatch.command,
+            OutboundCommand::BlockEvent(ClientboundBlockEvent {
+                action: 1,
+                parameter: 0,
+                block_type: 42,
+                ..
+            })
+        )
+    }));
 }
 
 #[test]
@@ -8104,6 +8244,7 @@ fn player_attack_uses_authoritative_held_spear_range() {
     let expected_xp = state.xp.clone();
     registry.register_player_persistence(session_id, Arc::new(Mutex::new(state)));
     let costs = PlayerSurvivalPlan {
+        hook_approval: None,
         expected_survival,
         updated_survival: expected_survival,
         expected_inventory: expected_inventory.clone(),
@@ -8168,6 +8309,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         updated_survival
             .add_exhaustion(mc_entity::player_survival_26_1_2::ENTITY_ATTACK_EXHAUSTION);
         PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival: state.survival,
             updated_survival,
             expected_inventory: state.inventory.clone(),
@@ -8627,6 +8769,9 @@ fn explosion_entity_impacts_publish_hurt_before_exact_velocity_delta() {
         .expect("surviving chicken velocity update");
     assert!(hurt_index < velocity_index);
 }
+
+#[path = "explosion_precommit_tests.rs"]
+mod explosion_precommit_tests;
 
 #[test]
 fn lethal_attack_keeps_dying_entity_until_twentieth_death_tick() {
@@ -10329,7 +10474,7 @@ async fn profile_properties_reach_observer_player_info_wire_packet() {
         })
         .expect("observer receives profiled player's spawn");
 
-    let (mut server_io, client_io) = duplex(4_096);
+    let (mut server_io, client_io) = tokio::io::duplex(4_096);
     super::super::wire_entities::send_player_spawn(
         &mut server_io,
         Compression::Disabled,
@@ -12552,6 +12697,61 @@ fn accepted_pose_orders_body_push_before_player_movement_and_pickup() {
 
     assert!(body_push < player_movement);
     assert!(player_movement < pickup);
+}
+
+#[test]
+fn warehouse_reservation_floor_preserves_two_projects_across_partial_pickup() {
+    let registry = SessionRegistry::new();
+    let position = mc_world::BlockPos {
+        x: 12,
+        y: 64,
+        z: -8,
+    };
+    // Two active construction projects hold a total of seven apples in this
+    // physical warehouse chest.
+    let floors = Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::from([(
+        position,
+        BTreeMap::from([(5_u32, 7_u64)]),
+    )])));
+    registry.install_warehouse_reservation_floors(Arc::clone(&floors));
+
+    let mut chest = mc_world::ChestBlockEntity::default();
+    chest.slots[0].item_id = 5;
+    chest.slots[0].count = 8;
+    assert!(registry.warehouse_reservation_stock_survives(&[position], &[chest.clone()]));
+
+    // A player may pick up the one unreserved apple, but no reserved apple.
+    chest.slots[0].count = 7;
+    assert!(registry.warehouse_reservation_stock_survives(&[position], &[chest.clone()]));
+    chest.slots[0].count = 6;
+    assert!(!registry.warehouse_reservation_stock_survives(&[position], &[chest.clone()]));
+
+    // A release/recovery refresh removes the physical floor, so the chest is
+    // available again without retaining stale reservation state.
+    floors.store(Arc::new(HashMap::new()));
+    assert!(registry.warehouse_reservation_stock_survives(&[position], &[chest]));
+}
+
+#[tokio::test]
+async fn warehouse_reservation_admission_never_races_a_chest_commit() {
+    let registry = SessionRegistry::new();
+    let position = mc_world::BlockPos { x: 0, y: 64, z: 0 };
+    let reservation = registry
+        .lock_warehouse_reservation_admission(position)
+        .await;
+    assert!(
+        registry
+            .try_lock_warehouse_reservation_admission(position)
+            .is_none(),
+        "a chest must resync while the durable reservation admission is live"
+    );
+    drop(reservation);
+    assert!(
+        registry
+            .try_lock_warehouse_reservation_admission(position)
+            .is_some(),
+        "the next chest may commit after the reservation gate releases"
+    );
 }
 
 #[test]

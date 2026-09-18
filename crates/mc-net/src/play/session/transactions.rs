@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,19 +16,19 @@ use crate::play::persistence::PlayerPersistedState;
 use crate::play::simulation::{
     BucketUsePlan, CampfireUsePlan, CommittedBucketUse, CommittedCampfireUse,
     CommittedSurvivalBreak, CommittedSurvivalPlacement, SimulationRequestError, SurvivalBreakPlan,
-    SurvivalPlacementPlan, placement_inventory_debit, resident_block_edit_outcome,
+    SurvivalPlacementPlan, placement_inventory_debit, precommit, resident_block_edit_outcome,
 };
 use crate::play::{
     ChestCommitOutcome, ContainerPlayerPlan, FurnaceCommitOutcome, SharedContainerCommit,
     chest_menu_state_change_count, furnace_slot_stacks,
 };
 
-use super::SessionId;
 #[cfg(test)]
 use super::container_state::ContainerCommitProbe;
 use super::container_state::{ContainerRegistry, chest_recipients, furnace_recipients_except};
 use super::outbound::OutboundCommand;
 use super::visibility::visibility_dispatches;
+use super::{SessionId, WarehouseReservationFloors};
 
 #[derive(Clone)]
 pub(in crate::play) struct SurvivalPlacementTransaction {
@@ -61,6 +61,8 @@ pub(in crate::play) struct ChestTransaction {
     /// The acting player's durable state, or `None` when no player's inventory
     /// moves with this container.
     pub(super) player_state: Option<Arc<Mutex<PlayerPersistedState>>>,
+    pub(super) warehouse_reservation_floors: Option<WarehouseReservationFloors>,
+    pub(super) warehouse_reservation_admission: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     pub(super) commit_probe: Option<ContainerCommitProbe>,
 }
@@ -268,6 +270,20 @@ impl ChestTransaction {
             // authority, and the plugin receipt carries the other participant.
             None => None,
         };
+        let Some(_warehouse_reservation_admission) =
+            Arc::clone(&self.warehouse_reservation_admission)
+                .try_lock_owned()
+                .ok()
+        else {
+            return Ok(ServerOwnedChestCommit::StaleContainer);
+        };
+        if !warehouse_reservation_stock_survives(
+            self.warehouse_reservation_floors.as_ref(),
+            request.positions,
+            request.updated,
+        ) {
+            return Ok(ServerOwnedChestCommit::StaleContainer);
+        }
         let dispatches = match commit_container_half(
             &mut containers,
             mutation,
@@ -359,6 +375,36 @@ impl ChestTransaction {
                 carried_item: player_state.carried_item.clone(),
             });
         }
+        let Some(_warehouse_reservation_admission) =
+            Arc::clone(&self.warehouse_reservation_admission)
+                .try_lock_owned()
+                .ok()
+        else {
+            let authoritative = mutation
+                .chest_block_entities(request.positions)
+                .ok_or(SimulationRequestError::WorldUnavailable)?;
+            return Ok(SharedContainerCommit::Rejected {
+                state_id: current_state_id,
+                authoritative,
+                inventory: player_state.inventory.clone(),
+                carried_item: player_state.carried_item.clone(),
+            });
+        };
+        if !warehouse_reservation_stock_survives(
+            self.warehouse_reservation_floors.as_ref(),
+            request.positions,
+            request.updated,
+        ) {
+            let authoritative = mutation
+                .chest_block_entities(request.positions)
+                .ok_or(SimulationRequestError::WorldUnavailable)?;
+            return Ok(SharedContainerCommit::Rejected {
+                state_id: current_state_id,
+                authoritative,
+                inventory: player_state.inventory.clone(),
+                carried_item: player_state.carried_item.clone(),
+            });
+        }
 
         let (state_id, dispatches) = match commit_container_half(
             &mut containers,
@@ -401,6 +447,31 @@ impl ChestTransaction {
             dispatches,
         })
     }
+}
+
+fn warehouse_reservation_stock_survives(
+    floors: Option<&WarehouseReservationFloors>,
+    positions: &[mc_world::BlockPos],
+    updated: &[mc_world::ChestBlockEntity],
+) -> bool {
+    let Some(floors) = floors else {
+        return true;
+    };
+    let floors = floors.load();
+    positions.iter().zip(updated).all(|(position, chest)| {
+        let Some(required) = floors.get(position) else {
+            return true;
+        };
+        let mut available = BTreeMap::new();
+        for slot in &chest.slots {
+            if let Ok(count) = u64::try_from(slot.count) {
+                *available.entry(slot.item_id).or_insert(0) += count;
+            }
+        }
+        required
+            .iter()
+            .all(|(item_id, quantity)| available.get(item_id).copied().unwrap_or(0) >= *quantity)
+    })
 }
 
 impl FurnaceTransaction {
@@ -529,6 +600,18 @@ impl BucketUseTransaction {
             (None, Vec::new())
         };
 
+        if plan
+            .zone_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_current())
+        {
+            return Err(SimulationRequestError::Precommit(
+                mc_script::precommit::HookFailure::PermissionDenied,
+            ));
+        }
+        precommit::refuse_build_approval(&plan.hook_approval)
+            .map_err(SimulationRequestError::Precommit)?;
+
         let Some(block) = resident_block_edit_outcome(
             mutation,
             block_light,
@@ -655,6 +738,18 @@ impl SurvivalBreakTransaction {
             changed_slots.push((tool_slot, held.clone()));
         }
 
+        if plan
+            .zone_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_current())
+        {
+            return Err(SimulationRequestError::Precommit(
+                mc_script::precommit::HookFailure::PermissionDenied,
+            ));
+        }
+        precommit::refuse_build_approval(&plan.hook_approval)
+            .map_err(SimulationRequestError::Precommit)?;
+
         let Some(block) = resident_block_edit_outcome(
             mutation,
             block_light,
@@ -729,6 +824,18 @@ impl SurvivalPlacementTransaction {
             Vec::new()
         };
 
+        if plan
+            .zone_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_current())
+        {
+            return Err(SimulationRequestError::Precommit(
+                mc_script::precommit::HookFailure::PermissionDenied,
+            ));
+        }
+        precommit::refuse_build_approval(&plan.hook_approval)
+            .map_err(SimulationRequestError::Precommit)?;
+
         let Some(block) = resident_block_edit_outcome(
             mutation,
             block_light,
@@ -758,3 +865,7 @@ impl SurvivalPlacementTransaction {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "transactions_precommit_tests.rs"]
+mod precommit_tests;

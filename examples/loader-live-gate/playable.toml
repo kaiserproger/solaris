@@ -19,7 +19,7 @@ operators = []
 allow_local_dev_operators = false
 
 [plugins]
-directory = "examples/loader-live-gate/plugins"
+directory = ".analysis/loader-live-gate/plugins"
 
 [data]
 world_dir = ".analysis/loader-live-gate/world"

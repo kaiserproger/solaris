@@ -13,7 +13,7 @@ use mc_entity::{
     EntityWardenSonicBoomPhase, EntityWardenSonicBoomState, EntityWitchAttackState,
     EntityWitchPotionKind, GoalState, Rotation, SpawnEntity, Vec3,
 };
-use mc_world::BlockStateId;
+use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldReadView};
 
 #[cfg(test)]
 use crate::play::HOSTILE_FOLLOW_SPEED;
@@ -25,6 +25,7 @@ use crate::play::{
     SKELETON_BOW_COOLDOWN_TICKS, SKELETON_BOW_DRAW_TICKS, SKELETON_SHOT_RANGE,
 };
 
+use super::damage_precommit::PlayerDamageSource;
 #[cfg(test)]
 use super::entity_lifecycle::nearby_entity_snapshots_locked;
 use super::entity_lifecycle::{
@@ -1243,6 +1244,110 @@ pub(super) fn plan_bow_transition(
     })
 }
 
+/// A skeleton must have loaded, unoccluded terrain between its eye and the
+/// player's body before it starts or continues its bow attack.
+fn skeleton_has_clear_sight(
+    world: Option<&WorldReadView>,
+    blocks: &BlockRegistry,
+    hostile: Vec3,
+    target: Vec3,
+) -> bool {
+    let Some(world) = world else {
+        return false;
+    };
+    let from = Vec3::new(hostile.x, hostile.y + 1.5, hostile.z);
+    let to = Vec3::new(target.x, target.y + SKELETON_BOW_TARGET_Y_OFFSET, target.z);
+    skeleton_sight_cells(from, to, |cell| {
+        let state = world.get_cached_block(BlockPos {
+            x: cell[0],
+            y: cell[1],
+            z: cell[2],
+        })?;
+        let state = blocks.by_id(state)?;
+        Some(matches!(
+            state.block.id.path(),
+            "air"
+                | "cave_air"
+                | "void_air"
+                | "water"
+                | "glass"
+                | "glass_pane"
+                | "short_grass"
+                | "tall_grass"
+                | "torch"
+        ))
+    })
+}
+
+fn skeleton_sight_cells(
+    from: Vec3,
+    to: Vec3,
+    mut is_transparent: impl FnMut([i32; 3]) -> Option<bool>,
+) -> bool {
+    const MAX_SKELETON_SIGHT_AXIS_DISTANCE: i32 = 32;
+    if !from.is_finite() || !to.is_finite() {
+        return false;
+    }
+    let mut cell = [
+        from.x.floor() as i32,
+        from.y.floor() as i32,
+        from.z.floor() as i32,
+    ];
+    let target = [
+        to.x.floor() as i32,
+        to.y.floor() as i32,
+        to.z.floor() as i32,
+    ];
+    if cell
+        .iter()
+        .zip(target)
+        .any(|(from, to)| (to - from).abs() > MAX_SKELETON_SIGHT_AXIS_DISTANCE)
+    {
+        return false;
+    }
+    let delta = [to.x - from.x, to.y - from.y, to.z - from.z];
+    let mut direction = [0_i32; 3];
+    let mut next_crossing = [f64::INFINITY; 3];
+    let mut crossing_interval = [f64::INFINITY; 3];
+    for axis in 0..3 {
+        if delta[axis] > 0.0 {
+            direction[axis] = 1;
+            next_crossing[axis] =
+                (f64::from(cell[axis]) + 1.0 - [from.x, from.y, from.z][axis]) / delta[axis];
+            crossing_interval[axis] = 1.0 / delta[axis];
+        } else if delta[axis] < 0.0 {
+            direction[axis] = -1;
+            next_crossing[axis] =
+                ([from.x, from.y, from.z][axis] - f64::from(cell[axis])) / -delta[axis];
+            crossing_interval[axis] = 1.0 / -delta[axis];
+        }
+    }
+    loop {
+        if is_transparent(cell) != Some(true) {
+            return false;
+        }
+        if cell == target {
+            return true;
+        }
+        let crossing = next_crossing[0].min(next_crossing[1]).min(next_crossing[2]);
+        for axis in 0..3 {
+            if next_crossing[axis] == crossing {
+                cell[axis] += direction[axis];
+                next_crossing[axis] += crossing_interval[axis];
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn skeleton_sight_cells_for_test(
+    from: Vec3,
+    to: Vec3,
+    is_transparent: impl FnMut([i32; 3]) -> Option<bool>,
+) -> bool {
+    skeleton_sight_cells(from, to, is_transparent)
+}
+
 fn plan_warden_sonic_transition(
     hostile: &HostileAttackTickEntity,
     targets: &[HostileTargetTickSession],
@@ -1734,6 +1839,7 @@ impl SessionRegistry {
                                 amount: EVOKER_FANGS_DAMAGE,
                                 source_origin: Some(next.position),
                             },
+                            source: PlayerDamageSource::Entity(id),
                         },
                     });
                 }
@@ -1742,11 +1848,46 @@ impl SessionRegistry {
         dispatches
     }
 
+    #[cfg(test)]
     pub(in crate::play) fn tick_hostile_attacks(
+        &self,
+        authority: &SimulationAuthority,
+        tick: u64,
+        air: BlockStateId,
+    ) -> (usize, Vec<VisibilityDispatch>) {
+        self.tick_hostile_attacks_with_skeleton_sight(authority, tick, air, |_, _| true)
+    }
+
+    pub(in crate::play) fn tick_hostile_attacks_with_world_sight(
+        &self,
+        authority: &SimulationAuthority,
+        tick: u64,
+        air: BlockStateId,
+        world: Option<&WorldReadView>,
+        blocks: &BlockRegistry,
+    ) -> (usize, Vec<VisibilityDispatch>) {
+        self.tick_hostile_attacks_with_skeleton_sight(authority, tick, air, |hostile, target| {
+            skeleton_has_clear_sight(world, blocks, hostile, target)
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn tick_hostile_attacks_with_skeleton_sight_for_test(
+        &self,
+        authority: &SimulationAuthority,
+        tick: u64,
+        air: BlockStateId,
+        skeleton_sight: impl Fn(Vec3, Vec3) -> bool,
+    ) -> (usize, Vec<VisibilityDispatch>) {
+        self.tick_hostile_attacks_with_skeleton_sight(authority, tick, air, skeleton_sight)
+    }
+
+    fn tick_hostile_attacks_with_skeleton_sight(
         &self,
         _authority: &SimulationAuthority,
         tick: u64,
         air: BlockStateId,
+        skeleton_sight: impl Fn(Vec3, Vec3) -> bool,
     ) -> (usize, Vec<VisibilityDispatch>) {
         #[cfg(feature = "load-bench")]
         let metrics = &self.hostile_attack_phase_metrics;
@@ -1991,7 +2132,9 @@ impl SessionRegistry {
                     let target = targets
                         .iter()
                         .filter_map(|target| {
-                            if !target.visible_entities.contains(&hostile.id) {
+                            if !target.visible_entities.contains(&hostile.id)
+                                || !skeleton_sight(hostile.position, target.position)
+                            {
                                 return None;
                             }
                             let distance = distance_sq(hostile.position, target.position);
@@ -3379,6 +3522,7 @@ impl SessionRegistry {
                             amount: attack.magic_damage,
                             source_origin: Some(guardian.position),
                         },
+                        source: PlayerDamageSource::Entity(attack.hostile_id),
                     },
                 });
                 dispatches.push(VisibilityDispatch {
@@ -3389,6 +3533,7 @@ impl SessionRegistry {
                             amount: attack.attack_damage,
                             source_origin: Some(guardian.position),
                         },
+                        source: PlayerDamageSource::Entity(attack.hostile_id),
                     },
                 });
                 attacks += 1;
@@ -3473,6 +3618,7 @@ impl SessionRegistry {
                             amount: WARDEN_SONIC_DAMAGE,
                             source_origin: Some(warden.position),
                         },
+                        source: PlayerDamageSource::Entity(attack.hostile_id),
                     },
                 });
                 attacks += 1;
@@ -3557,6 +3703,7 @@ impl SessionRegistry {
                             amount: attack.amount,
                             source_origin: Some(hostile.position),
                         },
+                        source: PlayerDamageSource::Entity(attack.hostile_id),
                     },
                 });
                 let animation_recipients = recipients

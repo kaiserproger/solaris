@@ -12,7 +12,7 @@ repository.workspace = true
 workspace = true
 
 [features]
-load-bench = ["mc-script/lua-runtime", "mc-entity/load-bench"]
+load-bench = ["mc-entity/load-bench"]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -49,6 +49,7 @@ rustix = { version = "1.1", features = ["time"] }
 
 [dev-dependencies]
 mc-entity = { path = "../mc-entity" }
-mc-script = { path = "../mc-script", features = ["lua-runtime"] }
+mc-plugin-host = { path = "../mc-plugin-host" }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+wit-component = "0.259"
