@@ -12,13 +12,12 @@ MODE="build"
 
 usage() {
     printf '%s\n' \
-        'Usage: tools/build-loader-live-gate-fixture.sh [--check|--prepare|--audio]' \
+        'Usage: tools/build-loader-live-gate-fixture.sh [--check|--prepare]' \
         '' \
         '  (default)   regenerate the authored client bundles and package manifests' \
         '  --check     verify the authored outputs are exactly reproducible from source' \
         '  --prepare   verify the fixture, build the real SDK guest and stage the' \
-        '              deployable packages under .analysis/loader-live-gate/plugins' \
-        '  --audio     regenerate the tracked OGG tone sources (needs ffmpeg+libvorbis)'
+        '              deployable packages under .analysis/loader-live-gate/plugins'
 }
 
 if [[ $# -gt 1 ]]; then
@@ -32,9 +31,6 @@ if [[ $# -eq 1 ]]; then
             ;;
         --prepare)
             MODE="prepare"
-            ;;
-        --audio)
-            MODE="audio"
             ;;
         -h|--help)
             usage
@@ -63,12 +59,11 @@ sha256() {
     sha256sum "$1" | sed 's/[[:space:]].*$//'
 }
 
-# One fixture owner per row: its id, the item/block names its bundle declares,
-# the tone frequency the audio phase measures, and the Ogg page serial the
-# normalizer pins. One table, so a third owner is a row and not a second script.
+# One fixture owner per row: its id and the item/block names its bundle
+# declares. One table, so a third owner is a row and not a second script.
 owners() {
-    printf '%s %s %s %s\n' ruby-live ruby 440 1105
-    printf '%s %s %s %s\n' sapphire-live sapphire 660 1106
+    printf '%s %s\n' ruby-live ruby
+    printf '%s %s\n' sapphire-live sapphire
 }
 
 require_asset() {
@@ -76,75 +71,6 @@ require_asset() {
         printf 'Fixture source is missing: %s\n' "${1#"$REPO_ROOT"/}" >&2
         exit 1
     fi
-}
-
-# ---------------------------------------------------------------------------
-# Audio sources
-#
-# The two tones are the gate's measurement inputs: the audio phase reads a real
-# 48 kHz capture and requires a 440 Hz Ruby tone and a 660 Hz Sapphire tone. They
-# are authored sources, tracked next to the JSON assets and regenerated
-# byte-for-byte by `--audio`: ffmpeg synthesizes a mono 8 second sine and the
-# normalizer rewrites the Ogg page serial and checksum, which are the only bytes
-# ffmpeg leaves to chance.
-# ---------------------------------------------------------------------------
-normalize_ogg() {
-    python3 - "$1" "$2" <<'PYTHON'
-import struct
-import sys
-
-POLYNOMIAL = 0x04C11DB7
-TABLE = []
-for index in range(256):
-    value = index << 24
-    for _ in range(8):
-        value = (
-            ((value << 1) ^ POLYNOMIAL) & 0xFFFFFFFF
-            if value & 0x80000000
-            else (value << 1) & 0xFFFFFFFF
-        )
-    TABLE.append(value)
-
-
-def crc32(data):
-    state = 0
-    for byte in data:
-        state = ((state << 8) & 0xFFFFFFFF) ^ TABLE[((state >> 24) & 0xFF) ^ byte]
-    return state
-
-
-path = sys.argv[1]
-serial = int(sys.argv[2])
-raw = bytearray(open(path, "rb").read())
-offset = 0
-pages = 0
-while offset < len(raw):
-    if raw[offset:offset + 4] != b"OggS":
-        raise SystemExit(f"{path}: page {pages} does not start with OggS")
-    segments = raw[offset + 26]
-    body = offset + 27 + segments
-    end = body + sum(raw[offset + 27:body])
-    struct.pack_into("<I", raw, offset + 14, serial)
-    struct.pack_into("<I", raw, offset + 22, 0)
-    struct.pack_into("<I", raw, offset + 22, crc32(bytes(raw[offset:end])))
-    offset = end
-    pages += 1
-open(path, "wb").write(bytes(raw))
-PYTHON
-}
-
-build_audio() {
-    local owner frequency serial path
-    while read -r owner _item_name frequency serial; do
-        require_command ffmpeg
-        path="$PLUGIN_ROOT/$owner/client-src/assets/$owner/sounds/tone.ogg"
-        mkdir -p "$(dirname -- "$path")"
-        ffmpeg -nostdin -hide_banner -loglevel error -y \
-            -f lavfi -i "sine=frequency=$frequency:sample_rate=48000:duration=8" \
-            -ac 1 -map_metadata -1 -c:a libvorbis -q:a 3 "$path" < /dev/null
-        normalize_ogg "$path" "$serial"
-        printf 'Wrote %s.\n' "${path#"$REPO_ROOT"/}"
-    done < <(owners)
 }
 
 # ---------------------------------------------------------------------------
@@ -160,14 +86,12 @@ build_owner() {
     local stage_root="$FIXTURE_TMP/$owner-stage"
     local item_path="assets/$owner/items/$item_name.json"
     local block_path="assets/$owner/models/block/${item_name}_block.json"
-    local tone_path="assets/$owner/sounds/tone.ogg"
     local archive_output="$FIXTURE_TMP/$owner-rich-content.zip"
     local manifest_output="$FIXTURE_TMP/$owner-plugin.toml"
 
     require_asset "$source_root/solaris-client.json.in"
     require_asset "$source_root/$item_path"
     require_asset "$source_root/$block_path"
-    require_asset "$source_root/$tone_path"
     require_asset "$plugin_root/plugin.toml.in"
 
     mkdir -p "$stage_root"
@@ -178,8 +102,6 @@ build_owner() {
         -e "s/@ITEM_SIZE@/$(stat -c %s "$source_root/$item_path")/g" \
         -e "s/@BLOCK_SHA256@/$(sha256 "$source_root/$block_path")/g" \
         -e "s/@BLOCK_SIZE@/$(stat -c %s "$source_root/$block_path")/g" \
-        -e "s/@TONE_SHA256@/$(sha256 "$source_root/$tone_path")/g" \
-        -e "s/@TONE_SIZE@/$(stat -c %s "$source_root/$tone_path")/g" \
         "$source_root/solaris-client.json.in" > "$stage_root/solaris-client.json"
 
     find "$stage_root" -type f -exec chmod 0644 {} +
@@ -260,11 +182,6 @@ prepare_owner() {
     printf 'Staged %s.\n' "${deploy_root#"$REPO_ROOT"/}"
 }
 
-if [[ "$MODE" == "audio" ]]; then
-    build_audio
-    printf 'Regenerated the tracked Loader live-gate tones.\n'
-    exit 0
-fi
 
 FIXTURE_TMP="$(mktemp -d)"
 cleanup() {

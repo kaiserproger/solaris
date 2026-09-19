@@ -17,7 +17,7 @@
       "entries": [{"id": "sapphire", "label": "Sapphire"}]
     }, {
       "type": "action_button",
-      "action_id": "sapphire-live:confirm",
+      "action_id": "confirm",
       "label": "Confirm Sapphire"
     }]
   }, {
@@ -36,12 +36,7 @@
     "id": "sapphire-live:input",
     "kind": "hud",
     "title": "Sapphire input",
-    "widgets": [],
-    "input_bindings": [{
-      "key": "key.keyboard.g",
-      "press_action": "sapphire-live:key_press",
-      "release_action": "sapphire-live:key_release"
-    }]
+    "widgets": []
   }],
   "blocks": [{
     "id": "sapphire-live:sapphire_block",
@@ -63,13 +58,5 @@
     "path": "assets/sapphire-live/models/block/sapphire_block.json",
     "sha256": "@BLOCK_SHA256@",
     "size_bytes": @BLOCK_SIZE@
-  }, {
-    "id": "sapphire-live:sapphire_tone",
-    "path": "assets/sapphire-live/sounds/tone.ogg",
-    "sha256": "@TONE_SHA256@",
-    "size_bytes": @TONE_SIZE@
-  }],
-  "sounds": [{
-    "id": "sapphire-live:tone"
   }]
 }

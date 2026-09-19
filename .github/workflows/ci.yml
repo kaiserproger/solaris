@@ -46,10 +46,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       - run: python3 -m tools.harness run code-health
-
   test:
     name: cargo test
     runs-on: ubuntu-24.04
+    env:
+      SOLARIS_HARNESS_MEMORY_MAX: 8G
     defaults:
       run:
         working-directory: solaris
