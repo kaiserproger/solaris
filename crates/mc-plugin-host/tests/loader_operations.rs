@@ -1151,7 +1151,6 @@ async fn the_tracked_gate_fixture_is_discoverable_and_runnable_as_two_components
                 mc_script::ClientContentKind::Views,
                 mc_script::ClientContentKind::ViewActions,
                 mc_script::ClientContentKind::Assets,
-                mc_script::ClientContentKind::Sounds,
             ]
         );
         assert_eq!(
@@ -1162,7 +1161,6 @@ async fn the_tracked_gate_fixture_is_discoverable_and_runnable_as_two_components
                 mc_script::ClientPermission::PresentViews,
                 mc_script::ClientPermission::SendViewActions,
                 mc_script::ClientPermission::LoadAssets,
-                mc_script::ClientPermission::PlaySounds,
             ]
         );
         // The bytes the manifest pins are the bytes on disk, and the cache
