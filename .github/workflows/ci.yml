@@ -160,6 +160,11 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
+      - name: Capture scope kill evidence
+        if: failure()
+        run: |
+          sudo dmesg | grep -iE "oom|killed|out of memory" | tail -30 || true
+          sudo journalctl -b --no-pager -n 300 | grep -iE "oom|killed|memory" | tail -40 || true
 
   release-tools:
     name: Release tools
