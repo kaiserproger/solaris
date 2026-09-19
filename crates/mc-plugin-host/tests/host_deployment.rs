@@ -99,7 +99,18 @@ fn start_with_limits(
 }
 
 fn start(root: &Path, expected: &[&str]) -> mc_plugin_host::PluginHost {
-    start_with_limits(root, expected, PluginLimits::default())
+    // These tests own reload, routing and timer semantics, not guest budgets:
+    // the default watchdog (4 x 25ms) is for guests that misbehave, while a
+    // loaded CI runner can stall a legitimate init past it. Widen the
+    // wall-clock allowance without touching any other bound.
+    start_with_limits(
+        root,
+        expected,
+        PluginLimits {
+            epoch_ticks_per_call: 64,
+            ..PluginLimits::default()
+        },
+    )
 }
 
 fn broadcast_message(command: ScriptCommand) -> String {

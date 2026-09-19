@@ -57,11 +57,11 @@ cgroup, so each bound is a total, not a per-process, allowance.
 
 | Property | Default | Env |
 | --- | --- | --- |
-| `CPUQuota` (+`CPUWeight=50`) | `600%` | `SOLARIS_HARNESS_CPU_QUOTA` |
+| `CPUQuota` (+`CPUWeight=50`) | every physical core | `SOLARIS_HARNESS_CPU_QUOTA` |
 | `MemoryHigh` | `off` (no throttle) | `SOLARIS_HARNESS_MEMORY_HIGH` |
 | `MemoryMax` | `4G` | `SOLARIS_HARNESS_MEMORY_MAX` |
 | `MemorySwapMax` | `1G` | `SOLARIS_HARNESS_MEMORY_SWAP_MAX` |
-| libtest threads (`RUST_TEST_THREADS`) | quota ÷ 100 | `SOLARIS_HARNESS_TEST_THREADS` |
+| libtest threads (`RUST_TEST_THREADS`) | one per physical core | `SOLARIS_HARNESS_TEST_THREADS` |
 
 ```sh
 python3 -m tools.harness run correctness              # the defaults above
@@ -91,23 +91,21 @@ That refusal is not acceptance evidence — it means the gate did not run, and t
 receipt is the harness's own message rather than a profile result. Beyond it, an
 over-large run is killed inside its own scope (`oomd`/cgroup OOM) instead of
 dragging the desktop into swap: the run fails loudly, the session keeps running.
-Test threads follow the CPU quota because cargo's default is one thread per
-*machine* CPU while the run holds a fraction of them; each concurrent test
-carries its own in-process server and Lua host, so oversubscribing costs both
-wall time and most of the run's memory.
+Test threads are one per physical core (unique `(physical id, core id)` pairs
+from `/proc/cpuinfo`, falling back to the logical count); each concurrent test
+carries its own in-process server and component host, so oversubscribing costs
+both wall time and most of the run's memory.
 
-The CPU default keeps half the machine for the session and the memory caps are
-what actually protect it: measured on the owner workstation (12 CPUs, 15 GiB),
-the freezes were memory pressure and writeback (PSI `cpu full` stayed at 0), so
-the quota is generous while `MemoryMax` is the hard wall. Twelve spinners in a 4 s
+The CPU default is every physical core, and the memory caps are what actually
+protect the session: measured on the owner workstation (12 CPUs, 15 GiB), the
+freezes were memory pressure and writeback (PSI `cpu full` stayed at 0), so the
+quota is generous while `MemoryMax` is the hard wall. Twelve spinners in a 4 s
 window consume 45.6 CPU-seconds unbounded, 24.6 under `CPUQuota=600%` and 4.1
 under `CPUQuota=100%`; a full `test` phase peaks at 1.13 GiB (483 one-second
-samples of the scope's `memory.current`), which is what `MemoryMax` is sized from.
-The thread default
-is matched to the quota so each concurrent test keeps the same CPU share it has
-unbounded (quota ÷ 100 threads): a *tighter* quota with unmatched threads starves
-every individual test, which is how fixed 5 s packet waits start failing on
-machines that pass unbounded. A run without a user systemd scope prints a warning
+samples of the scope's `memory.current`), which is what `MemoryMax` is sized
+from. A *tighter* quota with unmatched threads starves every individual test,
+which is how fixed 5 s packet waits start failing on machines that pass
+unbounded. A run without a user systemd scope prints a warning
 and continues unbounded rather than failing closed, because the scope is a
 machine protection, not acceptance evidence; the receipt records the profile's
 own result either way.

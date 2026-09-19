@@ -352,8 +352,9 @@ run starts about a dozen test binaries at once, each with its own in-process
 server and Lua host; unbounded, that evicts the desktop into swap and the run
 stalls on page-in instead of on CPU, so every ``run``/``client`` invocation is
 placed in one bounded scope first. Every knob takes a systemd value or ``off``:
-``SOLARIS_HARNESS_CPU_QUOTA`` (default ``600%``), ``SOLARIS_HARNESS_MEMORY_HIGH``
-(default ``3G``), ``SOLARIS_HARNESS_MEMORY_MAX`` (default ``4G``),
+``SOLARIS_HARNESS_CPU_QUOTA`` (default: every physical core),
+``SOLARIS_HARNESS_MEMORY_HIGH`` (default ``3G``), ``SOLARIS_HARNESS_MEMORY_MAX``
+(default ``4G``),
 ``SOLARIS_HARNESS_MEMORY_SWAP_MAX`` (default ``1G``).
 
 The cap has to leave the session room, not just bound the run: ``systemd-oomd``
@@ -370,7 +371,38 @@ so a throttled scope is what feeds the kill rather than what avoids it.
 measured to peak at, so it is a hard wall rather than a working limit. And
 ``_exec_in_scope`` refuses to start while the machine has less free memory than
 the run is allowed to take."""
-DEFAULT_CPU_QUOTA = "600%"
+
+
+def _physical_cores() -> int:
+    """One thread per physical core, not per SMT sibling.
+
+    /proc/cpuinfo groups siblings by (physical id, core id); a unique pair is
+    one physical core. Fall back to the logical count when the kernel does not
+    expose the topology.
+    """
+    try:
+        cores = set()
+        physical = None
+        with open("/proc/cpuinfo", encoding="utf-8") as cpuinfo:
+            for line in cpuinfo:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                if key == "physical id":
+                    physical = value.strip()
+                elif key == "core id":
+                    cores.add((physical, value.strip()))
+        if cores:
+            return len(cores)
+    except OSError:
+        pass
+    return os.cpu_count() or 1
+
+
+def _default_cpu_quota() -> str:
+    """The whole machine's physical cores: ``1200%`` on a 12-core host."""
+    return f"{_physical_cores() * 100}%"
+
+
 DEFAULT_MEMORY_HIGH = "off"
 DEFAULT_MEMORY_MAX = "4G"
 DEFAULT_MEMORY_SWAP_MAX = "1G"
@@ -418,21 +450,17 @@ def _limit(value: str, env: str) -> str | None:
 
 
 def _test_threads(quota: str) -> int:
-    """libtest concurrency that matches the CPU the run is allowed.
+    """libtest concurrency: one thread per physical core the quota allows.
 
-    Cargo's test harness defaults to one test thread per CPU of the *machine*
-    while the run is confined to a CPU quota, so a binary's whole test set would
-    fight over the bound - and every concurrent test carries its own server and
-    Lua host, which is most of the memory a run holds. Derived from the quota
-    unless ``SOLARIS_HARNESS_TEST_THREADS`` names a value.
+    Every concurrent test carries its own in-process server and component
+    host, and one thread per physical core is the most real parallelism the
+    machine offers. ``SOLARIS_HARNESS_TEST_THREADS`` names a value instead.
     """
+    del quota
     explicit = os.environ.get(TEST_THREADS_ENV, "").strip()
     if explicit.isdigit() and int(explicit) > 0:
         return int(explicit)
-    percent = quota.strip().rstrip("%")
-    if percent.isdigit() and int(percent) > 0:
-        return max(1, int(percent) // 100)
-    return max(1, os.cpu_count() or 1)
+    return _physical_cores()
 
 
 def _scope_command(quota: str) -> list[str] | None:
@@ -480,7 +508,7 @@ def _exec_in_scope() -> int | None:
     """
     if os.environ.get(CPU_SCOPE_ENV):
         return None
-    quota = os.environ.get(CPU_QUOTA_ENV, DEFAULT_CPU_QUOTA).strip()
+    quota = os.environ.get(CPU_QUOTA_ENV, _default_cpu_quota()).strip()
     if quota.lower() in _OFF:
         return None
     memory_max = os.environ.get(MEMORY_MAX_ENV, DEFAULT_MEMORY_MAX)
