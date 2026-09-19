@@ -597,6 +597,8 @@ async fn stale_stair_dependency_rolls_back_break_tool_and_drop_publication() {
             position: Vec3::new(8.5, 64.5, 8.5),
             stack: EntityItemStack::new(9, 1),
         }],
+        hook_approval: None,
+        zone_fence: None,
     }));
     std::future::poll_fn(|context| {
         assert!(request.as_mut().poll(context).is_pending());

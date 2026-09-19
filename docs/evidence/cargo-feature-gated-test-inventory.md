@@ -4,6 +4,13 @@ Date: 2026-07-30
 
 Checkpoint base: `a20bfd6179d9942093b4eabfbefff02b46937e70`
 
+Historical inventory at the base above, not the current feature graph. WASM
+migration P1 moved retained Luau and its feature-only tests to
+`mc-plugin-host/legacy-luau`, removed VM features from `mc-script`, and stopped
+`mc-net/load-bench` from selecting a VM. The counts and commands below remain
+the original receipt; current acceptance is recorded in
+[`MEMORY.md`](../MEMORY.md).
+
 ## Scope
 
 This checkpoint inventories local Cargo features that can change first-party

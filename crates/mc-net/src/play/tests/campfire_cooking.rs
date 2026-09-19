@@ -755,16 +755,20 @@ async fn server_owned_block_edits_commit_one_batch_and_evict_replaced_campfire_c
     assert!(!sessions.campfire_cooking_state(campfire_pos).is_empty());
 
     let (handle, mut owner) = simulation_channel();
-    let mut request = Box::pin(handle.apply_server_owned_block_edits(vec![
-        BlockEdit {
-            pos: campfire_pos,
-            new_state: BlockStateId(2),
-        },
-        BlockEdit {
-            pos: planks_pos,
-            new_state: BlockStateId(2),
-        },
-    ]));
+    let mut request = Box::pin(handle.apply_server_owned_block_edits(
+        "test",
+        vec![
+            BlockEdit {
+                pos: campfire_pos,
+                new_state: BlockStateId(2),
+            },
+            BlockEdit {
+                pos: planks_pos,
+                new_state: BlockStateId(2),
+            },
+        ],
+        None,
+    ));
     std::future::poll_fn(|cx| {
         assert!(
             Future::poll(request.as_mut(), cx).is_pending(),
@@ -844,10 +848,14 @@ async fn server_owned_block_edits_reject_fenced_handle_without_mutation() {
     let fenced = handle.for_session(1);
     assert_eq!(
         fenced
-            .apply_server_owned_block_edits(vec![BlockEdit {
-                pos: campfire_pos,
-                new_state: BlockStateId(2),
-            }])
+            .apply_server_owned_block_edits(
+                "test",
+                vec![BlockEdit {
+                    pos: campfire_pos,
+                    new_state: BlockStateId(2),
+                }],
+                None,
+            )
             .await
             .unwrap_err(),
         SimulationRequestError::InvalidCommand
@@ -908,10 +916,14 @@ async fn server_owned_block_edits_evict_cooking_on_a_single_region_batch() {
     assert!(!sessions.campfire_cooking_state(campfire_pos).is_empty());
 
     let (handle, mut owner) = simulation_channel();
-    let mut request = Box::pin(handle.apply_server_owned_block_edits(vec![BlockEdit {
-        pos: campfire_pos,
-        new_state: BlockStateId(2),
-    }]));
+    let mut request = Box::pin(handle.apply_server_owned_block_edits(
+        "test",
+        vec![BlockEdit {
+            pos: campfire_pos,
+            new_state: BlockStateId(2),
+        }],
+        None,
+    ));
     std::future::poll_fn(|cx| {
         assert!(
             Future::poll(request.as_mut(), cx).is_pending(),
@@ -1003,10 +1015,14 @@ async fn server_owned_block_edits_publish_deltas_to_a_loaded_session() {
     dispatch_and_clear_setup_packets(sessions.mark_loaded(session_id, (0, 0)), &mut [&mut rx]);
 
     let (handle, mut owner) = simulation_channel();
-    let mut request = Box::pin(handle.apply_server_owned_block_edits(vec![BlockEdit {
-        pos: target,
-        new_state: BlockStateId(2),
-    }]));
+    let mut request = Box::pin(handle.apply_server_owned_block_edits(
+        "test",
+        vec![BlockEdit {
+            pos: target,
+            new_state: BlockStateId(2),
+        }],
+        None,
+    ));
     std::future::poll_fn(|cx| {
         assert!(
             Future::poll(request.as_mut(), cx).is_pending(),

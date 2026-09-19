@@ -36,6 +36,7 @@ fn deployment(root: &Path, expected: Vec<String>) -> DeploymentConfig {
         expected,
         grants: BTreeMap::new(),
         require_grants: false,
+        precommit_hooks: Vec::new(),
     }
 }
 

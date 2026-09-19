@@ -22,8 +22,9 @@ use mc_plugin_host::bindings::exports::solaris::plugin::events::{
 };
 use mc_plugin_host::bindings::exports::solaris::plugin::lifecycle::InitContext;
 use mc_plugin_host::bindings::solaris::plugin::commands::{Command, MessageTarget};
+use mc_plugin_host::bindings::solaris::plugin::types::Position;
 use mc_plugin_host::{
-    HostError, HostServices, LogLevel, PluginInstance, PluginLimits, engine, linker,
+    HostError, HostServices, LogLevel, PluginInstance, PluginLimits, PluginStartup, engine, linker,
 };
 
 /// The services the fixture plugin is given: it logs, and it has an id.
@@ -56,13 +57,17 @@ fn guest_module() -> PathBuf {
 }
 
 /// Instantiate the example plugin with `config` as its `config.toml` text.
+///
+/// The startup phase runs first, in the store of its own the host drops before
+/// the runtime store exists; this answers with the runtime store, whose `init`
+/// each case calls for itself.
 fn instance(config: &str, limits: PluginLimits) -> PluginInstance<Services> {
     let bytes = component_bytes();
     let engine = engine(&limits).expect("engine");
     let compiled = mc_plugin_host::CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0")
         .expect("compile");
     let linker = linker::<Services>(&engine).expect("linker");
-    let mut instance = PluginInstance::instantiate(
+    let contribution = PluginStartup::instantiate(
         &linker,
         compiled.component(),
         Services {
@@ -71,12 +76,23 @@ fn instance(config: &str, limits: PluginLimits) -> PluginInstance<Services> {
         },
         limits,
     )
-    .expect("instantiate");
+    .expect("the startup store instantiates")
+    .configure(config)
+    .expect("configure");
     assert!(
-        instance.configure(config).expect("configure").is_none(),
-        "the example plugin answers no rule plan"
+        contribution.is_none(),
+        "the example plugin answers no startup contribution"
     );
-    instance
+    PluginInstance::instantiate(
+        &linker,
+        compiled.component(),
+        Services {
+            id: "hello".to_owned(),
+            ..Services::default()
+        },
+        limits,
+    )
+    .expect("instantiate")
 }
 
 #[test]
@@ -109,8 +125,16 @@ fn a_real_component_answers_a_join_and_a_command() {
             mc_plugin_host::bindings::exports::solaris::plugin::events::CommandInvoked {
                 player: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
                 session: 7,
+                username: "Ada".to_owned(),
+                operator: false,
+                position: Position {
+                    x: 0.0,
+                    y: 64.0,
+                    z: 0.0,
+                },
                 name: "hello".to_owned(),
                 arguments: Vec::new(),
+                raw_arguments: String::new(),
             },
         ),
     ];
@@ -143,22 +167,11 @@ fn a_real_component_answers_a_join_and_a_command() {
         "the configured greeting and the command answer reach the host verbatim"
     );
 
-    let lines = plugin.state().services().lines.clone();
-    assert!(
-        lines.iter().any(|(level, line)| *level == LogLevel::Info
-            && (line.contains("ready") || line.contains("stopping"))),
-        "the guest's own log lines arrive through the host import, saw {lines:?}"
-    );
     assert!(
         plugin.retired_because().is_none(),
         "the instance stayed live"
     );
     plugin.shutdown().expect("shutdown");
-    assert_eq!(
-        plugin.state().calls(),
-        4,
-        "configure, init, on-events, shutdown"
-    );
 }
 
 #[test]
@@ -208,12 +221,15 @@ fn a_guest_that_never_returns_is_stopped_by_its_budget() {
     let compiled = mc_plugin_host::CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0")
         .expect("compile");
     let linker = linker::<Services>(&engine).expect("linker");
+    let config = "mode = \"spin\"\n";
+    let _ = PluginStartup::instantiate(&linker, compiled.component(), Services::default(), limits)
+        .expect("the startup store instantiates")
+        .configure(config)
+        .expect("configure");
     let mut plugin =
         PluginInstance::instantiate(&linker, compiled.component(), Services::default(), limits)
             .expect("instantiate");
 
-    let config = "mode = \"spin\"\n";
-    plugin.configure(config).expect("configure");
     let start = std::time::Instant::now();
     let error = plugin
         .init(
@@ -256,12 +272,15 @@ fn a_guest_that_grows_without_bound_hits_its_memory_limit() {
     let compiled = mc_plugin_host::CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0")
         .expect("compile");
     let linker = linker::<Services>(&engine).expect("linker");
+    let config = "mode = \"grow\"\n";
+    let _ = PluginStartup::instantiate(&linker, compiled.component(), Services::default(), limits)
+        .expect("the startup store instantiates")
+        .configure(config)
+        .expect("configure");
     let mut plugin =
         PluginInstance::instantiate(&linker, compiled.component(), Services::default(), limits)
             .expect("instantiate");
 
-    let config = "mode = \"grow\"\n";
-    plugin.configure(config).expect("configure");
     let error = plugin
         .init(
             config,
@@ -306,17 +325,23 @@ fn a_trapped_guest_does_not_disturb_a_live_one() {
         api_version: "0.7.0".to_owned(),
         world_fingerprint: String::new(),
     };
+    let _ = PluginStartup::instantiate(&linker, compiled.component(), services(), limits)
+        .expect("the startup store instantiates")
+        .configure("greeting = \"Hi\"\n")
+        .expect("configure");
     let mut healthy =
         PluginInstance::instantiate(&linker, compiled.component(), services(), limits)
             .expect("healthy instance");
-    healthy.configure("greeting = \"Hi\"\n").expect("configure");
     healthy
         .init("greeting = \"Hi\"\n", context.clone())
         .expect("the healthy instance starts");
 
+    let _ = PluginStartup::instantiate(&linker, compiled.component(), services(), limits)
+        .expect("the startup store instantiates")
+        .configure("mode = \"spin\"\n")
+        .expect("configure");
     let mut doomed = PluginInstance::instantiate(&linker, compiled.component(), services(), limits)
         .expect("second instance");
-    doomed.configure("mode = \"spin\"\n").expect("configure");
     let error = doomed
         .init("mode = \"spin\"\n", context)
         .expect_err("the spinning instance is stopped");

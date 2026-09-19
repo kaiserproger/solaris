@@ -123,6 +123,7 @@ async fn debug_give_zero_count_clears_hotbar_slot_before_item_lookup() {
     let mut writer = Vec::new();
     let mut survival_state = SurvivalState::FULL;
     let mut xp_state = XpState::default();
+    let sessions = Arc::clone(&state.sessions);
 
     apply_debug_command(
         &mut writer,
@@ -133,6 +134,9 @@ async fn debug_give_zero_count_clears_hotbar_slot_before_item_lookup() {
             hotbar_slot: 0,
         },
         DebugCommandContext {
+            sessions: &sessions,
+            session_id,
+            dimension: "minecraft:overworld",
             survival_state: &mut survival_state,
             xp_state: &mut xp_state,
             interaction: Some(&mut state),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -30,11 +31,8 @@ OWNER_SCREENS = (
     ("loader_sapphire", "Sapphire Loader Fixture", "Confirm Sapphire", 2),
 )
 PLATFORMS = ("fabric", "neoforge", "forge")
-SCREEN_CLASS = "dev.solaris.loader.minecraft.LoaderTextScreen"
-EXPECTED_BUNDLE_CACHE_FILES = [
-    "ruby-live/rich-content/1/8530c181143bc3f1bc4590b95738fae72fd6bf0eae38aac98ea1a3ee2e652158.bundle",
-    "sapphire-live/rich-content/1/faadec262fb69554d684b0ed6f239dfa35e3c261b5d07b486535d7cfd45a4d5b.bundle",
-]
+SCREEN_CLASS = "dev.solaris.loader.minecraft.LoaderViewScreen"
+FIXTURE_OWNERS = ("ruby-live", "sapphire-live")
 
 
 def confirm_loader_permission(client: Any, timeout_seconds: float) -> str:
@@ -271,6 +269,17 @@ def run(platform: str, timeout_seconds: float, artifact_dir: Path) -> dict[str, 
         f'world_dir = "{world_dir.relative_to(REPO_ROOT).as_posix()}"',
     )
     run_config.write_text(config_text)
+    fixture_root = REPO_ROOT / tomllib.loads(config_text)["plugins"]["directory"]
+    expected_bundle_cache_files = []
+    for owner in FIXTURE_OWNERS:
+        manifest = tomllib.loads((fixture_root / owner / "plugin.toml").read_text())
+        if manifest["id"] != owner:
+            raise RuntimeError(f"Loader fixture directory {owner} declares a different owner")
+        expected_bundle_cache_files.extend(
+            f"{owner}/{bundle['id']}/{bundle['version']}/{bundle['sha256']}.bundle"
+            for bundle in manifest["client"]["bundles"]
+        )
+    expected_bundle_cache_files.sort()
     token = f"solaris-loader-{platform}-{time.time_ns()}"
     mcp_port = runtime.reserve_port()
     username = {"fabric": "GateFabric", "neoforge": "GateNeoForge", "forge": "GateForge"}[platform]
@@ -288,6 +297,7 @@ def run(platform: str, timeout_seconds: float, artifact_dir: Path) -> dict[str, 
         "server_address": SERVER_ADDRESS,
         "mcp_port": mcp_port,
         "forge_early_window_control": False if platform == "forge" else None,
+        "expected_bundle_cache_files": expected_bundle_cache_files,
     }
     try:
         xvfb, display, xvfb_log = runtime.start_xvfb(artifact_dir)
@@ -439,7 +449,7 @@ def run(platform: str, timeout_seconds: float, artifact_dir: Path) -> dict[str, 
         result["bundle_cache_files"] = bundle_cache_files
         if not result["permission_file_exists"]:
             raise RuntimeError("Loader permission decision was not stored in the isolated game-dir cache")
-        if bundle_cache_files != EXPECTED_BUNDLE_CACHE_FILES:
+        if bundle_cache_files != expected_bundle_cache_files:
             raise RuntimeError(
                 "Loader cache identities do not match the exact Ruby/Sapphire fixture: "
                 + json.dumps(bundle_cache_files)

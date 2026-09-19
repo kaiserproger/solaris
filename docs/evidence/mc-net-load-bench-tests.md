@@ -2,13 +2,17 @@
 
 Scope: Phase 1 feature-gated test inventory for `crates/mc-net`.
 
-`mc-net` defines `load-bench` as a performance-harness boundary that also
-enables `mc-script/lua-runtime`. The feature exposes the benchmark-only server
-handle and reports, bulk entity seeding and readiness snapshots, per-command
-timing, and entity-goal phase diagnostics. These items are unavailable in the
-normal server build.
+`mc-net` defines `load-bench` as a performance-harness boundary. The feature
+exposes the benchmark-only server handle and reports, bulk entity seeding and
+readiness snapshots, per-command timing, and entity-goal phase diagnostics.
+These items are unavailable in the normal server build. Since WASM migration
+P1, it no longer enables a VM: retained Luau is selected by the server through
+`mc-plugin-host/legacy-luau`; `mc-net` uses that host only as a development
+dependency for integration coverage.
 
 ## Inventory
+
+The counts below are the historical inventory, not a refreshed P1 test count.
 
 Comparing the two Cargo test lists yields no additional tests:
 
@@ -31,7 +35,7 @@ suite, not a separate benchmark test count:
 | Public `LoadBenchHandle`, entity specification, seed/readiness/activity reports, and simulation-command statistics | `mc-net::server`; after changing the benchmark API or server wiring, the explicit feature suite must compile and pass while the default suite remains green. |
 | Bulk entity seeding plus readiness/activity snapshots | `mc-net::play::session::load_bench`; after changing session/entity ownership or visibility publication, the explicit feature suite must pass and the mapped entity-scale benchmark must be re-run only when performance evidence is required. |
 | Simulation command timing and entity-goal phase diagnostics | `mc-net::play::simulation` and `mc-net::play::session::entity_simulation`; after changing the instrumented command or goal pipeline, the explicit feature suite must compile without altering default-build behavior. Performance claims require the separately mapped benchmark, not this correctness gate. |
-| Luau runtime availability for the benchmark server | `mc-script/lua-runtime`; production runtime correctness remains owned by the explicit `mc-script` feature suite. The `mc-net` gate proves only that the benchmark-enabled network crate composes with it. |
+| Retained Luau runtime for integration coverage | `mc-plugin-host/legacy-luau`, selected by `mc-net` only as a development dependency. Runtime correctness belongs to the host feature suite; `load-bench` itself selects no VM. |
 
 No test in this classification becomes graphical, network-dependent,
 self-skipping, or dependent on local Mojang data when the feature is enabled.

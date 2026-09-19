@@ -619,6 +619,22 @@ async fn public_effect_ingress_commits_damage_heal_and_expiry_once() {
         damaged.publications.first(),
         Some(PublicationFact::DamageApplied { .. })
     ));
+    // Registered damage protection must not steal the reply for ordinary
+    // synchronous effect addition, healing, or expiry.
+    let (boundary, _endpoint) = mc_script::script_boundary_pair(
+        std::num::NonZeroUsize::new(4).unwrap(),
+        std::num::NonZeroUsize::new(4).unwrap(),
+    );
+    boundary
+        .set_precommit_hooks(vec![mc_script::precommit::HookRegistration::new(
+            "judge",
+            mc_script::precommit::HookKind::Damage,
+            0,
+            mc_script::precommit::HookFailurePolicy::Deny,
+        )])
+        .unwrap();
+    simulation.install_precommit_boundary(boundary.clone());
+    registry.install_precommit_boundary(boundary);
 
     let instant_health = EffectInstance::new(
         EffectId::new(6),
@@ -710,6 +726,7 @@ fn effect_ingress_preserves_capacity_rejection_without_publication() {
                 target_kind: TargetKind::NonPlayer,
                 death_remove_tick: 20,
             },
+            &mut None,
         );
         assert!(matches!(result, EntityEffectResult::Applied(_)));
         assert!(dispatches.is_empty());
@@ -731,6 +748,7 @@ fn effect_ingress_preserves_capacity_rejection_without_publication() {
             target_kind: TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
 
     assert_eq!(
@@ -786,6 +804,7 @@ fn rejected_effect_actions_preserve_exact_outcomes_without_mutation_or_publicati
                 target_kind: TargetKind::NonPlayer,
                 death_remove_tick: 20,
             },
+            &mut None,
         );
 
         assert_eq!(result, EntityEffectResult::Rejected(expected_rejection));
@@ -827,6 +846,7 @@ fn stale_and_dead_effect_heals_do_not_publish() {
             target_kind: TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
     assert_eq!(
         rejected,
@@ -867,6 +887,7 @@ fn stale_and_dead_effect_heals_do_not_publish() {
             target_kind: TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
     assert_eq!(
         rejected,
@@ -902,6 +923,7 @@ fn non_living_effect_heal_is_rejected_without_publication() {
             target_kind: TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
 
     assert_eq!(
@@ -951,6 +973,7 @@ fn missing_effect_heal_target_is_rejected_without_publication() {
             target_kind: TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
 
     assert_eq!(
@@ -993,6 +1016,7 @@ fn invalid_max_health_rejects_heal_without_mutation_or_publication() {
             target_kind: TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
 
     assert_eq!(

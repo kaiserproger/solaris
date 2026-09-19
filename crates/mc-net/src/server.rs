@@ -931,6 +931,10 @@ impl ScriptEventSink {
         self.boundary.enqueue_targeted_event(event).await
     }
 
+    pub(crate) fn plugin_is_active(&self, plugin_id: &str) -> bool {
+        self.boundary.plugin_is_active(plugin_id)
+    }
+
     pub(crate) async fn enqueue_required_event(
         &self,
         event: ScriptEvent,
@@ -1087,6 +1091,7 @@ fn spawn_script_commit_workers(
             failure_watcher: None,
         };
     };
+    sessions.install_precommit_boundary(scripts.boundary().clone());
     let events = sessions.install_script_commit_event_outbox();
     let failure = sessions.script_commit_event_monitor();
     let failure_shutdown = shutdown.clone();
@@ -1725,6 +1730,7 @@ impl BoundServer {
             runtime_control: runtime_control.clone(),
             simulation: simulation.clone(),
             scripts: scripts.clone(),
+            script_storage: script_storage.clone(),
             script_zones: script_zones.clone(),
         };
         let (entity_shutdown, entity_shutdown_requested) = tokio::sync::oneshot::channel();
@@ -4196,6 +4202,10 @@ async fn bind_internal(
     // structure portion commits as one server-owned command on it.
     let (simulation, mut simulation_owner) =
         play::simulation_channel_with_explosion_seed(config.random_tick.seed as i64);
+    if let Some(scripts) = scripts.as_ref() {
+        simulation.install_precommit_boundary(scripts.boundary().clone());
+        sessions.install_damage_precommit_handle(simulation.clone());
+    }
     // A deployed package that declares the settlement features and ships an
     // authored catalog owns the profile for this world. Validation happens
     // before the storage actor starts, so a catalog violation fails startup
@@ -4289,11 +4299,10 @@ async fn bind_internal(
             let read = world.lock().await.read_view();
             inventory = inventory.with_resident_world(Arc::new(
                 crate::play::resident_work::LiveResidentWorld::new(
-                    Arc::clone(world),
                     read,
                     Arc::clone(&config.blocks),
-                    config.block_light.clone(),
                     script_zones.clone(),
+                    simulation.clone(),
                     Arc::clone(&config.items),
                     Arc::clone(&config.item_facts),
                 ),
@@ -5183,7 +5192,7 @@ pub(crate) mod tests {
             "greetings",
             "Greetings",
             "0.1.0",
-            mc_script::SCRIPT_API_VERSION,
+            mc_script::COMPONENT_PLUGIN_API_VERSION,
         )
         .declare_player_command_root("hello")
         .validate()
@@ -5224,7 +5233,7 @@ pub(crate) mod tests {
             "greetings",
             "Greetings",
             "0.1.0",
-            mc_script::SCRIPT_API_VERSION,
+            mc_script::COMPONENT_PLUGIN_API_VERSION,
         )
         .declare_player_command_root("hello")
         .validate()

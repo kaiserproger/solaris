@@ -164,6 +164,28 @@ pub(super) fn is_chest_state(
         .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:chest")
 }
 
+pub(super) fn dispatch_chest_lid_event(
+    state: &InteractionState,
+    position: mc_world::BlockPos,
+    opener_count: u8,
+) {
+    let Some(block_state) = state.world_read.get_cached_block(position) else {
+        return;
+    };
+    let Some(block) = state
+        .blocks
+        .by_id(block_state)
+        .filter(|_| is_chest_state(state, block_state))
+    else {
+        return;
+    };
+    super::dispatch_visibility_commands(state.sessions.chest_lid_event_dispatches(
+        position,
+        block.block.raw_id,
+        opener_count,
+    ));
+}
+
 pub(super) fn is_barrel_state(
     state: &InteractionState,
     block_state: mc_world::BlockStateId,
@@ -297,9 +319,14 @@ pub(super) async fn store_active_container(
                 .unregister_furnace_viewer(state.session_id, window.position);
         }
         Some(ActiveContainer::Chest(window)) => {
-            state
-                .sessions
-                .unregister_chest_viewer(state.session_id, window.position());
+            for position in &window.positions {
+                if state
+                    .sessions
+                    .unregister_chest_viewer_with_lid_transition(state.session_id, *position)
+                {
+                    dispatch_chest_lid_event(state, *position, 0);
+                }
+            }
         }
         Some(ActiveContainer::CraftingTable(window)) => {
             if let Err(error) = settle_player_inventory_returns(

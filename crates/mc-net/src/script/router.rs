@@ -39,12 +39,6 @@ pub(crate) struct ScriptRouter {
 }
 
 impl ScriptRouter {
-    #[cfg(test)]
-    pub(crate) fn new(scripts: ScriptEventSink, storage: Option<PluginStorageHandle>) -> Self {
-        let zones = PluginZoneAdapter::new(scripts.clone());
-        Self::new_with_zones(scripts, storage, zones)
-    }
-
     pub(crate) fn new_with_zones(
         scripts: ScriptEventSink,
         storage: Option<PluginStorageHandle>,
@@ -293,8 +287,14 @@ impl ScriptRouter {
                 }
             }
             ScriptCommand::UpsertZone { .. } | ScriptCommand::RemoveZone { .. } => {
-                match self.zones.route_admitted_with_result(admitted).await {
-                    Ok(_) => {}
+                match self.zones.route_admitted_with_changed_zones(admitted).await {
+                    Ok((_, changed_zones)) => {
+                        if let Some(storage) = self.storage.as_ref() {
+                            for zone in changed_zones {
+                                storage.wake_resident_work_for_zone(zone).await;
+                            }
+                        }
+                    }
                     Err(super::zone::ZoneAdapterError::PublicationClosed) => {
                         return ScriptRouterExit::Stop;
                     }
@@ -430,21 +430,31 @@ impl ScriptRouter {
                 &config.blocks,
             ) {
                 None => Some(ScriptLoaderBlockPlacementFailure::NotOwned),
-                Some(state) => match simulation
-                    .place_loader_block_server_owned(
-                        mc_world::BlockPos {
-                            x: request.x(),
-                            y: request.y(),
-                            z: request.z(),
-                        },
-                        state,
-                    )
-                    .await
-                {
-                    Ok(true) => None,
-                    Ok(false) => Some(ScriptLoaderBlockPlacementFailure::Rejected),
-                    Err(error) => Some(script_loader_block_failure(error)),
-                },
+                Some(state) => {
+                    let position = mc_world::BlockPos {
+                        x: request.x(),
+                        y: request.y(),
+                        z: request.z(),
+                    };
+                    let zone_fence = self.zones.capture_protection_fence();
+                    if !zone_fence.allows("minecraft:overworld", position) {
+                        Some(ScriptLoaderBlockPlacementFailure::Rejected)
+                    } else {
+                        match simulation
+                            .place_loader_block_server_owned(
+                                admitted.plugin_id(),
+                                position,
+                                state,
+                                Some(zone_fence),
+                            )
+                            .await
+                        {
+                            Ok(true) => None,
+                            Ok(false) => Some(ScriptLoaderBlockPlacementFailure::Rejected),
+                            Err(error) => Some(script_loader_block_failure(error)),
+                        }
+                    }
+                }
             }
         };
         let event = match admitted.loader_block_placement_result(failure) {
@@ -515,7 +525,11 @@ impl ScriptRouter {
         let entity_id = i32::try_from(request.entity_id().value())
             .expect("validated script entity id fits the simulation wire id");
         let (health, killed, failure) = match simulation
-            .damage_script_entity(mc_entity::EntityId(entity_id), request.amount())
+            .damage_script_entity(
+                mc_entity::EntityId(entity_id),
+                request.amount(),
+                admitted.plugin_id(),
+            )
             .await
         {
             Ok(Some(committed)) => (Some(committed.health), committed.killed, None),
@@ -547,16 +561,32 @@ impl ScriptRouter {
             debug!("invalid admitted world-block command rejected");
             return ScriptRouterExit::Continue;
         };
+        let wake = (
+            request.dimension().to_owned(),
+            [request.x().div_euclid(16), request.z().div_euclid(16)],
+        );
         let result = match resolve_world_block_request(request, blocks) {
             Err(failure) => (false, Some(failure)),
-            Ok((position, state)) => match simulation
-                .place_loader_block_server_owned(position, state)
-                .await
-            {
-                Ok(true) => (true, None),
-                Ok(false) => (false, Some(ScriptWorldBlockSetFailure::Rejected)),
-                Err(error) => (false, Some(script_world_block_failure(error))),
-            },
+            Ok((position, state)) => {
+                let zone_fence = self.zones.capture_protection_fence();
+                if !zone_fence.allows("minecraft:overworld", position) {
+                    (false, Some(ScriptWorldBlockSetFailure::Rejected))
+                } else {
+                    match simulation
+                        .place_loader_block_server_owned(
+                            admitted.plugin_id(),
+                            position,
+                            state,
+                            Some(zone_fence),
+                        )
+                        .await
+                    {
+                        Ok(true) => (true, None),
+                        Ok(false) => (false, Some(ScriptWorldBlockSetFailure::Rejected)),
+                        Err(error) => (false, Some(script_world_block_failure(error))),
+                    }
+                }
+            }
         };
         let event = match admitted.world_block_set_result(result.0, result.1) {
             Ok(event) => event,
@@ -566,7 +596,14 @@ impl ScriptRouter {
             }
         };
         match deliver_required_targeted_event(&self.scripts, event).await {
-            TargetedEventDelivery::Delivered => ScriptRouterExit::Continue,
+            TargetedEventDelivery::Delivered => {
+                if result.0
+                    && let Some(storage) = self.storage.as_ref()
+                {
+                    storage.wake_resident_work(wake.0, vec![wake.1]).await;
+                }
+                ScriptRouterExit::Continue
+            }
             TargetedEventDelivery::Closed | TargetedEventDelivery::Shutdown => {
                 ScriptRouterExit::Stop
             }
@@ -792,262 +829,7 @@ fn disconnect(sessions: &play::SessionRegistry, player_id: u64, reason: String) 
 
 #[cfg(test)]
 mod loader_mutation_tests {
-    use std::collections::BTreeMap;
-    use std::fs;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use mc_data::Identifier;
-    use mc_script::{LuaHostConfig, ScriptEvent, start_lua_host};
-    use mc_world::{BlockPos, Chunk, ChunkPos, WorldStorage};
-
     use super::*;
-    use crate::loader::{
-        LOADER_PROTOCOL_VERSION, LoaderBundle, LoaderContentKind, LoaderManifest, LoaderPermission,
-        LoaderPlatform,
-    };
-
-    fn loader_manifest(owner: &str) -> LoaderManifest {
-        LoaderManifest {
-            protocol: LOADER_PROTOCOL_VERSION,
-            bundles: vec![LoaderBundle {
-                owner: owner.to_owned(),
-                id: "ruby".to_owned(),
-                version: "1".to_owned(),
-                artifact: "client/ruby.zip".to_owned(),
-                sha256: "a".repeat(64),
-                size_bytes: 1,
-                loaders: vec![LoaderPlatform::Fabric],
-                content: vec![LoaderContentKind::Blocks],
-                permissions: vec![LoaderPermission::RegisterBlocks],
-                cache_key: format!("{owner}:ruby/1/{}", "a".repeat(64)),
-                view_kinds: Vec::new(),
-                source_path: None,
-                artifact_bytes: None,
-                block_id: Some(format!("{owner}:ruby_block")),
-                block_name: Some("Ruby Block".to_owned()),
-            }],
-        }
-    }
-
-    fn loader_blocks(manifest: &LoaderManifest) -> Arc<mc_world::BlockRegistry> {
-        let mut report = vec![mc_data::blocks::BlockReport {
-            id: Identifier::parse("minecraft:air").unwrap(),
-            properties: BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id: 0,
-                default: true,
-                properties: BTreeMap::new(),
-            }],
-        }];
-        manifest.append_world_block_report(&mut report).unwrap();
-        Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap())
-    }
-
-    fn loader_config(
-        manifest: LoaderManifest,
-        blocks: Arc<mc_world::BlockRegistry>,
-    ) -> ServerConfig {
-        ServerConfig {
-            tab_list: crate::server::TabListConfig::default(),
-            bind_address: "127.0.0.1:0".parse().unwrap(),
-            motd: "loader mutation plugin test".to_owned(),
-            max_players: 4,
-            view_distance: 2,
-            data: Arc::new(mc_data::testing::stub()),
-            blocks,
-            world: None,
-            tags: Arc::new(mc_data::tags::TagsData::default()),
-            recipes: Arc::new(Vec::new()),
-            loot: Arc::new(mc_data::loot::LootTables::default()),
-            block_light: None,
-            items: Arc::new(mc_data::items::solaris_required_items()),
-            item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
-            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            chunk_pipeline: crate::ChunkPipelinePolicy::default(),
-            random_tick: play::RandomTickPolicy::default(),
-            command_permissions: crate::server::CommandPermissionConfig::new(
-                Vec::<String>::new(),
-                true,
-            ),
-            loader_manifest: Some(Arc::new(manifest)),
-            shutdown: ShutdownHandle::default(),
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn loader_block_placement_returns_targeted_result_after_owner_commit() {
-        let owner_id = "loader-plugin";
-        let manifest = loader_manifest(owner_id);
-        let blocks = loader_blocks(&manifest);
-        let config = loader_config(manifest, Arc::clone(&blocks));
-        let custom = blocks
-            .block(&Identifier::parse("loader-plugin:ruby_block").unwrap())
-            .unwrap()
-            .default;
-        let air = blocks
-            .block(&Identifier::parse("minecraft:air").unwrap())
-            .unwrap()
-            .default;
-        let chunk = ChunkPos { x: 0, z: 0 };
-        let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
-        storage
-            .insert_generated_chunk(
-                chunk,
-                Chunk::empty(chunk, air, Identifier::parse("minecraft:plains").unwrap()),
-            )
-            .unwrap();
-        let world = Arc::new(tokio::sync::Mutex::new(storage));
-
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join(owner_id);
-        fs::create_dir(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "loader-plugin"
-name = "Loader Plugin"
-version = "0.1.0"
-api = "0.6.0"
-events = ["server.started"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.lua"),
-            r#"
-                function on_server_started(_event)
-                    solaris.place_loader_block("place-ruby", "loader-plugin:ruby_block", 1, 64, 1)
-                end
-
-                function on_loader_block_placement_result(event)
-                    solaris.broadcast(tostring(event.placed) .. ":" .. tostring(event.failure))
-                end
-            "#,
-        )
-        .unwrap();
-
-        let (boundary, host) =
-            start_lua_host(LuaHostConfig::new(plugins.path()).strict_discovery(true)).unwrap();
-        let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
-        boundary
-            .try_enqueue_event(ScriptEvent::server_started())
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        let sessions = play::SessionRegistry::new();
-        let (simulation, mut simulation_owner) = play::simulation_channel();
-        let (route_exit, ()) = tokio::join!(
-            router.route_loader_block_admitted(admitted, &config, &simulation),
-            async {
-                assert!(simulation_owner.wait_for_command().await);
-                assert_eq!(simulation.snapshot().depth, 1);
-                simulation_owner
-                    .process_commands_with_world(&sessions, Some(&world), None, 1)
-                    .await;
-            }
-        );
-        assert_eq!(route_exit, ScriptRouterExit::Continue);
-        assert_eq!(
-            world
-                .lock()
-                .await
-                .get_cached_block(BlockPos { x: 1, y: 64, z: 1 }),
-            Some(custom)
-        );
-
-        let result_command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let result = boundary.accept_host_command(result_command).unwrap();
-        assert!(matches!(
-            result.request(),
-            ScriptCommand::BroadcastChatMessage { message } if message == "true:nil"
-        ));
-
-        drop(router);
-        drop(boundary);
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn loader_item_grant_returns_targeted_player_unavailable_result() {
-        let owner_id = "loader-plugin";
-        let manifest = loader_manifest(owner_id);
-        let blocks = loader_blocks(&manifest);
-        let config = loader_config(manifest, blocks);
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join(owner_id);
-        fs::create_dir(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "loader-plugin"
-name = "Loader Plugin"
-version = "0.1.0"
-api = "0.6.0"
-events = ["server.started"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.lua"),
-            r#"
-                function on_server_started(_event)
-                    solaris.grant_loader_block_item("grant-ruby", 7, "loader-plugin:ruby_block", 1)
-                end
-
-                function on_loader_item_grant_result(event)
-                    solaris.broadcast(tostring(event.granted) .. ":" .. tostring(event.failure))
-                end
-            "#,
-        )
-        .unwrap();
-
-        let (boundary, host) =
-            start_lua_host(LuaHostConfig::new(plugins.path()).strict_discovery(true)).unwrap();
-        let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
-        boundary
-            .try_enqueue_event(ScriptEvent::server_started())
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        let sessions = play::SessionRegistry::new();
-        assert_eq!(
-            router
-                .route_loader_item_grant_admitted(admitted, &config, &sessions)
-                .await,
-            ScriptRouterExit::Continue
-        );
-
-        let result_command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let result = boundary.accept_host_command(result_command).unwrap();
-        assert!(matches!(
-            result.request(),
-            ScriptCommand::BroadcastChatMessage { message }
-                if message == "false:player_unavailable"
-        ));
-
-        drop(router);
-        drop(boundary);
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-    }
 
     #[test]
     fn loader_failure_categories_are_stable() {
@@ -1089,191 +871,8 @@ events = ["server.started"]
 
 #[cfg(test)]
 mod entity_damage_tests {
-    use std::fs;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use mc_script::{LuaHostConfig, ScriptEvent, start_lua_host};
 
     use super::*;
-
-    fn combat_test_config() -> ServerConfig {
-        ServerConfig {
-            tab_list: crate::server::TabListConfig::default(),
-            bind_address: "127.0.0.1:0".parse().unwrap(),
-            motd: "entity combat plugin test".to_owned(),
-            max_players: 4,
-            view_distance: 2,
-            data: Arc::new(mc_data::testing::stub()),
-            blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
-            world: None,
-            tags: Arc::new(mc_data::tags::TagsData::default()),
-            recipes: Arc::new(Vec::new()),
-            loot: Arc::new(mc_data::loot::LootTables::default()),
-            block_light: None,
-            items: Arc::new(mc_data::items::ItemRegistry::default()),
-            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            chunk_pipeline: crate::ChunkPipelinePolicy::default(),
-            random_tick: play::RandomTickPolicy::default(),
-            command_permissions: crate::server::CommandPermissionConfig::new(
-                Vec::<String>::new(),
-                true,
-            ),
-            loader_manifest: None,
-            shutdown: ShutdownHandle::default(),
-        }
-    }
-
-    async fn route_damage(
-        router: &ScriptRouter,
-        admitted: AdmittedScriptCommand,
-        simulation: &play::SimulationHandle,
-        owner: &mut play::SimulationOwner,
-        sessions: &play::SessionRegistry,
-    ) -> ScriptRouterExit {
-        let (route_exit, ()) = tokio::join!(
-            router.route_entity_damage_admitted(admitted, simulation),
-            async {
-                assert!(owner.wait_for_command().await);
-                assert_eq!(simulation.snapshot().depth, 1);
-                assert_eq!(owner.process_tick(sessions, 1).processed, 1);
-            }
-        );
-        route_exit
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn entity_damage_routes_through_generic_combat_owner_and_returns_targeted_results() {
-        let config = combat_test_config();
-        let sessions = play::SessionRegistry::new();
-        let cow_type = resolve_script_entity_type(&config, "minecraft:cow").unwrap();
-        let hurt = sessions.spawn_script_router_test_entity(
-            cow_type,
-            "minecraft:cow",
-            mc_entity::Vec3::new(1.5, 64.0, 1.5),
-        );
-        let kill = sessions.spawn_script_router_test_entity(
-            cow_type,
-            "minecraft:cow",
-            mc_entity::Vec3::new(3.5, 64.0, 1.5),
-        );
-        let hurt_before = sessions.authoritative_entity_snapshot(hurt).unwrap().health;
-        let kill_before = sessions.authoritative_entity_snapshot(kill).unwrap().health;
-        assert!(hurt_before > 2.0);
-        assert!(kill_before > 0.0);
-
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join("combat-plugin");
-        fs::create_dir(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "combat-plugin"
-name = "Combat Plugin"
-version = "0.1.0"
-api = "0.6.0"
-events = ["server.started"]
-capabilities = ["entity_damage"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.lua"),
-            format!(
-                r#"
-                    function on_server_started(_event)
-                        solaris.damage_entity("hurt", {hurt}, 2.0)
-                        solaris.damage_entity("kill", {kill}, 1000000.0)
-                        solaris.damage_entity("missing", 2147483647, 1.0)
-                    end
-
-                    function on_entity_damage_result(event)
-                        if event.request_id == "hurt" then
-                            assert(event.damaged == true)
-                            assert(event.health ~= nil)
-                            assert(event.killed == false)
-                            assert(event.failure == nil)
-                            solaris.broadcast("hurt-ok")
-                        elseif event.request_id == "kill" then
-                            assert(event.damaged == true)
-                            assert(event.health == 0)
-                            assert(event.killed == true)
-                            assert(event.failure == nil)
-                            solaris.broadcast("kill-ok")
-                        elseif event.request_id == "missing" then
-                            assert(event.damaged == false)
-                            assert(event.health == nil)
-                            assert(event.killed == false)
-                            assert(event.failure == "rejected")
-                            solaris.broadcast("missing-ok")
-                        end
-                    end
-                "#,
-                hurt = hurt.0,
-                kill = kill.0,
-            ),
-        )
-        .unwrap();
-
-        let (boundary, host) =
-            start_lua_host(LuaHostConfig::new(plugins.path()).strict_discovery(true)).unwrap();
-        let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
-        boundary
-            .try_enqueue_event(ScriptEvent::server_started())
-            .unwrap();
-
-        let mut admitted = Vec::new();
-        for expected in ["hurt", "kill", "missing"] {
-            let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-                .await
-                .unwrap()
-                .unwrap();
-            let command = boundary.accept_host_command(command).unwrap();
-            assert!(matches!(
-                command.request(),
-                ScriptCommand::DamageEntity { request } if request.request_id() == expected
-            ));
-            admitted.push(command);
-        }
-
-        let (simulation, mut owner) = play::simulation_channel();
-        for (command, expected_ack) in
-            admitted
-                .into_iter()
-                .zip(["hurt-ok", "kill-ok", "missing-ok"])
-        {
-            assert_eq!(
-                route_damage(&router, command, &simulation, &mut owner, &sessions).await,
-                ScriptRouterExit::Continue
-            );
-            let callback = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-                .await
-                .unwrap()
-                .unwrap();
-            let callback = boundary.accept_host_command(callback).unwrap();
-            assert!(matches!(
-                callback.request(),
-                ScriptCommand::BroadcastChatMessage { message } if message == expected_ack
-            ));
-        }
-
-        assert_eq!(
-            sessions.authoritative_entity_snapshot(hurt).unwrap().health,
-            hurt_before - 2.0
-        );
-        let killed = sessions.authoritative_entity_snapshot(kill).unwrap();
-        assert_eq!(killed.health, 0.0);
-        assert_ne!(killed.lifecycle, mc_entity::EntityLifecycle::Alive);
-
-        drop(router);
-        drop(boundary);
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-    }
 
     #[test]
     fn entity_damage_failure_categories_are_stable() {
@@ -1316,215 +915,8 @@ capabilities = ["entity_damage"]
 
 #[cfg(test)]
 mod entity_spawn_tests {
-    use std::fs;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use mc_script::{
-        LuaHostConfig, ScriptEvent, ScriptPlayerContext, ScriptPlayerId, start_lua_host,
-    };
 
     use super::*;
-
-    fn spawn_test_config() -> ServerConfig {
-        ServerConfig {
-            tab_list: crate::server::TabListConfig::default(),
-            bind_address: "127.0.0.1:0".parse().unwrap(),
-            motd: "entity spawn plugin test".to_owned(),
-            max_players: 4,
-            view_distance: 2,
-            data: Arc::new(mc_data::testing::stub()),
-            blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
-            world: None,
-            tags: Arc::new(mc_data::tags::TagsData::default()),
-            recipes: Arc::new(Vec::new()),
-            loot: Arc::new(mc_data::loot::LootTables::default()),
-            block_light: None,
-            items: Arc::new(mc_data::items::ItemRegistry::default()),
-            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            chunk_pipeline: crate::ChunkPipelinePolicy::default(),
-            random_tick: play::RandomTickPolicy::default(),
-            command_permissions: crate::server::CommandPermissionConfig::new(
-                Vec::<String>::new(),
-                true,
-            ),
-            loader_manifest: None,
-            shutdown: ShutdownHandle::default(),
-        }
-    }
-
-    fn register_actor(registry: &play::SessionRegistry) -> u64 {
-        registry.register_script_router_test_session("EntityActor")
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn entity_spawn_routes_through_owner_and_returns_targeted_result() {
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join("entity-plugin");
-        fs::create_dir(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "entity-plugin"
-name = "Entity Plugin"
-version = "0.1.0"
-api = "0.6.0"
-events = ["player.joined"]
-spawn_entities = ["minecraft:pig"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.lua"),
-            r#"
-                function on_player_joined(event)
-                    solaris.spawn_entity("spawn-pig", event.player_id, "minecraft:pig", 2.5, 64.0, 1.5)
-                end
-
-                function on_entity_spawn_result(event)
-                    solaris.broadcast(tostring(event.request_id) .. ":" .. tostring(event.failure))
-                end
-            "#,
-        )
-        .unwrap();
-
-        let (boundary, host) =
-            start_lua_host(LuaHostConfig::new(plugins.path()).strict_discovery(true)).unwrap();
-        let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
-        let config = spawn_test_config();
-        let sessions = play::SessionRegistry::new();
-        let actor = register_actor(&sessions);
-        boundary
-            .try_enqueue_event(ScriptEvent::player_joined_with_context(
-                ScriptPlayerId::new(actor),
-                ScriptPlayerContext::new(
-                    crate::login::offline_uuid("EntityActor").to_string(),
-                    "EntityActor",
-                    false,
-                    0.5,
-                    64.0,
-                    0.5,
-                ),
-            ))
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        let (simulation, mut owner) = play::simulation_channel();
-        let (route_exit, ()) = tokio::join!(
-            router.route_entity_spawn_admitted(admitted, &config, &simulation),
-            async {
-                assert!(owner.wait_for_command().await);
-                assert_eq!(simulation.snapshot().depth, 1);
-                assert_eq!(owner.process_tick(&sessions, 1).processed, 1);
-            }
-        );
-        assert_eq!(route_exit, ScriptRouterExit::Continue);
-        assert!(sessions.persisted_entity_records().iter().any(|entity| {
-            entity.snapshot.type_name == "minecraft:pig"
-                && entity.snapshot.position == mc_entity::Vec3::new(2.5, 64.0, 1.5)
-        }));
-
-        let result_command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let result = boundary.accept_host_command(result_command).unwrap();
-        assert!(matches!(
-            result.request(),
-            ScriptCommand::BroadcastChatMessage { message } if message == "spawn-pig:nil"
-        ));
-
-        drop(router);
-        drop(boundary);
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn unknown_entity_type_returns_targeted_failure_without_owner_mutation() {
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join("entity-plugin");
-        fs::create_dir(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "entity-plugin"
-name = "Entity Plugin"
-version = "0.1.0"
-api = "0.6.0"
-events = ["player.joined"]
-spawn_entities = ["minecraft:not_registered"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.lua"),
-            r#"
-                function on_player_joined(event)
-                    solaris.spawn_entity("missing-type", event.player_id, "minecraft:not_registered", 2.5, 64.0, 1.5)
-                end
-
-                function on_entity_spawn_result(event)
-                    solaris.broadcast(tostring(event.failure))
-                end
-            "#,
-        )
-        .unwrap();
-
-        let (boundary, host) =
-            start_lua_host(LuaHostConfig::new(plugins.path()).strict_discovery(true)).unwrap();
-        let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
-        let config = spawn_test_config();
-        boundary
-            .try_enqueue_event(ScriptEvent::player_joined_with_context(
-                ScriptPlayerId::new(7),
-                ScriptPlayerContext::new(
-                    "00000000-0000-0000-0000-000000000007",
-                    "EntityActor",
-                    false,
-                    0.5,
-                    64.0,
-                    0.5,
-                ),
-            ))
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        let (simulation, _owner) = play::simulation_channel();
-        assert_eq!(
-            router
-                .route_entity_spawn_admitted(admitted, &config, &simulation)
-                .await,
-            ScriptRouterExit::Continue
-        );
-        assert_eq!(simulation.snapshot().depth, 0);
-
-        let result_command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let result = boundary.accept_host_command(result_command).unwrap();
-        assert!(matches!(
-            result.request(),
-            ScriptCommand::BroadcastChatMessage { message } if message == "unknown_entity_type"
-        ));
-
-        drop(router);
-        drop(boundary);
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-    }
 
     #[test]
     fn entity_spawn_failure_categories_are_stable() {
@@ -1570,147 +962,10 @@ spawn_entities = ["minecraft:not_registered"]
 
 #[cfg(test)]
 mod world_block_tests {
-    use std::fs;
-    use std::sync::Arc;
-    use std::time::Duration;
-
     use mc_data::Identifier;
-    use mc_script::{LuaHostConfig, ScriptEvent, start_lua_host};
-    use mc_world::{BlockPos, BlockRegistry, Chunk, ChunkPos, WorldStorage};
+    use mc_world::{BlockPos, BlockRegistry};
 
     use super::*;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn world_block_command_routes_through_owner_and_returns_targeted_result() {
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join("block-plugin");
-        fs::create_dir(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "block-plugin"
-name = "Block Plugin"
-version = "0.1.0"
-api = "0.6.0"
-events = ["server.started"]
-capabilities = ["world_blocks"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.lua"),
-            r#"
-                function on_server_started(_event)
-                    solaris.set_block("set-stone", "minecraft:overworld", "minecraft:stone", 1, 64, 1)
-                end
-
-                function on_world_block_set_result(event)
-                    solaris.broadcast(tostring(event.applied))
-                end
-            "#,
-        )
-        .unwrap();
-
-        let (boundary, host) =
-            start_lua_host(LuaHostConfig::new(plugins.path()).strict_discovery(true)).unwrap();
-        assert_eq!(host.loaded_plugins(), 1);
-        let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
-        boundary
-            .try_enqueue_event(ScriptEvent::server_started())
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        assert_eq!(admitted.plugin_id(), "block-plugin");
-
-        let blocks = Arc::new(
-            BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
-        );
-        let air = blocks
-            .block(&Identifier::parse("minecraft:air").unwrap())
-            .unwrap()
-            .default;
-        let stone = blocks
-            .block(&Identifier::parse("minecraft:stone").unwrap())
-            .unwrap()
-            .default;
-        let chunk = ChunkPos { x: 0, z: 0 };
-        let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
-        storage
-            .insert_generated_chunk(
-                chunk,
-                Chunk::empty(chunk, air, Identifier::parse("minecraft:plains").unwrap()),
-            )
-            .unwrap();
-        let world = Arc::new(tokio::sync::Mutex::new(storage));
-        let sessions = play::SessionRegistry::new();
-        let (simulation, mut owner) = play::simulation_channel();
-        let (route_exit, ()) = tokio::join!(
-            router.route_world_block_admitted(admitted, blocks.as_ref(), &simulation),
-            async {
-                assert!(owner.wait_for_command().await);
-                assert_eq!(simulation.snapshot().depth, 1);
-                owner
-                    .process_commands_with_world(&sessions, Some(&world), None, 1)
-                    .await;
-            }
-        );
-        assert_eq!(route_exit, ScriptRouterExit::Continue);
-        assert_eq!(
-            world
-                .lock()
-                .await
-                .get_cached_block(BlockPos { x: 1, y: 64, z: 1 }),
-            Some(stone)
-        );
-
-        let result_command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let result = boundary.accept_host_command(result_command).unwrap();
-        assert!(matches!(
-            result.request(),
-            ScriptCommand::BroadcastChatMessage { message } if message == "true"
-        ));
-
-        boundary
-            .try_enqueue_event(ScriptEvent::server_started())
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        let (route_exit, ()) = tokio::join!(
-            router.route_world_block_admitted(admitted, blocks.as_ref(), &simulation),
-            async {
-                assert!(owner.wait_for_command().await);
-                assert_eq!(simulation.snapshot().depth, 1);
-                owner
-                    .process_commands_with_world(&sessions, Some(&world), None, 1)
-                    .await;
-            }
-        );
-        assert_eq!(route_exit, ScriptRouterExit::Continue);
-        let result_command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let result = boundary.accept_host_command(result_command).unwrap();
-        assert!(matches!(
-            result.request(),
-            ScriptCommand::BroadcastChatMessage { message } if message == "true"
-        ));
-
-        drop(router);
-        drop(boundary);
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-    }
 
     #[test]
     fn world_block_resolution_validates_closed_contract() {
@@ -1833,88 +1088,7 @@ capabilities = ["world_blocks"]
 
 #[cfg(test)]
 mod world_time_tests {
-    use std::fs;
-    use std::time::Duration;
-
-    use mc_script::{LuaHostConfig, ScriptEvent, start_lua_host};
-
     use super::*;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn world_time_command_routes_through_owner_and_returns_targeted_result() {
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join("clock-plugin");
-        fs::create_dir(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "clock-plugin"
-name = "Clock Plugin"
-version = "0.1.0"
-api = "0.6.0"
-events = ["server.started"]
-capabilities = ["world_time"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.lua"),
-            r#"
-                function on_server_started(_event)
-                    solaris.set_world_time("set-night", 13000)
-                end
-
-                function on_world_time_set_result(_event)
-                    solaris.broadcast("world-time-result")
-                end
-            "#,
-        )
-        .unwrap();
-
-        let (boundary, host) =
-            start_lua_host(LuaHostConfig::new(plugins.path()).strict_discovery(true)).unwrap();
-        assert_eq!(host.loaded_plugins(), 1);
-        let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
-        boundary
-            .try_enqueue_event(ScriptEvent::server_started())
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        assert_eq!(admitted.plugin_id(), "clock-plugin");
-
-        let sessions = play::SessionRegistry::new();
-        let (simulation, mut owner) = play::simulation_channel();
-        let (route_exit, ()) = tokio::join!(
-            router.route_world_time_admitted(admitted, &simulation),
-            async {
-                assert!(owner.wait_for_command().await);
-                assert_eq!(simulation.snapshot().depth, 1);
-                assert_eq!(owner.process_tick(&sessions, 1).processed, 1);
-            }
-        );
-        assert_eq!(route_exit, ScriptRouterExit::Continue);
-        assert_eq!(sessions.world_time(), 13_000);
-
-        let result_command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let result = boundary.accept_host_command(result_command).unwrap();
-        assert!(matches!(
-            result.request(),
-            ScriptCommand::BroadcastChatMessage { message }
-                if message == "world-time-result"
-        ));
-
-        drop(router);
-        drop(boundary);
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-    }
 
     #[test]
     fn world_time_failure_categories_are_stable() {

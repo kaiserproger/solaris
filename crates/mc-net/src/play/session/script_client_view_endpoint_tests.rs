@@ -1,3 +1,69 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Command;
+
+use mc_plugin_host::{DeploymentConfig, DiscoveryMode, PluginLimits, discover};
+
+fn hello_component_bytes() -> Vec<u8> {
+    static BYTES: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root");
+        let sdk = root.join("sdk/rust");
+        let status = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--manifest-path",
+                sdk.join("Cargo.toml")
+                    .to_str()
+                    .expect("utf-8 workspace path"),
+                "--target",
+                "wasm32-unknown-unknown",
+                "--release",
+                "-p",
+                "solaris-hello-plugin",
+            ])
+            .status()
+            .expect("guest build starts");
+        assert!(status.success(), "hello guest builds");
+        let module = std::fs::read(
+            sdk.join("target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm"),
+        )
+        .expect("guest module exists");
+        wit_component::ComponentEncoder::default()
+            .module(&module)
+            .expect("guest module carries component types")
+            .validate(true)
+            .encode()
+            .expect("guest module encodes as a component")
+    });
+    BYTES.clone()
+}
+
+fn strict_package(root: &Path, id: &str) -> mc_plugin_host::LoadedPackage {
+    let package = root.join(id);
+    std::fs::create_dir_all(&package).expect("package directory");
+    std::fs::write(package.join("plugin.wasm"), hello_component_bytes())
+        .expect("component artifact");
+    std::fs::write(package.join("config.toml"), "").expect("component config");
+    discover(
+        &DeploymentConfig {
+            root: root.to_path_buf(),
+            mode: DiscoveryMode::Strict,
+            expected: vec![id.to_owned()],
+            grants: BTreeMap::new(),
+            require_grants: false,
+            precommit_hooks: Vec::new(),
+        },
+        &PluginLimits::default(),
+    )
+    .expect("strict component package discovers")
+    .into_packages()
+    .pop()
+    .expect("one package")
+}
+
 use std::io::Write as _;
 
 use mc_script::ScriptClientViewRequestKind;
@@ -106,13 +172,12 @@ fn ambiguous_view_kind_owners_open_nothing() {
 fn a_shipped_client_bundle_declares_the_kinds_its_artifact_index_routes() {
     use std::fs;
 
-    use mc_script::{LuaHostConfig, prepare_lua_plugins};
     use sha2::{Digest, Sha256};
 
-    // A package whose verified artifact declares a settlement screen, exactly
-    // as a shipped client bundle does.
+    // A strict component package whose verified artifact declares a settlement
+    // screen, exactly as a shipped client bundle does.
     let directory = tempfile::tempdir().unwrap();
-    let package = directory.path().join("example-package");
+    let package = directory.path().join("example");
     fs::create_dir_all(&package).unwrap();
     let artifact = package.join("showcase.zip");
     let file = fs::File::create(&artifact).unwrap();
@@ -126,18 +191,15 @@ fn a_shipped_client_bundle_declares_the_kinds_its_artifact_index_routes() {
     write_index(&mut archive);
     archive.finish().unwrap();
     let bytes = fs::read(&artifact).unwrap();
-
-    fs::write(package.join("main.lua"), "").unwrap();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let size = bytes.len();
     fs::write(
         package.join("plugin.toml"),
         format!(
-            r#"
-id = "example"
+            r#"id = "example"
 name = "Example"
 version = "1.0.0"
-api = "0.6.0"
+api = "0.7.0"
 
 [client]
 schema = 2
@@ -155,16 +217,13 @@ permissions = ["present_views"]
         ),
     )
     .unwrap();
-
-    let prepared = prepare_lua_plugins(LuaHostConfig::new(directory.path())).unwrap();
-    let manifest = LoaderManifest::from_script_bundles(prepared.client_bundles()).unwrap();
+    let package = strict_package(directory.path(), "example");
+    let manifest = LoaderManifest::from_script_bundles(package.client_bundles()).unwrap();
     assert_eq!(
         manifest.declared_view_kinds().collect::<Vec<_>>(),
         vec![("example", ScriptClientViewRequestKind::Settlement)]
     );
 
-    // Production ordering: the bind-time declaration comes from the manifest,
-    // not from a test-only hook, so the key-driven request finds its owner.
     let registry = SessionRegistry::new();
     registry.declare_manifest_view_kinds(Some(&manifest));
     assert_eq!(
@@ -186,38 +245,4 @@ fn write_index(archive: &mut zip::ZipWriter<std::fs::File>) {
             br#"{"schema":2,"screens":[{"id":"example:overview","kind":"settlement","title":"Overview","widgets":[]}],"world_previews":[],"blocks":[],"items":[],"assets":[],"sounds":[]}"#,
         )
         .unwrap();
-}
-
-#[test]
-fn the_shipped_settlement_package_routes_its_declared_view_kind() {
-    use std::path::Path;
-
-    use mc_script::{LuaHostConfig, prepare_lua_plugins};
-
-    // The package is an independent sibling checkout; without it this test
-    // proves nothing and says so instead of inventing a fixture.
-    let package_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../solaris-default-plugins")
-        .join("solaris-settlements");
-    if !package_root.is_dir() {
-        return;
-    }
-
-    let prepared = prepare_lua_plugins(LuaHostConfig::new(package_root.parent().unwrap())).unwrap();
-    let manifest = LoaderManifest::from_script_bundles(prepared.client_bundles()).unwrap();
-    assert_eq!(
-        manifest.declared_view_kinds().collect::<Vec<_>>(),
-        vec![(
-            "solaris-settlements",
-            ScriptClientViewRequestKind::Settlement
-        )]
-    );
-
-    let registry = SessionRegistry::new();
-    registry.declare_manifest_view_kinds(Some(&manifest));
-    assert_eq!(
-        registry
-            .resolve_view_request_owner(ScriptClientViewRequestKind::Settlement, Some(&manifest)),
-        Some("solaris-settlements".to_owned())
-    );
 }

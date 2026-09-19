@@ -21,7 +21,7 @@ impl WorldChunkDecision {
         self.inventory
             .as_ref()
             .map(|inventory| {
-                PreparedStorageBatch::decode_world_inventory(&inventory.payload)
+                PreparedStorageBatch::decode_world_decision(&inventory.payload)
                     .map_err(|error| WorldChunkJournalError::InventoryDecision(error.to_string()))
             })
             .transpose()

@@ -169,6 +169,7 @@ fn lethal_effect_damage_uses_the_same_death_deadline_index() {
             target_kind: TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
     let EntityEffectResult::Applied(applied) = result else {
         panic!("lethal effect damage must commit");

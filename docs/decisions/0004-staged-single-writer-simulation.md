@@ -40,14 +40,21 @@ stale state/token preconditions reject the batch before any edit is published.
 Single-region execution retains its fast path; multi-region storage edits reuse
 the existing staged source fence and atomic publication boundary.
 
-Settlement structure portions are server-owned block-edit batches: one
-`ApplyBlockEdits` command with no actor session carries a whole portion and is
-awaited before the stage receipt is spent, so a stage is durable only once that
-command has committed. Server-owned batches deliberately never take the session
-fast lanes, which publish through a writer's visible-edit finalize and would
-skip eviction of a replaced campfire's cooking state; they take the staged
-storage path, which owns that eviction, reactivity, owner relighting, and the
-post-commit publication to loaded sessions.
+Receipt-bearing server-owned block-edit batches cover settlement structure
+portions and resident harvesting, mining, cutting, and planting. They reuse
+`ApplyBlockEdits`' regional lane rather than a domain-specific command or saga:
+the submitter captures exact mutation-token preconditions, calculates canonical
+loot for breaks, and prepares the storage batch (including material consumption
+or resident cargo and progress) before submitting the finite block portion with
+its encoded receipt. The regional worker checks those *supplied*
+preconditions, rechecks the captured zone fence and consumes the current
+`before-build` approval when applicable. It conditionally applies/stamps the
+blocks, appends the chunk after-images and encoded receipt as one world-journal
+decision, then publishes. Only the acknowledged decision permits storage
+projection and `mark_inventory_projected`; reopening projects that same receipt
+before new settlement or resident work. Ordinary server-owned edits without a
+receipt retain the canonical staged path, including campfire eviction and
+reactivity.
 
 Structure footprint change detection is content-scoped, not journal-scoped: a stage
 fence compares a digest of the block states strictly inside the reserved footprint and

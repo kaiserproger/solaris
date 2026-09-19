@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["solaris-plugin-sdk", "examples/hello"]
+members = [
+    "solaris-plugin-sdk",
+    "examples/hello",
+    "packages/solaris-permissions",
+    "packages/solaris-essentials",
+    "packages/solaris-economy",
+    "packages/solaris-towns",
+    "packages/solaris-audit",
+    "packages/solaris-settlements",
+]
 
 [workspace.package]
 version = "0.1.0"

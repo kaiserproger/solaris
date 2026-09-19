@@ -1,6 +1,6 @@
 //! `mc-server` binary entry point.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mc_server::{OperatorFileOperation, PluginRuntime, ServerConfig};
+use mc_server::{OperatorFileOperation, PluginHookSection, ServerConfig};
 
 mod startup_validation;
 
@@ -147,21 +147,18 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
 }
 
-/// The deployment one plugin directory describes, in the host's own terms.
+/// Build the component deployment for a configured plugin directory.
 ///
-/// One runtime per deployment: a directory configured as `wasm` is read by the
-/// component host and a `luau` directory by the Luau host, never by both, so a
-/// package cannot be half-validated against one contract and run under another.
+/// The operator's `[[plugins.hooks]]` registrations travel with the component
+/// deployment after `PluginSection::validate_hooks` has established that it has
+/// a directory to attach them to.
 fn component_deployment(config: &ServerConfig) -> Result<Option<mc_plugin_host::DeploymentConfig>> {
-    if config.plugins.runtime != PluginRuntime::Wasm {
-        return Ok(None);
+    if !config.plugins.strict && !config.plugins.expected.is_empty() {
+        bail!("plugins.expected requires plugins.strict = true");
     }
     let Some(directory) = config.plugins.directory.clone() else {
         return Ok(None);
     };
-    if !config.plugins.strict && !config.plugins.expected.is_empty() {
-        bail!("plugins.expected requires plugins.strict = true");
-    }
     let mode = if config.plugins.strict {
         mc_plugin_host::DiscoveryMode::Strict
     } else {
@@ -173,25 +170,25 @@ fn component_deployment(config: &ServerConfig) -> Result<Option<mc_plugin_host::
         .iter()
         .map(|(id, grant)| (id.clone(), grant.capabilities.clone()))
         .collect();
+    // The registrations discovery validates against the deployed packages and
+    // attaches to the ones that must answer them; the host's roster is built from
+    // those attachments, not from the manifest declarations behind them.
+    let precommit_hooks: Vec<mc_script::precommit::HookRegistration> = config
+        .plugins
+        .hooks
+        .iter()
+        .map(PluginHookSection::registration)
+        .collect();
     Ok(Some(mc_plugin_host::DeploymentConfig {
         root: directory,
         mode,
         expected: config.plugins.expected.clone(),
         grants,
         // A strict production deployment must have granted what it runs; local
-        // iteration may run without operator grants, as the Luau path does.
+        // iteration may run without operator grants.
         require_grants: config.plugins.strict,
+        precommit_hooks,
     }))
-}
-
-/// Whatever runtime `[plugins]` names, prepared.
-///
-/// One runtime per deployment: the Luau loader and the component host never read
-/// the same directory, so a package cannot be half-validated against one contract
-/// and run under another.
-enum PreparedPlugins {
-    Luau(mc_script::PreparedLuaPlugins),
-    Component(PreparedComponent),
 }
 
 /// A started component deployment and what the world needs from it.
@@ -199,18 +196,54 @@ enum PreparedPlugins {
 /// The host is started here rather than next to the network bind because its
 /// `configure` phase is what produces the startup rules the world is opened with,
 /// and because it owns the boundary the network binds to. Nothing is bound yet at
-/// this point: the host's opening commands wait in the boundary queue exactly as
-/// the Luau host's do.
+/// this point: the host's opening commands wait in the boundary queue.
 struct PreparedComponent {
-    /// The running host, stopped by whoever finishes with it.
-    host: mc_plugin_host::PluginHost,
+    /// The running host, or `None` once the server has taken it.
+    host: Option<mc_plugin_host::PluginHost>,
     /// The ids this deployment discovered, in the host's own order.
     plugin_ids: Vec<String>,
     /// The validated startup rules, or `None` when no package declared any.
     rules: Option<mc_script::GameplayRules>,
+    /// The ore profile the deployment's packages declared, or `None` when none
+    /// did. Read back from the started host, where `configure` ran.
+    ore_profile: Option<mc_script::PluginWorldgenOreProfile>,
+    /// The settlement plan the deployment's packages declared, read back the
+    /// same way.
+    settlement_plan: Option<mc_script::PluginSettlementPlan>,
+    /// The client bundles this deployment ships, in the host's own order.
+    client_bundles: Vec<mc_script::ClientBundle>,
     /// The server's live sessions. The host holds the lookup before the server
     /// exists; the server fills it when it binds.
     sessions: mc_net::PlayerSessionsHandle,
+}
+
+impl PreparedComponent {
+    /// Take the running host: whoever takes it owns stopping it.
+    ///
+    /// The server takes it when it binds; a startup that fails before the bind
+    /// drops this value instead, which stops the same host.
+    fn take_host(&mut self) -> mc_plugin_host::PluginHost {
+        self.host
+            .take()
+            .expect("the prepared component host is taken exactly once")
+    }
+}
+
+impl Drop for PreparedComponent {
+    /// Stop a host startup never handed to a server.
+    ///
+    /// Everything between the host starting and the network binding - reading
+    /// the Loader manifest, loading the startup data, validating the world
+    /// contract, opening the world - can fail, and each of those failures drops
+    /// this value on the way out. The host is a live thread that owns boundary
+    /// queues and every guest's durable storage, so it is stopped here, exactly
+    /// as the bind-failure path stops it, and what it owned is reported the same
+    /// way; a host the server did take is `None` by then and this is a no-op.
+    fn drop(&mut self) {
+        if let Some(host) = self.host.take() {
+            report_component_stop(host.stop());
+        }
+    }
 }
 
 /// The component host's view of this server's live sessions.
@@ -224,18 +257,6 @@ struct ServerSessions(mc_net::PlayerSessionsHandle);
 impl mc_plugin_host::PlayerSessions for ServerSessions {
     fn session_of(&self, player: &str) -> Option<u64> {
         self.0.session_of(player)
-    }
-}
-
-/// Prepare whatever runtime `[plugins]` names, or nothing when no directory is set.
-async fn prepare_configured_plugins(config: &ServerConfig) -> Result<Option<PreparedPlugins>> {
-    match config.plugins.runtime {
-        PluginRuntime::Luau => {
-            Ok(prepare_configured_luau_plugins(config)?.map(PreparedPlugins::Luau))
-        }
-        PluginRuntime::Wasm => Ok(prepare_component_deployment(config)
-            .await?
-            .map(PreparedPlugins::Component)),
     }
 }
 
@@ -314,10 +335,20 @@ async fn prepare_component_deployment(config: &ServerConfig) -> Result<Option<Pr
             );
         }
     };
+    // Read the world-startup records from the host that ran `configure` before it
+    // can be handed to a server. The host refuses a second declaration of an ore
+    // or settlement profile while it starts, so a deployment that reaches here
+    // has at most one owner per profile.
+    let ore_profile = host.worldgen_ore_profile();
+    let settlement_plan = host.worldgen_settlement_plan().cloned();
+    let client_bundles = host.client_bundles().to_vec();
     Ok(Some(PreparedComponent {
-        host,
+        host: Some(host),
         plugin_ids,
         rules,
+        ore_profile,
+        settlement_plan,
+        client_bundles,
         sessions,
     }))
 }
@@ -327,6 +358,15 @@ async fn stop_component_host(host: mc_plugin_host::PluginHost) -> Result<()> {
     let counters = tokio::task::spawn_blocking(move || host.stop())
         .await
         .context("stopping the component plugin host")?;
+    report_component_stop(counters);
+    Ok(())
+}
+
+/// Report what a stopped host owned.
+///
+/// Every stop reports the same counters, whether a finished run asked for it or a
+/// startup that failed dropped the host it had prepared.
+fn report_component_stop(counters: Vec<(String, mc_plugin_host::InstanceDiagnostics)>) {
     for (plugin_id, diagnostics) in counters {
         tracing::info!(
             plugin_id,
@@ -337,75 +377,6 @@ async fn stop_component_host(host: mc_plugin_host::PluginHost) -> Result<()> {
             "component plugin stopped"
         );
     }
-    Ok(())
-}
-
-fn prepare_configured_luau_plugins(
-    config: &ServerConfig,
-) -> Result<Option<mc_script::PreparedLuaPlugins>> {
-    if config.plugins.runtime != PluginRuntime::Luau {
-        bail!(
-            "plugins.runtime = {} is not the Luau loader; use the component host for it",
-            config.plugins.runtime.name()
-        );
-    }
-    if !config.plugins.strict && !config.plugins.expected.is_empty() {
-        bail!("plugins.expected requires plugins.strict = true");
-    }
-    let mut prepared = config
-        .plugins
-        .directory
-        .as_deref()
-        .map(|directory| {
-            mc_script::prepare_lua_plugins(
-                mc_script::LuaHostConfig::new(directory).strict_discovery(config.plugins.strict),
-            )
-            .with_context(|| {
-                format!(
-                    "preparing external Luau plugins from {}",
-                    directory.display()
-                )
-            })
-        })
-        .transpose()?;
-
-    prepared = prepared.map(|prepared| prepared.strict_startup(config.plugins.strict));
-    validate_expected_plugin_set(config, prepared.as_ref())?;
-    Ok(prepared)
-}
-
-fn validate_expected_plugin_set(
-    config: &ServerConfig,
-    prepared: Option<&mc_script::PreparedLuaPlugins>,
-) -> Result<()> {
-    if !config.plugins.strict {
-        return Ok(());
-    }
-
-    let mut expected = BTreeSet::new();
-    for id in &config.plugins.expected {
-        if id.is_empty() {
-            bail!("plugins.expected contains an empty plugin id");
-        }
-        if !expected.insert(id.as_str()) {
-            bail!("plugins.expected contains duplicate plugin id `{id}`");
-        }
-    }
-    let actual = prepared
-        .into_iter()
-        .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
-        .map(|plugin| plugin.id())
-        .collect::<BTreeSet<_>>();
-    let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
-    let unexpected = actual.difference(&expected).copied().collect::<Vec<_>>();
-    if missing.is_empty() && unexpected.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "strict plugin set mismatch: missing [{}], unexpected [{}]",
-        missing.join(", "),
-        unexpected.join(", ")
-    )
 }
 
 fn check_config(path: &Path) -> Result<()> {
@@ -421,36 +392,40 @@ fn check_config(path: &Path) -> Result<()> {
         cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
     }
     validate_runtime_config(&cfg)?;
-    if let Some(deployment) = component_deployment(&cfg)? {
-        // `--check` of a component deployment compiles every selected component
-        // and runs its startup phases against a boundary nobody drains: it
-        // reports the contract, the artifacts and the startup answers it really
-        // exercised, and touches no world, storage or listener.
-        let report =
-            mc_plugin_host::check_deployment(&deployment, &mc_plugin_host::PluginLimits::default())
-                .map_err(|error| anyhow::anyhow!("checking component plugins: {error}"))?;
-        // A check validates the whole selection: a package the deployment skipped
-        // is a package it could not validate, so the check fails instead of
-        // reporting success for a deployment it did not read end to end.
-        if let Some(skipped) = report.skipped().first() {
-            bail!(
-                "checking component plugins: {} was refused ({})",
-                skipped.path.display(),
-                skipped.message
-            );
-        }
-        let ids = report
-            .checked()
-            .iter()
-            .map(|checked| checked.id.clone())
-            .collect::<Vec<_>>();
-        println!("component plugins checked: {}", ids.join(", "));
+    let Some(deployment) = component_deployment(&cfg)? else {
+        let effective = EffectiveConfig::from(&cfg);
+        let rendered =
+            serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
+        println!("{rendered}");
         return Ok(());
+    };
+    // `--check` of a component deployment compiles every selected component and
+    // runs its startup phases against a boundary nobody drains: it reports the
+    // contract, artifacts, and startup answers it really exercised while
+    // touching no world, storage, or listener.
+    let report =
+        mc_plugin_host::check_deployment(&deployment, &mc_plugin_host::PluginLimits::default())
+            .map_err(|error| anyhow::anyhow!("checking component plugins: {error}"))?;
+    // A check validates the whole selection: a package the deployment skipped
+    // is a package it could not validate, so the check fails instead of
+    // reporting success for a deployment it did not read end to end.
+    if let Some(skipped) = report.skipped().first() {
+        bail!(
+            "checking component plugins: {} was refused ({})",
+            skipped.path.display(),
+            skipped.message
+        );
     }
-    let prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
-    let effective = EffectiveConfig::with_plugins(&cfg, prepared_plugins.as_ref());
-    let rendered = serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
-    println!("{rendered}");
+    mc_net::LoaderManifest::from_script_bundles(report.client_bundles())
+        .context("reading Solaris Loader artifact identities")?
+        .encode()
+        .context("encoding aggregated Solaris Loader manifest")?;
+    let ids = report
+        .checked()
+        .iter()
+        .map(|checked| checked.id.clone())
+        .collect::<Vec<_>>();
+    println!("component plugins checked: {}", ids.join(", "));
     Ok(())
 }
 
@@ -458,7 +433,6 @@ fn check_config(path: &Path) -> Result<()> {
 struct EffectiveConfig<'a> {
     #[serde(flatten)]
     config: &'a ServerConfig,
-    discovered_plugins: Vec<mc_script::PluginDiscovery<'a>>,
     effective_chunk_pipeline: EffectiveChunkPipeline,
     effective_autoscale: EffectiveAutoscale,
     operator_warnings: Vec<OperatorWarning>,
@@ -466,21 +440,8 @@ struct EffectiveConfig<'a> {
 
 impl<'a> From<&'a ServerConfig> for EffectiveConfig<'a> {
     fn from(config: &'a ServerConfig) -> Self {
-        Self::with_plugins(config, None)
-    }
-}
-
-impl<'a> EffectiveConfig<'a> {
-    fn with_plugins(
-        config: &'a ServerConfig,
-        plugins: Option<&'a mc_script::PreparedLuaPlugins>,
-    ) -> Self {
         Self {
             config,
-            discovered_plugins: plugins
-                .into_iter()
-                .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
-                .collect(),
             effective_chunk_pipeline: EffectiveChunkPipeline::from(
                 config.chunk_pipeline.to_network(),
             ),
@@ -886,6 +847,92 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
     }
 }
 
+/// The world-startup records one component deployment contributes.
+///
+/// A component host reads these records after `configure` runs and before the
+/// server opens its world. The host rejects conflicting declarations, so the
+/// records describe the one deployment the server will run.
+struct DeploymentRecords<'a> {
+    rules: Option<&'a mc_script::GameplayRules>,
+    ore_profile: Option<mc_script::PluginWorldgenOreProfile>,
+    settlement_plan: Option<&'a mc_script::PluginSettlementPlan>,
+    client_bundles: &'a [mc_script::ClientBundle],
+}
+
+impl<'a> DeploymentRecords<'a> {
+    /// Read the records of the component deployment this server prepared.
+    fn of(component: Option<&'a PreparedComponent>) -> Self {
+        match component {
+            Some(component) => Self {
+                rules: component.rules.as_ref(),
+                ore_profile: component.ore_profile,
+                settlement_plan: component.settlement_plan.as_ref(),
+                client_bundles: &component.client_bundles,
+            },
+            None => Self {
+                rules: None,
+                ore_profile: None,
+                settlement_plan: None,
+                client_bundles: &[],
+            },
+        }
+    }
+
+    /// The identities these records resolve to in the persisted world contract.
+    ///
+    /// `world.json` persists these strings and compares them on every reopen, so
+    /// they are derived in one place: a deployment that declares an ore profile
+    /// or a settlement plan owns that declaration, and a deployment that declares
+    /// neither records the baseline the world is actually generated with.
+    fn world_contract_identities(
+        &self,
+        configured_settlement: mc_server::SettlementProfile,
+    ) -> WorldContractIdentities {
+        WorldContractIdentities {
+            ore_profile: self
+                .ore_profile
+                .map(mc_script::PluginWorldgenOreProfile::contract_name)
+                .unwrap_or("vanilla")
+                .to_owned(),
+            settlement_profile: self
+                .settlement_plan
+                .map(mc_script::PluginSettlementPlan::contract_name)
+                .unwrap_or_else(|| configured_settlement.name().to_owned()),
+            gameplay_rules: self.rules.map(mc_script::GameplayRules::contract_name),
+        }
+    }
+
+    /// The manifest the Solaris Loader handshake advertises, or `None` for a
+    /// deployment that ships no client bundle - the vanilla-client server.
+    ///
+    /// Building the manifest is also the check the handshake depends on: every
+    /// declared block and view is verified against the artifact the package was
+    /// loaded from, and the encoded manifest is the exact payload the network
+    /// layer sends. A bundle that cannot be advertised fails startup here instead
+    /// of on a client's first login.
+    fn loader_manifest(&self) -> Result<Option<Arc<mc_net::LoaderManifest>>> {
+        if self.client_bundles.is_empty() {
+            return Ok(None);
+        }
+        let manifest = mc_net::LoaderManifest::from_script_bundles(self.client_bundles)
+            .context("reading Solaris Loader artifact identities")?;
+        if manifest.is_empty() {
+            return Ok(None);
+        }
+        manifest
+            .encode()
+            .context("encoding aggregated Solaris Loader manifest")?;
+        Ok(Some(Arc::new(manifest)))
+    }
+}
+
+/// The three identities one world records, as `world.json` keeps them.
+struct WorldContractIdentities {
+    ore_profile: String,
+    settlement_profile: String,
+    gameplay_rules: Option<String>,
+}
+
 async fn serve(
     path: &Path,
     warning_ring: Arc<mc_server::dashboard_stats::WarningRing>,
@@ -913,80 +960,45 @@ async fn serve(
     let configured_geometry = cfg.data.chunk_geometry().map_err(anyhow::Error::msg)?;
     let world_dir = required_world_dir(&cfg)?;
     let worldgen_mode = cfg.data.worldgen_mode.to_worldgen();
-    let mut component_deployment_prepared: Option<PreparedComponent> = None;
-    let mut luau_plugins = match prepare_configured_plugins(&cfg).await? {
-        None => None,
-        Some(PreparedPlugins::Luau(prepared)) => Some(prepared),
-        Some(PreparedPlugins::Component(component)) => {
-            component_deployment_prepared = Some(component);
-            None
-        }
-    };
+    let mut component_deployment_prepared = prepare_component_deployment(&cfg).await?;
     let mut dashboard_plugin_ids = Vec::new();
-    for plugin in luau_plugins
-        .as_ref()
-        .into_iter()
-        .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
-    {
-        dashboard_plugin_ids.push(plugin.id().to_owned());
-        tracing::info!(
-            plugin_id = plugin.id(),
-            deployment = plugin.deployment().contract_name(),
-            supported_loaders = ?plugin.supported_loaders(),
-            permissions = ?plugin.permissions(),
-            bundle_count = plugin.client_bundles().len(),
-            client_bundles = ?plugin.client_bundles(),
-            artifact_bytes = plugin.total_artifact_bytes(),
-            "Luau plugin discovered"
-        );
-    }
     if let Some(component) = component_deployment_prepared.as_ref() {
         for id in &component.plugin_ids {
             dashboard_plugin_ids.push(id.clone());
+            let client_bundles = component
+                .client_bundles
+                .iter()
+                .filter(|bundle| bundle.owner_plugin_id() == id.as_str())
+                .map(mc_script::ClientBundle::id)
+                .collect::<Vec<_>>();
             tracing::info!(
                 plugin_id = id,
                 runtime = "wasm",
+                client_bundles = ?client_bundles,
                 "component plugin discovered"
             );
         }
-        // A component package cannot declare an ore profile, a settlement plan or
-        // a client bundle yet - the contract has no record for them - so the world
-        // contract records what a server with no plugin directory records. That is
-        // a named limit of this stage, not a silent default, and it is stated here
-        // because this is where the declaration would have to be read.
+        // The records are read from the running host, so what the operator sees
+        // here is what the world contract below will record.
         tracing::info!(
             declares_startup_rules = component.rules.is_some(),
-            "component plugin deployment declares no ore profile, settlement plan or client bundle"
+            ore_profile = component
+                .ore_profile
+                .map(mc_script::PluginWorldgenOreProfile::contract_name),
+            settlement_profile = component
+                .settlement_plan
+                .as_ref()
+                .map(mc_script::PluginSettlementPlan::contract_name),
+            client_bundles = component.client_bundles.len(),
+            "component plugin deployment records read back"
         );
     }
-    let plugin_ore_profile = luau_plugins
-        .as_ref()
-        .and_then(mc_script::PreparedLuaPlugins::worldgen_ore_profile);
-    let plugin_settlement_plan = luau_plugins
-        .as_ref()
-        .and_then(mc_script::PreparedLuaPlugins::worldgen_settlement_plan)
-        .cloned();
-    let ore_profile_name = plugin_ore_profile
-        .map(mc_script::LuaWorldgenOreProfile::contract_name)
-        .unwrap_or("vanilla");
-    let settlement_contract = plugin_settlement_plan
-        .as_ref()
-        .map(mc_script::LuaSettlementPlan::contract_name)
-        .unwrap_or_else(|| cfg.data.settlement_profile.name().to_owned());
+    let records = DeploymentRecords::of(component_deployment_prepared.as_ref());
+    let identities = records.world_contract_identities(cfg.data.settlement_profile);
 
-    let loader_manifest = luau_plugins
-        .as_ref()
-        .map(|plugins| mc_net::LoaderManifest::from_script_bundles(plugins.client_bundles()))
-        .transpose()
-        .context("reading Solaris Loader artifact identities")?
-        .filter(|manifest| !manifest.is_empty())
-        .map(|manifest| {
-            manifest
-                .encode()
-                .context("encoding aggregated Solaris Loader manifest")?;
-            Ok::<_, anyhow::Error>(Arc::new(manifest))
-        })
-        .transpose()?;
+    // Component package bundles are the ones their manifests declared and whose
+    // artifacts were verified against.
+    let loader_manifest = records.loader_manifest()?;
     let content = content_import::resolve_or_import(&content_search(&cfg)).await?;
     let vanilla_data_dir = content.root();
     let StartupData {
@@ -1008,7 +1020,7 @@ async fn serve(
         vanilla_data_dir,
         &blocks,
         &items,
-        plugin_settlement_plan.as_ref(),
+        records.settlement_plan,
         cfg.data.settlement_profile,
     )?;
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
@@ -1020,7 +1032,7 @@ async fn serve(
         &blocks,
         &data,
         &tags,
-        plugin_settlement_plan.as_ref(),
+        records.settlement_plan,
         cfg.data.settlement_profile,
     )?;
     let mut terrain_generator = build_terrain_generator(
@@ -1029,22 +1041,14 @@ async fn serve(
         configured_geometry,
         Arc::clone(&blocks),
         structure_rules,
-        plugin_ore_profile,
+        records.ore_profile,
         chest_loot,
         village_plans,
     )?;
     // The rules the world is opened with, from the one runtime this deployment
     // runs. A component deployment's plan was converted and validated while its
     // host started, so a refusal has already failed the server by now.
-    let gameplay_rules = match (
-        luau_plugins.as_ref(),
-        component_deployment_prepared.as_ref(),
-    ) {
-        (Some(prepared), _) => prepared.gameplay_rules(),
-        (None, Some(component)) => component.rules.as_ref(),
-        (None, None) => None,
-    };
-    if let Some(rules) = gameplay_rules {
+    if let Some(rules) = records.rules {
         startup_rules::apply(
             rules,
             Arc::get_mut(&mut terrain_generator).expect("terrain is unpublished during startup"),
@@ -1053,7 +1057,6 @@ async fn serve(
         )
         .context("materializing startup rules")?;
     }
-    let gameplay_rules_contract = gameplay_rules.map(mc_script::GameplayRules::contract_name);
     let configured_spawn = if world_requires_solaris_spawn(world_dir)? {
         let located = terrain_generator
             .locate_safe_spawn()
@@ -1067,10 +1070,10 @@ async fn serve(
         configured_geometry,
         cfg.data.seed,
         worldgen_mode.contract_name(),
-        ore_profile_name,
-        &settlement_contract,
+        &identities.ore_profile,
+        &identities.settlement_profile,
         configured_spawn,
-        gameplay_rules_contract.as_deref(),
+        identities.gameplay_rules.as_deref(),
     )?;
     let world_spawn = match world_source {
         WorldSource::SolarisGenerated => configured_spawn,
@@ -1237,34 +1240,16 @@ async fn serve(
 
     let shutdown_handle = net.shutdown.clone();
     let mut component_host = None;
-    let (bound, lua_host) = if let Some(prepared) = luau_plugins.take() {
-        let (boundary, host) = mc_script::start_prepared_lua_host(prepared)
-            .context("starting configured Luau plugins")?;
-        tracing::info!(
-            plugin_directory = ?cfg.plugins.directory.as_deref(),
-            loaded = host.loaded_plugins(),
-            "Luau plugin host started"
-        );
-        match mc_net::bind_with_scripts(net, boundary).await {
-            Ok(bound) => (bound, Some(host)),
-            Err(error) => {
-                join_lua_host(host).await?;
-                return Err(error).context("network bind");
-            }
-        }
-    } else if let Some(prepared) = component_deployment_prepared.take() {
+    let bound = if let Some(mut prepared) = component_deployment_prepared.take() {
         // The component host is already running: it was started before the world
         // was opened, because that is when its `configure` phase produced the
         // rules the world was opened with.
-        let PreparedComponent {
-            host,
-            plugin_ids,
-            sessions,
-            ..
-        } = prepared;
+        let loaded = prepared.plugin_ids.len();
+        let sessions = prepared.sessions.clone();
+        let host = prepared.take_host();
         tracing::info!(
             plugin_directory = ?cfg.plugins.directory.as_deref(),
-            loaded = plugin_ids.len(),
+            loaded,
             "component plugin host started"
         );
         match mc_net::bind_with_scripts(net, host.boundary().clone()).await {
@@ -1274,7 +1259,7 @@ async fn serve(
                 // connection that identity has right now.
                 bound.register_player_sessions(&sessions);
                 component_host = Some(host);
-                (bound, None)
+                bound
             }
             Err(error) => {
                 stop_component_host(host).await?;
@@ -1282,7 +1267,7 @@ async fn serve(
             }
         }
     } else {
-        (mc_net::bind(net).await.context("network bind")?, None)
+        mc_net::bind(net).await.context("network bind")?
     };
     let stats = (cfg.dashboard.enabled || console_output.is_some()).then(|| {
         Arc::new(mc_server::dashboard_stats::ServerDashboardStats::new(
@@ -1325,11 +1310,7 @@ async fn serve(
                 interactive,
             }
         });
-    let plugin_host = match (lua_host.as_ref(), component_host.as_ref()) {
-        (Some(host), _) => Some(RunningPluginHost::Luau(host)),
-        (None, Some(_)) => Some(RunningPluginHost::Component),
-        (None, None) => None,
-    };
+    let plugin_host = component_host.as_ref();
     let result = run_bound_server(
         bound,
         shutdown_handle,
@@ -1341,9 +1322,6 @@ async fn serve(
     .await;
     if let Some(task) = dashboard_task {
         task.abort();
-    }
-    if let Some(host) = lua_host {
-        join_lua_host(host).await?;
     }
     if let Some(host) = component_host {
         stop_component_host(host).await?;
@@ -1381,55 +1359,56 @@ impl PluginReloadSignal {
     }
 }
 
-fn prepare_configured_luau_reload(
+fn prepare_configured_component_reload(
     path: &Path,
     startup_strict: bool,
-) -> Result<mc_script::PreparedLuaPlugins> {
+) -> Result<Vec<mc_plugin_host::LoadedPackage>> {
     if !startup_strict {
-        bail!("Luau runtime reload requires the server to start with plugins.strict = true");
+        bail!("component runtime reload requires the server to start with plugins.strict = true");
     }
     let config = load_config(path)?;
     if !config.plugins.strict {
         bail!("reloaded config must keep plugins.strict = true");
     }
-    prepare_configured_luau_plugins(&config)?
-        .context("reloaded config no longer enables a Luau plugin host")
+    let deployment = component_deployment(&config)?
+        .context("reloaded config no longer enables a component plugin host")?;
+    let limits = mc_plugin_host::PluginLimits::default();
+    let discovered = mc_plugin_host::discover(&deployment, &limits).with_context(|| {
+        format!(
+            "reading the configured component plugins from {}",
+            deployment.root.display()
+        )
+    })?;
+    for skipped in discovered.skipped() {
+        tracing::warn!(
+            path = %skipped.path.display(),
+            message = skipped.message,
+            "component plugin skipped"
+        );
+    }
+    Ok(discovered.into_packages())
 }
 
-async fn reload_configured_luau_plugins(
+async fn reload_configured_component_plugins(
     path: PathBuf,
     startup_strict: bool,
-    host: &mc_script::LuaHost,
-) -> Result<mc_script::PluginReloadReport> {
-    let prepared =
-        tokio::task::spawn_blocking(move || prepare_configured_luau_reload(&path, startup_strict))
-            .await
-            .context("joining Luau reload preparation task")??;
-    host.reload(prepared)
+    host: &mc_plugin_host::PluginHost,
+) -> Result<mc_plugin_host::PluginReloadReport> {
+    let packages = tokio::task::spawn_blocking(move || {
+        prepare_configured_component_reload(&path, startup_strict)
+    })
+    .await
+    .context("joining component reload preparation task")??;
+    host.reload(packages)
         .await
-        .context("committing prepared Luau plugin reload")
-}
-
-/// The plugin host a bound server runs with, if any.
-///
-/// One runtime per deployment, so this is a choice rather than a list, and the
-/// reload arm below is the only thing that has to know which one it has: the host
-/// values themselves live in `serve()` and are stopped after the run returns. A
-/// component deployment is carried as a marker rather than a reference because the
-/// value the arm needs is the *distinction* - a host that exists and has no reload
-/// contract yet is a different answer from no host at all, and only the first may
-/// never be reported as reloaded.
-#[derive(Clone, Copy)]
-enum RunningPluginHost<'a> {
-    Luau(&'a mc_script::LuaHost),
-    Component,
+        .context("committing prepared component plugin reload")
 }
 
 async fn run_bound_server(
     bound: mc_net::BoundServer,
     shutdown_handle: mc_net::ShutdownHandle,
     config_path: &Path,
-    plugin_host: Option<RunningPluginHost<'_>>,
+    plugin_host: Option<&mc_plugin_host::PluginHost>,
     startup_plugin_strict: bool,
     terminal_console: Option<console::Console<console::server_commands::ServerCommands>>,
 ) -> Result<()> {
@@ -1486,16 +1465,11 @@ async fn run_bound_server(
                     );
                     continue;
                 }
-                let RunningPluginHost::Luau(host) = host else {
-                    // The component host has no reload contract yet (plan P6). A
-                    // reload that swapped nothing is never reported as performed.
-                    tracing::warn!(
-                        "SIGHUP plugin reload ignored because the component plugin host has no reload contract yet"
-                    );
-                    continue;
-                };
-                tracing::info!(config = %config_path.display(), "SIGHUP plugin reload requested");
-                let mut reload = Box::pin(reload_configured_luau_plugins(
+                tracing::info!(
+                    config = %config_path.display(),
+                    "SIGHUP component plugin reload requested"
+                );
+                let mut reload = Box::pin(reload_configured_component_plugins(
                     config_path.to_path_buf(),
                     startup_plugin_strict,
                     host,
@@ -1505,7 +1479,7 @@ async fn run_bound_server(
                         return result.context("network listener");
                     }
                     console_result = shutdown.as_mut() => {
-                        tracing::info!("shutdown requested during Luau reload");
+                        tracing::info!("shutdown requested during component reload");
                         shutdown_handle.request();
                         let result = match tokio::time::timeout(
                             SHUTDOWN_DRAIN_TIMEOUT,
@@ -1523,59 +1497,19 @@ async fn run_bound_server(
                 };
                 match reload_result {
                     Ok(report) => {
-                        for diagnostic in report.replaced_disabled_plugins() {
-                            tracing::info!(
-                                plugin = diagnostic.plugin_id(),
-                                stage = diagnostic.stage().contract_name(),
-                                message = diagnostic.message(),
-                                "Luau reload replaced a previously disabled plugin generation"
-                            );
-                        }
                         tracing::info!(
-                            loaded = report.loaded_plugins(),
-                            recovered_disabled = report.replaced_disabled_plugins().len(),
-                            "Luau plugin reload committed"
+                            loaded = report.loaded_packages,
+                            replaced = report.replaced.len(),
+                            "component plugin reload committed"
                         );
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "Luau plugin reload rejected");
+                        tracing::warn!(error = %error, "component plugin reload rejected");
                     }
                 }
             }
         }
     }
-}
-
-async fn join_lua_host(host: mc_script::LuaHost) -> Result<()> {
-    let result = tokio::task::spawn_blocking(move || host.join())
-        .await
-        .context("joining Luau host task")?;
-    let report = match result {
-        Ok(report) => report,
-        Err(_) => bail!("Luau host thread panicked"),
-    };
-    for diagnostic in report.disabled_plugins() {
-        tracing::warn!(
-            plugin = diagnostic.plugin_id(),
-            stage = diagnostic.stage().contract_name(),
-            message = diagnostic.message(),
-            "Luau plugin remained disabled at host shutdown"
-        );
-    }
-    if report.exit_reason() != mc_script::LuaHostExitReason::EventQueueClosed {
-        tracing::warn!(
-            exit_reason = report.exit_reason().contract_name(),
-            "Luau plugin host stopped through a non-normal lifecycle path"
-        );
-    }
-    tracing::info!(
-        loaded = report.loaded_plugins(),
-        enabled_at_exit = report.enabled_plugins_at_exit(),
-        disabled = report.disabled_plugins().len(),
-        exit_reason = report.exit_reason().contract_name(),
-        "Luau plugin host stopped"
-    );
-    Ok(())
 }
 
 fn chest_loot_catalog_for_startup(
@@ -1613,7 +1547,7 @@ fn build_terrain_generator(
     geometry: mc_world::ChunkGeometry,
     blocks: Arc<mc_world::BlockRegistry>,
     structure_rules: mc_worldgen::StructureRules,
-    ore_profile: Option<mc_script::LuaWorldgenOreProfile>,
+    ore_profile: Option<mc_script::PluginWorldgenOreProfile>,
     chest_loot: Option<(
         mc_data::loot::chest_26_1_2::ChestLootCatalog,
         mc_data::items::ItemRegistry,
@@ -1639,7 +1573,7 @@ fn build_terrain_generator(
     }
     if matches!(
         ore_profile,
-        Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits)
+        Some(mc_script::PluginWorldgenOreProfile::RealisticDeposits)
     ) {
         generator = generator.with_realistic_deposits(blocks.as_ref());
     }
@@ -1651,7 +1585,7 @@ fn structure_rules_for_startup(
     vanilla_data_dir: &Path,
     blocks: &mc_world::BlockRegistry,
     items: &mc_data::items::ItemRegistry,
-    settlement_plan: Option<&mc_script::LuaSettlementPlan>,
+    settlement_plan: Option<&mc_script::PluginSettlementPlan>,
     settlement_profile: mc_server::SettlementProfile,
 ) -> Result<mc_worldgen::StructureRules> {
     if let Some(settlement_plan) = settlement_plan {
@@ -1659,13 +1593,13 @@ fn structure_rules_for_startup(
             .buildings()
             .iter()
             .map(|building| match building.template() {
-                mc_script::LuaSettlementBuildingTemplate::PlainsFountain => {
+                mc_script::PluginSettlementBuildingTemplate::PlainsFountain => {
                     Ok(mc_worldgen::PlainsVillagePrototypePart::Fountain)
                 }
-                mc_script::LuaSettlementBuildingTemplate::PlainsSmallHouse => {
+                mc_script::PluginSettlementBuildingTemplate::PlainsSmallHouse => {
                     Ok(mc_worldgen::PlainsVillagePrototypePart::SmallHouse)
                 }
-                mc_script::LuaSettlementBuildingTemplate::PlainsToolsmith => {
+                mc_script::PluginSettlementBuildingTemplate::PlainsToolsmith => {
                     Ok(mc_worldgen::PlainsVillagePrototypePart::Toolsmith)
                 }
                 _ => anyhow::bail!("unsupported settlement building template"),
@@ -1676,12 +1610,12 @@ fn structure_rules_for_startup(
             .iter()
             .map(|inhabitant| {
                 let entity_type = match inhabitant.kind() {
-                    mc_script::LuaSettlementInhabitantKind::Villager => "minecraft:villager",
+                    mc_script::PluginSettlementInhabitantKind::Villager => "minecraft:villager",
                     _ => anyhow::bail!("unsupported settlement inhabitant kind"),
                 };
                 let profession = match inhabitant.job() {
-                    mc_script::LuaSettlementJob::Unemployed => "none",
-                    mc_script::LuaSettlementJob::Toolsmith => "toolsmith",
+                    mc_script::PluginSettlementJob::Unemployed => "none",
+                    mc_script::PluginSettlementJob::Toolsmith => "toolsmith",
                     _ => anyhow::bail!("unsupported settlement inhabitant job"),
                 };
                 Ok(mc_worldgen::StructureInhabitant {
@@ -1742,10 +1676,10 @@ fn structure_rules_for_startup(
 /// is not core's to village.
 ///
 /// Core villages apply to the default `vanilla` profile only, and only when no
-/// Luau settlement plan is deployed: a deployed plan owns settlement content and
-/// wins, so attaching core villages as well would place two villages over one
-/// landscape. The `plains_village_prototype` profile keeps its own bounded
-/// prototype rules and gets no plan source.
+/// component settlement plan is deployed: a deployed plan owns settlement
+/// content and wins, so attaching core villages as well would place two villages
+/// over one landscape. The `plains_village_prototype` profile keeps its own
+/// bounded prototype rules and gets no plan source.
 ///
 /// The source is built from the resolved content cache: the village closure
 /// (`minecraft:villages`), the tag set the server already loaded, and the
@@ -1759,13 +1693,13 @@ fn village_plan_source_for_startup(
     blocks: &Arc<mc_world::BlockRegistry>,
     data: &Arc<mc_data::VanillaData>,
     tags: &Arc<mc_data::tags::TagsData>,
-    settlement_plan: Option<&mc_script::LuaSettlementPlan>,
+    settlement_plan: Option<&mc_script::PluginSettlementPlan>,
     settlement_profile: mc_server::SettlementProfile,
 ) -> Result<Option<Arc<mc_worldgen::village::plan_source::VillagePlanSource>>> {
     if settlement_plan.is_some() {
         tracing::info!(
-            owner = settlement_plan.map(mc_script::LuaSettlementPlan::owner_plugin_id),
-            "a deployed Luau settlement plan owns settlement content; core places no villages",
+            owner = settlement_plan.map(mc_script::PluginSettlementPlan::owner_plugin_id),
+            "a deployed component settlement plan owns settlement content; core places no villages",
         );
         return Ok(None);
     }
@@ -2557,6 +2491,10 @@ async fn main() -> ExitCode {
 mod structure_rules_tests;
 
 #[cfg(test)]
+#[path = "component_startup_tests.rs"]
+mod component_startup_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2608,436 +2546,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap())
-    }
-
-    /// Root of the independent `solaris-default-plugins` sibling checkout.
-    ///
-    /// Tests fail loudly here instead of skipping: behavior coverage must run
-    /// against the real packages, and a missing checkout is a setup error.
-    fn sibling_plugin_root() -> PathBuf {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../solaris-default-plugins");
-        assert!(
-            root.is_dir(),
-            "sibling plugin checkout missing at {}: clone solaris-default-plugins next to solaris",
-            root.display()
-        );
-        root
-    }
-
-    fn deploy_sibling_plugin(name: &str, destination_root: &Path) {
-        let source = sibling_plugin_root().join(name);
-        assert!(
-            source.is_dir(),
-            "sibling plugin package `{name}` missing at {}",
-            source.display()
-        );
-        let destination = destination_root.join(name);
-        copy_sibling_package(&source, &destination);
-    }
-
-    /// The whole package, so a shipped client artifact is deployed with it.
-    fn copy_sibling_package(source: &Path, destination: &Path) {
-        std::fs::create_dir(destination).expect("create deployed plugin directory");
-        for entry in std::fs::read_dir(source).expect("read sibling plugin directory") {
-            let entry = entry.expect("read sibling plugin entry");
-            let target = destination.join(entry.file_name());
-            if entry
-                .file_type()
-                .expect("sibling plugin entry type")
-                .is_dir()
-            {
-                copy_sibling_package(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), &target).unwrap_or_else(|error| {
-                    panic!("copy sibling {}: {error}", entry.path().display())
-                });
-            }
-        }
-    }
-
-    /// The example component plugin's bytes, built from the SDK.
-    ///
-    /// The build runs once per test process. P7 owns moving this recipe somewhere
-    /// shared - the component host's own test suite builds the same fixture - but
-    /// what matters here is that the deployment under test is a real component of
-    /// the contract rather than a hand-written module or a stub.
-    fn component_plugin_bytes() -> &'static [u8] {
-        static BYTES: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .expect("repository root");
-            let sdk = root.join("sdk/rust");
-            let status = std::process::Command::new(env!("CARGO"))
-                .args([
-                    "build",
-                    "--manifest-path",
-                    sdk.join("Cargo.toml").to_str().expect("utf-8 path"),
-                    "--target",
-                    "wasm32-unknown-unknown",
-                    "--release",
-                    "-p",
-                    "solaris-hello-plugin",
-                ])
-                .status()
-                .expect("the guest build starts");
-            assert!(status.success(), "the component fixture must build");
-            let module = std::fs::read(
-                sdk.join("target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm"),
-            )
-            .expect("the guest module exists");
-            wit_component::ComponentEncoder::default()
-                .module(&module)
-                .expect("the guest module carries its component types")
-                .validate(true)
-                .encode()
-                .expect("the guest module encodes as a component")
-        });
-        BYTES.as_slice()
-    }
-
-    /// Deploy the fixture under `id`, configured with `config` as its `config.toml`.
-    fn deploy_component_fixture(root: &Path, id: &str, config: &str) {
-        let directory = root.join(id);
-        std::fs::create_dir(&directory).expect("plugin directory");
-        std::fs::write(
-            directory.join("plugin.toml"),
-            format!(
-                "id = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\napi = \"0.7.0\"\nevents = [\"player.joined\"]\nplayer_commands = [\"hello\"]\n"
-            ),
-        )
-        .expect("manifest");
-        std::fs::write(directory.join("plugin.wasm"), component_plugin_bytes()).expect("artifact");
-        std::fs::write(directory.join("config.toml"), config).expect("config");
-    }
-
-    fn component_config(root: &Path) -> ServerConfig {
-        let mut config: ServerConfig = toml::from_str(
-            r#"
-                [server]
-                name = "Components"
-                motd = "Components"
-
-                [network]
-                bind_address = "127.0.0.1"
-                port = 25565
-
-                [plugins]
-                runtime = "wasm"
-                strict = true
-            "#,
-        )
-        .unwrap();
-        config.plugins.directory = Some(root.to_path_buf());
-        config
-    }
-
-    /// The same, expecting exactly `expected` to be discovered.
-    fn component_config_expecting(root: &Path, expected: &[&str]) -> ServerConfig {
-        let mut config = component_config(root);
-        config.plugins.expected = expected.iter().map(|id| (*id).to_owned()).collect();
-        config
-    }
-
-    #[tokio::test]
-    async fn a_component_deployment_starts_its_host_and_carries_its_rules() {
-        let root = tempfile::tempdir().expect("deployment root");
-        deploy_component_fixture(root.path(), "hello", "mode = \"placement\"\n");
-        let config = component_config_expecting(root.path(), &["hello"]);
-
-        let prepared = prepare_configured_plugins(&config)
-            .await
-            .expect("the deployment prepares")
-            .expect("a configured directory prepares a deployment");
-        let PreparedPlugins::Component(component) = prepared else {
-            panic!("runtime = wasm must prepare the component host");
-        };
-        assert_eq!(component.plugin_ids, vec!["hello".to_owned()]);
-        assert_eq!(
-            component.host.boundary().player_command_roots(),
-            vec!["hello".to_owned()],
-            "the started deployment really claims the command its manifest declares"
-        );
-
-        // The rules came from the *running host*, which is what stops a
-        // deployment from opening a world it did not configure, and they carry
-        // what the package declared rather than a default. The cross-runtime
-        // fingerprint invariant is pinned next to the converter
-        // (`crates/mc-plugin-host/tests/startup_contribution.rs`); what this case
-        // adds is that the composition root is really wired to that contribution.
-        let rules = component.rules.expect("the fixture declared a plan");
-        let placement = rules
-            .placement
-            .as_ref()
-            .expect("the fixture's plan is a placement");
-        assert_eq!(
-            (
-                placement.land_spacing,
-                placement.water_attempts,
-                placement.water_depth
-            ),
-            (2, 8, 4),
-            "the plan the world would be opened with is the package's own"
-        );
-        rules.validate().expect("the fixture's plan is valid");
-        stop_component_host(component.host)
-            .await
-            .expect("the host stops");
-    }
-
-    #[tokio::test]
-    async fn a_component_deployment_without_rules_prepares_none() {
-        let root = tempfile::tempdir().expect("deployment root");
-        deploy_component_fixture(root.path(), "hello", "greeting = \"Hi\"\n");
-        let config = component_config_expecting(root.path(), &["hello"]);
-
-        let prepared = prepare_configured_plugins(&config)
-            .await
-            .expect("the deployment prepares")
-            .expect("a configured directory prepares a deployment");
-        let PreparedPlugins::Component(component) = prepared else {
-            panic!("runtime = wasm must prepare the component host");
-        };
-        assert_eq!(component.plugin_ids, vec!["hello".to_owned()]);
-        assert!(
-            component.rules.is_none(),
-            "a package that declares no plan contributes none"
-        );
-        stop_component_host(component.host)
-            .await
-            .expect("the host stops");
-    }
-
-    #[tokio::test]
-    async fn two_component_packages_declaring_rules_refuse_the_deployment() {
-        let root = tempfile::tempdir().expect("deployment root");
-        deploy_component_fixture(root.path(), "first", "mode = \"placement\"\n");
-        deploy_component_fixture(root.path(), "second", "mode = \"placement\"\n");
-        let config = component_config_expecting(root.path(), &["first", "second"]);
-
-        let error = prepare_configured_plugins(&config)
-            .await
-            .err()
-            .expect("two declarers must refuse the deployment");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("first") && message.contains("second"),
-            "the refusal names both declaring packages: {message}"
-        );
-    }
-
-    fn config_with_deployed_plugins(names: &[&str]) -> (tempfile::TempDir, ServerConfig) {
-        let root = tempfile::tempdir().expect("deployed plugin root");
-        for name in names {
-            deploy_sibling_plugin(name, root.path());
-        }
-        let mut config: ServerConfig = toml::from_str(
-            r#"
-                [server]
-                name = "Deployed"
-                motd = "Deployed plugins"
-
-                [network]
-                bind_address = "127.0.0.1"
-                port = 25565
-            "#,
-        )
-        .unwrap();
-        config.plugins.directory = Some(root.path().to_path_buf());
-        (root, config)
-    }
-
-    #[test]
-    fn deployed_sibling_plugins_prepare_runtime_and_worldgen_profiles() {
-        let (_root, config) = config_with_deployed_plugins(&[
-            "online-roster",
-            "geological-mines",
-            "solaris-settlements",
-        ]);
-
-        let prepared = prepare_configured_luau_plugins(&config)
-            .unwrap()
-            .expect("deployed plugins should prepare a host");
-        assert_eq!(
-            prepared.worldgen_ore_profile(),
-            Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits)
-        );
-        // The merged settlement package is server-side only and declares no
-        // worldgen settlement plan; the config-driven `[data] settlement_profile`
-        // path covers prototype generation instead.
-        assert_eq!(prepared.worldgen_settlement_profile(), None);
-        let (boundary, host) = mc_script::start_prepared_lua_host(prepared).unwrap();
-        assert_eq!(host.loaded_plugins(), 3);
-        drop(boundary);
-        host.join().unwrap();
-    }
-
-    #[test]
-    fn strict_plugin_set_matches_deployed_directory() {
-        let plugins = tempfile::tempdir().unwrap();
-        let external = plugins.path().join("external");
-        std::fs::create_dir(&external).unwrap();
-        std::fs::write(
-            external.join("plugin.toml"),
-            "id='external'\nname='External'\nversion='0.1.0'\napi='0.6.0'\n",
-        )
-        .unwrap();
-        std::fs::write(external.join("main.lua"), "return nil").unwrap();
-        deploy_sibling_plugin("online-roster", plugins.path());
-        let mut config: ServerConfig = toml::from_str(
-            r#"
-                [server]
-                name = "Strict"
-                motd = "Strict plugins"
-
-                [network]
-                bind_address = "127.0.0.1"
-                port = 25565
-            "#,
-        )
-        .unwrap();
-        config.plugins.directory = Some(plugins.path().to_path_buf());
-        config.plugins.strict = true;
-        config.plugins.expected = vec!["online-roster".to_owned(), "external".to_owned()];
-
-        let prepared = prepare_configured_luau_plugins(&config)
-            .unwrap()
-            .expect("strict deployed plugin set prepares");
-        assert_eq!(
-            prepared
-                .discovered_plugins()
-                .map(|plugin| plugin.id())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["external", "online-roster"])
-        );
-        let (boundary, host) = mc_script::start_prepared_lua_host(prepared).unwrap();
-        assert_eq!(host.loaded_plugins(), 2);
-        drop(boundary);
-        host.join().unwrap();
-
-        config.plugins.expected.push("missing".to_owned());
-        let error = prepare_configured_luau_plugins(&config).unwrap_err();
-        assert!(error.to_string().contains("missing [missing]"), "{error:#}");
-
-        config.plugins.expected = vec!["external".to_owned()];
-        let error = prepare_configured_luau_plugins(&config).unwrap_err();
-        assert!(
-            error.to_string().contains("unexpected [online-roster]"),
-            "{error:#}"
-        );
-
-        config.plugins.expected = vec!["external".to_owned(), "external".to_owned()];
-        let error = prepare_configured_luau_plugins(&config).unwrap_err();
-        assert!(error.to_string().contains("duplicate plugin id `external`"));
-
-        config.plugins.strict = false;
-        config.plugins.expected = vec!["external".to_owned()];
-        let error = prepare_configured_luau_plugins(&config).unwrap_err();
-        assert!(error.to_string().contains("requires plugins.strict = true"));
-    }
-
-    #[tokio::test]
-    async fn strict_config_file_reload_reprepares_and_swaps_luau_generation() {
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join("reloadable");
-        std::fs::create_dir(&plugin).unwrap();
-        std::fs::write(
-            plugin.join("plugin.toml"),
-            r#"
-                id = "reloadable"
-                name = "Reloadable"
-                version = "0.1.0"
-                api = "0.6.0"
-                events = ["server.started", "server.tick"]
-            "#,
-        )
-        .unwrap();
-        std::fs::write(
-            plugin.join("main.lua"),
-            "function on_server_tick(_event) solaris.broadcast('old-generation') end",
-        )
-        .unwrap();
-
-        let mut config: ServerConfig = toml::from_str(
-            r#"
-                [server]
-                name = "Reload"
-                motd = "Reload plugins"
-
-                [network]
-                bind_address = "127.0.0.1"
-                port = 25565
-            "#,
-        )
-        .unwrap();
-        config.plugins.directory = Some(plugins.path().to_path_buf());
-        config.plugins.strict = true;
-        config.plugins.expected = vec!["reloadable".to_owned()];
-        let config_root = tempfile::tempdir().unwrap();
-        let config_path = config_root.path().join("server.toml");
-        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
-
-        let prepared = prepare_configured_luau_plugins(&config)
-            .unwrap()
-            .expect("strict reload fixture prepares");
-        let (boundary, host) = mc_script::start_prepared_lua_host(prepared).unwrap();
-        std::fs::write(
-            plugin.join("main.lua"),
-            r#"
-                function on_server_started(_event)
-                    solaris.broadcast("reload-started")
-                end
-
-                function on_server_tick(_event)
-                    solaris.broadcast("new-generation")
-                end
-            "#,
-        )
-        .unwrap();
-
-        let report = reload_configured_luau_plugins(config_path, true, &host)
-            .await
-            .unwrap();
-        assert_eq!(report.loaded_plugins(), 1);
-        assert!(report.replaced_disabled_plugins().is_empty());
-
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        assert!(matches!(
-            admitted.request(),
-            mc_script::ScriptCommand::BroadcastChatMessage { message }
-                if message == "reload-started"
-        ));
-
-        boundary
-            .try_enqueue_event(mc_script::ScriptEvent::server_tick(1))
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
-            .await
-            .unwrap()
-            .unwrap();
-        let admitted = boundary.accept_host_command(command).unwrap();
-        assert!(matches!(
-            admitted.request(),
-            mc_script::ScriptCommand::BroadcastChatMessage { message }
-                if message == "new-generation"
-        ));
-
-        drop(boundary);
-        host.join().unwrap();
-    }
-
-    #[test]
-    fn luau_reload_requires_strict_startup() {
-        let error = prepare_configured_luau_reload(Path::new("unused.toml"), false).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("start with plugins.strict = true")
-        );
     }
 
     #[test]
@@ -3720,7 +3228,7 @@ mod tests {
 
     /// No plan source, no villages: `build_terrain_generator` receives the
     /// source from its caller, and this call passes `None` (the shape a world
-    /// whose profile is not `vanilla`, or where a deployed Luau plan owns
+    /// whose profile is not `vanilla`, or where a deployed component plan owns
     /// settlement, reaches it with). The generator then places nothing and the
     /// terrain-adaptation analogue notice has nothing to report.
     #[test]
@@ -3762,7 +3270,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
-            Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits),
+            Some(mc_script::PluginWorldgenOreProfile::RealisticDeposits),
             None,
             None,
         )
@@ -3839,7 +3347,7 @@ mod tests {
             &vanilla_data_dir,
             &blocks,
             &items,
-            Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
+            Some(&mc_script::PluginSettlementPlan::plains_village_prototype(
                 "test-settlement",
             )),
             mc_server::SettlementProfile::Vanilla,
@@ -3873,7 +3381,7 @@ mod tests {
             &vanilla_data_dir,
             &blocks,
             &items,
-            Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
+            Some(&mc_script::PluginSettlementPlan::plains_village_prototype(
                 "test-settlement",
             )),
             mc_server::SettlementProfile::Vanilla,

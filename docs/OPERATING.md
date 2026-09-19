@@ -150,8 +150,9 @@ it. Malformed JSON, names, UUIDs, and oversized files fail closed. Invalid
 and then apply the change to the running process: a new operator receives the
 command tree without a restart, and the next login is checked against the live
 whitelist. The standalone CLI subcommands exit before the listener starts, so
-their change takes effect on the next server start. `SIGHUP` is a strict-plugin
-reload only.
+their change takes effect on the next server start. `SIGHUP` reloads only the
+active strict component deployment; it re-reads `[plugins]` but does not apply
+any other server configuration change.
 
 `allow_local_dev_operators = true` is a convenience for throwaway loopback
 development when no identities are configured. Leave it `false` for normal
@@ -314,7 +315,9 @@ Performance profiles that set their own workload knobs are unaffected.
 
 ## Plugins
 
-External plugin packages are child directories of the configured root:
+External component packages are child directories of the configured root. Each
+package contains `plugin.toml`, `plugin.wasm`, optional `config.toml`, and only
+the resources declared by its manifest:
 
 ```toml
 [plugins]
@@ -323,44 +326,59 @@ strict = false
 expected = []
 ```
 
-For local authoring, permissive discovery may skip an ordinary broken plugin.
-For a controlled deployment, enable strict mode and enumerate the complete
-deployed set. Copy selected packages from `../solaris-default-plugins` first:
+Permissive discovery is for local authoring only and may skip an ordinary
+broken package. For a controlled deployment, install independently built
+component packages, enable strict discovery, enumerate the complete roster,
+and grant each requested capability explicitly:
 
 ```toml
 [plugins]
 directory = "plugins"
 strict = true
-expected = ["online-roster", "my-plugin"]
+expected = [
+  "solaris-permissions",
+  "solaris-essentials",
+  "solaris-economy",
+  "solaris-towns",
+  "solaris-audit",
+]
+
+[plugins.grants.solaris-permissions]
+capabilities = ["storage"]
+
+[plugins.grants.solaris-essentials]
+capabilities = ["storage", "player_teleport", "player_queries"]
+
+[plugins.grants.solaris-economy]
+capabilities = ["storage"]
+
+[plugins.grants.solaris-towns]
+capabilities = ["storage", "zones", "player_queries"]
+
+[plugins.grants.solaris-audit]
+capabilities = ["storage"]
 ```
 
-Strict mode rejects stray entries, malformed packages, startup failures, and a
-missing or unexpected id. See [`PLUGINS.md`](PLUGINS.md) for manifests,
-permissions, APIs, reload boundaries, and deployment reporting. A plugin with
-client bundles requires players to follow
-[`SOLARIS_LOADER.md`](SOLARIS_LOADER.md).
+Strict mode rejects stray entries, malformed packages, component or startup
+failures, missing or unexpected ids, and requested capabilities without an
+operator grant. See [`PLUGINS.md`](PLUGINS.md) for package construction,
+permissions, lifecycle, and component deployment. A package with client
+bundles requires players to follow [`SOLARIS_LOADER.md`](SOLARIS_LOADER.md).
 
 ## Reading `--check`
 
-A successful check prints JSON and does not open the network listener. Important
-fields are:
+A successful component check prints the checked package ids and does not open a
+world, write storage, bind the network listener, apply commands, or start
+timers:
 
-- `network.bind_address` and `network.port`: the requested listener endpoint;
-- `operator_warnings`: security, access-control, world, and sidecar findings;
-- `effective_chunk_pipeline`: automatically derived worker capacity;
-- `effective_autoscale`: normalized mode, limits, and pressure policy;
-- `discovered_plugins`: each plugin's `server_only`/`server_and_client`
-  deployment, Loader platforms/permissions, and exact bundle artifacts.
-
-Typical inspection with `jq`:
-
-```sh
-cargo run --quiet --bin mc-server -- --check --config server.toml |
-  jq '{network, operator_warnings, effective_autoscale, discovered_plugins}'
+```text
+component plugins checked: solaris-audit, solaris-economy, solaris-essentials, solaris-permissions, solaris-towns
 ```
 
-A fresh-world warning is expected only when intentionally creating that world.
-Do not start after a warning you do not understand.
+`--check` performs the same discovery, grant validation, component compilation,
+and `configure`/`init` startup phases that serving performs. A fresh-world
+warning is expected only when intentionally creating that world. Do not start
+after a warning or component-check failure you do not understand.
 
 ## Dashboard
 

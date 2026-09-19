@@ -293,13 +293,26 @@ impl SessionRegistry {
                 .as_ref()
                 .is_some_and(|transition| transition.expected != active_shield)
         {
-            return Some(PlayerSurvivalCommitOutcome::Rejected(
+            return Some(PlayerSurvivalCommitOutcome::Rejected(Box::new(
                 AuthoritativePlayerStateSnapshot {
                     inventory: player_state.inventory.clone(),
                     carried_item: player_state.carried_item.clone(),
                     active_shield,
                 },
-            ));
+            )));
+        }
+        if plan
+            .hook_approval
+            .as_ref()
+            .is_some_and(|approval| approval.clone().consume().is_err())
+        {
+            return Some(PlayerSurvivalCommitOutcome::Rejected(Box::new(
+                AuthoritativePlayerStateSnapshot {
+                    inventory: player_state.inventory.clone(),
+                    carried_item: player_state.carried_item.clone(),
+                    active_shield,
+                },
+            )));
         }
         let respawned = plan.expected_survival.is_dead() && !plan.updated_survival.is_dead();
         let staged_damage_wake = (plan.updated_survival.health < plan.expected_survival.health)
@@ -335,7 +348,7 @@ impl SessionRegistry {
             dispatches.append(&mut committed.dispatches);
             committed.dispatches = dispatches;
         }
-        Some(PlayerSurvivalCommitOutcome::Committed(committed))
+        Some(PlayerSurvivalCommitOutcome::Committed(Box::new(committed)))
     }
 
     #[cfg(test)]

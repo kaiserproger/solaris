@@ -9,6 +9,10 @@
 //! This module is included by several test binaries, so it holds only what they
 //! all need: the fixture's bytes and the repository root. What a test's host
 //! services do (and how the fixture is driven) stays in the test that owns it.
+#![allow(
+    dead_code,
+    reason = "each integration-test binary uses a different subset of the shared fixture helpers"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -36,26 +40,42 @@ pub fn component_bytes() -> Vec<u8> {
 
 fn build_component_bytes() -> Vec<u8> {
     let sdk = repo_root().join("sdk/rust");
+    component_bytes_from_workspace(&sdk, "solaris-hello-plugin", "solaris_hello_plugin.wasm")
+}
+
+/// Build one SDK-workspace guest and encode its real core module as a component.
+///
+/// First-party component acceptance tests use this instead of hand-written wasm:
+/// the guest's source must compile against the same WIT contract as the host.
+#[must_use]
+pub fn component_bytes_from_workspace(
+    workspace: &Path,
+    package: &str,
+    module_name: &str,
+) -> Vec<u8> {
+    let manifest = workspace.join("Cargo.toml");
     let status = ProcessCommand::new(env!("CARGO"))
         .args([
             "build",
             "--manifest-path",
-            sdk.join("Cargo.toml").to_str().expect("utf-8 path"),
+            manifest.to_str().expect("utf-8 workspace path"),
             "--target",
             "wasm32-unknown-unknown",
             "--release",
             "-p",
-            "solaris-hello-plugin",
+            package,
         ])
         .status()
-        .expect("the guest build starts");
-    assert!(status.success(), "the guest fixture must build");
-    let module = sdk.join("target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm");
-    let bytes = std::fs::read(module).expect("the guest module exists");
+        .expect("guest build starts");
+    assert!(status.success(), "{package} guest build succeeds");
+    let module = workspace
+        .join("target/wasm32-unknown-unknown/release")
+        .join(module_name);
+    let bytes = std::fs::read(module).expect("guest module exists");
     wit_component::ComponentEncoder::default()
         .module(&bytes)
-        .expect("the guest module carries its component types")
+        .expect("guest module carries component types")
         .validate(true)
         .encode()
-        .expect("the guest module encodes as a component")
+        .expect("guest module encodes as a component")
 }

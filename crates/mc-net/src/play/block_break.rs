@@ -195,6 +195,8 @@ where
     let sequence = acknowledgement.sequence();
     let (x, y, z) = unpack_block_pos(position);
     let pos = mc_world::BlockPos { x, y, z };
+    let zone_fence =
+        script_events.and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
     if script_events.is_some_and(|events| !events.block_mutation_allowed(pos)) {
         debug!(
             sequence,
@@ -244,6 +246,8 @@ where
                     max_damage,
                 },
                 drop_items,
+                hook_approval: None,
+                zone_fence,
             })
             .await
         {
@@ -1045,7 +1049,7 @@ where
         && updated_survival
             .add_exhaustion(mc_entity::player_survival_26_1_2::BLOCK_BREAK_EXHAUSTION)
     {
-        let expected_inventory = state.inventory.clone();
+        let expected_inventory = Box::new(state.inventory.clone());
         commit_player_survival_update(
             state,
             writer,
@@ -1054,6 +1058,7 @@ where
             expected_inventory,
             updated_survival,
             xp_state.clone(),
+            None,
             None,
             true,
             player_pose,

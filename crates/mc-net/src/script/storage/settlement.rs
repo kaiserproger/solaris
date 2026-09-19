@@ -33,7 +33,7 @@ use mc_script::{
     ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteProvenance,
     ScriptSiteVariant, ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
     ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds, ScriptSurveySnapshot,
-    ScriptWarehouseBinding, resident_generation_id, warehouse_handle,
+    ScriptWarehouseBinding, ScriptWarehouseSource, resident_generation_id, warehouse_handle,
 };
 use mc_world::GeneratedVillageSite;
 use mc_worldgen::{
@@ -196,13 +196,23 @@ pub(super) struct DurableSurveyToken {
 
 /// One durable, owner-bound warehouse handle.
 ///
-/// A binding grants exactly one plugin read access to one authored container of
-/// one of its structures. `revision` is the storage transaction that minted the
-/// binding, which is also the fence a warehouse endpoint reports until the
-/// container itself becomes writable. `handle` is opaque and is the only
-/// identity a plugin ever names back; the structure and container identities
-/// stay owner-scoped here so a handle from another plugin resolves to a typed
-/// refusal rather than to a container.
+/// A binding grants exactly one plugin access to one core-resolved container.
+/// `revision` is the storage transaction that minted the binding, which is also
+/// the fence a warehouse endpoint reports. `handle` is opaque and is the only
+/// identity a plugin ever names back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableVillageWarehouseSource {
+    site_id: String,
+    container_id: u32,
+    position: [i32; 3],
+}
+
+/// One warehouse handle's durable source.
+///
+/// The authored fields remain the persisted representation of pre-village
+/// bindings. `village` makes the alternate source explicit while preserving
+/// those journals; it is the only source that stores a resolved position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableWarehouseBinding {
@@ -210,17 +220,27 @@ pub(super) struct DurableWarehouseBinding {
     plugin_id: String,
     structure_id: String,
     container_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    village: Option<DurableVillageWarehouseSource>,
     revision: u64,
 }
 
 impl DurableWarehouseBinding {
+    fn source(&self) -> ScriptWarehouseSource {
+        match &self.village {
+            Some(village) => ScriptWarehouseSource::VanillaVillage {
+                site_id: village.site_id.clone(),
+                container_id: village.container_id,
+            },
+            None => ScriptWarehouseSource::Authored {
+                structure_id: self.structure_id.clone(),
+                container_id: self.container_id,
+            },
+        }
+    }
+
     fn snapshot(&self) -> ScriptWarehouseBinding {
-        ScriptWarehouseBinding::new(
-            self.handle.clone(),
-            self.structure_id.clone(),
-            self.container_id,
-            self.revision,
-        )
+        ScriptWarehouseBinding::new(self.handle.clone(), self.source(), self.revision)
     }
 }
 
@@ -299,16 +319,30 @@ impl SettlementLedger {
     }
 
     /// The binding of one authored container, if any plugin already holds it.
-    ///
-    /// Container bindings are unique per `(structure, container)`: a second
-    /// binding of the same container would hand two handles to one container.
     pub(super) fn warehouse_for_container(
         &self,
         structure_id: &str,
         container_id: u32,
     ) -> Option<&DurableWarehouseBinding> {
         self.warehouses.values().find(|binding| {
-            binding.structure_id == structure_id && binding.container_id == container_id
+            binding.village.is_none()
+                && binding.structure_id == structure_id
+                && binding.container_id == container_id
+        })
+    }
+
+    /// The binding of one generator-authenticated village container, if any
+    /// plugin already holds its resolved physical position.
+    fn warehouse_for_village_container(
+        &self,
+        site_id: &str,
+        position: [i32; 3],
+    ) -> Option<&DurableWarehouseBinding> {
+        self.warehouses.values().find(|binding| {
+            binding
+                .village
+                .as_ref()
+                .is_some_and(|village| village.site_id == site_id && village.position == position)
         })
     }
 
@@ -416,18 +450,16 @@ impl SettlementLedger {
                         || previous.plugin_id != binding.plugin_id
                         || previous.structure_id != binding.structure_id
                         || previous.container_id != binding.container_id
+                        || previous.village != binding.village
                     {
                         return Err(PluginStorageStartError::Malformed(
                             "settlement warehouse revision",
                         ));
                     }
                 }
-                // One container carries at most one binding: a journal that
-                // binds the same authored container twice is malformed.
+                // One core-resolved container carries at most one binding.
                 if self.warehouses.values().any(|existing| {
-                    existing.handle != binding.handle
-                        && existing.structure_id == binding.structure_id
-                        && existing.container_id == binding.container_id
+                    existing.handle != binding.handle && same_warehouse_target(existing, binding)
                 }) {
                     return Err(PluginStorageStartError::Malformed(
                         "settlement warehouse container rebound",
@@ -814,25 +846,47 @@ fn validate_warehouse_binding(
     validate_identifier(&binding.handle, MAX_WAREHOUSE_HANDLE_BYTES)?;
     validate_identifier(&binding.plugin_id, 128)?;
     validate_identifier(&binding.structure_id, MAX_STRUCTURE_ID_BYTES)?;
+    if let Some(village) = &binding.village {
+        validate_identifier(&village.site_id, 64)?;
+        if village.position.iter().any(|coordinate| {
+            coordinate.unsigned_abs() > mc_script::MAX_SCRIPT_BLOCK_COORDINATE as u32
+        }) {
+            return Err(PluginStorageStartError::Malformed(
+                "settlement village warehouse position",
+            ));
+        }
+    }
     validate_revision(binding.revision)
 }
 
-/// The in-memory [`SettlementWorld`]s' stand-in for the server-owned
-/// composite's world half.
+fn same_warehouse_target(left: &DurableWarehouseBinding, right: &DurableWarehouseBinding) -> bool {
+    match (&left.village, &right.village) {
+        (Some(left), Some(right)) => {
+            left.site_id == right.site_id && left.position == right.position
+        }
+        (None, None) => {
+            left.structure_id == right.structure_id && left.container_id == right.container_id
+        }
+        _ => false,
+    }
+}
+
+/// The in-memory [`SettlementWorld`]s' stand-in for one receipt-bearing world
+/// decision.
 ///
-/// Those fakes own no world, so they cannot stamp a container after-image; they
-/// journal the caller's encoded receipt under a fresh decision id exactly like
-/// the live owner turn does, so the submitter's ledger projection, its player
-/// after-image, its acknowledgement and the startup replay are exercised for
-/// real.
+/// Those fakes own no resident chunk images, so they journal the caller's
+/// encoded receipt under a fresh decision id. The submitter's ledger projection,
+/// acknowledgement, and startup replay therefore use the same durable path as
+/// a live server-owned container transfer or structure portion.
 #[cfg(test)]
-pub(super) fn journal_test_warehouse_transfer(
+pub(super) fn journal_test_plugin_decision(
     sessions: &crate::play::SessionRegistry,
     receipt: Vec<u8>,
 ) -> Result<u64, ScriptOperationFailure> {
     let Some(journal) = sessions.world_chunk_journal() else {
         return Err(ScriptOperationFailure::RuntimeUnavailable);
     };
+
     let decision_id = journal
         .reserve_decision_ids(1)
         .map_err(|_| ScriptOperationFailure::RuntimeUnavailable)?[0];
@@ -919,12 +973,20 @@ pub(crate) trait SettlementWorld: Send + Sync {
     ) -> Result<SurveyReading, ScriptOperationFailure>;
     /// Mint the revision later [`Self::footprint_changed_since`] checks compare
     /// `bounds` against.
-    ///
     /// An observation is scoped to `bounds`: the world keeps writing chunks that
     /// share space with a footprint - fluid, snow, leaf decay, the structure's
     /// own staged commits - without changing the footprint itself, so a revision
     /// only means anything for the volume it was minted over.
     fn observe_footprint(&self, bounds: ScriptSurveyBounds) -> u64;
+    /// Predict and retain the exact post-portion footprint image under a fresh
+    /// revision. The caller puts this revision in the same receipt that carries
+    /// the portion, so the next advance distinguishes foreign edits from the
+    /// structure's own committed blocks without a second storage decision.
+    fn predict_structure_portion_revision(
+        &self,
+        bounds: ScriptSurveyBounds,
+        blocks: &[StructureBlockPlacement],
+    ) -> Result<u64, ScriptOperationFailure>;
     /// Whether anything inside `bounds` changed after `revision`.
     fn footprint_changed_since(&self, bounds: ScriptSurveyBounds, revision: u64) -> bool;
     /// Whether another plugin's structure or claim overlaps `bounds`.
@@ -951,6 +1013,16 @@ pub(crate) trait SettlementWorld: Send + Sync {
         &self,
         position: [i32; 3],
     ) -> Result<ContainerReading, ScriptOperationFailure>;
+
+    /// Materialized containers inside one generated village's bounded box.
+    ///
+    /// The world enumerates only container block entities it currently holds;
+    /// an unavailable covered chunk answers `Unloaded`, never an incomplete
+    /// ordinal set. Core sorts these exact positions before selecting one.
+    fn village_containers(
+        &self,
+        bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<[i32; 3]>, ScriptOperationFailure>;
     /// Commit one server-owned warehouse deposit against a bound container.
     ///
     /// The caller has already resolved the durable binding, read the loaded
@@ -963,17 +1035,19 @@ pub(crate) trait SettlementWorld: Send + Sync {
         &self,
         request: WarehouseTransferRequest,
     ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + '_>>;
-    /// Apply one committed structure portion to the world.
+    /// Commit one server-owned structure portion and its prepared plugin
+    /// receipt in the same world-journal decision.
     ///
-    /// The portion commits on the world's own async surface, so the future is
-    /// boxed and `Send`; keeping it behind a trait object lets the settlement
-    /// runtime stay generic over the live world and the in-memory fakes.
-    fn apply_structure_portion<'a>(
+    /// The world accepts its after-images only alongside `receipt`, and returns
+    /// that decision id only after append. The caller projects the prepared
+    /// storage batch afterwards; recovery replays both from the same decision.
+    fn commit_structure_portion<'a>(
         &'a self,
         plugin_id: &'a str,
         structure_id: &'a str,
         blocks: &'a [StructureBlockPlacement],
-    ) -> Pin<Box<dyn Future<Output = Result<(), ScriptOperationFailure>> + Send + 'a>>;
+        receipt: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>>;
     /// The points of interest a generated village's blocks hold.
     ///
     /// Read from the materialized chunks inside `bounds`: a bed, a bell and the
@@ -1272,6 +1346,17 @@ impl super::InventoryRuntime {
                         structure_id,
                         *expected_revision,
                     ),
+                    ScriptSettlementOperation::ResumeStructure {
+                        structure_id,
+                        expected_revision,
+                        ..
+                    } => self.resume_structure(
+                        storage,
+                        plugin_id,
+                        request,
+                        structure_id,
+                        *expected_revision,
+                    ),
                     ScriptSettlementOperation::CancelStructure {
                         structure_id,
                         expected_revision,
@@ -1293,6 +1378,18 @@ impl super::InventoryRuntime {
                         plugin_id,
                         request,
                         structure_id,
+                        *container_id,
+                    ),
+                    ScriptSettlementOperation::BindVillageWarehouse {
+                        site_id,
+                        container_id,
+                        ..
+                    } => self.bind_village_warehouse(
+                        storage,
+                        runtime,
+                        plugin_id,
+                        request,
+                        site_id,
                         *container_id,
                     ),
                     _ => Ok(rejected(ScriptOperationFailure::InvalidRequest)),
@@ -1545,6 +1642,96 @@ impl super::InventoryRuntime {
             plugin_id: plugin_id.to_owned(),
             structure_id: structure_id.to_owned(),
             container_id,
+            village: None,
+            revision: 0,
+        };
+        commit_settlement(
+            storage,
+            plugin_id,
+            request,
+            settlement_payload(ScriptSettlementResult::Warehouse {
+                binding: Box::new(binding.snapshot()),
+            }),
+            vec![DurableSettlementChange::Warehouse {
+                binding: Box::new(binding),
+            }],
+        )
+    }
+
+    /// Bind a materialized container from one generator-authenticated vanilla
+    /// village through the normal opaque warehouse authority.
+    fn bind_village_warehouse(
+        &self,
+        storage: &mut PluginStorage,
+        runtime: &SettlementRuntime,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+        site_id: &str,
+        container_id: u32,
+    ) -> Result<ScriptOperationOutcome, PluginStorageMutationError> {
+        let Some(world) = self.settlement_world() else {
+            return Ok(rejected(ScriptOperationFailure::RuntimeUnavailable));
+        };
+        let village = match generated_village(runtime, site_id) {
+            Ok(village) => village,
+            Err(failure) => return Ok(rejected(failure)),
+        };
+        let bounds = match village_bounds(&village) {
+            Ok(bounds) => bounds,
+            Err(failure) => return Ok(rejected(failure)),
+        };
+        let mut containers = match world.village_containers(bounds) {
+            Ok(VillageReading::Loaded(containers)) => containers,
+            Ok(VillageReading::Unloaded) => return Ok(rejected(ScriptOperationFailure::Unloaded)),
+            Err(failure) => return Ok(rejected(failure)),
+        };
+        containers.sort_unstable();
+        let index = match usize::try_from(container_id) {
+            Ok(index) => index,
+            Err(_) => return Ok(rejected(ScriptOperationFailure::NotFound)),
+        };
+        let Some(position) = containers.get(index).copied() else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if let Some(existing) = storage
+            .settlements()
+            .warehouse_for_village_container(site_id, position)
+        {
+            if existing.plugin_id != plugin_id {
+                return Ok(rejected(ScriptOperationFailure::Forbidden));
+            }
+            return commit_settlement(
+                storage,
+                plugin_id,
+                request,
+                settlement_payload(ScriptSettlementResult::Warehouse {
+                    binding: Box::new(existing.snapshot()),
+                }),
+                Vec::new(),
+            );
+        }
+        match world.container_reading(position) {
+            Ok(ContainerReading::Loaded(_)) => {}
+            Ok(ContainerReading::Unloaded) => {
+                return Ok(rejected(ScriptOperationFailure::Unloaded));
+            }
+            Ok(ContainerReading::Missing) => return Ok(rejected(ScriptOperationFailure::NotFound)),
+            Err(failure) => return Ok(rejected(failure)),
+        }
+        let handle = match village_warehouse_handle(plugin_id, site_id, container_id) {
+            Ok(handle) => handle,
+            Err(_) => return Ok(rejected(ScriptOperationFailure::InvalidRequest)),
+        };
+        let binding = DurableWarehouseBinding {
+            handle,
+            plugin_id: plugin_id.to_owned(),
+            structure_id: site_id.to_owned(),
+            container_id,
+            village: Some(DurableVillageWarehouseSource {
+                site_id: site_id.to_owned(),
+                container_id,
+                position,
+            }),
             revision: 0,
         };
         commit_settlement(
@@ -1588,17 +1775,36 @@ impl super::InventoryRuntime {
         if binding.plugin_id != plugin_id {
             return Err(ScriptOperationFailure::Forbidden);
         }
-        let Some(structure) = storage
-            .settlements()
-            .structure(&binding.structure_id)
-            .cloned()
-        else {
-            return Err(ScriptOperationFailure::NotFound);
+        let position = match &binding.village {
+            Some(village_source) => {
+                let village = generated_village(runtime, &village_source.site_id)?;
+                let bounds = village_bounds(&village)?;
+                if !position_in_bounds(village_source.position, bounds) {
+                    return Err(ScriptOperationFailure::NotFound);
+                }
+                let containers = match world.village_containers(bounds)? {
+                    VillageReading::Loaded(containers) => containers,
+                    VillageReading::Unloaded => return Err(ScriptOperationFailure::Unloaded),
+                };
+                if !containers.contains(&village_source.position) {
+                    return Err(ScriptOperationFailure::NotFound);
+                }
+                village_source.position
+            }
+            None => {
+                let Some(structure) = storage
+                    .settlements()
+                    .structure(&binding.structure_id)
+                    .cloned()
+                else {
+                    return Err(ScriptOperationFailure::NotFound);
+                };
+                if !structure.is_placed() {
+                    return Err(ScriptOperationFailure::Blocked);
+                }
+                warehouse_container_position(runtime, &structure, binding.container_id)?
+            }
         };
-        if !structure.is_placed() {
-            return Err(ScriptOperationFailure::Blocked);
-        }
-        let position = warehouse_container_position(runtime, &structure, binding.container_id)?;
         let items = match world.container_reading(position)? {
             ContainerReading::Loaded(items) => items,
             ContainerReading::Unloaded => return Err(ScriptOperationFailure::Unloaded),
@@ -1609,6 +1815,48 @@ impl super::InventoryRuntime {
             position,
             items,
         })
+    }
+
+    /// Resolve the durable position of a source which has already reported as
+    /// unloaded. Reservation floors retain that exact position until the source
+    /// can be read again, rather than briefly permitting a player drawdown.
+    pub(super) fn unloaded_warehouse_position(
+        &self,
+        storage: &PluginStorage,
+        plugin_id: &str,
+        handle: &str,
+    ) -> Result<[i32; 3], ScriptOperationFailure> {
+        let Some(runtime) = self.settlement_runtime() else {
+            return Err(ScriptOperationFailure::RuntimeUnavailable);
+        };
+        if self.settlement_world().is_none() {
+            return Err(ScriptOperationFailure::RuntimeUnavailable);
+        }
+        let Some(binding) = storage.settlements().warehouse(handle) else {
+            return Err(ScriptOperationFailure::NotFound);
+        };
+        if binding.plugin_id != plugin_id {
+            return Err(ScriptOperationFailure::Forbidden);
+        }
+        match &binding.village {
+            Some(village_source) => {
+                let village = generated_village(runtime, &village_source.site_id)?;
+                let bounds = village_bounds(&village)?;
+                if !position_in_bounds(village_source.position, bounds) {
+                    return Err(ScriptOperationFailure::NotFound);
+                }
+                Ok(village_source.position)
+            }
+            None => {
+                let Some(structure) = storage.settlements().structure(&binding.structure_id) else {
+                    return Err(ScriptOperationFailure::NotFound);
+                };
+                if !structure.is_placed() {
+                    return Err(ScriptOperationFailure::Blocked);
+                }
+                warehouse_container_position(runtime, structure, binding.container_id)
+            }
+        }
     }
 
     /// Canonical snapshot of one bound warehouse container.
@@ -2127,17 +2375,11 @@ impl super::InventoryRuntime {
                 state: cell.state,
             })
             .collect::<Vec<_>>();
-        if let Err(failure) = world
-            .apply_structure_portion(plugin_id, structure_id, &placements)
-            .await
-        {
-            return Ok(rejected(failure));
-        }
-        // The portion above staged this structure's own blocks durably, so the
-        // footprint the next advance fences against must be re-read after it:
-        // the observation has to describe the site the structure itself just
-        // produced, not the one it started from.
-        record.prepare_revision = world.observe_footprint(record.bounds());
+        record.prepare_revision =
+            match world.predict_structure_portion_revision(record.bounds(), &placements) {
+                Ok(revision) => revision,
+                Err(failure) => return Ok(rejected(failure)),
+            };
         let receipt = ScriptStructureReceipt::new(
             structure_id.to_owned(),
             stage.to_owned(),
@@ -2162,8 +2404,7 @@ impl super::InventoryRuntime {
         } else {
             ScriptStructureState::Running
         };
-        commit_settlement(
-            storage,
+        let prepared = match storage.prepare_settlement_operation_batch(
             plugin_id,
             request,
             settlement_payload(ScriptSettlementResult::Receipt {
@@ -2172,7 +2413,36 @@ impl super::InventoryRuntime {
             vec![DurableSettlementChange::Structure {
                 structure: Box::new(record),
             }],
-        )
+        )? {
+            ScriptStoragePrepareOutcome::Prepared(batch) => batch,
+            ScriptStoragePrepareOutcome::Rejected => {
+                return Ok(rejected(ScriptOperationFailure::Capacity));
+            }
+        };
+        match self
+            .commit_prepared_structure_portion(
+                storage,
+                plugin_id,
+                structure_id,
+                &placements,
+                prepared,
+            )
+            .await?
+        {
+            super::world_inventory::PreparedStructurePortionCommit::Refused(failure) => {
+                Ok(rejected(failure))
+            }
+            super::world_inventory::PreparedStructurePortionCommit::Committed => {
+                let operation_id = request
+                    .operation_id()
+                    .expect("structure advance has an operation id");
+                Ok(storage
+                    .operation_receipt(plugin_id, operation_id)
+                    .expect("committed structure receipt remains installed")
+                    .outcome
+                    .clone())
+            }
+        }
     }
 
     fn pause_structure(
@@ -2204,6 +2474,71 @@ impl super::InventoryRuntime {
         let mut record = record.clone();
         record.state = ScriptStructureState::Paused;
         record.pause_reason = changed.then(|| PAUSE_SITE_CHANGED.to_owned());
+        let snapshot = structure_snapshot(storage, &record);
+        commit_settlement(
+            storage,
+            plugin_id,
+            request,
+            settlement_payload(ScriptSettlementResult::Structure {
+                structure: Box::new(snapshot),
+            }),
+            vec![DurableSettlementChange::Structure {
+                structure: Box::new(record),
+            }],
+        )
+    }
+
+    fn resume_structure(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+        structure_id: &str,
+        expected_revision: u64,
+    ) -> Result<ScriptOperationOutcome, PluginStorageMutationError> {
+        let Some(record) = storage.settlements().structure(structure_id) else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if record.plugin_id != plugin_id {
+            return Ok(rejected(ScriptOperationFailure::Forbidden));
+        }
+        if record.state != ScriptStructureState::Paused {
+            return Ok(rejected(ScriptOperationFailure::Blocked));
+        }
+        if record.revision != expected_revision {
+            return Ok(rejected(ScriptOperationFailure::StaleRevision));
+        }
+        let Some(world) = self.settlement_world() else {
+            return Ok(rejected(ScriptOperationFailure::RuntimeUnavailable));
+        };
+        // A pause is never authority to overwrite an altered or unloaded site.
+        // The caller restores the exact accepted footprint, then retries from
+        // this authoritative paused revision.
+        if world.footprint_changed_since(record.bounds(), record.prepare_revision) {
+            return Ok(rejected(ScriptOperationFailure::Blocked));
+        }
+        if let Some(reservation_ref) = record.reservation_ref() {
+            let Some((_, reservation)) = storage.settlement_reservation(plugin_id, reservation_ref)
+            else {
+                return Ok(rejected(ScriptOperationFailure::NotFound));
+            };
+            if reservation.released
+                || reservation.resource_plan_hash != record.resource_plan_hash
+                || reservation
+                    .bound_to
+                    .as_deref()
+                    .is_some_and(|bound| bound != structure_id)
+            {
+                return Ok(rejected(ScriptOperationFailure::Blocked));
+            }
+        }
+        let mut record = record.clone();
+        record.state = if record.built_blocks == 0 {
+            ScriptStructureState::Prepared
+        } else {
+            ScriptStructureState::Running
+        };
+        record.pause_reason = None;
         let snapshot = structure_snapshot(storage, &record);
         commit_settlement(
             storage,
@@ -2711,6 +3046,61 @@ fn placed_position(instance: &BlueprintInstance, block: &BlueprintBlock) -> [i32
         origin[1].saturating_add(local[1]),
         origin[2].saturating_add(local[2]),
     ]
+}
+
+/// Resolve a village site id through the same generator and start-chunk
+/// authentication the site query path uses.
+fn generated_village(
+    runtime: &SettlementRuntime,
+    site_id: &str,
+) -> Result<GeneratedVillageSite, ScriptOperationFailure> {
+    let start_chunk =
+        village_site_start_chunk(runtime.world_identity(), VILLAGE_DIMENSION, site_id)
+            .ok_or(ScriptOperationFailure::NotFound)?;
+    let cell_axis = SITE_CELL_BLOCKS / CHUNK_AXIS;
+    let cell = [
+        start_chunk.0.div_euclid(cell_axis),
+        start_chunk.1.div_euclid(cell_axis),
+    ];
+    let village = runtime
+        .village_sites_in_cell(cell)
+        .into_iter()
+        .find(|village| village.start_chunk == start_chunk)
+        .ok_or(ScriptOperationFailure::NotFound)?;
+    (village_site_id(
+        runtime.world_identity(),
+        VILLAGE_DIMENSION,
+        village.start_chunk,
+    ) == site_id)
+        .then_some(village)
+        .ok_or(ScriptOperationFailure::NotFound)
+}
+
+fn village_bounds(
+    village: &GeneratedVillageSite,
+) -> Result<ScriptSurveyBounds, ScriptOperationFailure> {
+    ScriptSurveyBounds::new(
+        [village.min.x, village.min.y, village.min.z],
+        [village.max.x, village.max.y, village.max.z],
+    )
+    .map_err(|_| ScriptOperationFailure::RuntimeUnavailable)
+}
+
+fn position_in_bounds(position: [i32; 3], bounds: ScriptSurveyBounds) -> bool {
+    (bounds.min[0]..=bounds.max[0]).contains(&position[0])
+        && (bounds.min[1]..=bounds.max[1]).contains(&position[1])
+        && (bounds.min[2]..=bounds.max[2]).contains(&position[2])
+}
+
+fn village_warehouse_handle(
+    plugin_id: &str,
+    site_id: &str,
+    container_id: u32,
+) -> Result<String, ()> {
+    let handle = format!("warehouse:{plugin_id}:village:{site_id}:{container_id}");
+    (handle.len() <= MAX_WAREHOUSE_HANDLE_BYTES)
+        .then_some(handle)
+        .ok_or(())
 }
 
 /// World position of one authored container of a durable structure.

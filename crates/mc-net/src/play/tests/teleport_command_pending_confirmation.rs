@@ -30,6 +30,8 @@ async fn teleport_command_waits_for_pending_confirmation_before_repositioning_pl
         &mut xp_state,
         &config,
         &sessions,
+        0,
+        "minecraft:overworld",
         &simulation,
         None,
         &mut player_pose,

@@ -85,6 +85,12 @@ struct UseItemOnTarget {
     coords: (i32, i32, i32),
 }
 
+#[derive(Clone, Copy)]
+struct UseItemOnMutationContext<'a> {
+    script_events: Option<&'a ScriptGameplayEventPublisher>,
+    game_mode: GameMode,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BlockPlacementValidation {
     placed_state: mc_world::BlockStateId,
@@ -330,6 +336,8 @@ where
             .item_to_block
             .bucket_fluid_kind(held.item_id)
             .is_some();
+    let zone_fence =
+        script_events.and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
     if script_events.is_some_and(|events| {
         !events.block_mutation_allowed(target.clicked_pos)
             || (placing_fluid && !events.block_mutation_allowed(adjacent_pos))
@@ -402,6 +410,7 @@ where
         if handle_cauldron_bucket_use_on(
             state,
             writer,
+            zone_fence.clone(),
             game_mode,
             action.sequence,
             target.clicked_pos,
@@ -441,6 +450,7 @@ where
         && handle_cauldron_bucket_use_on(
             state,
             writer,
+            zone_fence.clone(),
             game_mode,
             action.sequence,
             target.clicked_pos,
@@ -477,6 +487,7 @@ where
     if handle_bucket_use_on(
         state,
         writer,
+        zone_fence,
         game_mode,
         player_pose,
         action.sequence,
@@ -491,7 +502,10 @@ where
     if handle_hoe_use_on(
         state,
         writer,
-        game_mode,
+        UseItemOnMutationContext {
+            script_events,
+            game_mode,
+        },
         action.sequence,
         target.clicked_pos,
         action.direction,
@@ -614,7 +628,7 @@ where
 async fn handle_hoe_use_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
-    game_mode: GameMode,
+    context: UseItemOnMutationContext<'_>,
     sequence: i32,
     clicked_pos: mc_world::BlockPos,
     direction: Direction,
@@ -636,7 +650,7 @@ where
     let Some(plan) = plan_hoe_tilling(state, clicked_pos, farmland) else {
         return Ok(false);
     };
-    let max_damage = if game_mode == GameMode::Survival {
+    let max_damage = if context.game_mode == GameMode::Survival {
         state
             .items
             .name_of(held.item_id)
@@ -644,6 +658,16 @@ where
     } else {
         None
     };
+    let zone_fence = context
+        .script_events
+        .and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
+    if context
+        .script_events
+        .is_some_and(|events| !events.block_mutation_allowed(clicked_pos))
+    {
+        write_block_ack(writer, state.compression, sequence).await?;
+        return Ok(true);
+    }
     let committed = match state
         .simulation
         .commit_survival_break(SurvivalBreakPlan {
@@ -658,6 +682,8 @@ where
                 max_damage,
             },
             drops: Vec::new(),
+            hook_approval: None,
+            zone_fence,
         })
         .await
     {
@@ -988,7 +1014,10 @@ where
     if handle_bonemeal_use_on(
         state,
         writer,
-        game_mode,
+        UseItemOnMutationContext {
+            script_events,
+            game_mode,
+        },
         action.sequence,
         clicked_pos,
         held_slot,
@@ -1152,6 +1181,8 @@ where
         edits,
         additional_preconditions,
     } = plan;
+    let zone_fence =
+        script_events.and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
     if script_events.is_some_and(|events| {
         edits
             .iter()
@@ -1202,6 +1233,8 @@ where
                 inventory_slot: held_slot,
                 expected: held,
             },
+            zone_fence,
+            hook_approval: None,
             expected_game_mode: game_mode,
         })
         .await
@@ -1387,7 +1420,7 @@ where
 async fn handle_bonemeal_use_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
-    game_mode: GameMode,
+    context: UseItemOnMutationContext<'_>,
     sequence: i32,
     clicked_pos: mc_world::BlockPos,
     held_slot: usize,
@@ -1401,12 +1434,23 @@ where
         return Ok(false);
     }
 
+    let zone_fence = context
+        .script_events
+        .and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
     let planned = plan_loaded_bonemeal_growth(state, clicked_pos, sequence);
 
     let Some((edits, preconditions)) = planned else {
         write_block_ack(writer, state.compression, sequence).await?;
         return Ok(true);
     };
+    if context.script_events.is_some_and(|events| {
+        edits
+            .iter()
+            .any(|edit| !events.block_mutation_allowed(edit.pos))
+    }) {
+        write_block_ack(writer, state.compression, sequence).await?;
+        return Ok(true);
+    }
     let expected_held = state.inventory.slots[held_slot].clone();
     let committed = state
         .simulation
@@ -1419,7 +1463,9 @@ where
                 inventory_slot: held_slot,
                 expected: expected_held,
             },
-            expected_game_mode: game_mode,
+            expected_game_mode: context.game_mode,
+            zone_fence,
+            hook_approval: None,
         })
         .await;
     let committed = match committed {

@@ -266,6 +266,7 @@ fn rejected_damage_does_not_stage_wake() {
         &SimulationAuthority::for_test(),
         sleeper,
         &PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival: stale_survival,
             updated_survival: damaged,
             expected_inventory: state.inventory.clone(),
@@ -309,6 +310,7 @@ fn accepted_lethal_damage_stages_wake_and_defers_death_publication() {
         &SimulationAuthority::for_test(),
         sleeper,
         &PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival: state.survival,
             updated_survival: dead,
             expected_inventory: state.inventory.clone(),

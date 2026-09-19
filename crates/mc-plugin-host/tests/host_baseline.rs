@@ -12,11 +12,12 @@
 //!
 //! The measured path is the public host API over the real fixture: a component
 //! built by the SDK from `sdk/rust/examples/hello`, compiled with
-//! [`CompiledPlugin::compile`], instantiated as a [`PluginInstance`] and driven
-//! through `on_events` with one `PlayerJoined` event per call - the smallest
-//! realistic batch, and the shape of most deliveries a busy server makes. The
-//! deployment path in `src/host.rs` is deliberately not on the measured path; the
-//! test prints what that leaves unreported.
+//! [`CompiledPlugin::compile`], its startup phase run in the short-lived store
+//! [`PluginStartup`] owns, and its runtime store driven through `on_events` with
+//! one `PlayerJoined` event per call - the smallest realistic batch, and the shape
+//! of most deliveries a busy server makes. The deployment path in `src/host.rs` is
+//! deliberately not on the measured path; the test prints what that leaves
+//! unreported.
 
 mod fixture;
 
@@ -27,7 +28,8 @@ use mc_plugin_host::bindings::exports::solaris::plugin::events::{
 };
 use mc_plugin_host::bindings::exports::solaris::plugin::lifecycle::InitContext;
 use mc_plugin_host::{
-    CompiledPlugin, HostServices, LogLevel, PluginInstance, PluginLimits, engine, linker,
+    CompiledPlugin, HostServices, LogLevel, PluginInstance, PluginLimits, PluginStartup, engine,
+    linker,
 };
 
 /// The plugin id the baseline instance is bound to.
@@ -155,6 +157,25 @@ fn the_p0_baseline_reports_what_a_callback_compile_and_instance_cost() {
     );
 
     let linker = linker::<Services>(&engine).expect("the contract's linker builds");
+    // The startup phase first, in the store of its own the host drops before the
+    // runtime store exists - the same two-phase sequence `start_deployment_with`
+    // and `check_deployment` run.
+    let contribution = PluginStartup::instantiate(
+        &linker,
+        compiled.component(),
+        Services {
+            id: PLUGIN_ID.to_owned(),
+            ..Services::default()
+        },
+        limits,
+    )
+    .expect("the startup store instantiates under the default limits")
+    .configure(CONFIG)
+    .expect("the fixture's configure succeeds");
+    assert!(
+        contribution.is_none(),
+        "the example plugin answers no startup contribution"
+    );
     let mut plugin = PluginInstance::instantiate(
         &linker,
         compiled.component(),
@@ -164,14 +185,7 @@ fn the_p0_baseline_reports_what_a_callback_compile_and_instance_cost() {
         },
         limits,
     )
-    .expect("the fixture instantiates under the default limits");
-    assert!(
-        plugin
-            .configure(CONFIG)
-            .expect("the fixture's configure succeeds")
-            .is_none(),
-        "the example plugin answers no rule plan"
-    );
+    .expect("the runtime store instantiates under the default limits");
     plugin
         .init(
             CONFIG,
@@ -240,8 +254,9 @@ fn the_p0_baseline_reports_what_a_callback_compile_and_instance_cost() {
     );
     assert_eq!(
         plugin.state().calls(),
-        (2 + WARMUP + ITERATIONS) as u64,
-        "configure, init, the warm-up calls and the measured calls are every call the host made"
+        (1 + WARMUP + ITERATIONS) as u64,
+        "init, the warm-up calls and the measured calls are every call this store made: \
+         the startup phase ran in its own, already dropped store"
     );
     assert_eq!(
         plugin.state().log_lines_dropped(),

@@ -6,6 +6,11 @@ use mc_entity::effects_26_1_2::{
 
 use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
+use mc_script::precommit::HookKind;
+
+use super::damage_precommit::{
+    PlayerDamagePrecommitResume, PlayerDamageSource, begin_player_damage,
+};
 
 use super::outbound::{OutboundCommand, VisibilityDispatch};
 use super::visibility::ordered_session_recipient;
@@ -391,6 +396,11 @@ impl SessionRegistry {
         _authority: &crate::play::simulation::SimulationAuthority,
         tick: u64,
     ) -> Vec<VisibilityDispatch> {
+        let damage_hooks = self
+            .precommit_boundary()
+            .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage));
+        let defer_damage = damage_hooks && self.damage_precommit_handle().is_some();
+        let mut pending_damage = Vec::new();
         let mut inner = self.lock_session_entities("tick player active effects");
         let mut session_ids = inner
             .player_effect_sessions
@@ -436,22 +446,33 @@ impl SessionRegistry {
                     .survival
                     .health;
                 if let Some(damage) = effect_damage_request(action, health) {
-                    let preview = super::player_combat::prepare_projectile_player_damage_locked(
-                        &inner, session_id, tick, damage,
-                    );
-                    match preview {
-                        super::player_combat::ProjectilePlayerDamagePreview::Accepted(prepared)
-                        | super::player_combat::ProjectilePlayerDamagePreview::Rejected(Some(
-                            prepared,
-                        )) => {
-                            super::player_combat::commit_projectile_player_damage_locked(
-                                &mut inner,
-                                prepared,
-                                |_| true,
-                                &mut dispatches,
-                            );
+                    if defer_damage {
+                        if let Some((target_fence, position)) =
+                            SessionRegistry::player_damage_target_fence_locked(&inner, session_id)
+                        {
+                            pending_damage.push((session_id, target_fence, position, damage));
                         }
-                        super::player_combat::ProjectilePlayerDamagePreview::Rejected(None) => {}
+                    } else if !damage_hooks {
+                        let preview = super::player_combat::prepare_projectile_player_damage_locked(
+                            &inner, session_id, tick, damage,
+                        );
+                        match preview {
+                            super::player_combat::ProjectilePlayerDamagePreview::Accepted(
+                                prepared,
+                            )
+                            | super::player_combat::ProjectilePlayerDamagePreview::Rejected(
+                                Some(prepared),
+                            ) => {
+                                super::player_combat::commit_projectile_player_damage_locked(
+                                    &mut inner,
+                                    prepared,
+                                    |_| true,
+                                    &mut dispatches,
+                                );
+                            }
+                            super::player_combat::ProjectilePlayerDamagePreview::Rejected(None) => {
+                            }
+                        }
                     }
                 }
             }
@@ -464,6 +485,39 @@ impl SessionRegistry {
         }
         let became_no_live_sessions = self.publish_live_session_count(&inner);
         drop(inner);
+        if defer_damage {
+            let handle = self
+                .damage_precommit_handle()
+                .expect("registered damage hooks require a resume handle");
+            for (target_session, target_fence, position, request) in pending_damage {
+                let Ok(Some(pending)) = begin_player_damage(
+                    self,
+                    target_session,
+                    "minecraft:overworld",
+                    request,
+                    position,
+                    PlayerDamageSource::Environment,
+                ) else {
+                    continue;
+                };
+                handle.for_session(target_session).spawn_precommit_resume(
+                    pending,
+                    Some(target_session),
+                    None,
+                    move |decision| {
+                        crate::play::simulation::SimulationCommand::ResumePlayerDamagePrecommit(
+                            Box::new(PlayerDamagePrecommitResume::Effect {
+                                target_session,
+                                target_fence,
+                                tick,
+                                request,
+                                decision,
+                            }),
+                        )
+                    },
+                );
+            }
+        }
         if became_no_live_sessions {
             self.reconcile_hostile_targets_after_live_session_change();
         }

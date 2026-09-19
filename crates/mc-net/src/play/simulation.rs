@@ -1886,18 +1886,18 @@ pub(super) struct CommittedFoodUse {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct AnimalFeedTargets {
-    pub(super) cow: bool,
-    pub(super) sheep: bool,
-    pub(super) chicken: bool,
+pub(crate) struct AnimalFeedTargets {
+    pub(crate) cow: bool,
+    pub(crate) sheep: bool,
+    pub(crate) chicken: bool,
 }
 
 impl AnimalFeedTargets {
-    pub(super) fn is_empty(self) -> bool {
+    pub(crate) fn is_empty(self) -> bool {
         !self.cow && !self.sheep && !self.chicken
     }
 
-    pub(super) fn accepts(self, entity_type: &str) -> bool {
+    pub(crate) fn accepts(self, entity_type: &str) -> bool {
         match entity_type {
             "minecraft:cow" => self.cow,
             "minecraft:sheep" => self.sheep,
@@ -1906,8 +1906,9 @@ impl AnimalFeedTargets {
         }
     }
 
-    /// Resolve the vanilla food tags shared by interaction and temptation.
-    pub(super) fn from_tags(tags: &TagsData, item_id: u32) -> Self {
+    /// Resolve the vanilla food tags shared by interaction, temptation and
+    /// resident provisioning.
+    pub(crate) fn from_tags(tags: &TagsData, item_id: u32) -> Self {
         let Ok(item_id) = i32::try_from(item_id) else {
             return Self::default();
         };

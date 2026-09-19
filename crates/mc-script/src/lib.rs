@@ -1,14 +1,19 @@
 //! # mc-script
 //!
-//! Safe script runtime contracts and the built-in Luau plugin host.
+//! Runtime-independent script contracts: the server-owned boundary, immutable
+//! event snapshots entering runtimes, bounded command batches leaving them, and
+//! the plugin metadata both sides share.
 //!
-//! Immutable event snapshots enter runtimes and bounded command batches leave
-//! them. The optional `lua-runtime` feature adds an isolated Luau VM per plugin on
-//! one dedicated host thread, with fixed memory and execution-fuel limits.
+//! No VM lives in this crate. A host crate owns guest execution and reaches this
+//! boundary through the trusted host methods below: it submits events, takes
+//! control input (a reload envelope whose payload only the host interprets), and
+//! commits a candidate deployment through the same route and command admission
+//! every other plugin command takes.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
@@ -100,11 +105,19 @@ pub use settlement_operations::{
     ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteProvenance,
     ScriptSiteVariant, ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
     ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose,
-    ScriptSurveySnapshot, ScriptWarehouseBinding, warehouse_handle,
+    ScriptSurveySnapshot, ScriptWarehouseBinding, ScriptWarehouseSource, warehouse_handle,
 };
 
-#[cfg(feature = "lua-runtime")]
-mod lua;
+mod plugin_metadata;
+pub use plugin_metadata::{
+    ClientBundle, ClientBundleDiscovery, ClientContentKind, ClientLoader, ClientPermission,
+    PluginDeployment, PluginDiscovery, PluginSettlementBuilding, PluginSettlementBuildingRole,
+    PluginSettlementBuildingTemplate, PluginSettlementExtension, PluginSettlementInhabitant,
+    PluginSettlementInhabitantKind, PluginSettlementJob, PluginSettlementPlan,
+    PluginWorldgenOreProfile, PluginWorldgenSettlementProfile, default_plains_village_buildings,
+};
+
+pub mod precommit;
 
 mod gameplay_rules;
 pub use gameplay_rules::{
@@ -118,6 +131,8 @@ mod entity_interaction_tests;
 #[cfg(test)]
 mod entity_kill_tests;
 #[cfg(test)]
+mod host_control_tests;
+#[cfg(test)]
 mod inventory_operations_tests;
 #[cfg(test)]
 mod item_pickup_tests;
@@ -130,6 +145,8 @@ mod player_query_tests;
 #[cfg(test)]
 mod player_teleport_tests;
 #[cfg(test)]
+mod precommit_tests;
+#[cfg(test)]
 mod resident_operations_tests;
 #[cfg(test)]
 mod resident_order_operations_tests;
@@ -138,30 +155,18 @@ mod settlement_operations_tests;
 #[cfg(test)]
 mod tick_delivery_tests;
 
-#[cfg(feature = "lua-runtime")]
-pub use lua::{
-    ClientBundle, ClientBundleDiscovery, ClientContentKind, ClientLoader, ClientPermission,
-    LuaHost, LuaHostConfig, LuaHostError, LuaHostExitReason, LuaHostExitReport,
-    LuaSettlementBuilding, LuaSettlementBuildingRole, LuaSettlementBuildingTemplate,
-    LuaSettlementExtension, LuaSettlementInhabitant, LuaSettlementInhabitantKind, LuaSettlementJob,
-    LuaSettlementPlan, LuaWorldgenOreProfile, LuaWorldgenSettlementProfile, PluginDeployment,
-    PluginDisableDiagnostic, PluginDisableStage, PluginDiscovery, PluginReloadError,
-    PluginReloadReport, PreparedLuaPlugins, prepare_lua_plugins, start_lua_host,
-    start_prepared_lua_host,
-};
-
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Semantic version of the stable script API contract.
-pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 6, 0);
+/// The API version every deployed WebAssembly component package must request.
+pub const COMPONENT_PLUGIN_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 7, 0);
 
 /// Maximum entity types one plugin may allow-list for spawning.
 pub const MAX_SPAWN_ENTITY_TYPES: usize = 32;
 
 /// Maximum byte length of a script-visible namespaced resource identifier.
 pub const MAX_SCRIPT_RESOURCE_ID_BYTES: usize = 128;
-/// Largest integer Luau can represent exactly in its number type.
+/// Largest integer preserved exactly by the component command boundary.
 pub const MAX_SCRIPT_WORLD_TIME: u64 = (1_u64 << 53) - 1;
 /// Maximum raw damage accepted by one bounded plugin combat request.
 pub const MAX_SCRIPT_ENTITY_DAMAGE: f32 = 1_000_000.0;
@@ -186,7 +191,7 @@ pub const MAX_PLUGIN_VERSION_BYTES: usize = 64;
 pub const MAX_MANIFEST_EVENT_SUBSCRIPTIONS: usize = 64;
 pub const MAX_MANIFEST_DEPENDENCIES: usize = 64;
 pub const MAX_MANIFEST_CAPABILITIES: usize = 128;
-/// Largest accepted `plugin.toml`, for either runtime.
+/// Largest accepted `plugin.toml` for a component deployment.
 pub const MAX_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 /// Largest accepted `api = "MAJOR.MINOR.PATCH"` string.
 pub const MAX_API_VERSION_BYTES: usize = 16;
@@ -211,10 +216,10 @@ pub const MAX_INVENTORY_RESOURCE_DELTA: i16 = 64;
 /// Maximum byte length of a server-rendered inventory menu title.
 pub const MAX_INVENTORY_MENU_TITLE_BYTES: usize = 128;
 
-/// Maximum absolute horizontal coordinate accepted from Lua.
+/// Maximum absolute horizontal coordinate accepted from a component command.
 pub const SCRIPT_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
 
-/// Maximum absolute vertical coordinate accepted from Lua.
+/// Maximum absolute vertical coordinate accepted from a component command.
 pub const SCRIPT_VERTICAL_COORDINATE_LIMIT: f64 = 20_000_000.0;
 
 /// Maximum byte length of one ASCII plugin player-command root.
@@ -294,22 +299,6 @@ impl ScriptApiVersion {
         self.patch
     }
 }
-
-pub const fn supports_script_api_version(requested: ScriptApiVersion) -> bool {
-    requested.major == SCRIPT_API_VERSION.major
-        && requested.minor == SCRIPT_API_VERSION.minor
-        && requested.patch == SCRIPT_API_VERSION.patch
-}
-
-/// The API version a WebAssembly component package must request.
-///
-/// It is the version of the `solaris:plugin` WIT package (`crates/mc-script/wit`)
-/// and is deliberately independent of [`SCRIPT_API_VERSION`]: the Luau packages
-/// keep requesting the Luau contract while the component host is built, and the
-/// package, storage-format, Loader-wire and world-contract versions are separate
-/// numbers again. A manifest is validated *for* one expected version, so
-/// admitting component packages never loosens what a Luau package may request.
-pub const COMPONENT_PLUGIN_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 7, 0);
 
 /// Whether `requested` is exactly the expected plugin API version.
 #[must_use]
@@ -1710,7 +1699,7 @@ pub enum ScriptProtocolPhase {
 }
 
 impl ScriptProtocolPhase {
-    /// Return the stable Lua-visible phase name.
+    /// Return the stable component-visible phase name.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Configuration => "configuration",
@@ -3308,12 +3297,13 @@ pub enum ScriptEventKind {
     },
 }
 
-/// Outbound command requests emitted by script code.
+/// Outbound command requests emitted by component code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScriptCommand {
-    /// A request emitted by a Lua VM and attested by its host. Lua has no API for
-    /// constructing `ScriptCommandProvenance` or selecting another plugin id.
+    /// A request emitted by a component and attested by its host. Guest code has
+    /// no API for constructing `ScriptCommandProvenance` or selecting another
+    /// plugin id.
     HostAttached {
         provenance: ScriptCommandProvenance,
         request: Arc<ScriptCommand>,
@@ -3421,9 +3411,9 @@ pub enum ScriptCommand {
     },
 }
 
-/// Origin attached by the Lua host after a handler returns its bounded commands.
+/// Origin attached by the component host after a handler returns bounded commands.
 ///
-/// The constructor is crate-private so scripts and external adapters cannot
+/// The constructor is crate-private so components and external adapters cannot
 /// fabricate an origin. Adapters may inspect the id to route a completion event.
 #[derive(Clone)]
 pub struct ScriptCommandProvenance {
@@ -4177,9 +4167,11 @@ impl ScriptCommand {
                     ScriptSettlementOperation::PrepareStructure { .. }
                     | ScriptSettlementOperation::AdvanceStructure { .. }
                     | ScriptSettlementOperation::PauseStructure { .. }
+                    | ScriptSettlementOperation::ResumeStructure { .. }
                     | ScriptSettlementOperation::CancelStructure { .. }
                     | ScriptSettlementOperation::Status { .. }
-                    | ScriptSettlementOperation::BindWarehouse { .. } => {
+                    | ScriptSettlementOperation::BindWarehouse { .. }
+                    | ScriptSettlementOperation::BindVillageWarehouse { .. } => {
                         RequiredCommandCapability::StructureOperations
                     }
                 },
@@ -4472,19 +4464,125 @@ pub enum ScriptBatchSubmissionError {
     },
 }
 
+/// Why a candidate deployment did not reach the live boundary.
+///
+/// Only the trusted host sees this: the commit path keeps readiness, route
+/// ownership, the caller's swap and command delivery in one order for every
+/// caller, so a refused reload leaves the running generation untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "lua-runtime")]
-pub(crate) enum ScriptReloadCommitError {
+#[non_exhaustive]
+pub enum ScriptReloadCommitError {
     QueueFull,
     QueueClosed,
     Rejected { error: CommandBatchError },
     Ownership { error: ScriptRouteRegistrationError },
 }
 
-pub(crate) enum ScriptHostInput {
-    Event(ScriptEvent),
-    #[cfg(feature = "lua-runtime")]
-    PluginReload(lua::PluginReloadRequest),
+/// Trusted control input of the host half of the boundary.
+///
+/// This is not a server observation and never a guest DTO: the boundary moves a
+/// payload between the two trusted halves without interpreting it, and only the
+/// runtime that queued it knows what it carries. A consumer that serves events
+/// only drops such input unread, which closes whatever response its payload holds.
+#[non_exhaustive]
+pub enum ScriptHostInput {
+    /// One immutable server event, in one FIFO with every other event.
+    Event(ScriptHostEvent),
+    /// Host-private control: a reload envelope whose payload only its sender reads.
+    Reload(Box<dyn std::any::Any + Send>),
+    /// One native pre-commit question, in the same FIFO and the same order.
+    ///
+    /// It is a request rather than an event because only the host can answer it:
+    /// the boundary moves it to the runtime that runs the registered handlers, and
+    /// the runtime answers it through the request's own one-shot reply. A consumer
+    /// that only serves events drops it unread, which answers the owner with
+    /// [`precommit::HookFailure::Unavailable`] instead of leaving it waiting.
+    Precommit(precommit::Request),
+}
+
+/// A server event admitted to the trusted host mailbox.
+///
+/// The wrapped event remains the guest-visible DTO. Target registration state is
+/// host-private so an event admitted for a retired plugin generation cannot be
+/// forged for its replacement.
+#[derive(Debug, Clone)]
+pub struct ScriptHostEvent {
+    event: ScriptEvent,
+    target_generation: EventTargetGeneration,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EventTargetGeneration {
+    Untargeted,
+    Targeted(Option<u64>),
+}
+
+impl ScriptHostEvent {
+    fn untargeted(event: ScriptEvent) -> Self {
+        Self {
+            event,
+            target_generation: EventTargetGeneration::Untargeted,
+        }
+    }
+
+    fn target_is_live(&self, plugin_routes: &PluginRouteAuthority) -> bool {
+        match self.target_generation {
+            EventTargetGeneration::Untargeted => true,
+            EventTargetGeneration::Targeted(Some(generation)) => self
+                .event
+                .target_plugin_id()
+                .is_some_and(|plugin_id| plugin_routes.registration_is_live(plugin_id, generation)),
+            EventTargetGeneration::Targeted(None) => false,
+        }
+    }
+
+    /// Recover the immutable guest-visible event after the host accepts it.
+    #[must_use]
+    pub fn into_event(self) -> ScriptEvent {
+        self.event
+    }
+}
+
+impl Deref for ScriptHostEvent {
+    type Target = ScriptEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
+/// Trusted handle the host queues its own control input through.
+///
+/// It is deliberately narrow — a host can queue a reload, not fabricate events
+/// or reach the queue — and deliberately weak: the boundary drops the ability to
+/// queue control when it closes its host side, so a reload after shutdown reports
+/// a closed queue instead of resurrecting the host. Control input shares the one
+/// bounded mailbox and its FIFO with events; there is no second queue.
+#[derive(Debug, Clone)]
+pub struct ScriptHostInputSender {
+    sender: mpsc::WeakSender<ScriptHostInput>,
+}
+
+impl ScriptHostInputSender {
+    /// Queue one reload envelope, waiting for bounded mailbox capacity.
+    ///
+    /// A boundary that closed its host side stops the weak upgrade, and a closed
+    /// send fails the same way: both report [`ScriptQueueError::Closed`], which is
+    /// what a reload caller turns into its own closed-host result. Capacity is
+    /// awaited rather than reported, so [`ScriptQueueError::Full`] is never
+    /// returned from here.
+    pub async fn send_reload(
+        &self,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> Result<(), ScriptQueueError> {
+        let Some(sender) = self.sender.upgrade() else {
+            return Err(ScriptQueueError::Closed);
+        };
+        sender
+            .send(ScriptHostInput::Reload(payload))
+            .await
+            .map_err(|_| ScriptQueueError::Closed)
+    }
 }
 
 /// One deployed package the script host discovered.
@@ -4544,6 +4642,12 @@ pub struct ScriptBoundary {
     plugin_routes: PluginRouteAuthority,
     host_admissions: Arc<HostAdmissionLedger>,
     deployed_packages: Arc<[PluginPackage]>,
+    /// The operator's hook registrations and the questions admitted under them.
+    ///
+    /// It is shared by every clone of this boundary rather than copied per clone,
+    /// because a game owner holds its own clone: the roster a question was admitted
+    /// under has to be the same roster the approval is checked against.
+    precommit: Arc<precommit::PrecommitAuthority>,
 }
 
 #[derive(Debug)]
@@ -4583,13 +4687,40 @@ impl ScriptEventAdmission {
 }
 
 impl ScriptBoundary {
+    /// Handle the trusted host queues its own control input through.
+    ///
+    /// The handle reaches the same bounded mailbox as events and cannot outlive
+    /// the boundary's open host side; [`ScriptHostInputSender`] explains what a
+    /// host may put in it and why it is narrow.
+    #[must_use]
+    pub fn host_input_sender(&self) -> ScriptHostInputSender {
+        ScriptHostInputSender {
+            sender: self.event_admission.weak_sender.clone(),
+        }
+    }
+
+    fn admit_event(&self, event: ScriptEvent) -> ScriptHostEvent {
+        let target_generation = match event.target_plugin_id() {
+            Some(plugin_id) => EventTargetGeneration::Targeted(
+                self.plugin_routes
+                    .registration(plugin_id)
+                    .map(|registration| registration.generation),
+            ),
+            None => EventTargetGeneration::Untargeted,
+        };
+        ScriptHostEvent {
+            event,
+            target_generation,
+        }
+    }
+
     /// Enqueue an immutable event without blocking a server task.
     pub fn try_enqueue_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
         let Some(event_tx) = self.event_admission.sender() else {
             return Err(ScriptQueueError::Closed);
         };
         event_tx
-            .try_send(ScriptHostInput::Event(event))
+            .try_send(ScriptHostInput::Event(self.admit_event(event)))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => ScriptQueueError::Full,
                 mpsc::error::TrySendError::Closed(_) => ScriptQueueError::Closed,
@@ -4620,8 +4751,8 @@ impl ScriptBoundary {
             .pending
             .take()
             .map_or(tick, |pending| pending.max(tick));
-        match event_tx.try_send(ScriptHostInput::Event(ScriptEvent::server_tick(
-            latest_tick,
+        match event_tx.try_send(ScriptHostInput::Event(ScriptHostEvent::untargeted(
+            ScriptEvent::server_tick(latest_tick),
         ))) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -4641,7 +4772,7 @@ impl ScriptBoundary {
             return Err(ScriptQueueError::Closed);
         };
         event_tx
-            .send(ScriptHostInput::Event(event))
+            .send(ScriptHostInput::Event(self.admit_event(event)))
             .await
             .map_err(|_| ScriptQueueError::Closed)
     }
@@ -4649,6 +4780,13 @@ impl ScriptBoundary {
     /// Deliver a targeted owner event through the required-delivery path.
     pub async fn enqueue_targeted_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
         self.enqueue_required_event(event).await
+    }
+
+    /// Whether a plugin currently owns a live event route. Native continuations
+    /// use this before changing state on the owner's behalf.
+    #[must_use]
+    pub fn plugin_is_active(&self, plugin_id: &str) -> bool {
+        self.plugin_routes.registration(plugin_id).is_some()
     }
 
     /// Stop accepting new host events while allowing already admitted events to drain.
@@ -4661,6 +4799,103 @@ impl ScriptBoundary {
     #[must_use]
     pub fn deployed_packages(&self) -> &[PluginPackage] {
         &self.deployed_packages
+    }
+
+    /// Publish the deployed packages the host discovered for this deployment.
+    ///
+    /// Discovery belongs to the host, which already parsed every manifest; the
+    /// boundary only carries the result to core's authored-data subsystems, so
+    /// this replaces the catalog in one step instead of re-reading packages.
+    pub fn set_deployed_packages(&mut self, packages: Vec<PluginPackage>) {
+        self.deployed_packages = Arc::from(packages);
+    }
+
+    /// Publish the operator's pre-commit hook registrations for this deployment.
+    ///
+    /// The host calls this once, after discovery, with exactly the registrations
+    /// each discovered package was authorized for: the roster an operator
+    /// configured is therefore the roster a game owner's questions are admitted
+    /// against, and no second list can disagree with it. A refused roster is left
+    /// unpublished, so a malformed one never replaces the registrations a live
+    /// chain is answering under.
+    pub fn set_precommit_hooks(
+        &self,
+        hooks: Vec<precommit::HookRegistration>,
+    ) -> Result<(), precommit::HookRosterError> {
+        self.precommit.set_hooks(hooks)
+    }
+
+    /// Whether any package is registered for this hook.
+    ///
+    /// This is the zero-handler fast branch a game owner takes first: with no
+    /// registration there is no question to ask, and the effect follows the direct
+    /// native path it always followed - nothing is queued, nothing is allocated and
+    /// no deadline is created.
+    #[must_use]
+    pub fn has_precommit_hooks(&self, kind: precommit::HookKind) -> bool {
+        self.precommit.has(kind)
+    }
+
+    /// Ask the registered packages about one effect before it is committed.
+    ///
+    /// The question is queued nonblocking onto the same bounded FIFO the host's
+    /// events and control input travel, under one absolute deadline created here
+    /// that covers the queue wait and the whole handler chain. A boundary with no
+    /// registration for this hook answers the direct path immediately.
+    pub fn begin_precommit(
+        &self,
+        context: precommit::HookContext,
+    ) -> Result<precommit::PendingDecision, precommit::HookFailure> {
+        self.begin_precommit_with_deadline(context, precommit::deadline_from_now())
+    }
+
+    /// The same, under a deadline the caller owns.
+    ///
+    /// The value is a bound in absolute time rather than a duration, so a caller
+    /// that has to fit the question inside its own budget can state it, and a test
+    /// can inject a deadline it controls instead of sleeping towards one.
+    pub fn begin_precommit_with_deadline(
+        &self,
+        context: precommit::HookContext,
+        deadline: std::time::Instant,
+    ) -> Result<precommit::PendingDecision, precommit::HookFailure> {
+        let source = self.plugin_source_fence(&context)?;
+        precommit::begin(&self.precommit, context, deadline, source, |request| {
+            let Some(sender) = self.event_admission.sender() else {
+                return Err(precommit::HookFailure::Unavailable);
+            };
+            sender
+                .try_send(ScriptHostInput::Precommit(request))
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => precommit::HookFailure::QueueFull,
+                    mpsc::error::TrySendError::Closed(_) => precommit::HookFailure::Unavailable,
+                })
+        })
+    }
+
+    /// The live registration authority a package's own request came from.
+    ///
+    /// Native admission already checked the concrete operation and grant before it
+    /// built the hook context. The hook boundary captures that registration's
+    /// generation and re-checks it at commit, so withdrawal or replacement cannot
+    /// authorize a decision after the source authority is gone without guessing a
+    /// capability from `HookKind`.
+    fn plugin_source_fence(
+        &self,
+        context: &precommit::HookContext,
+    ) -> Result<Option<Arc<dyn precommit::SourceRegistration>>, precommit::HookFailure> {
+        let Some(plugin_id) = context.plugin_source() else {
+            return Ok(None);
+        };
+        let registration = self
+            .plugin_routes
+            .registration(plugin_id)
+            .ok_or(precommit::HookFailure::Stale)?;
+        Ok(Some(Arc::new(PluginSourceFence {
+            routes: self.plugin_routes.clone(),
+            plugin_id: plugin_id.to_owned(),
+            generation: registration.generation,
+        })))
     }
 
     /// Return a sorted snapshot of currently active plugin command roots.
@@ -4783,34 +5018,55 @@ pub struct ScriptHostEndpoint {
 
 impl ScriptHostEndpoint {
     /// Wait asynchronously until an event arrives or the server side closes.
+    ///
+    /// Control input is not an event: this consumer drops such a payload unread,
+    /// and the drop closes whatever response that payload carries. A runtime that
+    /// owns the payload takes it through [`Self::recv_input_blocking`] instead.
     pub async fn recv_event(&mut self) -> Option<ScriptEvent> {
-        // The loop only iterates with the `lua-runtime` reload arm present; under
-        // default features a single hand-off returns, hence the conditional lint.
-        #[cfg_attr(not(feature = "lua-runtime"), allow(clippy::never_loop))]
         loop {
             match self.recv_input().await? {
-                ScriptHostInput::Event(event) => return Some(event),
-                #[cfg(feature = "lua-runtime")]
-                ScriptHostInput::PluginReload(request) => request.reject_host_unavailable(),
+                ScriptHostInput::Event(event) => return Some(event.into_event()),
+                ScriptHostInput::Reload(_) => {}
+                ScriptHostInput::Precommit(_) => {}
             }
         }
     }
 
     /// Block the dedicated host thread until an event arrives or the server side closes.
+    ///
+    /// Event-only, exactly like [`Self::recv_event`]: control input is dropped
+    /// unread rather than interpreted here.
     pub fn recv_event_blocking(&mut self) -> Option<ScriptEvent> {
-        #[cfg_attr(not(feature = "lua-runtime"), allow(clippy::never_loop))]
         loop {
             match self.recv_input_blocking()? {
-                ScriptHostInput::Event(event) => return Some(event),
-                #[cfg(feature = "lua-runtime")]
-                ScriptHostInput::PluginReload(request) => request.reject_host_unavailable(),
+                ScriptHostInput::Event(event) => return Some(event.into_event()),
+                ScriptHostInput::Reload(_) => {}
+                ScriptHostInput::Precommit(_) => {}
             }
         }
     }
 
-    #[cfg(feature = "lua-runtime")]
-    pub(crate) fn recv_lua_input_blocking(&mut self) -> Option<ScriptHostInput> {
-        self.recv_input_blocking()
+    /// Block the dedicated host thread until any input arrives or the server closes.
+    ///
+    /// The trusted host takes events and its own control input from this one FIFO,
+    /// in order, so a queued reload never overtakes the events admitted before it.
+    /// A targeted event whose admitted registration is no longer live is discarded
+    /// before a component runtime can dispatch it.
+    pub fn recv_input_blocking(&mut self) -> Option<ScriptHostInput> {
+        loop {
+            match self.try_recv_input() {
+                Ok(input) => return Some(input),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            let Some(input) = self.event_rx.blocking_recv() else {
+                continue;
+            };
+            self.coalesced_tick_due = has_coalesced_server_tick(&self.coalesced_server_tick);
+            if let Some(input) = self.accept_input(input) {
+                return Some(input);
+            }
+        }
     }
 
     fn try_recv_input(&mut self) -> Result<ScriptHostInput, mpsc::error::TryRecvError> {
@@ -4818,7 +5074,9 @@ impl ScriptHostEndpoint {
             if self.coalesced_tick_due {
                 self.coalesced_tick_due = false;
                 if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
-                    if let Some(event) = self.accept_monotonic_event(event) {
+                    if let Some(event) =
+                        self.accept_monotonic_event(ScriptHostEvent::untargeted(event))
+                    {
                         return Ok(ScriptHostInput::Event(event));
                     }
                     continue;
@@ -4834,7 +5092,9 @@ impl ScriptHostEndpoint {
                 }
                 Err(error) => {
                     if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
-                        if let Some(event) = self.accept_monotonic_event(event) {
+                        if let Some(event) =
+                            self.accept_monotonic_event(ScriptHostEvent::untargeted(event))
+                        {
                             return Ok(ScriptHostInput::Event(event));
                         }
                         continue;
@@ -4862,34 +5122,22 @@ impl ScriptHostEndpoint {
         }
     }
 
-    fn recv_input_blocking(&mut self) -> Option<ScriptHostInput> {
-        loop {
-            match self.try_recv_input() {
-                Ok(input) => return Some(input),
-                Err(mpsc::error::TryRecvError::Disconnected) => return None,
-                Err(mpsc::error::TryRecvError::Empty) => {}
-            }
-            let Some(input) = self.event_rx.blocking_recv() else {
-                continue;
-            };
-            self.coalesced_tick_due = has_coalesced_server_tick(&self.coalesced_server_tick);
-            if let Some(input) = self.accept_input(input) {
-                return Some(input);
-            }
-        }
-    }
-
     fn accept_input(&mut self, input: ScriptHostInput) -> Option<ScriptHostInput> {
         match input {
-            ScriptHostInput::Event(event) => self
-                .accept_monotonic_event(event)
+            ScriptHostInput::Event(event) => event
+                .target_is_live(&self.plugin_routes)
+                .then(|| self.accept_monotonic_event(event))
+                .flatten()
                 .map(ScriptHostInput::Event),
-            #[cfg(feature = "lua-runtime")]
-            ScriptHostInput::PluginReload(request) => Some(ScriptHostInput::PluginReload(request)),
+            ScriptHostInput::Reload(payload) => Some(ScriptHostInput::Reload(payload)),
+            // A pre-commit question is neither an event nor control this consumer
+            // interprets: it is carried through unchanged, and the runtime that
+            // owns the request answers it.
+            ScriptHostInput::Precommit(request) => Some(ScriptHostInput::Precommit(request)),
         }
     }
 
-    fn accept_monotonic_event(&mut self, event: ScriptEvent) -> Option<ScriptEvent> {
+    fn accept_monotonic_event(&mut self, event: ScriptHostEvent) -> Option<ScriptHostEvent> {
         let ScriptEventKind::ServerTick { tick } = event.kind() else {
             return Some(event);
         };
@@ -5010,8 +5258,16 @@ impl ScriptHostEndpoint {
         self.plugin_routes.unregister(plugin_id);
     }
 
-    #[cfg(feature = "lua-runtime")]
-    pub(crate) fn commit_lua_reload<F>(
+    /// Commit a candidate deployment into the live boundary.
+    ///
+    /// The trusted host builds the replacement off to the side and hands it here:
+    /// every command of every staged batch is checked against its own admission
+    /// and reserved before the route table changes, the caller's `swap` runs while
+    /// the routes already belong to the new generation, and only then are the
+    /// attached commands delivered. A refusal therefore leaves the running
+    /// generation, its routes and the command queue exactly as they were, and a
+    /// committed swap never publishes a route whose generation has not loaded.
+    pub fn commit_reload<F>(
         &self,
         manifests: &[ValidatedScriptPluginManifest],
         batches: Vec<(HostCommandAdmission, CommandBatch)>,
@@ -5110,16 +5366,64 @@ pub enum ScriptRouteRegistrationError {
     AuthorityPoisoned,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct PluginRouteAuthority {
     routes: Arc<RwLock<PluginRouteTable>>,
     disabled: Arc<AtomicBool>,
+    /// The next live-registration generation this authority hands out.
+    ///
+    /// It is monotonic for the authority's whole life rather than per table, so a
+    /// generation is never reused by a later table: a fence captured under one
+    /// registration cannot validate against a different one that happened to be
+    /// built into a fresh table by a reload.
+    next_registration: Arc<AtomicU64>,
+}
+
+impl Default for PluginRouteAuthority {
+    fn default() -> Self {
+        Self {
+            routes: Arc::default(),
+            disabled: Arc::default(),
+            next_registration: Arc::new(AtomicU64::new(1)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct PluginRouteTable {
     commands: BTreeMap<String, PluginCommandOwner>,
     payload_channels: BTreeMap<String, String>,
+    /// The live registration of each registered package.
+    ///
+    /// A route table entry says what a package owns; this says *since when* and
+    /// *with which grants*, which is what a decision admitted under that
+    /// registration is later checked against.
+    registrations: BTreeMap<String, PluginRegistration>,
+}
+
+/// One package's live registration generation in the boundary's authority.
+#[derive(Debug, Clone)]
+struct PluginRegistration {
+    generation: u64,
+}
+
+/// One package's registration, as a decision was admitted under it.
+///
+/// Native command admission already checked the concrete operation and grant that
+/// produced the request. This fence retains that exact registration generation,
+/// rather than attempting to infer a capability from the hook it later reaches.
+#[derive(Debug)]
+struct PluginSourceFence {
+    routes: PluginRouteAuthority,
+    plugin_id: String,
+    generation: u64,
+}
+
+impl precommit::SourceRegistration for PluginSourceFence {
+    fn is_live(&self) -> bool {
+        self.routes
+            .registration_is_live(&self.plugin_id, self.generation)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5132,6 +5436,7 @@ impl PluginRouteTable {
     fn clear(&mut self) {
         self.commands.clear();
         self.payload_channels.clear();
+        self.registrations.clear();
     }
 }
 
@@ -5282,12 +5587,49 @@ impl PluginRouteAuthority {
                 .payload_channels
                 .insert(channel.to_owned(), manifest.plugin_id().to_owned());
         }
+        // Every registered package gets a live registration, whether or not it
+        // owns a route: a package's own admitted request is authority this
+        // boundary granted, and this is where its generation is recorded.
+        routes.registrations.insert(
+            manifest.plugin_id().to_owned(),
+            PluginRegistration {
+                generation: self.next_generation(),
+            },
+        );
         Ok(())
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.next_registration.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// One package's live registration, as this boundary currently holds it.
+    ///
+    /// Event admission can be closed while the host drains inputs it already
+    /// accepted. Those inputs retain their captured registrations; only a route
+    /// replacement, unregistration, or poisoned authority makes them stale.
+    fn registration(&self, plugin_id: &str) -> Option<PluginRegistration> {
+        match self.routes.read() {
+            Ok(routes) => routes.registrations.get(plugin_id).cloned(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.disable();
+                None
+            }
+        }
+    }
+
+    /// Whether the registration a decision was admitted under is still live.
+    ///
+    /// Its generation changes for every replacement, including a changed grant;
+    /// operation-specific admission was checked before this question was built.
+    fn registration_is_live(&self, plugin_id: &str, generation: u64) -> bool {
+        self.registration(plugin_id)
+            .is_some_and(|registration| registration.generation == generation)
     }
 
     fn unregister(&self, plugin_id: &str) {
         if self.disabled.load(Ordering::Acquire) {
-            self.clear_poisoned();
             return;
         }
         match self.routes.write() {
@@ -5298,6 +5640,10 @@ impl PluginRouteAuthority {
                 routes
                     .payload_channels
                     .retain(|_, owner| owner.as_str() != plugin_id);
+                // A package that lost its routes lost the authority its own
+                // requests were admitted under: every fence captured from that
+                // registration stops being live the moment it is dropped.
+                routes.registrations.remove(plugin_id);
             }
             Err(poisoned) => {
                 poisoned.into_inner().clear();
@@ -5306,7 +5652,10 @@ impl PluginRouteAuthority {
         }
     }
 
-    #[cfg(feature = "lua-runtime")]
+    /// Replace every route with one candidate table, or refuse the whole table.
+    ///
+    /// Conflicts and limits are checked against a fully built replacement first,
+    /// so a refused reload never leaves the boundary with half a route table.
     fn replace_all(
         &self,
         manifests: &[ValidatedScriptPluginManifest],
@@ -5371,6 +5720,15 @@ impl PluginRouteAuthority {
                     });
                 }
             }
+            // A committed reload replaces every registration: a package that
+            // survives it gets a new generation, so a decision admitted under the
+            // previous deployment can never be committed under this one.
+            replacement.registrations.insert(
+                manifest.plugin_id().to_owned(),
+                PluginRegistration {
+                    generation: self.next_generation(),
+                },
+            );
         }
         let mut routes = match self.routes.write() {
             Ok(routes) => routes,
@@ -5384,9 +5742,9 @@ impl PluginRouteAuthority {
         Ok(())
     }
 
+    /// Close new route admission without invalidating events already in the FIFO.
     fn clear(&self) {
         self.disabled.store(true, Ordering::Release);
-        self.clear_poisoned();
     }
 
     fn disable(&self) {
@@ -5429,6 +5787,7 @@ pub fn script_boundary_pair(
             plugin_routes: plugin_routes.clone(),
             host_admissions: Arc::clone(&host_admissions),
             deployed_packages: Arc::from(Vec::new()),
+            precommit: Arc::new(precommit::PrecommitAuthority::new()),
         },
         ScriptHostEndpoint {
             event_rx,
@@ -5737,9 +6096,8 @@ impl ScriptPluginManifest {
 
     /// Declare one capability by the name a manifest writes.
     ///
-    /// The vocabulary is part of the contract, not of one runtime's loader: the
-    /// Luau and component deployments name the same capabilities, and an unknown
-    /// name is refused instead of being ignored.
+    /// The vocabulary belongs to the component manifest contract. An unknown
+    /// capability name is refused instead of being ignored.
     pub fn declare_capability(self, capability: &str) -> Result<Self, ScriptPluginManifestError> {
         match capability {
             "storage" => Ok(self.declare_plugin_storage()),
@@ -6097,19 +6455,16 @@ impl ScriptPluginManifest {
         &self.declared_permissions
     }
 
-    /// Validate and normalize this manifest for trusted host-side use.
-    /// Validate this manifest against the Luau contract version.
+    /// Validate and normalize this component manifest for trusted host-side use.
     pub fn validate(&self) -> Result<ValidatedScriptPluginManifest, ScriptPluginManifestError> {
-        self.validate_for(SCRIPT_API_VERSION)
+        self.validate_for(COMPONENT_PLUGIN_API_VERSION)
     }
 
-    /// Validate this manifest against the contract version the caller runs.
+    /// Validate this manifest against a specific component contract version.
     ///
-    /// The expected version is a parameter because the two runtimes have their
-    /// own versions: a Luau package is validated for [`SCRIPT_API_VERSION`] and a
-    /// component package for [`COMPONENT_PLUGIN_API_VERSION`], while everything
-    /// else about the manifest - ids, bounds, capabilities, routes, dependencies -
-    /// is one contract.
+    /// The explicit version keeps rejection tests and component-contract upgrades
+    /// deterministic; production discovery always supplies
+    /// [`COMPONENT_PLUGIN_API_VERSION`].
     pub fn validate_for(
         &self,
         expected_api_version: ScriptApiVersion,
@@ -6453,7 +6808,11 @@ impl ValidatedScriptPluginManifest {
 
     /// Trusted host-side conversion from validated manifest declarations to
     /// executable command capabilities.
-    pub(crate) fn to_command_capabilities(&self) -> CommandCapabilities {
+    ///
+    /// Public because the host pre-checks a whole guest batch against exactly the
+    /// grants the boundary re-checks when the batch is submitted: one conversion,
+    /// so what a package declared is what both sides enforce.
+    pub fn to_command_capabilities(&self) -> CommandCapabilities {
         let mut capabilities = CommandCapabilities::none();
         for capability in &self.declared_command_capabilities {
             match capability {
@@ -6784,7 +7143,12 @@ impl CommandCapabilities {
         self
     }
     /// Return whether this plugin may exchange one custom-payload channel.
-    pub(crate) fn allows_custom_payload_channel(&self, channel: &str) -> bool {
+    ///
+    /// The query half of the same grant the manifest conversion fills in, for a
+    /// host that filters a guest's payload against the grants the boundary
+    /// re-checks when the command is submitted.
+    #[must_use]
+    pub fn allows_custom_payload_channel(&self, channel: &str) -> bool {
         self.custom_payload_channels
             .iter()
             .any(|allowed| allowed == channel)
@@ -6969,7 +7333,12 @@ fn is_valid_plugin_id(plugin_id: &str) -> bool {
     chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
 }
 
-fn validate_script_resource_id(value: &str) -> Result<String, ScriptPluginManifestError> {
+/// Validate one namespaced resource identifier at a manifest boundary.
+///
+/// A host that accepts resource identifiers from a guest uses this instead of a
+/// second copy of the rule, so a resource that a package declares and a resource
+/// a runtime call names are accepted and refused identically.
+pub fn validate_script_resource_id(value: &str) -> Result<String, ScriptPluginManifestError> {
     if value.len() > MAX_SCRIPT_RESOURCE_ID_BYTES {
         return Err(ScriptPluginManifestError::InvalidSpawnEntityType {
             entity_type: value.to_owned(),
@@ -7035,7 +7404,11 @@ fn validate_script_id(value: &str) -> Result<String, ScriptDtoError> {
     Ok(value.to_owned())
 }
 
-fn validate_script_id_value(value: &str) -> Result<(), ScriptDtoError> {
+/// Validate the contract's own script-id shape without allocating.
+///
+/// The no-allocation form of the contract's script-id check, for a host that only
+/// needs the refusal.
+pub fn validate_script_id_value(value: &str) -> Result<(), ScriptDtoError> {
     if value.is_empty() {
         return Err(ScriptDtoError::EmptyValue { field: "script id" });
     }
@@ -7121,7 +7494,8 @@ fn normalize_player_uuid(uuid: &str) -> Result<String, ScriptDtoError> {
     Ok(normalized)
 }
 
-fn validate_contract_resource_id(value: &str) -> Result<String, ScriptDtoError> {
+/// Validate one namespaced contract resource identifier, returning it on success.
+pub fn validate_contract_resource_id(value: &str) -> Result<String, ScriptDtoError> {
     check_contract_resource_id(value)?;
     Ok(value.to_owned())
 }
@@ -7398,9 +7772,35 @@ mod tests {
         assert_eq!(endpoint.recv_event_blocking(), None);
     }
 
+    #[test]
+    fn closing_event_admission_drains_buffered_targeted_events() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
+        endpoint.register_plugin_routes(&manifest).unwrap();
+        let request = ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap();
+        let buffered =
+            ScriptEvent::plugin_storage_get_result("shop", &request, None, None).unwrap();
+        boundary.try_enqueue_event(buffered.clone()).unwrap();
+
+        boundary.close_event_admission();
+
+        assert_eq!(endpoint.recv_event_blocking(), Some(buffered));
+        assert_eq!(endpoint.recv_event_blocking(), None);
+    }
+
     #[tokio::test]
     async fn targeted_event_delivery_waits_for_host_consumer_progress() {
         let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
+        endpoint.register_plugin_routes(&manifest).unwrap();
         boundary
             .try_enqueue_event(ScriptEvent::server_started())
             .unwrap();
@@ -7428,6 +7828,40 @@ mod tests {
         assert!(
             matches!(endpoint.recv_event().await, Some(event) if event.event_name() == "plugin.storage.get_result")
         );
+    }
+
+    #[test]
+    fn targeted_event_admitted_before_replacement_is_not_delivered_afterwards() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(2), nonzero(1));
+        let initial =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
+        endpoint.register_plugin_routes(&initial).unwrap();
+        let request = ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap();
+        boundary
+            .try_enqueue_event(
+                ScriptEvent::plugin_storage_get_result("shop", &request, None, None).unwrap(),
+            )
+            .unwrap();
+
+        let replacement =
+            ScriptPluginManifest::new("shop", "Shop", "0.2.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
+        endpoint
+            .commit_reload(&[replacement], Vec::new(), || {})
+            .unwrap();
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+
+        assert!(matches!(
+            endpoint.recv_event_blocking(),
+            Some(event) if event.event_name() == "server.started"
+        ));
     }
 
     #[tokio::test]
@@ -7807,22 +8241,21 @@ mod tests {
     }
 
     #[test]
-    fn manifest_validation_rejects_unsupported_requested_api_version() {
-        let requested = ScriptApiVersion::new(0, 7, 0);
+    fn manifest_validation_rejects_an_obsolete_requested_api_version() {
+        let requested = ScriptApiVersion::new(0, 6, 0);
         let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested);
 
         assert_eq!(
             manifest.validate(),
             Err(ScriptPluginManifestError::UnsupportedScriptApiVersion {
                 requested,
-                supported: SCRIPT_API_VERSION,
+                supported: COMPONENT_PLUGIN_API_VERSION,
             })
         );
     }
 
     #[test]
-    fn extended_plugin_contract_is_available_at_0_6_0() {
-        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 6, 0));
+    fn component_contract_exposes_extended_events() {
         for event_name in [
             "player.block_broken",
             "player.block_placed",
@@ -7843,10 +8276,11 @@ mod tests {
             assert!(is_supported_event_name(event_name), "missing {event_name}");
         }
 
-        let manifest = ScriptPluginManifest::new("pickup", "Pickup", "0.1.0", SCRIPT_API_VERSION)
-            .subscribe_event(" PLAYER.ITEM_PICKED_UP ")
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("pickup", "Pickup", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .subscribe_event(" PLAYER.ITEM_PICKED_UP ")
+                .validate()
+                .unwrap();
         assert_eq!(
             manifest.event_subscriptions()[0].event_name(),
             "player.item_picked_up"
@@ -7855,9 +8289,13 @@ mod tests {
 
     #[test]
     fn spawn_entity_capability_is_exact_and_manifest_bounded() {
-        let invalid =
-            ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
-                .declare_spawn_entity_type("pig");
+        let invalid = ScriptPluginManifest::new(
+            "spawn-test",
+            "Spawn Test",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_spawn_entity_type("pig");
         assert!(matches!(
             invalid.validate(),
             Err(ScriptPluginManifestError::InvalidSpawnEntityType { .. })
@@ -7869,9 +8307,13 @@ mod tests {
             "minecraft:".to_owned(),
             format!("minecraft:{}", "a".repeat(MAX_SCRIPT_RESOURCE_ID_BYTES)),
         ] {
-            let invalid =
-                ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
-                    .declare_spawn_entity_type(invalid_type);
+            let invalid = ScriptPluginManifest::new(
+                "spawn-test",
+                "Spawn Test",
+                "0.1.0",
+                COMPONENT_PLUGIN_API_VERSION,
+            )
+            .declare_spawn_entity_type(invalid_type);
             assert!(matches!(
                 invalid.validate(),
                 Err(ScriptPluginManifestError::InvalidSpawnEntityType { .. })
@@ -7882,17 +8324,25 @@ mod tests {
             ));
         }
 
-        let duplicate =
-            ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
-                .declare_spawn_entity_type("minecraft:pig")
-                .declare_spawn_entity_type("minecraft:pig");
+        let duplicate = ScriptPluginManifest::new(
+            "spawn-test",
+            "Spawn Test",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_spawn_entity_type("minecraft:pig")
+        .declare_spawn_entity_type("minecraft:pig");
         assert!(matches!(
             duplicate.validate(),
             Err(ScriptPluginManifestError::DuplicateSpawnEntityType { .. })
         ));
 
-        let mut bounded =
-            ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION);
+        let mut bounded = ScriptPluginManifest::new(
+            "spawn-test",
+            "Spawn Test",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        );
         for index in 0..=MAX_SPAWN_ENTITY_TYPES {
             bounded = bounded.declare_spawn_entity_type(format!("minecraft:test_{index}"));
         }
@@ -7935,14 +8385,15 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_invalid_plugin_ids() {
-        let blank_id = ScriptPluginManifest::new(" ", "Daytime", "0.1.0", SCRIPT_API_VERSION);
+        let blank_id =
+            ScriptPluginManifest::new(" ", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION);
         assert_eq!(
             blank_id.validate(),
             Err(ScriptPluginManifestError::BlankPluginId)
         );
 
         let invalid_id =
-            ScriptPluginManifest::new("Day Time", "Daytime", "0.1.0", SCRIPT_API_VERSION);
+            ScriptPluginManifest::new("Day Time", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION);
         assert_eq!(
             invalid_id.validate(),
             Err(ScriptPluginManifestError::InvalidPluginId {
@@ -7953,11 +8404,15 @@ mod tests {
 
     #[test]
     fn manifest_validation_accepts_and_deduplicates_safe_player_command_roots() {
-        let manifest =
-            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
-                .declare_player_command_root("hello")
-                .declare_player_command_root("hello")
-                .declare_player_command_root("warp_home-2");
+        let manifest = ScriptPluginManifest::new(
+            "greetings",
+            "Greetings",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_player_command_root("hello")
+        .declare_player_command_root("hello")
+        .declare_player_command_root("warp_home-2");
 
         assert_eq!(
             manifest.validate().unwrap().player_command_roots(),
@@ -7968,18 +8423,26 @@ mod tests {
     #[test]
     fn manifest_validation_enforces_player_command_root_byte_limit() {
         let boundary_root = "a".repeat(MAX_PLAYER_COMMAND_ROOT_BYTES);
-        let boundary =
-            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
-                .declare_player_command_root(&boundary_root);
+        let boundary = ScriptPluginManifest::new(
+            "greetings",
+            "Greetings",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_player_command_root(&boundary_root);
         assert_eq!(
             boundary.validate().unwrap().player_command_roots(),
             &[boundary_root]
         );
 
         let over_limit_root = "a".repeat(MAX_PLAYER_COMMAND_ROOT_BYTES + 1);
-        let over_limit =
-            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
-                .declare_player_command_root(&over_limit_root);
+        let over_limit = ScriptPluginManifest::new(
+            "greetings",
+            "Greetings",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_player_command_root(&over_limit_root);
         assert_eq!(
             over_limit.validate(),
             Err(ScriptPluginManifestError::FieldTooLong {
@@ -7992,9 +8455,13 @@ mod tests {
     #[test]
     fn manifest_validation_rejects_unsafe_and_reserved_player_command_roots() {
         for root in ["Hello", "/hello", "hello there", "hello.world"] {
-            let manifest =
-                ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
-                    .declare_player_command_root(root);
+            let manifest = ScriptPluginManifest::new(
+                "greetings",
+                "Greetings",
+                "0.1.0",
+                COMPONENT_PLUGIN_API_VERSION,
+            )
+            .declare_player_command_root(root);
 
             assert_eq!(
                 manifest.validate(),
@@ -8004,18 +8471,27 @@ mod tests {
             );
         }
         assert_eq!(
-            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
-                .declare_player_command_root("")
-                .validate(),
+            ScriptPluginManifest::new(
+                "greetings",
+                "Greetings",
+                "0.1.0",
+                COMPONENT_PLUGIN_API_VERSION
+            )
+            .declare_player_command_root("")
+            .validate(),
             Err(ScriptPluginManifestError::EmptyField {
                 field: "player command root",
             })
         );
 
         for root in ["gamemode", "defaultgamemode", "tp", "teleport"] {
-            let manifest =
-                ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
-                    .declare_player_command_root(root);
+            let manifest = ScriptPluginManifest::new(
+                "greetings",
+                "Greetings",
+                "0.1.0",
+                COMPONENT_PLUGIN_API_VERSION,
+            )
+            .declare_player_command_root(root);
 
             assert_eq!(
                 manifest.validate(),
@@ -8057,11 +8533,15 @@ mod tests {
     #[test]
     fn player_command_boundary_reports_full_and_closed_without_retaining_events() {
         let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest =
-            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
-                .declare_player_command_root("hello")
-                .validate()
-                .unwrap();
+        let manifest = ScriptPluginManifest::new(
+            "greetings",
+            "Greetings",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_player_command_root("hello")
+        .validate()
+        .unwrap();
         endpoint.register_plugin_routes(&manifest).unwrap();
 
         assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
@@ -8119,10 +8599,11 @@ mod tests {
     #[test]
     fn owned_player_command_arguments_are_bounded_without_panicking_or_queuing_rejections() {
         let (boundary, mut endpoint) = script_boundary_pair(nonzero(4), nonzero(1));
-        let manifest = ScriptPluginManifest::new("owner", "Owner", "0.1.0", SCRIPT_API_VERSION)
-            .declare_player_command_root("owned")
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("owner", "Owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_player_command_root("owned")
+                .validate()
+                .unwrap();
         endpoint.register_plugin_routes(&manifest).unwrap();
         let context =
             ScriptPlayerContext::try_new("player-7", "Alex", false, 0.0, 64.0, 0.0).unwrap();
@@ -8195,11 +8676,15 @@ mod tests {
 
     #[test]
     fn operator_player_commands_require_verified_context_and_are_denied_before_a_full_queue() {
-        let manifest =
-            ScriptPluginManifest::new("admin-day", "Admin Day", "0.1.0", SCRIPT_API_VERSION)
-                .declare_operator_command_root("adminday")
-                .validate()
-                .unwrap();
+        let manifest = ScriptPluginManifest::new(
+            "admin-day",
+            "Admin Day",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_operator_command_root("adminday")
+        .validate()
+        .unwrap();
         assert!(manifest.player_command_roots().is_empty());
         assert_eq!(manifest.operator_command_roots(), ["adminday"]);
         let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
@@ -8233,18 +8718,26 @@ mod tests {
 
     #[test]
     fn player_command_registration_enforces_aggregate_root_limit_atomically() {
-        let mut boundary_manifest =
-            ScriptPluginManifest::new("boundary", "Boundary", "0.1.0", SCRIPT_API_VERSION);
+        let mut boundary_manifest = ScriptPluginManifest::new(
+            "boundary",
+            "Boundary",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        );
         for index in 0..MAX_PLAYER_COMMAND_ROOTS {
             boundary_manifest =
                 boundary_manifest.declare_player_command_root(format!("command{index}"));
         }
         let boundary_manifest = boundary_manifest.validate().unwrap();
-        let over_limit_manifest =
-            ScriptPluginManifest::new("over-limit", "Over Limit", "0.1.0", SCRIPT_API_VERSION)
-                .declare_player_command_root("one_more")
-                .validate()
-                .unwrap();
+        let over_limit_manifest = ScriptPluginManifest::new(
+            "over-limit",
+            "Over Limit",
+            "0.1.0",
+            COMPONENT_PLUGIN_API_VERSION,
+        )
+        .declare_player_command_root("one_more")
+        .validate()
+        .unwrap();
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
 
         endpoint.register_plugin_routes(&boundary_manifest).unwrap();
@@ -8268,13 +8761,14 @@ mod tests {
 
     #[test]
     fn manifest_validation_normalizes_event_subscriptions_and_dependencies() {
-        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .with_load_phase(ScriptPluginLoadPhase::Startup)
-            .subscribe_event(" Player.Chat ")
-            .subscribe_event("server.tick")
-            .declare_dependency(" Economy ", ScriptPluginDependencyRelation::Required)
-            .declare_dependency("chat-tools", ScriptPluginDependencyRelation::Optional)
-            .declare_dependency("spawn-protect", ScriptPluginDependencyRelation::LoadBefore);
+        let manifest =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .with_load_phase(ScriptPluginLoadPhase::Startup)
+                .subscribe_event(" Player.Chat ")
+                .subscribe_event("server.tick")
+                .declare_dependency(" Economy ", ScriptPluginDependencyRelation::Required)
+                .declare_dependency("chat-tools", ScriptPluginDependencyRelation::Optional)
+                .declare_dependency("spawn-protect", ScriptPluginDependencyRelation::LoadBefore);
 
         let validated = manifest.validate().unwrap();
 
@@ -8307,8 +8801,9 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unsafe_event_subscriptions() {
-        let invalid = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .subscribe_event("player.inventory.clicked");
+        let invalid =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .subscribe_event("player.inventory.clicked");
         assert_eq!(
             invalid.validate(),
             Err(ScriptPluginManifestError::InvalidEventName {
@@ -8317,7 +8812,7 @@ mod tests {
         );
 
         let duplicate =
-            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
                 .subscribe_event("player.chat")
                 .subscribe_event(" Player.Chat ");
         assert_eq!(
@@ -8330,15 +8825,17 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unsafe_dependency_declarations() {
-        let blank = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .declare_dependency(" ", ScriptPluginDependencyRelation::Required);
+        let blank =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_dependency(" ", ScriptPluginDependencyRelation::Required);
         assert_eq!(
             blank.validate(),
             Err(ScriptPluginManifestError::BlankDependencyPluginId)
         );
 
-        let invalid = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .declare_dependency("Economy Tools", ScriptPluginDependencyRelation::Required);
+        let invalid =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_dependency("Economy Tools", ScriptPluginDependencyRelation::Required);
         assert_eq!(
             invalid.validate(),
             Err(ScriptPluginManifestError::InvalidDependencyPluginId {
@@ -8347,7 +8844,7 @@ mod tests {
         );
 
         let self_dependency =
-            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
                 .declare_dependency("Daytime", ScriptPluginDependencyRelation::Required);
         assert_eq!(
             self_dependency.validate(),
@@ -8357,7 +8854,7 @@ mod tests {
         );
 
         let duplicate =
-            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
                 .declare_dependency("Economy", ScriptPluginDependencyRelation::Required)
                 .declare_dependency(" economy ", ScriptPluginDependencyRelation::Optional);
         assert_eq!(
@@ -8370,8 +8867,9 @@ mod tests {
 
     #[test]
     fn trusted_host_derives_command_capabilities_from_validated_manifest() {
-        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .declare_world_time();
+        let manifest =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_world_time();
         let validated = manifest.validate().unwrap();
         let capabilities = validated.to_command_capabilities();
 
@@ -8554,9 +9052,10 @@ mod tests {
     #[test]
     fn sealed_admission_rechecks_manifest_capabilities_and_rejects_the_whole_batch() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(2));
-        let manifest = ScriptPluginManifest::new("plain", "Plain", "0.1.0", SCRIPT_API_VERSION)
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("plain", "Plain", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let forged_capabilities = CommandCapabilities::none().allow_plugin_storage();
         let mut batch = CommandBatch::new(nonzero(1));
@@ -8592,10 +9091,11 @@ mod tests {
         };
         endpoint.try_submit_command(existing.clone()).unwrap();
 
-        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
-            .declare_plugin_storage()
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let capabilities = manifest.to_command_capabilities();
         let mut batch = CommandBatch::new(nonzero(2));
@@ -8775,12 +9275,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_attaches_plugin_provenance_to_lua_command_submissions() {
+    async fn host_attaches_plugin_provenance_to_component_command_submissions() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
-            .declare_plugin_storage()
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let mut batch = CommandBatch::new(nonzero(1));
         batch
@@ -8886,7 +9387,7 @@ mod tests {
                 "x".repeat(MAX_PLUGIN_ID_BYTES + 1),
                 "Plugin",
                 "0.1.0",
-                SCRIPT_API_VERSION,
+                COMPONENT_PLUGIN_API_VERSION,
             )
             .validate(),
             Err(ScriptPluginManifestError::FieldTooLong {
@@ -8896,7 +9397,7 @@ mod tests {
         ));
 
         let mut manifest =
-            ScriptPluginManifest::new("bounded", "Plugin", "0.1.0", SCRIPT_API_VERSION);
+            ScriptPluginManifest::new("bounded", "Plugin", "0.1.0", COMPONENT_PLUGIN_API_VERSION);
         for index in 0..=MAX_MANIFEST_EVENT_SUBSCRIPTIONS {
             manifest = manifest.subscribe_event(format!("event.{index}"));
         }
@@ -8912,10 +9413,11 @@ mod tests {
     #[tokio::test]
     async fn host_admission_ticket_is_exact_and_one_shot() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
-            .declare_plugin_storage()
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let mut batch = CommandBatch::new(nonzero(1));
         batch
@@ -8948,10 +9450,11 @@ mod tests {
     #[tokio::test]
     async fn dropping_last_host_attached_clone_cancels_admission_and_recovers_capacity() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
-            .declare_plugin_storage()
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let make_batch = |request_id: &str| {
             let mut batch = CommandBatch::new(nonzero(1));
@@ -8992,10 +9495,11 @@ mod tests {
     #[test]
     fn dropping_command_receiver_cancels_every_queued_admission() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(2));
-        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
-            .declare_plugin_storage()
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let mut batch = CommandBatch::new(nonzero(2));
         for request_id in ["first", "second"] {
@@ -9037,10 +9541,11 @@ mod tests {
 
         for (index, command) in commands.into_iter().enumerate() {
             let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-            let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
-                .declare_plugin_storage()
-                .validate()
-                .unwrap();
+            let manifest =
+                ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                    .declare_plugin_storage()
+                    .validate()
+                    .unwrap();
             let admission = HostCommandAdmission::from_manifest(&manifest);
             let mut batch = CommandBatch::new(nonzero(1));
             batch
@@ -9089,10 +9594,11 @@ mod tests {
     #[tokio::test]
     async fn host_admission_rejects_request_substitution_and_consumes_the_ticket() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
-            .declare_plugin_storage()
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let mut batch = CommandBatch::new(nonzero(1));
         batch
@@ -9128,9 +9634,10 @@ mod tests {
     #[tokio::test]
     async fn unconsumed_host_tickets_are_bounded_and_recover_after_drop_or_acceptance() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(256));
-        let manifest = ScriptPluginManifest::new("bounded", "Bounded", "0.1.0", SCRIPT_API_VERSION)
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("bounded", "Bounded", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
         let mut unconsumed = Vec::new();
         for batch_index in 0..8 {
@@ -9194,10 +9701,11 @@ mod tests {
     #[test]
     fn poisoned_plugin_route_authority_is_cleared_and_permanently_disabled() {
         let (_boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest = ScriptPluginManifest::new("owner", "Owner", "0.1.0", SCRIPT_API_VERSION)
-            .declare_player_command_root("owned")
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("owner", "Owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_player_command_root("owned")
+                .validate()
+                .unwrap();
         endpoint.register_plugin_routes(&manifest).unwrap();
         let routes = endpoint.plugin_routes.clone();
         std::thread::spawn(move || {
@@ -9238,23 +9746,25 @@ mod tests {
     }
 
     #[test]
-    fn script_api_version_requires_the_current_contract_version() {
-        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 6, 0));
-        assert!(supports_script_api_version(SCRIPT_API_VERSION));
+    fn component_api_version_requires_the_current_contract_version() {
+        assert_eq!(COMPONENT_PLUGIN_API_VERSION, ScriptApiVersion::new(0, 7, 0));
         for requested in [
             ScriptApiVersion::new(0, 0, 0),
             ScriptApiVersion::new(0, 4, 9),
             ScriptApiVersion::new(0, 5, 1),
             ScriptApiVersion::new(0, 6, 1),
-            ScriptApiVersion::new(0, 7, 0),
+            ScriptApiVersion::new(0, 6, 0),
             ScriptApiVersion::new(1, 0, 0),
         ] {
-            assert!(!supports_script_api_version(requested));
+            assert!(!supports_plugin_api_version(
+                requested,
+                COMPONENT_PLUGIN_API_VERSION
+            ));
             assert_eq!(
                 ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested).validate(),
                 Err(ScriptPluginManifestError::UnsupportedScriptApiVersion {
                     requested,
-                    supported: SCRIPT_API_VERSION,
+                    supported: COMPONENT_PLUGIN_API_VERSION,
                 })
             );
         }

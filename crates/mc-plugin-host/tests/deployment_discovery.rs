@@ -27,6 +27,7 @@ fn config(root: &Path, mode: DiscoveryMode) -> DeploymentConfig {
         expected: Vec::new(),
         grants: BTreeMap::new(),
         require_grants: false,
+        precommit_hooks: Vec::new(),
     }
 }
 
@@ -130,9 +131,8 @@ fn expected_ids_are_required_and_unexpected_ids_are_refused() {
 
 #[test]
 fn strict_mode_requires_the_exact_id_set_the_operator_declared() {
-    // The production contract, unchanged from the Luau deployment: strict means
-    // the discovered set equals the declared one, so nothing runs unless it was
-    // declared, and an empty declaration admits no package at all.
+    // Strict discovery requires the declared set exactly: nothing runs unless it
+    // was declared, and an empty declaration admits no package at all.
     let root = tempfile::tempdir().expect("deployment root");
     write_package(root.path(), "alpha", "");
     let error = discover(
@@ -187,17 +187,17 @@ fn a_requested_capability_without_a_grant_fails_the_package() {
 }
 
 #[test]
-fn a_package_that_asks_for_another_contract_version_is_refused_by_discovery() {
+fn a_package_that_asks_for_an_obsolete_contract_version_is_refused_by_discovery() {
     let root = tempfile::tempdir().expect("deployment root");
-    let directory = root.path().join("legacy");
+    let directory = root.path().join("obsolete-api");
     std::fs::create_dir_all(&directory).expect("package directory");
     std::fs::write(
         directory.join("plugin.toml"),
-        "id = \"legacy\"\nname = \"legacy\"\nversion = \"0.1.0\"\napi = \"0.6.0\"\n",
+        "id = \"obsolete-api\"\nname = \"obsolete-api\"\nversion = \"0.1.0\"\napi = \"0.6.0\"\n",
     )
     .expect("manifest");
     std::fs::write(directory.join("plugin.wasm"), b"component-bytes").expect("artifact");
     let error = load_package(&directory, &PluginLimits::default())
-        .expect_err("the Luau contract version is not the component one");
+        .expect_err("an obsolete API version is not the component contract");
     assert!(format!("{error}").contains("invalid manifest"), "{error}");
 }

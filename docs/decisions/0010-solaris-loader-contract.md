@@ -3,8 +3,8 @@
 **Date:** 2026-07-23
 **Status:** Accepted, staged implementation
 **Current wire contract:** Loader wire **3** with artifact index schema **2**
-(`crates/mc-net/src/loader.rs`); the protocol numbers quoted in this ADR's
-staged-boundary narrative are the ones it was written against.
+(`crates/mc-net/src/loader.rs`). The server's Luau 0.6.0 and WASM component
+0.7.0 frontends share this contract; neither runs guest code on the client.
 
 ## Problem
 
@@ -28,7 +28,7 @@ startup unless every bundle has:
 - a cache identity derived from plugin id, bundle id, version, and SHA-256.
 
 The server aggregates descriptors in deterministic plugin order. During the
-Minecraft Configuration state it sends Loader protocol 2 on
+Minecraft Configuration state it sends Loader protocol 3 on
 `solaris:loader/manifest`. Before accepting the normal finish acknowledgement,
 it requires `solaris:loader/ack` with the same protocol, a supported platform,
 a bounded loader version, every required permission, and every exact cache
@@ -59,8 +59,8 @@ a stale same-version artifact.
 
 ## Current staged boundary
 
-The implemented first slice validates plugin descriptors, sends the server
-manifest, validates the acknowledgement, and provides the shared Java core plus
+The runtime validates plugin descriptors, sends the server manifest, validates
+the acknowledgement, and uses the shared Java core plus
 three platform adapters. Fabric, NeoForge, and Forge register manifest,
 request, artifact, and acknowledgement payloads during Configuration through
 their native 26.1.2 networking APIs. Missing bundles are streamed in bounded
@@ -78,31 +78,30 @@ staging session.
 
 After every exact cache file passes verification, the shared core requires the
 first ZIP entry to be a closed `solaris-client.json` schema. The current
-activation slice accepts owner-namespaced UI, item, and interaction
-definitions plus declared asset bytes, rejects unknown fields and archive
-entries, verifies each asset's exact size and SHA-256, and bounds the combined
-immutable registry. Fabric,
+activation accepts owner-namespaced views, items, blocks, sounds and declared
+asset bytes. It rejects unknown fields and archive entries, verifies each
+asset's exact size and SHA-256, and bounds the combined immutable registry. Fabric,
 NeoForge, and Forge publish that registry before acknowledgement and retain it
 into Play. Denied, malformed, unverified, or not-yet-supported content cannot
 activate. Disconnect clears the process registry, preventing content from one
 server from leaking into a later vanilla connection.
 
 The Configuration outcome carries the exact Loader acknowledgement into the
-same Play session. A host-attested plugin may request only an
-owner-namespaced activated UI backed by `ui` and `present_ui`. One
-`present_client_ui` command carries the resource id, `screen`/`hud`/`hidden`
-mode, and optional bounded title/body overrides through `ScriptBoundary`.
-Solaris sends `solaris:loader/ui` only to that Loader-eligible session. Each
-adapter captures the originating connection before queueing client-thread work
-and discards work for a superseded connection.
+same Play session. Both server plugin frontends submit typed view open/present/
+close requests through `ScriptBoundary`. The native owner checks the plugin,
+original session, activated `views` content and `present_views` permission.
+The server assigns each opened view an instance id and revision; updates and
+actions must match the live instance and revision. Presentation travels over
+`solaris:view`. Each adapter captures the originating connection before
+queueing client-thread work and discards work for a superseded connection.
 
-`loader-platform-common` owns the modal presenter and non-interactive HUD
-registry. The three adapters register only their native payload and HUD-layer
-hooks; they do not duplicate presentation policy. A HUD update replaces the
-same owned id, hiding removes only that id, and activation/logout clears HUD
-state. Omitted text comes from the verified definition. UI ids and titles are
-limited to 128 UTF-8 bytes, bodies to 8 KiB; HUD layout is viewport-bounded,
-at most eight rows and 256 GUI pixels wide, with no input interception.
+`loader-platform-common` owns one modal presenter and a multi-owner non-modal
+HUD registry. Adapters register native payload and HUD-layer hooks, not separate
+presentation policies. The activated screen declaration supplies the modal
+caption; the Open message supplies its initial model. Updating or closing a
+HUD names one exact instance and never opens, replaces or closes a modal.
+Widgetless HUDs render nothing and may carry only declared input bindings.
+Activation/logout drops every view, held binding and action sink.
 
 Verified asset entries are exposed through one shared in-memory Minecraft
 client pack, keyed by their exact `assets/<namespace>/<path>` archive
@@ -111,8 +110,7 @@ accessor because vanilla does not expose source insertion there; NeoForge and
 Forge use their public repository hook. Loader acknowledgement waits until the
 Minecraft resource reload returns the exact bytes from that pack. The mount is
 owned by the Configuration origin and is removed by that connection's close
-notification, so stale disconnect work cannot clear a newer mount. Blocks
-remain outside this stage.
+notification, so stale disconnect work cannot clear a newer mount.
 
 The sound slice adds at most 64 owner-namespaced `sounds` definitions (`id`)
 under `play_sounds`. Each resolves only a same-bundle hash-verified mono
@@ -122,7 +120,7 @@ rejects resource collisions before acknowledgement. No Java/native plugin code
 or frozen sound-event registry mutation is involved.
 
 `play_client_sound` and `stop_client_sound` share one admitted command and
-`solaris:loader/sound` Play channel, with Loader protocol 2. Server ownership,
+`solaris:loader/sound` Play channel, with Loader protocol 3. Server ownership,
 permission and live-session checks precede ordered publication; adapters capture
 the source connection before scheduling and reject stale work. Shared playback
 resolves only activated definitions, uses native one-shot sound instances,
@@ -131,23 +129,24 @@ Stop affects all instances of that same owner sound id on that player;
 activation/disconnect stops old Loader sounds. No loops, moving sources or
 playback completion callbacks are introduced.
 
-The interaction contract uses at most 64 owner-namespaced actions with bounded
-labels and static UTF-8 payloads. Optional `ui_id` references same-bundle UI;
-optional `key` names a canonical Minecraft keyboard key. At least one source is
-required. UI buttons emit `trigger`; keyboard edges emit `press`/`release`
-through the same Play channel and targeted `loader.interaction` event.
-Protocol 2 adds the phase byte; no protocol-1 fallback is retained. The payload
-is big-endian `u16 protocol`, `u8 phase`, then `u16`-length-prefixed id/payload,
-bounded to 4,231 bytes. Plugin API remains `0.6.0`.
+Input belongs to the same view/action contract, not a separate interaction
+payload. A schema-2 HUD may declare up to eight `input_bindings` using canonical
+native keyboard names and declared press/release actions. Admission requires
+`views`/`view_actions` content and `present_views`/`send_view_actions` permissions.
+Each reported edge carries its instance, revision and per-instance sequence;
+the native owner admits only actions enabled in the current model and routes
+them to that plugin's `loader.view_action` event on the original session.
 
-One shared `KeyboardHandler.keyPress` HEAD mixin covers Fabric, NeoForge and
-Forge, including vanilla screenshot/fullscreen early returns. It observes the
-pre-callback menu/focus context and never cancels vanilla input. Shared
-`LoaderKeyActions` bounds held state by declarations and ignores autorepeat;
-`LoaderMinecraftInput` owns exact-connection binding, menu/overlay/window-focus
-release and activation/logout cleanup. There are no dynamic vanilla key
-mappings or platform-local held state machines. Fixed bindings do not add
-rebinding UI, chords, mouse/gamepad or client Lua execution.
+Shared `KeyboardHandler.keyPress` HEAD/RETURN hooks observe gameplay input
+without cancelling vanilla handling. Autorepeat is not an edge; presses must
+retain gameplay focus before and after vanilla handling. Declared F2/F11 may
+report edges while vanilla still takes screenshots or toggles fullscreen.
+Screen changes, overlays
+and the primary window's focus callback release held bindings once; there is
+no per-tick focus polling. Shared state is connection-scoped, and disconnect
+or content remount drops it rather than replaying it into another session.
+Fixed bindings do not add rebinding UI, chords, mouse/gamepad or client guest
+execution.
 
 The shared mixin declares `JAVA_21` compatibility because Forge's bundled
 Mixin 0.8.7 does not recognize `JAVA_25`; Minecraft still runs on Java 25.
@@ -155,13 +154,10 @@ Forge's packaged jar registers it through `MixinConfigs`; the development run,
 which loads class directories rather than that jar manifest, supplies
 `--mixin.config`. Fabric and NeoForge use their mod metadata registration.
 
-Only current definitions and the acknowledged originating Play connection may
-send. The server requires the owner's `interactions` plus `send_interactions`
-and delivers solely to that Luau owner through `ScriptBoundary`. Input-only
-content does not require `present_ui`. Client phases/payloads remain untrusted;
-no server physical-key authority table is introduced. Plugins own mechanic
-state and disconnect cleanup. MCP named-key batches are validated on the
-client thread before any input mutation; press and respawn release through
+Client fields and input remain untrusted; no server physical-key authority
+table is introduced. Plugins own mechanic state, while native view/session
+owners enforce delivery and cleanup. MCP named-key batches are validated on
+the client thread before any input mutation; press and respawn release through
 `finally` after execution begins.
 
 The item-presentation slice adds up to 128 owner-namespaced item declarations.

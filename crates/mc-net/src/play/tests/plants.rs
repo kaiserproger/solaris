@@ -1117,6 +1117,8 @@ fn support_pop_drops_once_per_double_plant_and_skips_the_upper_half() {
             max_damage: None,
         },
         drop_items: true,
+        hook_approval: None,
+        zone_fence: None,
     };
 
     let drops = plan_survival_break_drops(&request, &edits, &preconditions, BlockStateId(0));

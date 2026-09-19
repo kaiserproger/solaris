@@ -1,3 +1,6 @@
+use super::damage_precommit::{
+    PlayerDamagePrecommitResume, PlayerDamageSource, PlayerDamageTargetFence, begin_player_damage,
+};
 use super::interaction_geometry::{player_aabb_for_pose, within_entity_attack_reach};
 use super::outbound::{
     OutboundCommand, PlayerCarriedItemDelta, PlayerDamagePublication, PlayerHurtEvent,
@@ -10,6 +13,10 @@ use super::player_effects::{
 use super::player_state::{
     apply_player_survival_plan_locked, player_attack_cost_plan_matches,
     player_survival_plan_matches,
+};
+use super::projectiles::{
+    commit_deferred_projectile_player_damage_locked,
+    commit_deferred_projectile_player_impact_without_damage_locked,
 };
 use super::sleep::{
     SleepWakeReason, SleepingPlayer, defer_staged_sleep_dispatches_locked, stage_sleep_wake_locked,
@@ -28,7 +35,7 @@ use crate::play::inventory::{
     PlayerInventory, damage_inventory_armor, inventory_damage_after_armor,
     inventory_damage_after_protection,
 };
-use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
+use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority, SimulationCommand};
 use crate::play::{GameMode, PlayerPose};
 use mc_data::ItemStack;
 use mc_entity::{EntityId, Vec3};
@@ -40,6 +47,8 @@ const SHULKER_BULLET_LEVITATION_TICKS: i32 = 200;
 pub(in crate::play) struct PlayerEntityAttack<'a> {
     pub(in crate::play) attacker_session: SessionId,
     pub(in crate::play) entity_id: EntityId,
+    /// A resumed before-damage ticket. Normal simulation entries use `None`.
+    pub(in crate::play) hook_approval: Option<crate::play::HookApproval>,
     pub(in crate::play) amount: f32,
     pub(in crate::play) attacker_costs: Option<&'a PlayerSurvivalPlan>,
     pub(in crate::play) authority_tick: u64,
@@ -90,6 +99,7 @@ impl SessionRegistry {
             amount,
             attacker_costs,
             authority_tick,
+            hook_approval,
         } = attack;
         if !amount.is_finite() || amount <= 0.0 {
             return PlayerAttackResult::ValidationRejected;
@@ -211,6 +221,57 @@ impl SessionRegistry {
             source_origin: Some(Vec3::new(attacker_pose.x, attacker_pose.y, attacker_pose.z)),
         };
         let source_origin = damage.source_origin;
+        if hook_approval.is_none()
+            && self.precommit_boundary().is_some_and(|boundary| {
+                boundary.has_precommit_hooks(mc_script::precommit::HookKind::Damage)
+            })
+        {
+            let target_fence = PlayerDamageTargetFence {
+                survival: expected.survival,
+                inventory: expected.inventory.clone(),
+                carried_item: expected.carried_item.clone(),
+                xp: expected.xp.clone(),
+                active_shield: active_shield.clone(),
+                pose: target_pose,
+            };
+            match begin_player_damage(
+                self,
+                target_session,
+                "minecraft:overworld",
+                damage,
+                target_position,
+                PlayerDamageSource::Player(attacker_session),
+            ) {
+                Ok(Some(pending)) => {
+                    let Some(handle) = self.damage_precommit_handle() else {
+                        return committed_player_attack_without_damage(target_session);
+                    };
+                    let attacker_costs = attacker_costs.cloned();
+                    handle.for_session(attacker_session).spawn_precommit_resume(
+                        pending,
+                        Some(attacker_session),
+                        None,
+                        move |decision| {
+                            SimulationCommand::ResumePlayerDamagePrecommit(Box::new(
+                                PlayerDamagePrecommitResume::Pvp {
+                                    attacker_session,
+                                    target_session,
+                                    target_entity: entity_id,
+                                    target_fence,
+                                    attacker_costs,
+                                    authority_tick,
+                                    request: damage,
+                                    decision,
+                                },
+                            ))
+                        },
+                    );
+                    return committed_player_attack_without_damage(target_session);
+                }
+                Ok(None) => {}
+                Err(_) => return committed_player_attack_without_damage(target_session),
+            }
+        }
         let items = combat_resources.items.as_ref();
         let shield_blocks = active_shield.as_ref().is_some_and(|shield| {
             active_shield_blocks_player_damage(
@@ -313,6 +374,7 @@ impl SessionRegistry {
             xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
             keep_inventory,
             position: target_position,
+            hook_approval,
         };
         let shield_cooldown = shield_disable.as_ref().and_then(|disable| {
             i32::try_from(disable.duration_ticks)
@@ -423,6 +485,240 @@ impl SessionRegistry {
         }))
     }
 
+    pub(in crate::play) fn resume_player_damage_precommit(
+        &self,
+        authority: &SimulationAuthority,
+        resume: PlayerDamagePrecommitResume,
+    ) -> Vec<VisibilityDispatch> {
+        match resume {
+            PlayerDamagePrecommitResume::Pvp {
+                attacker_session,
+                target_session,
+                target_entity,
+                target_fence,
+                attacker_costs,
+                authority_tick,
+                request,
+                decision,
+            } => {
+                let Ok(approval) = decision else {
+                    return Vec::new();
+                };
+                let Some(amount) = Self::approved_raw_damage_amount(request, &approval) else {
+                    return Vec::new();
+                };
+                if !Self::player_damage_target_fence_matches(self, target_session, &target_fence) {
+                    return Vec::new();
+                }
+                match self.player_attack_entity(
+                    authority,
+                    PlayerEntityAttack {
+                        attacker_session,
+                        entity_id: target_entity,
+                        amount,
+                        attacker_costs: attacker_costs.as_ref(),
+                        authority_tick,
+                        hook_approval: Some(approval),
+                    },
+                ) {
+                    PlayerAttackResult::Damaged(mut outcome) => {
+                        std::mem::take(outcome.dispatches_mut())
+                    }
+                    PlayerAttackResult::ValidationRejected
+                    | PlayerAttackResult::AcceptedNoDamage => Vec::new(),
+                }
+            }
+            PlayerDamagePrecommitResume::Effect {
+                target_session,
+                target_fence,
+                tick,
+                request,
+                decision,
+            } => {
+                let Ok(approval) = decision else {
+                    return Vec::new();
+                };
+                let Some(amount) = Self::approved_raw_damage_amount(request, &approval) else {
+                    return Vec::new();
+                };
+                let mut inner = self.lock_session_entities("resume deferred effect damage");
+                if !Self::player_damage_target_fence_matches_locked(
+                    &inner,
+                    target_session,
+                    &target_fence,
+                ) {
+                    return Vec::new();
+                }
+                let preview = prepare_projectile_player_damage_locked(
+                    &inner,
+                    target_session,
+                    tick,
+                    PlayerDamageRequest { amount, ..request },
+                );
+                let (ProjectilePlayerDamagePreview::Accepted(mut prepared)
+                | ProjectilePlayerDamagePreview::Rejected(Some(mut prepared))) = preview
+                else {
+                    return Vec::new();
+                };
+                prepared.target_plan.hook_approval = Some(approval);
+                let mut dispatches = Vec::new();
+                let _ = commit_projectile_player_damage_locked(
+                    &mut inner,
+                    prepared,
+                    |_| true,
+                    &mut dispatches,
+                );
+                dispatches
+            }
+            PlayerDamagePrecommitResume::Projectile {
+                target_session,
+                target_fence,
+                tick,
+                request,
+                continuation,
+                decision,
+            } => {
+                let mut inner = self.lock_session_entities("resume deferred projectile damage");
+                let super::projectiles::ProjectileDamageContinuation::Hit {
+                    expected_projectile,
+                    ..
+                } = &continuation;
+                inner
+                    .pending_projectile_damage
+                    .remove(&expected_projectile.id);
+                let mut dispatches = Vec::new();
+                let Ok(approval) = decision else {
+                    let _ = commit_deferred_projectile_player_impact_without_damage_locked(
+                        &mut inner,
+                        continuation,
+                        &mut dispatches,
+                    );
+                    return dispatches;
+                };
+                let Some(amount) = Self::approved_raw_damage_amount(request, &approval) else {
+                    let _ = commit_deferred_projectile_player_impact_without_damage_locked(
+                        &mut inner,
+                        continuation,
+                        &mut dispatches,
+                    );
+                    return dispatches;
+                };
+                if !Self::player_damage_target_fence_matches_locked(
+                    &inner,
+                    target_session,
+                    &target_fence,
+                ) {
+                    let _ = commit_deferred_projectile_player_impact_without_damage_locked(
+                        &mut inner,
+                        continuation,
+                        &mut dispatches,
+                    );
+                    return dispatches;
+                }
+                let preview = prepare_projectile_player_damage_locked(
+                    &inner,
+                    target_session,
+                    tick,
+                    PlayerDamageRequest { amount, ..request },
+                );
+                let (ProjectilePlayerDamagePreview::Accepted(mut prepared)
+                | ProjectilePlayerDamagePreview::Rejected(Some(mut prepared))) = preview
+                else {
+                    let _ = commit_deferred_projectile_player_impact_without_damage_locked(
+                        &mut inner,
+                        continuation,
+                        &mut dispatches,
+                    );
+                    return dispatches;
+                };
+                prepared.target_plan.hook_approval = Some(approval);
+                if !commit_deferred_projectile_player_damage_locked(
+                    &mut inner,
+                    prepared,
+                    continuation.clone(),
+                    &mut dispatches,
+                ) {
+                    let _ = commit_deferred_projectile_player_impact_without_damage_locked(
+                        &mut inner,
+                        continuation,
+                        &mut dispatches,
+                    );
+                }
+                dispatches
+            }
+        }
+    }
+
+    fn approved_raw_damage_amount(
+        request: PlayerDamageRequest,
+        approval: &crate::play::HookApproval,
+    ) -> Option<f32> {
+        match approval.decision() {
+            mc_script::precommit::HookDecision::Keep => Some(request.amount),
+            mc_script::precommit::HookDecision::Replace(amount)
+                if amount.is_finite() && amount > 0.0 =>
+            {
+                Some(amount)
+            }
+            mc_script::precommit::HookDecision::Cancel
+            | mc_script::precommit::HookDecision::Replace(_)
+            | _ => None,
+        }
+    }
+
+    pub(super) fn player_damage_target_fence_locked(
+        inner: &SessionEntityGuards<'_>,
+        target_session: SessionId,
+    ) -> Option<(PlayerDamageTargetFence, Vec3)> {
+        let target = inner.sessions.get(&target_session)?;
+        let pose = target.pose;
+        let state = inner.player_persistence.get(&target_session)?.clone();
+        let state = lock_authoritative_mutex(&state, "freeze player damage target");
+        Some((
+            PlayerDamageTargetFence {
+                survival: state.survival,
+                inventory: state.inventory.clone(),
+                carried_item: state.carried_item.clone(),
+                xp: state.xp.clone(),
+                active_shield: inner.active_shields.get(&target_session).cloned(),
+                pose,
+            },
+            Vec3::new(pose.x, pose.y, pose.z),
+        ))
+    }
+
+    fn player_damage_target_fence_matches(
+        sessions: &SessionRegistry,
+        target_session: SessionId,
+        target_fence: &PlayerDamageTargetFence,
+    ) -> bool {
+        let inner = sessions.lock_session_entities("revalidate deferred player damage target");
+        Self::player_damage_target_fence_matches_locked(&inner, target_session, target_fence)
+    }
+
+    fn player_damage_target_fence_matches_locked(
+        inner: &SessionEntityGuards<'_>,
+        target_session: SessionId,
+        target_fence: &PlayerDamageTargetFence,
+    ) -> bool {
+        let Some(session) = inner.sessions.get(&target_session) else {
+            return false;
+        };
+        if session.pose != target_fence.pose
+            || inner.active_shields.get(&target_session) != target_fence.active_shield.as_ref()
+        {
+            return false;
+        }
+        let Some(state) = inner.player_persistence.get(&target_session).cloned() else {
+            return false;
+        };
+        let state = lock_authoritative_mutex(&state, "revalidate deferred player damage state");
+        state.survival == target_fence.survival
+            && state.inventory.slots == target_fence.inventory.slots
+            && state.carried_item == target_fence.carried_item
+            && state.xp == target_fence.xp
+    }
+
     fn commit_player_attack(
         &self,
         _authority: &SimulationAuthority,
@@ -502,6 +798,13 @@ impl SessionRegistry {
             return None;
         }
 
+        if target_plan
+            .hook_approval
+            .as_ref()
+            .is_some_and(|approval| approval.clone().consume().is_err())
+        {
+            return None;
+        }
         let staged_damage_wake = (target_plan.updated_survival.health
             < target_plan.expected_survival.health)
             .then(|| {
@@ -542,6 +845,7 @@ impl SessionRegistry {
         }
         if let Some(disable) = shield_disable {
             inner.active_shields.remove(&target_session);
+
             inner
                 .shield_disabled_until
                 .entry(target_session)
@@ -670,6 +974,10 @@ impl PreparedProjectilePlayerDamage {
     pub(super) fn kills_player(&self) -> bool {
         !self.target_plan.expected_survival.is_dead() && self.target_plan.updated_survival.is_dead()
     }
+
+    pub(super) fn target_session(&self) -> SessionId {
+        self.target_session
+    }
 }
 
 pub(super) fn prepare_projectile_player_damage_locked(
@@ -791,6 +1099,7 @@ pub(super) fn prepare_projectile_player_damage_locked(
         xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
         keep_inventory: inner.keep_inventory,
         position: target_position,
+        hook_approval: None,
     };
     let prepared = PreparedProjectilePlayerDamage {
         target_session,
@@ -849,6 +1158,13 @@ pub(super) fn commit_projectile_player_damage_locked(
         target_state,
     );
     if !player_survival_plan_matches(&target_state, &target_plan) {
+        return false;
+    }
+    if target_plan
+        .hook_approval
+        .as_ref()
+        .is_some_and(|approval| approval.clone().consume().is_err())
+    {
         return false;
     }
     if !commit_entities(inner) {
@@ -979,6 +1295,8 @@ pub(super) fn commit_projectile_player_damage_locked(
 
 #[cfg(test)]
 mod tests {
+    mod precommit_tests;
+
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
@@ -1068,6 +1386,7 @@ mod tests {
             xp_orb_entity_type_id: None,
             keep_inventory: false,
             position: mc_entity::Vec3::new(pose.x, pose.y, pose.z),
+            hook_approval: None,
         }
     }
 
@@ -1307,6 +1626,7 @@ mod tests {
                 amount: 4.0,
                 attacker_costs: None,
                 authority_tick,
+                hook_approval: None,
             },
         );
         let PlayerAttackResult::Damaged(outcome) = result else {
@@ -1505,6 +1825,7 @@ mod tests {
                 amount: 2.0,
                 attacker_costs: None,
                 authority_tick: registry.simulation_tick(),
+                hook_approval: None,
             },
         );
         let PlayerAttackResult::Damaged(outcome) = result else {
@@ -1564,6 +1885,7 @@ mod tests {
                 amount: 2.0,
                 attacker_costs: None,
                 authority_tick: registry.simulation_tick(),
+                hook_approval: None,
             },
         );
 
@@ -1601,6 +1923,7 @@ mod tests {
                 amount: mc_entity::player_survival_26_1_2::MAX_HEALTH,
                 attacker_costs: None,
                 authority_tick: registry.simulation_tick(),
+                hook_approval: None,
             },
         );
         assert!(matches!(result, PlayerAttackResult::Damaged(_)));
@@ -1700,6 +2023,7 @@ mod tests {
                         amount: 1.0,
                         attacker_costs: None,
                         authority_tick,
+                        hook_approval: None,
                     },
                 ),
                 PlayerAttackResult::Damaged(_)

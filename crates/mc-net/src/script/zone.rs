@@ -398,6 +398,36 @@ pub(crate) struct PluginZoneAdapter {
     protection: Arc<ArcSwap<ZoneProtectionSnapshot>>,
 }
 
+/// A lock-free fence over the precise protection image that admitted one build.
+/// A successful zone definition mutation replaces the image allocation, so Arc
+/// identity is an ABA-safe generation.  The retained image keeps the comparison
+/// meaningful until the owner commits or refuses.
+#[derive(Clone)]
+pub(crate) struct ZoneProtectionFence {
+    protection: Arc<ArcSwap<ZoneProtectionSnapshot>>,
+    snapshot: Arc<ZoneProtectionSnapshot>,
+}
+
+impl ZoneProtectionFence {
+    pub(crate) fn allows(&self, dimension: &str, position: mc_world::BlockPos) -> bool {
+        self.snapshot
+            .ambient_block_mutation_allowed(dimension, position)
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        Arc::ptr_eq(&self.snapshot, &self.protection.load_full())
+    }
+}
+
+impl std::fmt::Debug for ZoneProtectionFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ZoneProtectionFence")
+            .field("is_current", &self.is_current())
+            .finish()
+    }
+}
+
 impl PluginZoneAdapter {
     fn publish_protection_snapshot(
         protection: &ArcSwap<ZoneProtectionSnapshot>,
@@ -410,15 +440,6 @@ impl PluginZoneAdapter {
         Self {
             scripts,
             registry: Arc::new(Mutex::new(ZoneRegistry::new(ZoneLimits::production()))),
-            protection: Arc::new(ArcSwap::from_pointee(ZoneProtectionSnapshot::default())),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_limits_for_test(scripts: ScriptEventSink, limits: ZoneLimits) -> Self {
-        Self {
-            scripts,
-            registry: Arc::new(Mutex::new(ZoneRegistry::new(limits))),
             protection: Arc::new(ArcSwap::from_pointee(ZoneProtectionSnapshot::default())),
         }
     }
@@ -439,26 +460,42 @@ impl PluginZoneAdapter {
         outcome
     }
 
-    pub(crate) async fn route_admitted_with_result(
+    /// Applies one zone command and retains the old/new geometric definitions
+    /// that actually changed. Callers can notify bounded world work after the
+    /// owner's own command receipt is durably enqueued.
+    pub(crate) async fn route_admitted_with_changed_zones(
         &self,
         admitted: AdmittedScriptCommand,
-    ) -> Result<ZoneCommandOutcome, ZoneAdapterError> {
+    ) -> Result<(ZoneCommandOutcome, Vec<ScriptAxisAlignedZone>), ZoneAdapterError> {
         let (target, zone_id, outcome) = match admitted.request() {
             ScriptCommand::UpsertZone { .. } => {
                 let (target, zone) = admitted
                     .into_upsert_zone()
                     .map_err(ZoneAdapterError::InvalidCommand)?;
                 let zone_id = zone.id().to_owned();
+                let key = ZoneKey {
+                    plugin_id: target.plugin_id().to_owned(),
+                    zone_id: zone_id.clone(),
+                };
                 let outcome = self
                     .registry
                     .lock()
                     .map_err(|_| ZoneAdapterError::StateUnavailable)
                     .and_then(|mut registry| {
-                        let outcome = registry.upsert(target.clone(), zone);
-                        if outcome.is_ok() {
+                        let previous = registry
+                            .zones
+                            .get(&key)
+                            .map(|registered| registered.zone.clone());
+                        let changed_zone = zone.clone();
+                        let outcome = registry.upsert(target.clone(), zone)?;
+                        if outcome == ZoneCommandOutcome::Applied {
                             Self::publish_protection_snapshot(&self.protection, &registry);
+                            let mut changed = previous.into_iter().collect::<Vec<_>>();
+                            changed.push(changed_zone);
+                            Ok((outcome, changed))
+                        } else {
+                            Ok((outcome, Vec::new()))
                         }
-                        outcome
                     });
                 (target, zone_id, outcome)
             }
@@ -476,13 +513,18 @@ impl PluginZoneAdapter {
                     .map_err(|_| ZoneAdapterError::StateUnavailable)
                     .and_then(|mut registry| {
                         if registry.closed {
-                            Err(ZoneAdapterError::Closed)
+                            return Err(ZoneAdapterError::Closed);
+                        }
+                        let previous = registry
+                            .zones
+                            .get(&key)
+                            .map(|registered| registered.zone.clone());
+                        let outcome = registry.remove(&key);
+                        if outcome == ZoneCommandOutcome::Applied {
+                            Self::publish_protection_snapshot(&self.protection, &registry);
+                            Ok((outcome, previous.into_iter().collect()))
                         } else {
-                            let outcome = registry.remove(&key);
-                            if outcome == ZoneCommandOutcome::Applied {
-                                Self::publish_protection_snapshot(&self.protection, &registry);
-                            }
-                            Ok(outcome)
+                            Ok((outcome, Vec::new()))
                         }
                     });
                 (target, zone_id, outcome)
@@ -558,11 +600,24 @@ impl PluginZoneAdapter {
         Ok(self.protection.load_full().as_ref().clone())
     }
 
+    /// Capture the current immutable protection image before an admitted build
+    /// tests its position.  The caller must test this fence, not a cloned
+    /// snapshot, so the simulation owner can reject any changed image at commit.
+    pub(crate) fn capture_protection_fence(&self) -> ZoneProtectionFence {
+        ZoneProtectionFence {
+            protection: Arc::clone(&self.protection),
+            snapshot: self.protection.load_full(),
+        }
+    }
+
     pub(crate) fn close(&self) -> Result<(), ZoneAdapterError> {
-        self.registry
+        let mut registry = self
+            .registry
             .lock()
-            .map_err(|_| ZoneAdapterError::StateUnavailable)?
-            .close();
+            .map_err(|_| ZoneAdapterError::StateUnavailable)?;
+        registry.close();
+        self.protection
+            .store(Arc::new(ZoneProtectionSnapshot::unavailable()));
         Ok(())
     }
 

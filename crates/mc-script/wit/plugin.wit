@@ -1,12 +1,18 @@
 /// The one world a plugin component implements.
 ///
-/// The guest exports the phases and the event callback; the host owns every
-/// effect. There is no export that lets a guest choose its own plugin id, name a
-/// generation, or reach an admission boundary directly.
+/// The guest exports the phases, the event callback and the pre-commit hooks; the
+/// host owns every effect. There is no export that lets a guest choose its own
+/// plugin id, name a generation, or reach an admission boundary directly.
+///
+/// Exporting `precommit` is a capability of the component, not a registration:
+/// the host asks a hook only for the packages an operator registered for that
+/// kind, and a component that implements both hooks and is registered for
+/// neither is never asked either of them.
 package solaris:plugin@0.7.0;
 
 world plugin {
     import host;
     export lifecycle;
     export events;
+    export precommit;
 }

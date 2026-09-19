@@ -13,6 +13,7 @@ use super::block_edit_commit::{
     finalize_visible_block_edit_outcome, send_loaded_block_edit_resyncs,
 };
 use super::inventory::PlayerInventory;
+use super::script_gameplay_events::ScriptGameplayEventPublisher;
 use super::session::{dispatch_visibility_commands, within_block_reach};
 use super::simulation::{BucketInventoryChange, BucketUsePlan};
 use super::use_item_on_adapter::{
@@ -36,6 +37,7 @@ const BUCKET_FLUID_RAYCAST_RANGE: f64 = 4.5;
 pub(super) async fn handle_bucket_use<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     player_pose: PlayerPose,
     action: ServerboundUseItem,
@@ -73,6 +75,11 @@ where
     if !fluid.source {
         return resync_bucket_use_miss(state, writer, action.sequence, held_slot, &held, hit).await;
     }
+    let zone_fence =
+        script_events.and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
+    if script_events.is_some_and(|events| !events.block_mutation_allowed(hit)) {
+        return resync_bucket_use_miss(state, writer, action.sequence, held_slot, &held, hit).await;
+    }
     let Some(filled_bucket) = state.item_to_block.filled_bucket_item(fluid.kind) else {
         return write_block_ack(writer, state.compression, action.sequence)
             .await
@@ -96,6 +103,8 @@ where
                 replacement_max_stack: 1,
             }),
             schedule_fluid_ticks: true,
+            hook_approval: None,
+            zone_fence,
         },
     )
     .await?;
@@ -112,6 +121,7 @@ where
 pub(super) async fn handle_bucket_use_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    zone_fence: Option<crate::script::ZoneProtectionFence>,
     game_mode: GameMode,
     player_pose: PlayerPose,
     sequence: i32,
@@ -161,6 +171,8 @@ where
                     replacement_max_stack: 1,
                 }),
                 schedule_fluid_ticks: true,
+                hook_approval: None,
+                zone_fence: zone_fence.clone(),
             },
         )
         .await?;
@@ -277,6 +289,8 @@ where
                 replacement_max_stack: 16,
             }),
             schedule_fluid_ticks: true,
+            hook_approval: None,
+            zone_fence: zone_fence.clone(),
         },
     )
     .await?;
@@ -472,6 +486,7 @@ struct CauldronBucketPlan {
 pub(super) async fn handle_cauldron_bucket_use_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    zone_fence: Option<crate::script::ZoneProtectionFence>,
     game_mode: GameMode,
     sequence: i32,
     clicked_pos: mc_world::BlockPos,
@@ -518,6 +533,8 @@ where
                 replacement_max_stack: plan.replacement_max_stack,
             }),
             schedule_fluid_ticks: false,
+            hook_approval: None,
+            zone_fence,
         },
     )
     .await?;
@@ -537,7 +554,7 @@ where
     let inventory_slot = plan.inventory.as_ref().map(|change| change.held_slot);
     let committed = match state.simulation.commit_bucket_use(plan).await {
         Ok(Some(committed)) => committed,
-        Ok(None) => {
+        Ok(None) | Err(super::simulation::SimulationRequestError::Precommit(_)) => {
             // Rejected (stale precondition, moved held stack, or a full
             // inventory): the authoritative blocks + held slot are already
             // resent above, so this is terminal — falling through would ack
@@ -658,6 +675,10 @@ pub(in crate::play) fn plan_bucket_replacement(
 }
 
 #[cfg(test)]
+#[path = "bucket_precommit_tests.rs"]
+mod precommit_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -751,6 +772,8 @@ mod tests {
                 replacement_max_stack: 16,
             }),
             schedule_fluid_ticks: false,
+            hook_approval: None,
+            zone_fence: None,
         };
         let mut writer = Vec::new();
         let mut response = Box::pin(commit_bucket_use_and_respond(
@@ -945,6 +968,7 @@ mod tests {
         let handled = handle_bucket_use(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             ServerboundUseItem {
@@ -985,6 +1009,7 @@ mod tests {
         let handled = handle_bucket_use(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             ServerboundUseItem {
@@ -1033,6 +1058,7 @@ mod tests {
         let handled = handle_bucket_use(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             ServerboundUseItem {
@@ -1076,6 +1102,7 @@ mod tests {
         let handled = handle_bucket_use_on(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             11,
@@ -1117,6 +1144,7 @@ mod tests {
         let handled = handle_bucket_use_on(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             11,
@@ -1158,6 +1186,7 @@ mod tests {
         let handled = handle_bucket_use_on(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             11,
@@ -1204,6 +1233,7 @@ mod tests {
         let handled = handle_bucket_use_on(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             11,
@@ -1244,6 +1274,7 @@ mod tests {
         let handled = handle_bucket_use_on(
             &mut state,
             &mut writer,
+            None,
             GameMode::Survival,
             standing_pose(0.5, 64.0, 0.5, 0.0, 0.0),
             11,

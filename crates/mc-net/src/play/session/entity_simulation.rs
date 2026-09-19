@@ -2086,6 +2086,7 @@ impl SessionRegistry {
         let dragon_cloud_entity_type_id =
             (dragon_cloud_entity_type_id >= 0).then_some(dragon_cloud_entity_type_id);
         let (resolved_inner, hurting_steps) = resolve_hurting_projectile_hits_locked(
+            self,
             inner,
             steps,
             &old_motion,
@@ -2096,6 +2097,7 @@ impl SessionRegistry {
         inner = resolved_inner;
         applied_steps.extend(hurting_steps);
         let (resolved_inner, throwable_steps) = resolve_throwable_projectile_hits_locked(
+            self,
             inner,
             steps,
             &old_motion,

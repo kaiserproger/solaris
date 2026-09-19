@@ -12,7 +12,9 @@ use mc_script::ScriptHostileCategory;
 use uuid::Uuid;
 
 use super::entity_lifecycle::nearby_entity_candidate_ids_locked;
+
 use super::{ENTITY_DEATH_TICKS, SessionRegistry};
+use mc_script::precommit::HookKind;
 
 /// One resident order push target: the engine goal to set, keyed by identity.
 pub(crate) struct ResidentGoal {
@@ -21,6 +23,7 @@ pub(crate) struct ResidentGoal {
 }
 
 /// One committed damage request against a resident-perceived target.
+#[derive(Debug, Clone)]
 pub(crate) struct ResidentAttack {
     pub(crate) uuid: Uuid,
     pub(crate) amount: f32,
@@ -30,6 +33,7 @@ pub(crate) struct ResidentAttack {
 }
 
 /// One committed damage outcome.
+#[derive(Debug, Clone)]
 pub(crate) struct ResidentHit {
     pub(crate) damage: f32,
     pub(crate) killed: bool,
@@ -40,6 +44,8 @@ pub(crate) struct ResidentCandidate {
     pub(crate) uuid: Uuid,
     pub(crate) position: Vec3,
     pub(crate) category: ScriptHostileCategory,
+    pub(crate) type_name: String,
+    pub(crate) animal: Option<mc_entity::AnimalBreedingState>,
 }
 
 impl SessionRegistry {
@@ -105,10 +111,30 @@ impl SessionRegistry {
     /// or forged target commits nothing.
     pub(crate) async fn commit_resident_damage(
         &self,
+        plugin_id: &str,
         attacks: Vec<ResidentAttack>,
     ) -> Vec<Option<ResidentHit>> {
-        if attacks.is_empty() {
+        if attacks.is_empty() || plugin_id.is_empty() {
             return Vec::new();
+        }
+        if self
+            .precommit_boundary()
+            .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+        {
+            let Some(handle) = self.damage_precommit_handle().cloned() else {
+                return attacks.into_iter().map(|_| None).collect();
+            };
+            let mut hits = Vec::with_capacity(attacks.len());
+            for attack in attacks.iter().cloned() {
+                hits.push(
+                    handle
+                        .damage_resident_entity(plugin_id, attack)
+                        .await
+                        .ok()
+                        .flatten(),
+                );
+            }
+            return hits;
         }
         let tick = self.simulation_tick();
         let owner = self.entities.handle.clone();
@@ -202,6 +228,8 @@ impl SessionRegistry {
                     uuid: entity.uuid,
                     position: entity.position,
                     category,
+                    type_name: entity.type_name,
+                    animal: entity.animal,
                 })
             })
             .collect()

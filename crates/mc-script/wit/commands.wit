@@ -9,6 +9,8 @@
 interface commands {
     use types.{player-id, position, session-id};
     use storage.{storage-mutation};
+    use domain-operations.{operation-request};
+    use client-presentation.{client-command};
 
     /// Where one message goes. A player target reaches whichever session that
     /// player has when the host applies the command, so it survives a reconnect;
@@ -20,10 +22,18 @@ interface commands {
         session(session-id),
     }
 
-    /// One line of chat or one operator log line.
+    /// One chat line to the selected player or session.
     record send-message {
         target: message-target,
         text: string,
+    }
+
+    /// End only this connection, never a later session of the same player.
+    /// The existing owner drops a request for a session that has gone away.
+    /// Reasons are nonempty and at most 1024 UTF-8 bytes, as in the server DTO.
+    record disconnect-player {
+        session: session-id,
+        reason: string,
     }
 
     /// One read of this plugin's own durable storage. The host binds the owner;
@@ -106,11 +116,17 @@ interface commands {
     /// by that id instead of re-applying the batch.
     ///
     /// A package may send it only when its manifest declares the
-    /// `storage_batches` capability, and that same name has to be listed in the
-    /// manifest's `required_features`, which is where the server's own feature
-    /// check (`FEATURE_CAPABILITIES`) insists on it. The host converts a callback's
-    /// commands under the package's own grants, so an undeclared capability is
-    /// refused by name before the server sees anything.
+    /// `storage_batches` capability, which the operator grants this deployment.
+    /// `required_features` is not a type of this contract but a manifest-internal
+    /// consistency rule. The component manifest's `FEATURE_CAPABILITIES`
+    /// vocabulary is validated so a manifest that declares a feature-capability
+    /// without the matching `required_features` entry is refused as malformed
+    /// before any guest runs. It grants nothing and is no substitute for a
+    /// capability: what admits a command is the capability the manifest declared
+    /// and the operator's grant of it.
+    /// The host converts a callback's commands under the package's own grants,
+    /// so an undeclared capability is refused by name before the server sees
+    /// anything.
     ///
     /// Bounds: this record's list is the one the server's own operation DTO
     /// already validates, and its bounds are that DTO's - at most
@@ -256,9 +272,227 @@ interface commands {
         zone: string,
     }
 
-    /// One request from a plugin to the server. New members are added by the
-    /// phases that implement the game operation behind them; no member exists
-    /// here before its operation does.
+    /// One timer this plugin owns, to fire after a delay of pushed simulation
+    /// ticks.
+    ///
+    /// The command stays inside the host that owns this instance: a timer is the
+    /// plugin's own memory, not a server object, so nothing about it reaches the
+    /// game owners and no other plugin can name, replace or cancel one of these
+    /// ids. The host fires it from the simulation ticks the server already pushes
+    /// into the boundary - a plugin needs no subscription for that and no
+    /// `server.tick` member exists here - and drops the whole schedule when the
+    /// instance is retired. Nothing about it survives the host.
+    ///
+    /// A timer fires at most once per scheduling: the host delivers one
+    /// `timer-fired` event when the simulation reaches the deadline, and a plugin
+    /// that wants a repeating timer schedules the next one from that callback.
+    ///
+    /// A schedule that names an id the plugin already holds replaces it, and the
+    /// new delay is counted from the tick this callback observed - never from the
+    /// deadline the replaced timer had - so a late callback reschedules relative
+    /// to where the simulation is, not relative to where it should have been. A
+    /// replace is admitted even while the plugin holds the contract's maximum of
+    /// timers; only scheduling an id it does not hold past that maximum is
+    /// refused.
+    ///
+    /// A package may send it with no capability: the host owns the timer state of
+    /// its own instance, exactly as it owns the guest's memory.
+    ///
+    /// Bounds: the id is the contract's own script id, 1..64 bytes of lowercase
+    /// letters, digits, `_` and `-`, in the same alphabet as `storage-get`'s
+    /// request id; the delay is 1..630720000 ticks; and the deadline the observed
+    /// tick and the delay add up to is checked, so a sum that does not fit a `u64`
+    /// is refused rather than wrapped. The host checks every timer command of a
+    /// callback's answer before it applies any of that answer, so a request
+    /// outside these bounds - or one past the pending maximum - is refused as the
+    /// plugin's own malformed answer and the instance is retired, exactly as it is
+    /// for a command the server's DTO cannot accept.
+    record schedule-timer {
+        /// The plugin's own timer id, 1..64 bytes, in the same alphabet as
+        /// `storage-get`'s request id. The `timer-fired` event names it back.
+        timer-id: string,
+        /// How many pushed ticks from the observed one the timer waits,
+        /// 1..630720000.
+        delay-ticks: u64,
+    }
+
+    /// One timer this plugin no longer wants.
+    ///
+    /// Cancelling an id the plugin holds removes it before it fires anything.
+    /// Cancelling an id it does not hold - one that already fired, one it never
+    /// scheduled, one an earlier callback cancelled - is applied as nothing to
+    /// change, because a plugin cannot observe the schedule of a callback that
+    /// ran before it and a refusal would tell it nothing about its own work.
+    ///
+    /// A timer an earlier callback cancels cannot fire in the same pushed tick,
+    /// even after it became due: the host takes each due timer only after the
+    /// callback before it returned, so the cancel is already in the schedule the
+    /// next one is chosen from.
+    ///
+    /// A package may send it with no capability, exactly as for `schedule-timer`.
+    ///
+    /// Bounds: the id is the contract's own script id, 1..64 bytes, checked
+    /// exactly as `schedule-timer`'s is.
+    record cancel-timer {
+        /// The plugin's own timer id, 1..64 bytes.
+        timer-id: string,
+    }
+
+    /// Resource-count delta, not an item-stack replacement. Resource ids are
+    /// 1..128 bytes; amounts are nonzero and at most 64 in magnitude.
+    record inventory-resource-delta {
+        /// The item resource the delta counts, for example `minecraft:emerald`.
+        %resource: string,
+        /// Positive grants items; negative removes them.
+        delta: s16,
+    }
+
+    /// Atomic mutation of one live session's inventory and this plugin's storage.
+    /// The existing session gate, save coordinator and world journal own commit,
+    /// recovery and publication. Missing sessions, insufficient inventory and
+    /// stale storage revisions refuse the whole transaction.
+    ///
+    /// Requires `inventory_storage_transactions`. Both lists contain 1..16
+    /// entries, with unique resources and storage keys. Storage keys are 1..128
+    /// bytes, values 1..4096 bytes, and expected revisions at most
+    /// `MAX_SCRIPT_WORLD_TIME`; the existing DTO constructors validate them.
+    /// `PluginLimits::text_bytes` bounds each string, while `hostcall_bytes`
+    /// bounds the entire transfer before lifting.
+    ///
+    /// `request` is correlation only and may be reused after completion. This
+    /// operation has no durable operation-id receipt. A missing answer does not
+    /// establish refusal and must not trigger a blind retry.
+    record inventory-storage-transaction {
+        /// The plugin's correlation id, 1..64 bytes, as in `storage-get`. The
+        /// answer carries it back and it is correlation only.
+        request: string,
+        /// The connection whose inventory the transaction changes.
+        session: session-id,
+        /// The item counts to add and remove, applied as one set.
+        inventory: list<inventory-resource-delta>,
+        /// The storage mutations applied at the same time.
+        storage: list<storage-mutation>,
+    }
+
+    /// One fixed slot of a server-owned inventory menu.
+    ///
+    /// The record describes what the menu shows and nothing else: the index the
+    /// item appears at, the item resource, how many of it, and the line the
+    /// client renders in place of the item's own name. It names no item stack,
+    /// no slot state and no client packet, because the server's own menu owner
+    /// renders it and a plugin never handles the stack behind it.
+    ///
+    /// Bounds: `slot` is 0..`mc_script::MAX_INVENTORY_MENU_SLOTS` (54), the
+    /// resource id 1..128 bytes, `count` at least one (and at most 255, being a
+    /// `u8`), and the label, when present, 0..128 bytes. They are enforced by
+    /// `mc_script`'s own `ScriptInventoryMenuItem::try_new` and
+    /// `ScriptInventoryMenu::try_new` when the host converts this record into
+    /// the server's DTO: an index, a resource, a count or a label the validator
+    /// cannot accept is refused as the plugin's own malformed answer, never
+    /// clamped and never replaced with a slot the plugin did not ask for.
+    record inventory-menu-slot {
+        /// Where the item appears in the menu, 0..54.
+        slot: u8,
+        /// The item resource the slot shows, 1..128 bytes, for example
+        /// `minecraft:apple`.
+        %resource: string,
+        /// How many of that item the slot shows, at least one.
+        count: u8,
+        /// The line the client renders for the slot, at most 128 bytes;
+        /// absent means the item's own name.
+        label: option<string>,
+    }
+
+    /// One whole menu: the id a click names back, the title the client renders,
+    /// and the fixed slots it shows.
+    ///
+    /// A menu is shown on *one live connection*, like a teleport: the request that
+    /// carries it names the session it was built for, so a menu opened after that
+    /// connection ended is refused by the server's own menu owner instead of
+    /// appearing for that player's later session. The server owns the menu
+    /// once it admits it: it renders the slots, routes a click on one of them back
+    /// to the plugin that opened the menu, and drops the menu with the connection.
+    ///
+    /// Bounds: the id is the contract's own script id, 1..64 bytes of lowercase
+    /// letters, digits, `_` and `-`, in the same alphabet as `storage-get`'s
+    /// request id; the title is 1..128 bytes; the list holds at most 54 slots,
+    /// each index distinct, and a menu with no slots is a menu with nothing to
+    /// click rather than an error. Every one of them is enforced by the same
+    /// `mc_script` constructors the slot record documents.
+    record inventory-menu {
+        /// The menu's id, 1..64 bytes. A click event names it back, and a close
+        /// names it.
+        id: string,
+        /// The title the client renders, 1..128 bytes.
+        title: string,
+        /// The slots the menu shows, at most 54, with pairwise distinct indexes.
+        slots: list<inventory-menu-slot>,
+    }
+
+    /// One request to show a menu to the client of one live session.
+    ///
+    /// The session is named rather than the stable identity, exactly as for
+    /// `teleport-player`: a menu exists on one connection, so a request the
+    /// server receives after that connection ended is refused instead of being
+    /// shown to whoever holds the identity now.
+    ///
+    /// A package may send it only when its manifest declares the
+    /// `inventory_menus` capability; the host converts a callback's commands
+    /// under the package's own grants, so an undeclared capability is refused by
+    /// name before the server sees the command.
+    ///
+    /// The request is fire-and-forget: opening a menu carries no correlation id
+    /// and no event of this contract answers it, because the server records no
+    /// receipt for showing one. A plugin hears about its own menu only when a
+    /// player clicks one of its slots, so a plugin must not read the absence of
+    /// an answer as "the client saw the menu" - and a menu the owner refuses
+    /// produces no answer either way.
+    ///
+    /// Bounds: the record carries no text of its own beyond the menu's, which the
+    /// constructors named on `inventory-menu` bound, so the host-call budget
+    /// (`PluginLimits::hostcall_bytes`) is not what bounds it; that budget is
+    /// what bounds the whole answer before Wasmtime copies anything out of guest
+    /// memory.
+    record open-inventory-menu {
+        /// The connection whose client should see the menu.
+        session: session-id,
+        /// The menu to show.
+        menu: inventory-menu,
+    }
+
+    /// One request to close a menu this plugin opened for one live session.
+    ///
+    /// The request names the session and the menu rather than the object the
+    /// server holds: a plugin asks for its own menu to go away, and a close for a
+    /// session that has ended is refused rather than closing the menu of a
+    /// connection that holds the id now. A close for a menu that connection is not
+    /// showing is nothing to close rather than a refusal: the owner sends no close
+    /// for it and the connection keeps whatever it had open, and this contract
+    /// carries no answer that could report which of the two happened.
+    ///
+    /// The same `inventory_menus` capability admits it, and it is
+    /// fire-and-forget exactly as `open-inventory-menu` is: no correlation id, no
+    /// answer event, and a refusal that reaches the plugin only as the connection
+    /// carrying on with the menu it had.
+    ///
+    /// Bounds: the record carries the contract's script id and nothing else,
+    /// which `mc_script`'s own command validator enforces when the host converts
+    /// it: an id the validator cannot accept is refused as the plugin's own
+    /// malformed answer, never truncated.
+    record close-inventory-menu {
+        /// The connection whose client should lose the menu.
+        session: session-id,
+        /// The menu id to close, 1..64 bytes.
+        menu: string,
+    }
+
+    /// One request from a plugin. Every member is a request, never an effect:
+    /// the host validates the whole batch a callback returned, checks the
+    /// plugin's grants and the admission budget where a game owner is involved,
+    /// and applies the timer members to the plugin's own schedule only once the
+    /// batch that carried them was admitted. New members are added by the
+    /// phases that implement the operation behind them; no member exists here
+    /// before its operation does.
     variant command {
         send-message(send-message),
         storage-get(storage-get),
@@ -270,5 +504,40 @@ interface commands {
         upsert-zone(upsert-zone),
         upsert-protected-zone(upsert-protected-zone),
         remove-zone(remove-zone),
+        /// A nonempty chat line, at most 4096 UTF-8 bytes, to all online players.
+        broadcast(string),
+        disconnect-player(disconnect-player),
+        /// One timer this plugin owns, scheduled from the tick its callback
+        /// observed. The host applies it to the instance's own schedule; the
+        /// server never sees it and it needs no capability.
+        schedule-timer(schedule-timer),
+        /// One timer this plugin no longer wants, applied by the host with the
+        /// same rules.
+        cancel-timer(cancel-timer),
+        /// One atomic transaction of one session's inventory and this plugin's own
+        /// durable storage, applied by the existing owners together or not at all.
+        /// Its answer is `inventory-storage-transaction-answered`.
+        inventory-storage-transaction(inventory-storage-transaction),
+        /// One menu this plugin asks the client of one live session to show. The
+        /// server's menu owner renders it, owns it for that connection, and routes
+        /// a click on one of its slots back as `inventory-menu-clicked`. It is
+        /// fire-and-forget: no event of this contract answers it.
+        open-inventory-menu(open-inventory-menu),
+        /// One menu of one live session this plugin asks to close, applied by the
+        /// same owner and answered by no event either.
+        close-inventory-menu(close-inventory-menu),
+        operation(operation-request),
+        /// One typed Loader-bound client-presentation request: a view this plugin
+        /// owns, a sound it owns, or a grant of its own custom block item, applied
+        /// by the server's existing Loader owners. It carries no command
+        /// capability, and that is the Loader's own design rather than an
+        /// omission: the pair that admits these requests is the Loader manifest's
+        /// bundled content and its permission, checked inside the owner that
+        /// applies the request, so an undeclared view, sound or block is refused
+        /// there instead of here and this contract does not restate the pair as a
+        /// capability. Each request names one live session, never a stable
+        /// identity, so a request arriving after that connection ended is refused
+        /// rather than retargeted to a later session.
+        client-presentation(client-command),
     }
 }

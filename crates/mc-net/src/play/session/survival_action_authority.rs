@@ -14,7 +14,7 @@ use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::{
     BucketUsePlan, CommittedBucketUse, CommittedSurvivalBreak, CommittedSurvivalPlacement,
     SimulationAuthority, SimulationRequestError, SurvivalBreakPlan, SurvivalPlacementPlan,
-    placement_inventory_debit,
+    placement_inventory_debit, precommit,
 };
 use crate::play::{BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition};
 
@@ -150,6 +150,17 @@ impl SessionRegistry {
             (expected_inventory, updated_inventory, changed_slots)
         };
         let furnace_contents = broken_furnace_contents(storage, &plan.blocks, &plan.edits)?;
+        if plan
+            .zone_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_current())
+        {
+            return Err(SimulationRequestError::Precommit(
+                mc_script::precommit::HookFailure::PermissionDenied,
+            ));
+        }
+        precommit::refuse_build_approval(&plan.hook_approval)
+            .map_err(SimulationRequestError::Precommit)?;
         let Some(block) = apply_block_edit_batch_to_storage_conditionally(
             storage,
             block_light,
@@ -297,6 +308,17 @@ impl SessionRegistry {
             Vec::new()
         };
 
+        if plan
+            .zone_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_current())
+        {
+            return Err(SimulationRequestError::Precommit(
+                mc_script::precommit::HookFailure::PermissionDenied,
+            ));
+        }
+        precommit::refuse_build_approval(&plan.hook_approval)
+            .map_err(SimulationRequestError::Precommit)?;
         let Some(block) = apply_block_edit_batch_with_scheduled_ticks_to_storage_conditionally(
             storage,
             block_light,
@@ -408,6 +430,17 @@ impl SessionRegistry {
             (None, Vec::new())
         };
 
+        if plan
+            .zone_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_current())
+        {
+            return Err(SimulationRequestError::Precommit(
+                mc_script::precommit::HookFailure::PermissionDenied,
+            ));
+        }
+        precommit::refuse_build_approval(&plan.hook_approval)
+            .map_err(SimulationRequestError::Precommit)?;
         let Some(block) = apply_block_edit_batch_to_storage_conditionally(
             storage,
             block_light,

@@ -2,6 +2,14 @@
 
 Scope: Phase 1 feature-gated test inventory for `crates/mc-script`.
 
+Historical inventory: the counts and reproduction commands below refer to the
+pre-WASM-migration layout. P1 moved this runtime and its retained tests into
+`mc-plugin-host::legacy_luau` behind `legacy-luau`; `mc-script` no longer has a
+VM feature. Current commands are `cargo test -p mc-script` and
+`cargo test -p mc-plugin-host --features legacy-luau`; the latter also runs the
+component-host integration suite. Current acceptance evidence lives in
+[`MEMORY.md`](../MEMORY.md). The historical counts below are not refreshed.
+
 `mc-script` deliberately has an empty default feature set. Its default build
 owns the runtime-independent event, command, validation, queue, and capability
 contracts. The `lua-runtime` feature adds the production Luau VM, plugin

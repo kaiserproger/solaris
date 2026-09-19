@@ -47,7 +47,7 @@ pub const MAX_CLIENT_VIEW_MARKER_RADIUS: f64 = 128.0;
 pub const MAX_CLIENT_VIEW_RANGE_LIMIT: u32 = 256;
 /// Largest accepted selection context lifetime in simulation ticks.
 pub const MAX_CLIENT_VIEW_SELECTION_TTL_TICKS: u64 = 72_000;
-/// Largest exactly-representable revision or sequence (Luau exact integers).
+/// Largest exactly-representable revision or sequence on the component boundary.
 pub const MAX_CLIENT_VIEW_EXACT_INTEGER: u64 = (1_u64 << 53) - 1;
 
 /// The six declarative settlement screen kinds of contract section 8.2.

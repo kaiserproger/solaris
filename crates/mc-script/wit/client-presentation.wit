@@ -1,0 +1,211 @@
+// The Loader-bound client presentation a plugin may ask the server for.
+//
+// These records are the typed form of the Loader's existing view, sound and
+// custom-block surface, and they carry no client authority: the server supplies
+// every view instance id and revision, the acknowledged Loader session is what
+// addresses a request, and a plugin may only echo a server-issued selection
+// context inside a model. A request becomes an effect only when the server's own
+// owners admit it - the Loader content and permission pair on the manifest, the
+// live session, and the `mc_script` DTO validators, which bound every id, list
+// and string again when the host converts the record.
+interface client-presentation {
+    use types.{position, session-id};
+
+    /// One table row; cells are bounded display strings, never authority.
+    record view-row {
+        cells: list<string>,
+    }
+
+    /// One typed form value. Exactly one member is present, so a field can never
+    /// carry two values at once.
+    variant view-field-value {
+        number(f64),
+        text(string),
+        selected(string),
+    }
+
+    /// One typed form field echoed by the client and validated by the server.
+    record view-field {
+        id: string,
+        value: view-field-value,
+    }
+
+    /// One declared action plus its current enablement and optional caption.
+    record view-action {
+        action-id: string,
+        enabled: bool,
+        label: option<string>,
+        deny-reason: option<string>,
+    }
+
+    /// One tab heading bound to a tabs widget.
+    record view-tab {
+        id: string,
+        label: string,
+    }
+
+    /// One server-authoritative resource amount shown in a resource panel.
+    record view-resource-entry {
+        id: string,
+        have: f64,
+        need: f64,
+    }
+
+    /// One formation the server may render for a squad order.
+    enum view-formation {
+        line,
+        column,
+        wedge,
+        square,
+    }
+
+    /// One world-selection affordance. `selection-token` is the opaque,
+    /// server-issued selection-context id the client may only echo.
+    record view-marker {
+        marker-id: string,
+        selection-token: option<string>,
+        action-id: option<string>,
+        formation: option<view-formation>,
+        radius: option<f64>,
+    }
+
+    /// One bounded page of one declarative screen: flat lists of bounded values,
+    /// with no recursion for the contract to carry.
+    record view-model {
+        page: u32,
+        page-count: u32,
+        rows: list<view-row>,
+        fields: list<view-field>,
+        actions: list<view-action>,
+        tabs: list<view-tab>,
+        resource-entries: list<view-resource-entry>,
+        markers: list<view-marker>,
+        reason: option<string>,
+    }
+
+    /// One request to open a view this plugin owns on one live session.
+    ///
+    /// The session is named rather than the stable identity, as for every Loader
+    /// request: the view lives on one acknowledged Loader connection, so a
+    /// request the server receives after that connection ended is refused with
+    /// `player-unavailable` instead of appearing for whoever holds the identity
+    /// now. `owned-view-id` must be namespaced to this plugin, and the Loader
+    /// manifest must carry the view content and its present permission.
+    ///
+    /// The answer is `client-view-opened`, correlated by `request`; it is the one
+    /// Loader command of this contract whose outcome is reported, because the
+    /// owner decides it synchronously and the result is the only thing that tells
+    /// a plugin which instance and revision it may later present.
+    record open-client-view {
+        /// The plugin's correlation id, 1..64 bytes, as in `commands`'
+        /// `storage-get`. The answer carries it back.
+        request: string,
+        /// The connection whose client should show the view.
+        session: session-id,
+        /// The view this plugin owns, 1..128 bytes as a contract resource id,
+        /// for example `ruby-live:showcase`.
+        owned-view-id: string,
+        /// The page to present.
+        model: view-model,
+    }
+
+    /// One replacement of the model of a view this plugin already opened.
+    ///
+    /// `expected-revision` is the compare-and-swap: the server presents the new
+    /// model only while the live instance still holds that revision, and a
+    /// request after the instance moved on is refused rather than overwriting a
+    /// model the plugin never saw. A replacement drops every selection context
+    /// the earlier model armed.
+    ///
+    /// It is fire-and-forget: no event of this contract answers it, because a
+    /// present that the owner refuses changes nothing and a plugin that needs to
+    /// know reads the next `loader-view-action` instead.
+    record present-client-view {
+        /// The connection whose client should show the new model.
+        session: session-id,
+        /// The instance to replace, 1..128 bytes as a contract resource id.
+        view-instance-id: string,
+        /// The revision the replacement expects, 1..2^53-1.
+        expected-revision: u64,
+        /// The page to present in place of the current one.
+        model: view-model,
+    }
+
+    /// One request to close a view this plugin opened on one live session. A
+    /// close for a session that has ended is refused rather than closing the view
+    /// of a connection that holds the instance now, and a close for an instance
+    /// that connection is not showing is nothing to close. Like presenting, it is
+    /// fire-and-forget.
+    record close-client-view {
+        /// The connection whose client should lose the view.
+        session: session-id,
+        /// The instance to close, 1..128 bytes as a contract resource id.
+        view-instance-id: string,
+    }
+
+    /// One sound this plugin owns, played on one live session's client.
+    ///
+    /// The sound id must be namespaced to this plugin and the Loader manifest
+    /// must carry the sound content and its play permission. `position` absent
+    /// means listener-relative, non-attenuated audio; present means the sound is
+    /// placed at that point in the world.
+    record play-client-sound {
+        /// The connection whose client should hear the sound.
+        session: session-id,
+        /// The sound this plugin owns, 1..128 bytes as a contract resource id.
+        sound-id: string,
+        /// Playback volume, 0.0..=1.0.
+        volume: f32,
+        /// Playback pitch, 0.5..=2.0.
+        pitch: f32,
+        /// Where the sound is placed, absent for listener-relative audio.
+        position: option<position>,
+    }
+
+    /// One request to stop a sound this plugin is playing on one live session's
+    /// client. Stopping carries only the id, so it can never carry playback
+    /// parameters a play would have needed.
+    record stop-client-sound {
+        /// The connection whose client should stop the sound.
+        session: session-id,
+        /// The sound this plugin owns, 1..128 bytes as a contract resource id.
+        sound-id: string,
+    }
+
+    /// One grant of one custom block item this plugin owns into one live
+    /// session's inventory.
+    ///
+    /// The grant goes through the server's own player-inventory authority, which
+    /// re-checks that the block is this plugin's own Loader block, that the
+    /// connection is still there, and that the inventory can take it; the answer
+    /// is `loader-item-grant-result`, correlated by `request`, and it is the only
+    /// thing that tells a plugin whether the item reached the player. The session
+    /// is named rather than the stable identity, as for every Loader request, so
+    /// a grant for a connection that has ended is refused instead of reaching
+    /// whoever holds the identity now.
+    record grant-loader-block-item {
+        /// The plugin's correlation id, 1..64 bytes. The answer carries it back.
+        request: string,
+        /// The connection whose inventory should gain the item.
+        session: session-id,
+        /// The custom block this plugin owns, 1..128 bytes as a contract resource
+        /// id, for example `ruby-live:ruby_block`.
+        block: string,
+        /// How many items to grant, 1..=64.
+        count: u8,
+    }
+
+    /// One typed client-presentation request. Every member is a request, never an
+    /// effect, and the server's existing Loader owners apply it under the
+    /// package's Loader content and permission pair - which this contract does
+    /// not restate, because it is not a command capability: the same pair admits
+    /// any view, sound or custom-block item the manifest bundles.
+    variant client-command {
+        open-client-view(open-client-view),
+        present-client-view(present-client-view),
+        close-client-view(close-client-view),
+        play-client-sound(play-client-sound),
+        stop-client-sound(stop-client-sound),
+        grant-loader-block-item(grant-loader-block-item),
+    }
+}

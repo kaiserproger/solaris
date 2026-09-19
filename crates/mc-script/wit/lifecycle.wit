@@ -1,18 +1,18 @@
-// The phases of a plugin instance and the startup rule plan.
+// The phases of a plugin instance and the startup contribution.
 //
 // A plugin instance moves through exactly these phases: `configure` once in a
 // short-lived store with no runtime capability, then `init` once in its runtime
 // store, then any number of `on-events` calls, then `shutdown` when the host
 // retires the instance. Startup rules are a pure function of the package
-// configuration: the same configuration must produce the same plan, because the
-// resolved plan is fingerprinted into the world contract.
+// configuration: the same configuration must produce the same contribution,
+// because the resolved rules are fingerprinted into the world contract.
 interface lifecycle {
     use types.{plugin-error};
     use commands.{command};
 
-    /// Village and terrain placement rules, the WASM form of the retired
-    /// `rules.lua` plan. Every category is optional; a plan must set at least
-    /// one, and the host validates every bound before the plan is materialized.
+    /// Village and terrain placement rules declared by a component. Every
+    /// category is optional; a contribution must set at least one, and the host
+    /// validates every bound before the rules are materialized.
     record placement-rules {
         /// Candidate separation for land placements, 1..4.
         land-spacing: u32,
@@ -64,9 +64,9 @@ interface lifecycle {
         groups: list<spawn-group>,
     }
 
-    /// The normalized startup plan. Only the categories the package sets are
-    /// present; the host rejects a plan that sets none.
-    record rule-plan {
+    /// The normalized startup contribution. Only the categories the package sets
+    /// are present; the host rejects a contribution that sets none.
+    record startup-contribution {
         placement: option<placement-rules>,
         /// At most 64 declarations.
         trees: option<list<tree-rules>>,
@@ -87,10 +87,11 @@ interface lifecycle {
     }
 
     /// Startup phase. `config` is the package's `config.toml` text - the host
-    /// does not interpret it, and the guest SDK parses it. The returned plan is
-    /// the only thing this phase may produce; there is no world or runtime
-    /// access here.
-    configure: func(config: string) -> result<option<rule-plan>, plugin-error>;
+    /// does not interpret it, and the guest SDK parses it. The returned
+    /// contribution is the only thing this phase may produce; there is no world or
+    /// runtime access here, and the store this runs in is dropped before the
+    /// runtime store `init` runs in exists.
+    configure: func(config: string) -> result<option<startup-contribution>, plugin-error>;
 
     /// Runtime phase. Answers the commands that must be applied before the
     /// instance receives events, e.g. registering what it owns. Called exactly

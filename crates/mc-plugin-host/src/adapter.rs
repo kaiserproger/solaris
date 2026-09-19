@@ -12,13 +12,22 @@ use std::num::NonZeroUsize;
 
 use mc_script::{
     CommandBatch as ScriptCommandBatch, CommandBatchError, CommandCapabilities,
-    ScriptAxisAlignedZone, ScriptCommand, ScriptDtoError, ScriptOnlinePlayersRequest,
+    ScriptAxisAlignedZone, ScriptClientSound, ScriptClientViewAction, ScriptClientViewField,
+    ScriptClientViewFormation, ScriptClientViewMarker, ScriptClientViewModel, ScriptClientViewOpen,
+    ScriptClientViewPresent, ScriptClientViewResourceEntry, ScriptClientViewRow,
+    ScriptClientViewTab, ScriptCommand, ScriptDtoError, ScriptInventoryMenu,
+    ScriptInventoryMenuItem, ScriptInventoryMenuSlot, ScriptInventoryResourceDelta,
+    ScriptInventoryStorageTransaction, ScriptLoaderItemGrantRequest, ScriptOnlinePlayersRequest,
     ScriptOperation, ScriptOperationRequest, ScriptPlayerId, ScriptPlayerTeleportRequest,
     ScriptPluginStorageCompareAndSwapRequest, ScriptPluginStorageGetRequest, ScriptPosition,
     ScriptStorageMutation, ScriptZoneProtection,
 };
 
+use crate::bindings::solaris::plugin::client_presentation::{
+    ClientCommand, ViewField, ViewFieldValue, ViewFormation, ViewModel,
+};
 use crate::bindings::solaris::plugin::commands::{Command, MessageTarget, StorageMutation};
+use crate::bindings::solaris::plugin::domain_operations::DomainOperation;
 use crate::bindings::solaris::plugin::types::Position;
 
 /// Where a plugin's stable player identity is looked up.
@@ -146,6 +155,11 @@ fn convert(
                 message: message.text,
             })
         }
+        Command::Broadcast(message) => Ok(ScriptCommand::BroadcastChatMessage { message }),
+        Command::DisconnectPlayer(disconnect) => Ok(ScriptCommand::DisconnectPlayer {
+            player_id: ScriptPlayerId::new(disconnect.session),
+            reason: disconnect.reason,
+        }),
         // Storage names no player and needs no lookup: the DTO bounds the key,
         // the value and the correlation id, and the host binds the owner.
         Command::StorageGet(get) => Ok(ScriptCommand::PluginStorageGet {
@@ -215,6 +229,25 @@ fn convert(
                 },
             )?,
         }),
+        Command::Operation(request) => {
+            let operation = match request.operation {
+                DomainOperation::Settlement(value) => ScriptOperation::Settlement {
+                    operation: crate::domain_settlements::decode(value)?,
+                },
+                DomainOperation::Resident(value) => ScriptOperation::Resident {
+                    operation: crate::domain_residents::decode(value)?,
+                },
+                DomainOperation::ResidentOrder(value) => ScriptOperation::ResidentOrder {
+                    operation: crate::domain_residents::decode_order(value)?,
+                },
+                DomainOperation::Inventory(value) => ScriptOperation::Inventory {
+                    operation: crate::domain_inventories::decode(value)?,
+                },
+            };
+            Ok(ScriptCommand::Operation {
+                request: ScriptOperationRequest::try_new(request.request, operation)?,
+            })
+        }
         // A zone is a box of finite coordinates and nothing else, and the DTO the
         // owner applies is built by the validator the owner itself re-validates the
         // box with: the host invents no corner, no dimension and no id. A record the
@@ -246,12 +279,141 @@ fn convert(
                 )?),
             )?,
         }),
-        // A removal names one zone id and nothing else. The DTO carries the id as
-        // the id it is - the Lua API's own removal is exactly this - and the
-        // server's own command validator is what refuses an id the contract does not
-        // admit, exactly as it does for the id inside a box.
+        // A removal names one zone id and nothing else. The DTO carries that id
+        // unchanged, and the server command validator refuses an id the contract
+        // does not admit, exactly as it does for the id inside a box.
         Command::RemoveZone(remove) => Ok(ScriptCommand::RemoveZone {
             zone_id: remove.zone,
+        }),
+        // The transaction's two sides are the guest's own data, so this is the
+        // DTO's own constructor and not a policy decision: every delta and every
+        // mutation is re-validated by `ScriptInventoryStorageTransaction::try_new`,
+        // which refuses an empty side, a repeat, an amount or a key/value the
+        // contract does not admit. The session is the DTO's own player id, as for
+        // `teleport-player`, so the server's inventory owner refuses a transaction
+        // for a connection that has ended instead of reaching whoever holds that
+        // runtime id now.
+        Command::InventoryStorageTransaction(transaction) => {
+            let inventory = transaction
+                .inventory
+                .into_iter()
+                .map(|delta| ScriptInventoryResourceDelta::try_new(delta.resource, delta.delta))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScriptCommand::InventoryStorageTransaction {
+                transaction: ScriptInventoryStorageTransaction::try_new(
+                    transaction.request,
+                    ScriptPlayerId::new(transaction.session),
+                    inventory,
+                    transaction
+                        .storage
+                        .into_iter()
+                        .map(storage_mutation)
+                        .collect(),
+                )?,
+            })
+        }
+        // A menu names one live connection, as a teleport does, so the session the
+        // guest saw is the DTO's own player id: the server's menu owner refuses a
+        // menu for a connection that has ended instead of showing it to whoever
+        // holds that runtime id now. Every slot is re-validated by the server's own
+        // constructors - the menu id, the title, the slot indexes, the resources,
+        // the counts and the labels - so a definition the contract does not admit is
+        // the plugin's own malformed answer and fails the batch: the host invents no
+        // slot and clamps no value rather than converting something the plugin did
+        // not ask for. The package's own `inventory_menus` grant is what admits the
+        // converted command, as it is for every other command, and no answer event
+        // follows it - opening a menu is a request the plugin hears about only
+        // through a click on one of its slots.
+        Command::OpenInventoryMenu(open) => {
+            let slots = open
+                .menu
+                .slots
+                .into_iter()
+                .map(|slot| {
+                    Ok(ScriptInventoryMenuSlot::new(
+                        slot.slot,
+                        ScriptInventoryMenuItem::try_new(slot.resource, slot.count, slot.label)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, ScriptDtoError>>()?;
+            Ok(ScriptCommand::OpenInventoryMenu {
+                player_id: ScriptPlayerId::new(open.session),
+                menu: ScriptInventoryMenu::try_new(open.menu.id, open.menu.title, slots)?,
+            })
+        }
+        // A close carries the session and the menu id and nothing else, so the DTO
+        // holds the guest's own two values: the server's own command validator
+        // refuses an id the contract does not admit, and the menu owner decides
+        // whether that session holds that menu - the host neither invents a menu id
+        // nor retargets the close to whatever menu the connection has open now.
+        Command::CloseInventoryMenu(close) => Ok(ScriptCommand::CloseInventoryMenu {
+            player_id: ScriptPlayerId::new(close.session),
+            menu_id: close.menu,
+        }),
+        // Loader-bound client presentation. Every member names one live session
+        // rather than a stable identity: a view, a sound and a block-item grant are
+        // effects on one acknowledged Loader connection, so the server's own
+        // owners refuse a request for a session that is gone instead of delivering
+        // it to whoever holds that runtime id now. The host looks nothing up and
+        // adds nothing - the session is the DTO's own player id and the model is
+        // rebuilt by the DTO's own constructors - and the Loader gate stays where
+        // the native path keeps it: the manifest's bundled content and its
+        // permission, checked inside the owner that applies the request, which is
+        // why this command carries no capability here, exactly as it carries none
+        // natively.
+        Command::ClientPresentation(request) => match request {
+            ClientCommand::OpenClientView(open) => Ok(ScriptCommand::OpenClientView {
+                request: ScriptClientViewOpen::try_new(
+                    &open.request,
+                    ScriptPlayerId::new(open.session),
+                    &open.owned_view_id,
+                    view_model(open.model)?,
+                )?,
+            }),
+            ClientCommand::PresentClientView(present) => Ok(ScriptCommand::PresentClientView {
+                request: ScriptClientViewPresent::try_new(
+                    ScriptPlayerId::new(present.session),
+                    &present.view_instance_id,
+                    present.expected_revision,
+                    view_model(present.model)?,
+                )?,
+            }),
+            ClientCommand::CloseClientView(close) => Ok(ScriptCommand::CloseClientView {
+                player_id: ScriptPlayerId::new(close.session),
+                view_instance_id: close.view_instance_id,
+            }),
+            ClientCommand::PlayClientSound(play) => Ok(ScriptCommand::ClientSound {
+                player_id: ScriptPlayerId::new(play.session),
+                sound: ScriptClientSound::play(
+                    &play.sound_id,
+                    play.volume,
+                    play.pitch,
+                    play.position
+                        .map(|at| position(at, "client sound position"))
+                        .transpose()?,
+                )?,
+            }),
+            ClientCommand::StopClientSound(stop) => Ok(ScriptCommand::ClientSound {
+                player_id: ScriptPlayerId::new(stop.session),
+                sound: ScriptClientSound::stop(&stop.sound_id)?,
+            }),
+            ClientCommand::GrantLoaderBlockItem(grant) => Ok(ScriptCommand::GrantLoaderBlockItem {
+                request: ScriptLoaderItemGrantRequest::try_new(
+                    grant.request,
+                    ScriptPlayerId::new(grant.session),
+                    grant.block,
+                    grant.count,
+                )?,
+            }),
+        },
+        // A timer is the plugin's own host-side memory, not a server object: the
+        // host takes timer commands out of a callback's answer before it converts
+        // it, because they are applied to the instance's own schedule and never
+        // reach a game owner. One arriving here is refused under the name of what
+        // it is rather than converted into a server command that would mean
+        // something else - a timer is not a chat line and not a zone.
+        Command::ScheduleTimer(_) | Command::CancelTimer(_) => Err(AdapterError::InvalidCommand {
+            field: "timer command",
         }),
     }
 }
@@ -282,5 +444,96 @@ fn storage_mutation(mutation: StorageMutation) -> ScriptStorageMutation {
             key: delete.key,
             expected_version: delete.expected_version,
         },
+    }
+}
+
+/// One contract view model as the server's own DTO.
+///
+/// Every nested row, field, action, tab, resource entry and marker is rebuilt by
+/// the same `mc_script` constructors the native model uses, so a model that
+/// reaches the Loader owner is validated at the component boundary: page count,
+/// row and per-list element bounds, cell and text byte bounds, id and label byte
+/// bounds, finite amounts and radii, duplicate-free ids and selection tokens all
+/// refuse the whole batch as the plugin's malformed answer. Nothing is clamped,
+/// truncated, defaulted or reordered, and no value is invented for one the
+/// plugin omitted.
+fn view_model(model: ViewModel) -> Result<ScriptClientViewModel, AdapterError> {
+    let rows = model
+        .rows
+        .into_iter()
+        .map(|row| ScriptClientViewRow::try_new(row.cells))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = model
+        .fields
+        .into_iter()
+        .map(|field| {
+            let ViewField { id, value } = field;
+            match value {
+                ViewFieldValue::Number(number) => ScriptClientViewField::try_number(&id, number),
+                ViewFieldValue::Text(text) => ScriptClientViewField::try_text(&id, text),
+                ViewFieldValue::Selected(selected) => {
+                    ScriptClientViewField::try_selected(&id, &selected)
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let actions = model
+        .actions
+        .into_iter()
+        .map(|action| {
+            ScriptClientViewAction::try_new(
+                &action.action_id,
+                action.enabled,
+                action.label,
+                action.deny_reason,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tabs = model
+        .tabs
+        .into_iter()
+        .map(|tab| ScriptClientViewTab::try_new(&tab.id, &tab.label))
+        .collect::<Result<Vec<_>, _>>()?;
+    let resource_entries = model
+        .resource_entries
+        .into_iter()
+        .map(|entry| ScriptClientViewResourceEntry::try_new(&entry.id, entry.have, entry.need))
+        .collect::<Result<Vec<_>, _>>()?;
+    let markers = model
+        .markers
+        .into_iter()
+        .map(|marker| {
+            ScriptClientViewMarker::try_new(
+                &marker.marker_id,
+                marker.selection_token,
+                marker.action_id,
+                marker.formation.map(formation),
+                marker.radius,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ScriptClientViewModel::try_new(
+        model.page,
+        model.page_count,
+        rows,
+        fields,
+        actions,
+        tabs,
+        resource_entries,
+        markers,
+        model.reason,
+    )
+    .map_err(Into::into)
+}
+
+/// One contract formation as the server's own. The two vocabularies are the same
+/// four values, so this is a rename and the server's own set is what decides
+/// which ones exist.
+fn formation(formation: ViewFormation) -> ScriptClientViewFormation {
+    match formation {
+        ViewFormation::Line => ScriptClientViewFormation::Line,
+        ViewFormation::Column => ScriptClientViewFormation::Column,
+        ViewFormation::Wedge => ScriptClientViewFormation::Wedge,
+        ViewFormation::Square => ScriptClientViewFormation::Square,
     }
 }

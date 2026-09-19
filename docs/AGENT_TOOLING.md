@@ -41,6 +41,10 @@ Normal server runs write tracing events only to `logs/latest.log` and
 `logs/debug.log`. The canonical `run` entrypoint sets
 `SOLARIS_HARNESS_LOG_STDOUT=1` for its subprocesses, adding an INFO stdout layer
 so existing readiness events and per-run captured server logs remain available.
+`RUST_LOG` controls `logs/debug.log`, not the captured stdout threshold.
+The reconnect observer waits for the INFO `play session unregistered` event,
+not completion of the asynchronous player save; assert reconnect/disk
+persistence separately.
 Do not enable this variable for ordinary operator launches.
 
 ### CPU and memory bound on every run

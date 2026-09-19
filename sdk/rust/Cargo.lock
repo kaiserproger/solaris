@@ -180,6 +180,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "solaris-audit-plugin"
+version = "0.1.0"
+dependencies = [
+ "solaris-plugin-sdk",
+ "toml",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "solaris-economy-plugin"
+version = "0.1.0"
+dependencies = [
+ "solaris-plugin-sdk",
+ "toml",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "solaris-essentials-plugin"
+version = "0.1.0"
+dependencies = [
+ "solaris-plugin-sdk",
+ "toml",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "solaris-hello-plugin"
 version = "0.1.0"
 dependencies = [
@@ -188,9 +215,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "solaris-permissions-plugin"
+version = "0.1.0"
+dependencies = [
+ "solaris-plugin-sdk",
+ "toml",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "solaris-plugin-sdk"
 version = "0.1.0"
 dependencies = [
+ "toml",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "solaris-settlements-plugin"
+version = "0.1.0"
+dependencies = [
+ "solaris-plugin-sdk",
+]
+
+[[package]]
+name = "solaris-towns-plugin"
+version = "0.1.0"
+dependencies = [
+ "solaris-plugin-sdk",
  "toml",
  "wit-bindgen",
 ]

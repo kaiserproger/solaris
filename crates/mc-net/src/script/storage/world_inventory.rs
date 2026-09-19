@@ -83,6 +83,7 @@ impl PreparedStorageBatch {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct InventoryRuntime {
     world: Option<(PathBuf, WorldChunkJournal)>,
     sessions: Arc<SessionRegistry>,

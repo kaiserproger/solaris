@@ -19,7 +19,7 @@ use crate::{RuntimeControlHandle, connection::write_packet};
 
 use super::block_edit_commit::apply_visible_block_edit_batch_conditionally;
 use super::chunk_stream::ChunkStreamState;
-use super::combat::PlayerDamageKind;
+use super::combat::{PlayerDamageKind, PlayerDamageRequest};
 use super::commands::{
     AdminCommand, CommandError, CommandPermissions, DebugCommand, SurvivalCommand, WeatherCommand,
     parse_admin_command, player_abilities_for_mode,
@@ -27,6 +27,11 @@ use super::commands::{
 use super::inventory::{PlayerInventory, item_max_stack};
 use super::movement::{PendingTeleport, clamp_player_coordinates, next_player_teleport_id};
 use super::persistence::XpState;
+use super::player_damage_adapter::{
+    PlayerDamageApplication, admit_connection_player_damage, apply_player_damage,
+    player_damage_can_apply,
+};
+use super::session::damage_precommit::PlayerDamageSource;
 use super::session::{SessionRegistry, WeatherKind, dispatch_visibility_commands};
 use super::simulation::SimulationHandle;
 use super::survival::SurvivalState;
@@ -65,6 +70,8 @@ pub(super) async fn execute_player_command<W>(
     xp_state: &mut XpState,
     config: &ServerConfig,
     sessions: &SessionRegistry,
+    session_id: super::session::SessionId,
+    dimension: &str,
     simulation: &SimulationHandle,
     mut interaction: Option<&mut InteractionState>,
     player_pose: &mut PlayerPose,
@@ -228,7 +235,7 @@ where
             let mut updated_survival = *survival_state;
             updated_survival.apply_damage(damage);
             if let Some(state) = interaction.as_deref_mut() {
-                let expected_inventory = state.inventory.clone();
+                let expected_inventory = Box::new(state.inventory.clone());
                 commit_player_survival_update(
                     state,
                     writer,
@@ -237,6 +244,7 @@ where
                     expected_inventory,
                     updated_survival,
                     xp_state.clone(),
+                    None,
                     None,
                     true,
                     *player_pose,
@@ -317,6 +325,9 @@ where
                     interaction,
                     player_pose: *player_pose,
                     permissions,
+                    sessions,
+                    session_id,
+                    dimension,
                 },
             )
             .await?;
@@ -542,7 +553,20 @@ pub(super) struct DebugCommandContext<'a> {
     pub(super) xp_state: &'a mut XpState,
     pub(super) interaction: Option<&'a mut InteractionState>,
     pub(super) player_pose: PlayerPose,
+    pub(super) sessions: &'a SessionRegistry,
+    pub(super) session_id: super::session::SessionId,
+    pub(super) dimension: &'a str,
     pub(super) permissions: CommandPermissions,
+}
+
+struct SurvivalCommandContext<'a> {
+    state: &'a mut SurvivalState,
+    xp_state: &'a mut XpState,
+    interaction: Option<&'a mut InteractionState>,
+    player_pose: PlayerPose,
+    sessions: &'a SessionRegistry,
+    session_id: super::session::SessionId,
+    dimension: &'a str,
 }
 
 pub(super) async fn apply_debug_command<W>(
@@ -564,11 +588,16 @@ where
             let result = apply_survival_command(
                 writer,
                 compression,
-                context.survival_state,
-                context.xp_state,
-                context.interaction.as_deref_mut(),
-                context.player_pose,
                 command,
+                SurvivalCommandContext {
+                    state: context.survival_state,
+                    xp_state: context.xp_state,
+                    interaction: context.interaction.as_deref_mut(),
+                    player_pose: context.player_pose,
+                    sessions: context.sessions,
+                    session_id: context.session_id,
+                    dimension: context.dimension,
+                },
             )
             .await;
             if context.survival_state.is_dead()
@@ -675,31 +704,69 @@ where
         }
     }
 }
-
 async fn apply_survival_command<W>(
     writer: &mut W,
     compression: Compression,
-    state: &mut SurvivalState,
-    xp_state: &mut XpState,
-    interaction: Option<&mut InteractionState>,
-    player_pose: PlayerPose,
     command: SurvivalCommand,
+    mut context: SurvivalCommandContext<'_>,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let expected_inventory = interaction
+    if let SurvivalCommand::Damage(amount) = &command {
+        let request = PlayerDamageRequest {
+            kind: PlayerDamageKind::Generic,
+            amount: *amount,
+            source_origin: None,
+        };
+        if !player_damage_can_apply(GameMode::Survival, context.state, &request) {
+            return Ok(());
+        }
+        let Some(admitted) = admit_connection_player_damage(
+            context.sessions,
+            context.session_id,
+            context.dimension,
+            request,
+            Vec3::new(
+                context.player_pose.x,
+                context.player_pose.y,
+                context.player_pose.z,
+            ),
+            PlayerDamageSource::Player(context.session_id),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        apply_player_damage(
+            context.interaction.as_deref_mut(),
+            writer,
+            compression,
+            context.state,
+            context.xp_state,
+            GameMode::Survival,
+            PlayerDamageApplication {
+                player_pose: context.player_pose,
+                request,
+            },
+            admitted,
+        )
+        .await?;
+        return Ok(());
+    }
+    let expected_inventory = context
+        .interaction
         .as_deref()
-        .map(|interaction| interaction.inventory.clone());
-    let mut updated_state = *state;
-    let mut updated_xp = xp_state.clone();
+        .map(|interaction| Box::new(interaction.inventory.clone()));
+    let mut updated_state = *context.state;
+    let mut updated_xp = context.xp_state.clone();
     match command {
         SurvivalCommand::Experience(points) => {
             updated_xp.add_points(points);
         }
         SurvivalCommand::Damage(amount) => {
             updated_state.apply_damage(survival_damage_after_equipment(
-                interaction.as_deref(),
+                context.interaction.as_deref(),
                 amount,
                 PlayerDamageKind::Generic,
             ));
@@ -711,30 +778,31 @@ where
         }
     }
 
-    if let Some(interaction) = interaction {
+    if let Some(interaction) = context.interaction {
         commit_player_survival_update(
             interaction,
             writer,
-            state,
-            xp_state,
+            context.state,
+            context.xp_state,
             expected_inventory.expect("interaction inventory snapshot"),
             updated_state,
             updated_xp,
             None,
+            None,
             true,
-            player_pose,
+            context.player_pose,
         )
         .await?;
     } else {
-        let survival_changed = *state != updated_state;
-        let xp_changed = *xp_state != updated_xp;
-        *state = updated_state;
-        *xp_state = updated_xp;
+        let survival_changed = *context.state != updated_state;
+        let xp_changed = *context.xp_state != updated_xp;
+        *context.state = updated_state;
+        *context.xp_state = updated_xp;
         if survival_changed {
-            write_packet(writer, &state.as_packet(), compression).await?;
+            write_packet(writer, &context.state.as_packet(), compression).await?;
         }
         if xp_changed {
-            write_packet(writer, &xp_state.as_packet(), compression).await?;
+            write_packet(writer, &context.xp_state.as_packet(), compression).await?;
         }
     }
     Ok(())
@@ -805,7 +873,7 @@ where
                 return Ok(());
             }
             if let Some(state) = interaction.as_mut() {
-                let expected_inventory = state.inventory.clone();
+                let expected_inventory = Box::new(state.inventory.clone());
                 if !commit_player_survival_update(
                     state,
                     writer,
@@ -814,6 +882,7 @@ where
                     expected_inventory,
                     SurvivalState::FULL,
                     xp_state.clone(),
+                    None,
                     None,
                     false,
                     respawn_pose,

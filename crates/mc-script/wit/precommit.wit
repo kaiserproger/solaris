@@ -1,0 +1,131 @@
+// The two pre-commit hooks: what the server asks a registered package before it
+// commits a build or applies damage.
+//
+// A hook is a question, not an effect. The host asks it only for the packages an
+// operator explicitly registered for that kind, in the roster's own order
+// (`order`, then plugin id), inside one absolute deadline that covers the whole
+// chain and its queueing. A hook answers one decision and nothing else: the
+// contract has no shape here that carries commands, because a hook that could
+// stage one would be committing the very effect it is being asked about, and the
+// effect a hook may ask for is exactly what its decision says.
+//
+// A hook runs in the phase that asks the question, not in an ordinary event
+// callback. Nothing that reaches outside the instance is available in it: the
+// host refuses the `host.log` import and every command and asynchronous import
+// there, and a hook that tries one fails as its registration's `on_failure`
+// policy says. A hook therefore records whatever an ordinary callback later
+// reports, in its own instance state, instead of answering with a message or a
+// log line.
+//
+// The values here are the same ones the native hook DTOs carry: the request the
+// owning game system is about to commit, before any armor, shield, resistance or
+// other native reduction is applied, so a decision is a statement about what was
+// asked for rather than about what a particular damage formula would leave of it.
+// A chain is a pipeline while it keeps, so a later damage handler is asked about
+// the amount an earlier `replace` decided, not about the raw request again.
+interface precommit {
+    use types.{plugin-error, position};
+
+    /// One player as the hook sees them: the stable identity and the live
+    /// connection the question is about. The session is the connection that was
+    /// current when the hook began, not a later lookup of whatever session the
+    /// identity holds.
+    record hook-player {
+        uuid: string,
+        session: u64,
+    }
+
+    /// Who asked for the effect. `environment` is the game itself - no player and
+    /// no entity, as in a natural cause - and `plugin` is a package's own
+    /// programmatic request.
+    variant hook-actor {
+        player(hook-player),
+        entity(u64),
+        plugin(string),
+        environment,
+    }
+
+    /// One block change the build is about to commit, in the flattened
+    /// coordinates and state ids the native edit carries. `previous-state` is
+    /// what the block holds now and `proposed-state` is what the build would put
+    /// there.
+    record build-edit {
+        x: s32,
+        y: s32,
+        z: s32,
+        previous-state: u32,
+        proposed-state: u32,
+    }
+
+    /// One before-build question: a batch of edits one actor is about to commit
+    /// against one dimension.
+    ///
+    /// The list is bounded by the same native edit-command bound a guest's own
+    /// build command is (512 edits); a hook is never asked to decide a batch
+    /// larger than a package could have asked for itself, and a chain is never
+    /// handed a batch a single guest could not have produced.
+    record build-context {
+        actor: hook-actor,
+        dimension: string,
+        edits: list<build-edit>,
+    }
+
+    /// What the damage is about to be applied to.
+    variant damage-target {
+        player(hook-player),
+        entity(u64),
+    }
+
+    /// One before-damage question.
+    ///
+    /// `amount` is the amount this handler is asked about: for the first handler of
+    /// a chain, the raw damage the owning game system is about to apply; for a later
+    /// one, the amount the handlers before it decided. It is always the figure
+    /// before armor, shields, resistance or any other native reduction - never the
+    /// health that would actually be lost. `kind` is the damage type as the server
+    /// names it, and `position` is where the effect was produced.
+    record damage-context {
+        source: hook-actor,
+        target: damage-target,
+        kind: string,
+        dimension: string,
+        position: position,
+        amount: f32,
+    }
+
+    /// What the build chain concluded. A build has no replacement: the edits are
+    /// the actor's own, and the host either commits them or does not.
+    enum build-decision {
+        keep,
+        cancel,
+    }
+
+    /// What the damage chain concluded.
+    ///
+    /// `replace` names the amount that is applied instead of the one the context
+    /// carried, still before every native reduction. It is finite and at least
+    /// zero; zero is a deliberately admitted no-damage outcome, which is why it is
+    /// a value and not the `cancel` it is not.
+    variant damage-decision {
+        keep,
+        cancel,
+        replace(f32),
+    }
+
+    /// The before-build question. Answering it neither stages nor commits
+    /// anything: the host reads the decision, asks the next handler in the
+    /// roster's order only while every handler so far kept the build, and applies
+    /// the edits only if the whole chain kept them. A `cancel` is a veto: it
+    /// settles the chain, no later handler is asked, and the build is refused
+    /// whatever the handlers before it decided.
+    before-build: func(context: build-context) -> result<build-decision, plugin-error>;
+
+    /// The before-damage question.
+    ///
+    /// The chain is a pipeline while it keeps: a later handler is asked about the
+    /// amount an earlier `replace` decided, not about the raw request. A `cancel`
+    /// settles the chain instead - no later handler is asked, and the damage is
+    /// refused whatever the handlers before it decided, so a `replace` an earlier
+    /// handler answered is discarded rather than applied.
+    before-damage: func(context: damage-context) -> result<damage-decision, plugin-error>;
+}

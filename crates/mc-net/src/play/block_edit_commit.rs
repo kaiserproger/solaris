@@ -341,6 +341,13 @@ where
         return Ok(outcome);
     }
 
+    if let Some(storage) = state.script_storage.as_ref() {
+        let chunks = outcome.edit_chunks.iter().map(|&(x, z)| [x, z]).collect();
+        storage
+            .wake_resident_work(state.world_dimension.clone(), chunks)
+            .await;
+    }
+
     state
         .sessions
         .invalidate_prepared_chunks(&outcome.edit_chunks);

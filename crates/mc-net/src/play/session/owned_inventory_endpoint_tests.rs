@@ -471,9 +471,11 @@ async fn owned_reservation_refuses_a_warehouse_endpoint() {
     let request = reserve_request(warehouse, plan, harness.fence());
 
     let outcome = harness.execute(&request).await;
-    assert_eq!(outcome.failure(), Some(ScriptOperationFailure::Unloaded));
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::RuntimeUnavailable)
+    );
 }
-
 #[tokio::test]
 async fn owned_reservation_release_returns_only_the_unconsumed_remainder() {
     let mut harness = Harness::new(PlayerInventory::empty());

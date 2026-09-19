@@ -8,7 +8,8 @@ use mc_entity::{EntityId, EntityItemStack, Rotation, Vec3};
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
 use mc_protocol::packets::play::{
-    ClientboundExplode, EntityDataValue, LevelEvent, LightData, PlayerInfoRemove, PlayerInfoUpdate,
+    ClientboundBlockEvent, ClientboundExplode, EntityDataValue, LevelEvent, LightData,
+    PlayerInfoRemove, PlayerInfoUpdate,
 };
 use mc_world::ChunkPos;
 use mc_world::light::ChunkLight;
@@ -21,6 +22,7 @@ use crate::play::block_wire::BlockDelta;
 use crate::play::combat::{MeleeKnockback, PlayerDamageRequest};
 use crate::play::inventory::PlayerInventory;
 use crate::play::persistence::XpState;
+use crate::play::session::damage_precommit::PlayerDamageSource;
 use crate::play::session::{
     LoaderItemGrantCommand, ScriptMenuCloseRequest, ScriptMenuOpenRequest,
     ScriptPlayerInventoryCommand, ScriptPlayerTeleportCommand, WeatherProjection,
@@ -105,12 +107,14 @@ pub(in crate::play) enum OutboundCommand {
         entity_id: i32,
         event_id: i8,
     },
+    BlockEvent(ClientboundBlockEvent),
     EntityHurt {
         entity_id: i32,
     },
     LevelEvent(LevelEvent),
     DamagePlayer {
         damage: PlayerDamageRequest,
+        source: PlayerDamageSource,
     },
     ApplyPlayerEffect {
         entity_id: i32,
@@ -261,6 +265,7 @@ impl OutboundCommand {
             | Self::BlockDeltas(_)
             | Self::LightUpdates(_)
             | Self::EntityEvent { .. }
+            | Self::BlockEvent(_)
             | Self::EntityHurt { .. }
             | Self::LevelEvent(_)
             | Self::DamagePlayer { .. }

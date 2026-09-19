@@ -54,11 +54,17 @@ fn work_orders_require_a_concrete_bounded_target() {
         },
     );
     assert!(oversized.is_err());
-    // A zero-count craft and a zero work budget are refused.
-    let invalid: [ScriptResidentWorkOrder; 2] = [
+    // A zero-count craft, a non-single-cell station, and a zero work budget are refused.
+    let invalid: [ScriptResidentWorkOrder; 3] = [
         ScriptResidentWorkOrder::Craft {
             recipe: "minecraft:stick".to_owned(),
             count: 0,
+            station: area(0),
+        },
+        ScriptResidentWorkOrder::Craft {
+            recipe: "minecraft:stick".to_owned(),
+            count: 1,
+            station: area(1),
         },
         ScriptResidentWorkOrder::Mine {
             area: area(4),

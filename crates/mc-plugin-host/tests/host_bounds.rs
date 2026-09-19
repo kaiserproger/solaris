@@ -28,10 +28,12 @@
 use mc_plugin_host::bindings::exports::solaris::plugin::events::{
     Event, EventContext, PlayerJoined,
 };
-use mc_plugin_host::bindings::exports::solaris::plugin::lifecycle::{InitContext, RulePlan};
+use mc_plugin_host::bindings::exports::solaris::plugin::lifecycle::{
+    InitContext, StartupContribution,
+};
 use mc_plugin_host::{
     CommandBatch, CompiledPlugin, HostError, HostServices, LogLevel, PluginInstance, PluginLimits,
-    engine, linker,
+    PluginStartup, engine, linker,
 };
 
 mod fixture;
@@ -68,14 +70,19 @@ fn limits(hostcall_bytes: usize, guest_memory_bytes: usize) -> PluginLimits {
     }
 }
 
-/// Instantiate the fixture without running any phase.
-fn instance(limits: PluginLimits) -> PluginInstance<Services> {
+/// Instantiate the fixture's runtime store with `config` already read.
+///
+/// The phases run in the two stores both the check and the run path use: the
+/// startup phase in a store of its own that is dropped here, then `init` in the
+/// store this answers with. The probe in `mode = "configure-isolation"` is what a
+/// test uses to tell the two apart from the guest side.
+fn guest(limits: PluginLimits, config: &str) -> PluginInstance<Services> {
     let bytes = fixture::component_bytes();
     let engine = engine(&limits).expect("engine");
     let compiled =
         CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0").expect("the fixture compiles");
     let linker = linker::<Services>(&engine).expect("linker");
-    PluginInstance::instantiate(
+    let _ = PluginStartup::instantiate(
         &linker,
         compiled.component(),
         Services {
@@ -83,7 +90,44 @@ fn instance(limits: PluginLimits) -> PluginInstance<Services> {
         },
         limits,
     )
-    .expect("the fixture instantiates")
+    .expect("the startup store instantiates")
+    .configure(config)
+    .expect("configure");
+    let mut plugin = PluginInstance::instantiate(
+        &linker,
+        compiled.component(),
+        Services {
+            id: PLUGIN.to_owned(),
+        },
+        limits,
+    )
+    .expect("the fixture instantiates");
+    plugin
+        .init(config, init_context())
+        .expect("the fixture's init is harmless");
+    plugin
+}
+
+/// One arm of a startup case: the startup contribution is the answer under test.
+fn run_configure(
+    limits: PluginLimits,
+    config: &str,
+) -> Result<Option<StartupContribution>, HostError> {
+    let bytes = fixture::component_bytes();
+    let engine = engine(&limits).expect("engine");
+    let compiled =
+        CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0").expect("the fixture compiles");
+    let linker = linker::<Services>(&engine).expect("linker");
+    PluginStartup::instantiate(
+        &linker,
+        compiled.component(),
+        Services {
+            id: PLUGIN.to_owned(),
+        },
+        limits,
+    )
+    .expect("the startup store instantiates")
+    .configure(config)
 }
 
 fn event_context() -> EventContext {
@@ -110,20 +154,10 @@ fn init_context() -> InitContext {
     }
 }
 
-/// One arm of an event case: `configure`, `init`, then the answer to one join.
+/// One arm of an event case: the startup phase, `init`, then the answer to one
+/// join.
 fn run_join(limits: PluginLimits, config: &str) -> Result<CommandBatch, HostError> {
-    let mut plugin = instance(limits);
-    plugin.configure(config).expect("configure");
-    plugin
-        .init(config, init_context())
-        .expect("the fixture's init is harmless");
-    plugin.on_events(event_context(), &[join_event()])
-}
-
-/// One arm of a startup case: the rule plan is the answer under test.
-fn run_configure(limits: PluginLimits, config: &str) -> Result<Option<RulePlan>, HostError> {
-    let mut plugin = instance(limits);
-    plugin.configure(config)
+    guest(limits, config).on_events(event_context(), &[join_event()])
 }
 
 /// The refusal a claim past the transfer bound must produce.
@@ -221,20 +255,26 @@ fn the_transfer_budget_covers_the_whole_answer_not_one_string() {
     )
     .expect("an answer inside every bound must be admitted");
     assert_eq!(admitted.len(), COUNT, "every command of the answer arrives");
-    assert_eq!(
-        admitted.text_bytes(),
-        EACH * COUNT,
-        "the whole answer is what the budget paid for"
-    );
+    for command in admitted.into_commands() {
+        assert!(
+            matches!(
+                command,
+                mc_plugin_host::bindings::solaris::plugin::commands::Command::SendMessage(message)
+                    if message.text.len() == EACH
+            ),
+            "every returned message retains its full payload"
+        );
+    }
 }
 
 #[test]
-fn a_nested_startup_plan_is_held_to_the_same_bound() {
+fn a_nested_startup_contribution_is_held_to_the_same_bound() {
     // Sixteen declarations, each naming the fixture's fixed 64 biomes of 16 KiB:
-    // two levels of lists in the startup answer, where the answer is a rule plan
-    // rather than a batch. Few, long names on purpose - a claim of 16 MiB spread
-    // over 1024 strings costs the guest far less of its own budget than the same
-    // claim over a million, so what refuses it can only be the transfer bound.
+    // two levels of lists in the startup answer, where the answer is a startup
+    // contribution rather than a batch. Few, long names on purpose - a claim of
+    // 16 MiB spread over 1024 strings costs the guest far less of its own budget
+    // than the same claim over a million, so what refuses it can only be the
+    // transfer bound.
     const NAME_BYTES: usize = 16 * 1024;
     const NAMES_PER_DECLARATION: usize = 64;
     const DECLARATIONS: usize = 16;
@@ -246,7 +286,7 @@ fn a_nested_startup_plan_is_held_to_the_same_bound() {
         run_configure(limits(bound, GUEST_MEMORY), &config).map(drop),
     );
 
-    let plan = run_configure(
+    let contribution = run_configure(
         // Twice the names the answer declares, which covers the list strides as
         // well as the bytes.
         limits(
@@ -255,9 +295,9 @@ fn a_nested_startup_plan_is_held_to_the_same_bound() {
         ),
         &config,
     )
-    .expect("a plan inside the bound must be admitted")
-    .expect("the nested fixture answers a plan");
-    let trees = plan.trees.expect("the plan declares trees");
+    .expect("a contribution inside the bound must be admitted")
+    .expect("the nested fixture answers a contribution");
+    let trees = contribution.trees.expect("the contribution declares trees");
     assert_eq!(trees.len(), DECLARATIONS);
     assert_eq!(trees[0].biomes.len(), NAMES_PER_DECLARATION);
 }
@@ -273,17 +313,12 @@ fn a_guest_cannot_grow_the_stack_past_its_bound() {
     // would fail instead of quietly proving nothing about the stack.
     let shallow = "mode = \"recurse\"\ncount = 1000\n";
     let limits = limits(PluginLimits::default().hostcall_bytes, 64 * 1024 * 1024);
-    let mut plugin = instance(limits);
-    plugin.configure(shallow).expect("configure");
-    plugin.init(shallow, init_context()).expect("init");
-    plugin
+    guest(limits, shallow)
         .on_events(event_context(), &[join_event()])
         .expect("a thousand frames fit the stack a guest is given");
 
     let deep = "mode = \"recurse\"\ncount = 10000000\n";
-    let mut plugin = instance(limits);
-    plugin.configure(deep).expect("configure");
-    plugin.init(deep, init_context()).expect("init");
+    let mut plugin = guest(limits, deep);
     let error = plugin
         .on_events(event_context(), &[join_event()])
         .expect_err("unbounded recursion must not answer");
@@ -309,9 +344,7 @@ fn a_trapped_callback_publishes_no_batch() {
     // batch: the answer never exists as a value to admit.
     let config = "mode = \"trap\"\ncount = 4\n";
     let limits = limits(PluginLimits::default().hostcall_bytes, 64 * 1024 * 1024);
-    let mut plugin = instance(limits);
-    plugin.configure(config).expect("configure");
-    plugin.init(config, init_context()).expect("init");
+    let mut plugin = guest(limits, config);
 
     let error = plugin
         .on_events(event_context(), &[join_event()])

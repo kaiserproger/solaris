@@ -43,10 +43,11 @@ use mc_plugin_host::bindings::solaris::plugin::commands::{
 use mc_plugin_host::bindings::solaris::plugin::storage::{
     StorageCasMutation, StorageDeleteMutation, StorageMutation,
 };
+use mc_plugin_host::bindings::solaris::plugin::{domain_operations, inventories};
 use mc_plugin_host::{
     AdapterError, CommandBatch, DeploymentConfig, DiscoveryMode, HostQueues, HostServices,
     LoadedPackage, LogLevel, NoSessions, PlayerSessions, PluginInstance, PluginLimits,
-    start_deployment, to_script_batch,
+    PluginStartup, start_deployment, to_script_batch,
 };
 use mc_script::{
     COMPONENT_PLUGIN_API_VERSION, CommandCapabilities, HostCommandAdmission,
@@ -62,9 +63,11 @@ const PLAYER_UUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const SESSION: u64 = 7;
 
 /// The declaration an operator writes to grant the storage batch, in the
-/// manifest's own capability vocabulary. The same name is what the server's
-/// feature check requires in `required_features`.
-const STORAGE_BATCH_CAPABILITY: &str = "capabilities = [\"storage_batches\"]\n";
+/// manifest's own capability vocabulary. A feature-capability is admitted only
+/// together with its `required_features` entry, which is also the name the
+/// server's own feature check reads.
+const STORAGE_BATCH_DECLARATION: &str =
+    "capabilities = [\"storage_batches\"]\nrequired_features = [\"storage_batches\"]\n";
 
 /// The request id the fixture's batch mode uses, and the durable operation id it
 /// commits under. Both are the guest's own, so a test reads them back from what
@@ -100,6 +103,10 @@ impl PlayerSessions for Sessions {
 }
 
 /// Instantiate the shared fixture with `config` as its package's `config.toml`.
+///
+/// The two startup phases run in the two stores the host uses: the startup phase
+/// in a store of its own that is dropped here, `init` in the runtime store this
+/// answers with.
 fn guest(config: &str) -> PluginInstance<Services> {
     let limits = PluginLimits::default();
     let bytes = component_bytes();
@@ -107,6 +114,17 @@ fn guest(config: &str) -> PluginInstance<Services> {
     let compiled = mc_plugin_host::CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0")
         .expect("compile");
     let linker = mc_plugin_host::linker::<Services>(&engine).expect("linker");
+    let _ = PluginStartup::instantiate(
+        &linker,
+        compiled.component(),
+        Services {
+            id: "hello".to_owned(),
+        },
+        limits,
+    )
+    .expect("the startup store instantiates")
+    .configure(config)
+    .expect("configure");
     let mut instance = PluginInstance::instantiate(
         &linker,
         compiled.component(),
@@ -116,7 +134,6 @@ fn guest(config: &str) -> PluginInstance<Services> {
         limits,
     )
     .expect("instantiate");
-    instance.configure(config).expect("configure");
     instance
         .init(
             config,
@@ -518,6 +535,7 @@ fn deployment(root: &Path, ids: &[&str]) -> Vec<LoadedPackage> {
             expected: ids.iter().map(|id| (*id).to_owned()).collect(),
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )
@@ -584,7 +602,7 @@ async fn the_servers_committed_answer_returns_to_the_guest_that_asked_and_the_pr
     write_package(
         root.path(),
         "hello",
-        STORAGE_BATCH_CAPABILITY,
+        STORAGE_BATCH_DECLARATION,
         "greeting = \"Settled\"\nmode = \"storage-batch\"\ncount = 2\n",
     );
     let limits = PluginLimits::default();
@@ -702,7 +720,7 @@ async fn a_refusal_returns_the_servers_own_reason_and_the_reasons_stay_distingui
     write_package(
         root.path(),
         "hello",
-        STORAGE_BATCH_CAPABILITY,
+        STORAGE_BATCH_DECLARATION,
         "greeting = \"Settled\"\nmode = \"storage-batch\"\ncount = 2\n",
     );
     let limits = PluginLimits::default();
@@ -814,4 +832,83 @@ async fn a_package_that_never_declared_the_capability_loses_its_route_instead_of
         "the refusal is counted against the batch, not the instance's health"
     );
     assert_eq!(counters[0].1.commands_submitted, 0);
+}
+
+fn assert_inventory_fence_text_bound(operation: inventories::InventoryOperation) {
+    let command = Command::Operation(domain_operations::OperationRequest {
+        request: "query".to_owned(),
+        operation: domain_operations::DomainOperation::Inventory(operation),
+    });
+    let mut refused = CommandBatch::new();
+    assert_eq!(
+        refused.push(
+            command.clone(),
+            &PluginLimits {
+                text_bytes: 32,
+                ..PluginLimits::default()
+            },
+        ),
+        Err(mc_plugin_host::StagingError::TextTooLong)
+    );
+    assert!(refused.is_empty(), "an oversized fence must not be staged");
+
+    let mut accepted = CommandBatch::new();
+    accepted
+        .push(
+            command,
+            &PluginLimits {
+                text_bytes: 64,
+                ..PluginLimits::default()
+            },
+        )
+        .expect("a valid fence fits the exact per-string boundary");
+    convert(accepted, &["inventory_transfers"])
+        .expect("the admitted command also satisfies the native inventory DTO");
+}
+
+#[test]
+fn transfer_fence_hash_obeys_the_configured_text_bound() {
+    assert_inventory_fence_text_bound(inventories::InventoryOperation::Transfer(
+        inventories::InventoryTransfer {
+            operation_id: "move".to_owned(),
+            actor_id: SESSION,
+            transfers: vec![inventories::OwnedItemTransfer {
+                source: inventories::InventoryEndpoint::PlayerInventory(SESSION),
+                source_slot: 9,
+                destination: inventories::InventoryEndpoint::PlayerInventory(SESSION),
+                destination_slot: 10,
+                count: 1,
+            }],
+            expected_revisions: vec![inventories::InventoryExpectedRevision {
+                endpoint: inventories::InventoryEndpoint::PlayerInventory(SESSION),
+                fence: inventories::InventoryFence {
+                    revision: 1,
+                    snapshot_hash: "0".repeat(64),
+                },
+            }],
+        },
+    ));
+}
+
+#[test]
+fn reservation_fence_hash_obeys_the_configured_text_bound() {
+    assert_inventory_fence_text_bound(inventories::InventoryOperation::Reserve(
+        inventories::InventoryReserve {
+            operation_id: "reserve".to_owned(),
+            endpoint: inventories::InventoryEndpoint::PlayerInventory(SESSION),
+            resource_plan: inventories::InventoryResourcePlan {
+                portions: vec![inventories::InventoryWorkPortion {
+                    work_units: 1,
+                    materials: vec![inventories::InventoryMaterial {
+                        resource_id: "minecraft:emerald".to_owned(),
+                        quantity: 1,
+                    }],
+                }],
+            },
+            expected_revision: inventories::InventoryFence {
+                revision: 1,
+                snapshot_hash: "0".repeat(64),
+            },
+        },
+    ));
 }

@@ -135,7 +135,7 @@ async fn inventory_recovery_runs_when_server_binds_without_scripts() {
     let (player_id, _) = sessions.register(
         &LoggedInProfile {
             uuid,
-            name: "NoLuaRecovery".to_owned(),
+            name: "NoPluginRecovery".to_owned(),
         },
         (0, 0),
         2,

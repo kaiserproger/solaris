@@ -41,6 +41,88 @@ plugin checkout; integration tests explicitly read that checkout to exercise
 actual first-party behavior. This relocation does not change Lua API 0.6.0 or
 grant first-party packages access beyond the ordinary plugin boundary.
 
+### Component migration (2026-09-16)
+
+The owner-selected successor is WIT `solaris:plugin@0.7.0` with Wasmtime in
+`mc-plugin-host`. The composition root selects one runtime per deployment, not
+both. Each component has its own Store; callbacks run serially on the host
+worker, outside simulation owners, and publish validated batches through the
+same `ScriptBoundary`. The Luau implementation and reload descriptions below
+remain applicable to the retained Luau path, not promises about component reload.
+
+Component zone commands reuse the existing capability check, zone registry and
+plugin-scoped owner identity. Their completion is the owner's zone-keyed
+`applied | refused` bit, delivered only to that plugin; WIT does not invent a
+request id, detailed refusal, new registry or persistence mechanism. Component
+zone-membership observations remain unimplemented.
+
+Component messaging uses that same admission path for direct messages,
+broadcasts and session-scoped disconnects. The host publishes only after the
+entire callback, including canonical post-return cleanup, succeeds. A malformed
+batch retires only its guest; transient admission pressure discards the whole
+batch without retiring it. Disconnects retain the supplied session identity,
+so a delayed request cannot disconnect a newer connection of the same player.
+
+Component timers are private per-instance host state driven by the existing
+pushed simulation ticks; there is no new scheduler thread, mailbox, journal or
+simulation-owner API. The pure bounded schedule is shared with the retained
+Luau adapter. One advancing tick stages all of its due callbacks under one
+fuel/epoch/command allowance, counting timer mutations as well as game commands.
+The host commits that schedule only after the entire delivery and ordinary
+batch admission succeed. A non-retiring refusal leaves timers pending for a
+later tick; guest memory/logging are not rolled back. Retirement drops the
+schedule. This stronger admission boundary does not alter the retained Luau
+path's existing commit-before-command-routing behavior.
+
+P1 separates the contract from both VMs: `mc-script` owns deployment metadata,
+events, commands, routes and admission, without VM dependencies or features.
+The existing `mc-plugin-host` owns Wasmtime and the retained
+`legacy_luau` module; its `legacy-luau` feature is migration-only. The server
+enables that feature at composition, while production `mc-net` remains
+runtime-independent.
+
+Reload control shares the existing bounded host-input FIFO with events. A
+`ScriptHostInputSender` wrapper sends a trusted host-only opaque reload payload;
+the selected host downcasts it to its own reload request. This is not a guest
+API, WIT value, new mailbox or general control framework. The payload's reply
+channel closes if unsupported or dropped. `commit_reload` retains the same
+admission fencing, route replacement and host-swap order. Existing Luau reload
+behavior is preserved; component reload is still P6 work.
+
+Migration is incomplete. P2's graphical hello/join acceptance is recorded in
+`.analysis/codex-logs/wasm-p2-live-20260916/checkpoint.json`. P3 adds component
+timers, but remaining operations, Loader/startup metadata, precommit hooks,
+reload and final Luau removal still need their own acceptance evidence.
+
+### Bounded precommit ownership (P5)
+
+`mc-script::precommit` owns immutable build/damage contexts, operator-ordered
+registrations, bounded admission, the queue-inclusive 100 ms deadline and
+single-use approvals. Capacity is 64 in-flight decisions through native
+consumption/drop, with at most 512 edits per build context. Build decisions are
+Keep/Cancel; damage may replace the raw amount cumulatively. Cancel terminates
+the handler chain. The host executes serially outside simulation ownership;
+hook exports cannot use ordinary mutation, I/O or request imports.
+
+`mc-net` retains the frozen native action and resumes it through the existing
+bounded simulation queue. Each owner checks its snapshots, session, permissions
+and declarative zone fence, then consumes approval immediately before its
+ordinary commit. Regional build commits perform the same checks. Damage
+continuations retain producer semantics, including melee/dragon kernels,
+projectile impact ownership, explosion knockback and golem animation. A pending
+projectile collision has one native adjudication; rejection must not resubmit
+that collision on every tick.
+
+Original programmatic completion senders remain with synchronous operations
+and transfer only when an actual continuation is created. A native refusal
+cannot be reported before a later hidden mutation. A failed mandatory guest
+does not unregister protection; operator removal is separate from Store
+retirement. No-handler actions retain their direct native path.
+
+This records implementation ownership, not completed graphical acceptance or
+release readiness. P5 evidence and remaining gates are tracked in `MEMORY.md`;
+component reload and final Luau removal remain later migration outcomes.
+
 ## Event and mutation classes
 
 Ordinary observations such as chat, death, zone entry, and completed world
@@ -138,10 +220,12 @@ zones. Runtime failure isolation survives into a typed terminal `LuaHostExitRepo
 shutdown can distinguish a normal drained event-queue close from non-normal host
 exits and enumerate bounded per-plugin disable diagnostics without exposing the VM,
 queue, lock, or owner internals. Prepared reload uses that same private host-input
-serialization point: candidate VMs and their bounded `server.started` work are staged,
-command capacity/admission and command-root ownership are committed before generation
-swap, and Unix `mc-server` exposes strict SIGHUP preparation without replacing the
-`ScriptBoundary`. `mc-net` already has production adapters for storage, zones, menus,
+serialization point: component candidates are compiled, configured, and initialized
+outside live stores under a static combined old/candidate guest-memory capacity;
+their init effects remain staged. A committed replacement changes route registrations
+to fresh monotonic generations before it swaps instances, so old timers and targeted
+late results cannot enter a same-id component replacement. Unix `mc-server` exposes
+strict SIGHUP preparation without replacing the `ScriptBoundary`.
 player inventory transactions, teleports, durable resident handles, work and
 orders. Colony identity, roles and durable domain intent remain plugin-owned;
 runtime adapters receive bounded requests and return owner-scoped results,
@@ -156,7 +240,7 @@ internal session gate shared with standalone inventory owner commands; this
 keeps their plan, durable mutation, and ordered owner application serialized.
 
 Package discovery type-checks all callable `solaris` functions against the
-check-only `lua/solaris.d.luau` declarations. Known-name/argument errors fail
+check-only `mc-plugin-host/src/legacy_luau/solaris.d.luau` declarations. Known-name/argument errors fail
 before VM startup, including in handlers not executed by `--check`. Dynamic
 `any` values, advanced record shapes, resource bounds and authority checks remain
 runtime responsibilities. The declarations do not add a runtime SDK or change

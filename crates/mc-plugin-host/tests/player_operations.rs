@@ -36,7 +36,7 @@ use mc_plugin_host::bindings::solaris::plugin::types::Position;
 use mc_plugin_host::{
     AdapterError, CommandBatch, DeploymentConfig, DiscoveryMode, HostQueues, HostServices,
     LoadedPackage, LogLevel, NoSessions, PlayerSessions, PluginInstance, PluginLimits,
-    start_deployment, to_script_batch,
+    PluginStartup, start_deployment, to_script_batch,
 };
 use mc_script::{
     COMPONENT_PLUGIN_API_VERSION, CommandCapabilities, HostCommandAdmission,
@@ -78,6 +78,10 @@ impl PlayerSessions for Sessions {
 }
 
 /// Instantiate the shared fixture with `config` as its package's `config.toml`.
+///
+/// The two startup phases run in the two stores the host uses: the startup phase
+/// in a store of its own that is dropped here, `init` in the runtime store this
+/// answers with.
 fn guest(config: &str) -> PluginInstance<Services> {
     let limits = PluginLimits::default();
     let bytes = component_bytes();
@@ -85,6 +89,17 @@ fn guest(config: &str) -> PluginInstance<Services> {
     let compiled = mc_plugin_host::CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0")
         .expect("compile");
     let linker = mc_plugin_host::linker::<Services>(&engine).expect("linker");
+    let _ = PluginStartup::instantiate(
+        &linker,
+        compiled.component(),
+        Services {
+            id: "hello".to_owned(),
+        },
+        limits,
+    )
+    .expect("the startup store instantiates")
+    .configure(config)
+    .expect("configure");
     let mut instance = PluginInstance::instantiate(
         &linker,
         compiled.component(),
@@ -94,7 +109,6 @@ fn guest(config: &str) -> PluginInstance<Services> {
         limits,
     )
     .expect("instantiate");
-    instance.configure(config).expect("configure");
     instance
         .init(
             config,
@@ -404,6 +418,7 @@ fn deployment(root: &Path, ids: &[&str]) -> Vec<LoadedPackage> {
             expected: ids.iter().map(|id| (*id).to_owned()).collect(),
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )

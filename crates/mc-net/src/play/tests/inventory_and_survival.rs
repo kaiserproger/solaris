@@ -994,22 +994,20 @@ async fn projectile_damage_uses_armor_protection_and_damages_armor() {
         start_survival_test_owner(&mut state, "ProjectileArmor", survival_state, &xp_state);
     let mut writer = Vec::new();
 
-    apply_player_damage(
-        Some(&mut state),
-        &mut writer,
-        Compression::Disabled,
-        &mut survival_state,
-        &mut xp_state,
-        GameMode::Survival,
-        PlayerDamageApplication {
-            player_pose: PlayerPose::new(0.0, 64.0, 0.0),
-            request: PlayerDamageRequest {
-                kind: PlayerDamageKind::Projectile,
-                amount: 10.0,
-                source_origin: Some(Vec3::new(0.0, 64.0, 2.0)),
-            },
+    apply_unhooked_player_damage_for_test(Some(&mut state),
+    &mut writer,
+    Compression::Disabled,
+    &mut survival_state,
+    &mut xp_state,
+    GameMode::Survival,
+    PlayerDamageApplication {
+        player_pose: PlayerPose::new(0.0, 64.0, 0.0),
+        request: PlayerDamageRequest {
+            kind: PlayerDamageKind::Projectile,
+            amount: 10.0,
+            source_origin: Some(Vec3::new(0.0, 64.0, 2.0)),
         },
-    )
+    },)
     .await
     .unwrap();
     simulation_stop.send(()).unwrap();

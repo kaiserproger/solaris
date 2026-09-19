@@ -201,9 +201,18 @@ def _build_mc_server(ctx: ProfileContext) -> dict[str, Any]:
     )
 
 
+def _prepare_loader_fixture(ctx: ProfileContext) -> None:
+    _run_command(
+        ["bash", "tools/build-loader-live-gate-fixture.sh", "--prepare"],
+        ctx,
+        "fixture-prepare.log",
+    )
+
+
 def run_core_client(ctx: ProfileContext) -> dict[str, Any]:
     from . import compatibility
 
+    _prepare_loader_fixture(ctx)
     details = _build_mc_server(ctx)
     timeout = ctx.timeout_seconds or CORE_CLIENT_TIMEOUT_SECONDS
     result = compatibility.run(timeout, ctx.artifact_dir, inventory=False)
@@ -216,6 +225,7 @@ def run_core_client(ctx: ProfileContext) -> dict[str, Any]:
 def run_inventory(ctx: ProfileContext) -> dict[str, Any]:
     from . import compatibility
 
+    _prepare_loader_fixture(ctx)
     details = _build_mc_server(ctx)
     timeout = ctx.timeout_seconds or CORE_CLIENT_TIMEOUT_SECONDS
     result = compatibility.run(timeout, ctx.artifact_dir, inventory=True)
@@ -234,6 +244,7 @@ def run_loader_live(ctx: ProfileContext) -> dict[str, Any]:
             f"loader-live requires --platform {'|'.join(LOADER_PLATFORMS)}, "
             f"got {platform!r}"
         )
+    _prepare_loader_fixture(ctx)
     details = _build_mc_server(ctx)
     timeout = ctx.timeout_seconds or LOADER_LIVE_TIMEOUT_SECONDS
     result = loader.run(platform, timeout, ctx.artifact_dir)

@@ -721,10 +721,8 @@ fn verify_declared_block(
 
 /// The view kinds a view bundle's screens let the server route to their owner.
 ///
-/// The Loader refuses a bundle whose `views` content and screen index disagree,
-/// so a views bundle with no screens is already invalid there; the server
-/// rejects it at startup for the same reason instead of shipping a package
-/// whose key-driven screens can never be opened.
+/// A views bundle must declare screens. Only settlement and army screens have
+/// client-key request routes; the other schema-2 kinds are opened by their plugin.
 fn declared_screen_kinds(
     index: &LoaderArtifactIndex,
     owner: &str,
@@ -741,6 +739,12 @@ fn declared_screen_kinds(
                 "Loader screen identity {:?} must be owned by {owner}",
                 screen.id
             )));
+        }
+        if matches!(
+            screen.kind.as_str(),
+            "construction" | "economy" | "garrison" | "hud"
+        ) {
+            continue;
         }
         let Some(kind) = mc_script::ScriptClientViewRequestKind::from_contract_name(&screen.kind)
         else {
@@ -1509,69 +1513,6 @@ mod tests {
         );
     }
 
-    /// One schema-2 artifact whose index is its first entry, as the Loader
-    /// requires.
-    fn artifact_index_bytes(directory: &Path, index: &str) -> (Vec<u8>, PathBuf, u64, String) {
-        let path = directory.join("index.bundle");
-        let file = File::create(&path).unwrap();
-        let mut archive = zip::ZipWriter::new(file);
-        archive
-            .start_file(
-                LOADER_ARTIFACT_INDEX_PATH,
-                zip::write::SimpleFileOptions::default(),
-            )
-            .unwrap();
-        archive.write_all(index.as_bytes()).unwrap();
-        archive.finish().unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        let size = bytes.len() as u64;
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
-        (bytes, path, size, sha256)
-    }
-
-    /// A view index the server refuses is a package that can never open its
-    /// screen, so it fails at startup instead of shipping dead content.
-    #[test]
-    fn view_index_routing_fails_closed_on_unroutable_screens() {
-        let directory = tempfile::tempdir().unwrap();
-        let declared = |index: &str| {
-            let (bytes, path, size, sha256) = artifact_index_bytes(directory.path(), index);
-            read_index_from_artifact_bytes(&bytes, &path, size, &sha256)
-                .and_then(|index| declared_screen_kinds(&index, "example"))
-                .map_err(|error| error.to_string())
-        };
-
-        assert_eq!(
-            declared(r#"{"schema":2,"screens":[]}"#).unwrap_err(),
-            "loader artifact index is invalid: view bundle must declare at least one screen"
-        );
-        assert!(declared(
-            r#"{"schema":2,"screens":[{"id":"example:overview","kind":"siege","title":"Siege"}]}"#
-        )
-        .unwrap_err()
-        .contains("unsupported kind \"siege\""));
-        assert!(declared(
-            r#"{"schema":2,"screens":[{"id":"other:overview","kind":"settlement","title":"Other"}]}"#
-        )
-        .unwrap_err()
-        .contains("must be owned by example"));
-        // Two screens of one kind are one routing entry, not an ambiguous owner.
-        assert_eq!(
-            declared(
-                r#"{"schema":2,"screens":[{"id":"example:overview","kind":"settlement","title":"One"},{"id":"example:roster","kind":"settlement","title":"Two"}]}"#
-            )
-            .unwrap(),
-            vec![mc_script::ScriptClientViewRequestKind::Settlement]
-        );
-        assert_eq!(
-            declared(
-                r#"{"schema":2,"screens":[{"id":"example:army","kind":"army","title":"Army"}]}"#
-            )
-            .unwrap(),
-            vec![mc_script::ScriptClientViewRequestKind::Army]
-        );
-    }
-
     #[test]
     fn artifact_index_supplies_one_exact_owner_block_identity() {
         let directory = tempfile::tempdir().unwrap();
@@ -1740,3 +1681,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "loader_index_tests.rs"]
+mod index_tests;

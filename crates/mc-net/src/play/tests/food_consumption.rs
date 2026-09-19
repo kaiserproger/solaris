@@ -46,6 +46,7 @@ async fn embedded_food_consumption_preserves_timing_and_hunger_eligibility() {
         handle_use_item(
             &mut state,
             &mut wire,
+            None,
             GameMode::Survival,
             &mut survival,
             pose,
@@ -135,6 +136,7 @@ async fn ordinary_food_cannot_start_at_full_hunger() {
     handle_use_item(
         &mut state,
         &mut Vec::new(),
+        None,
         GameMode::Survival,
         &mut survival,
         PlayerPose::new(0.5, 64.0, 0.5),
@@ -222,6 +224,7 @@ async fn consumption_conserves_remainders_in_hand_inventory_and_overflow() {
         handle_use_item(
             &mut state,
             &mut wire,
+            None,
             GameMode::Survival,
             &mut survival,
             pose,

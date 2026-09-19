@@ -673,6 +673,9 @@ async fn spectator_ingress_keeps_no_physics_collision_semantics() {
     let mut pending_teleport = None;
     let mut movement = Box::pin(handle_accepted_absolute_movement(
         PlayerMovementIngressContext {
+            sessions: &registry,
+            session_id,
+            dimension: "minecraft:overworld",
             writer: &mut writer,
             compression: Compression::Disabled,
             interaction: Some(&mut world),
@@ -758,6 +761,9 @@ async fn authoritative_rejection_resyncs_client_without_advancing_local_pose() {
     let mut pending_teleport = None;
     let mut movement = Box::pin(handle_accepted_absolute_movement(
         PlayerMovementIngressContext {
+            sessions: &registry,
+            session_id,
+            dimension: "minecraft:overworld",
             writer: &mut writer,
             compression: Compression::Disabled,
             interaction,

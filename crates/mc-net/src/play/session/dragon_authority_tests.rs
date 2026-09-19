@@ -362,7 +362,8 @@ fn dragon_breath_cloud_pulses_every_five_ticks_reapplies_after_twenty_and_discar
                         kind: PlayerDamageKind::IndirectMagic,
                         amount,
                         ..
-                    }
+                    },
+                    ..
                 } if (amount - 6.0).abs() < f32::EPSILON
             )
     }));

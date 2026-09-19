@@ -1,46 +1,113 @@
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::process::Command;
+use std::sync::Arc;
+
+use mc_plugin_host::{
+    DeploymentConfig, DiscoveryMode, HostQueues, NoSessions, PluginLimits, discover,
+    start_deployment,
+};
+use mc_script::{
+    AdmittedScriptCommand, COMPONENT_PLUGIN_API_VERSION, ScriptEvent, ScriptEventKind,
+    ScriptPlayerContext, ScriptPlayerId, ScriptPluginManifest,
+};
 
 use super::player_query::{PlayerQueryAdapterError, PluginPlayerQueryAdapter};
 use crate::play::SessionRegistry;
 use crate::server::ScriptEventSink;
-use mc_script::{
-    AdmittedScriptCommand, LuaHostConfig, ScriptEvent, ScriptEventKind, start_lua_host,
-};
+
+fn hello_component_bytes() -> Vec<u8> {
+    static BYTES: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root");
+        let sdk = root.join("sdk/rust");
+        let status = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--manifest-path",
+                sdk.join("Cargo.toml")
+                    .to_str()
+                    .expect("utf-8 workspace path"),
+                "--target",
+                "wasm32-unknown-unknown",
+                "--release",
+                "-p",
+                "solaris-hello-plugin",
+            ])
+            .status()
+            .expect("guest build starts");
+        assert!(status.success(), "hello guest builds");
+        let module = std::fs::read(
+            sdk.join("target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm"),
+        )
+        .expect("guest module exists");
+        wit_component::ComponentEncoder::default()
+            .module(&module)
+            .expect("guest module carries component types")
+            .validate(true)
+            .encode()
+            .expect("guest module encodes as a component")
+    });
+    BYTES.clone()
+}
+
+fn deployment(root: &Path) -> Vec<mc_plugin_host::LoadedPackage> {
+    let package = root.join("who");
+    std::fs::create_dir_all(&package).expect("package directory");
+    std::fs::write(
+        package.join("plugin.toml"),
+        "id = \"who\"\nname = \"Who\"\nversion = \"0.1.0\"\napi = \"0.7.0\"\nevents = [\"player.joined\"]\ncapabilities = [\"player_queries\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(package.join("config.toml"), "mode = \"players\"\n").expect("config");
+    std::fs::write(package.join("plugin.wasm"), hello_component_bytes())
+        .expect("component artifact");
+    discover(
+        &DeploymentConfig {
+            root: root.to_path_buf(),
+            mode: DiscoveryMode::Strict,
+            expected: vec!["who".to_owned()],
+            grants: BTreeMap::new(),
+            require_grants: false,
+            precommit_hooks: Vec::new(),
+        },
+        &PluginLimits::default(),
+    )
+    .expect("strict component deployment discovers")
+    .into_packages()
+}
 
 async fn admitted_query() -> AdmittedScriptCommand {
-    let plugins = tempfile::tempdir().unwrap();
-    let plugin = plugins.path().join("who");
-    std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(
-        plugin.join("plugin.toml"),
-        r#"id = "who"
-name = "Who test"
-version = "0.1.0"
-api = "0.6.0"
-events = ["server.started"]
-capabilities = ["player_queries"]
-"#,
+    let plugins = tempfile::tempdir().expect("temporary deployment root");
+    let host = start_deployment(
+        deployment(plugins.path()),
+        PluginLimits::default(),
+        HostQueues::default(),
+        Arc::new(NoSessions),
     )
-    .unwrap();
-    std::fs::write(
-        plugin.join("main.lua"),
-        r#"function on_server_started(_event)
-    solaris.list_online_players("who-now", 8)
-end
-"#,
-    )
-    .unwrap();
-    let (boundary, host) = start_lua_host(LuaHostConfig::new(plugins.path())).unwrap();
+    .expect("component host starts");
+    let boundary = host.boundary().clone();
     boundary
-        .try_enqueue_event(ScriptEvent::server_started())
-        .unwrap();
-    let command = boundary.recv_command().await.unwrap();
-    let admitted = boundary.accept_host_command(command).unwrap();
-    drop(boundary);
-    tokio::task::spawn_blocking(move || host.join())
-        .await
-        .unwrap()
-        .unwrap();
+        .try_enqueue_event(ScriptEvent::player_joined_with_context(
+            ScriptPlayerId::new(7),
+            ScriptPlayerContext::try_new(
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "Ada",
+                false,
+                0.0,
+                64.0,
+                0.0,
+            )
+            .expect("context"),
+        ))
+        .expect("join event queues");
+    let admitted = boundary
+        .accept_host_command(boundary.recv_command().await.expect("query command"))
+        .expect("component query is admitted");
+    host.stop();
     admitted
 }
 
@@ -51,6 +118,14 @@ async fn player_query_adapter_publishes_authoritative_targeted_snapshot() {
         NonZeroUsize::new(4).unwrap(),
         NonZeroUsize::new(1).unwrap(),
     );
+    let manifest = ScriptPluginManifest::new("who", "Who", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+        .declare_capability("player_queries")
+        .expect("known component capability")
+        .validate()
+        .expect("component manifest validates");
+    events
+        .register_plugin_routes(&manifest)
+        .expect("component route registers");
     let adapter = PluginPlayerQueryAdapter::new(ScriptEventSink::new(boundary));
     assert_eq!(
         adapter
@@ -61,7 +136,7 @@ async fn player_query_adapter_publishes_authoritative_targeted_snapshot() {
     assert!(matches!(
         events.recv_event().await.unwrap().kind(),
         ScriptEventKind::OnlinePlayersResult { request_id, players, truncated }
-            if request_id == "who-now"
+            if request_id == "who"
                 && players.is_empty()
                 && !truncated
     ));

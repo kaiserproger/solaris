@@ -18,15 +18,12 @@
 use std::path::{Path, PathBuf};
 
 use mc_plugin_host::{
-    HostError, HostServices, LoadedPackage, LogLevel, PluginInstance, PluginLimits, engine, linker,
-    load_package, package::compile_package,
+    HostError, HostServices, LoadedPackage, LogLevel, PluginInstance, PluginLimits, PluginStartup,
+    engine, linker, load_package, package::compile_package,
 };
 use wit_component::{ComponentEncoder, StringEncoding, dummy_module, embed_component_metadata};
 use wit_parser::{ManglingAndAbi, Resolve, WorldId};
 
-// This binary builds no SDK guest: it needs the contract's WIT and the shared
-// repository root, so the fixture builder it never calls may stay unused here.
-#[allow(dead_code)]
 mod fixture;
 
 /// The services a case's instance is given.
@@ -196,14 +193,14 @@ fn a_component_of_the_contract_is_admitted_and_its_fault_is_reported_as_a_guest_
     let compiled = compile_package(&engine, &package, &limits).expect("the bytes compile");
     let linker = linker::<Services>(&engine).expect("linker");
 
-    let mut instance = PluginInstance::instantiate(&linker, compiled.component(), Services, limits)
+    let mut startup = PluginStartup::instantiate(&linker, compiled.component(), Services, limits)
         .expect("a component of the contract is admitted");
 
     // Every exported body of the dummy module is `unreachable`, so the guest
     // faults in its first callback. That is a guest's fault and not the package's:
-    // admitting the component was correct, and the fault costs the instance, not
-    // the host.
-    let error = instance
+    // admitting the component was correct, and the fault costs the startup store,
+    // which the host drops either way.
+    let error = startup
         .configure("")
         .expect_err("the dummy module's only body is `unreachable`");
     assert!(
@@ -214,9 +211,9 @@ fn a_component_of_the_contract_is_admitted_and_its_fault_is_reported_as_a_guest_
         format!("{error}").contains("unreachable"),
         "the trap is the guest's own body: {error}"
     );
-    assert_eq!(
-        instance.retired_because().map(ToString::to_string),
-        Some(error.to_string()),
-        "the instance is retired for the fault it hit"
-    );
+    // A failed startup phase costs the store it ran in and nothing else: the
+    // runtime store of the same component is still admitted, because the two
+    // phases never share one.
+    PluginInstance::instantiate(&linker, compiled.component(), Services, limits)
+        .expect("a failed startup phase does not poison the runtime store");
 }

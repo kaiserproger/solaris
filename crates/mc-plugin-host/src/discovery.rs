@@ -15,6 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use mc_script::precommit::{HookKind, HookRegistration};
+
 use crate::PluginLimits;
 use crate::package::{LoadedPackage, PackageError, load_package};
 
@@ -40,6 +42,17 @@ pub struct DeploymentConfig {
     /// Whether a capability without a grant fails the package. Strict production
     /// deployments set this; permissive ones may run without operator grants.
     pub require_grants: bool,
+    /// Operator pre-commit hook registrations, from `[[plugins.hooks]]`: which
+    /// package is asked which question, in which order, and what its failure
+    /// means.
+    ///
+    /// These are the operator's decision and are independent of what a package
+    /// declares: discovery refuses a registration no discovered package can serve
+    /// - an unknown plugin, a hook the package does not declare, a duplicate
+    ///   registration - in every mode, because a registration that silently did
+    ///   nothing would be an operator believing an effect is held back when it is
+    ///   not.
+    pub precommit_hooks: Vec<HookRegistration>,
 }
 
 /// One package that was discovered but not admitted, with the reason.
@@ -109,6 +122,23 @@ pub enum DiscoveryError {
     /// A requested capability has no operator grant.
     #[error("plugin {id:?} requests capability {capability:?}, which is not granted")]
     Ungranted { id: String, capability: String },
+    /// The operator's hook roster is malformed.
+    #[error("the hook roster is malformed: {message}")]
+    HookRoster { message: String },
+    /// A registration names a package this deployment does not run.
+    ///
+    /// It covers both an id no package declares and a package permissive
+    /// discovery skipped: an operator who configured a hook for a package expects
+    /// that package to be asked, so a deployment that cannot run it fails instead
+    /// of dropping the registration.
+    #[error("hook registration names plugin {id:?}, which this deployment does not run")]
+    HookPluginUnavailable { id: String },
+    /// A registration names a hook the package never declared.
+    #[error("plugin {id:?} is registered for {kind}, which its manifest does not declare")]
+    UndeclaredHook { id: String, kind: HookKind },
+    /// One package is registered twice for one hook.
+    #[error("plugin {id:?} is registered twice for {kind}")]
+    DuplicateHook { id: String, kind: HookKind },
 }
 
 /// Read the deployment directory and answer the packages it will run.
@@ -195,12 +225,71 @@ pub fn discover(
     for package in &packages {
         check_grants(config, package)?;
     }
+    attach_precommit_hooks(config, &mut packages)?;
     packages.sort_by(|left, right| {
         left.manifest()
             .plugin_id()
             .cmp(right.manifest().plugin_id())
     });
     Ok(DiscoveredDeployment { packages, skipped })
+}
+
+/// Validate the operator's hook registrations and attach each to its package.
+///
+/// The roster belongs to the deployment rather than to a package: one registration
+/// is the operator's decision to ask one package one question, so it is attached to
+/// that package and the host publishes the attached lists as the boundary's one
+/// roster. Every rule here is checked in *both* modes, permissive included: a
+/// registration no discovered package can serve is an operator believing an effect
+/// is held back when it is not, which is exactly what must not pass silently. That
+/// covers a package permissive discovery skipped, because a registration for it was
+/// the operator asking for that package to run.
+fn attach_precommit_hooks(
+    config: &DeploymentConfig,
+    packages: &mut [LoadedPackage],
+) -> Result<(), DiscoveryError> {
+    if config.precommit_hooks.is_empty() {
+        return Ok(());
+    }
+    let mut attached: BTreeMap<String, Vec<HookRegistration>> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for registration in &config.precommit_hooks {
+        let id = registration.plugin_id();
+        if id.is_empty() {
+            return Err(DiscoveryError::HookRoster {
+                message: "a hook registration names no plugin".to_owned(),
+            });
+        }
+        if !seen.insert((id, registration.kind())) {
+            return Err(DiscoveryError::DuplicateHook {
+                id: id.to_owned(),
+                kind: registration.kind(),
+            });
+        }
+        let Some(package) = packages
+            .iter()
+            .find(|package| package.manifest().plugin_id() == id)
+        else {
+            return Err(DiscoveryError::HookPluginUnavailable { id: id.to_owned() });
+        };
+        if !package.declares_hook(registration.kind()) {
+            return Err(DiscoveryError::UndeclaredHook {
+                id: id.to_owned(),
+                kind: registration.kind(),
+            });
+        }
+        attached
+            .entry(id.to_owned())
+            .or_default()
+            .push(registration.clone());
+    }
+    for package in packages {
+        let id = package.manifest().plugin_id().to_owned();
+        let mut registrations = attached.remove(&id).unwrap_or_default();
+        registrations.sort_by(mc_script::precommit::by_roster_order);
+        package.attach_precommit_registrations(registrations);
+    }
+    Ok(())
 }
 
 /// The capabilities one package may use: the ones it requests, all of which the

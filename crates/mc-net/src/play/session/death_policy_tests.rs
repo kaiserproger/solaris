@@ -61,6 +61,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
         let mut dead = before.survival;
         dead.apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
         let plan = PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival: before.survival,
             updated_survival: dead,
             expected_inventory: before.inventory.clone(),
@@ -144,6 +145,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
             .collect::<Vec<_>>();
         snapshots_before_duplicate.sort_unstable_by_key(|snapshot| snapshot.id);
         let duplicate_plan = PlayerSurvivalPlan {
+            hook_approval: None,
             expected_survival: after.survival,
             updated_survival: after.survival,
             expected_inventory: after.inventory.clone(),
@@ -201,6 +203,7 @@ fn stale_keep_inventory_death_plan_rejects_without_side_effects() {
             &SimulationAuthority::for_test(),
             session,
             &PlayerSurvivalPlan {
+                hook_approval: None,
                 expected_survival: before.survival,
                 updated_survival: dead,
                 expected_inventory: before.inventory.clone(),

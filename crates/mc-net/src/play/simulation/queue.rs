@@ -29,12 +29,14 @@ pub(super) const SIMULATION_OWNER_HEALTHY: u8 = 0;
 pub(super) const SIMULATION_OWNER_SHUTTING_DOWN: u8 = 1;
 pub(super) const SIMULATION_OWNER_STOPPED: u8 = 2;
 
+pub(in crate::play) type SimulationResponseSender = oneshot::Sender<SimulationOutcome>;
+
 #[derive(Debug)]
 pub(super) struct SimulationCommandEnvelope {
     pub(super) sequence: u64,
     pub(super) command: SimulationCommand,
     pub(super) session_fence: Option<SessionId>,
-    response: Option<oneshot::Sender<SimulationOutcome>>,
+    pub(super) response: Option<SimulationResponseSender>,
 }
 
 impl SimulationCommandEnvelope {
@@ -46,6 +48,13 @@ impl SimulationCommandEnvelope {
 
     pub(super) fn is_detached(&self) -> bool {
         self.response.is_none()
+    }
+
+    /// Transfer an existing request's response to a detached continuation.  The
+    /// continuation must either enqueue it or answer it with its admission
+    /// failure; leaving a caller without a terminal response is forbidden.
+    pub(super) fn take_response(&mut self) -> Option<SimulationResponseSender> {
+        self.response.take()
     }
 
     pub(super) fn respond(mut self, outcome: SimulationOutcome) {
@@ -340,6 +349,7 @@ impl SimulationHandle {
             sender: self.sender.clone(),
             metrics: Arc::clone(&self.metrics),
             session_fence: Some(session_id),
+            precommit_boundary: Arc::clone(&self.precommit_boundary),
         }
     }
 
@@ -513,6 +523,37 @@ impl SimulationHandle {
             response: None,
         });
         Ok(())
+    }
+
+    /// Re-enqueue a precommit continuation while preserving the original
+    /// request's response channel.  Admission failure is terminal and is sent to
+    /// that caller directly; the approval remains owned by `command` until this
+    /// bounded admission finishes.
+    pub(super) async fn enqueue_precommit_resume_wait(
+        &self,
+        session_fence: Option<SessionId>,
+        command: SimulationCommand,
+        response: Option<SimulationResponseSender>,
+    ) {
+        let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
+        match self.reserve_with_deadline().await {
+            Ok(permit) => {
+                self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
+                let depth = self.metrics.depth.fetch_add(1, Ordering::Relaxed) + 1;
+                self.metrics.record_depth(depth);
+                permit.send(SimulationCommandEnvelope {
+                    sequence,
+                    command,
+                    session_fence,
+                    response,
+                });
+            }
+            Err(error) => {
+                if let Some(response) = response {
+                    let _ = response.send(Err(error));
+                }
+            }
+        }
     }
 
     fn try_send(&self, envelope: SimulationCommandEnvelope) -> Result<(), SimulationRequestError> {
@@ -839,6 +880,7 @@ fn simulation_channel_with_capacity_and_explosion_seed(
             sender,
             metrics: Arc::clone(&metrics),
             session_fence: None,
+            precommit_boundary: Arc::new(std::sync::OnceLock::new()),
         },
         SimulationOwner {
             receiver,

@@ -23,8 +23,8 @@ use mc_entity::{
 };
 use mc_script::{
     MAX_RESIDENT_CARRY_SLOTS, MAX_RESIDENT_EQUIPMENT_SLOTS, MAX_SCRIPT_WORLD_TIME,
-    ScriptHostileCategory, ScriptItemChange, ScriptResidentOrder, ScriptResidentWorkOrder,
-    ScriptWorkState,
+    ScriptAxisAlignedZone, ScriptHostileCategory, ScriptInventoryEndpoint, ScriptItemChange,
+    ScriptResidentOrder, ScriptResidentWorkOrder, ScriptWorkPauseReason, ScriptWorkState,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +32,8 @@ use uuid::Uuid;
 
 use super::{PluginStorage, PluginStorageMutationError, PluginStorageStartError};
 
+/// Side length of one active resident-work routing region in blocks.
+pub(super) const RESIDENT_WORK_REGION_BLOCKS: i32 = 8 * 16;
 /// Bounded number of live server-issued target references one plugin may hold.
 pub(super) const MAX_RESIDENT_TARGET_REFS: usize = 64;
 /// Bounded number of durable group admissions kept for replay.
@@ -467,6 +469,11 @@ impl DurableResidentOrderChange {
 #[derive(Debug, Default)]
 pub(super) struct ResidentOrderLedger {
     records: BTreeMap<String, DurableResidentOrderRecord>,
+    /// Paused world work by active 8×8-chunk region. This is an event index,
+    /// never a settlement-wide scheduler scan.
+    paused_by_region: BTreeMap<(String, i32, i32), BTreeSet<String>>,
+    /// Paused haul assignments blocked on an exact warehouse destination.
+    paused_haul_by_warehouse: BTreeMap<ScriptInventoryEndpoint, BTreeSet<String>>,
     admissions: BTreeMap<u64, DurableAdmission>,
     references: BTreeMap<(String, String), DurableTargetRef>,
 }
@@ -505,6 +512,114 @@ impl ResidentOrderLedger {
         claims
     }
 
+    /// Paused assignments whose bounded world target overlaps one changed
+    /// chunk. The index makes a world wake proportional to active work in that
+    /// region, not to all residents or containers.
+    pub(super) fn paused_records_for_chunks(
+        &self,
+        dimension: &str,
+        chunks: &[[i32; 2]],
+    ) -> Vec<DurableResidentOrderRecord> {
+        let mut handles = BTreeSet::new();
+        for [chunk_x, chunk_z] in chunks {
+            let region_x = (chunk_x * 16).div_euclid(RESIDENT_WORK_REGION_BLOCKS);
+            let region_z = (chunk_z * 16).div_euclid(RESIDENT_WORK_REGION_BLOCKS);
+            if let Some(indexed) =
+                self.paused_by_region
+                    .get(&(dimension.to_owned(), region_x, region_z))
+            {
+                handles.extend(indexed.iter().cloned());
+            }
+        }
+        handles
+            .into_iter()
+            .filter_map(|handle| self.records.get(&handle))
+            .filter(|record| {
+                record.work.as_ref().is_some_and(|work| {
+                    work.state == ScriptWorkState::Paused
+                        && matches!(
+                            work.reason,
+                            Some(
+                                ScriptWorkPauseReason::Unloaded
+                                    | ScriptWorkPauseReason::MissingStation
+                                    | ScriptWorkPauseReason::Protected
+                                    | ScriptWorkPauseReason::BlockedRoute
+                            )
+                        )
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A successful protection-definition mutation wakes only paused work
+    /// regions that geometrically overlap its old or new zone, never a tick
+    /// scan of settlements or containers.
+    pub(super) fn paused_records_for_zone(
+        &self,
+        zone: &ScriptAxisAlignedZone,
+    ) -> Vec<DurableResidentOrderRecord> {
+        let minimum = zone.minimum();
+        let maximum = zone.maximum();
+        let handles = self
+            .paused_by_region
+            .iter()
+            .filter(|((dimension, region_x, region_z), _)| {
+                dimension == zone.dimension()
+                    && f64::from(*region_x * RESIDENT_WORK_REGION_BLOCKS) <= maximum.x()
+                    && f64::from((*region_x + 1) * RESIDENT_WORK_REGION_BLOCKS - 1) >= minimum.x()
+                    && f64::from(*region_z * RESIDENT_WORK_REGION_BLOCKS) <= maximum.z()
+                    && f64::from((*region_z + 1) * RESIDENT_WORK_REGION_BLOCKS - 1) >= minimum.z()
+            })
+            .flat_map(|(_, handles)| handles.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| self.records.get(&handle))
+            .filter(|record| {
+                record.work.as_ref().is_some_and(|work| {
+                    work.state == ScriptWorkState::Paused
+                        && work.reason == Some(ScriptWorkPauseReason::Protected)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Paused assignments affected by one accepted inventory transfer. The
+    /// transfer names resident endpoints directly and warehouse waits use the
+    /// durable exact-destination index; neither path scans the ledger.
+    pub(super) fn paused_records_for_inventory_change(
+        &self,
+        resident_handles: &[String],
+        endpoints: &[ScriptInventoryEndpoint],
+    ) -> Vec<DurableResidentOrderRecord> {
+        let mut handles = resident_handles.iter().cloned().collect::<BTreeSet<_>>();
+        for endpoint in endpoints {
+            if let Some(indexed) = self.paused_haul_by_warehouse.get(endpoint) {
+                handles.extend(indexed.iter().cloned());
+            }
+        }
+        handles
+            .into_iter()
+            .filter_map(|handle| self.records.get(&handle))
+            .filter(|record| {
+                record.work.as_ref().is_some_and(|work| {
+                    work.state == ScriptWorkState::Paused
+                        && matches!(
+                            work.reason,
+                            Some(
+                                ScriptWorkPauseReason::MissingTool
+                                    | ScriptWorkPauseReason::MissingInput
+                                    | ScriptWorkPauseReason::NoStorage
+                            )
+                        )
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Committed admissions whose members still owe an engine-goal application.
     pub(super) fn pending_admissions(&self) -> Vec<(u64, Vec<String>)> {
         self.admissions
@@ -517,6 +632,8 @@ impl ResidentOrderLedger {
 
     pub(super) fn reset(&mut self) {
         self.records.clear();
+        self.paused_by_region.clear();
+        self.paused_haul_by_warehouse.clear();
         self.admissions.clear();
         self.references.clear();
     }
@@ -558,8 +675,12 @@ impl ResidentOrderLedger {
                     // rollback of a newer accepted order.
                     return Ok(());
                 }
-                self.records
-                    .insert(record.handle.clone(), (**record).clone());
+                if let Some(existing) = self.records.get(&record.handle).cloned() {
+                    self.unindex_paused_work(&existing);
+                }
+                let record = (**record).clone();
+                self.index_paused_work(&record);
+                self.records.insert(record.handle.clone(), record);
             }
             DurableResidentOrderChange::Admission { admission } => {
                 if !admission.committed {
@@ -629,6 +750,95 @@ impl ResidentOrderLedger {
         }
         Ok(())
     }
+    fn index_paused_work(&mut self, record: &DurableResidentOrderRecord) {
+        for (dimension, x, z) in paused_work_regions(record) {
+            self.paused_by_region
+                .entry((dimension, x, z))
+                .or_default()
+                .insert(record.handle.clone());
+        }
+        if let Some(destination) = paused_haul_warehouse(record) {
+            self.paused_haul_by_warehouse
+                .entry(destination)
+                .or_default()
+                .insert(record.handle.clone());
+        }
+    }
+
+    fn unindex_paused_work(&mut self, record: &DurableResidentOrderRecord) {
+        for (dimension, x, z) in paused_work_regions(record) {
+            let key = (dimension, x, z);
+            let remove = self.paused_by_region.get_mut(&key).is_some_and(|handles| {
+                handles.remove(&record.handle);
+                handles.is_empty()
+            });
+            if remove {
+                self.paused_by_region.remove(&key);
+            }
+        }
+        if let Some(destination) = paused_haul_warehouse(record) {
+            let remove = self
+                .paused_haul_by_warehouse
+                .get_mut(&destination)
+                .is_some_and(|handles| {
+                    handles.remove(&record.handle);
+                    handles.is_empty()
+                });
+            if remove {
+                self.paused_haul_by_warehouse.remove(&destination);
+            }
+        }
+    }
+}
+
+fn paused_haul_warehouse(record: &DurableResidentOrderRecord) -> Option<ScriptInventoryEndpoint> {
+    let work = record.work.as_ref()?;
+    if work.state != ScriptWorkState::Paused
+        || work.reason != Some(ScriptWorkPauseReason::NoStorage)
+    {
+        return None;
+    }
+    match &work.work {
+        ScriptResidentWorkOrder::Haul {
+            destination: destination @ ScriptInventoryEndpoint::Warehouse { .. },
+            ..
+        } => Some(destination.clone()),
+        _ => None,
+    }
+}
+
+fn paused_work_regions(record: &DurableResidentOrderRecord) -> Vec<(String, i32, i32)> {
+    let Some(work) = record
+        .work
+        .as_ref()
+        .filter(|work| work.state == ScriptWorkState::Paused)
+    else {
+        return Vec::new();
+    };
+    let area = match &work.work {
+        ScriptResidentWorkOrder::Harvest { area, .. }
+        | ScriptResidentWorkOrder::Replant { area, .. }
+        | ScriptResidentWorkOrder::CutTree { area, .. }
+        | ScriptResidentWorkOrder::Mine { area, .. }
+        | ScriptResidentWorkOrder::Fish { area, .. }
+        | ScriptResidentWorkOrder::TendLivestock { area, .. } => area,
+        ScriptResidentWorkOrder::Craft { station, .. } => station,
+        ScriptResidentWorkOrder::Haul { .. } | ScriptResidentWorkOrder::Construct { .. } => {
+            return Vec::new();
+        }
+        _ => return Vec::new(),
+    };
+    let min_x = area.min.x.div_euclid(RESIDENT_WORK_REGION_BLOCKS);
+    let max_x = area.max.x.div_euclid(RESIDENT_WORK_REGION_BLOCKS);
+    let min_z = area.min.z.div_euclid(RESIDENT_WORK_REGION_BLOCKS);
+    let max_z = area.max.z.div_euclid(RESIDENT_WORK_REGION_BLOCKS);
+    let mut regions = Vec::new();
+    for x in min_x..=max_x {
+        for z in min_z..=max_z {
+            regions.push((area.dimension.clone(), x, z));
+        }
+    }
+    regions
 }
 
 pub(super) fn decode_resident_order_change(

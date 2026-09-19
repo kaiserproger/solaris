@@ -1,0 +1,181 @@
+// The world observations the server's own gameplay owners already publish, in the
+// contract's own shape.
+//
+// Each record here is an immutable snapshot of something an owner already
+// committed: a block a player removed or placed, an item a player crafted or
+// picked up, an entity a player killed or interacted with, and a player death. A
+// guest reads them and answers with commands; it never observes a live world.
+//
+// The field set is the one the plugins that use these observations actually read
+// (`solaris-audit`, `solaris-essentials`), not a copy of every field the server's
+// own DTO carries. Two native fields are deliberately absent:
+//
+// - the entity's runtime id: it is an unversioned simulation identifier that the
+//   owner reuses, so a plugin must not be handed one to keep, compare or persist;
+//   the entity's type id is the stable, server-authored part of the observation.
+// - the game mode, craft source and interaction hand: no current consumer of these
+//   observations reads them, and a member is added here by the change that makes a
+//   consumer read one, not by a guess made before it.
+//
+// Nothing here carries authority. `session` is the connection the observation was
+// produced on, taken from the runtime player id the event was built with; it is
+// never a lookup of whatever connection the stable identity holds now, so a
+// session a reconnect has left behind is still named as it was when the
+// observation was built.
+interface world-events {
+    use types.{player-id, position, session-id};
+
+    /// One block coordinate, as the owner's own block grid names it.
+    ///
+    /// It is a coordinate, not an identifier: the server validates it against the
+    /// dimension's own bounds before the observation exists, and a plugin may
+    /// compare, order and report it.
+    record block-position {
+        x: s32,
+        y: s32,
+        z: s32,
+    }
+
+    /// One player removed one block. Published after the owner committed the
+    /// removal, so the block is gone in the world a later read would see.
+    ///
+    /// This is one of the contract's broadcast observations: every instance whose
+    /// manifest declares `player.block_broken` receives it, and the server's own
+    /// event budget bounds the batch it arrives in.
+    record player-block-broken {
+        /// The stable identity that removed the block, from the event's own
+        /// immutable context.
+        player: player-id,
+        /// The connection the removal was produced on.
+        session: session-id,
+        /// The dimension the block was in, as the server's own resource id.
+        dimension: string,
+        /// The block that was removed, as the server's own block id.
+        block: string,
+        /// Where the removed block was.
+        at: block-position,
+    }
+
+    /// One player placed one block. Published after the owner committed the
+    /// placement, so the block is there in the world a later read would see.
+    ///
+    /// This is one of the contract's broadcast observations: every instance whose
+    /// manifest declares `player.block_placed` receives it.
+    record player-block-placed {
+        /// The stable identity that placed the block, from the event's own
+        /// immutable context.
+        player: player-id,
+        /// The connection the placement was produced on.
+        session: session-id,
+        /// The dimension the block was placed in.
+        dimension: string,
+        /// The block that was placed, as the server's own block id.
+        block: string,
+        /// Where the block was placed.
+        at: block-position,
+    }
+
+    /// One player crafted one item stack. Published after the owner committed the
+    /// craft, so the inputs were consumed and the output exists exactly once.
+    ///
+    /// This is one of the contract's broadcast observations: every instance whose
+    /// manifest declares `player.item_crafted` receives it.
+    record player-item-crafted {
+        /// The stable identity that crafted, from the event's own immutable
+        /// context.
+        player: player-id,
+        /// The connection the craft was produced on.
+        session: session-id,
+        /// The dimension the crafting session was in.
+        dimension: string,
+        /// The item the craft produced, as the server's own item id.
+        item: string,
+        /// How many of that item the commit produced, as the owner counted them.
+        count: u64,
+        /// The actor's authoritative pose when the craft committed.
+        position: position,
+    }
+
+    /// One player picked one item stack up. Published after the owner committed
+    /// the credit, so the count is the part of the stack the player really
+    /// received: a partially absorbed stack reports the part that fit.
+    ///
+    /// This is one of the contract's broadcast observations: every instance whose
+    /// manifest declares `player.item_picked_up` receives it.
+    record player-item-picked-up {
+        /// The stable identity that picked the stack up, from the event's own
+        /// immutable context.
+        player: player-id,
+        /// The connection the pickup was produced on.
+        session: session-id,
+        /// The dimension the pickup happened in.
+        dimension: string,
+        /// The item the pickup credited, as the server's own item id.
+        item: string,
+        /// How many of that item the commit credited.
+        count: u64,
+        /// The actor's authoritative pose when the pickup committed.
+        position: position,
+    }
+
+    /// One player killed one entity. Published after the owner committed the
+    /// lethal damage, so the entity is dead in the world a later read would see.
+    ///
+    /// This is one of the contract's broadcast observations: every instance whose
+    /// manifest declares `player.entity_killed` receives it.
+    record player-entity-killed {
+        /// The stable identity that landed the lethal damage, from the event's own
+        /// immutable context.
+        player: player-id,
+        /// The connection the kill was produced on.
+        session: session-id,
+        /// The dimension the entity was in.
+        dimension: string,
+        /// The type of the entity that died, as the server's own entity type id.
+        entity-type: string,
+        /// The actor's authoritative pose when the lethal commit occurred.
+        position: position,
+    }
+
+    /// One player interacted with one entity. Published after the owner accepted
+    /// the interaction, which is not a promise about what the entity did with it.
+    ///
+    /// The entity's runtime id is not part of this observation on purpose: the
+    /// simulation reuses those ids, so a plugin must not be handed one to keep.
+    /// Two interactions with the same entity type at the same moment therefore look
+    /// alike here, exactly as they do to a consumer that reported them.
+    ///
+    /// This is one of the contract's broadcast observations: every instance whose
+    /// manifest declares `player.entity_interacted` receives it.
+    record player-entity-interacted {
+        /// The stable identity that interacted, from the event's own immutable
+        /// context.
+        player: player-id,
+        /// The connection the interaction was produced on.
+        session: session-id,
+        /// The dimension the entity was in.
+        dimension: string,
+        /// The type of the entity that was interacted with.
+        entity-type: string,
+        /// The actor's authoritative pose when the interaction committed.
+        position: position,
+    }
+
+    /// One player died. Published after the owner committed the death, so the pose
+    /// is the one the player died at and not a later respawn position.
+    ///
+    /// This is one of the contract's broadcast observations: every instance whose
+    /// manifest declares `player.died` receives it. `session` is the connection
+    /// that was alive when the death committed; a respawn, which the server
+    /// publishes as no observation of this contract, opens a new one.
+    record player-died {
+        /// The stable identity that died, from the event's own immutable context.
+        player: player-id,
+        /// The connection the death was produced on.
+        session: session-id,
+        /// The dimension the player died in.
+        dimension: string,
+        /// Where the player died.
+        position: position,
+    }
+}

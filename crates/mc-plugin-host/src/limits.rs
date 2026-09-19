@@ -1,10 +1,10 @@
 //! Every bound one plugin instance runs under.
 //!
-//! The numbers are Wasmtime's units, not Luau's: fuel counts guest
-//! instructions, the epoch deadline is a wall-clock watchdog owned by a thread
-//! other than the one running the guest, and memory is enforced per linear
-//! memory by the store limiter. They are set before instantiation because a
-//! component can run guest code while it is being initialized.
+//! The numbers are Wasmtime's units: fuel counts guest instructions, the epoch
+//! deadline is a wall-clock watchdog owned by a thread other than the one
+//! running the guest, and memory is enforced per linear memory by the store
+//! limiter. They are set before instantiation because a component can run guest
+//! code while it is being initialized.
 //!
 //! The defaults below are deliberately conservative starting points, not
 //! measured budgets: the plan requires calibrating them against the baseline and
@@ -39,6 +39,12 @@ pub struct PluginLimits {
     /// a 64 MiB guest asked the host for gigabytes of `String`s in one call
     /// before this bound existed.
     pub hostcall_bytes: usize,
+    /// Maximum guest linear-memory capacity held by the live and candidate
+    /// deployment together during a reload. The host calculates this from every
+    /// store's `memories * guest_memory_bytes` bound before it compiles or starts
+    /// the candidate, so an oversized replacement cannot pressure out the live
+    /// generation.
+    pub reload_candidate_memory_bytes: usize,
     /// Bytes one linear memory may reach. Applied to each memory separately, so
     /// a component that declares several memories gets this bound each.
     pub guest_memory_bytes: usize,
@@ -89,6 +95,10 @@ impl Default for PluginLimits {
             // against the ported packages (P7) may lower it; nothing may raise it
             // back toward the default.
             hostcall_bytes: 8 * 1024 * 1024,
+            // Four default packages can coexist with their replacements:
+            // 2 generations × 4 packages × 4 memories × 64 MiB = 2 GiB.
+            // P7 replaces this provisional static bound with measured packages.
+            reload_candidate_memory_bytes: 2 * 1024 * 1024 * 1024,
             guest_memory_bytes: 64 * 1024 * 1024,
             table_elements: 100_000,
             instances: 4,

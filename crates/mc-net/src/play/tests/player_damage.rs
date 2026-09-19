@@ -14,8 +14,8 @@ use super::super::combat::{
 use super::super::inventory::PlayerInventory;
 use super::super::persistence::XpState;
 use super::super::player_damage_adapter::{
-    PlayerDamageApplication, apply_contact_block_damage, apply_player_damage,
-    apply_player_damage_publication, player_melee_knockback,
+    PlayerDamageApplication, apply_contact_block_damage, apply_player_damage_publication,
+    apply_unhooked_player_damage_for_test, player_melee_knockback,
 };
 use super::super::survival::SurvivalState;
 use super::super::{
@@ -50,8 +50,13 @@ async fn lit_campfire_contact_damage_uses_survival_death_path() {
     let (simulation_stop, simulation_task) =
         start_survival_test_owner(&mut state, "CampfireDeath", survival_state, &xp_state);
     let mut writer = Vec::new();
+    let sessions = state.sessions.clone();
+    let session_id = state.session_id;
 
     apply_contact_block_damage(
+        sessions.as_ref(),
+        session_id,
+        "minecraft:overworld",
         Some(&mut state),
         &mut writer,
         Compression::Disabled,
@@ -85,7 +90,12 @@ async fn committed_campfire_death_survives_client_write_failure() {
     let (mut writer, reader) = tokio::io::duplex(64);
     drop(reader);
 
+    let sessions = state.sessions.clone();
+    let session_id = state.session_id;
     let result = apply_contact_block_damage(
+        sessions.as_ref(),
+        session_id,
+        "minecraft:overworld",
         Some(&mut state),
         &mut writer,
         Compression::Disabled,
@@ -126,7 +136,12 @@ async fn lit_campfire_contact_damage_uses_player_width_edge_overlap() {
         start_survival_test_owner(&mut state, "CampfireEdge", survival_state, &xp_state);
     let mut writer = Vec::new();
 
+    let sessions = state.sessions.clone();
+    let session_id = state.session_id;
     apply_contact_block_damage(
+        sessions.as_ref(),
+        session_id,
+        "minecraft:overworld",
         Some(&mut state),
         &mut writer,
         Compression::Disabled,
@@ -163,7 +178,7 @@ async fn pushed_hostile_damage_shield_block_writes_break_clear_slot_update() {
         start_survival_test_owner(&mut state, "HostileShield", survival_state, &xp_state);
     let mut writer = Vec::new();
 
-    let damage_applied = apply_player_damage(
+    let damage_applied = apply_unhooked_player_damage_for_test(
         Some(&mut state),
         &mut writer,
         Compression::Disabled,
@@ -213,7 +228,7 @@ async fn pushed_hostile_damage_uses_equipped_iron_chestplate_and_damages_armor()
         start_survival_test_owner(&mut state, "HostileArmor", survival_state, &xp_state);
     let mut writer = Vec::new();
 
-    let damage_applied = apply_player_damage(
+    let damage_applied = apply_unhooked_player_damage_for_test(
         Some(&mut state),
         &mut writer,
         Compression::Disabled,

@@ -1,17 +1,19 @@
 //! The startup contribution of a component deployment.
 //!
-//! `configure` is the only phase that answers a rule plan, and the plan is what a
-//! world opens against: its fingerprint is persisted in the world contract and
-//! compared on every reopen. These cases fix that contract from the component
-//! side - the conversion a component's `rule-plan` takes into the startup rules,
-//! the refusals that keep an unmaterializable plan out of a world, and what a
-//! started deployment reports about the packages' answers.
+//! `configure` is the only phase that answers a startup contribution, and the
+//! rules it resolves to are what a world opens against: their fingerprint is
+//! persisted in the world contract and compared on every reopen. These cases fix
+//! that contract from the component side - the conversion a component's
+//! `startup-contribution` takes into the startup rules, the refusals that keep an
+//! unmaterializable contribution out of a world, and what a started deployment
+//! reports about the packages' answers.
 //!
 //! The component-path cases run the real fixture: a real Rust plugin compiled to
 //! `wasm32-unknown-unknown` and encoded as a component by `wit-component`, whose
-//! `mode = "nested"` answers a real `rule-plan`. The fixture's plan is a set of
-//! tree declarations, so the bounds it can drive are the tree ones; the direct
-//! cases below cover the rest of the contract's shape, which no config can reach.
+//! `mode = "nested"` answers a real `startup-contribution`. The fixture's
+//! contribution is a set of tree declarations, so the bounds it can drive are the
+//! tree ones; the direct cases below cover the rest of the contract's shape, which
+//! no config can reach.
 
 mod fixture;
 
@@ -21,20 +23,21 @@ use std::sync::Arc;
 
 use fixture::component_bytes;
 use mc_plugin_host::bindings::exports::solaris::plugin::lifecycle::{
-    ClayRules, PlacementRules, RulePlan, SpawnEntry as PlanSpawnEntry, SpawnGroup, SpawnRules,
-    TreeRules,
+    ClayRules, PlacementRules, SpawnEntry as ContributionEntry, SpawnGroup, SpawnRules,
+    StartupContribution, TreeRules,
 };
 use mc_plugin_host::{
-    ContributionOutcome, DeploymentConfig, DiscoveryMode, FieldOverflow, HostQueues, NoSessions,
-    PluginLimits, RulePlanRefusal, check_deployment, convert_rule_plan, start_deployment,
+    ContributionOutcome, ContributionRefusal, DeploymentConfig, DiscoveryMode, FieldOverflow,
+    HostQueues, NoSessions, PluginLimits, check_deployment, convert_startup_contribution,
+    start_deployment,
 };
 use mc_script::{
     BiomeSpawns, ClayRule, GameplayRules, GameplayRulesError, SpawnEntry, SpawnPlacement, TreeRule,
 };
 
-/// A component that declares no plan at all: every category absent.
-fn no_categories() -> RulePlan {
-    RulePlan {
+/// A component that declares no contribution at all: every category absent.
+fn no_categories() -> StartupContribution {
+    StartupContribution {
         placement: None,
         trees: None,
         clay: None,
@@ -42,9 +45,9 @@ fn no_categories() -> RulePlan {
     }
 }
 
-/// A plan whose only category is one tree declaration over one biome.
-fn one_tree(spacing: u32) -> RulePlan {
-    RulePlan {
+/// A contribution whose only category is one tree declaration over one biome.
+fn one_tree(spacing: u32) -> StartupContribution {
+    StartupContribution {
         placement: None,
         trees: Some(vec![TreeRules {
             biomes: vec!["minecraft:plains".to_owned()],
@@ -57,13 +60,11 @@ fn one_tree(spacing: u32) -> RulePlan {
 }
 
 #[test]
-fn the_same_effective_rules_fingerprint_the_same_whichever_runtime_declared_them() {
-    // The world compatibility invariant. `contract_name` is persisted in
-    // `PersistedWorldContract.gameplay_rules` and compared on every reopen, so a
-    // component deployment and a `rules.lua` deployment that resolve to the same
-    // rules must produce the same string - otherwise migrating a world between
-    // runtimes would look like a worldgen change.
-    let plan = RulePlan {
+fn component_rules_fingerprint_matches_its_independent_construction() {
+    // `contract_name` is persisted in `PersistedWorldContract.gameplay_rules`
+    // and compared on every reopen, so conversion and independent construction
+    // must produce the same component contract fingerprint.
+    let plan = StartupContribution {
         placement: Some(PlacementRules {
             land_spacing: 2,
             water_attempts: 8,
@@ -85,7 +86,7 @@ fn the_same_effective_rules_fingerprint_the_same_whichever_runtime_declared_them
             groups: vec![
                 SpawnGroup {
                     group: "creature".to_owned(),
-                    entries: vec![PlanSpawnEntry {
+                    entries: vec![ContributionEntry {
                         entity: "minecraft:cow".to_owned(),
                         min: 2,
                         max: 4,
@@ -94,7 +95,7 @@ fn the_same_effective_rules_fingerprint_the_same_whichever_runtime_declared_them
                 },
                 SpawnGroup {
                     group: "monster".to_owned(),
-                    entries: vec![PlanSpawnEntry {
+                    entries: vec![ContributionEntry {
                         entity: "minecraft:zombie".to_owned(),
                         min: 1,
                         max: 2,
@@ -104,8 +105,9 @@ fn the_same_effective_rules_fingerprint_the_same_whichever_runtime_declared_them
             ],
         }]),
     };
-    let from_component = convert_rule_plan(&plan).expect("a plan inside every bound is accepted");
-    let from_luau = GameplayRules::new(
+    let from_component =
+        convert_startup_contribution(&plan).expect("a plan inside every bound is accepted");
+    let independently_constructed = GameplayRules::new(
         vec![BiomeSpawns::new(
             "minecraft:plains",
             BTreeMap::from([
@@ -130,20 +132,22 @@ fn the_same_effective_rules_fingerprint_the_same_whichever_runtime_declared_them
     // Both sides are assembled by different code - one by the conversion, one by
     // the contract's own constructor - so equality is the conversion carrying
     // every field, not the two sides sharing a literal.
-    assert_eq!(from_component, from_luau);
+    assert_eq!(from_component, independently_constructed);
     assert_eq!(
         from_component.contract_name(),
-        from_luau.contract_name(),
-        "the fingerprint must not depend on which runtime declared the rules"
+        independently_constructed.contract_name(),
+        "the fingerprint must not depend on the construction path"
     );
     assert!(
-        from_component.contract_name().starts_with("luau-rules:"),
+        from_component
+            .contract_name()
+            .starts_with("component-rules:"),
         "the prefix is part of the persisted value: {}",
         from_component.contract_name()
     );
-    from_luau
+    independently_constructed
         .validate()
-        .expect("the same rules validate on the Luau path");
+        .expect("the independently constructed rules validate");
 }
 
 #[test]
@@ -158,7 +162,7 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
     // widening cannot overflow, and a guest cannot declare more than the WIT's
     // own `u32` allows, so the widest spacing a plan can carry is asserted below
     // to arrive exactly.
-    let clay_and_placement = |radius_min: u32, water_depth: u32| RulePlan {
+    let clay_and_placement = |radius_min: u32, water_depth: u32| StartupContribution {
         placement: Some(PlacementRules {
             land_spacing: 2,
             water_attempts: 8,
@@ -179,24 +183,25 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
     // A runtime that narrowed instead of refusing would materialize a plan no
     // package declared, and the world fingerprint would record it as if it had.
     assert_eq!(
-        convert_rule_plan(&clay_and_placement(3, 272))
+        convert_startup_contribution(&clay_and_placement(3, 272))
             .expect_err("272 does not fit the contract's u8, even though its low byte does"),
-        RulePlanRefusal::Overflow(FieldOverflow {
+        ContributionRefusal::Overflow(FieldOverflow {
             field: "placement-rules.water-depth",
             value: 272,
             max: u64::from(u8::MAX),
         })
     );
     assert_eq!(
-        convert_rule_plan(&clay_and_placement(300, 4))
+        convert_startup_contribution(&clay_and_placement(300, 4))
             .expect_err("300 does not fit the contract's u8"),
-        RulePlanRefusal::Overflow(FieldOverflow {
+        ContributionRefusal::Overflow(FieldOverflow {
             field: "clay-rules.radius-min",
             value: 300,
             max: u64::from(u8::MAX),
         })
     );
-    let accepted = convert_rule_plan(&clay_and_placement(3, 4)).expect("3 fits the contract's u8");
+    let accepted =
+        convert_startup_contribution(&clay_and_placement(3, 4)).expect("3 fits the contract's u8");
     assert_eq!(
         accepted.clay.expect("clay is declared").radius_min,
         3,
@@ -204,9 +209,9 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
     );
 
     assert_eq!(
-        convert_rule_plan(&clay_and_placement(3, 300))
+        convert_startup_contribution(&clay_and_placement(3, 300))
             .expect_err("a water depth of 300 does not fit the contract's u8"),
-        RulePlanRefusal::Overflow(FieldOverflow {
+        ContributionRefusal::Overflow(FieldOverflow {
             field: "placement-rules.water-depth",
             value: 300,
             max: u64::from(u8::MAX),
@@ -217,16 +222,16 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
     // A runtime that narrowed instead of refusing would materialize a plan no
     // package declared, and the world fingerprint would record it as if it had.
     assert_eq!(
-        convert_rule_plan(&clay_and_placement(3, 272))
+        convert_startup_contribution(&clay_and_placement(3, 272))
             .expect_err("272 does not fit the contract's u8, even though its low byte does"),
-        RulePlanRefusal::Overflow(FieldOverflow {
+        ContributionRefusal::Overflow(FieldOverflow {
             field: "placement-rules.water-depth",
             value: 272,
             max: u64::from(u8::MAX),
         })
     );
 
-    let widest = convert_rule_plan(&one_tree(u32::MAX))
+    let widest = convert_startup_contribution(&one_tree(u32::MAX))
         .expect("a u32 spacing is always inside the contract's u64");
     assert_eq!(
         widest.trees[0].spacing,
@@ -236,10 +241,10 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
 }
 
 #[test]
-fn a_plan_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_it() {
+fn a_contribution_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_it() {
     // Each refusal names the production check that produces it, so a component
-    // author and a `rules.lua` author read the same reason.
-    let declarations = |count: usize| RulePlan {
+    // author gets the same actionable reason for an invalid declaration.
+    let declarations = |count: usize| StartupContribution {
         placement: None,
         trees: Some(
             (0..count)
@@ -253,13 +258,14 @@ fn a_plan_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_i
         clay: None,
         spawning: None,
     };
-    convert_rule_plan(&declarations(64)).expect("64 tree declarations are the bound");
+    convert_startup_contribution(&declarations(64)).expect("64 tree declarations are the bound");
     assert_eq!(
-        convert_rule_plan(&declarations(65)).expect_err("65 declarations exceed the bound"),
-        RulePlanRefusal::Invalid(GameplayRulesError::TooManyDeclarations)
+        convert_startup_contribution(&declarations(65))
+            .expect_err("65 declarations exceed the bound"),
+        ContributionRefusal::Invalid(GameplayRulesError::TooManyDeclarations)
     );
 
-    let spawn_group = |group: &str, min: u32, max: u32| RulePlan {
+    let spawn_group = |group: &str, min: u32, max: u32| StartupContribution {
         placement: None,
         trees: None,
         clay: None,
@@ -267,7 +273,7 @@ fn a_plan_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_i
             biome: "minecraft:plains".to_owned(),
             groups: vec![SpawnGroup {
                 group: group.to_owned(),
-                entries: vec![PlanSpawnEntry {
+                entries: vec![ContributionEntry {
                     entity: "minecraft:cow".to_owned(),
                     min,
                     max,
@@ -276,25 +282,28 @@ fn a_plan_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_i
             }],
         }]),
     };
-    convert_rule_plan(&spawn_group("creature", 1, 4)).expect("a supported group is accepted");
+    convert_startup_contribution(&spawn_group("creature", 1, 4))
+        .expect("a supported group is accepted");
     assert_eq!(
-        convert_rule_plan(&spawn_group("boss", 1, 4)).expect_err("boss is not a spawn group"),
-        RulePlanRefusal::Invalid(GameplayRulesError::UnsupportedSpawnGroup)
+        convert_startup_contribution(&spawn_group("boss", 1, 4))
+            .expect_err("boss is not a spawn group"),
+        ContributionRefusal::Invalid(GameplayRulesError::UnsupportedSpawnGroup)
     );
     assert_eq!(
-        convert_rule_plan(&spawn_group("creature", 4, 1)).expect_err("min may not exceed max"),
-        RulePlanRefusal::Invalid(GameplayRulesError::InvalidSpawnEntry)
+        convert_startup_contribution(&spawn_group("creature", 4, 1))
+            .expect_err("min may not exceed max"),
+        ContributionRefusal::Invalid(GameplayRulesError::InvalidSpawnEntry)
     );
 
     // A repeated group name has no second slot in the contract's map: keeping
     // either replacement would silently drop the other one the package asked for.
-    let duplicated = RulePlan {
+    let duplicated = StartupContribution {
         spawning: Some(vec![SpawnRules {
             biome: "minecraft:plains".to_owned(),
             groups: vec![
                 SpawnGroup {
                     group: "creature".to_owned(),
-                    entries: vec![PlanSpawnEntry {
+                    entries: vec![ContributionEntry {
                         entity: "minecraft:cow".to_owned(),
                         min: 1,
                         max: 4,
@@ -303,7 +312,7 @@ fn a_plan_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_i
                 },
                 SpawnGroup {
                     group: "creature".to_owned(),
-                    entries: vec![PlanSpawnEntry {
+                    entries: vec![ContributionEntry {
                         entity: "minecraft:sheep".to_owned(),
                         min: 1,
                         max: 2,
@@ -315,8 +324,9 @@ fn a_plan_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_i
         ..no_categories()
     };
     assert_eq!(
-        convert_rule_plan(&duplicated).expect_err("a group name declared twice is refused"),
-        RulePlanRefusal::DuplicateSpawnGroup {
+        convert_startup_contribution(&duplicated)
+            .expect_err("a group name declared twice is refused"),
+        ContributionRefusal::DuplicateSpawnGroup {
             biome: "minecraft:plains".to_owned(),
             group: "creature".to_owned(),
         }
@@ -324,22 +334,24 @@ fn a_plan_that_breaks_an_enforced_bound_is_refused_with_the_check_that_refuses_i
 }
 
 #[test]
-fn an_empty_plan_is_refused() {
-    // WIT's own comment on `rule-plan`: "the host rejects a plan that sets none".
+fn an_empty_contribution_is_refused() {
+    // WIT's own comment on `startup-contribution`: "the host rejects a
+    // contribution that sets none".
     assert_eq!(
-        convert_rule_plan(&no_categories()).expect_err("a plan with no category is refused"),
-        RulePlanRefusal::Invalid(GameplayRulesError::NoCategory)
+        convert_startup_contribution(&no_categories())
+            .expect_err("a plan with no category is refused"),
+        ContributionRefusal::Invalid(GameplayRulesError::NoCategory)
     );
     // An empty *list* is a set category that sets nothing, and `validate` refuses
     // it by the same check: `option<list<..>>` says whether the package set the
     // category, not whether the category ended up empty.
     assert_eq!(
-        convert_rule_plan(&RulePlan {
+        convert_startup_contribution(&StartupContribution {
             trees: Some(Vec::new()),
             ..no_categories()
         })
         .expect_err("an empty category list is still an empty plan"),
-        RulePlanRefusal::Invalid(GameplayRulesError::NoCategory)
+        ContributionRefusal::Invalid(GameplayRulesError::NoCategory)
     );
 }
 
@@ -365,17 +377,18 @@ fn deployment(root: &Path, expected: &[&str]) -> DeploymentConfig {
         expected: expected.iter().map(|id| (*id).to_owned()).collect(),
         grants: BTreeMap::new(),
         require_grants: false,
+        precommit_hooks: Vec::new(),
     }
 }
 
-/// The fixture's `nested` mode answers a rule plan: `count` tree declarations
-/// whose one biome is a name of `size` bytes repeated 64 times.
+/// The fixture's `nested` mode answers a startup contribution: `count` tree
+/// declarations whose one biome is a name of `size` bytes repeated 64 times.
 fn nested_plan(size: usize, count: usize) -> String {
     format!("mode = \"nested\"\nsize = {size}\ncount = {count}\n")
 }
 
 #[test]
-fn a_started_deployment_reports_a_refused_plan_and_an_absent_one_apart() {
+fn a_started_deployment_reports_a_refused_contribution_and_an_absent_one_apart() {
     let root = tempfile::tempdir().expect("deployment root");
     // One package answers no plan, which is ordinary; the other answers a plan
     // whose 64 biomes all share one name, which the startup contract refuses.
@@ -406,7 +419,7 @@ fn a_started_deployment_reports_a_refused_plan_and_an_absent_one_apart() {
     };
     assert_eq!(
         package("quiet").outcome(),
-        &ContributionOutcome::NoPlan,
+        &ContributionOutcome::NoContribution,
         "a package that declares nothing is not a refusal"
     );
     assert!(package("quiet").refusal().is_none());
@@ -416,7 +429,7 @@ fn a_started_deployment_reports_a_refused_plan_and_an_absent_one_apart() {
     );
     assert_eq!(
         package("noisy").refusal(),
-        Some(&RulePlanRefusal::Invalid(
+        Some(&ContributionRefusal::Invalid(
             GameplayRulesError::InvalidTreeBiome
         )),
         "the refusal names the check that produced it"
@@ -428,7 +441,7 @@ fn a_started_deployment_reports_a_refused_plan_and_an_absent_one_apart() {
             .map(|(id, refusal)| (id, refusal.clone())),
         Some((
             "noisy",
-            RulePlanRefusal::Invalid(GameplayRulesError::InvalidTreeBiome)
+            ContributionRefusal::Invalid(GameplayRulesError::InvalidTreeBiome)
         )),
         "a caller that fails startup closed reads the refusal and the package that caused it"
     );
@@ -464,4 +477,48 @@ fn a_check_refuses_the_same_plans_the_run_path_refuses() {
             "the check reports {check:?}, saw {message}"
         );
     }
+}
+
+#[test]
+fn a_check_reports_the_rules_the_run_path_materializes() {
+    // Both paths run the same two startup phases in the same two stores, so the
+    // rules a `--check` reports have to be the rules a started deployment records:
+    // a world opened after a green check must be the world the check verified.
+    let root = tempfile::tempdir().expect("deployment root");
+    write_package(root.path(), "planner", "mode = \"placement\"\n");
+    let limits = PluginLimits::default();
+    let configuration = deployment(root.path(), &["planner"]);
+
+    let report = check_deployment(&configuration, &limits).expect("the deployment checks");
+    let checked = report
+        .checked()
+        .first()
+        .expect("the check reports the one package");
+    let checked_rules = checked
+        .plan
+        .as_ref()
+        .expect("the fixture's own contribution validates");
+
+    let packages = mc_plugin_host::discover(&configuration, &limits)
+        .expect("the deployment discovery succeeds")
+        .into_packages();
+    let host = start_deployment(
+        packages,
+        limits,
+        HostQueues::default(),
+        Arc::new(NoSessions),
+    )
+    .expect("the deployment starts");
+    assert!(host.contribution().refusal().is_none());
+    let (id, rules) = host
+        .contribution()
+        .rules()
+        .next()
+        .expect("the run path records the contribution it ran configure for");
+    assert_eq!(id, "planner");
+    assert_eq!(
+        rules, checked_rules,
+        "the rules a check reports are the rules the run path records"
+    );
+    host.stop();
 }

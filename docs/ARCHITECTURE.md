@@ -123,51 +123,106 @@ work and isolation, not a hard real-time guarantee against OS or hardware stalls
 
 ## One addon contract, server and client
 
-The server plugin runtime is being migrated from strict Luau to WebAssembly
-components (Wasmtime) behind a versioned WIT contract (`solaris:plugin@0.7.0`,
-`crates/mc-script/wit`) with an out-of-tree Rust guest SDK (`sdk/rust/`) and one
-host crate (`crates/mc-plugin-host`). Luau is the *migration-only* path from here
-on: it stays until the WASM host covers the operations the shipped packages use,
-and is then deleted with its `lua-runtime` feature, `mlua` and `luaur`
-dependencies. Do not start new plugin-facing work on the Luau path, and do not
-run both paths in one production deployment. Isolation, budgets and the
-single admission boundary stay Solaris' own responsibility: the WASM sandbox
-replaces the VM, not the contract, the world owners, or the durability rules.
-Reuse the existing common Loader implementation with thin
-Fabric/NeoForge/Forge adapters; do not build a second independent client stack.
+The server runs Wasmtime components implementing the versioned WIT contract
+`solaris:plugin@0.7.0` (`crates/mc-script/wit`). `mc-plugin-host` owns component
+loading and bounded callbacks; `mc-script` remains the runtime-independent
+deployment metadata and admission boundary. Rust guest source and its SDK live
+in the out-of-tree `sdk/rust/` workspace. Guests are independently built and
+encoded into deployable component artifacts; production core does not compile
+guest source or require a sibling checkout.
+
+Each package carries `plugin.toml`, `plugin.wasm`, optional `config.toml`, and
+only the declared resources it needs. `[plugins]` selects the deployment root,
+strictness, expected package set, grants, and optional hook registrations; it
+does not select a guest runtime. Strict production deployment requires explicit
+operator grants for every capability a package requests. A package that does
+not validate fails closed before a world or listener exists.
+
+Component startup has two phases in two stores: `configure` runs once in a
+short-lived store with no runtime capability and may answer only a normalized
+startup contribution; `init` runs once in the component's runtime store and
+builds instance state from the same package configuration. State retained in
+`configure` cannot reach `init`. The component host validates
+`required_features`, `[client]` bundles, `[worldgen]`, and startup
+contributions before bind. The resulting effective plan determines the world
+identity; a component binary, compiler, or contract revision does not.
+Nothing between preparing a deployment and binding the listener may leave a
+world or socket behind: a manifest, artifact, startup, or world-contract
+failure stops the prepared deployment, and `--check` neither opens a world nor
+binds.
+
+Isolation, budgets, and the single admission boundary remain Solaris'
+responsibility: the component sandbox does not replace the contract, world
+owners, or durability rules. Reuse the existing common Loader implementation
+with thin Fabric/NeoForge/Forge adapters; do not build a second independent
+client stack.
 
 The common API uses owned values, opaque generation-checked handles, immutable
 observations, bounded requests, and typed completion/rejection. A plugin sees
 serial callbacks, not engine concurrency. World reads, mutations, queries,
 transactions, timers, and services follow the same naming and failure model.
 Capabilities authorize access; resource budgets constrain its cost. Neither
-client input nor an addon-provided identifier establishes authority.
+client input nor an addon-provided identifier establishes authority: the native
+owners fence every request on the exact live session, the owning plugin, the
+live instance and revision, and the actions the presented model enables.
+
+Component precommit decisions use the same bounded host-input queue, not a
+synchronous Store call from a simulation owner. Build and damage freeze an
+immutable context plus native state fences; the owner resumes through its
+bounded command queue. Approval is consumed once, under the commit locks and
+after state/session/permission revalidation. Producer-specific melee, dragon,
+projectile, explosion and golem continuations retain their existing native
+effects rather than replacing them with a second damage kernel. Programmatic
+callers retain their original reply until a deferred continuation actually owns
+it. Pending projectile impacts have native ownership so one collision cannot
+submit repeated decisions. Mandatory protection registration outlives a failed
+guest Store; the no-subscriber path does not wait for the guest.
 
 The API must cover world/content operations, entities and inventory, persistence
 and typed services, and Loader-backed input, screens/HUD, assets, audio,
 particles, and bounded rendering. Domain-specific economies, colonies, machines,
 and bosses belong in addons, not in special Rust entry points.
 
-Implemented UI follows one `present_client_ui` command through `ScriptBoundary`,
-one owned `ui` resource schema, and one `present_ui` permission. Screen, HUD and
-hidden modes share bounded title/body values and exact-session authorization.
-One Minecraft presenter owns modal views and the per-connection HUD set; thin
-adapters only register transport and HUD-layer hooks. HUD is currently bounded
-literal text, not general client scripting or an arbitrary layout engine.
+Implemented client presentation is a bounded set of typed requests - open,
+present and close a view, play and stop an owned sound, grant an owned block
+item - the component form of the Loader's existing view, sound and
+custom-block surface. The server supplies every view instance id and revision,
+a plugin only echoes a server-issued selection token inside a model, and a
+request becomes an effect only where the Loader content-and-permission pair,
+the live session and the native owners admit it. One Minecraft presenter owns
+modal views and the per-connection set of non-modal HUD instances: several
+owners' HUDs coexist, an update or a close names one exact instance and
+revision, and a HUD never opens, replaces or closes a modal. A modal's caption
+is the activated screen declaration's own title, and a view's initial model is
+the authoritative one its Open carried. Screens and widgets are declared
+schema-2 index data, not client scripting: a widgetless HUD renders nothing and
+hosts only its declared input bindings. Thin adapters only register transport,
+keyboard/focus hooks and HUD-layer registrations, and a disconnect or content
+change drops every modal, HUD instance, held binding and action sink, so a
+reconnect starts from no state and cannot replay an old edge.
 
-Implemented keyboard input extends the same owned `interactions` resource and
-`on_loader_interaction` event with trigger/press/release phases, under Loader
-wire protocol 3. Shared bounded held state and one native keyboard HEAD hook
-preserve vanilla input and release on focus loss; activation/logout fences
-bindings to the exact connection. This is fixed declared keyboard input, not
-rebinding, arbitrary client scripts, or the complete target API.
+Declared keyboard input belongs to the same activation: a schema-2 HUD screen
+may declare at most eight bindings, each a canonical native key name bound to
+owner-qualified press and release actions and admitted only with the views,
+view_actions, present_views and send_view_actions content and permissions. The
+client produces key edges at the HEAD and RETURN of the vanilla key-press path
+plus GUI, overlay, screen-change and window-focus producers. Presses that open
+or close a screen do not reach gameplay bindings. Declared F2/F11 edges may
+also reach plugins while preserving vanilla screenshot/fullscreen handling.
+Autorepeat is not an edge, and losing focus emits
+exactly one release per held binding. Every admitted edge carries the live
+instance, revision and increasing per-instance action sequence, and only
+actions the presented model enables are sent. Runtime input stays vanilla: this
+is fixed declared keyboard input, not rebinding, arbitrary client scripts, or
+the complete target API.
 
 Implemented audio uses the same verified asset pack: owned mono OGG Vorbis
-`sounds`, permission `play_sounds`, and one shared Minecraft playback owner.
-`play_client_sound`/`stop_client_sound` pass through `ScriptBoundary` and the
+`sounds`, permission `play_sounds`, and one shared Minecraft playback owner. The
+typed play and stop requests pass through `ScriptBoundary` and the
 exact-session ordered lane. Personal and fixed world-position one-shots use
 native volume, pitch and attenuation; disconnect clears playback. Adapters
-only transport commands. Loops, moving sources and particles are not implemented.
+transport commands only. Loops, moving sources and particles are not
+implemented.
 
 Server-only addons retain vanilla-client support. Client features require the
 actual negotiated capabilities; no invisible fake substitute counts as support.

@@ -20,9 +20,9 @@ use crate::play::{
     LoggedInProfile, OutboundCommand, PlayerDamageApplication, PlayerDamageKind,
     PlayerDamageRequest, PlayerHurtResistance, PlayerHurtResolution, PlayerPersistedState,
     PlayerPose, SHIELD_ACTIVATION_DELAY_TICKS, SHIELD_FALLBACK_MAX_DAMAGE, SurvivalState, XpState,
-    apply_player_damage, arrow_entity_type_id, begin_player_attack_attempt, handle_attack,
-    held_attack_damage_at_tick, held_attack_speed, item_entity_type_id, mpsc, simulation,
-    xp_orb_entity_type_id,
+    apply_unhooked_player_damage_for_test, arrow_entity_type_id, begin_player_attack_attempt,
+    handle_attack, held_attack_damage_at_tick, held_attack_speed, item_entity_type_id, mpsc,
+    simulation, xp_orb_entity_type_id,
 };
 
 use super::{interaction_state_for_items, spawn_test_simulation_owner, start_survival_test_owner};
@@ -296,7 +296,7 @@ async fn adventure_player_accepts_pvp_damage() {
     let mut xp = XpState::default();
     let mut writer = Vec::new();
 
-    let applied = apply_player_damage(
+    let applied = apply_unhooked_player_damage_for_test(
         None,
         &mut writer,
         Compression::Disabled,
@@ -326,7 +326,7 @@ async fn creative_and_spectator_players_reject_pvp_damage() {
         let mut xp = XpState::default();
         let mut writer = Vec::new();
 
-        let applied = apply_player_damage(
+        let applied = apply_unhooked_player_damage_for_test(
             None,
             &mut writer,
             Compression::Disabled,

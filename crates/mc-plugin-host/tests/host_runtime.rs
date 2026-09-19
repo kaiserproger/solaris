@@ -78,6 +78,7 @@ async fn a_join_event_becomes_an_admitted_chat_command() {
         expected: vec!["hello".to_owned()],
         grants: BTreeMap::new(),
         require_grants: false,
+        precommit_hooks: Vec::new(),
     };
     let limits = PluginLimits::default();
     let packages = mc_plugin_host::discover(&config, &limits)
@@ -144,7 +145,7 @@ async fn a_join_event_becomes_an_admitted_chat_command() {
 }
 
 #[tokio::test]
-async fn a_trapped_instance_loses_its_routes_and_the_rest_keeps_running() {
+async fn a_guest_that_exhausts_its_startup_budget_refuses_the_deployment() {
     let root = tempfile::tempdir().expect("deployment root");
     write_package(root.path());
     // A second package whose guest can never finish its first callback.
@@ -168,6 +169,7 @@ async fn a_trapped_instance_loses_its_routes_and_the_rest_keeps_running() {
         expected: vec!["doomed".to_owned(), "hello".to_owned()],
         grants: BTreeMap::new(),
         require_grants: false,
+        precommit_hooks: Vec::new(),
     };
     let packages = mc_plugin_host::discover(&config, &limits)
         .expect("deployment")
@@ -211,6 +213,7 @@ async fn a_refusing_guest_keeps_its_routes_and_a_dead_player_does_not_retire_it(
             expected: vec!["hello".to_owned()],
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )
@@ -273,6 +276,7 @@ async fn a_callback_that_traps_publishes_none_of_the_batch_it_built() {
             expected: vec!["hello".to_owned()],
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )
@@ -330,6 +334,7 @@ async fn a_message_to_an_offline_player_drops_the_batch_and_keeps_the_instance()
             expected: vec!["hello".to_owned()],
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )
@@ -388,6 +393,7 @@ async fn a_guest_blocked_in_a_host_import_is_ended_by_the_epoch_deadline() {
             expected: vec!["hello".to_owned()],
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )
@@ -465,6 +471,7 @@ async fn a_full_command_queue_drops_the_batch_and_keeps_the_instance() {
             expected: vec!["hello".to_owned()],
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )
@@ -532,6 +539,7 @@ fn storage_deployment(root: &Path, capability: bool) -> Vec<mc_plugin_host::Load
             expected: vec!["hello".to_owned()],
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )
@@ -557,8 +565,7 @@ async fn a_storage_read_becomes_the_servers_own_request_and_its_answer_returns_t
     // The whole two-phase path through the real boundary: the guest asks, the
     // server's own storage DTO carries the request, the server's typed result
     // comes back, and the guest's reaction to the value it was given is what a
-    // player sees. Nothing here is a stub: the request is the DTO the Luau host
-    // also builds, validated by the same code.
+    // player sees. The request is validated at the component boundary.
     let root = tempfile::tempdir().expect("deployment root");
     let limits = PluginLimits::default();
     let packages = storage_deployment(root.path(), true);
@@ -746,6 +753,7 @@ async fn an_online_players_query_carries_the_servers_own_snapshot_back_to_the_pl
             expected: vec!["hello".to_owned()],
             grants: BTreeMap::new(),
             require_grants: false,
+            precommit_hooks: Vec::new(),
         },
         &limits,
     )

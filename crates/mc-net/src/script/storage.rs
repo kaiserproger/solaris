@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mc_script::{
-    AdmittedScriptCommand, ScriptCommand, ScriptEvent, ScriptInventoryEndpoint,
-    ScriptInventoryReservationSnapshot, ScriptOperationOutcome, ScriptOperationPayload,
-    ScriptOperationRequest, ScriptOwnedInventoryResult, ScriptPluginStorageCompareAndSwapRequest,
-    ScriptPluginStorageDeleteRequest, ScriptPluginStorageFailure, ScriptStorageMutation,
+    AdmittedScriptCommand, ScriptAxisAlignedZone, ScriptCommand, ScriptEvent,
+    ScriptInventoryEndpoint, ScriptInventoryReservationSnapshot, ScriptOperationOutcome,
+    ScriptOperationPayload, ScriptOperationRequest, ScriptOwnedInventoryResult,
+    ScriptPluginStorageCompareAndSwapRequest, ScriptPluginStorageDeleteRequest,
+    ScriptPluginStorageFailure, ScriptStorageMutation,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -924,7 +925,11 @@ impl PluginStorage {
     /// owners. A transfer must leave at least these quantities untouched.
     fn reserved_quantities(&self, endpoint: &ScriptInventoryEndpoint) -> BTreeMap<String, u64> {
         let mut quantities = BTreeMap::new();
-        for (_, snapshot) in self.reservations.values() {
+        for (plugin_id, reservation_ref) in self.reservations.keys() {
+            let Some((_, snapshot)) = self.settlement_reservation(plugin_id, reservation_ref)
+            else {
+                continue;
+            };
             if snapshot.released || &snapshot.endpoint != endpoint {
                 continue;
             }
@@ -1810,7 +1815,23 @@ fn sync_parent(directory: &Path) -> std::io::Result<()> {
 #[derive(Clone)]
 pub(crate) struct PluginStorageHandle {
     commands: mpsc::Sender<AdmittedScriptCommand>,
+    resident_work_wakes: mpsc::Sender<ResidentWorkWake>,
     stopped: Arc<StorageActorStop>,
+}
+
+#[derive(Debug)]
+enum ResidentWorkWake {
+    World {
+        dimension: String,
+        chunks: Vec<[i32; 2]>,
+    },
+    Zone {
+        zone: ScriptAxisAlignedZone,
+    },
+    Inventory {
+        handles: Vec<String>,
+        endpoints: Vec<ScriptInventoryEndpoint>,
+    },
 }
 
 struct StorageActorStop {
@@ -1853,6 +1874,7 @@ impl PluginStorageHandle {
         shutdown: ShutdownHandle,
     ) -> Self {
         let (commands, receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
+        let (resident_work_wakes, wake_receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
         let stopped = Arc::new(StorageActorStop {
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -1861,6 +1883,7 @@ impl PluginStorageHandle {
         tokio::spawn(run_storage_actor(
             storage,
             receiver,
+            wake_receiver,
             StorageActorContext {
                 events,
                 shutdown,
@@ -1868,7 +1891,11 @@ impl PluginStorageHandle {
                 stopped: Arc::clone(&stopped),
             },
         ));
-        Self { commands, stopped }
+        Self {
+            commands,
+            resident_work_wakes,
+            stopped,
+        }
     }
 
     pub(crate) async fn enqueue(
@@ -1892,6 +1919,37 @@ impl PluginStorageHandle {
         Ok(())
     }
 
+    /// Queue one post-commit world edit wake. Backpressure preserves the
+    /// causal event rather than silently dropping a prerequisite change.
+    pub(crate) async fn wake_resident_work(
+        &self,
+        dimension: impl Into<String>,
+        chunks: Vec<[i32; 2]>,
+    ) {
+        if chunks.is_empty() || self.stopped.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self
+            .resident_work_wakes
+            .send(ResidentWorkWake::World {
+                dimension: dimension.into(),
+                chunks,
+            })
+            .await;
+    }
+
+    /// Queue one accepted protection-zone mutation. The storage actor performs
+    /// a bounded active-work lookup for the exact old or new zone.
+    pub(crate) async fn wake_resident_work_for_zone(&self, zone: ScriptAxisAlignedZone) {
+        if self.stopped.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self
+            .resident_work_wakes
+            .send(ResidentWorkWake::Zone { zone })
+            .await;
+    }
+
     pub(crate) async fn wait_stopped(&self) {
         loop {
             let notified = self.stopped.notify.notified();
@@ -1912,6 +1970,7 @@ impl PluginStorageHandle {
 async fn run_storage_actor(
     mut storage: PluginStorage,
     mut commands: mpsc::Receiver<AdmittedScriptCommand>,
+    mut resident_work_wakes: mpsc::Receiver<ResidentWorkWake>,
     context: StorageActorContext,
 ) {
     let StorageActorContext {
@@ -1931,8 +1990,24 @@ async fn run_storage_actor(
     inventory.recover_resident_orders(&mut storage).await;
     loop {
         let command = tokio::select! {
-            biased;
             () = shutdown.notified() => return,
+            wake = resident_work_wakes.recv() => {
+                let Some(wake) = wake else {
+                    return;
+                };
+                if !resume_paused_resident_work(
+                    &mut storage,
+                    &inventory,
+                    &events,
+                    &shutdown,
+                    &stopped,
+                    &mut commands,
+                    wake,
+                ).await {
+                    return;
+                }
+                continue;
+            }
             command = commands.recv() => match command {
                 Some(command) => command,
                 None => return,
@@ -2115,6 +2190,12 @@ async fn run_storage_actor(
                     );
                     let plugin_id = command.plugin_id().to_owned();
                     let operation_id = request.operation_id().map(str::to_owned);
+                    let (resume_handles, resume_endpoints) = resident_transfer_targets(request);
+                    let transfer_is_new = operation_id.as_ref().is_some_and(|operation_id| {
+                        storage
+                            .operation_receipt(&plugin_id, operation_id)
+                            .is_none()
+                    });
                     let outcome = match if settlement {
                         inventory
                             .execute_settlement_operation(&mut storage, &plugin_id, request)
@@ -2166,6 +2247,10 @@ async fn run_storage_actor(
                             return;
                         }
                     };
+                    let resume_after_transfer = transfer_is_new
+                        && (!resume_handles.is_empty() || !resume_endpoints.is_empty())
+                        && outcome.state() == mc_script::ScriptOperationState::Committed;
+                    inventory.refresh_warehouse_reservation_floors(&storage);
                     let event = match command.operation_result(outcome) {
                         Ok(event) => event,
                         Err(error) => {
@@ -2186,6 +2271,23 @@ async fn run_storage_actor(
                         warn!(?error, "owned inventory receipt acknowledgement failed");
                         stopped.mark_failed();
                         fail_queued_storage_commands(&mut commands, &events).await;
+                        return;
+                    }
+                    if resume_after_transfer
+                        && !resume_paused_resident_work(
+                            &mut storage,
+                            &inventory,
+                            &events,
+                            &shutdown,
+                            &stopped,
+                            &mut commands,
+                            ResidentWorkWake::Inventory {
+                                handles: resume_handles,
+                                endpoints: resume_endpoints,
+                            },
+                        )
+                        .await
+                    {
                         return;
                     }
                     delivery
@@ -2306,6 +2408,113 @@ async fn run_storage_actor(
             return;
         }
     }
+}
+fn resident_transfer_targets(
+    request: &ScriptOperationRequest,
+) -> (Vec<String>, Vec<ScriptInventoryEndpoint>) {
+    let mc_script::ScriptOperation::Inventory {
+        operation: mc_script::ScriptOwnedInventoryOperation::Transfer { transfers, .. },
+    } = request.operation()
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut handles = BTreeSet::new();
+    let mut endpoints = BTreeSet::new();
+    for transfer in transfers {
+        for endpoint in [&transfer.source, &transfer.destination] {
+            if let Some(handle) = endpoint.resident_handle() {
+                handles.insert(handle.to_owned());
+            }
+            endpoints.insert(endpoint.clone());
+        }
+    }
+    (
+        handles.into_iter().collect(),
+        endpoints.into_iter().collect(),
+    )
+}
+
+async fn resume_paused_resident_work(
+    storage: &mut PluginStorage,
+    inventory: &InventoryRuntime,
+    events: &ScriptEventSink,
+    shutdown: &ShutdownHandle,
+    stopped: &Arc<StorageActorStop>,
+    commands: &mut mpsc::Receiver<AdmittedScriptCommand>,
+    wake: ResidentWorkWake,
+) -> bool {
+    let resumed = match match wake {
+        ResidentWorkWake::World { dimension, chunks } => {
+            inventory
+                .resume_paused_work_for_chunks(storage, &dimension, &chunks, |plugin_id| {
+                    events.plugin_is_active(plugin_id)
+                })
+                .await
+        }
+        ResidentWorkWake::Zone { zone } => {
+            inventory
+                .resume_paused_work_for_zone(storage, &zone, |plugin_id| {
+                    events.plugin_is_active(plugin_id)
+                })
+                .await
+        }
+        ResidentWorkWake::Inventory { handles, endpoints } => {
+            inventory
+                .resume_paused_work_for_inventory_change(
+                    storage,
+                    &handles,
+                    &endpoints,
+                    |plugin_id| events.plugin_is_active(plugin_id),
+                )
+                .await
+        }
+    } {
+        Ok(resumed) => resumed,
+        Err(error) => {
+            warn!(
+                ?error,
+                "native resident work resume failed; stopping storage actor"
+            );
+            stopped.mark_failed();
+            fail_queued_storage_commands(commands, events).await;
+            return false;
+        }
+    };
+    for resume in resumed {
+        let event = match ScriptEvent::operation_result(
+            &resume.plugin_id,
+            resume.request.request_id(),
+            resume.request.operation_id(),
+            resume.outcome,
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(?error, "native resident work result construction rejected");
+                return false;
+            }
+        };
+        if !matches!(
+            deliver_targeted_event(events, event, shutdown).await,
+            TargetedEventDelivery::Delivered
+        ) {
+            return false;
+        }
+        if let Some(operation_id) = resume.request.operation_id()
+            && let Some(receipt) = storage
+                .operation_receipt(&resume.plugin_id, operation_id)
+                .cloned()
+            && let Err(error) = storage.acknowledge_operation(&receipt)
+        {
+            warn!(
+                ?error,
+                "native resident work receipt acknowledgement failed"
+            );
+            stopped.mark_failed();
+            fail_queued_storage_commands(commands, events).await;
+            return false;
+        }
+    }
+    true
 }
 
 async fn replay_pending_results(
@@ -2438,43 +2647,4 @@ pub(super) fn storage_failure_event(
     } else {
         command.plugin_storage_failure_result(failure)
     }
-}
-
-#[cfg(test)]
-pub(super) async fn run_storage_actor_for_test(
-    storage: PluginStorage,
-    commands: Vec<AdmittedScriptCommand>,
-    events: ScriptEventSink,
-    shutdown: ShutdownHandle,
-) {
-    let (sender, receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
-    for command in commands {
-        sender
-            .try_send(command)
-            .expect("test storage command queue has capacity");
-    }
-    drop(sender);
-    let stopped = Arc::new(StorageActorStop {
-        failed: AtomicBool::new(false),
-        stopped: AtomicBool::new(false),
-        notify: tokio::sync::Notify::new(),
-    });
-    let inventory = InventoryRuntime::new(
-        None,
-        &shutdown,
-        Arc::new(crate::play::SessionRegistry::new()),
-        Arc::new(mc_data::items::ItemRegistry::default()),
-        Arc::new(mc_data::item_components::ItemFactsTable::default()),
-    );
-    run_storage_actor(
-        storage,
-        receiver,
-        StorageActorContext {
-            events,
-            shutdown,
-            inventory,
-            stopped,
-        },
-    )
-    .await;
 }

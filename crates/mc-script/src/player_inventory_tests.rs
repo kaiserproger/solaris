@@ -34,7 +34,7 @@ async fn admitted_player_inventory_transaction_is_capability_gated_and_targeted(
     );
     assert!(denied.commands().is_empty());
 
-    let manifest = ScriptPluginManifest::new("kits", "Kits", "0.1.0", SCRIPT_API_VERSION)
+    let manifest = ScriptPluginManifest::new("kits", "Kits", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
         .declare_player_inventory()
         .validate()
         .unwrap();

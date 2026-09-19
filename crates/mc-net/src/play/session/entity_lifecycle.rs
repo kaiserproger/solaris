@@ -263,25 +263,6 @@ impl SessionRegistry {
         dispatches
     }
 
-    #[cfg(test)]
-    pub(crate) fn spawn_script_router_test_entity(
-        &self,
-        entity_type_id: i32,
-        entity_type_name: &str,
-        position: Vec3,
-    ) -> EntityId {
-        let mob_behaviors = self.mob_behavior_table();
-        let mut inner = self.lock_session_entities("spawn script router test entity");
-        let (entity_id, _) = spawn_command_entity_locked(
-            &mut inner,
-            entity_type_id,
-            entity_type_name.to_owned(),
-            position,
-            &mob_behaviors,
-        );
-        entity_id
-    }
-
     pub(in crate::play) fn tick_dying_entities(
         &self,
         _authority: &SimulationAuthority,
@@ -558,6 +539,7 @@ pub(super) fn clear_removed_entity_tracking_locked(
     inner: &mut SessionRegistryInner,
     entity_id: EntityId,
 ) {
+    inner.pending_projectile_damage.remove(&entity_id);
     inner.item_despawn_deadline_by_id.remove(&entity_id);
     inner
         .zombie_villager_conversion_deadline_by_id

@@ -333,6 +333,8 @@ pub enum ScriptResidentWorkOrder {
     Craft {
         recipe: String,
         count: u32,
+        /// One loaded crafting-table cell the native engine verifies.
+        station: ScriptWorkArea,
     },
     Construct {
         structure_id: String,
@@ -377,9 +379,14 @@ impl ScriptResidentWorkOrder {
                 }
                 Ok(())
             }
-            Self::Craft { recipe, count } => {
+            Self::Craft {
+                recipe,
+                count,
+                station,
+            } => {
                 validate_bounded_nonempty("recipe", recipe, MAX_RECIPE_ID_BYTES)?;
-                if *count == 0 || *count > i32::MAX as u32 {
+                station.validate()?;
+                if station.min != station.max || *count == 0 || *count > i32::MAX as u32 {
                     return Err(ScriptDtoError::InvalidBounds);
                 }
                 Ok(())
@@ -757,6 +764,7 @@ pub enum ScriptWorkPauseReason {
     NoWorkers,
     MissingInput,
     MissingTool,
+    MissingStation,
     BlockedRoute,
     Interrupted,
     Protected,
@@ -771,6 +779,7 @@ impl ScriptWorkPauseReason {
             Self::NoWorkers => "no_workers",
             Self::MissingInput => "missing_input",
             Self::MissingTool => "missing_tool",
+            Self::MissingStation => "missing_station",
             Self::BlockedRoute => "blocked_route",
             Self::Interrupted => "interrupted",
             Self::Protected => "protected",

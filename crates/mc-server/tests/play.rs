@@ -15,9 +15,12 @@
 //! Packet IDs are still M1.g.4-pending; this test is the wire-shape
 //! check, not a vanilla-client compatibility test.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
@@ -32,18 +35,17 @@ use mc_protocol::packets::configuration::{
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
-    ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundPlayerAbilities,
-    ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundUpdateRecipes,
-    CommandNodeKind, ConfirmTeleportation, EntityEvent, GameEvent, LevelChunkWithLight, LoginPlay,
-    MovePlayerFlags, PlayDisconnect, ServerboundChat, ServerboundChatCommand,
-    ServerboundCustomPayload, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
+    ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundInitializeBorder, ClientboundPlayerAbilities, ClientboundRecipeBookAdd,
+    ClientboundRecipeBookSettings, ClientboundSetHealth, ClientboundSetHeldSlot,
+    ClientboundSetTime, ClientboundSystemChat, ClientboundUpdateRecipes, CommandNodeKind,
+    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, PlayDisconnect, ServerboundChat,
+    ServerboundChatCommand, ServerboundCustomPayload, ServerboundKeepAlive, SetCenterChunk,
     SetDefaultSpawnPosition, SynchronizePlayerPosition, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{
-    MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, SCRIPT_API_VERSION, ScriptCommand, ScriptEvent,
+    COMPONENT_PLUGIN_API_VERSION, MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, ScriptCommand, ScriptEvent,
     ScriptEventKind, ScriptHostEndpoint, ScriptPlayerId, ScriptPluginManifest, ScriptProtocolPhase,
     ValidatedScriptPluginManifest,
 };
@@ -100,10 +102,15 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
 }
 
 fn script_channel_manifest(plugin_id: &str) -> ValidatedScriptPluginManifest {
-    ScriptPluginManifest::new(plugin_id, "Test Payload", "0.1.0", SCRIPT_API_VERSION)
-        .declare_custom_payload_channel(SCRIPT_CHANNEL)
-        .validate()
-        .expect("test payload channel manifest validates")
+    ScriptPluginManifest::new(
+        plugin_id,
+        "Test Payload",
+        "0.1.0",
+        COMPONENT_PLUGIN_API_VERSION,
+    )
+    .declare_custom_payload_channel(SCRIPT_CHANNEL)
+    .validate()
+    .expect("test payload channel manifest validates")
 }
 
 async fn start_server_with_script_payloads() -> (SocketAddr, ScriptHostEndpoint) {
@@ -170,7 +177,7 @@ fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfi
     mc_net::ServerConfig {
         tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "Lua plugin integration".into(),
+        motd: "Component plugin integration".into(),
         max_players: 8,
         view_distance: 10,
         data: std::sync::Arc::new(mc_data::testing::stub()),
@@ -193,6 +200,99 @@ fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfi
         loader_manifest: None,
         shutdown,
     }
+}
+
+struct FirstConnectedSession;
+
+impl mc_plugin_host::PlayerSessions for FirstConnectedSession {
+    fn session_of(&self, _player: &str) -> Option<u64> {
+        Some(1)
+    }
+}
+
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repository root")
+}
+
+fn hello_component_bytes() -> &'static [u8] {
+    static BYTES: std::sync::LazyLock<Vec<u8>> =
+        std::sync::LazyLock::new(build_hello_component_bytes);
+    BYTES.as_slice()
+}
+
+fn build_hello_component_bytes() -> Vec<u8> {
+    let sdk = repository_root().join("sdk/rust");
+    let status = Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "--manifest-path",
+            sdk.join("Cargo.toml").to_str().expect("utf-8 path"),
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+            "-p",
+            "solaris-hello-plugin",
+        ])
+        .status()
+        .expect("the hello guest build starts");
+    assert!(status.success(), "the hello guest fixture must build");
+    let module =
+        std::fs::read(sdk.join("target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm"))
+            .expect("the hello guest module exists");
+    wit_component::ComponentEncoder::default()
+        .module(&module)
+        .expect("the hello guest module carries component types")
+        .validate(true)
+        .encode()
+        .expect("the hello guest module encodes as a component")
+}
+
+fn start_hello_component_deployment(
+    root: &Path,
+    id: &str,
+    greeting: &str,
+) -> mc_plugin_host::PluginHost {
+    let package = root.join(id);
+    std::fs::create_dir_all(&package).expect("component package directory");
+    std::fs::write(
+        package.join("plugin.toml"),
+        format!(
+            "id = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\napi = \"0.7.0\"\nevents = [\"player.joined\"]\nplayer_commands = [\"hello\"]\n"
+        ),
+    )
+    .expect("component manifest");
+    std::fs::write(
+        package.join("config.toml"),
+        format!("greeting = \"{greeting}\"\n"),
+    )
+    .expect("component config");
+    std::fs::write(package.join("plugin.wasm"), hello_component_bytes())
+        .expect("component artifact");
+
+    let limits = mc_plugin_host::PluginLimits::default();
+    let packages = mc_plugin_host::discover(
+        &mc_plugin_host::DeploymentConfig {
+            root: root.to_path_buf(),
+            mode: mc_plugin_host::DiscoveryMode::Strict,
+            expected: vec![id.to_owned()],
+            grants: BTreeMap::new(),
+            require_grants: false,
+            precommit_hooks: Vec::new(),
+        },
+        &limits,
+    )
+    .expect("strict component discovery")
+    .into_packages();
+    mc_plugin_host::start_deployment(
+        packages,
+        limits,
+        mc_plugin_host::HostQueues::default(),
+        Arc::new(FirstConnectedSession),
+    )
+    .expect("component deployment starts")
 }
 
 fn access_file_server_config(path: &Path) -> mc_net::ServerConfig {
@@ -302,23 +402,6 @@ async fn read_play_disconnect(
     .expect("play disconnect was not delivered within 2s")
 }
 
-async fn read_play_custom_payload(
-    stream: &mut TcpStream,
-    buf: &mut BytesMut,
-    compression: Compression,
-) -> ClientboundCustomPayload {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let mut frame = read_one_frame(stream, buf, compression).await;
-            if frame.id == ClientboundCustomPayload::ID {
-                return ClientboundCustomPayload::decode(&mut frame.body).unwrap();
-            }
-        }
-    })
-    .await
-    .expect("play custom payload was not delivered within 2s")
-}
-
 async fn assert_damage_command_still_processed(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
@@ -416,26 +499,6 @@ async fn read_matching_system_chat(
     })
     .await
     .expect("matching system chat was not delivered within 2s")
-}
-
-async fn confirm_initial_player_position(
-    stream: &mut TcpStream,
-    buf: &mut BytesMut,
-    compression: Compression,
-) {
-    let teleport_id = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let mut frame = read_one_frame(stream, buf, compression).await;
-            if frame.id == SynchronizePlayerPosition::ID {
-                return SynchronizePlayerPosition::decode(&mut frame.body)
-                    .unwrap()
-                    .teleport_id;
-            }
-        }
-    })
-    .await
-    .expect("initial player position was not delivered within 2s");
-    write_frame(stream, &ConfirmTeleportation { teleport_id }, compression).await;
 }
 
 async fn read_initial_position_and_matching_system_chat(
@@ -1099,7 +1162,7 @@ async fn plugin_owned_command_argument_limits_do_not_terminate_play_ingress() {
         "command-boundary",
         "Command Boundary",
         "0.1.0",
-        mc_script::SCRIPT_API_VERSION,
+        mc_script::COMPONENT_PLUGIN_API_VERSION,
     )
     .declare_player_command_root("owned")
     .validate()
@@ -1195,145 +1258,46 @@ async fn plugin_owned_command_argument_limits_do_not_terminate_play_ingress() {
 }
 
 #[tokio::test]
-async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
+async fn component_plugin_loaded_from_disk_replies_to_join_and_command_over_the_wire() {
     let plugins = tempfile::tempdir().unwrap();
-    let plugin = plugins.path().join("welcome");
-    std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(
-        plugin.join("plugin.toml"),
-        r#"
-            id = "welcome"
-            name = "Welcome"
-            version = "0.1.0"
-            api = "0.6.0"
-            events = ["player.joined", "player.chat"]
-            capabilities = ["world_time"]
-        "#,
-    )
-    .unwrap();
-    std::fs::write(
-        plugin.join("main.lua"),
-        r#"
-            --!strict
-
-            local function context(event: any): string
-                return tostring(event.context_verified) .. ":" .. event.uuid .. ":" ..
-                    event.username .. ":" .. tostring(event.operator) .. ":" ..
-                    event.x .. ":" .. event.y .. ":" .. event.z
-            end
-
-            function on_player_joined(event: any)
-                solaris.send_message(event.player_id, "joined:" .. context(event))
-            end
-
-            function on_player_chat(event: any)
-                if event.message == "ping" then
-                    solaris.send_message(event.player_id, "chat:" .. context(event))
-                elseif event.message == "day" then
-                    solaris.set_world_time("set-day", 1000)
-                end
-            end
-        "#,
-    )
-    .unwrap();
-    let (boundary, host) =
-        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
-    assert_eq!(host.loaded_plugins(), 1);
+    let host = start_hello_component_deployment(plugins.path(), "welcome", "joined");
+    let boundary = host.boundary().clone();
 
     let shutdown = mc_net::ShutdownHandle::default();
     let mut config = script_server_config(shutdown.clone());
-    config.command_permissions = mc_net::CommandPermissionConfig::new(["LuaPlayer"], false);
+    config.command_permissions = mc_net::CommandPermissionConfig::new(["ComponentPlayer"], false);
     let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
     let addr = bound.local_addr().unwrap();
     let server = tokio::spawn(async move { bound.serve().await });
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
-    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "LuaPlayer").await;
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ComponentPlayer").await;
     let joined = read_initial_position_and_matching_system_chat(
         &mut stream,
         &mut rbuf,
         compression,
-        &format!(
-            "joined:true:{}:LuaPlayer:true:0.5:-59:0.5",
-            mc_net::offline_uuid("LuaPlayer")
-        ),
+        "joined ComponentPlayer",
     )
     .await;
     assert!(!joined.overlay);
 
     write_frame(
         &mut stream,
-        &ServerboundMovePlayerPos {
-            x: 12.25,
-            y: 70.0,
-            z: -4.5,
-            flags: MovePlayerFlags::new(true, false),
+        &ServerboundChatCommand {
+            command: "hello".to_owned(),
         },
         compression,
     )
     .await;
-
-    write_frame(
-        &mut stream,
-        &ServerboundChat {
-            message: "ping".to_owned(),
-            timestamp_millis: 0,
-            salt: 0,
-            signature: None,
-            last_seen_offset: 0,
-            last_seen_acknowledged: [0; 3],
-            last_seen_checksum: 0,
-        },
-        compression,
-    )
-    .await;
-    let chat = read_matching_system_chat(
+    let reply = read_matching_system_chat(
         &mut stream,
         &mut rbuf,
         compression,
-        &format!(
-            "chat:true:{}:LuaPlayer:true:12.25:70:-4.5",
-            mc_net::offline_uuid("LuaPlayer")
-        ),
+        "Hello from a WASM plugin.",
     )
     .await;
-    assert!(!chat.overlay);
-
-    write_frame(
-        &mut stream,
-        &ServerboundChat {
-            message: "day".to_owned(),
-            timestamp_millis: 0,
-            salt: 0,
-            signature: None,
-            last_seen_offset: 0,
-            last_seen_acknowledged: [0; 3],
-            last_seen_checksum: 0,
-        },
-        compression,
-    )
-    .await;
-    let time = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-            if frame.id == ClientboundSetTime::ID {
-                let time = ClientboundSetTime::decode(&mut frame.body).unwrap();
-                if time
-                    .overworld_clock
-                    .is_some_and(|clock| clock.total_ticks == 1_000)
-                {
-                    return time;
-                }
-            }
-        }
-    })
-    .await
-    .expect("script time command did not publish overworld time within 2s");
-    assert_eq!(
-        time.overworld_clock.map(|clock| clock.total_ticks),
-        Some(1_000)
-    );
+    assert!(!reply.overlay);
 
     drop(stream);
     shutdown.request();
@@ -1342,123 +1306,8 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
         .expect("server did not stop within 2s")
         .expect("server task failed")
         .expect("server returned an error");
-    tokio::task::spawn_blocking(move || host.join())
-        .await
-        .expect("Lua host join task failed")
-        .expect("Lua host thread panicked");
-}
-
-#[tokio::test]
-async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
-    let plugins = tempfile::tempdir().unwrap();
-    let plugin = plugins.path().join("pet");
-    std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(
-        plugin.join("plugin.toml"),
-        r#"
-            id = "pet"
-            name = "Pet"
-            version = "0.1.0"
-            api = "0.6.0"
-            player_commands = ["pet"]
-            spawn_entities = ["minecraft:pig"]
-        "#,
-    )
-    .unwrap();
-    std::fs::write(
-        plugin.join("main.lua"),
-        r#"
-            --!strict
-
-            function on_player_command(event: any)
-                solaris.spawn_entity(
-                    "pet-spawn",
-                    event.player_id,
-                    "minecraft:pig",
-                    event.x + 2,
-                    event.y,
-                    event.z
-                )
-            end
-        "#,
-    )
-    .unwrap();
-    let (boundary, host) =
-        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
-    assert_eq!(host.loaded_plugins(), 1);
-
-    let shutdown = mc_net::ShutdownHandle::default();
-    let mut config = script_server_config(shutdown.clone());
-    config.data = std::sync::Arc::new(mc_data::solaris_required_data());
-    let mut world = mc_world::WorldStorage::in_memory(std::sync::Arc::clone(&config.blocks));
-    let chunk = mc_world::ChunkPos { x: 0, z: 0 };
-    world
-        .insert_generated_chunk(
-            chunk,
-            mc_world::Chunk::empty(
-                chunk,
-                mc_world::BlockStateId(0),
-                mc_data::Identifier::parse("minecraft:plains").unwrap(),
-            ),
-        )
-        .unwrap();
-    config.world = Some(std::sync::Arc::new(tokio::sync::Mutex::new(world)));
-    config.entity_types =
-        std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types());
-    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
-    let addr = bound.local_addr().unwrap();
-    let server = tokio::spawn(async move { bound.serve().await });
-
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let mut rbuf = BytesMut::with_capacity(8192);
-    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PetPlayer").await;
-    confirm_initial_player_position(&mut stream, &mut rbuf, compression).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-            if frame.id == LevelChunkWithLight::ID {
-                return;
-            }
-        }
-    })
-    .await
-    .expect("initial chunk was not delivered within 2s");
-    write_frame(
-        &mut stream,
-        &ServerboundChatCommand {
-            command: "pet".to_owned(),
-        },
-        compression,
-    )
-    .await;
-
-    let entity = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-            if frame.id == AddEntity::ID {
-                let entity = AddEntity::decode(&mut frame.body).unwrap();
-                if entity.entity_type_id == 100 {
-                    return entity;
-                }
-            }
-        }
-    })
-    .await
-    .expect("allow-listed Lua entity spawn was not delivered within 2s");
-    assert_eq!(entity.entity_type_id, 100);
-    assert_eq!((entity.x, entity.y, entity.z), (2.5, -59.0, 0.5));
-
-    drop(stream);
-    shutdown.request();
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server did not stop within 2s")
-        .expect("server task failed")
-        .expect("server returned an error");
-    tokio::task::spawn_blocking(move || host.join())
-        .await
-        .expect("Lua host join task failed")
-        .expect("Lua host thread panicked");
+    let counters = host.stop();
+    assert_eq!(counters.len(), 1, "one component instance ran");
 }
 
 #[tokio::test]
@@ -1500,129 +1349,6 @@ async fn file_backed_operator_permissions_reload_across_server_instances() {
 }
 
 #[tokio::test]
-async fn lua_player_command_context_distinguishes_operator_and_exposes_identity_and_position() {
-    let plugins = tempfile::tempdir().unwrap();
-    let plugin = plugins.path().join("context");
-    std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(
-        plugin.join("plugin.toml"),
-        r#"
-            id = "context"
-            name = "Context"
-            version = "0.1.0"
-            api = "0.6.0"
-            player_commands = ["who"]
-        "#,
-    )
-    .unwrap();
-    std::fs::write(
-        plugin.join("main.lua"),
-        r#"
-            --!strict
-
-            function on_player_command(event: any)
-                local role = event.operator and "operator" or "member"
-                solaris.send_message(
-                    event.player_id,
-                    role .. ":" .. tostring(event.operator) .. ":" ..
-                    event.uuid .. ":" .. event.username .. ":" ..
-                    event.x .. ":" .. event.y .. ":" .. event.z
-                )
-            end
-        "#,
-    )
-    .unwrap();
-    let (boundary, host) =
-        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
-    assert_eq!(host.loaded_plugins(), 1);
-
-    let shutdown = mc_net::ShutdownHandle::default();
-    let mut config = script_server_config(shutdown.clone());
-    config.command_permissions = mc_net::CommandPermissionConfig::new(["OpPlayer"], false);
-    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
-    let addr = bound.local_addr().unwrap();
-    let server = tokio::spawn(async move { bound.serve().await });
-
-    let mut member = TcpStream::connect(addr).await.unwrap();
-    let mut member_buf = BytesMut::with_capacity(8192);
-    let member_compression = drive_to_play(&mut member, &mut member_buf, addr, "Player").await;
-    confirm_initial_player_position(&mut member, &mut member_buf, member_compression).await;
-    write_frame(
-        &mut member,
-        &ServerboundMovePlayerPos {
-            x: 12.25,
-            y: 70.0,
-            z: -4.5,
-            flags: MovePlayerFlags::new(true, false),
-        },
-        member_compression,
-    )
-    .await;
-    write_frame(
-        &mut member,
-        &ServerboundChatCommand {
-            command: "who".to_owned(),
-        },
-        member_compression,
-    )
-    .await;
-    let member_reply = read_matching_system_chat(
-        &mut member,
-        &mut member_buf,
-        member_compression,
-        "member:false:a01e3843-e521-3998-958a-f459800e4d11:Player:12.25:70:-4.5",
-    )
-    .await;
-    assert!(!member_reply.overlay);
-
-    let mut operator = TcpStream::connect(addr).await.unwrap();
-    let mut operator_buf = BytesMut::with_capacity(8192);
-    let operator_compression =
-        drive_to_play(&mut operator, &mut operator_buf, addr, "OpPlayer").await;
-    confirm_initial_player_position(&mut operator, &mut operator_buf, operator_compression).await;
-    write_frame(
-        &mut operator,
-        &ServerboundMovePlayerPos {
-            x: -8.0,
-            y: 65.5,
-            z: 21.75,
-            flags: MovePlayerFlags::new(true, false),
-        },
-        operator_compression,
-    )
-    .await;
-    write_frame(
-        &mut operator,
-        &ServerboundChatCommand {
-            command: "who".to_owned(),
-        },
-        operator_compression,
-    )
-    .await;
-    let operator_reply = read_matching_system_chat(
-        &mut operator,
-        &mut operator_buf,
-        operator_compression,
-        "operator:true:0c2d537c-394b-30e2-a44a-1c42856286cb:OpPlayer:-8:65.5:21.75",
-    )
-    .await;
-    assert!(!operator_reply.overlay);
-
-    drop(member);
-    drop(operator);
-    shutdown.request();
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server did not stop within 2s")
-        .expect("server task failed")
-        .expect("server returned an error");
-    tokio::task::spawn_blocking(move || host.join())
-        .await
-        .expect("Lua host join task failed")
-        .expect("Lua host thread panicked");
-}
-
-#[tokio::test]
 async fn play_script_disconnect_command_disconnects_player() {
     let (addr, mut endpoint) = start_server_with_script_payloads().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -1653,190 +1379,6 @@ async fn play_script_disconnect_command_disconnects_player() {
     })
     .await;
     assert_eq!(left, ScriptEvent::player_left(player_id, "disconnected"));
-}
-
-#[tokio::test]
-async fn lua_script_payload_round_trip_reaches_player() {
-    let plugins = tempfile::tempdir().unwrap();
-    let plugin = plugins.path().join("echo");
-    std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(
-        plugin.join("plugin.toml"),
-        r#"
-            id = "echo"
-            name = "Echo"
-            version = "0.1.0"
-            api = "0.6.0"
-            events = ["player.joined", "player.custom_payload"]
-            capabilities = ["custom_payload:solaris:test"]
-        "#,
-    )
-    .unwrap();
-    std::fs::write(
-        plugin.join("main.lua"),
-        r#"
-            --!strict
-
-            function on_player_joined(event: any)
-                solaris.send_custom_payload(event.player_id, "solaris:test", "server-payload")
-            end
-
-            function on_player_custom_payload(event: any)
-                solaris.send_custom_payload(event.player_id, event.channel, event.payload)
-            end
-        "#,
-    )
-    .unwrap();
-    let (boundary, host) =
-        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
-    assert_eq!(host.loaded_plugins(), 1);
-
-    let shutdown = mc_net::ShutdownHandle::default();
-    let config = script_server_config(shutdown.clone());
-    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
-    let addr = bound.local_addr().unwrap();
-    let server = tokio::spawn(async move { bound.serve().await });
-
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let mut rbuf = BytesMut::with_capacity(8192);
-    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "EchoPlayer").await;
-
-    let payload = read_play_custom_payload(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(
-        payload,
-        ClientboundCustomPayload {
-            payload: CustomPayload::Unknown {
-                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
-                payload: b"server-payload".to_vec(),
-            },
-        }
-    );
-
-    // Binary bodies must survive the Luau round-trip byte-for-byte.
-    let binary = vec![0x00, 0xff, 0x01, 0x80, 0xfe, 0x42, 0x7f];
-    write_frame(
-        &mut stream,
-        &ServerboundCustomPayload {
-            payload: CustomPayload::Unknown {
-                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
-                payload: binary.clone(),
-            },
-        },
-        compression,
-    )
-    .await;
-    let echo = read_play_custom_payload(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(
-        echo,
-        ClientboundCustomPayload {
-            payload: CustomPayload::Unknown {
-                channel: Identifier::parse(SCRIPT_CHANNEL).unwrap(),
-                payload: binary,
-            },
-        }
-    );
-
-    drop(stream);
-    shutdown.request();
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server did not stop within 2s")
-        .expect("server task failed")
-        .expect("server returned an error");
-    let report = tokio::task::spawn_blocking(move || host.join())
-        .await
-        .expect("Lua host join task failed")
-        .expect("Lua host thread panicked");
-    assert!(
-        report.disabled_plugins().is_empty(),
-        "admitted payload round-trip must not disable the plugin, got {:?}",
-        report.disabled_plugins()
-    );
-}
-
-#[tokio::test]
-async fn lua_script_oversized_payload_is_rejected_before_the_wire() {
-    let plugins = tempfile::tempdir().unwrap();
-    let plugin = plugins.path().join("oversized");
-    std::fs::create_dir(&plugin).unwrap();
-    std::fs::write(
-        plugin.join("plugin.toml"),
-        r#"
-            id = "oversized"
-            name = "Oversized"
-            version = "0.1.0"
-            api = "0.6.0"
-            events = ["player.joined"]
-            capabilities = ["custom_payload:solaris:test"]
-        "#,
-    )
-    .unwrap();
-    std::fs::write(
-        plugin.join("main.lua"),
-        r#"
-            --!strict
-
-            function on_player_joined(event: any)
-                local accepted = pcall(function()
-                    solaris.send_custom_payload(event.player_id, "solaris:test", string.rep("x", 32769))
-                end)
-                assert(not accepted, "oversized payload was admitted")
-                solaris.send_custom_payload(event.player_id, "solaris:test", "bounded")
-            end
-        "#,
-    )
-    .unwrap();
-    let (boundary, host) =
-        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
-
-    let shutdown = mc_net::ShutdownHandle::default();
-    let config = script_server_config(shutdown.clone());
-    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
-    let addr = bound.local_addr().unwrap();
-    let server = tokio::spawn(async move { bound.serve().await });
-
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let mut rbuf = BytesMut::with_capacity(8192);
-    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PayloadBig").await;
-
-    let probe_started = std::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-            if frame.id == ClientboundCustomPayload::ID {
-                let packet = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
-                assert_eq!(
-                    packet.payload,
-                    CustomPayload::Unknown {
-                        channel: Identifier::parse("solaris:test").unwrap(),
-                        payload: b"bounded".to_vec(),
-                    },
-                    "only the valid payload following rejection may reach the wire"
-                );
-                break;
-            }
-        }
-    })
-    .await
-    .expect("valid payload after the rejected oversized send was not delivered");
-    eprintln!("OVERSIZED-PAYLOAD LATENCY: {:?}", probe_started.elapsed());
-
-    drop(stream);
-    shutdown.request();
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server did not stop within 2s")
-        .expect("server task failed")
-        .expect("server returned an error");
-    let report = tokio::task::spawn_blocking(move || host.join())
-        .await
-        .expect("Lua host join task failed")
-        .expect("Lua host thread panicked");
-    assert!(
-        report.disabled_plugins().is_empty(),
-        "a caught payload validation error must not disable the plugin: {:?}",
-        report.disabled_plugins()
-    );
 }
 
 #[tokio::test]

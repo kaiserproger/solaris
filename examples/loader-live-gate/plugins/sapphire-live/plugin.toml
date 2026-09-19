@@ -1,7 +1,8 @@
 id = "sapphire-live"
 name = "Sapphire Loader Live Gate"
 version = "1.0.0"
-api = "0.6.0"
+api = "0.7.0"
+events = ["player.joined", "player.left"]
 player_commands = ["loader_sapphire"]
 
 [client]
@@ -11,14 +12,15 @@ schema = 2
 id = "rich-content"
 version = "1"
 artifact = "client/rich-content.zip"
-sha256 = "a46ba314133a1897bf5c24b570e0b024f70ea6b3cdf369badc83dcd22b1e4daf"
-size_bytes = 1109
+sha256 = "167503e5e354b256075e8609d72d0aaecaabe3ee772fa344752df2e834a59cbf"
+size_bytes = 8264
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "views", "view_actions", "assets"]
+content = ["blocks", "items", "views", "view_actions", "assets", "sounds"]
 permissions = [
   "register_blocks",
   "register_items",
   "present_views",
   "send_view_actions",
   "load_assets",
+  "play_sounds",
 ]

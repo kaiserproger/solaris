@@ -19,7 +19,9 @@ use super::super::combat::{
 use super::super::commands::CommandPermissions;
 use super::super::inventory::PlayerInventory;
 use super::super::persistence::{PlayerPersistedState, XpState};
-use super::super::player_damage_adapter::{PlayerDamageApplication, apply_player_damage};
+use super::super::player_damage_adapter::{
+    PlayerDamageApplication, apply_unhooked_player_damage_for_test,
+};
 use super::super::session::{self, EntityAttackOutcome, PlayerAttackResult};
 use super::super::simulation::{self, SIMULATION_COMMAND_BATCH_LIMIT};
 use super::super::survival::SurvivalState;
@@ -299,7 +301,7 @@ async fn projectile_shield_block_writes_scaled_slot_update() {
         start_survival_test_owner(&mut state, "ProjectileShield", survival_state, &xp_state);
     let mut writer = Vec::new();
 
-    let damage_applied = apply_player_damage(
+    let damage_applied = apply_unhooked_player_damage_for_test(
         Some(&mut state),
         &mut writer,
         Compression::Disabled,
@@ -410,7 +412,7 @@ async fn authoritative_pvp_shield_block_refreshes_local_identity_before_retry() 
 
     let mut writer = Vec::new();
     let damage_applied = {
-        let damage = apply_player_damage(
+        let damage = apply_unhooked_player_damage_for_test(
             Some(&mut state),
             &mut writer,
             Compression::Disabled,
@@ -444,6 +446,7 @@ async fn authoritative_pvp_shield_block_refreshes_local_identity_before_retry() 
                 amount: 4.0,
                 attacker_costs: None,
                 authority_tick: sessions.simulation_tick(),
+                hook_approval: None,
             },
         );
         assert!(matches!(
@@ -556,7 +559,7 @@ async fn repeated_shield_cas_conflict_refreshes_owner_state_and_fails_closed() {
 
     let mut writer = Vec::new();
     let error = {
-        let damage = apply_player_damage(
+        let damage = apply_unhooked_player_damage_for_test(
             Some(&mut state),
             &mut writer,
             Compression::Disabled,

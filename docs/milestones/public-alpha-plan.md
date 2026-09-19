@@ -931,6 +931,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   `mc-net` test discovery, and no other local or `required-features` test gate
   exists. Current lists, ownership, and evidence boundaries are recorded in
   [`evidence/cargo-feature-gated-test-inventory.md`](../evidence/cargo-feature-gated-test-inventory.md).
+  These counts and the `mc-script/lua-runtime` name describe the historical
+  inventory. WASM migration P1 moved retained Luau and its tests into
+  `mc-plugin-host/legacy-luau`; `mc-script` now has no VM feature and `mc-net`
+  `load-bench` no longer selects one. See the current
+  [plugin ownership](../PLUGINS.md) and [live cursor](../MEMORY.md).
 - [x] Classify three `mc-worldgen::structures` tests whose local blocks-report
   or fountain-template prerequisite returned success when absent. They are now
   explicit opt-in gates and fail closed when selected; ownership, reproduction,

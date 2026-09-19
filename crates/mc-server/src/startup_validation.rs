@@ -176,6 +176,15 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
     {
         bail!("chunk_pipeline.compression_level must be between 0 and 9");
     }
+    // `[[plugins.hooks]]` registrations run on the component boundary, and both
+    // paths reach here before either touches a world, a storage file or a
+    // listener: `--check` calls this before it checks the deployment, and serve
+    // calls it before the deployment is even read. A registration the
+    // configured runtime cannot carry is refused here rather than skipped later.
+    config
+        .plugins
+        .validate_hooks()
+        .map_err(anyhow::Error::msg)?;
     if config.simulation.random_tick_speed > MAX_RANDOM_TICK_SPEED {
         bail!(
             "simulation.random_tick_speed={} exceeds safe maximum {}",

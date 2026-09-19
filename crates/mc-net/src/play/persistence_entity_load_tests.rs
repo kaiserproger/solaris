@@ -746,6 +746,7 @@ fn damaged_restart_preserves_independent_max_health_for_later_healing() {
             target_kind: mc_entity::runtime_26_1_2::TargetKind::NonPlayer,
             death_remove_tick: 20,
         },
+        &mut None,
     );
     let mc_entity::EntityEffectResult::Applied(healed) = result else {
         panic!("restored damaged entity must accept healing");

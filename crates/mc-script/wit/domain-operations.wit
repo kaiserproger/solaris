@@ -1,0 +1,19 @@
+interface domain-operations {
+    use settlements.{settlement-operation};
+    use residents.{resident-operation, resident-order-operation};
+    use inventories.{inventory-operation};
+
+    /// Existing native operation families; ownership and validation stay in the kernel.
+    variant domain-operation {
+        settlement(settlement-operation),
+        resident(resident-operation),
+        resident-order(resident-order-operation),
+        inventory(inventory-operation),
+    }
+
+    /// Request correlation is separate from the durable id inside mutation records.
+    record operation-request {
+        request: string,
+        operation: domain-operation,
+    }
+}

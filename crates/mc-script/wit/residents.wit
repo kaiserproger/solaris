@@ -1,0 +1,612 @@
+// Durable resident identity, bound points of interest, and the physical work
+// and squad orders one owned resident can be given.
+//
+// A resident is a durable record the server owns: the handle a plugin addresses
+// is minted by the server from the plugin's own owner scope, every mutation
+// carries the revision the plugin last read, and the entity behind the handle is
+// the server's own villager. A plugin never names an entity id, a generation id
+// or a durable operation id it invented: the ids it sends are the opaque ones
+// the server already answered it with, and the one name it does choose - the
+// operation id - is the durable name the server records the commit under, so a
+// repeated call replays that outcome instead of applying twice.
+//
+// Work and squad orders are instructions to the server's own engine, not
+// simulation a plugin performs: the engine reads the live world, decides what
+// each member can do, and answers with what actually happened. That is why a
+// result carries per-member state and real item deltas rather than a count of
+// members the plugin asked about.
+//
+// Every record here mirrors `mc_script`'s own resident DTOs, whose validators
+// bound it: the server refuses a value it cannot accept instead of clamping it,
+// and the host converts this record into that DTO under the package's own
+// grants. Nothing in this interface invents a second vocabulary for the same
+// field.
+interface residents {
+    use inventories.{inventory-endpoint};
+
+    /// One integer block coordinate.
+    ///
+    /// A work area, an order anchor and an order target are block cells, not
+    /// floating player positions, so this is the server's own
+    /// `mc_script::ScriptBlockPosition` rather than `types.position`. Each axis
+    /// is a block coordinate the world generator could place a cell at: its
+    /// absolute value is at most `mc_script::MAX_SCRIPT_BLOCK_COORDINATE`
+    /// (30000000), enforced by the server's own validator.
+    record block-position {
+        x: s32,
+        y: s32,
+        z: s32,
+    }
+
+    /// The kinds of resident the server knows how to materialise.
+    ///
+    /// One member today: the server's own villager. A closed union rather than a
+    /// free string, so a package cannot ask for an entity type the resident owner
+    /// would not bind.
+    enum resident-kind {
+        villager,
+    }
+
+    /// The bounded description of the resident to materialise.
+    record resident-profile {
+        kind: resident-kind,
+    }
+
+    /// Closed lifecycle state of one durable resident handle.
+    ///
+    /// `alive-unloaded` is a resident whose chunk is not loaded, which is not
+    /// `dead`: an unloaded resident keeps its identity and its living capacity,
+    /// while a dead one leaves a tombstone and frees capacity. A released
+    /// resident frees its home site, which is how a plugin lets another resident
+    /// live there.
+    enum resident-lifecycle {
+        alive-loaded,
+        alive-unloaded,
+        dead,
+        released,
+    }
+
+    /// One carried item summary of a loaded resident.
+    ///
+    /// At most `mc_script::MAX_RESIDENT_CARRIED_ITEMS` (8) of these are reported
+    /// per snapshot, each naming a registered item resource and a count of at
+    /// least one.
+    record resident-item-summary {
+        item-id: string,
+        count: u32,
+    }
+
+    /// Live state of a resident whose chunk is currently loaded.
+    ///
+    /// This is read from the server's own entity snapshot; a plugin only reads
+    /// it. Health is in health points, and the carried list is the bounded
+    /// summary above rather than the resident's whole inventory: reading a
+    /// resident's items is `query_owned_inventory` with the `resident_carry` or
+    /// `resident_equipment` endpoint.
+    record resident-loaded-state {
+        x: f64,
+        y: f64,
+        z: f64,
+        health: f32,
+        carried: list<resident-item-summary>,
+    }
+
+    /// The owner-scoped physical points of interest bound to one resident.
+    ///
+    /// Each value is an opaque POI handle the server issued, or absent for a POI
+    /// this resident is not bound to. Home is the site the resident lives at (a
+    /// settlement home POI), work is where it works and meeting is where it
+    /// gathers.
+    record resident-pois {
+        home: option<string>,
+        work: option<string>,
+        meeting: option<string>,
+    }
+
+    /// One bounded server-owned snapshot of a durable resident handle.
+    ///
+    /// `loaded` is present exactly when the lifecycle is `alive-loaded`, because
+    /// only a loaded resident has live state; a dead or unloaded one keeps its
+    /// handle, its entity and its revision without a pose.
+    record resident-snapshot {
+        handle: string,
+        entity-uuid: string,
+        lifecycle: resident-lifecycle,
+        revision: u64,
+        generation-id: option<string>,
+        pois: resident-pois,
+        loaded: option<resident-loaded-state>,
+    }
+
+    /// One claim: adopt the live villager with this entity uuid.
+    ///
+    /// The entity uuid is the server's canonical uuid string (36 bytes, dashed
+    /// lowercase hex) of a live villager the claiming actor can reach; the
+    /// server refuses one it does not hold, one that is not a villager, and one
+    /// further away than `mc_script::MAX_RESIDENT_CLAIM_DISTANCE` (64 blocks)
+    /// from the named actor. `expected-entity-revision` is `0` for an entity this
+    /// plugin has never bound - the only value the server accepts for a first
+    /// claim - and the resident's current revision when the plugin already holds
+    /// it.
+    ///
+    /// `actor-id` is the runtime player id of the session making the claim, the
+    /// same id a `player-joined` event carries.
+    record resident-claim {
+        /// The durable operation id, 1..64 bytes in the contract's script-id
+        /// alphabet, as `storage-batch-cas` documents it. A repeat with identical
+        /// content replays the recorded outcome; the same id with different
+        /// content is refused with `operation_conflict`.
+        operation-id: string,
+        /// The claiming actor: the runtime id of the session that must be near
+        /// the entity.
+        actor-id: u64,
+        /// The server's canonical uuid string of the villager to adopt.
+        entity-uuid: string,
+        /// `0` for a first claim, otherwise the resident's current revision.
+        expected-entity-revision: u64,
+    }
+
+    /// One spawn: materialise the resident a reserved site is waiting for.
+    ///
+    /// The token is the opaque `spawn-site-token` a settlement reservation
+    /// answered with; a plugin never derives one. The server materialises its own
+    /// villager at the reserved point of interest, so the spawn is refused when
+    /// that cell's chunk is not loaded, when the cell cannot hold a standing body,
+    /// or when the reservation was already consumed or released. The answer is
+    /// the new resident's snapshot, whose handle is derived from the reservation's
+    /// generation and not from anything the plugin sent.
+    record resident-spawn {
+        /// The durable operation id, as `resident-claim` documents it.
+        operation-id: string,
+        /// The opaque spawn site token from a resident site reservation.
+        spawn-site-token: string,
+        /// What to materialise: the server's own villager.
+        profile: resident-profile,
+    }
+
+    /// One point-of-interest binding: replace this resident's home, work and
+    /// meeting POIs.
+    ///
+    /// All three are sent together, so a binding never looks half applied: an
+    /// absent value unbinds that POI, and the server records the new set or
+    /// nothing. `expected-revision` is the resident revision the plugin last
+    /// read; the server refuses a stale one with `stale_revision` rather than
+    /// overwriting a binding another step made.
+    record resident-set-pois {
+        /// The durable operation id, as `resident-claim` documents it.
+        operation-id: string,
+        /// The durable resident handle to bind.
+        handle: string,
+        /// The opaque home POI handle, or absent to unbind it.
+        home-poi: option<string>,
+        /// The opaque work POI handle, or absent to unbind it.
+        work-poi: option<string>,
+        /// The opaque meeting POI handle, or absent to unbind it.
+        meeting-poi: option<string>,
+        /// The resident revision this binding expects.
+        expected-revision: u64,
+    }
+
+    /// One durable resident call.
+    variant resident-operation {
+        claim(resident-claim),
+        spawn(resident-spawn),
+        set-pois(resident-set-pois),
+    }
+
+    /// The answer to one resident call: the resident as the server now holds it.
+    variant resident-result {
+        snapshot(resident-snapshot),
+    }
+
+    /// One bounded axis-aligned work area the engine executes against.
+    ///
+    /// Each axis is at most `mc_script::MAX_WORK_AREA_AXIS` (16) blocks wide, so
+    /// one work order is a bounded amount of engine work rather than a region
+    /// scan, and `min` is never past `max` on any axis.
+    record work-area {
+        dimension: string,
+        min: block-position,
+        max: block-position,
+    }
+
+    /// The four work orders that take a work area and the tool they require.
+    ///
+    /// Harvest, cut-tree, mine and fish differ only in what the engine does with
+    /// the cells it is given, so they share one record: the bounded area and the
+    /// registered item the worker must hold. A worker without the tool pauses
+    /// with `missing_tool` instead of working with whatever it has.
+    record area-tool-work {
+        area: work-area,
+        tool: string,
+    }
+
+    /// One tend-livestock order: the bounded pen and the feed it takes.
+    record tend-livestock-work {
+        area: work-area,
+        feed: string,
+    }
+
+    /// One haul: move items between two inventory endpoints.
+    ///
+    /// The endpoints are the same closed vocabulary a transfer uses, so a haul is
+    /// a real item move between real containers rather than a second kind of
+    /// inventory call. `item` names the exact item the move takes from the
+    /// source; absent means whatever the source holds first in slot order, which
+    /// is the shape a worker's own cargo deposit uses. A named item the source
+    /// does not hold pauses the assignment with `missing_input` instead of
+    /// moving something else.
+    record haul-work {
+        source: inventory-endpoint,
+        destination: inventory-endpoint,
+        item: option<string>,
+    }
+
+    /// One craft: consume the recipe's inputs and produce its output.
+    ///
+    /// `station` is one loaded crafting-table cell the native engine verifies
+    /// before consuming inputs. At most `mc_script::MAX_WORK_UNITS` (4096)
+    /// units are craftable in one order, and the recipe must be one the server's
+    /// own registry knows. The inputs are consumed exactly once: a worker
+    /// missing them pauses with `missing_input` and nothing is consumed.
+    record craft-work {
+        recipe: string,
+        count: u32,
+        station: work-area,
+    }
+
+    /// One construct: commit the next stage of a prepared structure.
+    ///
+    /// `structure-id` and `stage` are the server's own ids from the structure
+    /// snapshot the settlement operations answered with, and
+    /// `expected-revision` is the structure revision the plugin read. A worker
+    /// building against a stale revision pauses instead of committing a stage
+    /// the plan no longer holds.
+    record construct-work {
+        structure-id: string,
+        stage: string,
+        expected-revision: u64,
+    }
+
+    /// The closed work-order union the current settlement consumer sends.
+    ///
+    /// Every member is a concrete bounded target: an area, a container pair, a
+    /// recipe or a structure stage. The engine decides what the worker can
+    /// actually do there and reports it in the assignment result.
+    variant work-order {
+        harvest(area-tool-work),
+        cut-tree(area-tool-work),
+        mine(area-tool-work),
+        fish(area-tool-work),
+        tend-livestock(tend-livestock-work),
+        haul(haul-work),
+        craft(craft-work),
+        construct(construct-work),
+    }
+
+    /// Closed formation vocabulary.
+    enum formation-kind {
+        line,
+        column,
+        wedge,
+        square,
+    }
+
+    /// The formation the engine renders for one squad order.
+    ///
+    /// Spacing is in half-blocks: `4` is two blocks between adjacent slots, and
+    /// the server admits `mc_script::MIN_FORMATION_SPACING` (1) through
+    /// `MAX_FORMATION_SPACING` (32).
+    record formation {
+        kind: formation-kind,
+        spacing: u8,
+    }
+
+    /// Closed hostile category one target reference may address.
+    enum hostile-category {
+        hostile,
+        player,
+        owned-resident,
+        neutral-animal,
+    }
+
+    /// The bounded ally and target policy supplied with an attack order.
+    ///
+    /// `allies` holds at most `mc_script::MAX_ORDER_AFFILIATIONS` (64) opaque
+    /// affiliations - owned resident handles and allied player uuids - and
+    /// `permitted` names the categories the members may engage. `revision` is the
+    /// policy revision the plugin is reasoning about.
+    record engagement-policy {
+        revision: u64,
+        allies: list<string>,
+        permitted: list<hostile-category>,
+    }
+
+    /// One opaque, server-issued target reference.
+    ///
+    /// A plugin does not name an entity: it sends back a reference the server
+    /// issued, with the policy revision it was issued under and the revision it
+    /// expires at. A reference the server no longer holds, or one whose policy
+    /// revision has moved, is refused rather than resolved to something else.
+    record order-target-ref {
+        target-ref: string,
+        policy-revision: u64,
+        expires-revision: u64,
+    }
+
+    /// One follow order: walk with the named player.
+    record follow-order {
+        target-player: u64,
+        formation: formation,
+    }
+
+    /// One move order: walk to an anchor and face a heading.
+    record move-order {
+        dimension: string,
+        anchor: block-position,
+        heading-degrees: u16,
+        formation: formation,
+    }
+
+    /// One hold order: stand at an anchor and engage inside a radius.
+    record hold-order {
+        anchor: block-position,
+        heading-degrees: u16,
+        formation: formation,
+        engagement-radius: u8,
+    }
+
+    /// One patrol order: walk a closed route of waypoints.
+    ///
+    /// Between `mc_script::MIN_ORDER_WAYPOINTS` (2) and `MAX_ORDER_WAYPOINTS`
+    /// (16) waypoints, with no two adjacent waypoints the same cell. Waypoint
+    /// order is the route and is never reordered by the server.
+    record patrol-order {
+        waypoints: list<block-position>,
+        formation: formation,
+        engagement-radius: u8,
+    }
+
+    /// One garrison order: hold a set of server-issued posts.
+    ///
+    /// Between one and `mc_script::MAX_ORDER_TARGETS` (64) opaque post handles,
+    /// each one a point of interest the server issued, with no duplicates.
+    record garrison-order {
+        posts: list<string>,
+        engagement-radius: u8,
+    }
+
+    /// One attack order: engage the named targets under this policy.
+    ///
+    /// Between one and `mc_script::MAX_ORDER_TARGETS` (64) target references,
+    /// sorted and unique by reference. Ammunition, line of sight and the ally
+    /// policy are decided by the engine per member and reported in the outcome.
+    record attack-order {
+        targets: list<order-target-ref>,
+        policy: engagement-policy,
+    }
+
+    /// One retreat order: fall back to an anchor in formation.
+    record retreat-order {
+        anchor: block-position,
+        formation: formation,
+    }
+
+    /// The closed squad-order union the current settlement consumer sends.
+    variant order {
+        follow(follow-order),
+        move(move-order),
+        hold(hold-order),
+        patrol(patrol-order),
+        garrison(garrison-order),
+        attack(attack-order),
+        retreat(retreat-order),
+    }
+
+    /// One work assignment: give the worker an order and a unit budget.
+    ///
+    /// `work-units` is how much of the order the engine may commit in this call,
+    /// between 1 and `mc_script::MAX_WORK_UNITS` (4096); it is the caller's own
+    /// bound, not a count of blocks the engine promises. `expected-revision` is
+    /// the resident revision the plugin read, so an assignment against a stale
+    /// resident is refused rather than stacked on a decision that moved.
+    record assign-work {
+        operation-id: string,
+        handle: string,
+        work: work-order,
+        work-units: u64,
+        expected-revision: u64,
+    }
+
+    /// One work cancellation: stop what this resident was told to do.
+    record cancel-work {
+        operation-id: string,
+        handle: string,
+        expected-revision: u64,
+    }
+
+    /// One squad order: give every named member the same order.
+    ///
+    /// Members are the durable handles the plugin holds, each with the order
+    /// revision it expects, so one member whose revision moved is reported as
+    /// `stale-revision` in the outcome rather than stopping the others. At most
+    /// `mc_script::MAX_RESIDENT_ORDER_HANDLES` (64) members, each named once.
+    record issue-order {
+        operation-id: string,
+        handles: list<string>,
+        expected-order-revisions: list<u64>,
+        order: order,
+    }
+
+    /// One squad order cancellation, against the same member list.
+    record cancel-order {
+        operation-id: string,
+        handles: list<string>,
+        expected-order-revisions: list<u64>,
+    }
+
+    /// One demobilisation: turn a serving resident back into a civilian.
+    ///
+    /// The server returns the serving gear to the resident's own containers and
+    /// keeps the handle and the housing, so a demobilised resident is still the
+    /// plugin's resident. A resident that cannot hand its gear anywhere stays
+    /// `demobilizing` with the gear and a typed reason instead of losing a stack.
+    record demobilize {
+        operation-id: string,
+        handle: string,
+        expected-revision: u64,
+    }
+
+    /// One durable resident work or squad call.
+    variant resident-order-operation {
+        assign-work(assign-work),
+        cancel-work(cancel-work),
+        issue-order(issue-order),
+        cancel-order(cancel-order),
+        demobilize(demobilize),
+    }
+
+    /// Closed pause reason for a work assignment or a demobilisation.
+    enum work-pause-reason {
+        unloaded,
+        no-workers,
+        missing-input,
+        missing-tool,
+        missing-station,
+        blocked-route,
+        interrupted,
+        protected,
+        unsupported,
+        no-storage,
+    }
+
+    /// Lifecycle state of one work assignment.
+    enum work-state {
+        accepted,
+        running,
+        paused,
+        committed,
+        cancelled,
+    }
+
+    /// One committed inventory change.
+    ///
+    /// Only changes the engine actually committed are reported: a positive delta
+    /// produced items and a negative one consumed them. This is the receipt for
+    /// what the order did to the world's items, so a plugin reads its own
+    /// accounting from it instead of assuming an order succeeded.
+    record item-change {
+        item-id: string,
+        delta: s64,
+    }
+
+    /// One work assignment result.
+    ///
+    /// `reason` is present exactly when the state is `paused`, and
+    /// `work-units-done` never exceeds `work-units-planned`.
+    record work-assignment {
+        handle: string,
+        state: work-state,
+        reason: option<work-pause-reason>,
+        work-units-done: u64,
+        work-units-planned: u64,
+        changes: list<item-change>,
+        revision: u64,
+    }
+
+    /// One cancellation result: the resident and the revision it now holds.
+    record work-cancelled {
+        handle: string,
+        revision: u64,
+    }
+
+    /// Closed observable state of one squad member after an order.
+    ///
+    /// `applied` means the member is executing the order; every other member is
+    /// reported with the reason it is not, which is what makes a partial squad
+    /// order readable instead of silently partial.
+    enum order-member-state {
+        applied,
+        blocked-route,
+        unloaded,
+        dead,
+        migrating,
+        forbidden,
+        stale-revision,
+    }
+
+    /// One server-issued target reference surfaced to the plugin.
+    record order-target {
+        target-ref: string,
+        category: hostile-category,
+        position: block-position,
+    }
+
+    /// One member's observable outcome after a squad order.
+    ///
+    /// `formation-slot` is present exactly when the member was `applied`, and
+    /// `targets` holds the references that member may engage, bounded by
+    /// `mc_script::MAX_ORDER_TARGETS`.
+    record order-member-outcome {
+        handle: string,
+        state: order-member-state,
+        formation-slot: option<u16>,
+        targets: list<order-target>,
+    }
+
+    /// One committed combat outcome. Damage is in thousandths of a health point.
+    ///
+    /// The event id is the server's own, so a plugin awards experience exactly
+    /// once per event; `order-revision` ties the outcome to the order that caused
+    /// it, and `killed` says whether the victim died from it.
+    record combat-event {
+        event-id: u64,
+        revision: u64,
+        attacker-handle: string,
+        victim-target-ref: string,
+        order-revision: u64,
+        damage-milli: u32,
+        killed: bool,
+    }
+
+    /// One squad order result: the order revision, the members, and the combat
+    /// the order committed.
+    record order-result {
+        order-revision: u64,
+        members: list<order-member-outcome>,
+        combat: list<combat-event>,
+    }
+
+    /// One squad cancellation result, against the same member list.
+    record order-cancelled {
+        order-revision: u64,
+        members: list<order-member-outcome>,
+    }
+
+    /// Demobilisation state of one resident.
+    enum demobilize-state {
+        demobilizing,
+        civilian,
+    }
+
+    /// One demobilisation result.
+    ///
+    /// `reason` is present exactly when the state is `demobilizing`, and
+    /// `returned` holds the committed item changes of the gear that came back.
+    record demobilize-result {
+        handle: string,
+        state: demobilize-state,
+        reason: option<work-pause-reason>,
+        returned: list<item-change>,
+        revision: u64,
+    }
+
+    /// The answer to one resident work or squad call.
+    variant resident-order-result {
+        work(work-assignment),
+        work-cancelled(work-cancelled),
+        order(order-result),
+        order-cancelled(order-cancelled),
+        demobilized(demobilize-result),
+    }
+}

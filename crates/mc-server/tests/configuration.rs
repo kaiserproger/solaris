@@ -27,7 +27,7 @@ use mc_protocol::packets::play::LoginPlay;
 use mc_protocol::packets::{ChatVisibility, ClientInformation, MainHand, ParticleStatus};
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{
-    MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, SCRIPT_API_VERSION, ScriptEvent, ScriptEventKind,
+    COMPONENT_PLUGIN_API_VERSION, MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES, ScriptEvent, ScriptEventKind,
     ScriptHostEndpoint, ScriptPluginManifest, ScriptProtocolPhase, ValidatedScriptPluginManifest,
 };
 use sha2::{Digest, Sha256};
@@ -144,10 +144,15 @@ fn full_registry_sidecar() -> TempDir {
 }
 
 fn script_channel_manifest() -> ValidatedScriptPluginManifest {
-    ScriptPluginManifest::new("test-payload", "Test Payload", "0.1.0", SCRIPT_API_VERSION)
-        .declare_custom_payload_channel(SCRIPT_CHANNEL)
-        .validate()
-        .expect("test payload channel manifest validates")
+    ScriptPluginManifest::new(
+        "test-payload",
+        "Test Payload",
+        "0.1.0",
+        COMPONENT_PLUGIN_API_VERSION,
+    )
+    .declare_custom_payload_channel(SCRIPT_CHANNEL)
+    .validate()
+    .expect("test payload channel manifest validates")
 }
 
 async fn start_server_with_script_payloads() -> (SocketAddr, ScriptHostEndpoint) {

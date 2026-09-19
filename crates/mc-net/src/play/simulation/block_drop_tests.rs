@@ -66,6 +66,8 @@ fn mining_accepts_leaf_distance_updates_but_rejects_replaced_blocks() {
             max_damage: None,
         },
         drop_items: false,
+        hook_approval: None,
+        zone_fence: None,
     };
     storage.set_block_at(pos, BlockStateId(2)).unwrap();
     storage.set_block_at(pos, BlockStateId(1)).unwrap();

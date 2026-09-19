@@ -392,18 +392,12 @@ impl LiveSettlementWorld {
         }
     }
 
-    /// Mint a fresh observation revision over `bounds`.
-    ///
-    /// The revision records the block content of the observed volume, so a
-    /// later [`SettlementWorld::footprint_changed_since`] check localizes a
-    /// change to the footprint itself instead of to any durable write that
-    /// happened to share a chunk with it.
-    fn next_revision(&self, bounds: ScriptSurveyBounds) -> u64 {
+    /// Record one exact footprint image under a fresh revision.
+    fn record_footprint(&self, footprint: Option<u64>) -> u64 {
         let revision = self
             .revision
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        let footprint = self.footprint_digest(bounds);
         if let Ok(mut observations) = self.observations.lock() {
             if observations.len() >= MAX_OBSERVED_REVISIONS {
                 observations.clear();
@@ -413,11 +407,30 @@ impl LiveSettlementWorld {
         revision
     }
 
+    /// Mint a fresh observation revision over `bounds`.
+    ///
+    /// The revision records the block content of the observed volume, so a
+    /// later [`SettlementWorld::footprint_changed_since`] check localizes a
+    /// change to the footprint itself instead of to any durable write that
+    /// happened to share a chunk with it.
+    fn next_revision(&self, bounds: ScriptSurveyBounds) -> u64 {
+        self.record_footprint(self.footprint_digest(bounds))
+    }
+
     /// A digest of every block state inside `bounds`, in a fixed order.
     ///
     /// `None` when any covering chunk is not loaded: a footprint that cannot be
     /// read back cannot be proven unchanged.
     fn footprint_digest(&self, bounds: ScriptSurveyBounds) -> Option<u64> {
+        self.footprint_digest_after(bounds, &BTreeMap::new())
+    }
+
+    /// Digest the same footprint after replacing the finite portion's cells.
+    fn footprint_digest_after(
+        &self,
+        bounds: ScriptSurveyBounds,
+        replacements: &BTreeMap<[i32; 3], mc_world::BlockStateId>,
+    ) -> Option<u64> {
         const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
         let positions = Self::chunk_positions(bounds);
@@ -426,18 +439,23 @@ impl LiveSettlementWorld {
         for y in bounds.min[1]..=bounds.max[1] {
             for z in bounds.min[2]..=bounds.max[2] {
                 for x in bounds.min[0]..=bounds.max[0] {
-                    let position = ChunkPos {
-                        x: x.div_euclid(CHUNK_AXIS),
-                        z: z.div_euclid(CHUNK_AXIS),
+                    let state = match replacements.get(&[x, y, z]) {
+                        Some(state) => u64::from(state.0),
+                        None => {
+                            let position = ChunkPos {
+                                x: x.div_euclid(CHUNK_AXIS),
+                                z: z.div_euclid(CHUNK_AXIS),
+                            };
+                            snapshot
+                                .chunk_ref(position)?
+                                .get_block(
+                                    x.rem_euclid(CHUNK_AXIS) as u8,
+                                    y,
+                                    z.rem_euclid(CHUNK_AXIS) as u8,
+                                )
+                                .map_or(u64::MAX, |state| u64::from(state.0))
+                        }
                     };
-                    let chunk = snapshot.chunk_ref(position)?;
-                    let state = chunk
-                        .get_block(
-                            x.rem_euclid(CHUNK_AXIS) as u8,
-                            y,
-                            z.rem_euclid(CHUNK_AXIS) as u8,
-                        )
-                        .map_or(u64::MAX, |state| u64::from(state.0));
                     digest = (digest ^ state).wrapping_mul(FNV_PRIME);
                 }
             }
@@ -597,6 +615,27 @@ impl SettlementWorld for LiveSettlementWorld {
         self.next_revision(bounds)
     }
 
+    fn predict_structure_portion_revision(
+        &self,
+        bounds: ScriptSurveyBounds,
+        blocks: &[StructureBlockPlacement],
+    ) -> Result<u64, ScriptOperationFailure> {
+        let mut replacements = BTreeMap::new();
+        for block in blocks {
+            if !(bounds.min[0]..=bounds.max[0]).contains(&block.pos[0])
+                || !(bounds.min[1]..=bounds.max[1]).contains(&block.pos[1])
+                || !(bounds.min[2]..=bounds.max[2]).contains(&block.pos[2])
+                || replacements.insert(block.pos, block.state).is_some()
+            {
+                return Err(ScriptOperationFailure::InvalidRequest);
+            }
+        }
+        let Some(footprint) = self.footprint_digest_after(bounds, &replacements) else {
+            return Err(ScriptOperationFailure::Unloaded);
+        };
+        Ok(self.record_footprint(Some(footprint)))
+    }
+
     fn footprint_changed_since(&self, bounds: ScriptSurveyBounds, revision: u64) -> bool {
         let Ok(observations) = self.observations.lock() else {
             // An unreadable observation ledger cannot prove the footprint is
@@ -684,6 +723,37 @@ impl SettlementWorld for LiveSettlementWorld {
         ))
     }
 
+    fn village_containers(
+        &self,
+        bounds: ScriptSurveyBounds,
+    ) -> Result<VillageReading<[i32; 3]>, ScriptOperationFailure> {
+        let positions = Self::chunk_positions(bounds);
+        let snapshot = self.read.snapshot_chunks(&positions);
+        if positions
+            .iter()
+            .any(|position| !snapshot.contains_chunk(*position))
+        {
+            return Ok(VillageReading::Unloaded);
+        }
+        let mut containers = Vec::new();
+        for position in positions {
+            let chunk = snapshot
+                .chunk_ref(position)
+                .expect("the reading covered this chunk");
+            for container in chunk.chests.keys() {
+                let at = [container.x, container.y, container.z];
+                if (bounds.min[0]..=bounds.max[0]).contains(&at[0])
+                    && (bounds.min[1]..=bounds.max[1]).contains(&at[1])
+                    && (bounds.min[2]..=bounds.max[2]).contains(&at[2])
+                {
+                    containers.push(at);
+                }
+            }
+        }
+        containers.sort_unstable();
+        Ok(VillageReading::Loaded(containers))
+    }
+
     fn commit_warehouse_transfer(
         &self,
         request: WarehouseTransferRequest,
@@ -708,15 +778,27 @@ impl SettlementWorld for LiveSettlementWorld {
         })
     }
 
-    fn apply_structure_portion<'a>(
+    fn commit_structure_portion<'a>(
         &'a self,
-        _plugin_id: &'a str,
+        plugin_id: &'a str,
         _structure_id: &'a str,
         blocks: &'a [StructureBlockPlacement],
-    ) -> Pin<Box<dyn Future<Output = Result<(), ScriptOperationFailure>> + Send + 'a>> {
+        receipt: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>> {
         Box::pin(async move {
             if blocks.is_empty() || blocks.len() > MAX_WORLD_COMMIT_PORTION {
                 return Err(ScriptOperationFailure::InvalidRequest);
+            }
+            let zone_fence = self
+                .zones
+                .as_ref()
+                .map(crate::script::PluginZoneAdapter::capture_protection_fence);
+            if blocks.iter().any(|placement| {
+                self.zones.as_ref().is_some_and(|zones| {
+                    zones.foreign_zone_overlaps(plugin_id, OVERWORLD, placement.pos, placement.pos)
+                })
+            }) {
+                return Err(ScriptOperationFailure::Forbidden);
             }
             let edits = blocks
                 .iter()
@@ -731,16 +813,17 @@ impl SettlementWorld for LiveSettlementWorld {
                     )
                 })
                 .collect::<Vec<_>>();
-            // The simulation owns block mutation, so submit the whole portion as
-            // exactly one server-owned batch and await the commit. Publication,
-            // reactivity and relighting are the pipeline's post-commit projection:
-            // a stage is durable only once this command has committed.
-            match self.simulation.apply_server_owned_block_edits(edits).await {
-                Ok(Some(_outcome)) => Ok(()),
-                // A missing, stale or cross-region batch applied nothing; the caller
-                // keeps its receipt unspent and retries. An unavailable or closed
-                // queue is never reported as a committed portion.
-                Ok(None) | Err(_) => Err(ScriptOperationFailure::RuntimeUnavailable),
+            match self
+                .simulation
+                .commit_server_owned_block_edits(plugin_id, edits, zone_fence, receipt)
+                .await
+            {
+                Ok(Some(decision_id)) => Ok(decision_id),
+                Ok(None) => Err(ScriptOperationFailure::StaleRevision),
+                Err(crate::play::SimulationRequestError::Precommit(
+                    mc_script::precommit::HookFailure::PermissionDenied,
+                )) => Err(ScriptOperationFailure::Forbidden),
+                Err(_) => Err(ScriptOperationFailure::RuntimeUnavailable),
             }
         })
     }

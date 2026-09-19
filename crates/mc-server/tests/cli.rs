@@ -2,15 +2,20 @@
 //!
 //! These cover only the synchronous `--check` path (parse a config, print
 //! it, exit). The end-to-end "actually serve a connection" test lives in
-//! `tests/status.rs` because it needs tokio and a real socket.
+//! `tests/status.rs` because it needs tokio and a real socket. A component
+//! deployment's own refusals are exercised here on the real binary, `--check`
+//! and `serve` alike, because what they have to prove is that startup fails
+//! before a world, a storage or a listener exists.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use tempfile::NamedTempFile;
+
+mod component_fixture;
 
 const SAMPLE_TOML: &str = r#"
 [server]
@@ -179,7 +184,7 @@ fn check_prints_parsed_config_and_exits_zero() {
 }
 
 #[test]
-fn check_reports_derived_deployment_for_every_plugin() {
+fn check_reports_component_deployment_ids() {
     let root = tempfile::tempdir().expect("plugin root");
     let plugins = root.path().join("plugins");
     let server_only = plugins.join("server-only");
@@ -193,18 +198,23 @@ fn check_reports_derived_deployment_for_every_plugin() {
             id = "server-only"
             name = "Server Only"
             version = "0.1.0"
-            api = "0.6.0"
+            api = "0.7.0"
         "#,
     )
     .expect("write server-only manifest");
-    std::fs::write(server_only.join("main.lua"), "").expect("write server-only source");
+    std::fs::write(
+        server_only.join("plugin.wasm"),
+        component_fixture::component_bytes(),
+    )
+    .expect("write server-only component");
+    std::fs::write(server_only.join("config.toml"), "").expect("write server-only config");
     std::fs::write(
         server_and_client.join("plugin.toml"),
         r#"
             id = "server-and-client"
             name = "Server And Client"
             version = "0.1.0"
-            api = "0.6.0"
+            api = "0.7.0"
 
             [client]
             schema = 2
@@ -221,7 +231,13 @@ fn check_reports_derived_deployment_for_every_plugin() {
         "#,
     )
     .expect("write client-required manifest");
-    std::fs::write(server_and_client.join("main.lua"), "").expect("write client-required source");
+    std::fs::write(
+        server_and_client.join("plugin.wasm"),
+        component_fixture::component_bytes(),
+    )
+    .expect("write client-required component");
+    std::fs::write(server_and_client.join("config.toml"), "")
+        .expect("write client-required config");
     std::fs::write(server_and_client.join("client/assets.zip"), b"x")
         .expect("write client artifact");
     let world = root.path().join("world");
@@ -260,37 +276,9 @@ fn check_reports_derived_deployment_for_every_plugin() {
         .get_output()
         .stdout
         .clone();
-    let check: serde_json::Value = serde_json::from_slice(&output).expect("parse check JSON");
-
     assert_eq!(
-        check["discovered_plugins"],
-        serde_json::json!([
-            {
-                "id": "server-and-client",
-                "deployment": "server_and_client",
-                "supported_loaders": ["fabric"],
-                "permissions": ["load_assets"],
-                "total_artifact_bytes": 1,
-                "client_bundles": [{
-                    "id": "assets",
-                    "version": "1",
-                    "artifact": "client/assets.zip",
-                    "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
-                    "size_bytes": 1,
-                    "loaders": ["fabric"],
-                    "content": ["assets"],
-                    "permissions": ["load_assets"]
-                }]
-            },
-            {
-                "id": "server-only",
-                "deployment": "server_only",
-                "supported_loaders": [],
-                "permissions": [],
-                "total_artifact_bytes": 0,
-                "client_bundles": []
-            }
-        ])
+        String::from_utf8(output).expect("check output is UTF-8"),
+        "component plugins checked: server-and-client, server-only\n"
     );
 }
 
@@ -1838,25 +1826,22 @@ fn pregenerate_cannot_be_combined_with_check() {
 }
 
 #[test]
-fn check_refuses_a_component_deployment_whose_package_asks_for_the_luau_contract() {
-    // One runtime per deployment: a directory declared as `wasm` is read by the
-    // component host, and a package that requests the Luau contract version is
-    // refused there rather than silently loaded by the wrong loader.
+fn check_refuses_a_component_deployment_with_an_obsolete_api_version() {
     let root = tempfile::tempdir().expect("plugin root");
     let plugins = root.path().join("plugins");
-    let legacy = plugins.join("legacy");
-    std::fs::create_dir_all(&legacy).expect("create package directory");
+    let package = plugins.join("obsolete-api");
+    std::fs::create_dir_all(&package).expect("create package directory");
     std::fs::write(
-        legacy.join("plugin.toml"),
+        package.join("plugin.toml"),
         r#"
-            id = "legacy"
-            name = "Legacy"
+            id = "obsolete-api"
+            name = "Obsolete API"
             version = "0.1.0"
             api = "0.6.0"
         "#,
     )
     .expect("write manifest");
-    std::fs::write(legacy.join("plugin.wasm"), b"not a component").expect("write artifact");
+    std::fs::write(package.join("plugin.wasm"), b"not a component").expect("write artifact");
     let world = root.path().join("world");
     let config = root.path().join("config.toml");
     std::fs::write(
@@ -1876,9 +1861,8 @@ fn check_refuses_a_component_deployment_whose_package_asks_for_the_luau_contract
 
                 [plugins]
                 directory = "{}"
-                runtime = "wasm"
 
-                [plugins.grants.legacy]
+                [plugins.grants.obsolete-api]
                 capabilities = ["player_inventory"]
             "#,
             world.display(),
@@ -1896,11 +1880,198 @@ fn check_refuses_a_component_deployment_whose_package_asks_for_the_luau_contract
         .failure();
     let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
     assert!(
-        stderr.contains("legacy"),
+        stderr.contains("obsolete-api"),
         "the refusal names the package it refused, saw {stderr}"
     );
     assert!(
         stderr.contains("manifest"),
         "the refusal names what was wrong, saw {stderr}"
     );
+}
+
+/// The config a component deployment is checked or served with.
+///
+/// One runtime per deployment, as a deployed server writes it: the directory is
+/// read by the component host, which is why a package here is a real component.
+fn write_component_server_config(path: &Path, world: &Path, plugins: &Path, port: u16) -> PathBuf {
+    std::fs::write(
+        path,
+        format!(
+            r#"
+                [server]
+                name = "Component Deployment"
+                motd = "Hello"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = {port}
+
+                [data]
+                world_dir = "{}"
+
+                [plugins]
+                directory = "{}"
+                strict = true
+                expected = ["hello"]
+            "#,
+            world.display(),
+            plugins.display()
+        ),
+    )
+    .expect("write config");
+    path.to_path_buf()
+}
+
+/// A loopback port nothing holds, reserved by binding and releasing it.
+fn reserved_loopback_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
+    let port = listener.local_addr().expect("reserved address").port();
+    drop(listener);
+    port
+}
+
+/// Deploy the fixture package with one client bundle whose declared artifact is
+/// `declared` while the file on disk is `written`.
+///
+/// Every case below ships a real component; only the bundle's artifact is the
+/// defect under test, so a refusal is the server's own verification and not a
+/// package that never parsed.
+fn deploy_fixture_with_artifact(root: &Path, declared: &[u8], written: &[u8]) -> PathBuf {
+    let plugins = root.join("plugins");
+    let declarations = component_fixture::client_bundle_declaration(declared);
+    let package =
+        component_fixture::deploy_package(&plugins, "hello", &declarations, "greeting = \"Hi\"\n");
+    component_fixture::write_artifact(&package, "client/rich-content.zip", written);
+    plugins
+}
+
+#[test]
+fn check_accepts_a_component_deployment_that_ships_a_client_bundle() {
+    let root = tempfile::tempdir().expect("server root");
+    let artifact = component_fixture::artifact_bytes(r#"{"schema":2,"screens":[],"blocks":[]}"#);
+    let plugins = deploy_fixture_with_artifact(root.path(), &artifact, &artifact);
+    let world = root.path().join("world");
+    let config =
+        write_component_server_config(&root.path().join("config.toml"), &world, &plugins, 30002);
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(contains("component plugins checked: hello"));
+    assert!(
+        !world.exists(),
+        "checking a deployment creates no world directory"
+    );
+}
+
+#[test]
+fn check_refuses_a_component_bundle_whose_artifact_fails_verification() {
+    let root = tempfile::tempdir().expect("server root");
+    let declared = component_fixture::artifact_bytes(r#"{"schema":2,"screens":[],"blocks":[]}"#);
+    let plugins = deploy_fixture_with_artifact(root.path(), &declared, b"tampered");
+    let world = root.path().join("world");
+    let config =
+        write_component_server_config(&root.path().join("config.toml"), &world, &plugins, 30003);
+
+    let assertion = Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("client"),
+        "the refusal names the bundle contract it could not verify, saw {stderr}"
+    );
+    assert!(
+        !world.exists(),
+        "a refused deployment creates no world directory"
+    );
+}
+
+#[test]
+fn serve_fails_closed_on_a_component_bundle_that_fails_verification() {
+    // The refusal happens before the content cache is resolved, but the cache is
+    // still set so a regression cannot turn this case into an automatic import
+    // (and a download) instead of a failure. The server runs only on content
+    // derived from a licensed installation, so the case skips without one.
+    let Some(content_cache) = content_cache_for_tests() else {
+        eprintln!("skipping: no derived vanilla content cache on this machine");
+        return;
+    };
+    let root = tempfile::tempdir().expect("server root");
+    let declared = component_fixture::artifact_bytes(r#"{"schema":2,"screens":[],"blocks":[]}"#);
+    let plugins = deploy_fixture_with_artifact(root.path(), &declared, b"tampered");
+    let world = root.path().join("world");
+    let port = reserved_loopback_port();
+    let config =
+        write_component_server_config(&root.path().join("config.toml"), &world, &plugins, port);
+
+    let assertion = Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .env("SOLARIS_CONTENT_CACHE", &content_cache)
+        .arg("--config")
+        .arg(&config)
+        .arg("--no-console")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("client"),
+        "the refusal names the bundle contract it could not verify, saw {stderr}"
+    );
+    assert!(
+        !world.exists(),
+        "startup failed before it created a world directory"
+    );
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("a failed startup binds no listener");
+}
+
+#[test]
+fn check_refuses_a_verified_bundle_with_an_invalid_native_index() {
+    let root = tempfile::tempdir().expect("server root");
+    let artifact = component_fixture::artifact_bytes(
+        r#"{"schema":2,"screens":[{"id":"hello:panel","kind":"unsupported-kind","title":"Panel","widgets":[]}],"blocks":[]}"#,
+    );
+    let declarations = format!(
+        r#"
+[client]
+schema = 2
+[[client.bundles]]
+id = "views"
+version = "1"
+artifact = "client/views.zip"
+sha256 = "{}"
+size_bytes = {}
+loaders = ["fabric"]
+content = ["views"]
+permissions = ["present_views"]
+"#,
+        component_fixture::sha256_hex(&artifact),
+        artifact.len(),
+    );
+    let plugins = root.path().join("plugins");
+    let package = component_fixture::deploy_package(&plugins, "hello", &declarations, "");
+    component_fixture::write_artifact(&package, "client/views.zip", &artifact);
+    let world = root.path().join("world");
+    let port = reserved_loopback_port();
+    let config =
+        write_component_server_config(&root.path().join("config.toml"), &world, &plugins, port);
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .failure();
+    assert!(!world.exists(), "preflight refusal must not create a world");
+    std::net::TcpListener::bind(("127.0.0.1", port))
+        .expect("preflight refusal must not leave a listener");
 }

@@ -153,9 +153,9 @@ pub struct TabListSection {
 pub enum SettlementProfile {
     /// Core stock world: Solaris generates the five vanilla village structures
     /// (plains, desert, savanna, snowy, taiga) and their decor from the derived
-    /// content cache, so this profile places villages. A deployed Luau
-    /// settlement plan owns settlement content instead and suppresses this
-    /// lane; [`Self::PlainsVillagePrototype`] attaches no core villages either.
+    /// content cache, so this profile places villages. A deployed component
+    /// settlement plan owns settlement content instead and suppresses this lane;
+    /// [`Self::PlainsVillagePrototype`] attaches no core villages either.
     #[default]
     Vanilla,
     /// Bounded Solaris prototype, not full vanilla village generation: the
@@ -321,12 +321,10 @@ pub struct SimulationSection {
     #[serde(default = "default_hostile_spawn_chunk_budget")]
     pub hostile_spawn_chunk_budget: usize,
 }
-/// Optional external plugins, loaded from a deployed plugin directory.
+/// Optional component plugins, loaded from a deployed plugin directory.
 ///
-/// One deployment runs one runtime: `luau` is the path still in production while
-/// the component host is finished, `wasm` selects the WebAssembly components of
-/// the `solaris:plugin` contract. The two are never started together, so a
-/// directory cannot be half-read by one runtime and half by the other.
+/// A configured directory is always a WebAssembly component deployment of the
+/// `solaris:plugin` contract.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginSection {
@@ -336,33 +334,37 @@ pub struct PluginSection {
     pub strict: bool,
     #[serde(default)]
     pub expected: Vec<String>,
-    #[serde(default)]
-    pub runtime: PluginRuntime,
     /// Operator grants per plugin id. A capability a package requests must be
     /// granted here when the deployment requires grants; the package is refused
     /// otherwise instead of running with fewer rights than it asked for.
     #[serde(default)]
     pub grants: BTreeMap<String, PluginGrantSection>,
+    /// Explicit operator registrations of WebAssembly precommit hooks, one
+    /// `[[plugins.hooks]]` entry each. A package's manifest declares the hooks
+    /// it can answer; only a registration here turns one on, so a declaration
+    /// alone never changes an edit or a damage request.
+    #[serde(default)]
+    pub hooks: Vec<PluginHookSection>,
 }
 
-/// Which runtime a plugin directory belongs to.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginRuntime {
-    /// Strict Luau sources (`main.lua`, optional `rules.lua`).
-    #[default]
-    Luau,
-    /// WebAssembly components of the `solaris:plugin` contract (`plugin.wasm`).
-    Wasm,
-}
-
-impl PluginRuntime {
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Luau => "luau",
-            Self::Wasm => "wasm",
+impl PluginSection {
+    /// Refuse registrations without a component deployment to carry them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mismatch when hooks are registered without a deployment
+    /// directory that could contain the registered component.
+    pub fn validate_hooks(&self) -> Result<(), String> {
+        if self.hooks.is_empty() {
+            return Ok(());
         }
+        if self.directory.is_none() {
+            return Err(
+                "[plugins.hooks] registers precommit handlers, but plugins.directory names no component deployment their plugin_id could belong to"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -372,6 +374,70 @@ impl PluginRuntime {
 pub struct PluginGrantSection {
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+/// One explicit operator registration of a WebAssembly precommit hook.
+///
+/// This is the operator's decision, not the package's: the registration names
+/// the deployed package that must answer the hook, where it sits in the chain,
+/// and what happens when it cannot answer. Nothing here is derived from a
+/// guest's manifest, and a package that never declares the hook cannot be
+/// registered for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginHookSection {
+    /// The deployed package id this registration authorizes.
+    pub plugin_id: String,
+    /// Which precommit hook this registration turns on.
+    pub kind: PluginHookKind,
+    /// Chain position. Registrations run in ascending `(order, plugin_id)`.
+    #[serde(default)]
+    pub order: i32,
+    /// What the chain does when this handler fails. Denied by default: a hook
+    /// that cannot answer must never silently become an allowed edit.
+    #[serde(default)]
+    pub on_failure: PluginHookFailure,
+}
+
+/// Which precommit hook one `[[plugins.hooks]]` registration turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginHookKind {
+    BeforeBuild,
+    BeforeDamage,
+}
+
+/// What the chain does when a registered handler fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHookFailure {
+    /// Refuse the edit or the damage: the fail-closed default.
+    #[default]
+    Deny,
+    /// Keep the unmodified request.
+    Keep,
+}
+
+impl PluginHookSection {
+    /// The registration the native host's roster is built from.
+    ///
+    /// The operator's TOML spelling and the contract's native names are not the
+    /// same words, and this is the only place they are translated.
+    #[must_use]
+    pub fn registration(&self) -> mc_script::precommit::HookRegistration {
+        mc_script::precommit::HookRegistration::new(
+            self.plugin_id.clone(),
+            match self.kind {
+                PluginHookKind::BeforeBuild => mc_script::precommit::HookKind::Build,
+                PluginHookKind::BeforeDamage => mc_script::precommit::HookKind::Damage,
+            },
+            self.order,
+            match self.on_failure {
+                PluginHookFailure::Deny => mc_script::precommit::HookFailurePolicy::Deny,
+                PluginHookFailure::Keep => mc_script::precommit::HookFailurePolicy::Keep,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1662,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_plugin_directory_without_exposing_runtime_tuning() {
+    fn parses_component_plugin_deployment_configuration() {
         let toml_src = r#"
             [server]
             name = "S"
@@ -1685,6 +1751,14 @@ mod tests {
             cfg.plugins.expected,
             ["basic-economy".to_owned(), "online-roster".to_owned()]
         );
+        let error = toml::from_str::<ServerConfig>(
+            r#"
+                [plugins]
+                runtime = "wasm"
+            "#,
+        )
+        .expect_err("the removed plugin runtime selector must be rejected");
+        assert!(error.to_string().contains("unknown field `runtime`"));
     }
 
     #[test]
@@ -1694,10 +1768,15 @@ mod tests {
         ))
         .expect("parse Loader live-gate config");
 
+        // The gate's isolation, which is what this case is for: its own port, an
+        // analysis workspace it may be deleted from, offline auth and no
+        // autoscaling. Where the gate's plugin directory is packaged is the
+        // packaging script's business, so only the fact that it deploys one is
+        // asserted here.
         assert_eq!(cfg.network.port, 25567);
-        assert_eq!(
-            cfg.plugins.directory,
-            Some(PathBuf::from("examples/loader-live-gate/plugins"))
+        assert!(
+            cfg.plugins.directory.is_some(),
+            "the gate deploys a plugin directory"
         );
         assert_eq!(
             cfg.data.world_dir,

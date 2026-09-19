@@ -1,0 +1,350 @@
+{
+  "schema_version": 1,
+  "pack_id": "wasm-p3-zone-market",
+  "quality_label": "draft",
+  "minecraft_version": "26.1.2",
+  "server_command": "cargo run --bin mc-server -- --config <run-dir>/server.toml (prepared from SOLARIS_REAL_CLIENT_SERVER_CONFIG)",
+  "artifact_root": ".analysis/real-client-runs",
+  "deployment": {
+    "server_config": ".analysis/codex-logs/wasm-p3-zone-20260916/server.toml",
+    "server_addr": "127.0.0.1:43655",
+    "world_seed": 81,
+    "world_preconditions": "The fresh world is generated with seed 81 and worldgen_mode tellus_like, so its terrain is deterministic: on the z=12 block row the natural surface is dirt/snow topping out at y77 across x 5..16, the only natural blocks above it on that row are spruce leaves at x 5 y79, x 4 y78..82 and x 17 y79, and x 6..16 are clear from y78 up. The four corridor builders therefore write the only blocks at y78..79 across x 5..16 and leave the feet layer y80 as air; the client's own block scan re-checks solid-at-y79 and air-at-y80 for x 5..16 at run time, so any drift in this expectation fails the run instead of silently changing the crossing height.",
+    "plugin_runtime": "wasm",
+    "plugin_directory": ".analysis/codex-logs/wasm-p3-zone-20260916/deployment",
+    "expected_package": "inventory-compat",
+    "plugin_grants": {
+      "inventory-compat": [
+        "storage",
+        "inventory_storage_transactions",
+        "inventory_menus",
+        "zones"
+      ]
+    },
+    "package_declarations": {
+      "id": "inventory-compat",
+      "api": "0.7.0",
+      "events": [
+        "player.joined",
+        "player.left",
+        "inventory.menu.clicked",
+        "player.zone_entered",
+        "player.zone_exited"
+      ],
+      "player_commands": [
+        "trade"
+      ],
+      "config": "mode = \"zone-market\""
+    },
+    "build_recipe": [
+      "rustup target add wasm32-unknown-unknown (once per toolchain)",
+      "cd sdk/rust && cargo build --release --target wasm32-unknown-unknown -p solaris-hello-plugin",
+      "target/debug/p1-component-packager sdk/rust/target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm .analysis/codex-logs/wasm-p3-zone-20260916/deployment/inventory-compat/plugin.wasm",
+      "the encoder is the recorded build artifact (sha256 7becacf5e6900a289e8b38722dfc51307d6433a888b6330036a224e3f9113672, recorded at .analysis/codex-logs/wasm-p2-live-20260916/prerequisites.json); plugin.toml and config.toml beside plugin.wasm are already written in that deployment directory"
+    ],
+    "operator_env": "SOLARIS_REAL_CLIENT_MANIFEST=docs/real-client-regression/manifests/wasm-p3-zone-market.json SOLARIS_REAL_CLIENT_AGENT_SCENARIO=wasm-p3-zone-market SOLARIS_REAL_CLIENT_SERVER_CONFIG=.analysis/codex-logs/wasm-p3-zone-20260916/server.toml SOLARIS_REAL_CLIENT_SERVER_ADDR=127.0.0.1:43655 SOLARIS_REAL_CLIENT_FRESH_WORLD=1 python3 -m tools.harness run regression --timeout-seconds 900"
+  },
+  "client_requirement": "A real graphical Minecraft Java Edition 26.1.2 client must execute this scenario through the repo-native Gradle runClient adapter (:fabric-agent:runClientAgent, net.neoforged.moddev). That client carries the repo's JVM client-agent bridge for observation and input only and deliberately does NOT load the Solaris Loader mod, so every /trade answer, every zone marker and every window arrives over the ordinary play protocol; it is a no-Loader development client, not an uninstrumented production binary. Protocol bots, wire probes and mock clients do not satisfy this gate. The scenario crosses the zone boundary with the client's own forward input, dispatches its menu clicks through the bridge's real container-click action, and takes the one teleport exit through the server's own /tp command.",
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "headless mock client",
+    "source-string assertion"
+  ],
+  "required_artifacts": [
+    "manifest.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt",
+    "automation-driver.txt"
+  ],
+  "automation_runner": {
+    "script": "python3 -m tools.harness run regression",
+    "delegates_to": "tools/harness/backends/regression.sh",
+    "agent_driver": "tools/harness/backends/driver.py",
+    "client_adapter": "../solaris-loader/gradlew -p ../solaris-loader --no-configuration-cache :fabric-agent:runClientAgent",
+    "client_adapter_source": "auto-gradle-runclient",
+    "client_isolation": "The primary Gradle runClient uses a per-run game directory and the fixed offline username SolarisPrimary.",
+    "modes": [
+      "--check",
+      "--prepare",
+      "--run",
+      "--validate-run"
+    ],
+    "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+    "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
+    "agent_port_env": "SOLARIS_REAL_CLIENT_AGENT_PORT",
+    "agent_server_addr_env": "SOLARIS_REAL_CLIENT_SERVER_ADDR",
+    "server_config_env": "SOLARIS_REAL_CLIENT_SERVER_CONFIG",
+    "fresh_world_env": "SOLARIS_REAL_CLIENT_FRESH_WORLD",
+    "default_agent_scenario": "wasm-p3-zone-market",
+    "prepared_status": "prepared-owner-run",
+    "passing_gate": "agent-run real-client"
+  },
+  "scenarios": [
+    {
+      "id": "wasm-p3-zone-market",
+      "title": "External WASM zone market: real boundary crossings open and close the market in a no-Loader graphical client",
+      "ledger_rows": [
+        "P3"
+      ],
+      "status": "manual-pending",
+      "no_debug_commands": false,
+      "bounded_time_minutes": 24,
+      "screenshots_required": true,
+      "steps": [
+        "Start Solaris from a fresh world with runtime = \"wasm\", strict = true, expected = [\"inventory-compat\"], the explicit storage/inventory_storage_transactions/inventory_menus/zones grants, and config.toml mode = \"zone-market\". The package declares player_commands = [\"trade\"] and events = [\"player.joined\", \"player.left\", \"inventory.menu.clicked\", \"player.zone_entered\", \"player.zone_exited\"]. The trade-ledger key must start absent.",
+        "Launch the real graphical 26.1.2 client through the repo-native Gradle runClient adapter (no Solaris Loader mod) and let the agent driver connect it to the loopback server address.",
+        "Fixture setup at the world spawn, declared debug and never claimed as no-debug survival: gamemode survival, /give minecraft:emerald 4, /give minecraft:diamond_pickaxe 1, /summon minecraft:pig beside the player, select the pickaxe, and land one real survival attack so the pickaxe carries a non-zero client-visible damage component. This runs before the walkway exists so the summoned target never stands in the crossing path.",
+        "Operator platform, declared debug: four /debug water-corridor builder commands (x = 6, 9, 12 and 15 at y = 78, z = 13) whose z = 12 end caps form one continuous stone walkway at y 78..79 from x = 5 to x = 16. Each command is accepted only on its own fresh feedback line 'Debug water corridor at <x> 78 13 verified 68/68 block states', which is the server's own read-back of the 68 block states it wrote.",
+        "Platform verification through the client: one block scan of x 5..16, y 79..80 at z = 12 must show every column solid at y = 79 (the layer the walk happens on, i.e. a stone platform at y79) and air at y = 80 (the layer the player stands in). Then /tp 8.5 80.0 12.5 puts the player on that walkway outside the box, and the landing is accepted only once the client reports that position with a solid block under it and air at its feet.",
+        "The fixture creates the fixed box with /trade zone-setup: upsert trade-zone in minecraft:overworld from [10.0, 80.0, 10.0] to [16.0, 84.0, 16.0]. The client must publish the fresh P3_ZONE ready zone=trade-zone marker only after the owner answered that upsert Applied; no window may exist while the client stands outside the box, and exactly one fresh P3_ZONE line is accepted for this phase.",
+        "Every entry is ordinary walking: the driver faces the crossing direction, holds the client's own forward input for real ticks, and re-reads the client's own reported position until it crosses the actual box face. No extra interior margin is required because the entering player's container immediately consumes further movement input. The entry is accepted only together with one fresh P3_ZONE entered zone=trade-zone marker and the real window the fixture opened on the entering session - the plain container screen titled WASM Market with slot 0 showing the labelled apple stack and slot 8 the labelled barrier at the declared buttons and container id.",
+        "Every purchase and refund is one real container click on that window's own slot 0 (primary buys, secondary refunds) through the bridge's confirmed click action, followed by the fixture's own P3_TRADE marker plus the emerald/apple counts it implies, a byte-identical unaffected damage-bearing pickaxe, and the closed screen the fixture leaves behind.",
+        "Leaving is ordinary walking too: the driver walks the client back across the face and requires one fresh P3_ZONE exited zone=trade-zone marker, the client's own position outside the box, and no server-owned window. The one exception is the exit that must close a window still open: a container screen swallows ordinary movement input, so that crossing is the operator /tp 8.5 80.0 12.5 sent while the window is open, followed by one real client position report, and the closed screen that follows is the fixture's own exit-driven close - the driver never closes that window itself.",
+        "Movement that does not cross the face must not fabricate a transition: while the client is inside with the window already closed by its trade, ordinary forward input that stays inside must publish no fresh P3_ZONE line and open nothing; after a crossing, ordinary forward input that stays outside must publish no fresh P3_ZONE line and open nothing.",
+        "Disconnect and rejoin the same player, require the server's session release, then require the persisted emerald/apple counts, the identical damage-bearing pickaxe entry, and a position outside the box so the next entry is another real crossing. After the rejoin one further entry must open the window on the new session and one purchase must commit at the next ledger count, which is what proves the zone tracking follows the reconnected session rather than the session that left.",
+        "Capture the inventory after the fixture seed, before every window, the inventory after every trade, the screen after every exit, and the inventory after the rejoin."
+      ],
+      "expected_observations": [
+        "Every fence marker is a request marker and never an effect: the window that opens after the entry marker and the closed screen that follows the exit marker are what the driver accepts, and each crossing requires exactly one fresh P3_ZONE line, so a duplicated or spurious transition fails the phase instead of being ignored.",
+        "The fixture publishes P3_ZONE ready zone=trade-zone only from the owner's Applied answer to its own upsert; a refused or missing answer produces no marker, so this wait times out and fails instead of reporting a zone that does not exist.",
+        "The walkway is real and client-visible before any crossing: every column from x = 5 to x = 16 at z = 12 is solid at y = 79 and air at y = 80 in the client's own block scan, each builder command reported 68/68 verified block states, and the /tp landing is read back with solid ground under the client.",
+        "Entry is a real movement across the declared face: the client's own reported position moves from x = 8.5 to x >= 10.0 while the client walks, the box [10.0, 80.0, 10.0]..[16.0, 84.0, 16.0] contains it, and the P3_ZONE entered marker plus the opened WASM Market window follow.",
+        "The entry window is the server-owned market: a plain container screen titled WASM Market whose slot 0 is the labelled apple stack, whose slot 8 is the labelled barrier, and whose container id is non-zero; the same window content is asserted for every entry.",
+        "Left-clicking slot 0 buys and right-clicking it refunds through the existing ledger machine: P3_TRADE buy committed ledger=1 with emeralds/apples 2/1, buy committed ledger=2 with 0/2, buy refused ledger=2 with 0/2 and a byte-identical inventory, refund committed ledger=1 with 2/1, and after the rejoin buy committed ledger=2 with 0/2.",
+        "Every accepted click leaves no server-owned window, and the unaffected damage-bearing pickaxe keeps its item_id, count, name, damage, max_damage, foil and enchantment list across every phase and across the disconnect/rejoin.",
+        "The exit that closes a live window is driven by the zone event: the window is asserted open immediately before the teleport crossing, one fresh P3_ZONE exited zone=trade-zone marker follows, and the client's screen is closed with container id 0 afterwards, with no bridge call that dismisses the screen. Ordinary walking exits assert the same closed state without any teleport.",
+        "Movement that stays on one side of the face publishes no transition marker, opens no window and does not leave that side, so the entry and exit events are transitions of the zone and not per-tick reports.",
+        "Every bridge call fails the run on an RPC error, a timeout, or an unconfirmed click; the driver never accepts a marker that was already visible before its submission. The zone's Applied answer, the server's zone table and the plugin's tracked session are not readable from the real client, so the crossing is asserted from the client's own position, the guest's fence marker and the window that opens or closes as its effect."
+      ],
+      "wasm_zone_market_expectation": {
+        "package_id": "inventory-compat",
+        "mode": "zone-market",
+        "player_username": "SolarisPrimary",
+        "command_root": "trade",
+        "ledger_key": "trade-ledger",
+        "marker_prefix": "P3_TRADE",
+        "zone_marker_prefix": "P3_ZONE",
+        "menu_button_slot_count": 9,
+        "menu_container_slot_count": 45,
+        "zone": {
+          "id": "trade-zone",
+          "dimension": "minecraft:overworld",
+          "minimum": [
+            10.0,
+            80.0,
+            10.0
+          ],
+          "maximum": [
+            16.0,
+            84.0,
+            16.0
+          ],
+          "setup_action": "zone-setup",
+          "ready_marker": "P3_ZONE ready zone=trade-zone",
+          "entered_marker": "P3_ZONE entered zone=trade-zone",
+          "exited_marker": "P3_ZONE exited zone=trade-zone"
+        },
+        "positions": {
+          "outside": [
+            8.5,
+            80.0,
+            12.5
+          ],
+          "inside": [
+            12.5,
+            80.0,
+            12.5
+          ],
+          "teleport_command": "tp 8.5 80.0 12.5",
+          "landing_tolerance": 0.75
+        },
+        "terrain": {
+          "commands": [
+            {
+              "command": "debug water-corridor 6 78 13",
+              "prefix": "Debug water corridor",
+              "feedback": "Debug water corridor at 6 78 13 verified 68/68 block states"
+            },
+            {
+              "command": "debug water-corridor 9 78 13",
+              "prefix": "Debug water corridor",
+              "feedback": "Debug water corridor at 9 78 13 verified 68/68 block states"
+            },
+            {
+              "command": "debug water-corridor 12 78 13",
+              "prefix": "Debug water corridor",
+              "feedback": "Debug water corridor at 12 78 13 verified 68/68 block states"
+            },
+            {
+              "command": "debug water-corridor 15 78 13",
+              "prefix": "Debug water corridor",
+              "feedback": "Debug water corridor at 15 78 13 verified 68/68 block states"
+            }
+          ],
+          "walkway": {
+            "walk_y": 79,
+            "surface_y": 80,
+            "z": 12,
+            "x_min": 5,
+            "x_max": 16,
+            "note": "the four corridor builders at y=78 write their z=bz-1 end caps at y 78..79 across x bx-1..bx+1, so their caps form one continuous stone walkway at y79 from x=5 to x=16 on the z=12 block row, which is the stub the fixed outside point and the crossing both stand on; it is one block wide in z, and every crossing walks it as a straight line along x because the adjacent z=13 row is the builders' water channel"
+          }
+        },
+        "crossing": {
+          "step_ticks": 5,
+          "max_steps": 24,
+          "margin": 0.5,
+          "confirm_offset_cm": 50,
+          "note": "each walk step holds the client's own forward input for 5 ticks and the loop re-reads the client's position until it is 0.5 blocks past the face; the teleport crossing adds one real client position report 50 cm further away from the box, because an operator /tp commits the server pose without feeding the zone observer"
+        },
+        "setup": {
+          "gamemode_command": "gamemode survival",
+          "emerald": {
+            "item_id": "minecraft:emerald",
+            "command": "give minecraft:emerald 4",
+            "count": 4
+          },
+          "apple": {
+            "item_id": "minecraft:apple",
+            "initial_count": 0
+          },
+          "tool": {
+            "item_id": "minecraft:diamond_pickaxe",
+            "command": "give minecraft:diamond_pickaxe 1"
+          },
+          "damage_entity_type": "minecraft:pig",
+          "summon_command_template": "summon minecraft:pig {x} {y} {z}",
+          "inventory_screenshot": "zone-seed-inventory"
+        },
+        "market": {
+          "id": "trade-market",
+          "title": "WASM Market",
+          "slots": [
+            {
+              "slot": 0,
+              "item_id": "minecraft:apple",
+              "count": 1,
+              "label": "Apple: buy 2 emeralds / refund 1 apple",
+              "action": "buy"
+            },
+            {
+              "slot": 8,
+              "item_id": "minecraft:barrier",
+              "count": 1,
+              "label": "Close",
+              "action": "close"
+            }
+          ]
+        },
+        "cycles": [
+          {
+            "label": "zone-buy-1",
+            "kind": "trade",
+            "exit_route": "walk",
+            "slot": 0,
+            "button": "primary",
+            "outcome": "committed",
+            "ledger": 1,
+            "marker": "P3_TRADE buy committed ledger=1",
+            "emerald": 2,
+            "apple": 1,
+            "window_capture": "zone-window-buy-1",
+            "inventory_capture": "zone-buy-1-inventory",
+            "closed_capture": "zone-exit-buy-1-closed",
+            "interior_probe": {
+              "ticks": 5,
+              "steps": 2,
+              "adversarial": "interior_movement_no_reentry"
+            },
+            "exterior_probe": {
+              "ticks": 5,
+              "steps": 1,
+              "adversarial": "exterior_movement_no_window"
+            }
+          },
+          {
+            "label": "exit-with-window",
+            "kind": "exit",
+            "exit_route": "tp",
+            "window_capture": "zone-window-exit-open",
+            "closed_capture": "zone-exit-driven-closed",
+            "adversarial": "exit_driven_close"
+          },
+          {
+            "label": "zone-buy-2",
+            "kind": "trade",
+            "exit_route": "walk",
+            "slot": 0,
+            "button": "primary",
+            "outcome": "committed",
+            "ledger": 2,
+            "marker": "P3_TRADE buy committed ledger=2",
+            "emerald": 0,
+            "apple": 2,
+            "window_capture": "zone-window-buy-2",
+            "inventory_capture": "zone-buy-2-inventory",
+            "closed_capture": "zone-exit-buy-2-closed"
+          },
+          {
+            "label": "zone-insufficient-buy",
+            "kind": "trade",
+            "exit_route": "walk",
+            "slot": 0,
+            "button": "primary",
+            "outcome": "refused",
+            "ledger": 2,
+            "marker": "P3_TRADE buy refused ledger=2",
+            "emerald": 0,
+            "apple": 2,
+            "window_capture": "zone-window-insufficient-buy",
+            "inventory_capture": "zone-insufficient-buy-inventory",
+            "closed_capture": "zone-exit-insufficient-buy-closed",
+            "adversarial": "insufficient_items"
+          },
+          {
+            "label": "zone-refund",
+            "kind": "trade",
+            "exit_route": "walk",
+            "slot": 0,
+            "button": "secondary",
+            "outcome": "committed",
+            "ledger": 1,
+            "marker": "P3_TRADE refund committed ledger=1",
+            "emerald": 2,
+            "apple": 1,
+            "window_capture": "zone-window-refund",
+            "inventory_capture": "zone-refund-inventory",
+            "closed_capture": "zone-exit-refund-closed"
+          },
+          {
+            "label": "zone-buy-after-rejoin",
+            "kind": "trade",
+            "exit_route": "walk",
+            "reconnect_before": true,
+            "slot": 0,
+            "button": "primary",
+            "outcome": "committed",
+            "ledger": 2,
+            "marker": "P3_TRADE buy committed ledger=2",
+            "emerald": 0,
+            "apple": 2,
+            "window_capture": "zone-window-after-rejoin",
+            "inventory_capture": "zone-buy-after-rejoin-inventory",
+            "closed_capture": "zone-exit-after-rejoin-closed"
+          }
+        ],
+        "reconnect": {
+          "emerald": 2,
+          "apple": 1,
+          "capture": "zone-rejoin-inventory"
+        }
+      }
+    }
+  ]
+}

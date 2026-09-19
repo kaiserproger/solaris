@@ -17,8 +17,46 @@
       "entries": [{"id": "ruby", "label": "Ruby"}]
     }, {
       "type": "action_button",
-      "action_id": "confirm",
+      "action_id": "ruby-live:confirm",
       "label": "Confirm Ruby"
+    }]
+  }, {
+    "id": "ruby-live:hud",
+    "kind": "hud",
+    "title": "Ruby HUD",
+    "widgets": [{
+      "type": "paged_table",
+      "id": "status",
+      "columns": [
+        {"id": "label", "label": "Panel", "align": "left", "width_bucket": 2},
+        {"id": "state", "label": "State", "align": "left", "width_bucket": 2}
+      ]
+    }]
+  }, {
+    "id": "ruby-live:input",
+    "kind": "hud",
+    "title": "Ruby input",
+    "widgets": [],
+    "input_bindings": [{
+      "key": "key.keyboard.g",
+      "press_action": "ruby-live:key_press",
+      "release_action": "ruby-live:key_release"
+    }, {
+      "key": "key.keyboard.space",
+      "press_action": "ruby-live:jump_press",
+      "release_action": "ruby-live:jump_release"
+    }, {
+      "key": "key.keyboard.escape",
+      "press_action": "ruby-live:escape_press",
+      "release_action": "ruby-live:escape_release"
+    }, {
+      "key": "key.keyboard.f2",
+      "press_action": "ruby-live:f2_press",
+      "release_action": "ruby-live:f2_release"
+    }, {
+      "key": "key.keyboard.f11",
+      "press_action": "ruby-live:f11_press",
+      "release_action": "ruby-live:f11_release"
     }]
   }],
   "blocks": [{
@@ -41,5 +79,13 @@
     "path": "assets/ruby-live/models/block/ruby_block.json",
     "sha256": "@BLOCK_SHA256@",
     "size_bytes": @BLOCK_SIZE@
+  }, {
+    "id": "ruby-live:ruby_tone",
+    "path": "assets/ruby-live/sounds/tone.ogg",
+    "sha256": "@TONE_SHA256@",
+    "size_bytes": @TONE_SIZE@
+  }],
+  "sounds": [{
+    "id": "ruby-live:tone"
   }]
 }

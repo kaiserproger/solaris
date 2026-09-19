@@ -1,14 +1,15 @@
 use std::collections::HashSet;
 
 use mc_entity::{
-    AttributeKind, EntityId, EntityLifecycle, EntitySimulationProjection, EntitySnapshot,
-    GoalState, SpawnEntity, Vec3,
+    AttributeKind, EntityDamageRequest, EntityId, EntityLifecycle, EntitySimulationProjection,
+    EntitySnapshot, GoalState, SpawnEntity, Vec3,
 };
 use mc_physics::{BlockMaterial, BlockMaterialIds};
 use mc_world::{BlockPos, WorldReadView};
 
 use crate::play::simulation::SimulationAuthority;
 
+use super::damage_precommit::{EntityDamagePrecommitResume, begin_entity_damage};
 use super::entity_combat::{attack_server_entity_locked, entity_kill_rewards_locked};
 use super::entity_lifecycle::track_entity_chunk_locked;
 use super::interaction_geometry::{distance_sq, entity_aabb};
@@ -25,6 +26,8 @@ use super::{
     EntityAttackOutcome, SessionRegistry, apply_entity_facts, apply_entity_velocity_locked,
     is_hostile_entity, record_entity_dispatches_locked,
 };
+use crate::play::simulation::SimulationCommand;
+use mc_script::precommit::{Approval, HookActor, HookDecision, HookFailure, HookKind};
 
 // Exact local 26.1.2 Villager/VillagerPanicTrigger/GolemSensor constants.
 const VILLAGE_DEFENSE_TICK_INTERVAL: u64 = 100;
@@ -62,6 +65,121 @@ struct PlannedGolemAttack {
     golem_id: EntityId,
     target_id: EntityId,
     damage: f32,
+}
+
+/// The source-side image an approved iron-golem attack must still match.
+#[derive(Debug, Clone)]
+pub(in crate::play) struct GolemDamageContinuation {
+    pub(in crate::play) golem: EntitySnapshot,
+}
+
+fn defer_golem_entity_damage_precommit(
+    registry: &SessionRegistry,
+    expected: EntitySnapshot,
+    request: EntityDamageRequest,
+    continuation: GolemDamageContinuation,
+) -> bool {
+    let Some(handle) = registry.damage_precommit_handle().cloned() else {
+        return true;
+    };
+    let Ok(source) = u64::try_from(continuation.golem.id.0).map(HookActor::Entity) else {
+        return true;
+    };
+    let pending = match begin_entity_damage(
+        registry,
+        expected.id,
+        source,
+        "mob-attack",
+        expected.position,
+        request.amount,
+    ) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    handle.spawn_precommit_resume(pending, None, None, move |decision| {
+        SimulationCommand::ResumeEntityDamagePrecommit(Box::new(EntityDamagePrecommitResume {
+            expected,
+            request,
+            attacker_costs: None,
+            completion: super::damage_precommit::EntityDamagePrecommitCompletion::Golem(
+                continuation,
+            ),
+            decision,
+        }))
+    });
+    true
+}
+
+/// Re-enters the complete native golem attack kernel only for the exact source
+/// and target images that asked the guest boundary.
+pub(in crate::play) fn resume_golem_entity_damage_precommit(
+    registry: &SessionRegistry,
+    expected: EntitySnapshot,
+    mut request: EntityDamageRequest,
+    decision: Result<Approval, HookFailure>,
+    continuation: GolemDamageContinuation,
+) -> Vec<VisibilityDispatch> {
+    let Ok(mut approval) = decision else {
+        return Vec::new();
+    };
+    request.amount = match approval.decision() {
+        HookDecision::Keep => request.amount,
+        HookDecision::Replace(amount) if amount.is_finite() && amount > 0.0 => amount,
+        HookDecision::Cancel | HookDecision::Replace(_) | _ => return Vec::new(),
+    };
+    let mut inner = registry.lock_session_entities("resume iron golem damage precommit");
+    let Some(golem) = inner.entities.snapshot(continuation.golem.id) else {
+        return Vec::new();
+    };
+    if golem != continuation.golem
+        || inner.entities.snapshot(expected.id).as_ref() != Some(&expected)
+        || golem.lifecycle != EntityLifecycle::Alive
+        || golem.type_name != "minecraft:iron_golem"
+        || expected.lifecycle != EntityLifecycle::Alive
+        || !is_hostile_entity(&expected.type_name)
+        || expected.type_name == "minecraft:creeper"
+        || !within_golem_attack_range(
+            golem.position,
+            &golem.type_name,
+            expected.position,
+            &expected.type_name,
+        )
+        || approval.consume().is_err()
+    {
+        return Vec::new();
+    }
+    let rewards = entity_kill_rewards_locked(&inner, &expected);
+    let Some(mut outcome) = attack_server_entity_locked(
+        &mut inner,
+        expected.id,
+        request.amount,
+        None,
+        &rewards,
+        None,
+    ) else {
+        return Vec::new();
+    };
+    let knockback_dispatches = if let EntityAttackOutcome::Damaged { damage, .. } = &outcome {
+        let resistance = expected
+            .attributes
+            .base(&AttributeKind::Custom(
+                "minecraft:knockback_resistance".to_owned(),
+            ))
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let mut velocity = damage.snapshot.velocity;
+        velocity.y += GOLEM_VERTICAL_KNOCKBACK * (1.0 - resistance);
+        apply_entity_velocity_locked(&mut inner, expected.id, velocity)
+    } else {
+        Vec::new()
+    };
+    let mut dispatches = outcome.dispatches_mut().drain(..).collect::<Vec<_>>();
+    dispatches.extend(knockback_dispatches);
+    let events = entity_event_dispatches_locked(&inner, golem.id, GOLEM_ATTACK_EVENT);
+    record_entity_dispatches_locked(&mut inner, &events);
+    dispatches.extend(events);
+    dispatches
 }
 
 impl SessionRegistry {
@@ -432,6 +550,29 @@ fn commit_golem_attack(
     {
         return None;
     }
+    if registry
+        .precommit_boundary()
+        .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+    {
+        let request = EntityDamageRequest {
+            amount: attack.damage,
+            tick: inner.entity_lifecycle_tick,
+            death_remove_tick: inner
+                .entity_lifecycle_tick
+                .saturating_add(super::ENTITY_DEATH_TICKS),
+            villager_gossip_event: None,
+        };
+        drop(inner);
+        if defer_golem_entity_damage_precommit(
+            registry,
+            target,
+            request,
+            GolemDamageContinuation { golem },
+        ) {
+            return Some(Vec::new());
+        }
+        unreachable!("a registered damage hook must either defer or refuse golem damage");
+    }
     let rewards = entity_kill_rewards_locked(&inner, &target);
     let mut outcome = attack_server_entity_locked(
         &mut inner,
@@ -723,459 +864,5 @@ fn deterministic_golem_uuid(entity: EntityId, tick: u64, position: Vec3) -> uuid
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, HashSet};
-    use std::sync::Arc;
-
-    use mc_data::Identifier;
-    use mc_entity::villager_26_1_2::{VillagerBrainState, VillagerPoiSet, VillagerScheduleKind};
-    use mc_entity::villager_population_26_1_2::VillagerPopulationState;
-    use mc_entity::{VillagerData, VillagerKind, VillagerProfession};
-    use mc_world::{BlockRegistry, BlockStateId, Chunk, ChunkPos};
-    use tokio::sync::mpsc;
-
-    use crate::play::persistence::PersistedEntityCheckpoint;
-    use crate::play::{LoggedInProfile, PlayerPose};
-
-    use super::*;
-
-    fn defense_world() -> (WorldReadView, BlockMaterialIds) {
-        let block = |name: &str, id: u32| mc_data::blocks::BlockReport {
-            id: Identifier::parse(name).unwrap(),
-            properties: BTreeMap::new(),
-            states: vec![mc_data::blocks::BlockStateReport {
-                id,
-                default: true,
-                properties: BTreeMap::new(),
-            }],
-        };
-        let blocks = Arc::new(
-            BlockRegistry::from_report(&[block("minecraft:air", 0), block("minecraft:stone", 1)])
-                .unwrap(),
-        );
-        let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
-        let chunk_pos = ChunkPos { x: 0, z: 0 };
-        let mut chunk = Chunk::empty(
-            chunk_pos,
-            BlockStateId(0),
-            Identifier::parse("minecraft:plains").unwrap(),
-        );
-        for x in 0..16 {
-            for z in 0..16 {
-                let _ = chunk.set_block(x, 63, z, BlockStateId(1));
-            }
-        }
-        world.insert_generated_chunk(chunk_pos, chunk).unwrap();
-        (world.read_view(), BlockMaterialIds::new(0, None, None))
-    }
-
-    fn register_observer(registry: &SessionRegistry) -> (u64, mpsc::Receiver<OutboundCommand>) {
-        let profile = LoggedInProfile {
-            uuid: crate::login::offline_uuid("GolemObserver"),
-            name: "GolemObserver".to_owned(),
-        };
-        let (tx, rx) = mpsc::channel(64);
-        let session = registry
-            .register(
-                &profile,
-                (0, 0),
-                2,
-                HashSet::new(),
-                tx,
-                PlayerPose::new(0.5, 64.0, 0.5),
-            )
-            .0;
-        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
-        (session, rx)
-    }
-
-    fn spawn_villager(registry: &SessionRegistry, position: Vec3, tick: u64) -> EntityId {
-        let mut entity = SpawnEntity::new(139, "minecraft:villager", position);
-        entity.retained.villager = Some(VillagerData::new(
-            VillagerKind::Plains,
-            VillagerProfession::None,
-            1,
-        ));
-        entity.retained.villager_population = Some(VillagerPopulationState::adult());
-        let mut brain = VillagerBrainState::adult(VillagerPoiSet {
-            home: Some(position),
-            job_site: None,
-            meeting_point: Some(position),
-        });
-        brain.schedule = VillagerScheduleKind::Adult;
-        brain.last_slept_tick = Some(tick);
-        entity.retained.villager_brain = Some(brain);
-        apply_entity_facts(&mut entity);
-        registry
-            .lock_entities("spawn village defence villager")
-            .spawn(entity)
-    }
-
-    fn spawn_mob(
-        registry: &SessionRegistry,
-        type_id: i32,
-        type_name: &str,
-        position: Vec3,
-    ) -> EntityId {
-        spawn_mob_with_max_health(registry, type_id, type_name, position, None)
-    }
-
-    fn spawn_mob_with_max_health(
-        registry: &SessionRegistry,
-        type_id: i32,
-        type_name: &str,
-        position: Vec3,
-        max_health: Option<f64>,
-    ) -> EntityId {
-        let mut entity = SpawnEntity::new(type_id, type_name, position);
-        apply_entity_facts(&mut entity);
-        if let Some(max_health) = max_health {
-            entity
-                .attributes
-                .set_base(AttributeKind::MaxHealth, max_health);
-        }
-        let id = registry
-            .lock_entities("spawn village defence mob")
-            .spawn(entity);
-        if is_hostile_entity(type_name) {
-            registry
-                .lock_inner("index village defence hostile fixture")
-                .hostile_entities
-                .insert(id);
-        }
-        id
-    }
-
-    #[test]
-    fn three_recently_slept_villagers_spawn_one_persisted_golem_and_memory_blocks_duplicate() {
-        let registry = SessionRegistry::new();
-        let (_observer, _outbound) = register_observer(&registry);
-        let (world, materials) = defense_world();
-        let villagers = [
-            spawn_villager(&registry, Vec3::new(4.5, 64.0, 4.5), 90),
-            spawn_villager(&registry, Vec3::new(5.5, 64.0, 4.5), 90),
-            spawn_villager(&registry, Vec3::new(4.5, 64.0, 5.5), 90),
-        ];
-        let zombie = spawn_mob(
-            &registry,
-            151,
-            "minecraft:zombie",
-            Vec3::new(7.5, 64.0, 4.5),
-        );
-        registry.publish_active_simulation_entities_for_test(villagers.into_iter().chain([zombie]));
-        registry.synchronize_entity_lifecycle_epoch(100);
-
-        let (report, dispatches) = registry.tick_village_defense(
-            &SimulationAuthority::for_test(),
-            100,
-            70,
-            Some(&world),
-            Some(&materials),
-        );
-        assert_eq!(report.spawned_golems, 1);
-        assert!(dispatches.iter().any(|dispatch| {
-            matches!(
-                &dispatch.command,
-                OutboundCommand::SpawnEntity(entity)
-                    if entity.type_name == "minecraft:iron_golem"
-            ) || matches!(
-                &dispatch.command,
-                OutboundCommand::SpawnEntities(entities)
-                    if entities.iter().any(|entity| entity.type_name == "minecraft:iron_golem")
-            )
-        }));
-        let records = registry.persisted_entity_records();
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record.snapshot.type_name == "minecraft:iron_golem")
-                .count(),
-            1
-        );
-        let golem = &records
-            .iter()
-            .find(|record| record.snapshot.type_name == "minecraft:iron_golem")
-            .expect("persisted iron golem")
-            .snapshot;
-        for entity_id in villagers.iter().copied().chain([zombie]) {
-            let other = registry
-                .lock_entities("read village defence spawn neighbour")
-                .snapshot(entity_id)
-                .unwrap();
-            assert!(!aabbs_intersect(
-                golem.position,
-                entity_aabb(&golem.type_name),
-                other.position,
-                entity_aabb(&other.type_name),
-            ));
-        }
-        for villager in villagers {
-            let brain = registry
-                .lock_entities("read golem detection memory")
-                .snapshot(villager)
-                .unwrap()
-                .retained
-                .villager_brain
-                .unwrap();
-            assert_eq!(brain.golem_detected_until_tick, Some(699));
-        }
-
-        let active = records.into_iter().map(|record| record.snapshot.id);
-        registry.publish_active_simulation_entities_for_test(active);
-        registry.synchronize_entity_lifecycle_epoch(200);
-        let (repeat, _) = registry.tick_village_defense(
-            &SimulationAuthority::for_test(),
-            200,
-            70,
-            Some(&world),
-            Some(&materials),
-        );
-        assert_eq!(repeat.spawned_golems, 0);
-        assert_eq!(
-            registry
-                .persisted_entity_records()
-                .iter()
-                .filter(|record| record.snapshot.type_name == "minecraft:iron_golem")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn restored_golem_and_villager_memory_prevent_duplicate_spawn() {
-        let source = SessionRegistry::new();
-        let (_observer, _outbound) = register_observer(&source);
-        let (world, materials) = defense_world();
-        let villagers = [
-            spawn_villager(&source, Vec3::new(4.5, 64.0, 4.5), 90),
-            spawn_villager(&source, Vec3::new(5.5, 64.0, 4.5), 90),
-            spawn_villager(&source, Vec3::new(4.5, 64.0, 5.5), 90),
-        ];
-        let zombie = spawn_mob(&source, 151, "minecraft:zombie", Vec3::new(7.5, 64.0, 4.5));
-        source.publish_active_simulation_entities_for_test(villagers.into_iter().chain([zombie]));
-        source.synchronize_entity_lifecycle_epoch(100);
-        assert_eq!(
-            source
-                .tick_village_defense(
-                    &SimulationAuthority::for_test(),
-                    100,
-                    70,
-                    Some(&world),
-                    Some(&materials),
-                )
-                .0
-                .spawned_golems,
-            1
-        );
-
-        let records = source.persisted_entity_records();
-        let restored = SessionRegistry::new();
-        let (_observer, _outbound) = register_observer(&restored);
-        assert_eq!(
-            restored
-                .restore_persisted_entities(PersistedEntityCheckpoint::new(100, records.clone())),
-            records.len()
-        );
-        let restored_records = restored.persisted_entity_records();
-        assert_eq!(
-            restored_records
-                .iter()
-                .filter(|record| record.snapshot.type_name == "minecraft:iron_golem")
-                .count(),
-            1
-        );
-        for record in restored_records
-            .iter()
-            .filter(|record| record.snapshot.type_name == "minecraft:villager")
-        {
-            let brain = record
-                .snapshot
-                .retained
-                .villager_brain
-                .as_ref()
-                .expect("restored villager brain");
-            assert_eq!(brain.last_slept_tick, Some(90));
-            assert_eq!(brain.golem_detected_until_tick, Some(699));
-        }
-
-        restored.publish_active_simulation_entities_for_test(
-            restored_records.iter().map(|record| record.snapshot.id),
-        );
-        restored.synchronize_entity_lifecycle_epoch(800);
-        let (restored_world, restored_materials) = defense_world();
-        let (report, _) = restored.tick_village_defense(
-            &SimulationAuthority::for_test(),
-            800,
-            70,
-            Some(&restored_world),
-            Some(&restored_materials),
-        );
-        assert_eq!(report.spawned_golems, 0);
-        assert_eq!(
-            restored
-                .persisted_entity_records()
-                .iter()
-                .filter(|record| record.snapshot.type_name == "minecraft:iron_golem")
-                .count(),
-            1
-        );
-        for record in restored
-            .persisted_entity_records()
-            .iter()
-            .filter(|record| record.snapshot.type_name == "minecraft:villager")
-        {
-            assert_eq!(
-                record
-                    .snapshot
-                    .retained
-                    .villager_brain
-                    .as_ref()
-                    .and_then(|brain| brain.golem_detected_until_tick),
-                Some(1_399)
-            );
-        }
-    }
-
-    #[test]
-    fn golem_goal_update_uses_deferred_owner_path() {
-        let registry = SessionRegistry::new();
-        let golem = spawn_mob(
-            &registry,
-            70,
-            "minecraft:iron_golem",
-            Vec3::new(4.5, 64.0, 4.5),
-        );
-        let goal = GoalState::Wander {
-            speed: GOLEM_WANDER_SPEED,
-            period_ticks: GOLEM_WANDER_PERIOD_TICKS,
-        };
-        let applied = registry
-            .lock_entities("set village defence fixture goal")
-            .set_goals_deferred_journal([(golem, goal.clone())]);
-        assert_eq!(applied, 1);
-        assert_eq!(
-            registry
-                .lock_entities("read village defence fixture goal")
-                .snapshot(golem)
-                .unwrap()
-                .goal,
-            goal
-        );
-    }
-
-    #[test]
-    fn surviving_damage_accepts_followup_velocity_update() {
-        let registry = SessionRegistry::new();
-        let zombie = spawn_mob(
-            &registry,
-            151,
-            "minecraft:zombie",
-            Vec3::new(6.0, 64.0, 4.5),
-        );
-        let mut inner = registry.lock_session_entities("damage village defence fixture");
-        assert!(
-            super::super::entity_combat::damage_server_entity_locked(
-                &mut inner, zombie, 16.5, None,
-            )
-            .is_some()
-        );
-        assert!(
-            inner
-                .entities
-                .set_velocity(zombie, Vec3::new(0.0, GOLEM_VERTICAL_KNOCKBACK, 0.0),)
-        );
-    }
-
-    #[test]
-    fn golem_attacks_nearby_ravager_with_event_and_vertical_knockback() {
-        let registry = SessionRegistry::new();
-        registry.configure_arrow_kill_rewards(
-            None,
-            None,
-            None,
-            Arc::new(mc_data::items::ItemRegistry::default()),
-            Arc::new(mc_data::item_components::ItemFactsTable::default()),
-            Arc::new(mc_data::loot::LootTables::default()),
-        );
-        let (_observer, _outbound) = register_observer(&registry);
-        let golem = spawn_mob(
-            &registry,
-            70,
-            "minecraft:iron_golem",
-            Vec3::new(4.5, 64.0, 4.5),
-        );
-        let ravager = spawn_mob_with_max_health(
-            &registry,
-            109,
-            "minecraft:ravager",
-            Vec3::new(6.0, 64.0, 4.5),
-            Some(100.0),
-        );
-        registry.publish_active_simulation_entities_for_test([golem, ravager]);
-        {
-            let mut inner = registry.lock_session_entities("publish golem combat fixture");
-            for entity_id in [golem, ravager] {
-                let position = inner.entities.snapshot(entity_id).unwrap().position;
-                track_entity_chunk_locked(&mut inner, entity_id, position);
-                assert!(!spawn_entity_visibility_locked(&mut inner, entity_id).is_empty());
-            }
-        }
-        let phase = u64::from(golem.0.unsigned_abs()) % GOLEM_ATTACK_INTERVAL;
-        let due = if phase == 0 {
-            GOLEM_ATTACK_INTERVAL
-        } else {
-            GOLEM_ATTACK_INTERVAL - phase
-        };
-
-        let before = registry
-            .lock_entities("read ravager before golem attack")
-            .snapshot(ravager)
-            .unwrap();
-        assert!(before.health > 30.0, "ravager health={}", before.health);
-        let (report, dispatches) =
-            registry.tick_village_defense(&SimulationAuthority::for_test(), due, 70, None, None);
-        assert_eq!(report.golem_attacks, 1);
-        let after = registry
-            .lock_entities("read ravager after golem attack")
-            .snapshot(ravager)
-            .unwrap();
-        assert!(after.health < before.health);
-        assert!(after.velocity.y >= GOLEM_VERTICAL_KNOCKBACK - 1.0e-9);
-        assert!(dispatches.iter().any(|dispatch| {
-            matches!(
-                dispatch.command,
-                OutboundCommand::EntityEvent { entity_id, event_id }
-                    if entity_id == golem.0 && event_id == GOLEM_ATTACK_EVENT
-            )
-        }));
-    }
-
-    #[test]
-    fn golem_never_targets_creeper() {
-        let registry = SessionRegistry::new();
-        let (_observer, _outbound) = register_observer(&registry);
-        let golem = spawn_mob(
-            &registry,
-            70,
-            "minecraft:iron_golem",
-            Vec3::new(4.5, 64.0, 4.5),
-        );
-        let creeper = spawn_mob(
-            &registry,
-            20,
-            "minecraft:creeper",
-            Vec3::new(5.5, 64.0, 4.5),
-        );
-        registry.publish_active_simulation_entities_for_test([golem, creeper]);
-
-        let (report, _) =
-            registry.tick_village_defense(&SimulationAuthority::for_test(), 20, 70, None, None);
-        assert_eq!(report.golem_attacks, 0);
-        let goal = registry
-            .lock_entities("read golem creeper exclusion")
-            .snapshot(golem)
-            .unwrap()
-            .goal;
-        assert!(matches!(goal, GoalState::Wander { .. }), "goal={goal:?}");
-    }
-}
+#[path = "village_defense_tests.rs"]
+mod tests;

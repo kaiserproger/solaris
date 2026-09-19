@@ -19,7 +19,7 @@ use crate::connection::{
     read_packet_with_timeout_budgeted,
 };
 use crate::error::ConnectionError;
-use crate::script::PluginZoneAdapter;
+use crate::script::{PluginStorageHandle, PluginZoneAdapter};
 use crate::server::{ConnectionWorld, ScriptEventSink, ServerConfig};
 use crate::{RuntimeControlHandle, configuration, login, play, status};
 
@@ -35,6 +35,7 @@ pub(crate) struct ConnectionServices {
     pub(crate) runtime_control: Option<RuntimeControlHandle>,
     pub(crate) simulation: play::SimulationHandle,
     pub(crate) scripts: Option<ScriptEventSink>,
+    pub(crate) script_storage: Option<PluginStorageHandle>,
     pub(crate) script_zones: Option<PluginZoneAdapter>,
 }
 
@@ -179,6 +180,7 @@ pub(crate) async fn handle_connection(
                 configuration_outcome.custom_payloads,
                 configuration_outcome.loader_session,
                 services.scripts,
+                services.script_storage,
                 services.script_zones,
             ))
             .await

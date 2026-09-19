@@ -8,6 +8,12 @@ interface events {
     use types.{player-id, plugin-error, position, session-id, sequence, tick};
     use commands.{command};
     use storage.{storage-cas-outcome, storage-change, storage-get-outcome};
+    use settlements.{settlement-result};
+    use residents.{resident-result, resident-order-result};
+    use inventories.{inventory-result};
+    use client-presentation.{view-field};
+    use operation-types.{operation-failure};
+    use world-events.{player-block-broken, player-block-placed, player-item-crafted, player-item-picked-up, player-entity-killed, player-entity-interacted, player-died};
 
     /// What one event says about its own origin. A batch carries the tick and
     /// the owner of the events in it, so a plugin can order its own work without
@@ -51,10 +57,19 @@ interface events {
     record command-invoked {
         player: player-id,
         session: session-id,
+        /// The name the player used for this command.
+        username: string,
+        /// Whether the server authorized this command's player as an operator.
+        operator: bool,
+        /// The player's server-authoritative pose when the command was parsed.
+        position: position,
         /// The command name as the manifest declared it, without the prefix.
         name: string,
         /// The remaining arguments, split on whitespace and bounded by the host.
         arguments: list<string>,
+        /// The exact text after the command name, bounded by the host. Components
+        /// use this only when their existing command grammar preserves whitespace.
+        raw-arguments: string,
     }
 
     /// The answer to one `storage-get` this plugin issued, correlated by the
@@ -79,6 +94,8 @@ interface events {
         session: session-id,
         name: string,
         dimension: string,
+        /// The server-authoritative pose when the query was answered.
+        position: position,
     }
 
     /// The answer to one `list-online-players`. `truncated` says the server held
@@ -133,102 +150,38 @@ interface events {
         outcome: player-teleport-outcome,
     }
 
-    /// Why an operation the plugin issued did not commit.
-    ///
-    /// Every member is a reason the server's own operation outcome already
-    /// reports, so a plugin reads the server's vocabulary instead of parsing a
-    /// string, and the reasons stay distinguishable: a batch refused for a stale
-    /// revision is not the same operator problem as one refused for a reused
-    /// operation id, and neither is a lookup that found nothing.
-    enum operation-failure {
-        /// The plugin's own request was not a valid operation for the owner it
-        /// reached.
-        invalid-request,
-        /// The package does not hold what the operation needs.
-        forbidden,
-        /// A mutation expected a revision a key no longer holds. Nothing changed.
-        stale-revision,
-        /// The operation named something that does not exist, including a durable
-        /// operation id the server never recorded.
-        not-found,
-        /// The owner that would apply the operation is not loaded.
-        unloaded,
-        /// The owner is not in a state that admits the operation.
-        blocked,
-        /// The owner does not hold the items the operation needs.
-        insufficient-items,
-        /// The owner has no room for the operation.
-        capacity,
-        /// The owner is already applying an operation on the same object.
-        busy,
-        /// The owner could not take the commit at all: storage that is unavailable,
-        /// or an actor that stopped after a durability failure.
-        runtime-unavailable,
-        /// The operation id is already recorded for different content, so the
-        /// server refused the substituted request instead of applying it.
-        operation-conflict,
-        /// A cursor the operation named has expired.
-        cursor-expired,
-        /// The server refused, and this contract does not name its reason yet. The
-        /// operation did not commit, exactly as for every other member here.
-        unknown,
-    }
 
-    /// What one committed operation changed, one member per operation family.
-    ///
-    /// The union grows with the operations the contract carries; a family the
-    /// contract does not carry yet has no member here, and no second union exists.
+    /// The existing native result, including per-member refusal details.
     variant operation-payload {
-        /// One storage batch: every key it wrote and every key it removed. A key
-        /// of a `cas` mutation appears once with `deleted: false`, one of a
-        /// `delete` mutation once with `deleted: true`.
-        ///
-        /// The server's own outcome validator bounds the list at 16 changes of at
-        /// most 128 bytes per key, which is the same bound the batch that produced
-        /// it was admitted under.
         storage-batch(list<storage-change>),
+        none,
+        settlement(settlement-result),
+        resident(resident-result),
+        resident-order(resident-order-result),
+        owned-inventory(inventory-result),
     }
 
-    /// One operation the server durably committed.
+    /// Native success: a mutation's committed revision or a query's observation
+    /// revision. A successful query does not create a durable effect or receipt.
     record operation-committed {
-        /// The revision the commit landed at. The plugin never picks it, and one
-        /// batch leaves every key it changed at this same revision.
         revision: u64,
-        /// What the commit changed, in the shape that operation's family declares.
         payload: operation-payload,
     }
 
-    /// What one operation the plugin issued ended in. The two shapes are
-    /// exclusive: one carries the commit the server recorded, the other the
-    /// server's own reason for recording none, and only the committed shape means
-    /// anything changed.
-    variant operation-outcome {
-        /// The server durably applied the operation. It does not mean a client or
-        /// another owner has observed the change yet.
-        committed(operation-committed),
-        /// The server applied nothing: an operation is all-or-nothing, so no part
-        /// of a refused batch is half-applied.
-        refused(operation-failure),
+    record operation-refused {
+        reason: operation-failure,
+        payload: operation-payload,
     }
 
-    /// The answer to one operation this plugin issued.
-    ///
-    /// The answer is correlated twice, on purpose. `request` is the id the plugin
-    /// chose for this call, so it matches the answer to the request it made
-    /// without trusting an order the server does not promise. `operation-id` is
-    /// the durable id the plugin named, and it is the id a later `operation-status`
-    /// addresses: a plugin re-probes by it instead of re-applying a batch whose
-    /// outcome it never saw.
-    ///
-    /// The answer carries no list of its own beyond the commit's changed keys: its
-    /// only bounded values are the two 64-byte ids, the revision, and that key
-    /// list, which the server's own outcome validator bounds at 16 keys of 128
-    /// bytes. The host-call budget bounds what lifting one answer costs.
+    variant operation-outcome {
+        committed(operation-committed),
+        refused(operation-refused),
+    }
+
     record operation-answered {
-        /// The request id of the operation being answered.
         request: string,
-        /// The durable operation id the plugin named for it.
-        operation-id: string,
+        /// Absent for queries without a durable operation id. Never invented.
+        operation-id: option<string>,
         outcome: operation-outcome,
     }
 
@@ -266,9 +219,8 @@ interface events {
     /// acted on. The host therefore adds no correlation id the server never sent -
     /// inventing one would need a map from zone to request that promises an
     /// attribution the server's answer cannot support - and a plugin matches an
-    /// answer to its command by the zone it named, exactly as the Lua API's
-    /// `on_zone_command_result` does. The second correlation style is deliberate
-    /// and one field wide.
+    /// answer to its command by the zone it named. The correlation style is
+    /// deliberate and one field wide.
     ///
     /// The answer carries no list and no text beyond that id, which the server's
     /// own event validator bounds at the contract's script id when it builds the
@@ -281,17 +233,363 @@ interface events {
         outcome: zone-command-outcome,
     }
 
+    /// A boundary transition published by this plugin's existing zone owner.
+    /// The session is the original connection, not a later UUID lookup.
+    record player-zone-transition {
+        player: player-id,
+        session: session-id,
+        zone: string,
+    }
+
+    /// One timer this plugin scheduled, due at this simulation tick.
+    ///
+    /// This is the contract's one event a plugin does not subscribe to. A pushed
+    /// simulation tick drives the timers of every live instance, so a plugin that
+    /// schedules one needs no line in its manifest and no `server.tick` member to
+    /// exist in this contract.
+    ///
+    /// Due callbacks are ordered by deadline and then timer id, at most eight
+    /// per advancing simulation tick. Remaining due timers keep their original
+    /// deadline until a later tick. A timer is removed only when the whole
+    /// delivery is admitted. A non-retiring guest failure or transient admission
+    /// refusal retains the schedule, so a later tick may invoke the callback
+    /// again with the same `scheduled-tick` and a later `fired-tick`. Retirement
+    /// drops the instance's timers. Guest memory and log imports are not rolled
+    /// back; callback execution is not an exactly-once guarantee.
+    ///
+    /// A pushed tick that does not move the clock the instance observes is not a
+    /// new tick: the value it repeats has already had its delivery, so it fires
+    /// nothing. A timer is therefore fired by a tick that advances, never twice by
+    /// one value of it, and a plugin that needs work to happen more than the
+    /// contract's bound of times in one tick schedules a later one instead.
+    ///
+    /// The callback that receives it is an ordinary one: its commands are staged
+    /// and admitted together with everything else the same pushed tick produced,
+    /// and nothing of that pushed tick is applied unless all of it is. Every
+    /// callback of one pushed tick shares fuel, the epoch deadline and the
+    /// returned-command limit, including schedule/cancel commands.
+    ///
+    /// The record carries the two ticks a plugin cannot derive by itself: the
+    /// deadline it asked for and the tick the simulation actually reached, which
+    /// is the same value the batch's own `event-context` carries.
+    record timer-fired {
+        /// The plugin's own timer id, the one `schedule-timer` named, 1..64 bytes.
+        timer-id: string,
+        /// The tick the timer was scheduled for: the observed tick at scheduling
+        /// plus the delay it asked for. It is not a promise about when the
+        /// callback runs - a pushed tick only fires the timers whose deadline it
+        /// reached - so a plugin must not read it as a wall-clock deadline.
+        scheduled-tick: u64,
+        /// The tick the callback observed: the greatest pushed tick this instance
+        /// has seen, never a value that moves backwards, even when a stale tick
+        /// arrives after a later one. A callback that reschedules a timer counts
+        /// its delay from this tick, not from `scheduled-tick`.
+        fired-tick: u64,
+    }
+
+    /// What one admitted `inventory-storage-transaction` ended in.
+    ///
+    /// The existing owners answer one bit: the transaction committed both sides,
+    /// or it applied none of it. Every refusal they decide ends in `refused` - an
+    /// inventory that cannot afford a delta, a storage revision that has moved
+    /// away from the one the plugin named, a session that is already gone - and
+    /// the reasons behind that bit stay with the owners that decided it, so this
+    /// contract names no reason of its own and a plugin must not read one into the
+    /// answer.
+    ///
+    /// A transaction whose outcome the owners could not decide at all publishes no
+    /// answer. Silence is not a refusal: a plugin that needs to know re-reads both
+    /// sides and decides again rather than treating a missing answer as "nothing
+    /// changed".
+    enum inventory-storage-outcome {
+        /// The owners committed both sides of the transaction. It does not mean a
+        /// client has observed the change yet.
+        committed,
+        /// The owners applied nothing, for any reason they decided: neither side
+        /// changed.
+        refused,
+    }
+
+    /// The answer to one `inventory-storage-transaction`, correlated by the
+    /// request id the plugin chose.
+    ///
+    /// The id is correlation only, as in every answer of this contract: the server
+    /// records no durable operation for this command, so a plugin reuses the id for
+    /// a later transaction rather than reading it as a receipt, and the answer
+    /// names the outcome the owners decided.
+    ///
+    /// Bounds: the record carries no list and no text beyond that id, which the
+    /// contract bounds at 64 bytes and the server's own event validator enforces
+    /// when it builds the result, so the host-call budget
+    /// (`PluginLimits::hostcall_bytes`) is not what bounds this event.
+    record inventory-storage-transaction-answered {
+        /// The request id of the transaction being answered, 1..64 bytes.
+        request: string,
+        outcome: inventory-storage-outcome,
+    }
+
+    /// How one player clicked one slot of a server-owned menu.
+    ///
+    /// The four members are the server's own closed set of click kinds, which it
+    /// normalizes before the event exists: a plugin reads the same vocabulary the
+    /// owner decided instead of a slot's stack or a client packet. A kind the
+    /// server can decide but this contract does not name yet has no member here,
+    /// and the host skips such an event rather than reporting it as one of these
+    /// four - telling a plugin "primary" for a click the server decided was
+    /// something else would be telling it something the owner never said.
+    enum inventory-click {
+        /// The left click: the click a menu conventionally reads as "take one".
+        primary,
+        /// The right click.
+        secondary,
+        /// The left click with the shift key held.
+        shift-primary,
+        /// The right click with the shift key held.
+        shift-secondary,
+    }
+
+    /// One click a player made on one slot of a menu this plugin opened.
+    ///
+    /// This is one of the contract's targeted events: the server's menu owner
+    /// addresses it to the single plugin that opened the menu the click landed
+    /// on, so it reaches that instance and no other package. Another package
+    /// cannot receive a click on somebody else's menu however it subscribes, and
+    /// the plugin that opened the menu receives its own clicks the way it receives
+    /// every other targeted event: addressed to it, whatever else it subscribed
+    /// to. A package that opens menus still declares `inventory.menu.clicked`, so
+    /// that its own manifest states the events it acts on. `menu` is the id
+    /// `open-inventory-menu` named, `slot` the index `inventory-menu-slot` named,
+    /// and `click` the server's own normalized kind. Like `zone-command-answered`,
+    /// it is keyed by the object it acted on rather than by a correlation id the
+    /// plugin chose, and the host adds none.
+    ///
+    /// The player and the connection are the owner's own, exactly as in
+    /// `command-invoked`: the click was built with the session's identity context
+    /// and the runtime id of the connection it arrived on, and the host carries
+    /// both through unchanged rather than re-deriving the player from the menu or
+    /// looking up the identity's current session - so a session a reconnect has
+    /// left behind is still named as it was when the click happened. The click
+    /// happened: it is not a promise that the menu is still on that client's
+    /// screen, so a plugin that will not act on a stale menu compares the session
+    /// it still holds before it trades.
+    ///
+    /// Bounds: the record carries the menu id, the slot index and the click kind,
+    /// all of which the server's own event validator enforces when it builds the
+    /// result (64 bytes, 0..54, and the enum above), plus a session id that is the
+    /// runtime player id itself, so the host-call budget is not what bounds this
+    /// event.
+    record inventory-menu-clicked {
+        /// The player who clicked, as the stable identity the server knows.
+        player: player-id,
+        /// The connection the click arrived on, which the host takes from the
+        /// click's own runtime player id and never from a current-connection
+        /// lookup.
+        session: session-id,
+        /// The menu id the click landed on, 1..64 bytes.
+        menu: string,
+        /// The slot index the click landed on, 0..54.
+        slot: u8,
+        /// How the player clicked that slot.
+        click: inventory-click,
+    }
+
+    /// The two key-driven view kinds a client may explicitly request.
+    ///
+    /// The server's own closed set: a client asks for one of these screens by
+    /// key, the declared bundle indexes route the request to its owner, and a
+    /// kind this contract does not name yet has no member here - the host skips
+    /// such an event rather than reporting it as one of these two.
+    enum view-request-kind {
+        settlement,
+        army,
+    }
+
+    /// Why a view lifecycle request was refused before it reached the owner.
+    ///
+    /// The server's own closed vocabulary, carried through unchanged: a plugin
+    /// reads the same reason the owner decided instead of parsing text. A reason
+    /// the server adds later has no member here, and the host refuses such an
+    /// event rather than inventing one of these five.
+    enum view-failure {
+        /// The owner does not own the requested view, or the manifest lacks the
+        /// Loader content and permission pair.
+        refused,
+        /// The named connection has no live Loader session.
+        player-unavailable,
+        /// The referenced instance is not open, or already retired.
+        unknown-instance,
+        /// The named revision no longer matches the live instance.
+        stale-revision,
+        /// The model exceeded a hard bound and was not delivered.
+        too-large,
+    }
+
+    /// One explicit key-driven view request, addressed to the one plugin whose
+    /// bundle declares the requested kind.
+    ///
+    /// This is one of the contract's targeted events: the server resolves the
+    /// declared kind to its owner and addresses the event to that plugin alone,
+    /// so a package that subscribed to `loader.view_request` still receives only
+    /// the kinds its own bundle routes. The session is the connection the request
+    /// arrived on, taken from the event itself and never re-resolved, so a
+    /// reconnect cannot change which session the request is reported for.
+    record loader-view-request {
+        /// The connection the client request arrived on.
+        session: session-id,
+        /// Which screen the client asked for.
+        request-kind: view-request-kind,
+    }
+
+    /// One admitted client view action, after the server re-read the instance.
+    ///
+    /// The owner admits an action only when the instance, the revision, the
+    /// action declaration, the field schema and any selection token still match
+    /// what it holds, so everything here is the owner's own validated snapshot:
+    /// the instance and revision it acted on, the action id, the client's
+    /// sequence for that action, the typed fields it accepted and the
+    /// server-issued selection token when the action carried one. The fields are
+    /// the client's echo of the model this plugin presented, and the token is
+    /// opaque: a plugin may only compare it, never mint one.
+    ///
+    /// The session is the connection the action arrived on, taken from the event
+    /// itself: a reconnect cannot retarget it to a later session.
+    record loader-view-action {
+        /// The connection the action arrived on.
+        session: session-id,
+        /// The instance the action landed on, 1..128 bytes.
+        view-instance-id: string,
+        /// The revision the instance held when the owner admitted it, 1..2^53-1.
+        view-revision: u64,
+        /// The action that was invoked, 1..128 bytes.
+        action-id: string,
+        /// The client's own sequence for that action, at most 2^53-1.
+        action-sequence: u64,
+        /// The typed fields the owner accepted, at most 16 distinct ids.
+        fields: list<view-field>,
+        /// The server-issued selection token the action echoed, when it carried
+        /// one; 1..128 bytes and single-use.
+        selection-token: option<string>,
+    }
+
+    /// The instance and revision one acknowledged open created.
+    record view-opened {
+        /// The instance the server opened, 1..128 bytes.
+        view-instance-id: string,
+        /// The revision the instance starts at, 1..2^53-1. A later
+        /// `present-client-view` compares against this value.
+        revision: u64,
+    }
+
+    /// What one acknowledged open ended in: the instance the plugin may present
+    /// against, or the owner's own reason for refusing. The two shapes are
+    /// exclusive, so a plugin cannot read an instance out of a refusal.
+    variant client-view-outcome {
+        opened(view-opened),
+        refused(view-failure),
+    }
+
+    /// The outcome of one `open-client-view` this plugin issued, correlated by
+    /// the request id the plugin chose and addressed to the issuing plugin.
+    record client-view-opened {
+        /// The request id of the open being answered, 1..64 bytes.
+        request: string,
+        /// The connection the open was issued for.
+        session: session-id,
+        /// The instance and revision, or the owner's refusal.
+        outcome: client-view-outcome,
+    }
+
+    /// Why a Loader-owned custom-block item grant did not commit.
+    ///
+    /// The server's own closed vocabulary, carried through unchanged. A reason
+    /// the server adds later has no member here, and the host refuses such an
+    /// event rather than inventing one of these six.
+    enum loader-item-grant-failure {
+        /// The deployment runs no Loader manifest.
+        loader-unavailable,
+        /// The block is not a custom block this plugin's bundle declares.
+        not-owned,
+        /// The named connection is gone.
+        player-unavailable,
+        /// The inventory could not take the whole grant.
+        inventory-full,
+        /// The simulation owner could not take the commit.
+        runtime-unavailable,
+        /// The owner refused the grant for a reason of its own.
+        rejected,
+    }
+
+    /// What one item grant ended in. The two shapes are exclusive: `granted`
+    /// means the inventory authority committed the items, and `refused` carries
+    /// the server's own reason and means nothing was added.
+    variant loader-item-grant-outcome {
+        granted,
+        refused(loader-item-grant-failure),
+    }
+
+    /// The result of one `grant-loader-block-item` this plugin issued, correlated
+    /// by the request id the plugin chose and addressed to the issuing plugin.
+    /// The block and count are echoed so a plugin matches the answer to its own
+    /// request without trusting an order the server does not promise, and the
+    /// session is the original connection the grant named - never a later
+    /// session of the same player.
+    record loader-item-grant-result {
+        /// The request id of the grant being answered, 1..64 bytes.
+        request: string,
+        /// The connection the grant was issued for.
+        session: session-id,
+        /// The block the grant named, 1..128 bytes.
+        block: string,
+        /// How many items the grant asked for, 1..=64.
+        count: u8,
+        /// Whether the inventory authority committed the items, or its reason for
+        /// refusing.
+        outcome: loader-item-grant-outcome,
+    }
+
     variant event {
         player-joined(player-joined),
         player-left(player-left),
         chat-sent(chat-sent),
         command-invoked(command-invoked),
+        /// The host dropped this plugin's preceding command batch for transient
+        /// backpressure after the guest had updated local state. A handler may
+        /// discard correlations for that batch, but must return no commands or
+        /// timers: the host does not recursively submit a rejection handler.
+        command-batch-rejected,
         storage-get-answered(storage-get-answered),
         storage-cas-answered(storage-cas-answered),
         online-players-answered(online-players-answered),
         player-teleport-answered(player-teleport-answered),
         operation-answered(operation-answered),
         zone-command-answered(zone-command-answered),
+        /// The answer to one `inventory-storage-transaction` this plugin issued,
+        /// as the owners' own committed/refused bit.
+        inventory-storage-transaction-answered(inventory-storage-transaction-answered),
+        /// One click a player made on one slot of a menu this plugin opened. The
+        /// server addresses it to that one plugin, as it does for every targeted
+        /// event, and never broadcasts it to the packages that subscribed.
+        inventory-menu-clicked(inventory-menu-clicked),
+        /// One timer this plugin owns became due on a pushed simulation tick.
+        timer-fired(timer-fired),
+        player-zone-entered(player-zone-transition),
+        player-zone-exited(player-zone-transition),
+        player-block-broken(player-block-broken),
+        player-block-placed(player-block-placed),
+        player-item-crafted(player-item-crafted),
+        player-item-picked-up(player-item-picked-up),
+        player-entity-killed(player-entity-killed),
+        player-entity-interacted(player-entity-interacted),
+        player-died(player-died),
+        /// One explicit key-driven view request the server routed to this plugin
+        /// as the declared owner of that view kind.
+        loader-view-request(loader-view-request),
+        /// One admitted client view action on an instance this plugin opened.
+        loader-view-action(loader-view-action),
+        /// The outcome of one `open-client-view` this plugin issued.
+        client-view-opened(client-view-opened),
+        /// The result of one `grant-loader-block-item` this plugin issued.
+        loader-item-grant-result(loader-item-grant-result),
     }
 
     /// One batch of events for the plugin, in delivery order for this plugin.

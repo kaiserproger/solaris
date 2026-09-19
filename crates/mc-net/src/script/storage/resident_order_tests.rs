@@ -6,9 +6,12 @@
 //! demobilisation rule.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use mc_data::block_light::BlockLightTable;
 use mc_data::blocks::solaris_required_blocks_report;
 use mc_data::item_components::solaris_required_item_facts;
 use mc_data::items::solaris_required_items;
@@ -16,29 +19,208 @@ use mc_data::{Identifier, ItemStack};
 use mc_entity::{SpawnEntity, Vec3};
 use mc_protocol::codec;
 use mc_script::{
-    MAX_RESIDENT_CARRY_SLOTS, MAX_RESIDENT_EQUIPMENT_SLOTS, ScriptBlockPosition,
-    ScriptEngagementPolicy, ScriptFormation, ScriptFormationKind, ScriptHostileCategory,
-    ScriptInventoryEndpoint, ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome,
-    ScriptOperationPayload, ScriptOperationRequest, ScriptOrderMemberState, ScriptOrderTargetRef,
-    ScriptOwnedInventoryOperation, ScriptResidentOrder, ScriptResidentOrderOperation,
-    ScriptResidentOrderResult, ScriptResidentWorkOrder, ScriptWorkArea, ScriptWorkPauseReason,
-    ScriptWorkState, resident_generation_id,
+    COMPONENT_PLUGIN_API_VERSION, MAX_RESIDENT_CARRY_SLOTS, MAX_RESIDENT_EQUIPMENT_SLOTS,
+    ScriptAxisAlignedZone, ScriptBlockPosition, ScriptEngagementPolicy, ScriptEventKind,
+    ScriptFormation, ScriptFormationKind, ScriptHostileCategory, ScriptInventoryEndpoint,
+    ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload,
+    ScriptOperationRequest, ScriptOrderMemberState, ScriptOrderTargetRef,
+    ScriptOwnedInventoryOperation, ScriptPluginManifest, ScriptPosition, ScriptResidentOrder,
+    ScriptResidentOrderOperation, ScriptResidentOrderResult, ScriptResidentWorkOrder,
+    ScriptWorkArea, ScriptWorkPauseReason, ScriptWorkState, resident_generation_id,
+    script_boundary_pair,
 };
-use mc_world::{BlockPos, BlockStateId, Chunk, ChunkPos, WorldReadView, WorldStorage};
+use mc_world::{BlockPos, BlockStateId, Chunk, ChunkPos, WorldStorage};
 use uuid::Uuid;
 
 use crate::play::SessionRegistry;
-use crate::play::resident_work::LiveResidentWorld;
-use crate::play::resident_work::ResidentWorld;
-use crate::script::storage::PluginStorage;
+use crate::play::resident_work::{LiveResidentWorld, ResidentWorld, ResidentWorldEdit};
 use crate::script::storage::resident_orders::{DurableResidentOrderChange, DurableResidentStack};
 use crate::script::storage::world_inventory::InventoryRuntime;
-use crate::server::WorldHandle;
+use crate::script::storage::{PluginStorage, PluginStorageHandle, StorageFaultPoint};
+use crate::server::{ScriptEventSink, ShutdownHandle, WorldHandle};
 
 const OWNER: &str = "settlement";
 const WORLD_IDENTITY: &str = "resident-order-world";
 /// Flat terrain surface of the test world.
 const SURFACE_Y: i32 = 63;
+
+/// Test adapter that replaces the source block after loot preview but before
+/// the simulation consumes the preview's precondition.
+struct ReplacingResidentWorld {
+    inner: Arc<LiveResidentWorld>,
+    world: WorldHandle,
+    replacement: BlockStateId,
+    only_placements: bool,
+}
+
+impl ResidentWorld for ReplacingResidentWorld {
+    fn dimension_loaded(&self, dimension: &str) -> bool {
+        self.inner.dimension_loaded(dimension)
+    }
+
+    fn block(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+    ) -> Option<crate::play::resident_work::ResidentBlock> {
+        self.inner.block(dimension, pos)
+    }
+
+    fn standable(&self, dimension: &str, pos: [i32; 3]) -> Option<bool> {
+        self.inner.standable(dimension, pos)
+    }
+
+    fn route_open(&self, dimension: &str, from: [i32; 3], to: [i32; 3]) -> Option<bool> {
+        self.inner.route_open(dimension, from, to)
+    }
+
+    fn line_of_sight(&self, dimension: &str, from: Vec3, to: Vec3) -> Option<bool> {
+        self.inner.line_of_sight(dimension, from, to)
+    }
+
+    fn foreign_zone_overlaps(
+        &self,
+        plugin_id: &str,
+        dimension: &str,
+        min: [i32; 3],
+        max: [i32; 3],
+    ) -> bool {
+        self.inner
+            .foreign_zone_overlaps(plugin_id, dimension, min, max)
+    }
+
+    fn state_for(&self, block_path: &str) -> Option<u32> {
+        self.inner.state_for(block_path)
+    }
+
+    fn preview_break(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+        expected_state: u32,
+        tool: Option<&str>,
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure> {
+        self.inner
+            .preview_break(dimension, pos, expected_state, tool)
+    }
+
+    fn commit_world_edits<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        dimension: &'a str,
+        breaks: &'a [ResidentWorldEdit],
+        receipt: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>>
+    {
+        let inner = Arc::clone(&self.inner);
+        let world = Arc::clone(&self.world);
+        let replacement = self.replacement;
+        let only_placements = self.only_placements;
+        Box::pin(async move {
+            let preview = breaks
+                .first()
+                .ok_or(ScriptOperationFailure::InvalidRequest)?;
+            if !only_placements || preview.drops.is_empty() {
+                world
+                    .lock()
+                    .await
+                    .set_block_at(preview.precondition.pos, replacement)
+                    .map_err(|_| ScriptOperationFailure::RuntimeUnavailable)?;
+            }
+            inner
+                .commit_world_edits(plugin_id, dimension, breaks, receipt)
+                .await
+        })
+    }
+
+    fn preview_place(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+        state: u32,
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure> {
+        self.inner.preview_place(dimension, pos, state)
+    }
+}
+
+/// Test-only protection authority whose transition models an accepted zone
+/// removal while every other live-world read remains real.
+struct ProtectionGatedResidentWorld {
+    inner: Arc<LiveResidentWorld>,
+    protected: Arc<AtomicBool>,
+}
+
+impl ResidentWorld for ProtectionGatedResidentWorld {
+    fn dimension_loaded(&self, dimension: &str) -> bool {
+        self.inner.dimension_loaded(dimension)
+    }
+
+    fn block(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+    ) -> Option<crate::play::resident_work::ResidentBlock> {
+        self.inner.block(dimension, pos)
+    }
+
+    fn standable(&self, dimension: &str, pos: [i32; 3]) -> Option<bool> {
+        self.inner.standable(dimension, pos)
+    }
+
+    fn route_open(&self, dimension: &str, from: [i32; 3], to: [i32; 3]) -> Option<bool> {
+        self.inner.route_open(dimension, from, to)
+    }
+
+    fn line_of_sight(&self, dimension: &str, from: Vec3, to: Vec3) -> Option<bool> {
+        self.inner.line_of_sight(dimension, from, to)
+    }
+
+    fn foreign_zone_overlaps(
+        &self,
+        _plugin_id: &str,
+        _dimension: &str,
+        _min: [i32; 3],
+        _max: [i32; 3],
+    ) -> bool {
+        self.protected.load(Ordering::Acquire)
+    }
+
+    fn state_for(&self, block_path: &str) -> Option<u32> {
+        self.inner.state_for(block_path)
+    }
+
+    fn preview_break(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+        expected_state: u32,
+        tool: Option<&str>,
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure> {
+        self.inner
+            .preview_break(dimension, pos, expected_state, tool)
+    }
+
+    fn commit_world_edits<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        dimension: &'a str,
+        edits: &'a [ResidentWorldEdit],
+        receipt: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>>
+    {
+        self.inner
+            .commit_world_edits(plugin_id, dimension, edits, receipt)
+    }
+
+    fn preview_place(
+        &self,
+        dimension: &str,
+        pos: [i32; 3],
+        state: u32,
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure> {
+        self.inner.preview_place(dimension, pos, state)
+    }
+}
 
 struct Fixture {
     storage_root: tempfile::TempDir,
@@ -52,9 +234,36 @@ struct Fixture {
 
 impl Fixture {
     fn new(wall: bool) -> Self {
+        Self::with_options(wall, None, false, false, None)
+    }
+
+    fn with_replacement(wall: bool, replacement: Option<&str>) -> Self {
+        Self::with_options(wall, replacement, false, false, None)
+    }
+
+    fn with_replant_replacement(wall: bool, replacement: &str) -> Self {
+        Self::with_options(wall, Some(replacement), false, true, None)
+    }
+
+    fn with_regional_edge_crop(wall: bool) -> Self {
+        Self::with_options(wall, None, true, false, None)
+    }
+
+    fn with_protection_gate(protected: Arc<AtomicBool>) -> Self {
+        Self::with_options(false, None, false, false, Some(protected))
+    }
+
+    fn with_options(
+        wall: bool,
+        replacement: Option<&str>,
+        regional_edge_crop: bool,
+        only_placements: bool,
+        protected: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let blocks = Arc::new(
             mc_world::BlockRegistry::from_report(&solaris_required_blocks_report()).unwrap(),
         );
+        let replacement = replacement.map(|path| state_of(&blocks, path));
         let world_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(
             world_root
@@ -75,8 +284,10 @@ impl Fixture {
             let farmland = state_of(&blocks, "farmland");
             let wheat = state_with_props(&blocks, "wheat", &[("age", "7")]);
             let log = state_of(&blocks, "oak_log");
+            let leaves = state_of(&blocks, "oak_leaves");
             let ore = state_of(&blocks, "iron_ore");
             let water = state_of(&blocks, "water");
+            let crafting_table = state_of(&blocks, "crafting_table");
             for x in 0..16_u8 {
                 for z in 0..16_u8 {
                     for y in SURFACE_Y - 5..SURFACE_Y {
@@ -88,13 +299,24 @@ impl Fixture {
             // A ripe crop on farmland.
             chunk.set_block(2, SURFACE_Y, 2, farmland);
             chunk.set_block(2, SURFACE_Y + 1, 2, wheat);
-            // A rooted tree.
+            if regional_edge_crop {
+                chunk.set_block(0, SURFACE_Y, 2, farmland);
+                chunk.set_block(0, SURFACE_Y + 1, 2, wheat);
+            }
+            // A bounded natural tree: rooted trunk plus a small leaf canopy.
             chunk.set_block(6, SURFACE_Y + 1, 6, log);
             chunk.set_block(6, SURFACE_Y + 2, 6, log);
+            for x in 5..=7 {
+                for z in 5..=7 {
+                    chunk.set_block(x, SURFACE_Y + 3, z, leaves);
+                }
+            }
             // Ore inside the stone band.
             chunk.set_block(4, SURFACE_Y - 2, 4, ore);
             // A single water column.
             chunk.set_block(8, SURFACE_Y, 8, water);
+            // A loaded workstation for the craft-work contract.
+            chunk.set_block(9, SURFACE_Y + 1, 9, crafting_table);
             if wall {
                 // A closed passage: solid blocks where the squad must walk.
                 let wall_block = state_of(&blocks, "stone");
@@ -107,31 +329,79 @@ impl Fixture {
                 .insert_generated_chunk(ChunkPos { x: 0, z: 0 }, chunk)
                 .unwrap();
         }
-        let read: WorldReadView = {
+        let (read, mutation) = {
             let storage = world.try_lock().expect("test world is free");
-            storage.read_view()
+            (storage.read_view(), storage.mutation_view())
         };
         let sessions = Arc::new(SessionRegistry::new());
         let items = Arc::new(solaris_required_items());
+        let (journal, pending) = crate::play::world_journal::WorldChunkJournal::open_for_test(
+            world_root.path(),
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+        )
+        .unwrap();
+        assert!(pending.is_empty());
+        let first_decision = journal.reserve_decision_ids(1).unwrap()[0];
+        journal
+            .record_reserved_snapshot_groups(1, vec![(first_decision, Vec::new())])
+            .unwrap();
+        sessions.install_world_chunk_journal(journal);
+        let (simulation, mut owner) = crate::play::simulation_channel();
+        let _driver = {
+            let sessions = Arc::clone(&sessions);
+            let world = Arc::clone(&world);
+            let simulation_read = read.clone();
+            let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+            tokio::spawn(async move {
+                while owner.wait_for_command().await {
+                    owner
+                        .process_commands_with_world_views(
+                            &sessions,
+                            Some(&world),
+                            crate::play::SimulationWorldAccess {
+                                read: Some(&simulation_read),
+                                mutation: Some(&mutation),
+                                cpu: Some(&resources),
+                                light: None,
+                            },
+                            None,
+                            1,
+                        )
+                        .await;
+                }
+            })
+        };
         let item_facts = Arc::new(solaris_required_item_facts());
-        let light: Option<Arc<BlockLightTable>> = None;
-        let adapter = LiveResidentWorld::new(
-            Arc::clone(&world),
+        let adapter = Arc::new(LiveResidentWorld::new(
             read,
             Arc::clone(&blocks),
-            light,
             None,
+            simulation,
             Arc::clone(&items),
             Arc::clone(&item_facts),
-        );
+        ));
+        let resident_world: Arc<dyn ResidentWorld> = match (replacement, protected) {
+            (Some(replacement), _) => Arc::new(ReplacingResidentWorld {
+                inner: Arc::clone(&adapter),
+                world: Arc::clone(&world),
+                replacement,
+                only_placements,
+            }),
+            (None, Some(protected)) => Arc::new(ProtectionGatedResidentWorld {
+                inner: adapter,
+                protected,
+            }),
+            (None, None) => adapter,
+        };
         let runtime = InventoryRuntime::new(
-            None,
+            Some(world_root.path()),
             &crate::server::ShutdownHandle::default(),
             Arc::clone(&sessions),
             items,
             item_facts,
         )
-        .with_resident_world(Arc::new(adapter) as Arc<dyn ResidentWorld>);
+        .with_resident_world(resident_world);
         Self {
             storage_root: tempfile::tempdir().unwrap(),
             world_root,
@@ -182,6 +452,25 @@ impl Fixture {
         storage.get_block(BlockPos { x, y, z }).unwrap()
     }
 
+    /// Seed enough real farmland cells to force a receipt-bearing replant
+    /// operation to stop at the simulation's conditional-edit boundary.
+    async fn prepare_dense_replant_field(&self) {
+        let farmland = state_of(&self.blocks, "farmland");
+        let air = state_of(&self.blocks, "air");
+        let mut storage = self.world.lock().await;
+        for y in [40, 42, 44] {
+            for x in 0..16 {
+                for z in 0..16 {
+                    storage
+                        .set_block_at(BlockPos { x, y, z }, farmland)
+                        .expect("dense farmland stays in the loaded fixture chunk");
+                    storage
+                        .set_block_at(BlockPos { x, y: y + 1, z }, air)
+                        .expect("dense crop target stays in the loaded fixture chunk");
+                }
+            }
+        }
+    }
     async fn goal(&self, uuid: Uuid) -> mc_entity::GoalState {
         self.sessions
             .resident_entity_snapshots(&[uuid])
@@ -399,6 +688,10 @@ fn area(min: [i32; 3], max: [i32; 3]) -> ScriptWorkArea {
     )
 }
 
+fn crafting_station() -> ScriptWorkArea {
+    area([9, SURFACE_Y + 1, 9], [9, SURFACE_Y + 1, 9])
+}
+
 fn work_of(outcome: &ScriptOperationOutcome) -> mc_script::ScriptWorkAssignment {
     let ScriptOperationPayload::ResidentOrder { result } = outcome.payload() else {
         panic!(
@@ -511,6 +804,455 @@ async fn harvest_requires_its_tool_and_commits_real_drops() {
     );
 }
 
+/// (CP-013) A post-commit station event resumes the same paused assignment
+/// exactly once; another region cannot wake it, and completion cannot loop.
+#[tokio::test]
+async fn world_event_resumes_the_same_paused_craft_once() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 17, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let air = state_of(&fixture.blocks, "air");
+    let crafting_table = state_of(&fixture.blocks, "crafting_table");
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 9,
+                y: SURFACE_Y + 1,
+                z: 9,
+            },
+            air,
+        )
+        .expect("fixture station stays loaded");
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:oak_log", 1)]);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "paused-craft",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:oak_planks".to_owned(),
+                    count: 1,
+                    station: crafting_station(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::MissingStation)
+    );
+    drop(storage);
+    let mut storage = fixture.storage();
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .and_then(|record| record.work.as_ref())
+            .map(|work| work.state),
+        Some(ScriptWorkState::Paused),
+        "the reopened Store retains the exact paused job"
+    );
+
+    let unrelated = fixture
+        .runtime
+        .resume_paused_work_for_chunks(&mut storage, "minecraft:overworld", &[[8, 8]], |_| true)
+        .await
+        .expect("unrelated world event is bounded");
+    assert!(unrelated.is_empty());
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 9,
+
+                y: SURFACE_Y + 1,
+                z: 9,
+            },
+            crafting_table,
+        )
+        .expect("fixture station restoration commits");
+
+    let inactive_owner = fixture
+        .runtime
+        .resume_paused_work_for_chunks(&mut storage, "minecraft:overworld", &[[0, 0]], |_| false)
+        .await
+        .expect("inactive owner leaves durable work paused");
+    assert!(inactive_owner.is_empty());
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .and_then(|record| record.work.as_ref())
+            .map(|work| work.state),
+        Some(ScriptWorkState::Paused)
+    );
+
+    let resumed = fixture
+        .runtime
+        .resume_paused_work_for_chunks(&mut storage, "minecraft:overworld", &[[0, 0]], |_| true)
+        .await
+        .expect("matching world event resumes work");
+    assert_eq!(resumed.len(), 1);
+    let assignment = work_of(&resumed[0].outcome);
+    assert_eq!(assignment.state, ScriptWorkState::Committed);
+    assert_eq!(assignment.reason, None);
+    assert_eq!(assignment.work_units_done, 1);
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:oak_planks" && *count == 4)
+    );
+
+    let repeated = fixture
+        .runtime
+        .resume_paused_work_for_chunks(&mut storage, "minecraft:overworld", &[[0, 0]], |_| true)
+        .await
+        .expect("repeated event does not reschedule committed work");
+    assert!(repeated.is_empty());
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .and_then(|record| record.work.as_ref())
+            .map(|work| work.done),
+        Some(1)
+    );
+}
+
+/// (CP-013) A work target absent from the resident world stays unloaded until
+/// the matching chunk is published again; the reload resumes that same record.
+#[tokio::test]
+async fn chunk_load_event_resumes_the_same_unloaded_craft_once() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 21, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let station = area([24, SURFACE_Y + 1, 8], [24, SURFACE_Y + 1, 8]);
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:oak_log", 1)]);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "pause-unloaded-craft",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:oak_planks".to_owned(),
+                    count: 1,
+                    station,
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::Unloaded)
+    );
+
+    let air = state_of(&fixture.blocks, "air");
+    let crafting_table = state_of(&fixture.blocks, "crafting_table");
+    let mut loaded = Chunk::empty(
+        ChunkPos { x: 1, z: 0 },
+        air,
+        Identifier::parse("minecraft:plains").expect("valid fixture biome"),
+    );
+    loaded.set_block(8, SURFACE_Y + 1, 8, crafting_table);
+    fixture
+        .world
+        .lock()
+        .await
+        .commit_chunk_snapshot(ChunkPos { x: 1, z: 0 }, loaded)
+        .expect("fixture publishes the reloaded chunk");
+
+    let resumed = fixture
+        .runtime
+        .resume_paused_work_for_chunks(&mut storage, "minecraft:overworld", &[[1, 0]], |_| true)
+        .await
+        .expect("matching chunk load resumes craft");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        work_of(&resumed[0].outcome).state,
+        ScriptWorkState::Committed
+    );
+    assert!(
+        fixture
+            .runtime
+            .resume_paused_work_for_chunks(
+                &mut storage,
+                "minecraft:overworld",
+                &[[1, 0]],
+                |_| true,
+            )
+            .await
+            .expect("completed work cannot resume twice")
+            .is_empty()
+    );
+}
+
+/// (CP-013) A resident inventory event wakes only that resident's blocked
+/// prerequisite and preserves the original assignment watermark.
+#[tokio::test]
+async fn inventory_event_resumes_the_same_paused_harvest_once() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 18, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let harvest = ScriptResidentWorkOrder::Harvest {
+        area: area([2, 64, 2], [2, 64, 2]),
+        tool: "minecraft:iron_hoe".to_owned(),
+    };
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request("paused-harvest", &handle, harvest, 1, 0),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::MissingTool)
+    );
+
+    seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let resumed = fixture
+        .runtime
+        .resume_paused_work_for_inventory_change(
+            &mut storage,
+            std::slice::from_ref(&handle),
+            &[],
+            |_| true,
+        )
+        .await
+        .expect("resident inventory event resumes work");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        work_of(&resumed[0].outcome).state,
+        ScriptWorkState::Committed
+    );
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air"))
+    );
+    assert!(
+        fixture
+            .runtime
+            .resume_paused_work_for_inventory_change(
+                &mut storage,
+                std::slice::from_ref(&handle),
+                &[],
+                |_| true,
+            )
+            .await
+            .expect("completed work cannot loop")
+            .is_empty()
+    );
+}
+/// (CP-013) A changed protection zone selects only the paused work region it
+/// overlaps. Removing that protection resumes the original job once.
+#[tokio::test]
+async fn zone_change_resumes_the_same_protected_harvest_once() {
+    let protected = Arc::new(AtomicBool::new(true));
+    let fixture = Fixture::with_protection_gate(Arc::clone(&protected));
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 22, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "pause-protected-harvest",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([2, 64, 2], [2, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::Protected)
+    );
+    let released_zone = ScriptAxisAlignedZone::try_new(
+        "released-field",
+        "minecraft:overworld",
+        ScriptPosition::try_new(1.5, 63.0, 1.5).expect("valid zone minimum"),
+        ScriptPosition::try_new(2.5, 65.0, 2.5).expect("valid zone maximum"),
+    )
+    .expect("valid released zone");
+    let other_zone = ScriptAxisAlignedZone::try_new(
+        "other-field",
+        "minecraft:overworld",
+        ScriptPosition::try_new(128.0, 63.0, 128.0).expect("valid zone minimum"),
+        ScriptPosition::try_new(129.0, 65.0, 129.0).expect("valid zone maximum"),
+    )
+    .expect("valid unrelated zone");
+    assert!(
+        storage
+            .resident_orders()
+            .paused_records_for_zone(&other_zone)
+            .is_empty(),
+        "a non-overlapping zone cannot wake protected work"
+    );
+
+    protected.store(false, Ordering::Release);
+    let resumed = fixture
+        .runtime
+        .resume_paused_work_for_zone(&mut storage, &released_zone, |_| true)
+        .await
+        .expect("removed protection resumes work");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        work_of(&resumed[0].outcome).state,
+        ScriptWorkState::Committed
+    );
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air"))
+    );
+    assert!(
+        fixture
+            .runtime
+            .resume_paused_work_for_zone(&mut storage, &released_zone, |_| true)
+            .await
+            .expect("completed protected work cannot loop")
+            .is_empty()
+    );
+}
+
+/// (CP-013) The storage actor sends the real native resumption receipt only
+/// after its queued world event observes the restored station.
+#[tokio::test]
+async fn storage_actor_delivers_one_native_resume_receipt() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 19, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let air = state_of(&fixture.blocks, "air");
+    let crafting_table = state_of(&fixture.blocks, "crafting_table");
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 9,
+                y: SURFACE_Y + 1,
+                z: 9,
+            },
+            air,
+        )
+        .expect("fixture station stays loaded");
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:oak_log", 1)]);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "actor-paused-craft",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:oak_planks".to_owned(),
+                    count: 1,
+                    station: crafting_station(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::MissingStation)
+    );
+    let receipt = storage
+        .operation_receipt(OWNER, "actor-paused-craft")
+        .cloned()
+        .expect("paused assignment receipt is durable");
+    storage
+        .acknowledge_operation(&receipt)
+        .expect("fixture consumes the original receipt before actor startup");
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 9,
+                y: SURFACE_Y + 1,
+                z: 9,
+            },
+            crafting_table,
+        )
+        .expect("fixture station restoration commits");
+
+    let (boundary, mut endpoint) = script_boundary_pair(
+        NonZeroUsize::new(8).expect("event capacity"),
+        NonZeroUsize::new(8).expect("command capacity"),
+    );
+    let manifest = ScriptPluginManifest::new(OWNER, OWNER, "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+        .validate()
+        .expect("test owner manifest is valid");
+    endpoint
+        .register_plugin_routes(&manifest)
+        .expect("test owner registration is live");
+    let actor = PluginStorageHandle::start(
+        storage,
+        fixture.runtime.clone(),
+        ScriptEventSink::new(boundary),
+        ShutdownHandle::default(),
+    );
+    actor
+        .wake_resident_work("minecraft:overworld", vec![[0, 0]])
+        .await;
+    let event = match tokio::time::timeout(Duration::from_secs(1), endpoint.recv_event()).await {
+        Ok(Some(event)) => event,
+        Ok(None) => panic!("storage actor closed before native resume delivery"),
+        Err(_) => panic!(
+            "native resume event is not delivered; storage actor failed: {}",
+            actor.failed()
+        ),
+    };
+    let ScriptEventKind::OperationResult {
+        operation_id,
+        outcome,
+        ..
+    } = event.kind()
+    else {
+        panic!(
+            "expected native operation result, got {}",
+            event.event_name()
+        );
+    };
+    assert!(
+        operation_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("native-resume-"))
+    );
+    assert_eq!(work_of(outcome).state, ScriptWorkState::Committed);
+    assert_eq!(
+        fixture.block(9, SURFACE_Y + 1, 9).await,
+        Some(crafting_table)
+    );
+    drop(actor);
+}
+
 /// (R1) The harvested crop ends up in the worker's own cargo, and the receipt
 /// states exactly what it holds: a receipt delta with no owner was the defect.
 #[tokio::test]
@@ -537,6 +1279,7 @@ async fn harvest_deposits_the_real_crop_into_the_worker_cargo() {
             ),
         )
         .await;
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
     let assignment = work_of(&outcome);
     assert_eq!(assignment.reason, None, "{assignment:?}");
     assert!(assignment.work_units_done >= 1);
@@ -585,6 +1328,487 @@ async fn harvest_deposits_the_real_crop_into_the_worker_cargo() {
             .any(|(item, count)| item == "minecraft:wheat" && *count == wheat),
         "the carry snapshot shows the harvested crop: {counted:?}"
     );
+}
+
+/// (CP-007) A receipt-bearing resident break at a regional edge still uses the
+/// journaled regional decision instead of falling through to a direct refusal.
+#[tokio::test]
+async fn harvest_at_regional_edge_commits_the_crop_and_cargo_together() {
+    let fixture = Fixture::with_regional_edge_crop(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(0.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "harvest-regional-edge",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([0, 64, 2], [0, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(
+        fixture.block(0, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air"))
+    );
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:wheat" && *count >= 1),
+        "the edge decision records its crop in worker cargo"
+    );
+}
+
+/// (CP-007) A storage projection failure after the world decision never loses
+/// the previewed crop: reopening projects the exact journal receipt once.
+#[tokio::test]
+async fn harvest_recovers_cargo_and_progress_after_storage_projection_fails() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let request = work_request(
+        "harvest-projection-recovery",
+        &handle,
+        ScriptResidentWorkOrder::Harvest {
+            area: area([2, 64, 2], [2, 64, 2]),
+            tool: "minecraft:iron_hoe".to_owned(),
+        },
+        1,
+        revision,
+    );
+
+    storage.inject_fault_for_test(StorageFaultPoint::Write);
+    assert!(matches!(
+        fixture
+            .runtime
+            .execute_resident_order_operation(&mut storage, OWNER, &request)
+            .await,
+        Err(super::PluginStorageMutationError::DurabilityUnknown(_))
+    ));
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air")),
+        "the accepted world decision keeps the broken crop"
+    );
+
+    drop(storage);
+    let mut reopened = fixture.storage();
+    fixture
+        .runtime
+        .recover(&mut reopened)
+        .expect("the accepted world receipt projects at recovery");
+    let recovered = fixture.execute(&mut reopened, &request).await;
+    let assignment = work_of(&recovered);
+    assert_eq!(assignment.work_units_done, 1);
+    let wheat = carry(&reopened, &handle)
+        .iter()
+        .filter(|(item, _)| item == "minecraft:wheat")
+        .map(|(_, count)| *count)
+        .sum::<u32>();
+    assert_eq!(wheat, 1, "recovery must not duplicate the canonical crop");
+}
+
+/// (CP-007) Replacing a crop after preview consumes neither the replacement
+/// block nor the previewed loot; the worker record keeps its old progress.
+#[tokio::test]
+async fn replaced_crop_after_preview_does_not_create_cargo_or_work_progress() {
+    let fixture = Fixture::with_replacement(false, Some("stone"));
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "harvest-replaced-after-preview",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([2, 64, 2], [2, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "stone")),
+        "the replacement survives the stale conditional decision"
+    );
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:wheat"),
+        "a stale preview cannot mint crop cargo"
+    );
+    let record = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("seeded resident record remains");
+    assert_eq!(record.revision, revision);
+    assert!(
+        record.work.is_none(),
+        "the stale call records no work progress"
+    );
+}
+
+/// (CP-008) Harvesting and replanting use the real crop state and leave the
+/// worker with the canonical produce and the exact remaining seed reserve.
+#[tokio::test]
+async fn harvest_then_replant_commits_crop_seed_and_work_together() {
+    let fixture = Fixture::with_regional_edge_crop(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(0.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_hoe", 1), ("minecraft:wheat_seeds", 2)],
+    );
+    let harvest = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "harvest-before-replant",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([0, 64, 2], [0, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(harvest.failure(), None, "{harvest:?}");
+    assert_eq!(
+        fixture.block(0, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air"))
+    );
+
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("harvest record")
+        .revision;
+    let seeds_before_replant = carry(&storage, &handle)
+        .iter()
+        .find(|(item, _)| item == "minecraft:wheat_seeds")
+        .map(|(_, count)| *count)
+        .expect("harvest retains the canonical seed drop");
+    let replant = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "replant-after-harvest",
+                &handle,
+                ScriptResidentWorkOrder::Replant {
+                    area: area([0, SURFACE_Y, 2], [0, SURFACE_Y, 2]),
+                    seed: "minecraft:wheat_seeds".to_owned(),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&replant);
+    assert_eq!(replant.failure(), None, "{replant:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Committed);
+    assert_eq!(assignment.work_units_done, 1);
+    assert_eq!(
+        fixture.block(0, 64, 2).await,
+        Some(state_of(&fixture.blocks, "wheat")),
+        "replant places the registered default crop state"
+    );
+    let carried = carry(&storage, &handle);
+    assert_eq!(
+        carried
+            .iter()
+            .find(|(item, _)| item == "minecraft:wheat_seeds")
+            .map(|(_, count)| *count),
+        Some(seeds_before_replant - 1),
+        "exactly one seed left the worker's reserve"
+    );
+    assert!(
+        carried
+            .iter()
+            .any(|(item, count)| item == "minecraft:wheat" && *count >= 1),
+        "the first cycle's canonical harvest remains worker-owned"
+    );
+}
+
+/// (CP-008) A field with no seed reserve advances neither the replant
+/// assignment nor a speculative world decision.
+#[tokio::test]
+async fn replant_without_seed_leaves_the_field_unchanged() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let replant = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "replant-without-seed",
+                &handle,
+                ScriptResidentWorkOrder::Replant {
+                    area: area([2, SURFACE_Y, 2], [2, SURFACE_Y, 2]),
+                    seed: "minecraft:wheat_seeds".to_owned(),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&replant);
+    assert_eq!(replant.failure(), None, "{replant:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::MissingInput));
+    assert_eq!(assignment.work_units_done, 0);
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_with_props(&fixture.blocks, "wheat", &[("age", "7")])),
+        "a missing seed cannot change the field"
+    );
+}
+
+/// (CP-008) A seed reserve alone cannot plant a crop: replant requires its
+/// configured tool before either the field or inventory record can change.
+#[tokio::test]
+async fn replant_without_tool_leaves_the_field_and_seed_unchanged() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:wheat_seeds", 1)]);
+    let replant = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "replant-without-tool",
+                &handle,
+                ScriptResidentWorkOrder::Replant {
+                    area: area([2, SURFACE_Y, 2], [2, SURFACE_Y, 2]),
+                    seed: "minecraft:wheat_seeds".to_owned(),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&replant);
+    assert_eq!(replant.failure(), None, "{replant:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::MissingTool));
+    assert_eq!(assignment.work_units_done, 0);
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_with_props(&fixture.blocks, "wheat", &[("age", "7")])),
+        "a missing tool cannot change the field"
+    );
+    assert_eq!(
+        carry(&storage, &handle),
+        vec![("minecraft:wheat_seeds".to_owned(), 1)],
+        "a missing tool cannot spend the seed reserve"
+    );
+}
+
+/// (CP-008) A player edit after placement preview consumes neither seed nor
+/// replant progress; the changed field wins the conditional decision.
+#[tokio::test]
+async fn changed_field_after_replant_preview_keeps_seed_and_work_unchanged() {
+    let fixture = Fixture::with_replant_replacement(false, "stone");
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_hoe", 1), ("minecraft:wheat_seeds", 1)],
+    );
+    let harvest = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "harvest-before-changed-replant",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([2, 64, 2], [2, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(harvest.failure(), None, "{harvest:?}");
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("harvest record")
+        .revision;
+    let seeds_before_replant = carry(&storage, &handle)
+        .iter()
+        .find(|(item, _)| item == "minecraft:wheat_seeds")
+        .map(|(_, count)| *count)
+        .expect("harvest retains the canonical seed drop");
+    let wheat_before_replant = carry(&storage, &handle)
+        .iter()
+        .filter(|(item, _)| item == "minecraft:wheat")
+        .map(|(_, count)| *count)
+        .sum::<u32>();
+    let replant = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "replant-after-player-field-change",
+                &handle,
+                ScriptResidentWorkOrder::Replant {
+                    area: area([2, SURFACE_Y, 2], [2, SURFACE_Y, 2]),
+                    seed: "minecraft:wheat_seeds".to_owned(),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        replant.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "stone")),
+        "the player-changed field survives the rejected placement"
+    );
+    assert_eq!(
+        carry(&storage, &handle)
+            .iter()
+            .find(|(item, _)| item == "minecraft:wheat_seeds")
+            .map(|(_, count)| *count),
+        Some(seeds_before_replant),
+        "a rejected placement preserves the durable seed reserve"
+    );
+    assert_eq!(
+        carry(&storage, &handle)
+            .iter()
+            .filter(|(item, _)| item == "minecraft:wheat")
+            .map(|(_, count)| *count)
+            .sum::<u32>(),
+        wheat_before_replant,
+        "a rejected placement cannot duplicate harvested produce"
+    );
+    let record = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("harvest record remains");
+    assert_eq!(record.revision, revision);
+    assert!(
+        matches!(
+            record.work.as_deref(),
+            Some(work) if matches!(&work.work, ScriptResidentWorkOrder::Harvest { .. })
+        ),
+        "the rejected replant cannot replace prior committed work progress"
+    );
+}
+
+/// (CP-008) A replant receipt never exceeds the simulation's conditional-edit
+/// cap: the durable work watermark resumes the one remaining real field cell.
+#[tokio::test]
+async fn replant_splits_at_the_simulation_edit_limit() {
+    let fixture = Fixture::new(false);
+    fixture.prepare_dense_replant_field().await;
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(0.5, 64.0, 0.5))
+        .await;
+    let equipment = [
+        ("minecraft:iron_hoe", 1),
+        ("minecraft:wheat_seeds", 64),
+        ("minecraft:wheat_seeds", 64),
+        ("minecraft:wheat_seeds", 64),
+        ("minecraft:wheat_seeds", 64),
+        ("minecraft:wheat_seeds", 64),
+    ];
+    let carry = [
+        ("minecraft:wheat_seeds", 64),
+        ("minecraft:wheat_seeds", 64),
+        ("minecraft:wheat_seeds", 64),
+        ("minecraft:wheat_seeds", 64),
+    ];
+    let revision = seed_gear_in(&mut storage, &handle, uuid, &equipment, true);
+    let revision = seed_gear_in(&mut storage, &handle, uuid, &carry, false).max(revision);
+    let work = ScriptResidentWorkOrder::Replant {
+        area: area([0, 40, 0], [15, 44, 15]),
+        seed: "minecraft:wheat_seeds".to_owned(),
+        tool: "minecraft:iron_hoe".to_owned(),
+    };
+    let first = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "replant-edit-limit-first",
+                &handle,
+                work.clone(),
+                513,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&first);
+    assert_eq!(first.failure(), None, "{first:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Running);
+    assert_eq!(assignment.reason, None);
+    assert_eq!(assignment.work_units_done, 512);
+
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("first portion record")
+        .revision;
+    let resumed = fixture
+        .execute(
+            &mut storage,
+            &work_request("replant-edit-limit-resume", &handle, work, 513, revision),
+        )
+        .await;
+    let assignment = work_of(&resumed);
+    assert_eq!(resumed.failure(), None, "{resumed:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Committed);
+    assert_eq!(assignment.reason, None);
+    assert_eq!(assignment.work_units_done, 513);
 }
 
 /// (R1) A worker who cannot hold the loot leaves the world alone: no block is
@@ -685,6 +1909,512 @@ async fn mined_ore_reaches_the_worker_cargo() {
     );
 }
 
+/// (CP-010) Mining must not destroy an ore whose canonical loot cannot enter
+/// the worker's actual inventory.
+#[tokio::test]
+async fn mine_with_full_cargo_leaves_ore_untouched() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
+        .await;
+    let fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_CARRY_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    let mut revision = seed_gear_in(&mut storage, &handle, uuid, &fill, false);
+    let equipment: Vec<(&str, u32)> = (0..MAX_RESIDENT_EQUIPMENT_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    revision = seed_gear_in(&mut storage, &handle, uuid, &equipment, true).max(revision);
+    revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_pickaxe", 1)],
+    )
+    .max(revision);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-full",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area([4, SURFACE_Y - 2, 4], [4, SURFACE_Y - 2, 4]),
+                    tool: "minecraft:iron_pickaxe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(assignment.work_units_done, 0);
+    assert_eq!(
+        fixture.block(4, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "iron_ore")),
+        "a full worker cannot convert an ore to unowned loot"
+    );
+}
+
+/// (CP-010) An unsuitable tool cannot consume an ore block without producing
+/// its canonical loot for the worker.
+#[tokio::test]
+async fn mine_with_unsuitable_tool_preserves_ore() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-with-hoe",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area([4, SURFACE_Y - 2, 4], [4, SURFACE_Y - 2, 4]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::MissingTool));
+    assert_eq!(assignment.work_units_done, 0);
+    assert_eq!(
+        fixture.block(4, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "iron_ore")),
+        "a non-dropping tool must leave the ore in the world"
+    );
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:raw_iron"),
+        "a refused mine does not mint ore cargo"
+    );
+}
+
+/// (CP-010) A tool-tier refusal after one accepted ore preserves the next ore
+/// and exposes the reason without rolling back the accepted durable decision.
+#[tokio::test]
+async fn mine_pauses_for_a_later_ore_that_needs_a_better_tool() {
+    let fixture = Fixture::new(false);
+    {
+        let mut world = fixture.world.lock().await;
+        world
+            .set_block_at(
+                BlockPos {
+                    x: 4,
+                    y: SURFACE_Y - 2,
+                    z: 4,
+                },
+                state_of(&fixture.blocks, "coal_ore"),
+            )
+            .expect("the first ore remains in the loaded fixture chunk");
+        world
+            .set_block_at(
+                BlockPos {
+                    x: 5,
+                    y: SURFACE_Y - 2,
+                    z: 4,
+                },
+                state_of(&fixture.blocks, "diamond_ore"),
+            )
+            .expect("the later ore remains in the loaded fixture chunk");
+    }
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:stone_pickaxe", 1)],
+    );
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-coal-before-diamond",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area([4, SURFACE_Y - 2, 4], [5, SURFACE_Y - 2, 4]),
+                    tool: "minecraft:stone_pickaxe".to_owned(),
+                },
+                2,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::MissingTool));
+    assert_eq!(assignment.work_units_done, 1);
+    assert_eq!(
+        fixture.block(4, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "air")),
+        "the canonical coal decision remains committed"
+    );
+    assert_eq!(
+        fixture.block(5, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "diamond_ore")),
+        "the tier-gated ore remains available for a suitable tool"
+    );
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:coal" && *count >= 1),
+        "only the accepted coal reaches the worker"
+    );
+}
+
+/// (CP-007) Tree cutting uses the same receipt-bearing break boundary as crop
+/// harvest and mining.
+#[tokio::test]
+async fn cut_tree_commits_the_log_and_worker_cargo_together() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_axe", 1)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "cut-cargo",
+                &handle,
+                ScriptResidentWorkOrder::CutTree {
+                    area: area([6, SURFACE_Y + 1, 6], [6, SURFACE_Y + 2, 6]),
+                    tool: "minecraft:iron_axe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(assignment.work_units_done, 1);
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:oak_log" && *count == 1),
+        "the worker receives the one committed log"
+    );
+    assert_eq!(
+        fixture.block(6, SURFACE_Y + 1, 6).await,
+        Some(state_of(&fixture.blocks, "air")),
+        "the matching world log was committed in the receipt decision"
+    );
+}
+
+/// (CP-009) A grounded house column beside a real tree remains untouched.
+#[tokio::test]
+async fn cut_tree_keeps_adjacent_grounded_house_logs() {
+    let fixture = Fixture::new(false);
+
+    let house_log = state_of(&fixture.blocks, "oak_log");
+    {
+        let mut world = fixture.world.lock().await;
+        for y in SURFACE_Y + 1..=SURFACE_Y + 2 {
+            world
+                .set_block_at(BlockPos { x: 9, y, z: 6 }, house_log)
+                .expect("the house column stays in the loaded fixture chunk");
+        }
+    }
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_axe", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "cut-tree-not-house",
+                &handle,
+                ScriptResidentWorkOrder::CutTree {
+                    area: area([6, SURFACE_Y + 1, 6], [9, SURFACE_Y + 2, 6]),
+                    tool: "minecraft:iron_axe".to_owned(),
+                },
+                3,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(
+        fixture.block(9, SURFACE_Y + 1, 6).await,
+        Some(house_log),
+        "a grounded log column without a canopy is a house, not a tree"
+    );
+    assert_eq!(
+        fixture.block(9, SURFACE_Y + 2, 6).await,
+        Some(house_log),
+        "the worker must not progress into the adjacent house column"
+    );
+    assert_eq!(
+        carry(&storage, &handle)
+            .iter()
+            .filter(|(item, _)| item == "minecraft:oak_log")
+            .map(|(_, count)| *count)
+            .sum::<u32>(),
+        2,
+        "only the two natural-tree trunk logs reach the worker"
+    );
+}
+/// (CP-011) Fishing pays a durable owner only from water currently present in
+/// the named work area; its deterministic cod result is not a vanilla-loot claim.
+#[tokio::test]
+async fn fish_uses_real_water_and_credits_resident_cargo() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(8.5, 64.0, 8.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:fishing_rod", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "fish-water-column",
+                &handle,
+                ScriptResidentWorkOrder::Fish {
+                    area: area([8, SURFACE_Y, 8], [8, SURFACE_Y, 8]),
+                    tool: "minecraft:fishing_rod".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Committed);
+    assert_eq!(assignment.reason, None);
+    assert_eq!(assignment.work_units_done, 1);
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:cod" && *count == 1),
+        "the catch belongs to the worker"
+    );
+}
+
+/// (CP-011) Tending spends feed only while a live, locally tracked animal is
+/// available; it produces no virtual livestock goods.
+#[tokio::test]
+async fn tend_livestock_consumes_feed_for_a_visible_animal() {
+    let fixture = Fixture::new(false);
+    let mut cow = SpawnEntity::new(0, "minecraft:cow", Vec3::new(6.5, 64.0, 6.5));
+    cow.animal = Some(mc_entity::AnimalBreedingState::adult());
+    fixture
+        .sessions
+        .spawn_tracked_entity_for_test(cow, false)
+        .expect("the cow joins the local session index");
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:wheat", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "tend-visible-cow",
+                &handle,
+                ScriptResidentWorkOrder::TendLivestock {
+                    area: area([6, 64, 6], [6, 64, 6]),
+                    feed: "minecraft:wheat".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Committed);
+    assert_eq!(assignment.reason, None);
+    assert_eq!(assignment.work_units_done, 1);
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:wheat"),
+        "the real tending action consumes resident-owned feed"
+    );
+    assert!(
+        assignment.changes.iter().all(|change| change.delta <= 0),
+        "tending does not mint livestock output: {:?}",
+        assignment.changes
+    );
+}
+
+/// (CP-011) A resident cannot spend wheat on a chicken or a baby cow: the
+/// shared vanilla food tags and breeding state gate the durable cost.
+#[tokio::test]
+async fn tend_livestock_refuses_incompatible_or_immature_animals() {
+    for (case, type_name, animal) in [
+        (
+            "incompatible-chicken",
+            "minecraft:chicken",
+            mc_entity::AnimalBreedingState::adult(),
+        ),
+        (
+            "immature-cow",
+            "minecraft:cow",
+            mc_entity::AnimalBreedingState::baby(),
+        ),
+    ] {
+        let fixture = Fixture::new(false);
+        let mut entity = SpawnEntity::new(0, type_name, Vec3::new(6.5, 64.0, 6.5));
+        entity.animal = Some(animal);
+        fixture
+            .sessions
+            .spawn_tracked_entity_for_test(entity, false)
+            .expect("the animal joins the local session index");
+        let mut storage = fixture.storage();
+        let (handle, uuid) = fixture
+            .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+            .await;
+        let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:wheat", 1)]);
+        let operation_id = format!("tend-{case}");
+        let outcome = fixture
+            .execute(
+                &mut storage,
+                &work_request(
+                    &operation_id,
+                    &handle,
+                    ScriptResidentWorkOrder::TendLivestock {
+                        area: area([6, 64, 6], [6, 64, 6]),
+                        feed: "minecraft:wheat".to_owned(),
+                    },
+                    1,
+                    revision,
+                ),
+            )
+            .await;
+        let assignment = work_of(&outcome);
+
+        assert_eq!(outcome.failure(), None, "{case}: {outcome:?}");
+        assert_eq!(assignment.state, ScriptWorkState::Paused, "{case}");
+        assert_eq!(
+            assignment.reason,
+            Some(ScriptWorkPauseReason::MissingInput),
+            "{case}"
+        );
+        assert_eq!(assignment.work_units_done, 0, "{case}");
+        assert!(
+            carry(&storage, &handle)
+                .iter()
+                .any(|(item, count)| item == "minecraft:wheat" && *count == 1),
+            "{case}: an ineligible animal cannot consume feed"
+        );
+    }
+}
+
+/// (CP-011) Water and livestock work both preserve their input when their
+/// corresponding live source is absent.
+#[tokio::test]
+async fn fish_and_livestock_without_sources_preserve_inputs() {
+    let fishing = Fixture::new(false);
+    let mut fishing_storage = fishing.storage();
+    let (fisher, fisher_uuid) = fishing
+        .resident(&mut fishing_storage, 3, Vec3::new(7.5, 64.0, 7.5))
+        .await;
+    let fishing_revision = seed_gear(
+        &mut fishing_storage,
+        &fisher,
+        fisher_uuid,
+        &[("minecraft:fishing_rod", 1)],
+    );
+    let fishing_outcome = fishing
+        .execute(
+            &mut fishing_storage,
+            &work_request(
+                "fish-without-water",
+                &fisher,
+                ScriptResidentWorkOrder::Fish {
+                    area: area([7, SURFACE_Y, 7], [7, SURFACE_Y, 7]),
+                    tool: "minecraft:fishing_rod".to_owned(),
+                },
+                1,
+                fishing_revision,
+            ),
+        )
+        .await;
+    let fishing_work = work_of(&fishing_outcome);
+    assert_eq!(fishing_work.state, ScriptWorkState::Paused);
+    assert_eq!(
+        fishing_work.reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    assert!(
+        carry(&fishing_storage, &fisher)
+            .iter()
+            .any(|(item, count)| item == "minecraft:fishing_rod" && *count == 1),
+        "no water leaves the rod untouched"
+    );
+
+    let livestock = Fixture::new(false);
+    let mut livestock_storage = livestock.storage();
+    let (tender, tender_uuid) = livestock
+        .resident(&mut livestock_storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let livestock_revision = seed_gear(
+        &mut livestock_storage,
+        &tender,
+        tender_uuid,
+        &[("minecraft:wheat", 1)],
+    );
+    let livestock_outcome = livestock
+        .execute(
+            &mut livestock_storage,
+            &work_request(
+                "tend-without-livestock",
+                &tender,
+                ScriptResidentWorkOrder::TendLivestock {
+                    area: area([6, 64, 6], [6, 64, 6]),
+                    feed: "minecraft:wheat".to_owned(),
+                },
+                1,
+                livestock_revision,
+            ),
+        )
+        .await;
+    let livestock_work = work_of(&livestock_outcome);
+    assert_eq!(livestock_work.state, ScriptWorkState::Paused);
+    assert_eq!(
+        livestock_work.reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    assert!(
+        carry(&livestock_storage, &tender)
+            .iter()
+            .any(|(item, count)| item == "minecraft:wheat" && *count == 1),
+        "no livestock leaves the feed with its owner"
+    );
+}
+
 fn carry_request(handle: &str, expected_revision: Option<u64>) -> ScriptOperationRequest {
     ScriptOperationRequest::try_new(
         "request",
@@ -747,6 +2477,7 @@ async fn craft_requires_inputs_and_consumes_them_exactly_once() {
     let craft = ScriptResidentWorkOrder::Craft {
         recipe: "minecraft:oak_planks".to_owned(),
         count: 2,
+        station: crafting_station(),
     };
 
     let outcome = fixture
@@ -790,6 +2521,7 @@ async fn craft_requires_inputs_and_consumes_them_exactly_once() {
         ScriptResidentWorkOrder::Craft {
             recipe: "minecraft:oak_planks".to_owned(),
             count: 1,
+            station: crafting_station(),
         },
         1,
         assignment.revision,
@@ -805,6 +2537,111 @@ async fn craft_requires_inputs_and_consumes_them_exactly_once() {
         .map(|(_, count)| count)
         .sum::<u32>();
     assert_eq!(planks, 8, "no second craft ran");
+}
+
+/// (CP-012) A full inventory keeps every ingredient and leaves no partial output
+/// when a recipe can fill only part of an existing output stack.
+#[tokio::test]
+async fn craft_without_output_capacity_preserves_ingredients() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let mut carry_fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_CARRY_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    carry_fill[0] = ("minecraft:oak_planks", 62);
+    carry_fill[1] = ("minecraft:oak_log", 64);
+    let revision = seed_gear_in(&mut storage, &handle, uuid, &carry_fill, false);
+    let equipment_fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_EQUIPMENT_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    let revision = seed_gear_in(&mut storage, &handle, uuid, &equipment_fill, true).max(revision);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "craft-full-output",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:oak_planks".to_owned(),
+                    count: 1,
+                    station: crafting_station(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(assignment.work_units_done, 0);
+    let contents = gear(&storage, &handle);
+    assert_eq!(
+        contents
+            .iter()
+            .filter(|(item, _)| item == "minecraft:oak_log")
+            .map(|(_, count)| count)
+            .sum::<u32>(),
+        64,
+        "the failed output placement restores the exact input stack"
+    );
+    assert_eq!(
+        contents
+            .iter()
+            .filter(|(item, _)| item == "minecraft:oak_planks")
+            .map(|(_, count)| count)
+            .sum::<u32>(),
+        62,
+        "a failed partial merge leaves no phantom output"
+    );
+}
+
+/// (CP-012) A craft pauses before consuming material when its named station
+/// is absent, rather than treating an arbitrary loaded cell as a workshop.
+#[tokio::test]
+async fn craft_requires_the_named_crafting_table() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:oak_log", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "craft-without-table",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:oak_planks".to_owned(),
+                    count: 1,
+                    station: area([7, SURFACE_Y, 7], [7, SURFACE_Y, 7]),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(
+        assignment.reason,
+        Some(ScriptWorkPauseReason::MissingStation)
+    );
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(
+        gear(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:oak_log" && *count == 1),
+        "a missing table leaves the craft input with its resident owner"
+    );
 }
 
 /// (A08) Haul moves real items between the resident's canonical endpoints and

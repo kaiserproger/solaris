@@ -1,6 +1,7 @@
 use mc_data::block_facts::FluidKind;
 use mc_data::item_stack::ItemStack;
 use mc_domain::GameMode;
+use mc_entity::Vec3;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::play::EntityVec3;
 use mc_world::BlockPos;
@@ -15,13 +16,89 @@ use super::inventory::damage_equipped_armor;
 use super::movement::{fall_damage_amount, player_touches_lit_campfire_in_snapshot};
 use super::persistence::XpState;
 use super::session::PlayerDamagePublication;
+use super::session::SessionId;
+use super::session::damage_precommit::{
+    PlayerDamageAdmission, PlayerDamagePrecommitAdmission, PlayerDamageSource,
+};
 use super::survival::SurvivalState;
 use super::{
-    InteractionState, PlayerPose, PlayerSurvivalUpdateOutcome, clear_shield_use,
+    HookApproval, InteractionState, PlayerPose, PlayerSurvivalUpdateOutcome, clear_shield_use,
     commit_player_survival_update, commit_player_survival_update_with_shield,
     finish_committed_shield_damage, plan_active_shield_damage, player_body_block_snapshot,
     refresh_shield_use_state, shield_blocks_current_damage, survival_damage_after_equipment,
 };
+
+/// One connection-side damage event the before-damage chain let through.
+///
+/// [`Self::amount`] is the raw amount the owner applies through its unchanged
+/// armor/shield/resistance pipeline; [`Self::approval`] is the live ticket the
+/// resulting plan commits against. A decision the chain refused never reaches
+/// this type at all.
+pub(super) struct AdmittedPlayerDamage {
+    pub(super) amount: f32,
+    pub(super) approval: Option<HookApproval>,
+}
+
+/// Ask the shared owner-side before-damage chain about one connection request.
+///
+/// The transport, the hook context and the decision semantics live in
+/// [`super::session::damage_precommit`]; this is only the connection side's
+/// adaptation of its answer. `None` means the chain refused the effect - a
+/// cancellation, an expiry or any typed failure - and the caller applies
+/// nothing: no health, no durability, no hurt or death publication.
+pub(super) async fn admit_connection_player_damage<P>(
+    precommit: &P,
+    session_id: SessionId,
+    dimension: &str,
+    request: PlayerDamageRequest,
+    position: Vec3,
+    source: PlayerDamageSource,
+) -> Option<AdmittedPlayerDamage>
+where
+    P: PlayerDamagePrecommitAdmission + ?Sized,
+{
+    match precommit
+        .admit_player_damage(session_id, dimension, request, position, source)
+        .await
+    {
+        PlayerDamageAdmission::Direct => Some(AdmittedPlayerDamage {
+            amount: request.amount,
+            approval: None,
+        }),
+        PlayerDamageAdmission::Approved { amount, approval } => Some(AdmittedPlayerDamage {
+            amount,
+            approval: Some(approval),
+        }),
+        PlayerDamageAdmission::Refused(failure) => {
+            debug!(
+                session_id,
+                ?failure,
+                kind = ?request.kind,
+                "player damage refused before any native reduction"
+            );
+            None
+        }
+    }
+}
+
+/// Whether a connection-side producer's request could damage this player at all.
+///
+/// Producers ask this before they consult the before-damage hook, so a request
+/// the owner would ignore never becomes a plugin question. It is the pre-commit
+/// half of the adapter's own guard: a zero amount is excluded here, because only
+/// an approved [`mc_script::precommit::HookDecision::Replace`] may make a request
+/// zero, and that answer arrives after the question is asked.
+pub(super) fn player_damage_can_apply(
+    game_mode: GameMode,
+    survival_state: &SurvivalState,
+    request: &PlayerDamageRequest,
+) -> bool {
+    !matches!(game_mode, GameMode::Creative | GameMode::Spectator)
+        && request.amount.is_finite()
+        && request.amount > 0.0
+        && request.kind.is_supported()
+        && !survival_state.is_dead()
+}
 
 pub(super) fn player_is_submerged(state: Option<&InteractionState>, pose: PlayerPose) -> bool {
     pose.eye_in_water
@@ -38,7 +115,14 @@ pub(super) fn player_is_submerged(state: Option<&InteractionState>, pose: Player
         })
 }
 
-pub(super) async fn apply_fall_damage<W>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connection fall damage is a boundary adapter for independently-owned session, transport, survival, and pose state"
+)]
+pub(super) async fn apply_fall_damage<W, P>(
+    precommit: &P,
+    session_id: SessionId,
+    dimension: &str,
     state: Option<&mut InteractionState>,
     writer: &mut W,
     compression: Compression,
@@ -49,6 +133,7 @@ pub(super) async fn apply_fall_damage<W>(
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
+    P: PlayerDamagePrecommitAdmission + ?Sized,
 {
     if old_pose.in_water || new_pose.in_water {
         return Ok(());
@@ -60,12 +145,35 @@ where
     if damage <= 0.0 || survival_state.is_dead() {
         return Ok(());
     }
+    let request = PlayerDamageRequest {
+        kind: PlayerDamageKind::Fall,
+        amount: damage,
+        source_origin: None,
+    };
+    if !player_damage_can_apply(GameMode::Survival, survival_state, &request) {
+        return Ok(());
+    }
+    let Some(admitted) = admit_connection_player_damage(
+        precommit,
+        session_id,
+        dimension,
+        request,
+        Vec3::new(new_pose.x, new_pose.y, new_pose.z),
+        PlayerDamageSource::Environment,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    if admitted.approval.is_some() && state.is_none() {
+        return Ok(());
+    }
     let applied_damage =
-        survival_damage_after_equipment(state.as_deref(), damage, PlayerDamageKind::Fall);
+        survival_damage_after_equipment(state.as_deref(), admitted.amount, request.kind);
     let mut updated_survival = *survival_state;
     updated_survival.apply_damage(applied_damage);
     if let Some(state) = state {
-        let expected_inventory = state.inventory.clone();
+        let expected_inventory = Box::new(state.inventory.clone());
         commit_player_survival_update(
             state,
             writer,
@@ -75,6 +183,7 @@ where
             updated_survival,
             xp_state.clone(),
             None,
+            admitted.approval,
             true,
             new_pose,
         )
@@ -86,7 +195,14 @@ where
     Ok(())
 }
 
-pub(super) async fn apply_contact_block_damage<W>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connection contact damage is a boundary adapter for independently-owned session, transport, survival, and pose state"
+)]
+pub(super) async fn apply_contact_block_damage<W, P>(
+    precommit: &P,
+    session_id: SessionId,
+    dimension: &str,
     state: Option<&mut InteractionState>,
     writer: &mut W,
     _compression: Compression,
@@ -97,6 +213,7 @@ pub(super) async fn apply_contact_block_damage<W>(
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
+    P: PlayerDamagePrecommitAdmission + ?Sized,
 {
     if game_mode != GameMode::Survival || survival_state.is_dead() {
         return Ok(());
@@ -107,13 +224,32 @@ where
     let Some((amount, kind)) = contact_block_damage(state, player_pose).await else {
         return Ok(());
     };
-
-    let expected_inventory = state.inventory.clone();
-    let applied_damage = survival_damage_after_equipment(Some(state), amount, kind);
+    let request = PlayerDamageRequest {
+        kind,
+        amount,
+        source_origin: None,
+    };
+    if !player_damage_can_apply(game_mode, survival_state, &request) {
+        return Ok(());
+    }
+    let Some(admitted) = admit_connection_player_damage(
+        precommit,
+        session_id,
+        dimension,
+        request,
+        Vec3::new(player_pose.x, player_pose.y, player_pose.z),
+        PlayerDamageSource::Environment,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let expected_inventory = Box::new(state.inventory.clone());
+    let applied_damage = survival_damage_after_equipment(Some(state), admitted.amount, kind);
     let mut updated_survival = *survival_state;
     updated_survival.apply_damage(applied_damage);
     if kind.damages_armor() {
-        damage_equipped_armor(state, amount);
+        damage_equipped_armor(state, admitted.amount);
     }
     commit_player_survival_update(
         state,
@@ -124,6 +260,7 @@ where
         updated_survival,
         xp_state.clone(),
         None,
+        admitted.approval,
         true,
         player_pose,
     )
@@ -275,7 +412,8 @@ pub(super) struct PlayerDamageApplication {
     pub(super) request: PlayerDamageRequest,
 }
 
-pub(super) async fn apply_player_damage<W>(
+#[cfg(test)]
+pub(super) async fn apply_unhooked_player_damage_for_test<W>(
     state: Option<&mut InteractionState>,
     writer: &mut W,
     compression: Compression,
@@ -283,6 +421,75 @@ pub(super) async fn apply_player_damage<W>(
     xp_state: &mut XpState,
     game_mode: GameMode,
     damage: PlayerDamageApplication,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let amount = damage.request.amount;
+    apply_player_damage(
+        state,
+        writer,
+        compression,
+        survival_state,
+        xp_state,
+        game_mode,
+        damage,
+        AdmittedPlayerDamage {
+            amount,
+            approval: None,
+        },
+    )
+    .await
+}
+/// Apply the result of an already-admitted connection damage request.
+///
+/// The approval travels unchanged into the existing fenced survival commit.
+/// A rejected chain never calls this function, so none of the shield, armor,
+/// death or publication preparation below observes it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the admitted-damage boundary preserves independently-owned connection, transport, survival, and approval state"
+)]
+pub(super) async fn apply_player_damage<W>(
+    state: Option<&mut InteractionState>,
+    writer: &mut W,
+    compression: Compression,
+    survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
+    game_mode: GameMode,
+    mut damage: PlayerDamageApplication,
+    admitted: AdmittedPlayerDamage,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    damage.request.amount = admitted.amount;
+    apply_player_damage_with_approval(
+        state,
+        writer,
+        compression,
+        survival_state,
+        xp_state,
+        game_mode,
+        damage,
+        admitted.approval,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the approved-damage commit receives independently-owned connection, transport, survival, and approval state"
+)]
+async fn apply_player_damage_with_approval<W>(
+    state: Option<&mut InteractionState>,
+    writer: &mut W,
+    compression: Compression,
+    survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
+    game_mode: GameMode,
+    damage: PlayerDamageApplication,
+    hook_approval: Option<HookApproval>,
 ) -> Result<bool, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -300,6 +507,9 @@ where
         return Ok(false);
     }
     let mut state = state;
+    if hook_approval.is_some() && state.is_none() {
+        return Ok(false);
+    }
     if request.kind.can_be_blocked_by_shield()
         && let Some(state) = state.as_deref_mut()
     {
@@ -308,13 +518,34 @@ where
             if !shield_blocks_current_damage(state, player_pose, request.source_origin) {
                 break;
             }
-            let expected_inventory = state.inventory.clone();
+            let expected_inventory = Box::new(state.inventory.clone());
             let Some(planned_shield_damage) = plan_active_shield_damage(state, request.amount)
             else {
                 return Ok(false);
             };
             shield_commit_attempts += 1;
             let transition = planned_shield_damage.transition.clone();
+            if hook_approval.is_some() {
+                let committed = commit_player_survival_update_with_shield(
+                    state,
+                    writer,
+                    survival_state,
+                    xp_state,
+                    expected_inventory,
+                    *survival_state,
+                    xp_state.clone(),
+                    Some(transition),
+                    None,
+                    hook_approval,
+                    true,
+                    player_pose,
+                )
+                .await?;
+                if matches!(committed, PlayerSurvivalUpdateOutcome::Committed) {
+                    finish_committed_shield_damage(state, planned_shield_damage);
+                }
+                return Ok(false);
+            }
             let committed = commit_player_survival_update_with_shield(
                 state,
                 writer,
@@ -324,6 +555,7 @@ where
                 *survival_state,
                 xp_state.clone(),
                 Some(transition),
+                None,
                 None,
                 true,
                 player_pose,
@@ -355,7 +587,7 @@ where
         updated_survival.apply_damage(applied_damage);
     }
     if let Some(state) = state {
-        let expected_inventory = state.inventory.clone();
+        let expected_inventory = Box::new(state.inventory.clone());
         if applied_damage > 0.0 && request.kind.damages_armor() {
             damage_equipped_armor(state, request.amount);
         }
@@ -368,6 +600,7 @@ where
             updated_survival,
             xp_state.clone(),
             None,
+            hook_approval,
             true,
             player_pose,
         )
@@ -389,7 +622,7 @@ mod tests {
 
     use super::{
         Compression, GameMode, PlayerDamageApplication, PlayerDamageKind, PlayerDamageRequest,
-        PlayerPose, SurvivalState, XpState, apply_player_damage,
+        PlayerPose, SurvivalState, XpState, apply_unhooked_player_damage_for_test,
     };
 
     #[tokio::test]
@@ -405,7 +638,7 @@ mod tests {
             let mut survival = SurvivalState::FULL;
             let mut xp = XpState::default();
             assert!(
-                apply_player_damage(
+                apply_unhooked_player_damage_for_test(
                     None,
                     &mut writer,
                     Compression::Disabled,
@@ -444,7 +677,7 @@ mod tests {
             let mut survival = SurvivalState::FULL;
             let mut xp = XpState::default();
             assert!(
-                !apply_player_damage(
+                !apply_unhooked_player_damage_for_test(
                     None,
                     &mut writer,
                     Compression::Disabled,

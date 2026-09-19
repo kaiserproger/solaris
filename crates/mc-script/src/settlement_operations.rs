@@ -784,30 +784,97 @@ impl ScriptStructureSnapshot {
     }
 }
 
-/// One core-issued warehouse binding for an authored container of a durable
-/// structure.
+/// The core-authenticated origin of one warehouse binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum ScriptWarehouseSource {
+    Authored {
+        structure_id: String,
+        container_id: u32,
+    },
+    VanillaVillage {
+        site_id: String,
+        container_id: u32,
+    },
+}
+
+impl ScriptWarehouseSource {
+    pub fn validate(&self) -> Result<(), ScriptDtoError> {
+        match self {
+            Self::Authored { structure_id, .. } => validate_structure_id(structure_id),
+            Self::VanillaVillage { site_id, .. } => validate_site_id(site_id),
+        }
+    }
+}
+
+/// One core-issued warehouse binding for an authored structure container or a
+/// materialized generator-authenticated village container.
 ///
 /// `handle` is opaque to the plugin: the plugin never parses it and never
-/// chooses a container by coordinates. `container_id` is the authored
-/// `empty_container` seed ordinal inside the structure's blueprint, in authored
-/// order, which is the only container identity the frozen catalog carries.
+/// chooses a container by coordinates. The source ordinal is resolved by core;
+/// a village binding retains its exact source position durably outside this
+/// public snapshot so the ordinal is never reinterpreted after the bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "UncheckedWarehouseBinding")]
 #[non_exhaustive]
 pub struct ScriptWarehouseBinding {
     pub handle: String,
-    pub structure_id: String,
-    pub container_id: u32,
+    pub source: ScriptWarehouseSource,
     pub revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum UncheckedWarehouseBinding {
+    Current {
+        handle: String,
+        source: ScriptWarehouseSource,
+        revision: u64,
+    },
+    LegacyAuthored {
+        handle: String,
+        structure_id: String,
+        container_id: u32,
+        revision: u64,
+    },
+}
+
+impl TryFrom<UncheckedWarehouseBinding> for ScriptWarehouseBinding {
+    type Error = ScriptDtoError;
+
+    fn try_from(value: UncheckedWarehouseBinding) -> Result<Self, Self::Error> {
+        let binding = match value {
+            UncheckedWarehouseBinding::Current {
+                handle,
+                source,
+                revision,
+            } => Self::new(handle, source, revision),
+            UncheckedWarehouseBinding::LegacyAuthored {
+                handle,
+                structure_id,
+                container_id,
+                revision,
+            } => Self::new(
+                handle,
+                ScriptWarehouseSource::Authored {
+                    structure_id,
+                    container_id,
+                },
+                revision,
+            ),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
 }
 
 impl ScriptWarehouseBinding {
     #[must_use]
-    pub fn new(handle: String, structure_id: String, container_id: u32, revision: u64) -> Self {
+    pub fn new(handle: String, source: ScriptWarehouseSource, revision: u64) -> Self {
         Self {
             handle,
-            structure_id,
-            container_id,
+            source,
             revision,
         }
     }
@@ -818,7 +885,7 @@ impl ScriptWarehouseBinding {
             &self.handle,
             crate::MAX_WAREHOUSE_HANDLE_BYTES,
         )?;
-        validate_structure_id(&self.structure_id)?;
+        self.source.validate()?;
         validate_revision(self.revision)
     }
 }
@@ -894,6 +961,11 @@ pub enum ScriptSettlementOperation {
         structure_id: String,
         expected_revision: u64,
     },
+    ResumeStructure {
+        operation_id: String,
+        structure_id: String,
+        expected_revision: u64,
+    },
     CancelStructure {
         operation_id: String,
         structure_id: String,
@@ -905,6 +977,11 @@ pub enum ScriptSettlementOperation {
     BindWarehouse {
         operation_id: String,
         structure_id: String,
+        container_id: u32,
+    },
+    BindVillageWarehouse {
+        operation_id: String,
+        site_id: String,
         container_id: u32,
     },
 }
@@ -920,8 +997,10 @@ impl ScriptSettlementOperation {
             | Self::PrepareStructure { operation_id, .. }
             | Self::AdvanceStructure { operation_id, .. }
             | Self::PauseStructure { operation_id, .. }
+            | Self::ResumeStructure { operation_id, .. }
             | Self::CancelStructure { operation_id, .. }
-            | Self::BindWarehouse { operation_id, .. } => Some(operation_id),
+            | Self::BindWarehouse { operation_id, .. }
+            | Self::BindVillageWarehouse { operation_id, .. } => Some(operation_id),
             Self::ListSites { .. }
             | Self::QuerySite { .. }
             | Self::Survey { .. }
@@ -1006,6 +1085,11 @@ impl ScriptSettlementOperation {
                 expected_revision,
                 ..
             }
+            | Self::ResumeStructure {
+                structure_id,
+                expected_revision,
+                ..
+            }
             | Self::CancelStructure {
                 structure_id,
                 expected_revision,
@@ -1016,6 +1100,7 @@ impl ScriptSettlementOperation {
             }
             Self::Status { structure_id } => validate_structure_id(structure_id)?,
             Self::BindWarehouse { structure_id, .. } => validate_structure_id(structure_id)?,
+            Self::BindVillageWarehouse { site_id, .. } => validate_site_id(site_id)?,
         }
         Ok(())
     }

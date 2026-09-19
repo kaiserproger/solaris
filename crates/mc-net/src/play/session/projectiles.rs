@@ -13,8 +13,8 @@ use mc_entity::projectile_26_1_2::{
     prepare_hurting_projectile_tick, prepare_throwable_tick,
 };
 use mc_entity::{
-    EntityDamage, EntityId, EntityLifecycle, EntityMotionState, EntitySnapshot,
-    EntityWitchPotionKind, Rotation, SpawnEntity, Vec3,
+    EntityDamage, EntityDamageRequest, EntityId, EntityLifecycle, EntityMotionState,
+    EntitySnapshot, EntityWitchPotionKind, Rotation, SpawnEntity, Vec3,
 };
 
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
@@ -22,9 +22,13 @@ use crate::play::spawn::chunk_pos_from_coords;
 use crate::play::survival::{entity_item_stack, mob_xp_value};
 use crate::play::{
     ARROW_ENTITY_HIT_DAMAGE, ARROW_ENTITY_HIT_KNOCKBACK, ArrowPhysicsFact, EntityPhysicsStep,
-    HurtingProjectilePhysicsFact,
+    HurtingProjectilePhysicsFact, SessionRegistry,
 };
 
+use super::damage_precommit::{
+    EntityDamagePrecommitCompletion, EntityDamagePrecommitResume, PlayerDamagePrecommitResume,
+    begin_entity_damage, damage_kind_name,
+};
 use super::entity_combat::{
     begin_server_entity_death_locked, publish_accepted_entity_health_locked,
 };
@@ -49,6 +53,11 @@ use super::{
     ENTITY_DEATH_TICKS, ENTITY_HURT_INVULNERABLE_TICKS, EntityKillRewards, SessionEntityGuards,
     SessionId, apply_entity_facts, entity_kill_drop_stacks, player_aabb, player_collision_position,
 };
+use mc_script::ScriptPosition;
+use mc_script::precommit::{
+    Approval, DamageContext, DamageTarget, HookActor, HookContext, HookDecision, HookFailure,
+    HookKind, HookPlayer,
+};
 
 const MAX_ARROW_TICK_CANDIDATES: usize = MAX_PIERCED_ENTITIES + 1;
 const MAX_OWNER_VEHICLE_MEMBERS: usize = 8;
@@ -69,6 +78,76 @@ const SHULKER_BULLET_LEVITATION_TICKS: i32 = 200;
 struct PlainProjectileDamage {
     kind: PlayerDamageKind,
     amount: f32,
+}
+
+struct ProjectileEntityHit {
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    expected_target: EntitySnapshot,
+    amount: f32,
+}
+
+struct ProjectilePlayerHit {
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    target_session: SessionId,
+    source_origin: Vec3,
+}
+
+/// Immutable projectile-side state that must be conditionally committed with a
+/// deferred player-damage approval.
+#[derive(Debug, Clone)]
+pub(in crate::play) enum ProjectileDamageContinuation {
+    Hit {
+        expected_projectile: EntitySnapshot,
+        next_projectile: EntitySnapshot,
+    },
+}
+
+/// The immutable native impact that a before-damage approval must re-enter.
+///
+/// Both entity images are fences: an answer for an older projectile flight or
+/// target state must not be allowed to publish a later impact.
+#[derive(Debug, Clone)]
+pub(in crate::play) struct ProjectileEntityDamageContinuation {
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    expected_target: EntitySnapshot,
+    impact: ProjectileEntityDamageImpact,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProjectileEntityDamageImpact {
+    Arrow {
+        start: Vec3,
+        location: Vec3,
+        discard: bool,
+    },
+    Plain,
+    SmallFireball,
+    ShulkerBullet,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectileDamageAdmission {
+    Direct,
+    Pending,
+    Refused,
+}
+
+fn pending_projectile_admission_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    projectile: EntityId,
+) -> Option<ProjectileDamageAdmission> {
+    if let Some(deadline) = inner.pending_projectile_damage.get(&projectile) {
+        if std::time::Instant::now() < *deadline {
+            return Some(ProjectileDamageAdmission::Pending);
+        }
+        // A dropped resume must not leave this collision frozen indefinitely.
+        inner.pending_projectile_damage.remove(&projectile);
+        return Some(ProjectileDamageAdmission::Refused);
+    }
+    (inner.pending_projectile_damage.len() >= mc_script::precommit::MAX_PRECOMMIT_REQUESTS)
+        .then_some(ProjectileDamageAdmission::Refused)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +239,7 @@ pub(super) fn spawn_arrow_locked(
 }
 
 pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
+    registry: &'a super::SessionRegistry,
     mut inner: SessionEntityGuards<'a>,
     steps: &[EntityPhysicsStep],
     old_motion: &HashMap<EntityId, EntityMotionState>,
@@ -280,54 +360,66 @@ pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
                 };
                 let snapshot = scratch.candidates.swap_remove(candidate_index);
                 match projectile_kind {
-                    HurtingProjectileKind::SmallFireball => {
-                        commit_small_fireball_entity_hit_locked(
-                            &mut inner,
-                            expected,
+                    HurtingProjectileKind::SmallFireball => commit_projectile_entity_hit_locked(
+                        registry,
+                        &mut inner,
+                        ProjectileEntityHit {
+                            expected_projectile: expected,
                             next_projectile,
-                            snapshot,
-                            dispatches,
-                        )
-                    }
-                    HurtingProjectileKind::ShulkerBullet => {
-                        commit_shulker_bullet_entity_hit_locked(
-                            &mut inner,
-                            expected,
+                            expected_target: snapshot,
+                            amount: SMALL_FIREBALL_ENTITY_DAMAGE,
+                        },
+                        ProjectileEntityDamageImpact::SmallFireball,
+                        dispatches,
+                    ),
+                    HurtingProjectileKind::ShulkerBullet => commit_projectile_entity_hit_locked(
+                        registry,
+                        &mut inner,
+                        ProjectileEntityHit {
+                            expected_projectile: expected,
                             next_projectile,
-                            snapshot,
-                            dispatches,
-                        )
-                    }
-                    HurtingProjectileKind::LargeFireball => {
-                        commit_plain_hurting_projectile_entity_hit_locked(
-                            &mut inner,
-                            expected,
+                            expected_target: snapshot,
+                            amount: SHULKER_BULLET_ENTITY_DAMAGE,
+                        },
+                        ProjectileEntityDamageImpact::ShulkerBullet,
+                        dispatches,
+                    ),
+                    HurtingProjectileKind::LargeFireball => commit_projectile_entity_hit_locked(
+                        registry,
+                        &mut inner,
+                        ProjectileEntityHit {
+                            expected_projectile: expected,
                             next_projectile,
-                            snapshot,
-                            LARGE_FIREBALL_ENTITY_DAMAGE,
-                            dispatches,
-                        )
-                    }
-                    HurtingProjectileKind::BreezeWindCharge => {
-                        commit_plain_hurting_projectile_entity_hit_locked(
-                            &mut inner,
-                            expected,
+                            expected_target: snapshot,
+                            amount: LARGE_FIREBALL_ENTITY_DAMAGE,
+                        },
+                        ProjectileEntityDamageImpact::Plain,
+                        dispatches,
+                    ),
+                    HurtingProjectileKind::BreezeWindCharge => commit_projectile_entity_hit_locked(
+                        registry,
+                        &mut inner,
+                        ProjectileEntityHit {
+                            expected_projectile: expected,
                             next_projectile,
-                            snapshot,
-                            BREEZE_WIND_CHARGE_ENTITY_DAMAGE,
-                            dispatches,
-                        )
-                    }
-                    HurtingProjectileKind::WitherSkull => {
-                        commit_plain_hurting_projectile_entity_hit_locked(
-                            &mut inner,
-                            expected,
+                            expected_target: snapshot,
+                            amount: BREEZE_WIND_CHARGE_ENTITY_DAMAGE,
+                        },
+                        ProjectileEntityDamageImpact::Plain,
+                        dispatches,
+                    ),
+                    HurtingProjectileKind::WitherSkull => commit_projectile_entity_hit_locked(
+                        registry,
+                        &mut inner,
+                        ProjectileEntityHit {
+                            expected_projectile: expected,
                             next_projectile,
-                            snapshot,
-                            WITHER_SKULL_ENTITY_DAMAGE,
-                            dispatches,
-                        )
-                    }
+                            expected_target: snapshot,
+                            amount: WITHER_SKULL_ENTITY_DAMAGE,
+                        },
+                        ProjectileEntityDamageImpact::Plain,
+                        dispatches,
+                    ),
                     HurtingProjectileKind::DragonFireball => commit_dragon_fireball_hit_locked(
                         &mut inner,
                         expected,
@@ -345,6 +437,7 @@ pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
                 }),
             ) if entity == projectile_entity(player_entity) => match projectile_kind {
                 HurtingProjectileKind::SmallFireball => commit_small_fireball_player_hit_locked(
+                    registry,
                     &mut inner,
                     expected,
                     next_projectile,
@@ -353,6 +446,7 @@ pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
                     dispatches,
                 ),
                 HurtingProjectileKind::ShulkerBullet => commit_shulker_bullet_player_hit_locked(
+                    registry,
                     &mut inner,
                     expected,
                     next_projectile,
@@ -362,11 +456,14 @@ pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
                 ),
                 HurtingProjectileKind::LargeFireball => {
                     commit_plain_hurting_projectile_player_hit_locked(
+                        registry,
                         &mut inner,
-                        expected,
-                        next_projectile,
-                        session,
-                        start,
+                        ProjectilePlayerHit {
+                            expected_projectile: expected,
+                            next_projectile,
+                            target_session: session,
+                            source_origin: start,
+                        },
                         PlainProjectileDamage {
                             kind: PlayerDamageKind::LargeFireball,
                             amount: LARGE_FIREBALL_ENTITY_DAMAGE,
@@ -376,11 +473,14 @@ pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
                 }
                 HurtingProjectileKind::BreezeWindCharge => {
                     commit_plain_hurting_projectile_player_hit_locked(
+                        registry,
                         &mut inner,
-                        expected,
-                        next_projectile,
-                        session,
-                        start,
+                        ProjectilePlayerHit {
+                            expected_projectile: expected,
+                            next_projectile,
+                            target_session: session,
+                            source_origin: start,
+                        },
                         PlainProjectileDamage {
                             kind: PlayerDamageKind::WindCharge,
                             amount: BREEZE_WIND_CHARGE_ENTITY_DAMAGE,
@@ -390,11 +490,14 @@ pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
                 }
                 HurtingProjectileKind::WitherSkull => {
                     commit_plain_hurting_projectile_player_hit_locked(
+                        registry,
                         &mut inner,
-                        expected,
-                        next_projectile,
-                        session,
-                        start,
+                        ProjectilePlayerHit {
+                            expected_projectile: expected,
+                            next_projectile,
+                            target_session: session,
+                            source_origin: start,
+                        },
                         PlainProjectileDamage {
                             kind: PlayerDamageKind::Projectile,
                             amount: WITHER_SKULL_ENTITY_DAMAGE,
@@ -445,6 +548,7 @@ pub(super) fn resolve_hurting_projectile_hits_locked<'a>(
 }
 
 pub(super) fn resolve_throwable_projectile_hits_locked<'a>(
+    registry: &'a super::SessionRegistry,
     mut inner: SessionEntityGuards<'a>,
     steps: &[EntityPhysicsStep],
     old_motion: &HashMap<EntityId, EntityMotionState>,
@@ -570,6 +674,7 @@ pub(super) fn resolve_throwable_projectile_hits_locked<'a>(
                 };
                 let target = scratch.candidates.swap_remove(candidate_index);
                 commit_witch_potion_entity_hit_locked(
+                    registry,
                     &mut inner,
                     expected,
                     next_projectile,
@@ -586,11 +691,14 @@ pub(super) fn resolve_throwable_projectile_hits_locked<'a>(
                 }),
             ) if entity == projectile_entity(player_entity) => {
                 commit_witch_potion_player_hit_locked(
+                    registry,
                     &mut inner,
-                    expected,
-                    next_projectile,
-                    session,
-                    start,
+                    ProjectilePlayerHit {
+                        expected_projectile: expected,
+                        next_projectile,
+                        target_session: session,
+                        source_origin: start,
+                    },
                     potion_kind,
                     dispatches,
                 )
@@ -643,6 +751,7 @@ fn throwable_projectile_snapshot_with_state(
 }
 
 fn commit_witch_potion_entity_hit_locked(
+    registry: &super::SessionRegistry,
     inner: &mut SessionEntityGuards<'_>,
     expected_projectile: EntitySnapshot,
     next_projectile: EntitySnapshot,
@@ -651,12 +760,16 @@ fn commit_witch_potion_entity_hit_locked(
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
     if potion == EntityWitchPotionKind::Harming {
-        return commit_plain_hurting_projectile_entity_hit_locked(
+        return commit_projectile_entity_hit_locked(
+            registry,
             inner,
-            expected_projectile,
-            next_projectile,
-            expected_target,
-            WITCH_HARMING_DAMAGE,
+            ProjectileEntityHit {
+                expected_projectile,
+                next_projectile,
+                expected_target,
+                amount: WITCH_HARMING_DAMAGE,
+            },
+            ProjectileEntityDamageImpact::Plain,
             dispatches,
         );
     }
@@ -740,21 +853,17 @@ fn apply_witch_status_splash_players_locked(
 }
 
 fn commit_witch_potion_player_hit_locked(
+    registry: &super::SessionRegistry,
     inner: &mut SessionEntityGuards<'_>,
-    expected_projectile: EntitySnapshot,
-    next_projectile: EntitySnapshot,
-    target_session: SessionId,
-    source_origin: Vec3,
+    hit: ProjectilePlayerHit,
     potion: EntityWitchPotionKind,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
     if potion == EntityWitchPotionKind::Harming {
         return commit_plain_hurting_projectile_player_hit_locked(
+            registry,
             inner,
-            expected_projectile,
-            next_projectile,
-            target_session,
-            source_origin,
+            hit,
             PlainProjectileDamage {
                 kind: PlayerDamageKind::IndirectMagic,
                 amount: WITCH_HARMING_DAMAGE,
@@ -762,6 +871,11 @@ fn commit_witch_potion_player_hit_locked(
             dispatches,
         );
     }
+    let ProjectilePlayerHit {
+        expected_projectile,
+        next_projectile,
+        ..
+    } = hit;
     inner
         .entities
         .replace_snapshot_if_current(expected_projectile, next_projectile)
@@ -947,7 +1061,6 @@ fn commit_dragon_fireball_hit_locked(
     {
         return false;
     }
-
     let mut cloud = SpawnEntity::new(
         cloud_entity_type_id,
         "minecraft:area_effect_cloud",
@@ -971,63 +1084,98 @@ fn commit_dragon_fireball_hit_locked(
     true
 }
 
-fn commit_small_fireball_entity_hit_locked(
+fn commit_small_fireball_entity_hit_direct_locked(
     inner: &mut SessionEntityGuards<'_>,
+    tick: u64,
     expected_projectile: EntitySnapshot,
     next_projectile: EntitySnapshot,
     expected_target: EntitySnapshot,
+    amount: f32,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
-    let tick = inner.entity_lifecycle_tick;
-    let damage = if expected_target
-        .retained
-        .last_damage_tick
-        .is_some_and(|last| tick.saturating_sub(last) < ENTITY_HURT_INVULNERABLE_TICKS)
-    {
-        None
+    let damage = if projectile_entity_damage_is_admissible(&expected_target, tick, amount) {
+        prepare_small_fireball_entity_damage(&expected_target, tick, amount)
     } else {
-        prepare_small_fireball_entity_damage(&expected_target, tick)
+        None
     };
-    let mut transaction = vec![(expected_projectile, next_projectile)];
-    if let Some(damage) = &damage {
-        transaction.push((expected_target, damage.snapshot.clone()));
-    }
-    if !inner.entities.replace_snapshots_if_current(transaction) {
-        return false;
-    }
-    if let Some(damage) = damage {
-        dispatches.extend(publish_accepted_entity_health_locked(
-            inner,
-            &damage.snapshot,
-        ));
-        if damage.killed {
-            let rewards = projectile_entity_kill_rewards(inner, &damage.snapshot);
-            let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
-            dispatches.extend(death_dispatches);
-        } else {
-            dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
-        }
-    }
-    true
+    commit_projectile_entity_damage_transaction_locked(
+        inner,
+        expected_projectile,
+        next_projectile,
+        expected_target,
+        damage,
+        false,
+        tick,
+        dispatches,
+    )
 }
 
-fn commit_shulker_bullet_entity_hit_locked(
+fn commit_shulker_bullet_entity_hit_direct_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    tick: u64,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    expected_target: EntitySnapshot,
+    amount: f32,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    let damage = if projectile_entity_damage_is_admissible(&expected_target, tick, amount) {
+        prepare_shulker_bullet_entity_damage(&expected_target, tick, amount)
+    } else {
+        None
+    };
+    commit_projectile_entity_damage_transaction_locked(
+        inner,
+        expected_projectile,
+        next_projectile,
+        expected_target,
+        damage,
+        true,
+        tick,
+        dispatches,
+    )
+}
+
+fn commit_plain_hurting_projectile_entity_hit_direct_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    tick: u64,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    expected_target: EntitySnapshot,
+    amount: f32,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    let damage = if projectile_entity_damage_is_admissible(&expected_target, tick, amount) {
+        prepare_plain_hurting_projectile_entity_damage(&expected_target, tick, amount)
+    } else {
+        None
+    };
+    commit_projectile_entity_damage_transaction_locked(
+        inner,
+        expected_projectile,
+        next_projectile,
+        expected_target,
+        damage,
+        false,
+        tick,
+        dispatches,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the atomic entity-damage transaction must retain its independent CAS fences, damage result, effect flag, tick, and publication sink"
+)]
+fn commit_projectile_entity_damage_transaction_locked(
     inner: &mut SessionEntityGuards<'_>,
     expected_projectile: EntitySnapshot,
     next_projectile: EntitySnapshot,
     expected_target: EntitySnapshot,
+    damage: Option<EntityDamage>,
+    apply_levitation: bool,
+    tick: u64,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
-    let tick = inner.entity_lifecycle_tick;
-    let damage = if expected_target
-        .retained
-        .last_damage_tick
-        .is_some_and(|last| tick.saturating_sub(last) < ENTITY_HURT_INVULNERABLE_TICKS)
-    {
-        None
-    } else {
-        prepare_shulker_bullet_entity_damage(&expected_target, tick)
-    };
     let mut transaction = vec![(expected_projectile, next_projectile)];
     if let Some(damage) = &damage {
         transaction.push((expected_target, damage.snapshot.clone()));
@@ -1035,17 +1183,20 @@ fn commit_shulker_bullet_entity_hit_locked(
     if !inner.entities.replace_snapshots_if_current(transaction) {
         return false;
     }
-    if let Some(damage) = damage {
-        dispatches.extend(publish_accepted_entity_health_locked(
-            inner,
-            &damage.snapshot,
-        ));
-        if damage.killed {
-            let rewards = projectile_entity_kill_rewards(inner, &damage.snapshot);
-            let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
-            dispatches.extend(death_dispatches);
-        } else {
-            dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
+    let Some(damage) = damage else {
+        return true;
+    };
+    dispatches.extend(publish_accepted_entity_health_locked(
+        inner,
+        &damage.snapshot,
+    ));
+    if damage.killed {
+        let rewards = projectile_entity_kill_rewards(inner, &damage.snapshot);
+        let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
+        dispatches.extend(death_dispatches);
+    } else {
+        dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
+        if apply_levitation {
             let _ = inner.entities.apply_effect_if_current(
                 damage.snapshot.clone(),
                 mc_entity::EntityEffectRequest {
@@ -1069,43 +1220,193 @@ fn commit_shulker_bullet_entity_hit_locked(
     true
 }
 
-fn commit_plain_hurting_projectile_entity_hit_locked(
+fn commit_projectile_entity_hit_locked(
+    registry: &super::SessionRegistry,
+    inner: &mut SessionEntityGuards<'_>,
+    hit: ProjectileEntityHit,
+    impact: ProjectileEntityDamageImpact,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    let ProjectileEntityHit {
+        expected_projectile,
+        next_projectile,
+        expected_target,
+        amount,
+    } = hit;
+    let tick = inner.entity_lifecycle_tick;
+    if projectile_entity_damage_is_admissible(&expected_target, tick, amount) {
+        match defer_projectile_entity_damage_locked(
+            registry,
+            inner,
+            expected_projectile.clone(),
+            next_projectile.clone(),
+            expected_target.clone(),
+            amount,
+            impact,
+        ) {
+            ProjectileDamageAdmission::Pending => return false,
+            ProjectileDamageAdmission::Refused => {
+                return commit_projectile_entity_impact_without_damage_locked(
+                    inner,
+                    expected_projectile,
+                    next_projectile,
+                    impact,
+                    tick,
+                    dispatches,
+                );
+            }
+            ProjectileDamageAdmission::Direct => {}
+        }
+    }
+    commit_projectile_entity_impact_locked(
+        inner,
+        tick,
+        expected_projectile,
+        next_projectile,
+        expected_target,
+        amount,
+        impact,
+        dispatches,
+    )
+}
+
+fn commit_projectile_entity_impact_after_precommit_locked(
     inner: &mut SessionEntityGuards<'_>,
     expected_projectile: EntitySnapshot,
     next_projectile: EntitySnapshot,
     expected_target: EntitySnapshot,
+    request: EntityDamageRequest,
+    impact: ProjectileEntityDamageImpact,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    commit_projectile_entity_impact_locked(
+        inner,
+        request.tick,
+        expected_projectile,
+        next_projectile,
+        expected_target,
+        request.amount,
+        impact,
+        dispatches,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the impact dispatcher keeps its independent projectile and target fences, impact protocol, tick, and publication sink explicit"
+)]
+fn commit_projectile_entity_impact_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    tick: u64,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    expected_target: EntitySnapshot,
+    amount: f32,
+    impact: ProjectileEntityDamageImpact,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    match impact {
+        ProjectileEntityDamageImpact::Plain => {
+            commit_plain_hurting_projectile_entity_hit_direct_locked(
+                inner,
+                tick,
+                expected_projectile,
+                next_projectile,
+                expected_target,
+                amount,
+                dispatches,
+            )
+        }
+        ProjectileEntityDamageImpact::SmallFireball => {
+            commit_small_fireball_entity_hit_direct_locked(
+                inner,
+                tick,
+                expected_projectile,
+                next_projectile,
+                expected_target,
+                amount,
+                dispatches,
+            )
+        }
+        ProjectileEntityDamageImpact::ShulkerBullet => {
+            commit_shulker_bullet_entity_hit_direct_locked(
+                inner,
+                tick,
+                expected_projectile,
+                next_projectile,
+                expected_target,
+                amount,
+                dispatches,
+            )
+        }
+        ProjectileEntityDamageImpact::Arrow {
+            start, location, ..
+        } => commit_arrow_entity_hit_direct_locked(
+            inner,
+            tick,
+            expected_projectile,
+            next_projectile,
+            expected_target,
+            start,
+            location,
+            amount,
+            dispatches,
+        ),
+    }
+}
+
+fn projectile_entity_damage_is_admissible(
+    expected: &EntitySnapshot,
+    tick: u64,
+    amount: f32,
+) -> bool {
+    expected.lifecycle == EntityLifecycle::Alive
+        && expected.health.is_finite()
+        && expected.health > 0.0
+        && amount.is_finite()
+        && amount > 0.0
+        && expected
+            .retained
+            .last_damage_tick
+            .is_none_or(|last| tick.saturating_sub(last) >= ENTITY_HURT_INVULNERABLE_TICKS)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arrow transaction must retain its independent projectile and target fences, impact coordinates, tick, and publication sink"
+)]
+fn commit_arrow_entity_hit_direct_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    tick: u64,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    expected_target: EntitySnapshot,
+    start: Vec3,
+    location: Vec3,
     amount: f32,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
-    let tick = inner.entity_lifecycle_tick;
-    let damage = if expected_target
-        .retained
-        .last_damage_tick
-        .is_some_and(|last| tick.saturating_sub(last) < ENTITY_HURT_INVULNERABLE_TICKS)
-    {
-        None
-    } else {
-        prepare_plain_hurting_projectile_entity_damage(&expected_target, tick, amount)
+    let Some(damage) = prepare_arrow_entity_damage(&expected_target, start, location, tick, amount)
+    else {
+        return false;
     };
-    let mut transaction = vec![(expected_projectile, next_projectile)];
-    if let Some(damage) = &damage {
-        transaction.push((expected_target, damage.snapshot.clone()));
-    }
-    if !inner.entities.replace_snapshots_if_current(transaction) {
+    if !inner.entities.replace_snapshots_if_current([
+        (expected_projectile, next_projectile),
+        (expected_target, damage.snapshot.clone()),
+    ]) {
         return false;
     }
-    if let Some(damage) = damage {
-        dispatches.extend(publish_accepted_entity_health_locked(
-            inner,
-            &damage.snapshot,
-        ));
-        if damage.killed {
-            let rewards = projectile_entity_kill_rewards(inner, &damage.snapshot);
-            let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
-            dispatches.extend(death_dispatches);
-        } else {
-            dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
-        }
+    dispatches.extend(publish_accepted_entity_health_locked(
+        inner,
+        &damage.snapshot,
+    ));
+    if damage.killed {
+        let rewards = projectile_entity_kill_rewards(inner, &damage.snapshot);
+        let (_, death_dispatches) = begin_server_entity_death_locked(inner, &damage, &rewards);
+        dispatches.extend(death_dispatches);
+    } else {
+        publish_arrow_knockback_locked(inner, &damage.snapshot, dispatches);
+        dispatches.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
     }
     true
 }
@@ -1141,31 +1442,15 @@ fn prepare_plain_hurting_projectile_entity_damage(
 fn prepare_shulker_bullet_entity_damage(
     expected: &EntitySnapshot,
     tick: u64,
+    amount: f32,
 ) -> Option<EntityDamage> {
-    if expected.lifecycle != EntityLifecycle::Alive
-        || !expected.health.is_finite()
-        || expected.health <= 0.0
-    {
-        return None;
-    }
-    let mut next = expected.clone();
-    next.health = (next.health - SHULKER_BULLET_ENTITY_DAMAGE).max(0.0);
-    next.retained.last_damage_tick = Some(tick);
-    let killed = next.health <= 0.0;
-    if killed {
-        next.lifecycle = EntityLifecycle::Despawning;
-        next.retained.death_remove_tick = Some(tick.saturating_add(ENTITY_DEATH_TICKS));
-        next.retained.sheep_grazing_ticks = None;
-    }
-    Some(EntityDamage {
-        snapshot: next,
-        killed,
-    })
+    prepare_plain_hurting_projectile_entity_damage(expected, tick, amount)
 }
 
 fn prepare_small_fireball_entity_damage(
     expected: &EntitySnapshot,
     tick: u64,
+    amount: f32,
 ) -> Option<EntityDamage> {
     if expected.lifecycle != EntityLifecycle::Alive
         || !expected.health.is_finite()
@@ -1176,7 +1461,7 @@ fn prepare_small_fireball_entity_damage(
     let mut next = expected.clone();
     next.retained.remaining_fire_ticks =
         mc_entity::fire_26_1_2::ignite_for_seconds(next.retained.remaining_fire_ticks, 5.0);
-    next.health = (next.health - SMALL_FIREBALL_ENTITY_DAMAGE).max(0.0);
+    next.health = (next.health - amount).max(0.0);
     next.retained.last_damage_tick = Some(tick);
     let killed = next.health <= 0.0;
     if killed {
@@ -1215,8 +1500,422 @@ fn projectile_entity_kill_rewards(
             .map(|entity_type_id| (entity_type_id, mob_xp_value(&snapshot.type_name))),
     }
 }
+fn defer_projectile_entity_damage_locked(
+    registry: &super::SessionRegistry,
+    inner: &mut SessionEntityGuards<'_>,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    expected_target: EntitySnapshot,
+    amount: f32,
+    impact: ProjectileEntityDamageImpact,
+) -> ProjectileDamageAdmission {
+    if let Some(admission) = pending_projectile_admission_locked(inner, expected_projectile.id) {
+        return admission;
+    }
+    if !registry
+        .precommit_boundary()
+        .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+    {
+        return ProjectileDamageAdmission::Direct;
+    }
+    let Some(handle) = registry.damage_precommit_handle() else {
+        return ProjectileDamageAdmission::Refused;
+    };
+    let Ok(source) = u64::try_from(expected_projectile.id.0).map(HookActor::Entity) else {
+        return ProjectileDamageAdmission::Refused;
+    };
+    let tick = inner.entity_lifecycle_tick;
+    let request = EntityDamageRequest {
+        amount,
+        tick,
+        death_remove_tick: tick.saturating_add(ENTITY_DEATH_TICKS),
+        villager_gossip_event: None,
+    };
+    let pending = match begin_entity_damage(
+        registry,
+        expected_target.id,
+        source,
+        "projectile",
+        expected_projectile.position,
+        amount,
+    ) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return ProjectileDamageAdmission::Direct,
+        Err(_) => return ProjectileDamageAdmission::Refused,
+    };
+    inner
+        .pending_projectile_damage
+        .insert(expected_projectile.id, pending.deadline());
+    handle.spawn_precommit_resume(pending, None, None, move |decision| {
+        crate::play::simulation::SimulationCommand::ResumeEntityDamagePrecommit(Box::new(
+            EntityDamagePrecommitResume {
+                expected: expected_target.clone(),
+                request,
+                attacker_costs: None,
+                completion: EntityDamagePrecommitCompletion::Projectile(
+                    ProjectileEntityDamageContinuation {
+                        expected_projectile,
+                        next_projectile,
+                        expected_target,
+                        impact,
+                    },
+                ),
+                decision,
+            },
+        ))
+    });
+    ProjectileDamageAdmission::Pending
+}
 
+fn finish_projectile_entity_impact_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    projectile_id: EntityId,
+    next_projectile: &EntitySnapshot,
+    impact: ProjectileEntityDamageImpact,
+    tick: u64,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) {
+    if let ProjectileEntityDamageImpact::Arrow { discard: false, .. } = impact {
+        if inner.entities.contains(projectile_id) {
+            synchronize_arrow_snapshot_locked(inner, projectile_id);
+        }
+    } else if next_projectile.retained.pending_explosion.is_some() {
+        schedule_primed_tnt_deadline_locked(inner, projectile_id, Some(tick));
+    } else if let Some((_, removed)) = remove_server_entity_locked(inner, projectile_id) {
+        dispatches.extend(removed);
+    }
+}
+
+fn commit_projectile_entity_impact_without_damage_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    impact: ProjectileEntityDamageImpact,
+    tick: u64,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    let projectile_id = expected_projectile.id;
+    if !inner
+        .entities
+        .replace_snapshot_if_current(expected_projectile, next_projectile.clone())
+    {
+        return false;
+    }
+    finish_projectile_entity_impact_locked(
+        inner,
+        projectile_id,
+        &next_projectile,
+        impact,
+        tick,
+        dispatches,
+    );
+    true
+}
+
+pub(in crate::play) fn resume_projectile_entity_damage_precommit(
+    registry: &SessionRegistry,
+    continuation: ProjectileEntityDamageContinuation,
+    mut request: EntityDamageRequest,
+    decision: Result<Approval, HookFailure>,
+) -> Vec<VisibilityDispatch> {
+    let ProjectileEntityDamageContinuation {
+        expected_projectile,
+        next_projectile,
+        expected_target,
+        impact,
+    } = continuation;
+    let mut inner = registry.lock_session_entities("resume projectile entity damage precommit");
+    inner
+        .pending_projectile_damage
+        .remove(&expected_projectile.id);
+    if inner.entities.snapshot(expected_projectile.id).as_ref() != Some(&expected_projectile)
+        || inner.entities.snapshot(expected_target.id).as_ref() != Some(&expected_target)
+    {
+        return Vec::new();
+    }
+    let amount = match decision {
+        Ok(mut approval) => {
+            let amount = match approval.decision() {
+                HookDecision::Keep => Some(request.amount),
+                HookDecision::Replace(amount) if amount.is_finite() && amount > 0.0 => Some(amount),
+                HookDecision::Cancel | HookDecision::Replace(_) | _ => None,
+            };
+            approval.consume().ok().and(amount)
+        }
+        Err(_) => None,
+    };
+    let mut dispatches = Vec::new();
+    let committed = if let Some(amount) = amount {
+        request.amount = amount;
+        commit_projectile_entity_impact_after_precommit_locked(
+            &mut inner,
+            expected_projectile,
+            next_projectile.clone(),
+            expected_target,
+            request,
+            impact,
+            &mut dispatches,
+        )
+    } else {
+        commit_projectile_entity_impact_without_damage_locked(
+            &mut inner,
+            expected_projectile,
+            next_projectile.clone(),
+            impact,
+            request.tick,
+            &mut dispatches,
+        )
+    };
+    if !committed {
+        return Vec::new();
+    }
+    finish_projectile_entity_impact_locked(
+        &mut inner,
+        next_projectile.id,
+        &next_projectile,
+        impact,
+        request.tick,
+        &mut dispatches,
+    );
+    drop(inner);
+    registry.append_spawned_xp_pickup_candidates(&mut dispatches);
+    dispatches
+}
+
+fn begin_projectile_player_damage_locked(
+    registry: &super::SessionRegistry,
+    inner: &SessionEntityGuards<'_>,
+    target_session: SessionId,
+    request: PlayerDamageRequest,
+    position: Vec3,
+    source: EntityId,
+) -> Result<Option<mc_script::precommit::PendingDecision>, HookFailure> {
+    let Some(boundary) = registry.precommit_boundary() else {
+        return Ok(None);
+    };
+    if !boundary.has_precommit_hooks(HookKind::Damage) {
+        return Ok(None);
+    }
+    let target_uuid = inner
+        .sessions
+        .get(&target_session)
+        .map(|session| session.uuid.to_string())
+        .ok_or(HookFailure::Unavailable)?;
+    let target = HookPlayer::try_new(target_uuid, target_session).map_err(HookFailure::from)?;
+    let source = u64::try_from(source.0)
+        .map(HookActor::Entity)
+        .map_err(|_| HookFailure::Invalid)?;
+    let position =
+        ScriptPosition::try_new(position.x, position.y, position.z).ok_or(HookFailure::Invalid)?;
+    let context = DamageContext::try_new(
+        source,
+        DamageTarget::Player(target),
+        damage_kind_name(request.kind),
+        "minecraft:overworld",
+        position,
+        request.amount,
+    )
+    .map(HookContext::Damage)
+    .map_err(HookFailure::from)?;
+    boundary.begin_precommit(context).map(Some)
+}
+
+fn defer_projectile_player_damage_locked(
+    registry: &super::SessionRegistry,
+    inner: &mut SessionEntityGuards<'_>,
+    target_session: SessionId,
+    request: PlayerDamageRequest,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+) -> ProjectileDamageAdmission {
+    if let Some(admission) = pending_projectile_admission_locked(inner, expected_projectile.id) {
+        return admission;
+    }
+    if !registry
+        .precommit_boundary()
+        .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+    {
+        return ProjectileDamageAdmission::Direct;
+    }
+    let Some(handle) = registry.damage_precommit_handle() else {
+        return ProjectileDamageAdmission::Refused;
+    };
+    let Some((target_fence, position)) =
+        SessionRegistry::player_damage_target_fence_locked(inner, target_session)
+    else {
+        return ProjectileDamageAdmission::Refused;
+    };
+    let tick = inner.entity_lifecycle_tick;
+    let pending = match begin_projectile_player_damage_locked(
+        registry,
+        inner,
+        target_session,
+        request,
+        position,
+        expected_projectile.id,
+    ) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return ProjectileDamageAdmission::Direct,
+        Err(_) => return ProjectileDamageAdmission::Refused,
+    };
+    inner
+        .pending_projectile_damage
+        .insert(expected_projectile.id, pending.deadline());
+    handle.spawn_precommit_resume(pending, None, None, move |decision| {
+        crate::play::simulation::SimulationCommand::ResumePlayerDamagePrecommit(Box::new(
+            PlayerDamagePrecommitResume::Projectile {
+                target_session,
+                target_fence,
+                tick,
+                request,
+                continuation: ProjectileDamageContinuation::Hit {
+                    expected_projectile,
+                    next_projectile,
+                },
+                decision,
+            },
+        ))
+    });
+    ProjectileDamageAdmission::Pending
+}
+
+fn commit_projectile_player_hit_locked(
+    registry: &super::SessionRegistry,
+    inner: &mut SessionEntityGuards<'_>,
+    expected_projectile: EntitySnapshot,
+    next_projectile: EntitySnapshot,
+    target_session: SessionId,
+    request: PlayerDamageRequest,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    match defer_projectile_player_damage_locked(
+        registry,
+        inner,
+        target_session,
+        request,
+        expected_projectile.clone(),
+        next_projectile.clone(),
+    ) {
+        ProjectileDamageAdmission::Pending => return false,
+        ProjectileDamageAdmission::Refused => {
+            return commit_deferred_projectile_player_impact_without_damage_locked(
+                inner,
+                ProjectileDamageContinuation::Hit {
+                    expected_projectile,
+                    next_projectile,
+                },
+                dispatches,
+            );
+        }
+        ProjectileDamageAdmission::Direct => {}
+    }
+    let preview = prepare_projectile_player_damage_locked(
+        inner,
+        target_session,
+        inner.entity_lifecycle_tick,
+        request,
+    );
+    let prepared = match preview {
+        ProjectilePlayerDamagePreview::Accepted(prepared)
+        | ProjectilePlayerDamagePreview::Rejected(Some(prepared)) => Some(prepared),
+        ProjectilePlayerDamagePreview::Rejected(None) => None,
+    };
+    if let Some(prepared) = prepared {
+        commit_projectile_player_damage_locked(
+            inner,
+            prepared,
+            |inner| {
+                inner
+                    .entities
+                    .replace_snapshot_if_current(expected_projectile, next_projectile)
+            },
+            dispatches,
+        )
+    } else {
+        inner
+            .entities
+            .replace_snapshot_if_current(expected_projectile, next_projectile)
+    }
+}
+
+fn finish_deferred_projectile_player_impact_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    projectile_id: EntityId,
+    next_projectile: &EntitySnapshot,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) {
+    if next_projectile.retained.pending_explosion.is_some() {
+        let tick = inner.entity_lifecycle_tick;
+        schedule_primed_tnt_deadline_locked(inner, projectile_id, Some(tick));
+    } else if let Some((_, removed)) = remove_server_entity_locked(inner, projectile_id) {
+        dispatches.extend(removed);
+    }
+}
+
+pub(super) fn commit_deferred_projectile_player_impact_without_damage_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    continuation: ProjectileDamageContinuation,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    match continuation {
+        ProjectileDamageContinuation::Hit {
+            expected_projectile,
+            next_projectile,
+        } => {
+            let projectile_id = expected_projectile.id;
+            if !inner
+                .entities
+                .replace_snapshot_if_current(expected_projectile, next_projectile.clone())
+            {
+                return false;
+            }
+            finish_deferred_projectile_player_impact_locked(
+                inner,
+                projectile_id,
+                &next_projectile,
+                dispatches,
+            );
+            true
+        }
+    }
+}
+
+pub(super) fn commit_deferred_projectile_player_damage_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    prepared: PreparedProjectilePlayerDamage,
+    continuation: ProjectileDamageContinuation,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    match continuation {
+        ProjectileDamageContinuation::Hit {
+            expected_projectile,
+            next_projectile,
+        } => {
+            let projectile_id = expected_projectile.id;
+            if !commit_projectile_player_damage_locked(
+                inner,
+                prepared,
+                |inner| {
+                    inner
+                        .entities
+                        .replace_snapshot_if_current(expected_projectile, next_projectile.clone())
+                },
+                dispatches,
+            ) {
+                return false;
+            }
+            finish_deferred_projectile_player_impact_locked(
+                inner,
+                projectile_id,
+                &next_projectile,
+                dispatches,
+            );
+            true
+        }
+    }
+}
 fn commit_shulker_bullet_player_hit_locked(
+    registry: &super::SessionRegistry,
     inner: &mut SessionEntityGuards<'_>,
     expected_projectile: EntitySnapshot,
     next_projectile: EntitySnapshot,
@@ -1224,82 +1923,49 @@ fn commit_shulker_bullet_player_hit_locked(
     source_origin: Vec3,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
-    let preview = prepare_projectile_player_damage_locked(
+    commit_projectile_player_hit_locked(
+        registry,
         inner,
+        expected_projectile,
+        next_projectile,
         target_session,
-        inner.entity_lifecycle_tick,
         PlayerDamageRequest {
             kind: PlayerDamageKind::ShulkerBullet,
             amount: SHULKER_BULLET_ENTITY_DAMAGE,
             source_origin: Some(source_origin),
         },
-    );
-    let prepared = match preview {
-        ProjectilePlayerDamagePreview::Accepted(prepared)
-        | ProjectilePlayerDamagePreview::Rejected(Some(prepared)) => Some(prepared),
-        ProjectilePlayerDamagePreview::Rejected(None) => None,
-    };
-    if let Some(prepared) = prepared {
-        commit_projectile_player_damage_locked(
-            inner,
-            prepared,
-            |inner| {
-                inner
-                    .entities
-                    .replace_snapshot_if_current(expected_projectile, next_projectile)
-            },
-            dispatches,
-        )
-    } else {
-        inner
-            .entities
-            .replace_snapshot_if_current(expected_projectile, next_projectile)
-    }
+        dispatches,
+    )
 }
-
 fn commit_plain_hurting_projectile_player_hit_locked(
+    registry: &super::SessionRegistry,
     inner: &mut SessionEntityGuards<'_>,
-    expected_projectile: EntitySnapshot,
-    next_projectile: EntitySnapshot,
-    target_session: SessionId,
-    source_origin: Vec3,
+    hit: ProjectilePlayerHit,
     damage: PlainProjectileDamage,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
-    let preview = prepare_projectile_player_damage_locked(
-        inner,
+    let ProjectilePlayerHit {
+        expected_projectile,
+        next_projectile,
         target_session,
-        inner.entity_lifecycle_tick,
+        source_origin,
+    } = hit;
+    commit_projectile_player_hit_locked(
+        registry,
+        inner,
+        expected_projectile,
+        next_projectile,
+        target_session,
         PlayerDamageRequest {
             kind: damage.kind,
             amount: damage.amount,
             source_origin: Some(source_origin),
         },
-    );
-    let prepared = match preview {
-        ProjectilePlayerDamagePreview::Accepted(prepared)
-        | ProjectilePlayerDamagePreview::Rejected(Some(prepared)) => Some(prepared),
-        ProjectilePlayerDamagePreview::Rejected(None) => None,
-    };
-    if let Some(prepared) = prepared {
-        commit_projectile_player_damage_locked(
-            inner,
-            prepared,
-            |inner| {
-                inner
-                    .entities
-                    .replace_snapshot_if_current(expected_projectile, next_projectile)
-            },
-            dispatches,
-        )
-    } else {
-        inner
-            .entities
-            .replace_snapshot_if_current(expected_projectile, next_projectile)
-    }
+        dispatches,
+    )
 }
-
 fn commit_small_fireball_player_hit_locked(
+    registry: &super::SessionRegistry,
     inner: &mut SessionEntityGuards<'_>,
     expected_projectile: EntitySnapshot,
     next_projectile: EntitySnapshot,
@@ -1307,37 +1973,19 @@ fn commit_small_fireball_player_hit_locked(
     source_origin: Vec3,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> bool {
-    let preview = prepare_projectile_player_damage_locked(
+    commit_projectile_player_hit_locked(
+        registry,
         inner,
+        expected_projectile,
+        next_projectile,
         target_session,
-        inner.entity_lifecycle_tick,
         PlayerDamageRequest {
             kind: PlayerDamageKind::Fireball,
             amount: SMALL_FIREBALL_ENTITY_DAMAGE,
             source_origin: Some(source_origin),
         },
-    );
-    let prepared = match preview {
-        ProjectilePlayerDamagePreview::Accepted(prepared)
-        | ProjectilePlayerDamagePreview::Rejected(Some(prepared)) => Some(prepared),
-        ProjectilePlayerDamagePreview::Rejected(None) => None,
-    };
-    if let Some(prepared) = prepared {
-        commit_projectile_player_damage_locked(
-            inner,
-            prepared,
-            |inner| {
-                inner
-                    .entities
-                    .replace_snapshot_if_current(expected_projectile, next_projectile)
-            },
-            dispatches,
-        )
-    } else {
-        inner
-            .entities
-            .replace_snapshot_if_current(expected_projectile, next_projectile)
-    }
+        dispatches,
+    )
 }
 
 pub(super) fn resolve_arrow_entity_hits_locked<'a>(
@@ -1493,6 +2141,7 @@ pub(super) fn resolve_arrow_entity_hits_locked<'a>(
         };
         let next = arrow_snapshot_with_state(&expected, state);
         let Ok(discard_arrow) = commit_arrow_transaction_locked(
+            registry,
             &mut inner,
             expected,
             next,
@@ -2084,7 +2733,12 @@ fn arrow_damage_is_invulnerable(inner: &SessionEntityGuards<'_>, entity_id: Enti
         })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the atomic arrow transaction keeps its independent arrow fences, start position, publications, scratch state, and publication sink explicit"
+)]
 fn commit_arrow_transaction_locked(
+    registry: &super::SessionRegistry,
     inner: &mut SessionEntityGuards<'_>,
     expected_arrow: EntitySnapshot,
     next_arrow: EntitySnapshot,
@@ -2093,8 +2747,61 @@ fn commit_arrow_transaction_locked(
     scratch: &mut ArrowTickScratch,
     dispatches: &mut Vec<VisibilityDispatch>,
 ) -> Result<bool, ()> {
+    let will_discard = publications
+        .iter()
+        .any(|publication| matches!(publication, ProjectilePublication::Discarded { .. }));
+    for publication in publications.iter() {
+        let ProjectilePublication::ArrowDamageAccepted { entity, .. } = publication else {
+            continue;
+        };
+        let entity = session_entity(entity);
+        let Some(target) = scratch
+            .targets
+            .iter()
+            .find(|target| target.entity_id == entity)
+        else {
+            return Err(());
+        };
+        let (Some(location), Some(expected_target)) =
+            (target.entity_location, target.expected_entity.as_ref())
+        else {
+            continue;
+        };
+        let impact = ProjectileEntityDamageImpact::Arrow {
+            start,
+            location,
+            discard: will_discard,
+        };
+        match defer_projectile_entity_damage_locked(
+            registry,
+            inner,
+            expected_arrow.clone(),
+            next_arrow.clone(),
+            expected_target.clone(),
+            ARROW_ENTITY_HIT_DAMAGE,
+            impact,
+        ) {
+            ProjectileDamageAdmission::Pending => return Err(()),
+            ProjectileDamageAdmission::Refused => {
+                if !commit_projectile_entity_impact_without_damage_locked(
+                    inner,
+                    expected_arrow.clone(),
+                    next_arrow.clone(),
+                    impact,
+                    inner.entity_lifecycle_tick,
+                    dispatches,
+                ) {
+                    return Err(());
+                }
+                return Ok(false);
+            }
+            ProjectileDamageAdmission::Direct => {}
+        }
+    }
     scratch.transaction.clear();
-    scratch.transaction.push((expected_arrow, next_arrow));
+    scratch
+        .transaction
+        .push((expected_arrow.clone(), next_arrow.clone()));
     let mut discard_arrow = false;
     let mut player_damage = None;
     for publication in publications.iter() {
@@ -2109,6 +2816,7 @@ fn commit_arrow_transaction_locked(
                         start,
                         location,
                         inner.entity_lifecycle_tick,
+                        ARROW_ENTITY_HIT_DAMAGE,
                     )
                     .ok_or(())?;
                     scratch
@@ -2140,6 +2848,34 @@ fn commit_arrow_transaction_locked(
     }
 
     let committed = if let Some(player_damage) = player_damage {
+        match defer_projectile_player_damage_locked(
+            registry,
+            inner,
+            player_damage.target_session(),
+            PlayerDamageRequest {
+                kind: PlayerDamageKind::Projectile,
+                amount: ARROW_ENTITY_HIT_DAMAGE,
+                source_origin: Some(start),
+            },
+            expected_arrow.clone(),
+            next_arrow.clone(),
+        ) {
+            ProjectileDamageAdmission::Pending => return Err(()),
+            ProjectileDamageAdmission::Refused => {
+                if !commit_deferred_projectile_player_impact_without_damage_locked(
+                    inner,
+                    ProjectileDamageContinuation::Hit {
+                        expected_projectile: expected_arrow,
+                        next_projectile: next_arrow,
+                    },
+                    dispatches,
+                ) {
+                    return Err(());
+                }
+                return Ok(false);
+            }
+            ProjectileDamageAdmission::Direct => {}
+        }
         commit_projectile_player_damage_locked(
             inner,
             player_damage,
@@ -2168,6 +2904,7 @@ fn prepare_arrow_entity_damage(
     start: Vec3,
     location: Vec3,
     tick: u64,
+    amount: f32,
 ) -> Option<EntityDamage> {
     if expected.lifecycle != EntityLifecycle::Alive
         || !expected.health.is_finite()
@@ -2176,7 +2913,7 @@ fn prepare_arrow_entity_damage(
         return None;
     }
     let mut next = expected.clone();
-    next.health = (next.health - ARROW_ENTITY_HIT_DAMAGE).max(0.0);
+    next.health = (next.health - amount).max(0.0);
     next.retained.last_damage_tick = Some(tick);
     let killed = next.health <= 0.0;
     if killed {

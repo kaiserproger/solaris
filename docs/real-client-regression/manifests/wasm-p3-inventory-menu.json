@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "pack_id": "wasm-p3-inventory-menu",
+  "quality_label": "draft",
+  "minecraft_version": "26.1.2",
+  "server_command": "cargo run --bin mc-server -- --config <run-dir>/server.toml (prepared from SOLARIS_REAL_CLIENT_SERVER_CONFIG)",
+  "artifact_root": ".analysis/real-client-runs",
+  "deployment": {
+    "server_config": ".analysis/codex-logs/wasm-p3-menu-20260916/server.toml",
+    "server_addr": "127.0.0.1:43654",
+    "world_seed": 81,
+    "plugin_runtime": "wasm",
+    "plugin_directory": ".analysis/codex-logs/wasm-p3-menu-20260916/deployment",
+    "expected_package": "inventory-compat",
+    "plugin_grants": {
+      "inventory-compat": [
+        "storage",
+        "inventory_storage_transactions",
+        "inventory_menus"
+      ]
+    },
+    "operator_env": "SOLARIS_REAL_CLIENT_MANIFEST=docs/real-client-regression/manifests/wasm-p3-inventory-menu.json SOLARIS_REAL_CLIENT_AGENT_SCENARIO=wasm-p3-inventory-menu SOLARIS_REAL_CLIENT_SERVER_CONFIG=.analysis/codex-logs/wasm-p3-menu-20260916/server.toml SOLARIS_REAL_CLIENT_SERVER_ADDR=127.0.0.1:43654 SOLARIS_REAL_CLIENT_FRESH_WORLD=1 python3 -m tools.harness run regression --timeout-seconds 600"
+  },
+  "client_requirement": "A real graphical Minecraft Java Edition 26.1.2 client must execute this scenario through the repo-native Gradle runClient adapter (:fabric-agent:runClientAgent, net.neoforged.moddev). That client carries the repo's JVM client-agent bridge for observation and input only and deliberately does NOT load the Solaris Loader mod, so every /trade answer and every menu window arrives over the ordinary play protocol; it is a no-Loader development client, not an uninstrumented production binary. Protocol bots, wire probes and mock clients do not satisfy this gate. The scenario dispatches its menu clicks through the bridge's real container-click action: it never forges a click packet, a stale session or a stale window.",
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "headless mock client",
+    "source-string assertion"
+  ],
+  "required_artifacts": [
+    "manifest.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt",
+    "automation-driver.txt"
+  ],
+  "automation_runner": {
+    "script": "python3 -m tools.harness run regression",
+    "delegates_to": "tools/harness/backends/regression.sh",
+    "agent_driver": "tools/harness/backends/driver.py",
+    "client_adapter": "../solaris-loader/gradlew -p ../solaris-loader --no-configuration-cache :fabric-agent:runClientAgent",
+    "client_adapter_source": "auto-gradle-runclient",
+    "client_isolation": "The primary Gradle runClient uses a per-run game directory and the fixed offline username SolarisPrimary.",
+    "modes": [
+      "--check",
+      "--prepare",
+      "--run",
+      "--validate-run"
+    ],
+    "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+    "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
+    "agent_port_env": "SOLARIS_REAL_CLIENT_AGENT_PORT",
+    "agent_server_addr_env": "SOLARIS_REAL_CLIENT_SERVER_ADDR",
+    "server_config_env": "SOLARIS_REAL_CLIENT_SERVER_CONFIG",
+    "fresh_world_env": "SOLARIS_REAL_CLIENT_FRESH_WORLD",
+    "default_agent_scenario": "wasm-p3-inventory-menu",
+    "prepared_status": "prepared-owner-run",
+    "passing_gate": "agent-run real-client"
+  },
+  "scenarios": [
+    {
+      "id": "wasm-p3-inventory-menu",
+      "title": "External WASM inventory menu buys, refunds and stale requests in a no-Loader graphical client",
+      "ledger_rows": [
+        "P3"
+      ],
+      "status": "manual-pending",
+      "no_debug_commands": false,
+      "bounded_time_minutes": 16,
+      "screenshots_required": true,
+      "steps": [
+        "Start Solaris from a fresh world with runtime = \"wasm\", strict = true, expected = [\"inventory-compat\"], and explicit storage/inventory_storage_transactions/inventory_menus grants. The package declares player_commands = [\"trade\"], events = [\"player.joined\", \"player.left\", \"inventory.menu.clicked\"], and config.toml mode = \"inventory-storage\"; this mode reuses that fixture and its /trade actions. The trade-ledger key must start absent.",
+        "Launch the real graphical 26.1.2 client through the repo-native Gradle runClient adapter (no Solaris Loader mod) and let the agent driver connect it to the loopback server address.",
+        "Operator fixture setup, declared debug and never claimed as no-debug survival: gamemode survival, /give minecraft:emerald 4, /give minecraft:diamond_pickaxe 1, /summon minecraft:pig beside the player, select the pickaxe, and land one real survival attack so the pickaxe carries a non-zero client-visible damage component.",
+        "For each trade: submit /trade menu, require the request marker P3_MENU open-requested and then the real window, left-click the window's slot 0 (primary) to buy or right-click it (secondary) to refund, and require the guest's P3_TRADE marker together with the emerald/apple counts it implies. A buy takes 2 emeralds and grants 1 apple; a refund reverses that.",
+        "Buy twice (ledger 1 then 2, emeralds 4 -> 2 -> 0, apples 0 -> 1 -> 2), then left-click slot 0 with zero emeralds and require P3_TRADE buy refused ledger=2 with a byte-identical client inventory (the insufficient-items adversarial check), then right-click slot 0 and require P3_TRADE refund committed ledger=1 (the right-click refund).",
+        "Close the window explicitly twice: first by clicking the window's own close slot 8, then by submitting /trade menu-close. Each close must publish the fresh P3_MENU close-requested marker and leave no server-owned window on the client, with the inventory untouched.",
+        "Disconnect and rejoin the same player, require the server's session release, then require the persisted emerald/apple counts and the identical damage-bearing pickaxe entry.",
+        "Submit /trade menu-next and require the P3_MENU next-open-requested marker plus the trade-market-next window, then keep that window open while submitting /trade stale-menu-close and /trade stale-session-menu. Both requests must publish their own marker, and the live window (title, container id, buttons) and the client inventory must stay exactly as they were; neither request may replace or close it.",
+        "With the kept trade-market-next window still open, left-click slot 0 on the live session and require P3_TRADE buy committed ledger=2 with emeralds/apples 0/2: the current-session purchase proves the window and the guest are still live after the stale requests.",
+        "Capture the inventory after the first buy, the second buy, the refused buy, the refund, the rejoin and the live purchase, and capture the open window before every trade, before both closes and after both stale requests."
+      ],
+      "expected_observations": [
+        "Every /trade submission produces exactly one fresh marker line in client chat and the driver never accepts a marker that was already visible before that submission. P3_MENU markers fence the request only; the window, the closed screen and the counts are the observed effects.",
+        "A successful /trade menu opens the client's plain container screen titled WASM Market with the declared buttons: slot 0 shows the labelled apple stack and slot 8 the labelled barrier, and the container id is the server's own non-zero window.",
+        "Left-clicking slot 0 performs a buy and right-clicking it a refund; each click is followed by the guest closing the accepted window before its transaction, so the client holds no server-owned window once the marker is published.",
+        "The committed buys and refund change exactly the client-visible emerald/apple counts the marker claims, and every refusal (the third buy with zero emeralds) leaves the whole client-visible inventory unchanged.",
+        "Closing by the window's close slot and by /trade menu-close both remove the window without touching the inventory.",
+        "The unaffected component-bearing pickaxe keeps its item_id, count, name, damage, max_damage, foil and enchantment list across every phase and across the disconnect/rejoin.",
+        "After the stale-menu-close request the live window is byte-identical to the window observed before it, and after the stale-session request it is still the same window; the stale requests are fenced by their markers, and wire-level refusal of a foreign window or a released session is owned by the native component tests.",
+        "The live-session purchase on the kept window commits, which proves the stale requests did not fence or replace the current session's window and that a known refusal does not disable unrelated valid work.",
+        "Closing the accepted window is the fixture's own behaviour, reusing the existing compound transaction: this mode closes a window before driving the storage read/transaction/ledger-check and never invents a completion outcome for a fire-and-forget menu command.",
+        "Every menu click must be confirmed by the real bridge action. The fixture closes each accepted window, changing the client container id even though the menu content state id is fixed; RPC errors and confirmation timeouts fail the scenario. The plugin's ledger record and storage revision are not readable from the real client, so the ledger value is asserted from the guest's marker and the counts separately."
+      ],
+      "wasm_inventory_menu_expectation": {
+        "package_id": "inventory-compat",
+        "mode": "inventory-storage",
+        "player_username": "SolarisPrimary",
+        "command_root": "trade",
+        "ledger_key": "trade-ledger",
+        "marker_prefix": "P3_TRADE",
+        "menu_marker_prefix": "P3_MENU",
+        "menu_button_slot_count": 9,
+        "menu_container_slot_count": 45,
+        "setup": {
+          "gamemode_command": "gamemode survival",
+          "emerald": {
+            "item_id": "minecraft:emerald",
+            "command": "give minecraft:emerald 4",
+            "count": 4
+          },
+          "apple": {
+            "item_id": "minecraft:apple",
+            "initial_count": 0
+          },
+          "tool": {
+            "item_id": "minecraft:diamond_pickaxe",
+            "command": "give minecraft:diamond_pickaxe 1"
+          },
+          "damage_entity_type": "minecraft:pig",
+          "summon_command_template": "summon minecraft:pig {x} {y} {z}",
+          "inventory_screenshot": "seed-inventory"
+        },
+        "market": {
+          "id": "trade-market",
+          "title": "WASM Market",
+          "open_action": "menu",
+          "open_fence": "P3_MENU open-requested",
+          "slots": [
+            {
+              "slot": 0,
+              "item_id": "minecraft:apple",
+              "count": 1,
+              "label": "Apple: buy 2 emeralds / refund 1 apple",
+              "action": "buy"
+            },
+            {
+              "slot": 8,
+              "item_id": "minecraft:barrier",
+              "count": 1,
+              "label": "Close",
+              "action": "close"
+            }
+          ]
+        },
+        "next_market": {
+          "id": "trade-market-next",
+          "title": "WASM Market Next",
+          "open_action": "menu-next",
+          "open_fence": "P3_MENU next-open-requested",
+          "slots": [
+            {
+              "slot": 0,
+              "item_id": "minecraft:apple",
+              "count": 1,
+              "label": "Apple: buy 2 emeralds / refund 1 apple",
+              "action": "buy"
+            },
+            {
+              "slot": 8,
+              "item_id": "minecraft:barrier",
+              "count": 1,
+              "label": "Close",
+              "action": "close"
+            }
+          ]
+        },
+        "trades": [
+          {
+            "label": "first-buy",
+            "slot": 0,
+            "button": "primary",
+            "outcome": "committed",
+            "ledger": 1,
+            "marker": "P3_TRADE buy committed ledger=1",
+            "emerald": 2,
+            "apple": 1,
+            "menu_capture": "menu-before-first-buy",
+            "capture": "first-buy-inventory"
+          },
+          {
+            "label": "second-buy",
+            "slot": 0,
+            "button": "primary",
+            "outcome": "committed",
+            "ledger": 2,
+            "marker": "P3_TRADE buy committed ledger=2",
+            "emerald": 0,
+            "apple": 2,
+            "menu_capture": "menu-before-second-buy",
+            "capture": "second-buy-inventory"
+          },
+          {
+            "label": "insufficient-buy",
+            "slot": 0,
+            "button": "primary",
+            "outcome": "refused",
+            "ledger": 2,
+            "marker": "P3_TRADE buy refused ledger=2",
+            "emerald": 0,
+            "apple": 2,
+            "menu_capture": "menu-before-insufficient-buy",
+            "capture": "insufficient-buy-inventory",
+            "adversarial": "insufficient_items"
+          },
+          {
+            "label": "refund",
+            "slot": 0,
+            "button": "secondary",
+            "outcome": "committed",
+            "ledger": 1,
+            "marker": "P3_TRADE refund committed ledger=1",
+            "emerald": 2,
+            "apple": 1,
+            "menu_capture": "menu-before-refund",
+            "capture": "refund-inventory"
+          }
+        ],
+        "close_slot": {
+          "label": "close-slot",
+          "slot": 8,
+          "button": "primary",
+          "fence": "P3_MENU close-requested",
+          "menu_capture": "menu-before-close-slot",
+          "capture": "closed-by-slot-inventory",
+          "adversarial": "close_slot_click"
+        },
+        "close_request": {
+          "label": "close-request",
+          "action": "menu-close",
+          "fence": "P3_MENU close-requested",
+          "menu_capture": "menu-before-close-request",
+          "capture": "closed-by-request-inventory",
+          "adversarial": "explicit_close_request"
+        },
+        "rejoin": {
+          "emerald": 2,
+          "apple": 1,
+          "capture": "rejoin-inventory"
+        },
+        "stale_close": {
+          "label": "stale-menu-close",
+          "action": "stale-menu-close",
+          "fence": "P3_MENU stale-close-requested",
+          "capture": "next-menu-after-stale-close",
+          "adversarial": "stale_menu_close"
+        },
+        "stale_session": {
+          "label": "stale-session-menu",
+          "action": "stale-session-menu",
+          "fence": "P3_MENU stale-session-requested",
+          "capture": "next-menu-after-stale-session",
+          "adversarial": "stale_session_menu"
+        },
+        "live_purchase": {
+          "label": "live-session-purchase",
+          "slot": 0,
+          "button": "primary",
+          "outcome": "committed",
+          "ledger": 2,
+          "marker": "P3_TRADE buy committed ledger=2",
+          "emerald": 0,
+          "apple": 2,
+          "menu_capture": "next-menu-before-live-purchase",
+          "capture": "live-purchase-inventory",
+          "adversarial": "live_session_purchase_after_stale_probes"
+        }
+      }
+    }
+  ]
+}

@@ -1,7 +1,8 @@
 id = "ruby-live"
 name = "Ruby Loader Live Gate"
 version = "1.0.0"
-api = "0.6.0"
+api = "0.7.0"
+events = ["player.joined", "player.left"]
 player_commands = ["loader_ruby"]
 
 [client]
@@ -11,14 +12,15 @@ schema = 2
 id = "rich-content"
 version = "1"
 artifact = "client/rich-content.zip"
-sha256 = "cb8358bc94832395b55aa5950195798d43bbe4e3471c6ff07081bef8ef1bf5c4"
-size_bytes = 1073
+sha256 = "6f2df25adc6b211fcf1a8daa7a99769a775ce2787d61e83ad8287e8add36e22d"
+size_bytes = 7961
 loaders = ["fabric", "neoforge", "forge"]
-content = ["blocks", "items", "views", "view_actions", "assets"]
+content = ["blocks", "items", "views", "view_actions", "assets", "sounds"]
 permissions = [
   "register_blocks",
   "register_items",
   "present_views",
   "send_view_actions",
   "load_assets",
+  "play_sounds",
 ]

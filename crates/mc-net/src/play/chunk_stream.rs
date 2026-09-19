@@ -168,6 +168,8 @@ pub(super) struct ChunkStreamState {
     scheduler: ChunkScheduler,
     staged: HashSet<(i32, i32)>,
     loaded: HashSet<(i32, i32)>,
+    /// Chunks whose publication made an unloaded work target observable again.
+    published: Vec<(i32, i32)>,
     started: Instant,
     fetch_ms: u64,
     build_timing: ChunkBuildTiming,
@@ -507,6 +509,7 @@ impl ChunkStreamState {
             scheduler,
             staged: HashSet::new(),
             loaded: HashSet::new(),
+            published: Vec::new(),
             started: Instant::now(),
             fetch_ms: 0,
             build_timing: ChunkBuildTiming::default(),
@@ -618,6 +621,12 @@ impl ChunkStreamState {
 
     pub(super) fn is_complete(&self) -> bool {
         self.scheduler.is_complete()
+    }
+
+    /// Drain chunks published since the caller's last stream step. Publication
+    /// is the player-visible load boundary for event-gated resident work.
+    pub(super) fn take_published_chunks(&mut self) -> Vec<(i32, i32)> {
+        std::mem::take(&mut self.published)
     }
 
     pub(super) fn progress_notify(&self) -> Arc<tokio::sync::Notify> {
@@ -1752,6 +1761,9 @@ impl ChunkStreamState {
                 );
                 if newly_loaded {
                     retention.transfer_to_loaded();
+                }
+                if newly_loaded {
+                    self.published.push(loaded_chunk);
                 }
                 for (position, cooking) in &prepared.hydrated_campfires {
                     self.sessions

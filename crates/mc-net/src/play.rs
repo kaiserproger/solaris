@@ -100,7 +100,7 @@ use crate::error::ConnectionError;
 use crate::loader::loader_view_action_channel;
 use crate::login::LoggedInProfile;
 use crate::play::scheduled_blocks::ScheduledBlockRegionPlan;
-use crate::script::PluginZoneAdapter;
+use crate::script::{PluginStorageHandle, PluginZoneAdapter};
 use crate::server::{ScriptEventSink, ServerConfig, WorldHandle};
 use crate::{
     ChunkPipelinePolicy, ChunkPipelineStopReason, ChunkPriority, ChunkRequest, ChunkScheduler,
@@ -249,8 +249,8 @@ pub(crate) fn prewarm_entity_pathing_tables() -> std::num::NonZeroUsize {
 #[cfg(test)]
 pub(crate) use simulation::simulation_channel;
 use simulation::{
-    ActiveShieldTransition, AnimalFeedPlan, AnimalFeedTargets, AuthoritativePlayerStateSnapshot,
-    BowReleasePlan, CommittedPlayerPose, FoodUsePlan, MerchantTradeDestination, MerchantTradePlan,
+    ActiveShieldTransition, AnimalFeedPlan, AuthoritativePlayerStateSnapshot, BowReleasePlan,
+    CommittedPlayerPose, FoodUsePlan, MerchantTradeDestination, MerchantTradePlan,
     PlayerSurvivalCommitOutcome, PlayerSurvivalPlan, SelectedItemDropPlan, SheepShearPlan,
     ZombieVillagerCurePlan,
 };
@@ -277,9 +277,10 @@ pub struct PlayerAttackObservation {
     pub authority_sequence: u64,
 }
 pub(crate) use simulation::{
-    EntitySimulationTickPolicy, EntitySimulationWorldContext, ExplosionRegistries,
-    SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner, SimulationRequestError,
-    SimulationSaveSnapshot, SimulationTickReport, simulation_channel_with_explosion_seed,
+    AnimalFeedTargets, EntitySimulationTickPolicy, EntitySimulationWorldContext,
+    ExplosionRegistries, SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner,
+    SimulationRequestError, SimulationSaveSnapshot, SimulationTickReport,
+    simulation_channel_with_explosion_seed,
 };
 pub(crate) use spawn::prepare_spawn_chunk;
 
@@ -1693,6 +1694,7 @@ pub(crate) async fn handle<R, W>(
     configuration_custom_payloads: Vec<ConfigurationCustomPayload>,
     loader_session: Option<crate::LoaderSession>,
     scripts: Option<ScriptEventSink>,
+    script_storage: Option<PluginStorageHandle>,
     script_zones: Option<PluginZoneAdapter>,
 ) -> Result<(), ConnectionError>
 where
@@ -2088,6 +2090,16 @@ where
             else {
                 return Ok(());
             };
+            if let Some(storage) = script_storage.as_ref() {
+                let chunks = stream
+                    .take_published_chunks()
+                    .into_iter()
+                    .map(|(x, z)| [x, z])
+                    .collect();
+                storage
+                    .wake_resident_work(dim_name.to_string(), chunks)
+                    .await;
+            }
             if step == ChunkStreamStep::Complete {
                 stream.log_summary_once();
             }
@@ -2124,6 +2136,8 @@ where
             tags: Arc::clone(&config.tags),
             recipes,
             loot: Arc::clone(&config.loot),
+            script_storage: script_storage.clone(),
+            world_dimension: dim_name.to_string(),
             script_zones: script_zones.clone(),
             next_container_id: FURNACE_CONTAINER_ID_MIN,
             active_container: None,
@@ -2257,6 +2271,8 @@ struct InteractionState {
     tags: Arc<TagsData>,
     recipes: Vec<mc_data::recipes::Recipe>,
     loot: Arc<mc_data::loot::LootTables>,
+    script_storage: Option<PluginStorageHandle>,
+    world_dimension: String,
     script_zones: Option<PluginZoneAdapter>,
     next_container_id: i32,
     active_container: Option<ActiveContainer>,
@@ -14087,6 +14103,16 @@ where
         else {
             return Ok(None);
         };
+        if let Some(storage) = state.script_storage.as_ref() {
+            let chunks = stream
+                .take_published_chunks()
+                .into_iter()
+                .map(|(x, z)| [x, z])
+                .collect();
+            storage
+                .wake_resident_work(state.world_dimension.clone(), chunks)
+                .await;
+        }
         match step {
             ChunkStreamStep::Progress => {
                 stream_finished = stream.is_complete();

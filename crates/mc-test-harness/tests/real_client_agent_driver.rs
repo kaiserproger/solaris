@@ -977,155 +977,6 @@ fn agent_driver_rejects_passed_broad_blocked_only_scenario() {
 }
 
 #[test]
-fn agent_driver_runs_join_rejoin_movement_scenario_without_run_scenario_rpc() {
-    let repo_root = repo_root();
-    let run_dir = tempfile::tempdir().expect("create run dir");
-    std::fs::write(
-        run_dir.path().join("server.log"),
-        "2026-06-22T14:10:54.741091Z  INFO mc_net::play: saved player state player=SolarisAgent state=pos=(-2.31,80.00,-6.58)\n",
-    )
-    .expect("write server release marker");
-    let bridge = FakeBridge::start(13);
-
-    let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/harness/backends/driver.py"))
-        .arg("--bridge-url")
-        .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
-        .arg("--secret")
-        .arg("test-secret")
-        .arg("--run-dir")
-        .arg(run_dir.path())
-        .arg("--scenario")
-        .arg("m94-01-join-rejoin-chunks-movement")
-        .arg("--server-addr")
-        .arg("127.0.0.1:25565")
-        .arg("--timeout-seconds")
-        .arg("3")
-        .output()
-        .expect("run real-client agent driver");
-
-    assert!(
-        output.status.success(),
-        "driver failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let requests = bridge.join();
-    let commands: Vec<_> = requests
-        .iter()
-        .map(|request| request["command"].as_str().expect("command is present"))
-        .collect();
-    assert_eq!(
-        commands,
-        [
-            "ping",
-            "wait_play",
-            "state",
-            "move_forward",
-            "state",
-            "screenshot",
-            "disconnect",
-            "state",
-            "connect",
-            "wait_play",
-            "state",
-            "screenshot",
-            "disconnect"
-        ]
-    );
-    assert_eq!(requests[3]["payload"]["ticks"], 15);
-    assert_eq!(
-        requests[7]["command"], "state",
-        "driver must poll client state after disconnect"
-    );
-    assert_eq!(
-        requests[8]["command"], "connect",
-        "driver must wait for the client to leave Play before reconnecting"
-    );
-
-    let observations_path = run_dir.path().join("observations.json");
-    let observations: Value = serde_json::from_slice(
-        &std::fs::read(&observations_path).expect("observations.json exists"),
-    )
-    .expect("observations.json is valid JSON");
-    assert_eq!(observations["result"], "passed");
-    assert_eq!(
-        observations["scenarios"][0]["id"],
-        "m94-01-join-rejoin-chunks-movement"
-    );
-    assert!(
-        observations["scenarios"][0]["agent_report"]["observations"]
-            .as_array()
-            .is_some_and(|entries| entries.iter().any(|entry| entry
-                .as_str()
-                .is_some_and(|text| text.contains("movement probe: passed")))),
-        "scenario report must record the movement probe outcome"
-    );
-    assert!(
-        observations["scenarios"][0]["screenshots"]
-            .as_array()
-            .is_some_and(|screenshots| screenshots.len() == 2),
-        "join/rejoin scenario must attach before and after reconnect screenshots"
-    );
-}
-
-#[test]
-fn agent_driver_waits_for_server_session_release_before_rejoin() {
-    let repo_root = repo_root();
-    let run_dir = tempfile::tempdir().expect("create run dir");
-    let server_log_path = run_dir.path().join("server.log");
-    std::fs::write(&server_log_path, "").expect("create server log");
-    let bridge =
-        FakeBridge::start_requiring_server_release_before_connect(13, server_log_path.clone());
-
-    let output = SerializedPythonCommand::new("python3")
-        .arg(repo_root.join("tools/harness/backends/driver.py"))
-        .arg("--bridge-url")
-        .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
-        .arg("--secret")
-        .arg("test-secret")
-        .arg("--run-dir")
-        .arg(run_dir.path())
-        .arg("--scenario")
-        .arg("m94-01-join-rejoin-chunks-movement")
-        .arg("--server-addr")
-        .arg("127.0.0.1:25565")
-        .arg("--timeout-seconds")
-        .arg("3")
-        .output()
-        .expect("run real-client agent driver");
-
-    assert!(
-        output.status.success(),
-        "driver failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let requests = bridge.join();
-    let commands: Vec<_> = requests
-        .iter()
-        .map(|request| request["command"].as_str().expect("command is present"))
-        .collect();
-    assert_eq!(commands[8], "connect");
-
-    let observations_path = run_dir.path().join("observations.json");
-    let observations: Value = serde_json::from_slice(
-        &std::fs::read(&observations_path).expect("observations.json exists"),
-    )
-    .expect("observations.json is valid JSON");
-    assert!(
-        observations["scenarios"][0]["agent_report"]["observations"]
-            .as_array()
-            .is_some_and(|entries| entries.iter().any(|entry| entry
-                .as_str()
-                .is_some_and(|text| text.contains("server session release: observed")))),
-        "scenario report must record the server-side session release wait"
-    );
-}
-
-#[test]
 fn agent_driver_appends_phase_observations_and_recomputes_blocked_result() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
@@ -2209,7 +2060,6 @@ fn agent_driver_coordinates_two_client_shared_chest_across_restart_phases() {
         14,
         vec![wait_play_payload(true), wait_play_payload(false)],
         false,
-        None,
         "passed",
         VALID_PNG_1X1,
     );
@@ -2217,7 +2067,6 @@ fn agent_driver_coordinates_two_client_shared_chest_across_restart_phases() {
         13,
         vec![wait_play_payload(true), wait_play_payload(false)],
         false,
-        None,
         "passed",
         VALID_PNG_1X1,
     );
@@ -2457,7 +2306,6 @@ fn agent_driver_rejects_restart_marker_drift_across_phases() {
         6,
         vec![wait_play_payload(true)],
         false,
-        None,
         "passed",
         VALID_PNG_1X1,
     );
@@ -2465,7 +2313,6 @@ fn agent_driver_rejects_restart_marker_drift_across_phases() {
         5,
         vec![wait_play_payload(true)],
         false,
-        None,
         "passed",
         VALID_PNG_1X1,
     );
@@ -2639,7 +2486,6 @@ impl FakeBridge {
             expected_requests,
             wait_play_results,
             false,
-            None,
             "passed",
             VALID_PNG_1X1,
         )
@@ -2650,7 +2496,6 @@ impl FakeBridge {
             expected_requests,
             vec![wait_play_payload(true)],
             true,
-            None,
             "passed",
             VALID_PNG_1X1,
         )
@@ -2664,23 +2509,8 @@ impl FakeBridge {
             expected_requests,
             vec![wait_play_payload(true)],
             false,
-            None,
             "passed",
             screenshot_bytes,
-        )
-    }
-
-    fn start_requiring_server_release_before_connect(
-        expected_requests: usize,
-        server_release_log_path: std::path::PathBuf,
-    ) -> Self {
-        Self::start_with_options(
-            expected_requests,
-            vec![wait_play_payload(true)],
-            false,
-            Some(server_release_log_path),
-            "passed",
-            VALID_PNG_1X1,
         )
     }
 
@@ -2689,7 +2519,6 @@ impl FakeBridge {
             expected_requests,
             vec![wait_play_payload(true)],
             false,
-            None,
             scenario_result,
             VALID_PNG_1X1,
         )
@@ -2699,7 +2528,6 @@ impl FakeBridge {
         expected_requests: usize,
         wait_play_results: Vec<Value>,
         defer_screenshot_until_response: bool,
-        server_release_log_path: Option<std::path::PathBuf>,
         scenario_result: &'static str,
         screenshot_bytes: &'static [u8],
     ) -> Self {
@@ -2748,7 +2576,6 @@ impl FakeBridge {
                     &thread_play_state,
                     BridgeResponseOptions {
                         defer_screenshot_until_response,
-                        server_release_log_path: server_release_log_path.as_deref(),
                         scenario_result,
                         screenshot_bytes,
                     },
@@ -2825,24 +2652,9 @@ fn bridge_response(
     movement_count: &Mutex<u32>,
     replay_movement_cm: &Mutex<(i32, i32)>,
     play_state: &Mutex<bool>,
-    options: BridgeResponseOptions<'_>,
+    options: BridgeResponseOptions,
 ) -> Value {
     let request_id = request["id"].as_u64().expect("request id");
-    if request["command"].as_str() == Some("connect")
-        && options
-            .server_release_log_path
-            .is_some_and(|path| !server_session_release_logged(path))
-    {
-        return json!({
-            "id": request_id,
-            "ok": false,
-            "payload": null,
-            "error": {
-                "code": "server-session-still-active",
-                "message": "server release marker was not observed before reconnect",
-            },
-        });
-    }
 
     let payload = match request["command"].as_str().expect("command") {
         "ping" => json!({"client": "fake-real-client", "agent_version": "test"}),
@@ -2903,13 +2715,6 @@ fn bridge_response(
         }
         "disconnect" => {
             *play_state.lock().expect("play lock") = false;
-            if let Some(path) = options.server_release_log_path {
-                std::fs::write(
-                    path,
-                    "2026-06-22T14:10:54.741091Z  INFO mc_net::play: saved player state player=SolarisAgent state=pos=(-2.31,80.00,-6.58)\n",
-                )
-                .expect("write server release marker after disconnect");
-            }
             json!({"disconnected": true})
         }
         other => json!({"unknown_command": other}),
@@ -2923,9 +2728,8 @@ fn bridge_response(
     })
 }
 
-struct BridgeResponseOptions<'a> {
+struct BridgeResponseOptions {
     defer_screenshot_until_response: bool,
-    server_release_log_path: Option<&'a std::path::Path>,
     scenario_result: &'static str,
     screenshot_bytes: &'static [u8],
 }
@@ -2954,11 +2758,6 @@ fn wait_play_payload(in_play: bool) -> Value {
             "player": null,
         })
     }
-}
-
-fn server_session_release_logged(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .is_ok_and(|log| log.contains("saved player state player=SolarisAgent"))
 }
 
 fn write_json_response(stream: &mut TcpStream, response: &Value) {

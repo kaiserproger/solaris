@@ -5,7 +5,7 @@ use crate::{
     ScriptSitePoiState, ScriptSiteProvenance, ScriptSiteVariant, ScriptStructureMaterial,
     ScriptStructureReceipt, ScriptStructureSnapshot, ScriptStructureStagePlan,
     ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose, ScriptSurveySnapshot,
-    ScriptWarehouseBinding, warehouse_handle,
+    ScriptWarehouseBinding, ScriptWarehouseSource, warehouse_handle,
 };
 
 const GENERATION_ID_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -277,6 +277,15 @@ fn operation_id_is_exposed_only_for_idempotent_mutations() {
         Some("pause-1")
     );
     assert_eq!(
+        ScriptSettlementOperation::ResumeStructure {
+            operation_id: "resume-1".to_owned(),
+            structure_id: "structure-1".to_owned(),
+            expected_revision: 1,
+        }
+        .operation_id(),
+        Some("resume-1")
+    );
+    assert_eq!(
         ScriptSettlementOperation::CancelStructure {
             operation_id: "cancel-1".to_owned(),
             structure_id: "structure-1".to_owned(),
@@ -460,7 +469,14 @@ fn serde_round_trips_one_full_site_and_one_full_structure() {
 fn warehouse_binding_and_handle_are_bounded_and_owner_scoped() {
     let handle = warehouse_handle("settlement", &"a".repeat(64), 3).expect("handle");
     assert_eq!(handle, format!("warehouse:settlement:{}:3", "a".repeat(64)));
-    let binding = ScriptWarehouseBinding::new(handle, "a".repeat(64), 3, 5);
+    let binding = ScriptWarehouseBinding::new(
+        handle,
+        ScriptWarehouseSource::Authored {
+            structure_id: "a".repeat(64),
+            container_id: 3,
+        },
+        5,
+    );
     assert!(binding.validate().is_ok());
     assert!(
         ScriptSettlementResult::Warehouse {
@@ -468,6 +484,24 @@ fn warehouse_binding_and_handle_are_bounded_and_owner_scoped() {
         }
         .validate()
         .is_ok()
+    );
+
+    let legacy = serde_json::json!({
+        "handle": "warehouse:settlement:structure-1:3",
+        "structure_id": "structure-1",
+        "container_id": 3,
+        "revision": 5,
+    });
+    assert_eq!(
+        serde_json::from_value::<ScriptWarehouseBinding>(legacy).expect("legacy binding decodes"),
+        ScriptWarehouseBinding::new(
+            "warehouse:settlement:structure-1:3".to_owned(),
+            ScriptWarehouseSource::Authored {
+                structure_id: "structure-1".to_owned(),
+                container_id: 3,
+            },
+            5,
+        )
     );
 
     // A handle that cannot fit the opaque 128-byte bound is refused at mint.
@@ -494,6 +528,14 @@ fn warehouse_binding_and_handle_are_bounded_and_owner_scoped() {
         serde_json::from_str::<ScriptSettlementOperation>(&encoded).expect("bind deserializes"),
         operation
     );
+
+    let village = ScriptSettlementOperation::BindVillageWarehouse {
+        operation_id: "bind-village-1".to_owned(),
+        site_id: "village_3_5_0123456789abcdef".to_owned(),
+        container_id: 2,
+    };
+    assert_eq!(village.operation_id(), Some("bind-village-1"));
+    assert!(village.validate().is_ok());
 }
 
 #[test]

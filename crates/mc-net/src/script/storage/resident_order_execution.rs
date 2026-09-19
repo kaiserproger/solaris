@@ -17,9 +17,9 @@ use mc_entity::{
 };
 use mc_protocol::codec;
 use mc_script::{
-    ScriptCombatEvent, ScriptDemobilizeResult, ScriptDemobilizeState, ScriptEngagementPolicy,
-    ScriptHostileCategory, ScriptInventoryEndpoint, ScriptOperation, ScriptOperationFailure,
-    ScriptOperationOutcome, ScriptOperationPayload, ScriptOperationRequest,
+    ScriptAxisAlignedZone, ScriptCombatEvent, ScriptDemobilizeResult, ScriptDemobilizeState,
+    ScriptEngagementPolicy, ScriptHostileCategory, ScriptInventoryEndpoint, ScriptOperation,
+    ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload, ScriptOperationRequest,
     ScriptOrderMemberOutcome, ScriptOrderMemberState, ScriptOrderTarget, ScriptOrderTargetRef,
     ScriptResidentOrder, ScriptResidentOrderOperation, ScriptResidentOrderResult,
     ScriptResidentWorkOrder, ScriptSettlementOperation, ScriptSettlementResult,
@@ -34,14 +34,25 @@ use super::resident_orders::{
 };
 use super::world_inventory::{ResidentDepositCommit, ResidentWarehouseMove};
 use super::{PluginStorage, PluginStorageMutationError, ScriptStoragePrepareOutcome};
-use crate::play::resident_work::{RESIDENT_WORLD_DIMENSION, ResidentDrop, ResidentWorld};
-use crate::play::{ResidentAttack, ResidentGoal};
+use crate::play::resident_work::{
+    RESIDENT_WORLD_DIMENSION, ResidentDrop, ResidentWorld, ResidentWorldEdit,
+};
+use crate::play::{MAX_BLOCK_EDIT_COMMAND_EDITS, ResidentAttack, ResidentGoal};
+
+/// One core-scheduled work resumption whose durable outcome must reach the
+/// owning plugin after the triggering world edit has become visible.
+pub(super) struct NativeResidentWorkResume {
+    pub(super) plugin_id: String,
+    pub(super) request: ScriptOperationRequest,
+    pub(super) outcome: ScriptOperationOutcome,
+}
 
 /// Attack reach of one resident melee, in blocks.
 const RESIDENT_MELEE_REACH: f64 = 3.0;
 /// Attack reach of one resident bow shot, in blocks.
 const RESIDENT_BOW_REACH: f64 = 16.0;
-/// Canonical catch of resident fishing, matching the vanilla fishing loot.
+/// Deterministic resident-fishing output. This is a bounded worker abstraction,
+/// not a claim to simulate vanilla fishing loot or timing.
 const RESIDENT_FISHING_CATCH: &str = "minecraft:cod";
 /// Canonical ammo one bow shot consumes.
 const RESIDENT_ARROW: &str = "minecraft:arrow";
@@ -208,6 +219,95 @@ impl super::InventoryRuntime {
         }
     }
 
+    /// Resume the same durable assignments whose bounded work regions received
+    /// a real world event. One event gets one attempt per matching assignment;
+    /// a still-missing prerequisite simply remains paused until another event.
+    pub(super) async fn resume_paused_work_for_chunks(
+        &self,
+        storage: &mut PluginStorage,
+        dimension: &str,
+        chunks: &[[i32; 2]],
+        plugin_is_active: impl Fn(&str) -> bool,
+    ) -> Result<Vec<NativeResidentWorkResume>, PluginStorageMutationError> {
+        let candidates = storage
+            .resident_orders()
+            .paused_records_for_chunks(dimension, chunks);
+        self.resume_paused_work_records(storage, candidates, plugin_is_active)
+            .await
+    }
+
+    /// Resume protected work only when the zone definition that overlaps its
+    /// bounded work region changed.
+    pub(super) async fn resume_paused_work_for_zone(
+        &self,
+        storage: &mut PluginStorage,
+        zone: &ScriptAxisAlignedZone,
+        plugin_is_active: impl Fn(&str) -> bool,
+    ) -> Result<Vec<NativeResidentWorkResume>, PluginStorageMutationError> {
+        let candidates = storage.resident_orders().paused_records_for_zone(zone);
+        self.resume_paused_work_records(storage, candidates, plugin_is_active)
+            .await
+    }
+
+    /// Resume tool/input waits for addressed residents and no-storage hauls
+    /// whose exact warehouse destination changed in the same transfer.
+    pub(super) async fn resume_paused_work_for_inventory_change(
+        &self,
+        storage: &mut PluginStorage,
+        handles: &[String],
+        endpoints: &[ScriptInventoryEndpoint],
+        plugin_is_active: impl Fn(&str) -> bool,
+    ) -> Result<Vec<NativeResidentWorkResume>, PluginStorageMutationError> {
+        let candidates = storage
+            .resident_orders()
+            .paused_records_for_inventory_change(handles, endpoints);
+        self.resume_paused_work_records(storage, candidates, plugin_is_active)
+            .await
+    }
+
+    async fn resume_paused_work_records(
+        &self,
+        storage: &mut PluginStorage,
+        candidates: Vec<DurableResidentOrderRecord>,
+        plugin_is_active: impl Fn(&str) -> bool,
+    ) -> Result<Vec<NativeResidentWorkResume>, PluginStorageMutationError> {
+        let mut resumed = Vec::with_capacity(candidates.len());
+        for record in candidates {
+            let Some(work) = record.work.as_ref() else {
+                continue;
+            };
+            if work.state != ScriptWorkState::Paused {
+                continue;
+            }
+            if !plugin_is_active(&record.plugin_id) {
+                continue;
+            }
+            let operation_id = format!("native-resume-{}", record.revision);
+            let request = ScriptOperationRequest::try_new(
+                &operation_id,
+                ScriptOperation::ResidentOrder {
+                    operation: ScriptResidentOrderOperation::AssignWork {
+                        operation_id: operation_id.clone(),
+                        handle: record.handle.clone(),
+                        work: work.work.clone(),
+                        work_units: work.planned,
+                        expected_revision: record.revision,
+                    },
+                },
+            )
+            .expect("durable resident work remains a valid native resume request");
+            let outcome = self
+                .execute_resident_order_operation(storage, &record.plugin_id, &request)
+                .await?;
+            resumed.push(NativeResidentWorkResume {
+                plugin_id: record.plugin_id,
+                request,
+                outcome,
+            });
+        }
+        Ok(resumed)
+    }
+
     // ---------------------------------------------------------------- work
 
     #[allow(clippy::too_many_arguments)]
@@ -243,6 +343,7 @@ impl super::InventoryRuntime {
         let mut ledger = ItemLedger::default();
         let planned = work_units.min(MAX_WORK_CELLS);
         let mut staged: Option<ResidentWarehouseMove> = None;
+        let mut staged_edits = Vec::new();
         let (done, reason) = self
             .run_resident_work(
                 storage,
@@ -253,6 +354,7 @@ impl super::InventoryRuntime {
                 resumed.unwrap_or(0),
                 &mut ledger,
                 &mut staged,
+                &mut staged_edits,
             )
             .await;
         let state = match reason {
@@ -289,15 +391,54 @@ impl super::InventoryRuntime {
                     state,
                     reason,
                 }));
-                self.commit_resident_order(
-                    storage,
-                    plugin_id,
-                    request,
-                    payload(assignment(done, state, reason, ledger)),
-                    vec![DurableResidentOrderChange::Record {
-                        record: Box::new(next),
-                    }],
-                )?;
+                let payload = payload(assignment(done, state, reason, ledger));
+                if staged_edits.is_empty() {
+                    self.commit_resident_order(
+                        storage,
+                        plugin_id,
+                        request,
+                        payload,
+                        vec![DurableResidentOrderChange::Record {
+                            record: Box::new(next),
+                        }],
+                    )?;
+                } else {
+                    let dimension = match work {
+                        ScriptResidentWorkOrder::Harvest { area, .. }
+                        | ScriptResidentWorkOrder::Replant { area, .. }
+                        | ScriptResidentWorkOrder::CutTree { area, .. }
+                        | ScriptResidentWorkOrder::Mine { area, .. } => area.dimension.as_str(),
+                        _ => unreachable!("only world work stages a world decision"),
+                    };
+                    let batch = match storage.prepare_resident_order_operation_batch(
+                        plugin_id,
+                        request,
+                        payload,
+                        vec![DurableResidentOrderChange::Record {
+                            record: Box::new(next),
+                        }],
+                    )? {
+                        ScriptStoragePrepareOutcome::Prepared(batch) => batch,
+                        ScriptStoragePrepareOutcome::Rejected => {
+                            return Err(PluginStorageMutationError::QuotaExceeded);
+                        }
+                    };
+                    let commit = self
+                        .commit_prepared_resident_edits(
+                            storage,
+                            plugin_id,
+                            dimension,
+                            &staged_edits,
+                            batch,
+                        )
+                        .await;
+                    match commit? {
+                        super::world_inventory::PreparedResidentEditCommit::Committed => {}
+                        super::world_inventory::PreparedResidentEditCommit::Refused(failure) => {
+                            return Ok(rejected(failure));
+                        }
+                    }
+                }
             }
             Some(deposit) => {
                 // The record change and the container move under one decision:
@@ -423,6 +564,7 @@ impl super::InventoryRuntime {
         already_done: u64,
         ledger: &mut ItemLedger,
         staged: &mut Option<ResidentWarehouseMove>,
+        staged_edits: &mut Vec<ResidentWorldEdit>,
     ) -> (u64, Option<ScriptWorkPauseReason>) {
         let remaining = planned.saturating_sub(already_done);
         if remaining == 0 {
@@ -449,7 +591,9 @@ impl super::InventoryRuntime {
                 }
                 let mut done = already_done;
                 for cell in work_cells(area) {
-                    if done - already_done >= remaining {
+                    if done - already_done >= remaining
+                        || staged_edits.len() >= MAX_BLOCK_EDIT_COMMAND_EDITS
+                    {
                         break;
                     }
                     let Some(block) = world.block(&area.dimension, cell) else {
@@ -458,13 +602,25 @@ impl super::InventoryRuntime {
                     if !is_harvestable_crop(&block.path) {
                         continue;
                     }
-                    let drops = match world.preview_break(
+                    if staged_edits.first().is_some_and(|first| {
+                        !same_resident_work_region(
+                            [
+                                first.precondition.pos.x,
+                                first.precondition.pos.y,
+                                first.precondition.pos.z,
+                            ],
+                            cell,
+                        )
+                    }) {
+                        return (done, None);
+                    }
+                    let preview = match world.preview_break(
                         &area.dimension,
                         cell,
                         block.state,
                         Some(&tool),
                     ) {
-                        Ok(drops) => drops,
+                        Ok(preview) => preview,
                         Err(failure) => {
                             return (done, Some(work_failure_reason(failure)));
                         }
@@ -472,7 +628,7 @@ impl super::InventoryRuntime {
                     // The worker must be able to hold the loot *before* the
                     // crop leaves the world: a full worker leaves the field
                     // standing instead of harvesting into nothing.
-                    if !self.drops_fit(record, &drops) {
+                    if !self.drops_fit(record, &preview.drops) {
                         let reason = if done == already_done {
                             ScriptWorkPauseReason::NoStorage
                         } else {
@@ -480,16 +636,12 @@ impl super::InventoryRuntime {
                         };
                         return (done, Some(reason));
                     }
-                    match world.break_block(&area.dimension, cell, block.state, Some(&tool)) {
-                        Ok(committed) => {
-                            if !self.deposit_drops(record, &committed, ledger) {
-                                return (done, Some(ScriptWorkPauseReason::NoStorage));
-                            }
-                            wear_tool(record, &tool, ledger, 1);
-                            done += 1;
-                        }
-                        Err(failure) => return (done, Some(work_failure_reason(failure))),
+                    if !self.deposit_drops(record, &preview.drops, ledger) {
+                        return (done, Some(ScriptWorkPauseReason::NoStorage));
                     }
+                    wear_tool(record, &tool, ledger, 1);
+                    staged_edits.push(preview);
+                    done += 1;
                 }
                 if done == already_done {
                     return (done, Some(ScriptWorkPauseReason::MissingInput));
@@ -505,6 +657,14 @@ impl super::InventoryRuntime {
                 if !gear_has(record, &seed_item) {
                     return (already_done, Some(ScriptWorkPauseReason::MissingInput));
                 }
+                if world.foreign_zone_overlaps(
+                    plugin_id,
+                    &area.dimension,
+                    bounds_min(area),
+                    bounds_max(area),
+                ) {
+                    return (already_done, Some(ScriptWorkPauseReason::Protected));
+                }
                 let Some(crop) = crop_block_for_seed(&seed_item) else {
                     return (already_done, Some(ScriptWorkPauseReason::Unsupported));
                 };
@@ -513,7 +673,10 @@ impl super::InventoryRuntime {
                 };
                 let mut done = already_done;
                 for cell in work_cells(area) {
-                    if done - already_done >= remaining || !gear_has(record, &seed_item) {
+                    if done - already_done >= remaining
+                        || staged_edits.len() >= MAX_BLOCK_EDIT_COMMAND_EDITS
+                        || !gear_has(record, &seed_item)
+                    {
                         break;
                     }
                     let Some(block) = world.block(&area.dimension, cell) else {
@@ -529,15 +692,29 @@ impl super::InventoryRuntime {
                     if !is_air_path(&above_block.path) {
                         continue;
                     }
-                    match world.place_block(&area.dimension, above, crop_state) {
-                        Ok(()) => {
-                            // The seed leaves the canonical slot in the same
-                            // committed record as the placement.
-                            wear_gear_count(record, &seed_item, 1, ledger);
-                            done += 1;
+                    let preview = match world.preview_place(&area.dimension, above, crop_state) {
+                        Ok(preview) => preview,
+                        Err(failure) => {
+                            return (done, Some(work_failure_reason(failure)));
                         }
-                        Err(failure) => return (done, Some(work_failure_reason(failure))),
+                    };
+                    if staged_edits.first().is_some_and(|first| {
+                        !same_resident_work_region(
+                            [
+                                first.precondition.pos.x,
+                                first.precondition.pos.y,
+                                first.precondition.pos.z,
+                            ],
+                            above,
+                        )
+                    }) {
+                        return (done, None);
                     }
+                    // The seed leaves the canonical slot in the same committed
+                    // record and receipt-bearing world decision as the crop.
+                    wear_gear_count(record, &seed_item, 1, ledger);
+                    staged_edits.push(preview);
+                    done += 1;
                 }
                 if done == already_done {
                     return (done, Some(ScriptWorkPauseReason::MissingInput));
@@ -559,7 +736,9 @@ impl super::InventoryRuntime {
                 }
                 let mut done = already_done;
                 for cell in work_cells(area) {
-                    if done - already_done >= remaining {
+                    if done - already_done >= remaining
+                        || staged_edits.len() >= MAX_BLOCK_EDIT_COMMAND_EDITS
+                    {
                         break;
                     }
                     let Some(block) = world.block(&area.dimension, cell) else {
@@ -568,42 +747,49 @@ impl super::InventoryRuntime {
                     if !is_log_path(&block.path) {
                         continue;
                     }
-                    // A log that is not rooted in natural ground is another
-                    // player's wooden build; it is never cut.
-                    let below = [cell[0], cell[1] - 1, cell[2]];
-                    let rooted = world.block(&area.dimension, below).is_some_and(|below| {
-                        is_log_path(&below.path) || is_ground_path(&below.path)
-                    });
-                    if !rooted {
-                        continue;
+                    // A log must belong to a bounded rooted trunk with a real
+                    // canopy. That admits the fixture's natural tree without
+                    // treating every grounded log column as harvestable wood.
+                    match rooted_tree_with_canopy(world, &area.dimension, cell) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(reason) => return (done, Some(reason)),
                     }
-                    let drops = match world.preview_break(
+                    if staged_edits.first().is_some_and(|first| {
+                        !same_resident_work_region(
+                            [
+                                first.precondition.pos.x,
+                                first.precondition.pos.y,
+                                first.precondition.pos.z,
+                            ],
+                            cell,
+                        )
+                    }) {
+                        return (done, None);
+                    }
+                    let preview = match world.preview_break(
                         &area.dimension,
                         cell,
                         block.state,
                         Some(&tool),
                     ) {
-                        Ok(drops) => drops,
+                        Ok(preview) => preview,
                         Err(failure) => {
                             return (done, Some(work_failure_reason(failure)));
                         }
                     };
-                    if !self.drops_fit(record, &drops) {
+                    if !self.drops_fit(record, &preview.drops) {
                         if done == already_done {
                             return (done, Some(ScriptWorkPauseReason::NoStorage));
                         }
                         return (done, None);
                     }
-                    match world.break_block(&area.dimension, cell, block.state, Some(&tool)) {
-                        Ok(committed) => {
-                            if !self.deposit_drops(record, &committed, ledger) {
-                                return (done, Some(ScriptWorkPauseReason::NoStorage));
-                            }
-                            wear_tool(record, &tool, ledger, 1);
-                            done += 1;
-                        }
-                        Err(failure) => return (done, Some(work_failure_reason(failure))),
+                    if !self.deposit_drops(record, &preview.drops, ledger) {
+                        return (done, Some(ScriptWorkPauseReason::NoStorage));
                     }
+                    wear_tool(record, &tool, ledger, 1);
+                    staged_edits.push(preview);
+                    done += 1;
                 }
                 if done == already_done {
                     return (done, Some(ScriptWorkPauseReason::MissingInput));
@@ -625,7 +811,9 @@ impl super::InventoryRuntime {
                 }
                 let mut done = already_done;
                 for cell in work_cells(area) {
-                    if done - already_done >= remaining {
+                    if done - already_done >= remaining
+                        || staged_edits.len() >= MAX_BLOCK_EDIT_COMMAND_EDITS
+                    {
                         break;
                     }
                     let Some(block) = world.block(&area.dimension, cell) else {
@@ -636,33 +824,44 @@ impl super::InventoryRuntime {
                     if !is_ore_path(&block.path) {
                         continue;
                     }
-                    let drops = match world.preview_break(
+                    if staged_edits.first().is_some_and(|first| {
+                        !same_resident_work_region(
+                            [
+                                first.precondition.pos.x,
+                                first.precondition.pos.y,
+                                first.precondition.pos.z,
+                            ],
+                            cell,
+                        )
+                    }) {
+                        return (done, None);
+                    }
+                    let preview = match world.preview_break(
                         &area.dimension,
                         cell,
                         block.state,
                         Some(&tool),
                     ) {
-                        Ok(drops) => drops,
+                        Ok(preview) => preview,
                         Err(failure) => {
                             return (done, Some(work_failure_reason(failure)));
                         }
                     };
-                    if !self.drops_fit(record, &drops) {
+                    if preview.drops.is_empty() {
+                        return (done, Some(ScriptWorkPauseReason::MissingTool));
+                    }
+                    if !self.drops_fit(record, &preview.drops) {
                         if done == already_done {
                             return (done, Some(ScriptWorkPauseReason::NoStorage));
                         }
                         return (done, None);
                     }
-                    match world.break_block(&area.dimension, cell, block.state, Some(&tool)) {
-                        Ok(committed) => {
-                            if !self.deposit_drops(record, &committed, ledger) {
-                                return (done, Some(ScriptWorkPauseReason::NoStorage));
-                            }
-                            wear_tool(record, &tool, ledger, 1);
-                            done += 1;
-                        }
-                        Err(failure) => return (done, Some(work_failure_reason(failure))),
+                    if !self.deposit_drops(record, &preview.drops, ledger) {
+                        return (done, Some(ScriptWorkPauseReason::NoStorage));
                     }
+                    wear_tool(record, &tool, ledger, 1);
+                    staged_edits.push(preview);
+                    done += 1;
                 }
                 if done == already_done {
                     return (done, Some(ScriptWorkPauseReason::MissingInput));
@@ -686,14 +885,15 @@ impl super::InventoryRuntime {
                 if columns.is_empty() {
                     return (already_done, Some(ScriptWorkPauseReason::MissingInput));
                 }
-                // One canonical catch per real water column: the bounded water in
-                // the named area is the only source.
+                // One deterministic catch per real water column. This proves
+                // the physical source and inventory owner without representing
+                // vanilla loot-table rolls or fishing timing.
                 let catchable = u64::try_from(columns.len()).unwrap_or(0).min(remaining);
                 let catch_id = resource_item(RESIDENT_FISHING_CATCH);
                 let mut caught = 0_u64;
                 for _ in 0..catchable {
-                    // The catch is canonical, not a roll: one cod per water
-                    // column, and it only counts when the worker can hold it.
+                    // The deterministic catch only counts when the worker can
+                    // hold it.
                     let drops = [ResidentDrop {
                         item_id: catch_id.clone(),
                         count: 1,
@@ -718,6 +918,19 @@ impl super::InventoryRuntime {
                 if !gear_has(record, &feed_item) {
                     return (already_done, Some(ScriptWorkPauseReason::MissingInput));
                 }
+                let Some(feed_id) = Identifier::parse(feed_item.clone())
+                    .ok()
+                    .and_then(|name| self.items().id_of(&name))
+                else {
+                    return (already_done, Some(ScriptWorkPauseReason::MissingInput));
+                };
+                let feed_targets = crate::play::AnimalFeedTargets::from_tags(
+                    &mc_data::tags::solaris_required_item_tags(self.items()),
+                    feed_id,
+                );
+                if feed_targets.is_empty() {
+                    return (already_done, Some(ScriptWorkPauseReason::MissingInput));
+                }
                 let center = Vec3::new(
                     (f64::from(area.min.x) + f64::from(area.max.x)) / 2.0,
                     f64::from(area.min.y),
@@ -729,11 +942,17 @@ impl super::InventoryRuntime {
                         .max(area.max.z - area.min.z)
                         + 1,
                 );
-                let animals = self.sessions().resident_perception(
-                    center,
-                    radius,
-                    &[ScriptHostileCategory::NeutralAnimal],
-                );
+                let animals = self
+                    .sessions()
+                    .resident_perception(center, radius, &[ScriptHostileCategory::NeutralAnimal])
+                    .into_iter()
+                    .filter(|animal| {
+                        feed_targets.accepts(&animal.type_name)
+                            && animal
+                                .animal
+                                .is_some_and(mc_entity::AnimalBreedingState::can_fall_in_love)
+                    })
+                    .collect::<Vec<_>>();
                 if animals.is_empty() {
                     return (already_done, Some(ScriptWorkPauseReason::MissingInput));
                 }
@@ -742,8 +961,9 @@ impl super::InventoryRuntime {
                     if done - already_done >= remaining || !gear_has(record, &feed_item) {
                         break;
                     }
-                    // Ranching consumes feed for a real animal and produces
-                    // nothing by itself.
+                    // Tending consumes resident-owned feed only for animals
+                    // currently visible to the simulation; it does not mint
+                    // livestock goods.
                     wear_gear_count(record, &feed_item, 1, ledger);
                     done += 1;
                 }
@@ -784,7 +1004,25 @@ impl super::InventoryRuntime {
                     (already_done + moved, reason)
                 }
             }
-            ScriptResidentWorkOrder::Craft { recipe, count } => {
+            ScriptResidentWorkOrder::Craft {
+                recipe,
+                count,
+                station,
+            } => {
+                if world.foreign_zone_overlaps(
+                    plugin_id,
+                    &station.dimension,
+                    bounds_min(station),
+                    bounds_max(station),
+                ) {
+                    return (already_done, Some(ScriptWorkPauseReason::Protected));
+                }
+                let Some(block) = world.block(&station.dimension, bounds_min(station)) else {
+                    return (already_done, Some(ScriptWorkPauseReason::Unloaded));
+                };
+                if block.path != "crafting_table" {
+                    return (already_done, Some(ScriptWorkPauseReason::MissingStation));
+                }
                 self.craft_resident_items(record, recipe, *count, remaining, ledger)
             }
             ScriptResidentWorkOrder::Construct {
@@ -1005,6 +1243,14 @@ impl super::InventoryRuntime {
             let max_stack = self.drop_max_stack(&result_name);
             let produced = u64::try_from(result.count).unwrap_or(0);
             if !put_resident_item(record, &result_name, produced, max_stack) {
+                // The inputs were tentatively taken for this craft, but its
+                // output cannot fit. Restore them so only completed crafts
+                // consume canonical resident inventory.
+                for item_id in taken {
+                    let max_stack = self.drop_max_stack(&item_id);
+                    put_resident_item(record, &item_id, 1, max_stack);
+                    ledger.add(&item_id, 1);
+                }
                 return (done, Some(ScriptWorkPauseReason::NoStorage));
             }
             ledger.add(&result_name, i64::from(result.count));
@@ -1124,7 +1370,10 @@ impl super::InventoryRuntime {
                 expected: attack.expected.clone(),
             })
             .collect::<Vec<_>>();
-        let hits = self.sessions().commit_resident_damage(attacks).await;
+        let hits = self
+            .sessions()
+            .commit_resident_damage(plugin_id, attacks)
+            .await;
         let mut combat = Vec::new();
         let mut hit_index = 0_usize;
         for plan in &mut plans {
@@ -2551,6 +2800,27 @@ fn wear_gear_count(
     taken
 }
 
+/// Whether one item can fit without leaving a partial mutation behind.
+fn resident_item_fits(
+    record: &DurableResidentOrderRecord,
+    item_id: &str,
+    count: u64,
+    max_stack: u32,
+) -> bool {
+    let max_stack = max_stack.max(1);
+    let existing_room = record
+        .carry
+        .iter()
+        .chain(record.equipment.iter())
+        .flatten()
+        .filter(|stack| mergeable_stack(stack, item_id))
+        .map(|stack| u64::from(max_stack.saturating_sub(stack.count)))
+        .sum::<u64>();
+    let remaining = count.saturating_sub(existing_room);
+    let free_slots = u64::try_from(free_resident_slots(record)).unwrap_or(u64::MAX);
+    remaining <= free_slots.saturating_mul(u64::from(max_stack))
+}
+
 fn put_resident_item(
     record: &mut DurableResidentOrderRecord,
     item_id: &str,
@@ -2559,6 +2829,9 @@ fn put_resident_item(
 ) -> bool {
     if count == 0 {
         return true;
+    }
+    if !resident_item_fits(record, item_id, count, max_stack) {
+        return false;
     }
     // Merge into an existing compatible stack first, then take free slots: the
     // canonical inventory never fragments one resource beyond what one item's
@@ -2738,6 +3011,14 @@ fn target_ref_for(uuid: &uuid::Uuid) -> String {
 
 // ------------------------------------------------------------ work plumbing
 
+/// A receipt-bearing resident step stays in one eight-chunk regional owner
+/// lane. The next order call resumes the area at the first untouched target.
+fn same_resident_work_region(left: [i32; 3], right: [i32; 3]) -> bool {
+    const REGION_BLOCKS: i32 = 8 * 16;
+    left[0].div_euclid(REGION_BLOCKS) == right[0].div_euclid(REGION_BLOCKS)
+        && left[2].div_euclid(REGION_BLOCKS) == right[2].div_euclid(REGION_BLOCKS)
+}
+
 fn work_cells(area: &mc_script::ScriptWorkArea) -> impl Iterator<Item = [i32; 3]> {
     let min = bounds_min(area);
     let max = bounds_max(area);
@@ -2794,6 +3075,55 @@ fn is_log_path(path: &str) -> bool {
         || path.ends_with("_stem")
         || path == "bamboo_block"
         || path == "mangrove_roots"
+}
+
+/// Bounded evidence that a trunk belongs to a tree rather than a wooden build.
+/// The scan follows at most sixteen vertical log cells and requires a canopy
+/// block directly above the trunk's top; unloaded terrain fails closed.
+fn rooted_tree_with_canopy(
+    world: &dyn ResidentWorld,
+    dimension: &str,
+    cell: [i32; 3],
+) -> Result<bool, ScriptWorkPauseReason> {
+    const MAX_TREE_TRUNK_HEIGHT: usize = 16;
+    let mut root = cell;
+    for _ in 0..MAX_TREE_TRUNK_HEIGHT {
+        let below = [root[0], root[1] - 1, root[2]];
+        let block = world
+            .block(dimension, below)
+            .ok_or(ScriptWorkPauseReason::Unloaded)?;
+        if !is_log_path(&block.path) {
+            break;
+        }
+        root = below;
+    }
+    let below_root = [root[0], root[1] - 1, root[2]];
+    let ground = world
+        .block(dimension, below_root)
+        .ok_or(ScriptWorkPauseReason::Unloaded)?;
+    if !is_ground_path(&ground.path) {
+        return Ok(false);
+    }
+
+    let mut top = cell;
+    for _ in 0..MAX_TREE_TRUNK_HEIGHT {
+        let above = [top[0], top[1] + 1, top[2]];
+        let block = world
+            .block(dimension, above)
+            .ok_or(ScriptWorkPauseReason::Unloaded)?;
+        if !is_log_path(&block.path) {
+            break;
+        }
+        top = above;
+    }
+    let canopy = world
+        .block(dimension, [top[0], top[1] + 1, top[2]])
+        .ok_or(ScriptWorkPauseReason::Unloaded)?;
+    Ok(canopy.path.ends_with("_leaves")
+        || matches!(
+            canopy.path.as_str(),
+            "nether_wart_block" | "warped_wart_block"
+        ))
 }
 
 fn is_ground_path(path: &str) -> bool {

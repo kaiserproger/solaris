@@ -10,7 +10,7 @@
 //!
 //! The default `vanilla` profile *is* core vanilla village generation: startup
 //! builds a `VillagePlanSource` from the resolved content cache and attaches it
-//! to the generator, so the world gets real jigsaw villages. A deployed Luau
+//! to the generator, so the world gets real jigsaw villages. A deployed component
 //! settlement plan owns settlement content instead, and the explicit
 //! `plains_village_prototype` opt-in keeps its own bounded prototype rules; both
 //! leave core villages detached, which is what keeps one landscape from carrying
@@ -300,7 +300,7 @@ fn core_villages_attach_only_for_the_vanilla_profile_without_a_plugin_plan() {
     );
     let data = Arc::new(mc_data::VanillaData::from_registries("", Vec::new()));
     let tags = Arc::new(mc_data::tags::TagsData::default());
-    let plan = mc_script::LuaSettlementPlan::plains_village_prototype("test-settlement");
+    let plan = mc_script::PluginSettlementPlan::plains_village_prototype("test-settlement");
     let prototype = configured("plains_village_prototype");
 
     // The prototype profile never takes core villages.
@@ -370,7 +370,7 @@ fn deployed_settlement_plan_replaces_core_villages() {
         .block(&Identifier::parse("minecraft:bookshelf").unwrap())
         .expect("the baseline registry holds the marker block")
         .default;
-    let plan = mc_script::LuaSettlementPlan::plains_village_prototype("test-settlement");
+    let plan = mc_script::PluginSettlementPlan::plains_village_prototype("test-settlement");
 
     let rules = structure_rules_for_startup(
         config.data.seed,

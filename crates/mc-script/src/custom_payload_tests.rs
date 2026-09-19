@@ -9,7 +9,7 @@ fn nonzero(value: usize) -> NonZeroUsize {
 }
 
 fn channel_manifest(id: &str, channel: &str) -> ValidatedScriptPluginManifest {
-    ScriptPluginManifest::new(id, id, "0.1.0", SCRIPT_API_VERSION)
+    ScriptPluginManifest::new(id, id, "0.1.0", COMPONENT_PLUGIN_API_VERSION)
         .declare_custom_payload_channel(channel)
         .validate()
         .unwrap()
@@ -116,10 +116,11 @@ fn payload_body_at_host_bound_is_accepted() {
 #[test]
 fn full_queue_reports_backpressure_for_owned_channels() {
     let (boundary, _endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-    let manifest = ScriptPluginManifest::new("owner", "owner", "0.1.0", SCRIPT_API_VERSION)
-        .declare_custom_payload_channel("owner:telemetry")
-        .validate()
-        .unwrap();
+    let manifest =
+        ScriptPluginManifest::new("owner", "owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_custom_payload_channel("owner:telemetry")
+            .validate()
+            .unwrap();
     _endpoint.register_plugin_routes(&manifest).unwrap();
     boundary
         .try_enqueue_event(ScriptEvent::server_started())
@@ -142,7 +143,7 @@ fn channel_conflicts_reject_atomically_without_stealing_ownership() {
         .register_plugin_routes(&channel_manifest("owner", "owner:telemetry"))
         .unwrap();
 
-    let rival = ScriptPluginManifest::new("rival", "rival", "0.1.0", SCRIPT_API_VERSION)
+    let rival = ScriptPluginManifest::new("rival", "rival", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
         .declare_player_command_root("rivalcmd")
         .declare_custom_payload_channel("owner:telemetry")
         .validate()
@@ -174,7 +175,7 @@ fn channel_conflicts_reject_atomically_without_stealing_ownership() {
 #[test]
 fn channel_limit_rejects_atomically() {
     let (boundary, endpoint) = script_boundary_pair(nonzero(4), nonzero(4));
-    let mut full = ScriptPluginManifest::new("full", "full", "0.1.0", SCRIPT_API_VERSION);
+    let mut full = ScriptPluginManifest::new("full", "full", "0.1.0", COMPONENT_PLUGIN_API_VERSION);
     for index in 0..MAX_PLUGIN_PAYLOAD_CHANNELS {
         full = full.declare_custom_payload_channel(format!("full:channel-{index}"));
     }
@@ -199,11 +200,12 @@ fn channel_limit_rejects_atomically() {
 #[test]
 fn unregister_releases_channels_and_roots_together() {
     let (boundary, endpoint) = script_boundary_pair(nonzero(4), nonzero(4));
-    let manifest = ScriptPluginManifest::new("owner", "owner", "0.1.0", SCRIPT_API_VERSION)
-        .declare_player_command_root("owned")
-        .declare_custom_payload_channel("owner:telemetry")
-        .validate()
-        .unwrap();
+    let manifest =
+        ScriptPluginManifest::new("owner", "owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_player_command_root("owned")
+            .declare_custom_payload_channel("owner:telemetry")
+            .validate()
+            .unwrap();
     endpoint.register_plugin_routes(&manifest).unwrap();
     endpoint.unregister_plugin_routes("owner");
 
@@ -222,9 +224,10 @@ fn unregister_releases_channels_and_roots_together() {
 
 #[test]
 fn raw_payload_manifest_cannot_claim_loader_control_channels() {
-    let manifest = ScriptPluginManifest::new("owner", "owner", "0.1.0", SCRIPT_API_VERSION)
-        .declare_custom_payload_channel("solaris:loader/ui")
-        .validate();
+    let manifest =
+        ScriptPluginManifest::new("owner", "owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_custom_payload_channel("solaris:loader/ui")
+            .validate();
     assert!(matches!(
         manifest,
         Err(ScriptPluginManifestError::InvalidCustomPayloadChannel { .. })
@@ -337,18 +340,20 @@ fn channel_manifest_validation_rejects_malformed_and_duplicate_channels() {
         ":path",
         "owner:has:colon",
     ] {
-        let manifest = ScriptPluginManifest::new("owner", "owner", "0.1.0", SCRIPT_API_VERSION)
-            .declare_custom_payload_channel(channel);
+        let manifest =
+            ScriptPluginManifest::new("owner", "owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+                .declare_custom_payload_channel(channel);
         assert!(
             manifest.validate().is_err(),
             "channel {channel:?} must be rejected"
         );
     }
 
-    let duplicate = ScriptPluginManifest::new("owner", "owner", "0.1.0", SCRIPT_API_VERSION)
-        .declare_custom_payload_channel("owner:telemetry")
-        .declare_custom_payload_channel("owner:telemetry")
-        .validate();
+    let duplicate =
+        ScriptPluginManifest::new("owner", "owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_custom_payload_channel("owner:telemetry")
+            .declare_custom_payload_channel("owner:telemetry")
+            .validate();
     assert!(matches!(
         duplicate,
         Err(ScriptPluginManifestError::DuplicateCapability { .. })
@@ -358,11 +363,12 @@ fn channel_manifest_validation_rejects_malformed_and_duplicate_channels() {
 #[test]
 fn root_and_channel_routes_share_one_atomic_lifecycle() {
     let (boundary, endpoint) = script_boundary_pair(nonzero(4), nonzero(4));
-    let manifest = ScriptPluginManifest::new("owner", "owner", "0.1.0", SCRIPT_API_VERSION)
-        .declare_player_command_root("owned")
-        .declare_custom_payload_channel("owner:telemetry")
-        .validate()
-        .unwrap();
+    let manifest =
+        ScriptPluginManifest::new("owner", "owner", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_player_command_root("owned")
+            .declare_custom_payload_channel("owner:telemetry")
+            .validate()
+            .unwrap();
     endpoint.register_plugin_routes(&manifest).unwrap();
     assert_eq!(boundary.player_command_roots(), vec!["owned".to_owned()]);
     assert!(boundary.allows_custom_payload("owner:telemetry"));
@@ -385,7 +391,6 @@ fn root_and_channel_routes_share_one_atomic_lifecycle() {
     );
 }
 
-#[cfg(feature = "lua-runtime")]
 #[test]
 fn reload_replaces_both_route_kinds_atomically() {
     let (boundary, endpoint) = script_boundary_pair(nonzero(4), nonzero(4));
@@ -398,19 +403,23 @@ fn reload_replaces_both_route_kinds_atomically() {
         channel_manifest("beta", "shared:channel"),
     ];
     assert!(matches!(
-        endpoint.plugin_routes.replace_all(&clashing),
-        Err(ScriptRouteRegistrationError::ChannelConflict { .. })
+        endpoint.commit_reload(&clashing, Vec::new(), || {}),
+        Err(ScriptReloadCommitError::Ownership {
+            error: ScriptRouteRegistrationError::ChannelConflict { .. }
+        })
     ));
     assert!(boundary.allows_custom_payload("owner:telemetry"));
 
     let replacement = vec![
-        ScriptPluginManifest::new("next", "next", "0.1.0", SCRIPT_API_VERSION)
+        ScriptPluginManifest::new("next", "next", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
             .declare_player_command_root("nextcmd")
             .declare_custom_payload_channel("next:telemetry")
             .validate()
             .unwrap(),
     ];
-    endpoint.plugin_routes.replace_all(&replacement).unwrap();
+    endpoint
+        .commit_reload(&replacement, Vec::new(), || {})
+        .unwrap();
     assert!(!boundary.allows_custom_payload("owner:telemetry"));
     assert!(boundary.allows_custom_payload("next:telemetry"));
     assert_eq!(boundary.player_command_roots(), vec!["nextcmd".to_owned()]);

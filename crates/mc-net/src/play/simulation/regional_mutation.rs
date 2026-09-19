@@ -64,6 +64,10 @@ enum RegionalMutationJob {
         edits: Vec<ResidentBlockEdit>,
         preconditions: Vec<ResidentBlockPrecondition>,
         scheduled_block_ticks: Vec<ScheduledBlockTick>,
+        leaf_trigger: bool,
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
+        hook_approval: Option<mc_script::precommit::Approval>,
+        plugin_receipt: Option<Vec<u8>>,
     },
     SurvivalPlacement {
         actor_session: SessionId,
@@ -139,10 +143,12 @@ enum RegionalBlockEditJobResult {
         sequence: u64,
         actor_session: Option<SessionId>,
         outcome: Box<Option<BlockEditBatchOutcome>>,
+        failure: Option<SimulationRequestError>,
         journal_snapshots: Option<Vec<mc_world::ChunkSnapshot>>,
         journal_snapshot_complete: bool,
         light_sources: Option<IncrementalLightSources>,
         light_updates: Vec<crate::play::session::OutboundLightUpdate>,
+        plugin_receipt: Option<Vec<u8>>,
     },
     SurvivalPlacement {
         sequence: u64,
@@ -308,11 +314,19 @@ impl SimulationOwner {
                     edits,
                     preconditions,
                     scheduled_block_ticks,
+                    leaf_trigger,
+                    zone_fence,
+                    hook_approval,
+                    plugin_receipt,
                 } => RegionalMutationJob::BlockEdits {
                     actor_session: *actor_session,
                     edits: resident_block_edits(edits),
                     preconditions: resident_block_preconditions(preconditions),
                     scheduled_block_ticks: scheduled_block_ticks.clone(),
+                    leaf_trigger: *leaf_trigger,
+                    zone_fence: zone_fence.clone(),
+                    hook_approval: hook_approval.clone(),
+                    plugin_receipt: plugin_receipt.clone(),
                 },
                 SimulationCommand::CommitSurvivalPlacement(command) => {
                     RegionalMutationJob::SurvivalPlacement {
@@ -444,54 +458,91 @@ impl SimulationOwner {
                                 edits,
                                 preconditions,
                                 scheduled_block_ticks,
+                                leaf_trigger,
+                                zone_fence,
+                                hook_approval,
+                                plugin_receipt,
                             } => {
-                                let (raw_outcome, touched_chunks) =
-                                    if let Some(decision_id) = journal_id {
-                                        mutation.apply_block_edits_conditionally_journaled(
-                                            decision_id,
-                                            &edits,
-                                            &preconditions,
-                                            &scheduled_block_ticks,
-                                            block_light.as_deref(),
-                                            Some(world_tick.saturating_add(1)),
-                                        )
-                                    } else {
-                                        (
-                                            mutation.apply_block_edits_conditionally(
-                                                &edits,
-                                                &preconditions,
-                                                &scheduled_block_ticks,
-                                                block_light.as_deref(),
-                                                Some(world_tick.saturating_add(1)),
-                                            ),
-                                            Vec::new(),
-                                        )
-                                    };
-                                let outcome = resident_block_edit_result_outcome(raw_outcome);
-                                let journal_snapshots = journal_id.map(|_| {
-                                    let snapshot = world_read.snapshot_chunks(&touched_chunks);
-                                    touched_chunks
-                                        .iter()
-                                        .filter_map(|position| snapshot.chunk(*position))
-                                        .collect::<Vec<_>>()
-                                });
-                                let journal_snapshot_complete =
-                                    journal_snapshots.as_ref().is_none_or(|snapshots| {
-                                        snapshots.len() == touched_chunks.len()
-                                    });
-                                let (light_sources, light_updates) = regional_light_updates(
-                                    &world_read,
-                                    block_light.as_deref(),
-                                    outcome.as_ref(),
-                                );
-                                RegionalBlockEditJobResult::BlockEdits {
-                                    sequence: job.sequence,
-                                    actor_session,
-                                    outcome: Box::new(outcome),
+                                let failure = if zone_fence
+                                    .as_ref()
+                                    .is_some_and(|fence| !fence.is_current())
+                                {
+                                    Some(SimulationRequestError::Precommit(
+                                        mc_script::precommit::HookFailure::PermissionDenied,
+                                    ))
+                                } else {
+                                    super::precommit::refuse_build_approval(&hook_approval)
+                                        .err()
+                                        .map(SimulationRequestError::Precommit)
+                                };
+                                let (
+                                    outcome,
                                     journal_snapshots,
                                     journal_snapshot_complete,
                                     light_sources,
                                     light_updates,
+                                ) = if failure.is_some() {
+                                    (None, journal_id.map(|_| Vec::new()), true, None, Vec::new())
+                                } else {
+                                    let (raw_outcome, touched_chunks) =
+                                        if let Some(decision_id) = journal_id {
+                                            mutation.apply_block_edits_conditionally_journaled(
+                                                decision_id,
+                                                &edits,
+                                                &preconditions,
+                                                &scheduled_block_ticks,
+                                                block_light.as_deref(),
+                                                leaf_trigger
+                                                    .then_some(world_tick.saturating_add(1)),
+                                            )
+                                        } else {
+                                            (
+                                                mutation.apply_block_edits_conditionally(
+                                                    &edits,
+                                                    &preconditions,
+                                                    &scheduled_block_ticks,
+                                                    block_light.as_deref(),
+                                                    leaf_trigger
+                                                        .then_some(world_tick.saturating_add(1)),
+                                                ),
+                                                Vec::new(),
+                                            )
+                                        };
+                                    let outcome = resident_block_edit_result_outcome(raw_outcome);
+                                    let journal_snapshots = journal_id.map(|_| {
+                                        let snapshot = world_read.snapshot_chunks(&touched_chunks);
+                                        touched_chunks
+                                            .iter()
+                                            .filter_map(|position| snapshot.chunk(*position))
+                                            .collect::<Vec<_>>()
+                                    });
+                                    let journal_snapshot_complete =
+                                        journal_snapshots.as_ref().is_none_or(|snapshots| {
+                                            snapshots.len() == touched_chunks.len()
+                                        });
+                                    let (light_sources, light_updates) = regional_light_updates(
+                                        &world_read,
+                                        block_light.as_deref(),
+                                        outcome.as_ref(),
+                                    );
+                                    (
+                                        outcome,
+                                        journal_snapshots,
+                                        journal_snapshot_complete,
+                                        light_sources,
+                                        light_updates,
+                                    )
+                                };
+                                RegionalBlockEditJobResult::BlockEdits {
+                                    sequence: job.sequence,
+                                    actor_session,
+                                    outcome: Box::new(outcome),
+                                    failure,
+                                    journal_snapshots,
+                                    journal_snapshot_complete,
+                                    light_sources,
+                                    light_updates,
+                                    plugin_receipt,
                                 }
                             }
                             RegionalMutationJob::SurvivalPlacement {
@@ -547,6 +598,9 @@ impl SimulationOwner {
                                             &planning_snapshot,
                                             &request,
                                         )
+                                    }
+                                    SurvivalBreakRequest::PrecommitFailure(_) => {
+                                        unreachable!("precommit refusals use the canonical owner path")
                                     }
                                 };
                                 let mut committed = match plan.as_ref() {
@@ -967,13 +1021,22 @@ impl SimulationOwner {
                     RegionalBlockEditJobResult::BlockEdits {
                         journal_snapshots: Some(snapshots),
                         journal_snapshot_complete,
+                        outcome,
+                        plugin_receipt,
                         ..
                     } => {
                         if !journal_snapshot_complete {
                             complete = false;
                             break;
                         }
-                        groups.push((id, snapshots.clone(), None));
+                        groups.push((
+                            id,
+                            snapshots.clone(),
+                            match outcome.as_ref().as_ref() {
+                                Some(_) => plugin_receipt.clone(),
+                                None => None,
+                            },
+                        ));
                     }
                     // A refused server-owned deposit closes its reserved id
                     // with no participant, exactly like a cancelled block-drop
@@ -1083,8 +1146,10 @@ impl SimulationOwner {
                 RegionalBlockEditJobResult::BlockEdits {
                     actor_session,
                     mut outcome,
+                    failure,
                     light_sources,
                     light_updates,
+                    plugin_receipt,
                     ..
                 } => {
                     if world_journal_failed
@@ -1099,6 +1164,11 @@ impl SimulationOwner {
                         envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
                         continue;
                     }
+                    if let Some(error) = failure {
+                        envelope.respond(Err(error));
+                        continue;
+                    }
+                    let committed = outcome.is_some();
                     if let Some(outcome) = outcome.as_mut() {
                         publish_regional_light_updates(
                             sessions,
@@ -1110,7 +1180,18 @@ impl SimulationOwner {
                         );
                         dispatch_regional_block_outcome(sessions, actor_session, outcome);
                     }
-                    envelope.respond(Ok(SimulationResponse::BlockEdits(Ok(Box::new(*outcome)))));
+                    if plugin_receipt.is_some() {
+                        let decision = committed.then(|| {
+                            journal_ids
+                                .get(&envelope.sequence)
+                                .copied()
+                                .expect("journaled structure portion has a decision")
+                        });
+                        envelope.respond(Ok(SimulationResponse::SettlementPortion(Ok(decision))));
+                    } else {
+                        envelope
+                            .respond(Ok(SimulationResponse::BlockEdits(Ok(Box::new(*outcome)))));
+                    }
                 }
                 RegionalBlockEditJobResult::SurvivalPlacement {
                     actor_session,

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "pack_id": "wasm-p2-plugin-join-hello-real-client",
+  "quality_label": "draft",
+  "minecraft_version": "26.1.2",
+  "server_command": "cargo run --bin mc-server -- --config <run-dir>/server.toml (prepared from SOLARIS_REAL_CLIENT_SERVER_CONFIG)",
+  "artifact_root": ".analysis/real-client-runs",
+  "client_requirement": "A real graphical Minecraft Java Edition 26.1.2 client must execute this scenario through the repo-native Gradle runClient adapter (:fabric-agent:runClientAgent, net.neoforged.moddev). That client carries the repo's JVM client-agent bridge for observation only and deliberately does NOT load the Solaris Loader mod, so the greeting and /hello arrive over the ordinary vanilla-compatible play protocol; it is a no-Loader development client, not an uninstrumented production binary. Protocol bots, wire probes and mock clients do not satisfy this gate.",
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "headless mock client",
+    "source-string assertion"
+  ],
+  "required_artifacts": [
+    "manifest.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt",
+    "automation-driver.txt"
+  ],
+  "automation_runner": {
+    "script": "python3 -m tools.harness run regression",
+    "delegates_to": "tools/harness/backends/regression.sh",
+    "agent_driver": "tools/harness/backends/driver.py",
+    "client_adapter": "../solaris-loader/gradlew -p ../solaris-loader --no-configuration-cache :fabric-agent:runClientAgent",
+    "client_adapter_source": "auto-gradle-runclient",
+    "client_isolation": "The primary Gradle runClient uses a per-run game directory and the fixed offline username SolarisPrimary.",
+    "modes": [
+      "--check",
+      "--prepare",
+      "--run",
+      "--validate-run"
+    ],
+    "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+    "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
+    "agent_port_env": "SOLARIS_REAL_CLIENT_AGENT_PORT",
+    "agent_server_addr_env": "SOLARIS_REAL_CLIENT_SERVER_ADDR",
+    "default_agent_scenario": "wasm-p2-plugin-join-hello",
+    "prepared_status": "prepared-owner-run",
+    "passing_gate": "agent-run real-client"
+  },
+  "scenarios": [
+    {
+      "id": "wasm-p2-plugin-join-hello",
+      "title": "External WASM package join greeting and /hello in a no-Loader graphical client",
+      "ledger_rows": [
+        "P2"
+      ],
+      "status": "manual-pending",
+      "no_debug_commands": true,
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Start Solaris from the prepared run directory with the plugins deployment configured as runtime = \"wasm\", strict = true and expected = [\"hello\"]; the server must publish readiness with the external component admitted or fail startup.",
+        "Launch the real graphical 26.1.2 client through the repo-native Gradle runClient adapter (no Solaris Loader mod) and let the agent driver connect it to the loopback server address.",
+        "Enter Play as the ordinary non-operator player SolarisPrimary and require the client chat to render the guest's configured join greeting for that live player name.",
+        "Send the ordinary command /hello and require a fresh guest answer in client chat, then repeat it and require another fresh answer.",
+        "Send one command root no package declares and require fresh server rejection feedback.",
+        "Capture the actual client surface after the greeting and answers and after the rejected command."
+      ],
+      "expected_observations": [
+        "The graphical client reaches Play against the strict wasm deployment and stays in Play for the whole scenario.",
+        "The join greeting rendered in client chat equals the configured template with the live player name.",
+        "Each /hello submission produces a fresh expected answer line in client chat.",
+        "The unregistered command produces fresh server rejection feedback.",
+        "No operator privileges are granted and no debug/operator command is used to produce any observed line."
+      ],
+      "wasm_plugin_expectation": {
+        "package_id": "hello",
+        "player_username": "SolarisPrimary",
+        "join_greeting_template": "WASM P2 welcome {player}",
+        "player_command": "hello",
+        "command_response": "Hello from a WASM plugin.",
+        "unknown_command_probe": "solaris_probe_unknown_command",
+        "unknown_command_feedback": [
+          "Unknown command",
+          "Unknown or incomplete command"
+        ]
+      }
+    }
+  ]
+}

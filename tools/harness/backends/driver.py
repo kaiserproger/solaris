@@ -20,6 +20,40 @@ from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
 
+if __package__:
+    from .wasm_inventory_storage import (
+        WASM_INVENTORY_MENU_SCENARIOS,
+        WASM_INVENTORY_STORAGE_SCENARIOS,
+        WASM_ZONE_MARKET_SCENARIOS,
+        TradeScenarioHooks,
+        run_wasm_inventory_menu_scenario,
+        run_wasm_inventory_storage_scenario,
+        run_wasm_zone_market_scenario,
+    )
+    from .wasm_plugin_join_hello import (
+        WASM_PLUGIN_JOIN_HELLO_SCENARIOS,
+        HarnessHooks,
+        run_wasm_plugin_join_hello_scenario,
+    )
+else:
+    # Direct scripts get this path automatically; importlib/runpy file loaders
+    # do not. Both entry modes need the same sibling scenario modules.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from wasm_inventory_storage import (
+        WASM_INVENTORY_MENU_SCENARIOS,
+        WASM_INVENTORY_STORAGE_SCENARIOS,
+        WASM_ZONE_MARKET_SCENARIOS,
+        TradeScenarioHooks,
+        run_wasm_inventory_menu_scenario,
+        run_wasm_inventory_storage_scenario,
+        run_wasm_zone_market_scenario,
+    )
+    from wasm_plugin_join_hello import (
+        WASM_PLUGIN_JOIN_HELLO_SCENARIOS,
+        HarnessHooks,
+        run_wasm_plugin_join_hello_scenario,
+    )
+
 
 CORE_REPLAY_SCENARIO_SCHEMA = "solaris.core_replay.scenario.v1"
 CORE_REPLAY_RESULT_SCHEMA = "solaris.core_replay.result.v1"
@@ -1113,6 +1147,83 @@ def run_bridge_scenario(
             server_addr,
             timeout_seconds,
             transcript,
+        )
+    if scenario_id in WASM_PLUGIN_JOIN_HELLO_SCENARIOS:
+        if secondary_client is not None:
+            raise ValueError(f"{scenario_id} drives exactly one real client")
+        return run_wasm_plugin_join_hello_scenario(
+            client,
+            run_dir,
+            scenario_id,
+            server_addr,
+            timeout_seconds,
+            transcript,
+            HarnessHooks(
+                call=call_and_record,
+                capture_screenshot=capture_screenshot,
+                connect_or_confirm_play=wait_for_existing_or_explicit_connection,
+                is_in_play=is_in_play,
+            ),
+        )
+    if scenario_id in WASM_INVENTORY_STORAGE_SCENARIOS:
+        if secondary_client is not None:
+            raise ValueError(f"{scenario_id} drives exactly one real client")
+        return run_wasm_inventory_storage_scenario(
+            client,
+            run_dir,
+            scenario_id,
+            server_addr,
+            timeout_seconds,
+            transcript,
+            TradeScenarioHooks(
+                call=call_and_record,
+                capture_screenshot=capture_screenshot,
+                connect_or_confirm_play=wait_for_existing_or_explicit_connection,
+                is_in_play=is_in_play,
+                leave_play=wait_until_not_in_play,
+                await_session_release=wait_for_server_session_release,
+                await_interactive_play=wait_for_interactive_play,
+            ),
+        )
+    if scenario_id in WASM_INVENTORY_MENU_SCENARIOS:
+        if secondary_client is not None:
+            raise ValueError(f"{scenario_id} drives exactly one real client")
+        return run_wasm_inventory_menu_scenario(
+            client,
+            run_dir,
+            scenario_id,
+            server_addr,
+            timeout_seconds,
+            transcript,
+            TradeScenarioHooks(
+                call=call_and_record,
+                capture_screenshot=capture_screenshot,
+                connect_or_confirm_play=wait_for_existing_or_explicit_connection,
+                is_in_play=is_in_play,
+                leave_play=wait_until_not_in_play,
+                await_session_release=wait_for_server_session_release,
+                await_interactive_play=wait_for_interactive_play,
+            ),
+        )
+    if scenario_id in WASM_ZONE_MARKET_SCENARIOS:
+        if secondary_client is not None:
+            raise ValueError(f"{scenario_id} drives exactly one real client")
+        return run_wasm_zone_market_scenario(
+            client,
+            run_dir,
+            scenario_id,
+            server_addr,
+            timeout_seconds,
+            transcript,
+            TradeScenarioHooks(
+                call=call_and_record,
+                capture_screenshot=capture_screenshot,
+                connect_or_confirm_play=wait_for_existing_or_explicit_connection,
+                is_in_play=is_in_play,
+                leave_play=wait_until_not_in_play,
+                await_session_release=wait_for_server_session_release,
+                await_interactive_play=wait_for_interactive_play,
+            ),
         )
     if scenario_id == "m94-01-join-rejoin-chunks-movement":
         return run_join_rejoin_movement_scenario(
@@ -4050,8 +4161,9 @@ def wait_for_server_session_release(run_dir: Path, timeout_seconds: float) -> st
 
 
 def server_session_release_logged(server_log: Path) -> bool:
+    """Observe session removal, not completion of its asynchronous player save."""
     try:
-        return "saved player state player=" in server_log.read_text(
+        return "play session unregistered" in server_log.read_text(
             encoding="utf-8",
             errors="replace",
         )

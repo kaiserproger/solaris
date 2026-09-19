@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, info};
 
 impl SessionRegistry {
     pub(crate) fn subscribe_active_sessions(&self) -> tokio::sync::watch::Receiver<usize> {
@@ -378,7 +378,7 @@ impl SessionRegistry {
                 self.publish_prepared_cache(&cache);
                 released_prepare_claims
             };
-            debug!(
+            info!(
                 session_id = id,
                 player = %session.name,
                 desired = desired_len,

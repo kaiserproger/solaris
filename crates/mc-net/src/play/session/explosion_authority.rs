@@ -11,6 +11,9 @@ use crate::play::explosions::{PlayerExplosionImpact, TNT_ENTITY_TYPE_NAME, explo
 use crate::play::simulation::SimulationAuthority;
 use crate::play::survival::{entity_item_stack, mob_xp_value};
 
+use super::damage_precommit::{
+    EntityDamagePrecommitResume, PlayerDamageSource, begin_entity_damage,
+};
 use super::entity_combat::{
     begin_server_entity_death_locked, publish_accepted_entity_health_locked,
 };
@@ -32,6 +35,8 @@ use super::{
     SessionId, SessionRegistry, SessionRegistryInner, entity_kill_drop_stacks,
     player_collision_position, record_entity_dispatches_locked,
 };
+use crate::play::simulation::SimulationCommand;
+use mc_script::precommit::{Approval, HookActor, HookDecision, HookFailure, HookKind};
 
 pub(in crate::play) const EXPLOSIONS_PER_TICK: usize = 1;
 
@@ -68,6 +73,112 @@ pub(in crate::play) struct ServerEntityExplosionImpact {
     pub(in crate::play) entity_id: EntityId,
     pub(in crate::play) damage: f32,
     pub(in crate::play) knockback: Vec3,
+}
+
+/// The native explosion policy that must run beside an approved damage commit.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::play) struct ExplosionDamageContinuation {
+    pub(in crate::play) knockback: Vec3,
+}
+
+fn defer_explosion_entity_damage_precommit(
+    registry: &SessionRegistry,
+    expected: mc_entity::EntitySnapshot,
+    request: EntityDamageRequest,
+    continuation: ExplosionDamageContinuation,
+) -> bool {
+    let Some(handle) = registry.damage_precommit_handle().cloned() else {
+        return true;
+    };
+    let pending = match begin_entity_damage(
+        registry,
+        expected.id,
+        HookActor::Environment,
+        "explosion",
+        expected.position,
+        request.amount,
+    ) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    handle.spawn_precommit_resume(pending, None, None, move |decision| {
+        SimulationCommand::ResumeEntityDamagePrecommit(Box::new(EntityDamagePrecommitResume {
+            expected,
+            request,
+            attacker_costs: None,
+            completion: super::damage_precommit::EntityDamagePrecommitCompletion::Explosion(
+                continuation,
+            ),
+            decision,
+        }))
+    });
+    true
+}
+
+/// Commits an explosion impact exactly as the native direct path would, after
+/// the guest decision has returned and the original target image still holds.
+pub(in crate::play) fn resume_explosion_entity_damage_precommit(
+    registry: &SessionRegistry,
+    expected: mc_entity::EntitySnapshot,
+    mut request: EntityDamageRequest,
+    decision: Result<Approval, HookFailure>,
+    continuation: ExplosionDamageContinuation,
+) -> Vec<VisibilityDispatch> {
+    let Ok(mut approval) = decision else {
+        return Vec::new();
+    };
+    request.amount = match approval.decision() {
+        HookDecision::Keep => request.amount,
+        HookDecision::Replace(amount) if amount.is_finite() && amount > 0.0 => amount,
+        HookDecision::Cancel | HookDecision::Replace(_) | _ => return Vec::new(),
+    };
+    let mut inner = registry.lock_session_entities("resume explosion entity damage precommit");
+    if inner.entities.snapshot(expected.id).as_ref() != Some(&expected)
+        || approval.consume().is_err()
+    {
+        return Vec::new();
+    }
+    let rewards = EntityKillRewards {
+        items: inner.arrow_kill_rewards.item_entity_type_id.map_or_else(
+            Vec::new,
+            |entity_type_id| {
+                entity_kill_drop_stacks(
+                    &inner.arrow_kill_rewards,
+                    &expected.type_name,
+                    expected.animal,
+                    expected.id.0 as i64 as u64,
+                )
+                .into_iter()
+                .map(|drop| (entity_type_id, entity_item_stack(drop)))
+                .collect()
+            },
+        ),
+        experience: inner
+            .arrow_kill_rewards
+            .xp_orb_entity_type_id
+            .map(|entity_type_id| (entity_type_id, mob_xp_value(&expected.type_name))),
+    };
+    let Some(damage) = inner.entities.damage_if_current(expected, request) else {
+        return Vec::new();
+    };
+    let mut dispatches = publish_accepted_entity_health_locked(&mut inner, &damage.snapshot);
+    if damage.killed {
+        let (_, mut death_dispatches) =
+            begin_server_entity_death_locked(&mut inner, &damage, &rewards);
+        death_dispatches.splice(0..0, dispatches);
+        dispatches = death_dispatches;
+    } else {
+        dispatches.extend(entity_hurt_dispatches_locked(&inner, damage.snapshot.id));
+        dispatches.extend(apply_explosion_knockback_locked(
+            &mut inner,
+            damage.snapshot.id,
+            continuation.knockback,
+        ));
+    }
+    drop(inner);
+    registry.append_spawned_xp_pickup_candidates(&mut dispatches);
+    dispatches
 }
 
 impl ExpiredPrimedTnt {
@@ -142,6 +253,7 @@ impl ExpiredPrimedTnt {
                             amount: impact.damage,
                             source_origin: Some(self.position),
                         },
+                        source: PlayerDamageSource::Environment,
                     },
                 });
             }
@@ -219,6 +331,62 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         impacts: &[ServerEntityExplosionImpact],
     ) -> Vec<VisibilityDispatch> {
+        if self
+            .precommit_boundary()
+            .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+        {
+            let (deferred, dispatches) = {
+                let mut inner = self.lock_session_entities("freeze explosion entity impacts");
+                let tick = inner.entity_lifecycle_tick;
+                let mut deferred = Vec::new();
+                let mut dispatches = Vec::new();
+                for impact in impacts {
+                    if !impact.damage.is_finite()
+                        || impact.damage < 0.0
+                        || !impact.knockback.is_finite()
+                    {
+                        continue;
+                    }
+                    let Some(target) = inner.entities.snapshot(impact.entity_id) else {
+                        continue;
+                    };
+                    if target.lifecycle != EntityLifecycle::Alive {
+                        continue;
+                    }
+                    if impact.damage == 0.0 {
+                        dispatches.extend(apply_explosion_knockback_locked(
+                            &mut inner,
+                            impact.entity_id,
+                            impact.knockback,
+                        ));
+                        continue;
+                    }
+                    if target.retained.last_damage_tick.is_some_and(|last| {
+                        tick.saturating_sub(last) < ENTITY_HURT_INVULNERABLE_TICKS
+                    }) {
+                        continue;
+                    }
+                    deferred.push((
+                        target,
+                        EntityDamageRequest {
+                            amount: impact.damage,
+                            tick,
+                            death_remove_tick: tick.saturating_add(ENTITY_DEATH_TICKS),
+                            villager_gossip_event: None,
+                        },
+                        ExplosionDamageContinuation {
+                            knockback: impact.knockback,
+                        },
+                    ));
+                }
+                (deferred, dispatches)
+            };
+            for (target, request, continuation) in deferred {
+                let _ =
+                    defer_explosion_entity_damage_precommit(self, target, request, continuation);
+            }
+            return dispatches;
+        }
         let mut dispatches =
             {
                 let mut inner = self.lock_session_entities("apply explosion entity impacts");

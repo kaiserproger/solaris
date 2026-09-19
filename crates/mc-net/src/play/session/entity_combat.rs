@@ -1,3 +1,7 @@
+use super::damage_precommit::{
+    EntityDamagePrecommitCompletion, EntityDamagePrecommitResult, EntityDamagePrecommitResume,
+    begin_entity_damage,
+};
 use super::entity_lifecycle::{nearby_entity_candidate_ids_locked, schedule_entity_death_locked};
 use super::interaction_geometry::{entity_geometry, within_entity_attack_reach};
 use super::player_combat::held_attack_range;
@@ -14,16 +18,20 @@ use super::{
     visibility_dispatches, visible_entity_observers_locked,
 };
 use crate::lock_policy::lock_authoritative_mutex;
-use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
+use crate::play::simulation::{
+    PlayerSurvivalPlan, SimulationAuthority, SimulationCommand, SimulationRequestError,
+    SimulationResponseSender,
+};
 use crate::play::{GameMode, PlayerPose};
 use mc_entity::dragon_26_1_2::{
     DragonAirPhase, DragonAirState, DragonPart, dragon_part_damage, part_center,
 };
 use mc_entity::{
-    AttributeKind, EntityDamageRequest, EntityEffectRejection, EntityEffectRequest,
-    EntityEffectResult, EntityId, EntityLifecycle, EntitySnapshot, Vec3,
+    AttributeKind, EntityDamageRequest, EntityEffectOperation, EntityEffectRejection,
+    EntityEffectRequest, EntityEffectResult, EntityId, EntityLifecycle, EntitySnapshot, Vec3,
 };
 use mc_physics::Aabb;
+use mc_script::precommit::{HookActor, HookKind, HookPlayer};
 use std::time::Instant;
 
 const VILLAGER_WITNESS_FOLLOW_RANGE_DEFAULT: f64 = 16.0;
@@ -34,6 +42,128 @@ struct ResolvedServerAttackTarget {
     reach_position: Vec3,
     reach_aabb: Aabb,
     dragon_part: Option<DragonPart>,
+}
+
+pub(super) struct DeferredEntityDamage {
+    expected: EntitySnapshot,
+    request: EntityDamageRequest,
+    source: HookActor,
+    kind: &'static str,
+    position: Vec3,
+    attacker_costs: Option<(SessionId, PlayerSurvivalPlan)>,
+    response: Option<SimulationResponseSender>,
+    completion: EntityDamagePrecommitCompletion,
+}
+
+/// Ask the shared damage boundary after a producer has released every native
+/// owner guard.  A `true` result is terminal for that producer's current turn:
+/// the detached continuation owns the frozen CAS image and is the only path
+/// allowed to commit it after the guest answers.
+pub(super) fn defer_entity_damage_precommit(
+    sessions: &SessionRegistry,
+    deferred: DeferredEntityDamage,
+) -> bool {
+    let DeferredEntityDamage {
+        expected,
+        request,
+        source,
+        kind,
+        position,
+        attacker_costs,
+        response,
+        completion,
+    } = deferred;
+    if !sessions
+        .precommit_boundary()
+        .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+    {
+        return false;
+    }
+    let Some(handle) = sessions.damage_precommit_handle().cloned() else {
+        if let Some(response) = response {
+            let _ = response.send(Err(SimulationRequestError::Precommit(
+                mc_script::precommit::HookFailure::Unavailable,
+            )));
+        }
+        return true;
+    };
+    let pending = match begin_entity_damage(
+        sessions,
+        expected.id,
+        source,
+        kind,
+        position,
+        request.amount,
+    ) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return false,
+        Err(error) => {
+            if let Some(response) = response {
+                let _ = response.send(Err(SimulationRequestError::Precommit(error)));
+            }
+            return true;
+        }
+    };
+    handle.spawn_precommit_resume(pending, None, response, move |decision| {
+        SimulationCommand::ResumeEntityDamagePrecommit(Box::new(EntityDamagePrecommitResume {
+            expected,
+            request,
+            attacker_costs,
+            completion,
+            decision,
+        }))
+    });
+    true
+}
+
+fn entity_effect_damage_amount(operation: &EntityEffectOperation) -> Option<(f32, &'static str)> {
+    let EntityEffectOperation::ApplyAction { action, .. } = operation else {
+        return None;
+    };
+    match action {
+        mc_entity::effects_26_1_2::EffectAction::Damage { amount, .. } => Some((*amount, "effect")),
+        mc_entity::effects_26_1_2::EffectAction::MagicDamageIfHealthAbove { amount, .. } => {
+            Some((*amount, "magic"))
+        }
+
+        _ => None,
+    }
+}
+fn replace_entity_effect_damage_amount(request: &mut EntityEffectRequest, amount: f32) -> bool {
+    let EntityEffectOperation::ApplyAction { action, .. } = &mut request.operation else {
+        return false;
+    };
+    match action {
+        mc_entity::effects_26_1_2::EffectAction::Damage {
+            amount: raw_amount, ..
+        }
+        | mc_entity::effects_26_1_2::EffectAction::MagicDamageIfHealthAbove {
+            amount: raw_amount,
+            ..
+        } => {
+            *raw_amount = amount;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn entity_damage_precommit_refusal(
+    completion: &EntityDamagePrecommitCompletion,
+) -> EntityDamagePrecommitResult {
+    match completion {
+        EntityDamagePrecommitCompletion::Direct { .. } => EntityDamagePrecommitResult::Direct,
+        EntityDamagePrecommitCompletion::Script => EntityDamagePrecommitResult::Script(None),
+        EntityDamagePrecommitCompletion::Resident { .. } => {
+            EntityDamagePrecommitResult::Resident(None)
+        }
+        EntityDamagePrecommitCompletion::Effect { .. } => EntityDamagePrecommitResult::Effect(
+            EntityEffectResult::Rejected(EntityEffectRejection::Stale),
+        ),
+        EntityDamagePrecommitCompletion::Projectile(_)
+        | EntityDamagePrecommitCompletion::Explosion(_)
+        | EntityDamagePrecommitCompletion::Golem(_) => EntityDamagePrecommitResult::Projectile,
+    }
 }
 
 fn dragon_part_reach(snapshot: &EntitySnapshot, part: DragonPart) -> Option<(Vec3, Aabb)> {
@@ -284,6 +414,7 @@ impl SessionRegistry {
         expected: Option<EntitySnapshot>,
         entity_id: EntityId,
         request: EntityEffectRequest,
+        response: &mut Option<SimulationResponseSender>,
     ) -> (EntityEffectResult, Vec<VisibilityDispatch>) {
         let mut inner = self.lock_session_entities("apply server entity effect transaction");
         let Some(expected) = expected.or_else(|| inner.entities.snapshot(entity_id)) else {
@@ -292,6 +423,42 @@ impl SessionRegistry {
                 Vec::new(),
             );
         };
+        let damage = entity_effect_damage_amount(&request.operation);
+        if let Some((amount, kind)) = damage
+            && self
+                .precommit_boundary()
+                .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+        {
+            let raw = EntityDamageRequest {
+                amount,
+                tick: inner.entity_lifecycle_tick,
+                death_remove_tick: request.death_remove_tick,
+                villager_gossip_event: None,
+            };
+            let position = expected.position;
+            drop(inner);
+            if defer_entity_damage_precommit(
+                self,
+                DeferredEntityDamage {
+                    expected,
+                    request: raw,
+                    source: HookActor::Environment,
+                    kind,
+                    position,
+                    attacker_costs: None,
+                    response: response.take(),
+                    completion: EntityDamagePrecommitCompletion::Effect {
+                        request: request.clone(),
+                    },
+                },
+            ) {
+                return (
+                    EntityEffectResult::Rejected(EntityEffectRejection::Stale),
+                    Vec::new(),
+                );
+            }
+            unreachable!("a registered damage hook must either defer or refuse an effect");
+        }
         apply_server_entity_effect_request_locked(&mut inner, expected, request)
     }
 
@@ -379,6 +546,51 @@ impl SessionRegistry {
         ) {
             return PlayerAttackResult::ValidationRejected;
         }
+        if self
+            .precommit_boundary()
+            .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+        {
+            let request = EntityDamageRequest {
+                amount,
+                tick: inner.entity_lifecycle_tick,
+                death_remove_tick: inner
+                    .entity_lifecycle_tick
+                    .saturating_add(ENTITY_DEATH_TICKS),
+                villager_gossip_event: None,
+            };
+            let source = attacker
+                .zip(attacker_uuid)
+                .and_then(|((session, _), uuid)| HookPlayer::try_new(uuid, session).ok())
+                .map(HookActor::Player)
+                .unwrap_or(HookActor::Environment);
+            let deferred_costs = attacker.map(|(session, costs)| (session, costs.clone()));
+            let deferred_target = target.clone();
+            let attacker_session = attacker.map(|(session, _)| session);
+            drop(attacker_state);
+            drop(inner);
+            if defer_entity_damage_precommit(
+                self,
+                DeferredEntityDamage {
+                    expected: deferred_target.clone(),
+                    request,
+                    source,
+                    kind: "player-attack",
+                    position: deferred_target.position,
+                    attacker_costs: deferred_costs,
+                    response: None,
+                    completion: EntityDamagePrecommitCompletion::Direct {
+                        entity_id,
+                        game_mode,
+                        player_pose,
+                        attacker_session,
+                        dragon_part,
+                    },
+                },
+            ) {
+                return PlayerAttackResult::AcceptedNoDamage;
+            }
+            unreachable!("a registered damage hook must either defer or refuse the attack");
+        }
         let gossip_event =
             (target.type_name == "minecraft:villager")
                 .then_some(attacker_uuid)
@@ -440,13 +652,360 @@ impl SessionRegistry {
         self.append_spawned_xp_pickup_candidates(outcome.dispatches_mut());
         PlayerAttackResult::Damaged(Box::new(outcome))
     }
+    pub(in crate::play) fn resume_entity_damage_precommit(
+        &self,
+        _authority: &SimulationAuthority,
+        resume: EntityDamagePrecommitResume,
+    ) -> (EntityDamagePrecommitResult, Vec<VisibilityDispatch>) {
+        let EntityDamagePrecommitResume {
+            expected,
+            mut request,
+            attacker_costs,
+            completion,
+            decision,
+        } = resume;
+        if let EntityDamagePrecommitCompletion::Projectile(continuation) = completion {
+            let dispatches = super::projectiles::resume_projectile_entity_damage_precommit(
+                self,
+                continuation,
+                request,
+                decision,
+            );
+            return (EntityDamagePrecommitResult::Projectile, dispatches);
+        }
+        if let EntityDamagePrecommitCompletion::Explosion(continuation) = completion {
+            let dispatches = super::explosion_authority::resume_explosion_entity_damage_precommit(
+                self,
+                expected,
+                request,
+                decision,
+                continuation,
+            );
+            return (EntityDamagePrecommitResult::Projectile, dispatches);
+        }
+        if let EntityDamagePrecommitCompletion::Golem(continuation) = completion {
+            let dispatches = super::village_defense::resume_golem_entity_damage_precommit(
+                self,
+                expected,
+                request,
+                decision,
+                continuation,
+            );
+            return (EntityDamagePrecommitResult::Projectile, dispatches);
+        }
+        let Ok(mut approval) = decision else {
+            return (entity_damage_precommit_refusal(&completion), Vec::new());
+        };
+        request.amount = match approval.decision() {
+            mc_script::precommit::HookDecision::Keep => request.amount,
+            mc_script::precommit::HookDecision::Replace(amount)
+                if amount.is_finite() && amount > 0.0 =>
+            {
+                amount
+            }
+            mc_script::precommit::HookDecision::Cancel
+            | mc_script::precommit::HookDecision::Replace(_)
+            | _ => {
+                return (entity_damage_precommit_refusal(&completion), Vec::new());
+            }
+        };
+        if let EntityDamagePrecommitCompletion::Direct {
+            entity_id,
+            game_mode,
+            player_pose,
+            attacker_session,
+            dragon_part,
+        } = completion
+        {
+            let mut inner = self.lock_session_entities("resume player attack server entity");
+            let Some(ResolvedServerAttackTarget {
+                snapshot: target,
+                reach_position,
+                reach_aabb,
+                dragon_part: current_dragon_part,
+            }) = resolve_server_attack_target_locked(&inner, entity_id)
+            else {
+                return (EntityDamagePrecommitResult::Direct, Vec::new());
+            };
+            if target != expected
+                || target.item_stack.is_some()
+                || current_dragon_part != dragon_part
+            {
+                return (EntityDamagePrecommitResult::Direct, Vec::new());
+            }
+            if attacker_costs
+                .as_ref()
+                .is_some_and(|(session, _)| Some(*session) != attacker_session)
+            {
+                return (EntityDamagePrecommitResult::Direct, Vec::new());
+            }
+            let attacker_persistence = attacker_session
+                .and_then(|session| inner.player_persistence.get(&session).cloned());
+            let (attacker_uuid, mut attacker_state) = if let Some(attacker_session) =
+                attacker_session
+            {
+                let Some(session) = inner.sessions.get(&attacker_session) else {
+                    return (EntityDamagePrecommitResult::Direct, Vec::new());
+                };
+                if session.pose != player_pose {
+                    return (EntityDamagePrecommitResult::Direct, Vec::new());
+                }
+                let Some(persistence) = attacker_persistence.as_ref() else {
+                    return (EntityDamagePrecommitResult::Direct, Vec::new());
+                };
+                let wait_started = Instant::now();
+                let state =
+                    lock_authoritative_mutex(persistence.as_ref(), "session_player_persistence");
+                let state = crate::lock_metrics::timed_guard(
+                    crate::lock_metrics::LockMetricKind::PlayerPersistence,
+                    "resume player attack server entity",
+                    wait_started,
+                    state,
+                );
+                if state.game_mode != game_mode
+                    || state.game_mode == GameMode::Spectator
+                    || state.survival.is_dead()
+                    || attacker_costs
+                        .as_ref()
+                        .is_some_and(|(_, costs)| !player_attack_cost_plan_matches(&state, costs))
+                {
+                    return (EntityDamagePrecommitResult::Direct, Vec::new());
+                }
+                (Some(session.uuid), Some(state))
+            } else {
+                (None, None)
+            };
+            let attack_range = attacker_state
+                .as_deref()
+                .and_then(|state| held_attack_range(&inner.player_combat, state));
+            if game_mode == GameMode::Spectator
+                || !within_entity_attack_reach(
+                    player_pose,
+                    reach_position,
+                    reach_aabb,
+                    game_mode,
+                    attack_range,
+                )
+                || approval.consume().is_err()
+            {
+                return (EntityDamagePrecommitResult::Direct, Vec::new());
+            }
+            let rewards = entity_kill_rewards_locked(&inner, &target);
+            let knockback_origin = (game_mode == GameMode::Survival).then_some(Vec3::new(
+                player_pose.x,
+                player_pose.y,
+                player_pose.z,
+            ));
+            let gossip_event = (target.type_name == "minecraft:villager")
+                .then_some(attacker_uuid)
+                .flatten()
+                .map(|player| {
+                    mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player }
+                });
+            let outcome = if let Some(part) = dragon_part {
+                attack_dragon_part_locked(&mut inner, target, part, request.amount)
+            } else {
+                attack_server_entity_locked(
+                    &mut inner,
+                    target.id,
+                    request.amount,
+                    knockback_origin,
+                    &rewards,
+                    gossip_event,
+                )
+            };
+            let Some(mut outcome) = outcome else {
+                return (EntityDamagePrecommitResult::Direct, Vec::new());
+            };
+            let committed_attacker = attacker_costs.as_ref().zip(attacker_state.as_mut()).map(
+                |((attacker_session, costs), attacker_state)| {
+                    let mut effective = costs.clone();
+                    effective.expected_survival = attacker_state.survival;
+                    effective.updated_survival.health = attacker_state.survival.health;
+                    let committed = apply_player_survival_plan_locked(
+                        &mut inner,
+                        *attacker_session,
+                        attacker_state,
+                        &effective,
+                    );
+                    CommittedPlayerAttackCosts {
+                        survival: committed.survival,
+                        inventory: committed.inventory,
+                    }
+                },
+            );
+            match &mut outcome {
+                EntityAttackOutcome::Damaged { attacker_costs, .. }
+                | EntityAttackOutcome::Killed { attacker_costs, .. } => {
+                    *attacker_costs = committed_attacker;
+                }
+                EntityAttackOutcome::PlayerDamaged { .. } => unreachable!("server entity outcome"),
+            }
+            if let (Some(attacker_session), EntityAttackOutcome::Killed { entity, .. }) =
+                (attacker_session, &outcome)
+            {
+                push_player_entity_killed_event_locked(
+                    &inner,
+                    attacker_session,
+                    game_mode,
+                    player_pose,
+                    entity,
+                );
+            }
+            let mut dispatches = std::mem::take(outcome.dispatches_mut());
+            drop(attacker_state);
+            drop(inner);
+            self.append_spawned_xp_pickup_candidates(&mut dispatches);
+            return (EntityDamagePrecommitResult::Direct, dispatches);
+        }
+        if let EntityDamagePrecommitCompletion::Effect {
+            request: mut effect_request,
+        } = completion
+        {
+            if !replace_entity_effect_damage_amount(&mut effect_request, request.amount) {
+                return (
+                    EntityDamagePrecommitResult::Effect(EntityEffectResult::Rejected(
+                        EntityEffectRejection::InvalidAction,
+                    )),
+                    Vec::new(),
+                );
+            }
+            let mut inner = self.lock_session_entities("resume entity effect damage precommit");
+            if inner.entities.snapshot(expected.id).as_ref() != Some(&expected)
+                || approval.consume().is_err()
+            {
+                return (
+                    EntityDamagePrecommitResult::Effect(EntityEffectResult::Rejected(
+                        EntityEffectRejection::Stale,
+                    )),
+                    Vec::new(),
+                );
+            }
+            let (result, dispatches) =
+                apply_server_entity_effect_request_locked(&mut inner, expected, effect_request);
+            return (EntityDamagePrecommitResult::Effect(result), dispatches);
+        }
+        let mut inner = self.lock_session_entities("resume entity damage precommit");
+        let attacker_persistence = attacker_costs
+            .as_ref()
+            .and_then(|(session, _)| inner.player_persistence.get(session).cloned());
+        let mut attacker_state = if let Some((attacker_session, costs)) = attacker_costs.as_ref() {
+            let Some(persistence) = attacker_persistence.as_ref() else {
+                return (entity_damage_precommit_refusal(&completion), Vec::new());
+            };
+            let wait_started = Instant::now();
+            let state = lock_authoritative_mutex(persistence, "session_player_persistence");
+            let state = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::PlayerPersistence,
+                "resume server-entity attack costs",
+                wait_started,
+                state,
+            );
+            if !player_attack_cost_plan_matches(&state, costs) || state.survival.is_dead() {
+                return (entity_damage_precommit_refusal(&completion), Vec::new());
+            }
+            Some((*attacker_session, costs, state))
+        } else {
+            None
+        };
+        if inner.entities.snapshot(expected.id).as_ref() != Some(&expected)
+            || approval.consume().is_err()
+        {
+            return (entity_damage_precommit_refusal(&completion), Vec::new());
+        }
+        let Some(damage) = inner.entities.damage_if_current(expected, request) else {
+            return (entity_damage_precommit_refusal(&completion), Vec::new());
+        };
+        if let Some((attacker_session, costs, state)) = attacker_state.as_mut() {
+            let mut effective = (*costs).clone();
+            effective.expected_survival = state.survival;
+            effective.updated_survival.health = state.survival.health;
+            let _ =
+                apply_player_survival_plan_locked(&mut inner, *attacker_session, state, &effective);
+        }
+        let mut dispatches = publish_accepted_entity_health_locked(&mut inner, &damage.snapshot);
+        if damage.killed {
+            let rewards = entity_kill_rewards_locked(&inner, &damage.snapshot);
+            let (_, mut death_dispatches) =
+                begin_server_entity_death_locked(&mut inner, &damage, &rewards);
+            death_dispatches.splice(0..0, dispatches);
+            dispatches = death_dispatches;
+        } else {
+            dispatches.extend(entity_hurt_dispatches_locked(&inner, damage.snapshot.id));
+        }
+        let result = match completion {
+            EntityDamagePrecommitCompletion::Script => {
+                EntityDamagePrecommitResult::Script(Some((damage.snapshot.health, damage.killed)))
+            }
+            EntityDamagePrecommitCompletion::Resident { prior_health } => {
+                EntityDamagePrecommitResult::Resident(Some(super::resident_orders::ResidentHit {
+                    damage: (prior_health - damage.snapshot.health).max(0.0),
+                    killed: damage.killed,
+                }))
+            }
+            EntityDamagePrecommitCompletion::Direct { .. }
+            | EntityDamagePrecommitCompletion::Effect { .. }
+            | EntityDamagePrecommitCompletion::Projectile(_)
+            | EntityDamagePrecommitCompletion::Explosion(_)
+            | EntityDamagePrecommitCompletion::Golem(_) => unreachable!(),
+        };
+        drop(attacker_state);
+        drop(inner);
+        self.append_spawned_xp_pickup_candidates(&mut dispatches);
+        (result, dispatches)
+    }
 
     pub(in crate::play) fn damage_script_entity(
         &self,
         _authority: &SimulationAuthority,
         entity_id: EntityId,
         amount: f32,
+        plugin_id: &str,
+        response: &mut Option<SimulationResponseSender>,
     ) -> Option<EntityAttackOutcome> {
+        if self
+            .precommit_boundary()
+            .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+        {
+            let (expected, request) = {
+                let inner = self.lock_session_entities("freeze script entity damage");
+                let expected = inner.entities.snapshot(entity_id)?;
+                if expected.item_stack.is_some()
+                    || server_entity_snapshot_from(expected.clone())
+                        .health
+                        .is_none()
+                {
+                    return None;
+                }
+                (
+                    expected,
+                    EntityDamageRequest {
+                        amount,
+                        tick: inner.entity_lifecycle_tick,
+                        death_remove_tick: inner
+                            .entity_lifecycle_tick
+                            .saturating_add(ENTITY_DEATH_TICKS),
+                        villager_gossip_event: None,
+                    },
+                )
+            };
+            if defer_entity_damage_precommit(
+                self,
+                DeferredEntityDamage {
+                    expected: expected.clone(),
+                    request,
+                    source: HookActor::Plugin(plugin_id.to_owned()),
+                    kind: "script",
+                    position: expected.position,
+                    attacker_costs: None,
+                    response: response.take(),
+                    completion: EntityDamagePrecommitCompletion::Script,
+                },
+            ) {
+                return None;
+            }
+            unreachable!("a registered damage hook must either defer or refuse script damage");
+        }
         let mut outcome = {
             let mut inner = self.lock_session_entities("damage script entity");
             let expected = inner.entities.snapshot(entity_id)?;
@@ -462,6 +1021,78 @@ impl SessionRegistry {
         };
         self.append_spawned_xp_pickup_candidates(outcome.dispatches_mut());
         Some(outcome)
+    }
+
+    pub(in crate::play) fn damage_resident_entity(
+        &self,
+        _authority: &SimulationAuthority,
+        attack: super::resident_orders::ResidentAttack,
+        plugin_id: &str,
+        response: &mut Option<SimulationResponseSender>,
+    ) -> Option<super::resident_orders::ResidentHit> {
+        if self
+            .precommit_boundary()
+            .is_some_and(|boundary| boundary.has_precommit_hooks(HookKind::Damage))
+        {
+            let tick = self.simulation_tick();
+            let request = EntityDamageRequest {
+                amount: attack.amount,
+                tick,
+                death_remove_tick: tick.saturating_add(ENTITY_DEATH_TICKS),
+                villager_gossip_event: None,
+            };
+            if defer_entity_damage_precommit(
+                self,
+                DeferredEntityDamage {
+                    expected: attack.expected.clone(),
+                    request,
+                    source: HookActor::Plugin(plugin_id.to_owned()),
+                    kind: "resident",
+                    position: attack.expected.position,
+                    attacker_costs: None,
+                    response: response.take(),
+                    completion: EntityDamagePrecommitCompletion::Resident {
+                        prior_health: attack.expected.health.max(0.0),
+                    },
+                },
+            ) {
+                return None;
+            }
+            unreachable!("a registered damage hook must defer or refuse resident damage");
+        }
+        let mut inner = self.lock_session_entities("damage resident entity");
+        if inner.entities.snapshot(attack.expected.id).as_ref() != Some(&attack.expected) {
+            return None;
+        }
+        let request = EntityDamageRequest {
+            amount: attack.amount,
+            tick: inner.entity_lifecycle_tick,
+            death_remove_tick: inner
+                .entity_lifecycle_tick
+                .saturating_add(ENTITY_DEATH_TICKS),
+            villager_gossip_event: None,
+        };
+        let damage = inner
+            .entities
+            .damage_if_current(attack.expected.clone(), request)?;
+        let mut dispatches = publish_accepted_entity_health_locked(&mut inner, &damage.snapshot);
+        if damage.killed {
+            let rewards = entity_kill_rewards_locked(&inner, &damage.snapshot);
+            let (_, mut death_dispatches) =
+                begin_server_entity_death_locked(&mut inner, &damage, &rewards);
+            death_dispatches.splice(0..0, dispatches);
+            dispatches = death_dispatches;
+        } else {
+            dispatches.extend(entity_hurt_dispatches_locked(&inner, damage.snapshot.id));
+        }
+        drop(inner);
+        self.append_spawned_xp_pickup_candidates(&mut dispatches);
+        let hit = super::resident_orders::ResidentHit {
+            damage: (attack.expected.health.max(0.0) - damage.snapshot.health).max(0.0),
+            killed: damage.killed,
+        };
+        super::dispatch_visibility_commands(dispatches);
+        Some(hit)
     }
 
     #[cfg(test)]

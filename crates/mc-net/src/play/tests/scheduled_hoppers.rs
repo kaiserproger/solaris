@@ -640,6 +640,8 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
         loot: Arc::new(mc_data::loot::LootTables::default()),
+        script_storage: None,
+        world_dimension: "minecraft:overworld".to_owned(),
         script_zones: None,
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,

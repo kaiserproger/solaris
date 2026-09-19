@@ -33,10 +33,11 @@ async fn admitted_player_teleport_is_capability_gated_and_builds_targeted_result
     );
     assert!(denied.commands().is_empty());
 
-    let manifest = ScriptPluginManifest::new("warps", "Warps", "0.1.0", SCRIPT_API_VERSION)
-        .declare_player_teleport()
-        .validate()
-        .unwrap();
+    let manifest =
+        ScriptPluginManifest::new("warps", "Warps", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_player_teleport()
+            .validate()
+            .unwrap();
     let admission = HostCommandAdmission::from_manifest(&manifest);
     let (boundary, endpoint) =
         script_boundary_pair(NonZeroUsize::new(1).unwrap(), NonZeroUsize::new(1).unwrap());

@@ -59,6 +59,7 @@ fn merchant(emerald: u32, axe: u32) -> VillagerMerchantState {
 
 fn unchanged_attack_plan(state: &PlayerPersistedState) -> PlayerSurvivalPlan {
     PlayerSurvivalPlan {
+        hook_approval: None,
         expected_survival: state.survival,
         updated_survival: state.survival,
         expected_inventory: state.inventory.clone(),

@@ -1,0 +1,568 @@
+// Settlement sites, resident-site reservations, terrain surveys and durable
+// structures: the values the settlement owner describes and the calls the used
+// settlement flows make against it.
+//
+// A site is territory core already laid out or generated: the authored catalog a
+// deployed package ships, or a vanilla village the world's own generator places.
+// A plugin never authors a site here - it lists, queries and reserves against
+// the ones core describes - and every identifier in this file is validated by the
+// server's own DTO, so holding one never proves a right to the object it names.
+//
+// One identity rule spans the family: `settlement-site.inhabitant-generation-ids`
+// are authored generation ids for an authored site and entity UUIDs for a
+// generated village, exactly as the server's own validator separates them. A
+// structure is durable: `prepare` plans it, `advance` commits bounded portions of
+// one stage and answers the portion's own receipt, `pause`, `resume`, and
+// `cancel` change its state, and `status` reads it back, so a plugin recovers
+// by reading instead of re-deriving.
+//
+// Every mutation carries a plugin-chosen `operation-id`; a query does not, because
+// a query changes nothing and creates no receipt, and its answer's `operation-id`
+// is absent rather than invented. The answer arrives later as
+// `events.operation-answered`, carrying the `settlement-result` this interface
+// names. The host converts the record into the server's own `mc_script` DTO, that
+// DTO's validator re-checks every bound and canonicalizes every unordered set, and
+// the server's own settlement owner performs the call - never a coordinator of
+// this contract.
+interface settlements {
+    /// One integer block coordinate.
+    ///
+    /// Settlement coordinates are integer block coordinates, never a continuous
+    /// position: the server's own `mc_script::ScriptBlockPosition` bounds every
+    /// coordinate to `|x|`, `|y|`, `|z|` at most
+    /// `mc_script::MAX_SCRIPT_BLOCK_COORDINATE` (30 000 000), and the footprints
+    /// and survey bounds this file declares carry their own, smaller extents. A
+    /// value outside a bound is the plugin's own malformed answer and is refused,
+    /// never clamped.
+    record block-position {
+        x: s32,
+        y: s32,
+        z: s32,
+    }
+
+    /// Settlement size class selected by deterministic worldgen.
+    enum site-variant {
+        hamlet,
+        village,
+        town,
+    }
+
+    /// Authored point-of-interest role.
+    enum site-poi-kind {
+        home,
+        work,
+        meeting,
+        guard,
+    }
+
+    /// Who authored the settlement a site describes.
+    ///
+    /// An authored site is one the settlement owner laid out from its own
+    /// authoring catalog; a generated one is a vanilla village core generated.
+    /// The two carry the same description, and the provenance is what makes an
+    /// inhabitant identity a generation id or an entity UUID, so a caller never
+    /// has to guess which it is holding.
+    enum site-provenance {
+        authored,
+        vanilla-village,
+    }
+
+    /// Occupancy state of one settlement point of interest.
+    enum site-poi-state {
+        free,
+        reserved,
+        occupied,
+    }
+
+    /// Why a plugin requested a survey of one bounded region.
+    enum survey-purpose {
+        settlement,
+        expansion,
+        restoration,
+    }
+
+    /// Whether the surveyed chunks are currently loaded.
+    enum chunk-availability {
+        loaded,
+        unloaded,
+    }
+
+    /// Durable lifecycle state of one structure.
+    enum structure-state {
+        prepared,
+        running,
+        paused,
+        committed,
+        cancelled,
+    }
+
+    /// One blueprint placement inside a settlement site.
+    record settlement-building {
+        /// 1..`mc_script::MAX_BLUEPRINT_ID_BYTES` (64) bytes and a contract
+        /// resource id.
+        blueprint-id: string,
+        origin: block-position,
+        /// One of 0, 90, 180 or 270 quarter degrees, as the server's own quarter
+        /// turn validator admits; any other value is refused.
+        rotation: u16,
+    }
+
+    /// One point of interest resolved against a settled site.
+    record settlement-poi {
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        poi-id: string,
+        kind: site-poi-kind,
+        at: block-position,
+        capacity: u16,
+        state: site-poi-state,
+    }
+
+    /// One fully described settlement site.
+    ///
+    /// `contents-known` is whether the point-of-interest and inhabitant lists are
+    /// the site's contents. An authored site always describes its own layout, and
+    /// a generated village describes itself once core can read its chunks. Until
+    /// then the two lists are empty because the contents are *unknown*, not because
+    /// the village holds nothing: a caller must not read an ungenerated village as
+    /// an empty one.
+    ///
+    /// Bounds: `site-id` is 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes;
+    /// `revision` is at most `mc_script::MAX_SCRIPT_WORLD_TIME`; `buildings` holds
+    /// at most `mc_script::MAX_SETTLEMENT_PLACEMENTS` (128) entries, `pois` at most
+    /// `mc_script::MAX_SETTLEMENT_POIS` (128) with pairwise distinct ids, and
+    /// `inhabitant-generation-ids` at most `mc_script::MAX_SETTLEMENT_RESIDENTS`
+    /// (80) with no repeat; the footprint axes are 1..`MAX_SETTLEMENT_SITE_AXIS`
+    /// (256) each. The buildings, points of interest and inhabitants arrive in the
+    /// site's own canonical order - sorted by blueprint id and origin, by point-of-
+    /// interest id, and by identity - so equal sites compare equal on the wire.
+    record settlement-site {
+        site-id: string,
+        provenance: site-provenance,
+        %variant: site-variant,
+        revision: u64,
+        contents-known: bool,
+        footprint-origin: block-position,
+        footprint-size: block-position,
+        buildings: list<settlement-building>,
+        pois: list<settlement-poi>,
+        inhabitant-generation-ids: list<string>,
+    }
+
+    /// One bounded page of settlement sites.
+    ///
+    /// `cursor` is absent only when the page carries no cursor at all; a walk the
+    /// owner can continue names the next cell to read, and a later `list-sites` or
+    /// `query-site` names it back rather than recomputing it. A cursor the owner
+    /// cannot parse is answered `cursor-expired`, never silently restarted from the
+    /// first page.
+    record settlement-site-page {
+        sites: list<settlement-site>,
+        cursor: option<string>,
+    }
+
+    /// Inclusive axis-aligned survey bounds.
+    ///
+    /// Each axis extent is 1..`mc_script::MAX_SURVEY_BOUNDS_AXIS` (128) columns;
+    /// a non-positive or oversized extent is refused before the world is read.
+    record survey-bounds {
+        min: block-position,
+        max: block-position,
+    }
+
+    /// One bounded, core-owned terrain survey snapshot.
+    ///
+    /// The snapshot carries the aggregate reading of the surveyed columns, never
+    /// one record per column: `usable-plots` and `water-columns` partition the
+    /// columns the survey read, `claimed` is whether another plugin's zone already
+    /// covers the region, and `existing-structures` counts what core already holds
+    /// there. `survey-token` is the opaque token a later `prepare-structure` names,
+    /// and it is core's own: a plugin never mints one.
+    ///
+    /// Bounds: `dimension` is a contract resource id; `revision` and the token are
+    /// bounded as `mc_script` bounds them - the token is
+    /// 1..`mc_script::MAX_SURVEY_TOKEN_BYTES` (64) bytes - `usable-plots` plus
+    /// `water-columns` never exceeds the number of surveyed columns, and each tag
+    /// list holds at most `mc_script::MAX_SURVEY_TAGS` (32) nonempty entries.
+    record survey-snapshot {
+        dimension: string,
+        bounds: survey-bounds,
+        revision: u64,
+        chunk-availability: chunk-availability,
+        survey-token: string,
+        usable-plots: u32,
+        water-columns: u32,
+        claimed: bool,
+        existing-structures: u32,
+        biome-tags: list<string>,
+        resource-tags: list<string>,
+    }
+
+    /// One durable resident reservation against a settled site point of interest.
+    ///
+    /// `spawn-site-token` is core's own opaque token, and it is what a
+    /// `spawn-resident` call names to consume the reservation and what
+    /// `release-resident-site` names to hand it back.
+    record resident-site-reservation {
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        site-id: string,
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        poi-id: string,
+        /// 1..`mc_script::MAX_RESIDENT_SPAWN_TOKEN_BYTES` (64) bytes.
+        spawn-site-token: string,
+        revision: u64,
+    }
+
+    /// One bounded resource requirement of a structure.
+    record structure-material {
+        /// A contract resource id.
+        %resource: string,
+        /// 1..`mc_script::MAX_SCRIPT_WORLD_TIME`.
+        quantity: u64,
+    }
+
+    /// One authored stage plan for a structure.
+    record structure-stage-plan {
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        stage: string,
+        block-count: u32,
+        /// 1..`mc_script::MAX_SCRIPT_WORLD_TIME`.
+        work-units: u64,
+        /// At most `mc_script::MAX_STRUCTURE_RESOURCE_TYPES` (16) entries, each
+        /// resource named once.
+        materials: list<structure-material>,
+    }
+
+    /// One committed portion receipt of a structure.
+    ///
+    /// The receipt is what `advance-structure` answers with: it names the stage
+    /// and the sequence the portion was committed at, how many blocks and work
+    /// units it covered, what it consumed, and the structure revision the commit
+    /// left behind.
+    record structure-receipt {
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        stage: string,
+        /// At most `mc_script::MAX_SCRIPT_WORLD_TIME`.
+        sequence: u64,
+        block-count: u32,
+        /// 1..`mc_script::MAX_WORLD_COMMIT_PORTION` (512).
+        work-units: u64,
+        consumed: list<structure-material>,
+        revision: u64,
+    }
+
+    /// One bounded, core-owned structure snapshot.
+    ///
+    /// `stages` is the authored plan in order, `watermark` counts the portions
+    /// committed so far, `consumed` and `remaining` are the material plan's two
+    /// halves, and `reservation-ref` is the inventory reservation the structure is
+    /// bound to, when it has one. `pause-reason` is present only for a structure the
+    /// owner paused because the site it was planned against changed.
+    ///
+    /// Bounds: the two ids are 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes,
+    /// `site-id` 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes and the blueprint id
+    /// 1..`mc_script::MAX_BLUEPRINT_ID_BYTES` (64) bytes; `rotation` is a quarter
+    /// turn; `reserved-footprint` axes are 1..`MAX_BLUEPRINT_FOOTPRINT_AXIS` (64)
+    /// each; `stages` holds at most `mc_script::MAX_STRUCTURE_STAGES` (32) entries
+    /// with distinct stage names; `resource-plan-hash` is exactly 64 lowercase
+    /// hexadecimal bytes; `reservation-ref` is 1..64 bytes; and a pause reason is
+    /// 1..64 bytes.
+    record structure-snapshot {
+        structure-id: string,
+        blueprint-id: string,
+        site-id: string,
+        state: structure-state,
+        revision: u64,
+        origin: block-position,
+        rotation: u16,
+        reserved-footprint: block-position,
+        stages: list<structure-stage-plan>,
+        resource-plan-hash: string,
+        reservation-ref: option<string>,
+        watermark: u64,
+        consumed: list<structure-material>,
+        remaining: list<structure-material>,
+        pause-reason: option<string>,
+    }
+
+    /// The core-authenticated origin of one bound warehouse container.
+    ///
+    /// The opaque handle never carries a plugin-selected coordinate. An authored
+    /// source names a frozen blueprint seed ordinal; a village source names the
+    /// generator-authenticated site and its canonical materialized ordinal. Core
+    /// resolves the latter to one immutable position before it binds.
+    variant warehouse-source {
+        authored(authored-warehouse-source),
+        vanilla-village(village-warehouse-source),
+    }
+
+    /// One authored container selected by its blueprint seed ordinal.
+    record authored-warehouse-source {
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+        container-id: u32,
+    }
+
+    /// One materialized container selected by its ordinal in a generated village.
+    ///
+    /// `site-id` is the generator-authenticated village identity and
+    /// `container-id` is its canonical ordinal among that site's materialized
+    /// containers. The position is deliberately absent: core resolves and retains
+    /// it before minting the opaque handle.
+    record village-warehouse-source {
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        site-id: string,
+        container-id: u32,
+    }
+
+    /// One core-issued opaque warehouse binding.
+    record warehouse-binding {
+        /// 1..`mc_script::MAX_WAREHOUSE_HANDLE_BYTES` (128) bytes.
+        handle: string,
+        source: warehouse-source,
+        revision: u64,
+    }
+
+    /// One bounded page of settlement sites, read from `cursor` or from the start.
+    ///
+    /// A query: it carries no durable operation id and changes nothing.
+    record list-sites {
+        /// A cursor a previous page answered with, 1..64 bytes when present.
+        cursor: option<string>,
+        /// How many sites the caller wants at most, 1..64.
+        limit: u8,
+    }
+
+    /// One bounded read of one site's own points of interest.
+    ///
+    /// A query: it carries no durable operation id and changes nothing. The page
+    /// is a contiguous slice of the site's canonical point-of-interest order, and
+    /// `cursor` names the last id the caller received. A cursor the site does not
+    /// hold is answered `cursor-expired` rather than silently restarting.
+    record query-site {
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        site-id: string,
+        /// A point-of-interest id a previous page answered with, when continuing.
+        cursor: option<string>,
+        /// How many points of interest the caller wants at most, 1..64.
+        limit: u8,
+    }
+
+    /// One durable reservation of one free home point of interest.
+    ///
+    /// `expected-site-revision` is the revision the caller read with `list-sites`
+    /// or `query-site`, or zero when the site holds no durable reservation state
+    /// yet: a reservation against a revision the site has moved past is refused
+    /// `stale-revision`, never made against the wrong image. A point of interest
+    /// that is already reserved or occupied is refused `blocked`, and one whose
+    /// role is not `home` is refused the same way.
+    record reserve-resident-site {
+        /// The durable operation id, 1..64 bytes. Repeating it with byte-identical
+        /// content replays the recorded receipt, and reusing it for different
+        /// content is refused `operation-conflict`.
+        operation-id: string,
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        site-id: string,
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        poi-id: string,
+        expected-site-revision: u64,
+    }
+
+    /// One hand-back of a reservation the caller still holds.
+    ///
+    /// A reservation consumed by a spawn can never be handed back - releasing it
+    /// would make an occupied home reservable again - so that answer is `blocked`.
+    /// A token the settlement owner does not hold is `not-found`, and one another
+    /// plugin holds is `forbidden`; a release of a reservation already released is
+    /// `not-found` rather than a second effect.
+    record release-resident-site {
+        /// The durable operation id, 1..64 bytes, as in `reserve-resident-site`.
+        operation-id: string,
+        /// 1..`mc_script::MAX_RESIDENT_SPAWN_TOKEN_BYTES` (64) bytes.
+        spawn-site-token: string,
+    }
+
+    /// One bounded terrain survey of one region.
+    ///
+    /// A query in the sense that it decides no durable structure: it mints the
+    /// opaque survey token a later `prepare-structure` names, which is why it has
+    /// no operation id. A region whose chunks are not loaded is answered `unloaded`
+    /// rather than with an empty survey, and a dimension the profile does not own
+    /// is answered `runtime-unavailable`.
+    record survey {
+        dimension: string,
+        bounds: survey-bounds,
+        purpose: survey-purpose,
+    }
+
+    /// One plan of one structure against one authored blueprint.
+    ///
+    /// The anchor is the structure's own base row. The owner refuses a placement
+    /// whose footprint blocks are not all loaded (`unloaded`, never a shortened
+    /// plan) or whose terrain rises above that row (`blocked`), so a structure is
+    /// never planned where it would overwrite what is already there. The survey
+    /// token must be the caller's own and unexpired: an expired token, one whose
+    /// region changed since it was read, or one whose site revision moved is
+    /// refused `stale-revision`; a foreign token is `forbidden` and one the owner
+    /// does not hold is `not-found`.
+    record prepare-structure {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_BLUEPRINT_ID_BYTES` (64) bytes and a contract
+        /// resource id; a blueprint the deployment's catalog does not hold is
+        /// `not-found`.
+        blueprint-id: string,
+        anchor: block-position,
+        /// One of 0, 90, 180 or 270.
+        rotation: u16,
+        /// 1..`mc_script::MAX_SURVEY_TOKEN_BYTES` (64) bytes.
+        survey-token: string,
+        expected-site-revision: u64,
+    }
+
+    /// One bounded work portion of one stage of a structure.
+    ///
+    /// The owner commits at most `mc_script::MAX_WORLD_COMMIT_PORTION` (512) work
+    /// units and at most what the named stage can still commit; the answer is the
+    /// portion's own `structure-receipt`. `reservation-ref` is the inventory
+    /// reservation the portion spends from: one the owner does not hold is
+    /// `not-found`, a released one, one bound to another structure, or one whose
+    /// resource plan does not match the structure's is `blocked`, and a portion the
+    /// reservation cannot cover is `insufficient-items`. A structure the site
+    /// changed under is paused by the owner instead of committed, and that
+    /// `structure-snapshot` is the answer.
+    record advance-structure {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes; it must be the
+        /// structure's own next stage.
+        stage: string,
+        /// 1..64 bytes.
+        reservation-ref: string,
+        /// The revision the caller last read; a moved revision is `stale-revision`.
+        expected-revision: u64,
+        /// 1..`mc_script::MAX_WORLD_COMMIT_PORTION` (512).
+        work-units: u64,
+    }
+
+    /// One pause of an active structure.
+    ///
+    /// The owner records the paused state and, when the site the structure was
+    /// planned against changed, the reason it paused; the answer is the resulting
+    /// `structure-snapshot`.
+    record pause-structure {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+        expected-revision: u64,
+    }
+
+    /// Resume one paused structure whose authoritative footprint still matches its
+    /// last accepted portion.
+    ///
+    /// The owner refuses a changed or unavailable footprint rather than treating
+    /// a resume as authority to overwrite it. A successful resume preserves the
+    /// reservation and every committed portion, then answers the resulting
+    /// `structure-snapshot`.
+    record resume-structure {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+        expected-revision: u64,
+    }
+
+    /// One cancellation of an active structure.
+    ///
+    /// Cancelling preserves what was already built - it stops future portions - and
+    /// a structure that is already committed or cancelled is refused `blocked`.
+    record cancel-structure {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+        expected-revision: u64,
+    }
+
+    /// One read of one durable structure.
+    ///
+    /// A query: it carries no durable operation id and changes nothing. An id the
+    /// owner does not hold is `not-found`, and one another plugin owns is
+    /// `forbidden` rather than an empty snapshot.
+    record structure-status {
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+    }
+
+    /// One bind of one authored container of an active structure.
+    ///
+    /// The caller names the structure and the authored container ordinal and core
+    /// mints the handle; a container already bound to the same plugin answers its
+    /// original handle and revision, and one bound to another plugin is
+    /// `forbidden`. An unplaced structure is `blocked`, a container whose chunk is
+    /// not loaded is `unloaded`, and one with no container at the placed position
+    /// is `not-found` - never an empty container.
+    record bind-warehouse {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        structure-id: string,
+        /// The authored `empty_container` seed ordinal inside the structure's
+        /// blueprint, in authored order.
+        container-id: u32,
+    }
+
+    /// Bind one materialized container from one generator-authenticated village.
+    ///
+    /// The caller names only the stable village site identity and the container's
+    /// canonical ordinal; core re-derives the village from the world identity,
+    /// dimension and start chunk, then resolves the exact bounded position before
+    /// it mints the normal opaque warehouse handle.
+    record bind-village-warehouse {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes.
+        site-id: string,
+        /// Canonical ordinal among this site's materialized containers.
+        container-id: u32,
+    }
+
+
+    /// One settlement call inside the durable operation envelope.
+    variant settlement-operation {
+        list-sites(list-sites),
+        query-site(query-site),
+        reserve-resident-site(reserve-resident-site),
+        release-resident-site(release-resident-site),
+        survey(survey),
+        prepare-structure(prepare-structure),
+        advance-structure(advance-structure),
+        pause-structure(pause-structure),
+        resume-structure(resume-structure),
+        cancel-structure(cancel-structure),
+        structure-status(structure-status),
+        bind-warehouse(bind-warehouse),
+        bind-village-warehouse(bind-village-warehouse),
+    }
+
+    /// The typed answer to one settlement call.
+    ///
+    /// The variants are the server's own result, one for one: a site page, one
+    /// site, one resident-site reservation, one survey, one structure snapshot, one
+    /// committed portion receipt, and one warehouse binding. A successful query is
+    /// an observation, not a durable effect: its answer carries the revision it
+    /// observed and no receipt.
+    variant settlement-result {
+        sites(settlement-site-page),
+        site(settlement-site),
+        resident-site(resident-site-reservation),
+        survey(survey-snapshot),
+        structure(structure-snapshot),
+        receipt(structure-receipt),
+        warehouse(warehouse-binding),
+    }
+}

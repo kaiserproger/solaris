@@ -14,8 +14,7 @@
 //!
 //! Limits are deliberately measured in the units Wasmtime actually accounts:
 //! fuel for guest instructions and a wall-clock epoch deadline as an independent
-//! watchdog. Neither is a millisecond budget, and neither may be copied from the
-//! retired Luau numbers.
+//! watchdog. They are component-host limits, not elapsed-millisecond budgets.
 //!
 //! One of them bounds the *host*: [`PluginLimits::hostcall_bytes`] is the guest's
 //! transfer budget, spent by Wasmtime before it copies a string or a list element
@@ -33,13 +32,22 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 pub mod adapter;
 pub mod check;
+pub mod client_bundle;
+mod client_presentation;
 pub mod discovery;
+mod domain_inventories;
+mod domain_residents;
+mod domain_settlements;
 pub mod host;
 pub mod instance;
 pub mod limits;
 pub mod package;
+pub mod required_features;
 pub mod staging;
 pub mod startup;
+mod timers;
+mod world_events;
+pub mod worldgen;
 
 pub use adapter::{AdapterError, NoSessions, PlayerSessions, to_script_batch};
 pub use check::{CheckError, CheckReport, CheckedPackage, check_deployment};
@@ -47,16 +55,16 @@ pub use discovery::{
     DeploymentConfig, DiscoveredDeployment, DiscoveryError, DiscoveryMode, discover,
 };
 pub use host::{
-    HostQueues, HostStartError, InstanceDiagnostics, PluginHost, start_deployment,
-    start_deployment_with,
+    HostQueues, HostStartError, InstanceDiagnostics, PluginHost, PluginReloadContractField,
+    PluginReloadError, PluginReloadReport, start_deployment, start_deployment_with,
 };
-pub use instance::PluginInstance;
+pub use instance::{PluginInstance, PluginStartup};
 pub use limits::{PluginLimits, TRUNCATION_MARKER};
 pub use package::{LoadedPackage, PackageError, PackageManifest, load_package};
 pub use staging::{CommandBatch, StagingError};
 pub use startup::{
-    ContributionOutcome, DeploymentContribution, FieldOverflow, PackageContribution,
-    RulePlanRefusal, convert_rule_plan,
+    ContributionOutcome, ContributionRefusal, DeploymentContribution, FieldOverflow,
+    PackageContribution, convert_startup_contribution,
 };
 
 /// Why a plugin could not be compiled, instantiated or called.
@@ -172,6 +180,16 @@ pub struct InstanceState<S: HostServices> {
     /// per-call bound. Reset at the start of every callback.
     log_lines: u32,
     log_lines_dropped: u32,
+    /// Whether the guest is answering a pre-commit hook right now.
+    ///
+    /// The hook phase is the one phase a guest cannot reach out of: the contract
+    /// refuses every import there except reading the instance's own plugin id, so
+    /// a hook cannot log, cannot ask the host for anything and cannot stage an
+    /// effect while it is deciding one. The phase is the store's own, so it ends
+    /// with the call whatever the guest did inside it.
+    hook_phase: bool,
+    /// Imports the current hook phase refused, reset when the phase begins.
+    hook_violations: u32,
 }
 
 impl<S: HostServices> InstanceState<S> {
@@ -191,6 +209,8 @@ impl<S: HostServices> InstanceState<S> {
             calls: 0,
             log_lines: 0,
             log_lines_dropped: 0,
+            hook_phase: false,
+            hook_violations: 0,
         }
     }
 
@@ -215,6 +235,40 @@ impl<S: HostServices> InstanceState<S> {
     #[must_use]
     pub const fn log_lines_dropped(&self) -> u32 {
         self.log_lines_dropped
+    }
+
+    /// Begin one hook call: the imports the hook phase refuses are refused until
+    /// the call ends.
+    pub(crate) fn enter_hook_phase(&mut self) {
+        self.hook_phase = true;
+        self.hook_violations = 0;
+    }
+
+    /// End one hook call, answering how many imports it refused.
+    pub(crate) fn leave_hook_phase(&mut self) -> u32 {
+        self.hook_phase = false;
+        std::mem::take(&mut self.hook_violations)
+    }
+
+    /// Whether the guest is answering a pre-commit hook right now.
+    #[must_use]
+    pub const fn in_hook_phase(&self) -> bool {
+        self.hook_phase
+    }
+
+    /// Whether the guest's current phase allows an import that leaves the
+    /// instance, counting the refusal when it does not.
+    ///
+    /// `plugin-id` reads nothing but the identity the host bound to the instance,
+    /// so it is the one import a hook may still call; everything else reaches
+    /// outside, and a hook that reaches for one has answered nothing the owner may
+    /// commit - which is why the refusal is counted rather than silently ignored.
+    pub(crate) fn allow_import(&mut self) -> bool {
+        if self.hook_phase {
+            self.hook_violations = self.hook_violations.saturating_add(1);
+            return false;
+        }
+        true
     }
 }
 

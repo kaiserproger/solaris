@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "pack_id": "wasm-p3-inventory-storage-real-client",
+  "quality_label": "draft",
+  "minecraft_version": "26.1.2",
+  "server_command": "cargo run --bin mc-server -- --config <run-dir>/server.toml (prepared from SOLARIS_REAL_CLIENT_SERVER_CONFIG)",
+  "artifact_root": ".analysis/real-client-runs",
+  "client_requirement": "A real graphical Minecraft Java Edition 26.1.2 client must execute this scenario through the repo-native Gradle runClient adapter (:fabric-agent:runClientAgent, net.neoforged.moddev). That client carries the repo's JVM client-agent bridge for observation and input only and deliberately does NOT load the Solaris Loader mod, so every /trade answer arrives over the ordinary play protocol; it is a no-Loader development client, not an uninstrumented production binary. Protocol bots, wire probes and mock clients do not satisfy this gate.",
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "headless mock client",
+    "source-string assertion"
+  ],
+  "required_artifacts": [
+    "manifest.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt",
+    "automation-driver.txt"
+  ],
+  "automation_runner": {
+    "script": "python3 -m tools.harness run regression",
+    "delegates_to": "tools/harness/backends/regression.sh",
+    "agent_driver": "tools/harness/backends/driver.py",
+    "client_adapter": "../solaris-loader/gradlew -p ../solaris-loader --no-configuration-cache :fabric-agent:runClientAgent",
+    "client_adapter_source": "auto-gradle-runclient",
+    "client_isolation": "The primary Gradle runClient uses a per-run game directory and the fixed offline username SolarisPrimary.",
+    "modes": [
+      "--check",
+      "--prepare",
+      "--run",
+      "--validate-run"
+    ],
+    "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+    "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
+    "agent_port_env": "SOLARIS_REAL_CLIENT_AGENT_PORT",
+    "agent_server_addr_env": "SOLARIS_REAL_CLIENT_SERVER_ADDR",
+    "server_config_env": "SOLARIS_REAL_CLIENT_SERVER_CONFIG",
+    "fresh_world_env": "SOLARIS_REAL_CLIENT_FRESH_WORLD",
+    "default_agent_scenario": "wasm-p3-inventory-storage",
+    "prepared_status": "prepared-owner-run",
+    "passing_gate": "agent-run real-client"
+  },
+  "scenarios": [
+    {
+      "id": "wasm-p3-inventory-storage",
+      "title": "External WASM inventory/storage trade terminal in a no-Loader graphical client",
+      "ledger_rows": [
+        "P3"
+      ],
+      "status": "manual-pending",
+      "no_debug_commands": false,
+      "bounded_time_minutes": 14,
+      "screenshots_required": true,
+      "steps": [
+        "Start Solaris from a fresh world with runtime = \"wasm\", strict = true, expected = [\"inventory-compat\"], and explicit storage/inventory_storage_transactions grants. The package declares player_commands = [\"trade\"], events = [\"player.joined\", \"player.left\"], and config.toml mode = \"inventory-storage\". The trade-ledger key must start absent.",
+        "Launch the real graphical 26.1.2 client through the repo-native Gradle runClient adapter (no Solaris Loader mod) and let the agent driver connect it to the loopback server address.",
+        "Seed the fixture with explicit operator commands: gamemode survival, /give minecraft:emerald 4, /give minecraft:diamond_pickaxe 1. These are declared debug setup (no_debug_commands = false) and are never claimed as no-debug survival.",
+        "Make the seeded tool genuinely component-bearing through ordinary gameplay: /summon minecraft:pig beside the player, select the pickaxe in the hotbar, and land one real survival attack, then require a non-zero client-visible damage component on the pickaxe entry.",
+        "Buy twice with /trade buy and require the fresh marker P3_TRADE buy committed ledger=1 then ledger=2 with emerald/apple counts 2/1 then 0/2.",
+        "Submit /trade buy a third time with zero emeralds and require P3_TRADE buy refused ledger=2 with byte-identical client inventory (the insufficient-inventory adversarial check).",
+        "Submit /trade refund and require P3_TRADE refund committed ledger=1 with emerald/apple counts 2/1.",
+        "Submit /trade retry-original while the funds are present and require P3_TRADE retry-original refused ledger=1 with unchanged inventory (the stale storage precondition adversarial check).",
+        "Disconnect and rejoin the same player, require the server's session release, then require the persisted emerald/apple counts and the identical damage-bearing pickaxe entry.",
+        "Submit /trade stale-session after the rejoin and require P3_TRADE stale-session refused ledger=1 with unchanged inventory (the stale player-session adversarial check).",
+        "Capture the inventory after setup, second purchase, refund, rejoin and stale-session refusal. Then probe an ordinary purchase on the new live session: it must still commit with ledger=2 and emerald/apple counts 0/2; capture that final inventory too."
+      ],
+      "expected_observations": [
+        "Every /trade submission produces exactly one fresh P3_TRADE marker line in client chat and the driver never accepts a marker that was already visible before that submission.",
+        "The committed buys and refund change exactly the client-visible emerald/apple counts the marker claims, and every refusal leaves the whole client-visible inventory unchanged.",
+        "The unaffected component-bearing pickaxe keeps its item_id, count, name, damage, max_damage, foil and enchantment list across every phase, across the disconnect/rejoin, and after the stale-session refusal.",
+        "The disconnected and rejoined player is the same username, inventory counts persist across the session change, and the stale-session refusal is observed on the new session.",
+        "After refusing the old session, the current session still completes an ordinary purchase; a known refusal must not disable the guest or fence unrelated valid work.",
+        "No storage revision, refusal reason beyond committed/refused, or durable operation-id receipt is observable from the real client; those gaps are recorded in the scenario report instead of being inferred."
+      ],
+      "wasm_inventory_storage_expectation": {
+        "package_id": "inventory-compat",
+        "mode": "inventory-storage",
+        "player_username": "SolarisPrimary",
+        "command_root": "trade",
+        "ledger_key": "trade-ledger",
+        "marker_prefix": "P3_TRADE",
+        "setup": {
+          "gamemode_command": "gamemode survival",
+          "emerald": {
+            "item_id": "minecraft:emerald",
+            "command": "give minecraft:emerald 4",
+            "count": 4
+          },
+          "apple": {
+            "item_id": "minecraft:apple",
+            "initial_count": 0
+          },
+          "tool": {
+            "item_id": "minecraft:diamond_pickaxe",
+            "command": "give minecraft:diamond_pickaxe 1"
+          },
+          "damage_entity_type": "minecraft:pig",
+          "summon_command_template": "summon minecraft:pig {x} {y} {z}",
+          "inventory_screenshot": "seed-inventory"
+        },
+        "sequence": [
+          {
+            "action": "buy",
+            "args": "buy",
+            "outcome": "committed",
+            "ledger": 1,
+            "emerald": 2,
+            "apple": 1
+          },
+          {
+            "action": "buy",
+            "args": "buy",
+            "outcome": "committed",
+            "ledger": 2,
+            "emerald": 0,
+            "apple": 2,
+            "capture": "second-buy-inventory"
+          },
+          {
+            "action": "buy",
+            "args": "buy",
+            "outcome": "refused",
+            "ledger": 2,
+            "emerald": 0,
+            "apple": 2,
+            "adversarial": "insufficient_inventory"
+          },
+          {
+            "action": "refund",
+            "args": "refund",
+            "outcome": "committed",
+            "ledger": 1,
+            "emerald": 2,
+            "apple": 1,
+            "capture": "refund-inventory"
+          },
+          {
+            "action": "retry-original",
+            "args": "retry-original",
+            "outcome": "refused",
+            "ledger": 1,
+            "emerald": 2,
+            "apple": 1,
+            "adversarial": "stale_storage_precondition"
+          }
+        ],
+        "rejoin": {
+          "action": "stale-session",
+          "args": "stale-session",
+          "outcome": "refused",
+          "ledger": 1,
+          "emerald": 2,
+          "apple": 1,
+          "capture": "stale-session-refused-inventory",
+          "adversarial": "stale_player_session"
+        },
+        "live_session_probe": {
+          "action": "buy",
+          "args": "buy",
+          "outcome": "committed",
+          "ledger": 2,
+          "emerald": 0,
+          "apple": 2,
+          "capture": "live-session-purchase-inventory",
+          "adversarial": "live_session_after_stale_refusal"
+        }
+      }
+    }
+  ]
+}

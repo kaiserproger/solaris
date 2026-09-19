@@ -7,23 +7,20 @@
 //! (`unloaded`/`unsupported`) when no adapter is installed, and the tests drive
 //! the real [`LiveResidentWorld`] over a real world storage.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use mc_data::block_light::BlockLightTable;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::item_stack::ItemStack;
 use mc_data::items::ItemRegistry;
 use mc_entity::Vec3;
 use mc_protocol::codec;
 use mc_script::ScriptOperationFailure;
-use mc_world::{
-    BlockPos, BlockRegistry, BlockStateId, ResidentBlockEdit, ResidentBlockEditBatchResult,
-    ResidentBlockPrecondition, WorldReadView,
-};
+use mc_world::{BlockPos, BlockRegistry, BlockStateId, ResidentBlockPrecondition, WorldReadView};
 
 use crate::play::survival::block_drop_stacks_with_tool_and_facts_from_seeded;
 use crate::script::PluginZoneAdapter;
-use crate::server::WorldHandle;
 
 /// One resident has to be an overworld actor: the work, route and combat
 /// adapters all read the region the resident owner simulates.
@@ -45,6 +42,17 @@ pub(crate) struct ResidentBlock {
 pub(crate) struct ResidentDrop {
     pub item_id: String,
     pub count: u32,
+}
+
+/// One immutable resident world edit: exact source image, destination state
+/// and any canonical loot calculated before a storage batch is prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentWorldEdit {
+    pub(crate) precondition: ResidentBlockPrecondition,
+    pub(crate) new_state: BlockStateId,
+    pub(crate) drops: Vec<ResidentDrop>,
+    /// Only felled logs schedule their neighbouring leaf updates.
+    pub(crate) triggers_leaf_updates: bool,
 }
 
 /// Bounded world adapter for resident work, routes and combat.
@@ -72,65 +80,65 @@ pub(crate) trait ResidentWorld: Send + Sync {
     ) -> bool;
     /// Canonical block state id for one block path, when it is registered.
     fn state_for(&self, block_path: &str) -> Option<u32>;
-    /// Canonical loot of one conditional break, computed **without** touching
-    /// the world.
+    /// Canonical loot and source image of one conditional break, computed
+    /// **without** touching the world. The returned precondition is the exact
+    /// image the later durable decision must consume.
     ///
-    /// Loot depends only on the block state, the held tool and the block
-    /// position's own seed, so a preview and the commit that follows it agree
-    /// exactly. It exists so a caller can refuse to break a block whose loot
-    /// nobody can hold, instead of removing the block and losing the drops.
+    /// Loot depends only on the block state, held tool and position seed, so
+    /// the preview and the committed record agree exactly. It lets the caller
+    /// refuse a break whose loot cannot fit before the block leaves the world.
     fn preview_break(
         &self,
         dimension: &str,
         pos: [i32; 3],
         expected_state: u32,
         tool: Option<&str>,
-    ) -> Result<Vec<ResidentDrop>, ScriptOperationFailure>;
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure>;
 
-    /// Commit one conditional break and return the canonical loot.
-    fn break_block(
-        &self,
-        dimension: &str,
-        pos: [i32; 3],
-        expected_state: u32,
-        tool: Option<&str>,
-    ) -> Result<Vec<ResidentDrop>, ScriptOperationFailure>;
-    /// Commit one conditional placement of `state` over an air cell.
-    fn place_block(
+    /// Preview a seed placement over its exact air image without touching the
+    /// world. The later decision consumes the returned precondition.
+    fn preview_place(
         &self,
         dimension: &str,
         pos: [i32; 3],
         state: u32,
-    ) -> Result<(), ScriptOperationFailure>;
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure>;
+    /// Commit prepared resident edits and their encoded storage receipt under
+    /// one world decision. A stale source image leaves both world and receipt
+    /// untouched; after append, recovery projects the same receipt.
+    fn commit_world_edits<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        dimension: &'a str,
+        edits: &'a [ResidentWorldEdit],
+        receipt: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>>;
 }
 
 /// The production [`ResidentWorld`] over live world storage.
 pub(crate) struct LiveResidentWorld {
-    world: WorldHandle,
     read: WorldReadView,
     blocks: Arc<BlockRegistry>,
-    light: Option<Arc<BlockLightTable>>,
     zones: Option<PluginZoneAdapter>,
+    simulation: crate::play::SimulationHandle,
     items: Arc<ItemRegistry>,
     item_facts: Arc<ItemFactsTable>,
 }
 
 impl LiveResidentWorld {
     pub(crate) fn new(
-        world: WorldHandle,
         read: WorldReadView,
         blocks: Arc<BlockRegistry>,
-        light: Option<Arc<BlockLightTable>>,
         zones: Option<PluginZoneAdapter>,
+        simulation: crate::play::SimulationHandle,
         items: Arc<ItemRegistry>,
         item_facts: Arc<ItemFactsTable>,
     ) -> Self {
         Self {
-            world,
             read,
             blocks,
-            light,
             zones,
+            simulation,
             items,
             item_facts,
         }
@@ -218,50 +226,6 @@ impl LiveResidentWorld {
             }
         }
         drops
-    }
-
-    /// Apply one conditional edit through the shared world storage kernel.
-    fn commit_edit(
-        &self,
-        pos: [i32; 3],
-        expected_state: BlockStateId,
-        new_state: BlockStateId,
-    ) -> Result<(), ScriptOperationFailure> {
-        let position = BlockPos {
-            x: pos[0],
-            y: pos[1],
-            z: pos[2],
-        };
-        let Some(token) = self.read.block_mutation_token(position) else {
-            return Err(ScriptOperationFailure::Unloaded);
-        };
-        let edits = [ResidentBlockEdit {
-            pos: position,
-            new_state,
-            preserve_light: false,
-        }];
-        let preconditions = [ResidentBlockPrecondition {
-            pos: position,
-            expected_state,
-            expected_token: token,
-        }];
-        let Ok(mut storage) = self.world.try_lock() else {
-            return Err(ScriptOperationFailure::Busy);
-        };
-        match storage.apply_block_edits_conditionally(
-            &edits,
-            &preconditions,
-            &[],
-            self.light.as_deref(),
-            None,
-        ) {
-            Ok(ResidentBlockEditBatchResult::Applied(_)) => Ok(()),
-            // A concurrently changed cell is a stale target, not a silent break.
-            Ok(ResidentBlockEditBatchResult::Stale) => Err(ScriptOperationFailure::StaleRevision),
-            Ok(ResidentBlockEditBatchResult::Missing) => Err(ScriptOperationFailure::Unloaded),
-            Ok(ResidentBlockEditBatchResult::CrossRegion) => Err(ScriptOperationFailure::Blocked),
-            Err(_) => Err(ScriptOperationFailure::RuntimeUnavailable),
-        }
     }
 
     /// Walk a bounded integer ray, invoking `visit` per cell; `None` means the
@@ -374,49 +338,138 @@ impl ResidentWorld for LiveResidentWorld {
         pos: [i32; 3],
         expected_state: u32,
         tool: Option<&str>,
-    ) -> Result<Vec<ResidentDrop>, ScriptOperationFailure> {
-        let Some((current, _)) = self.loaded_block(dimension, pos) else {
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure> {
+        let Some((current, path)) = self.loaded_block(dimension, pos) else {
             return Err(ScriptOperationFailure::Unloaded);
         };
         if current.0 != expected_state {
             return Err(ScriptOperationFailure::StaleRevision);
         }
-        Ok(self.break_loot(pos, expected_state, tool))
-    }
-
-    fn break_block(
-        &self,
-        dimension: &str,
-        pos: [i32; 3],
-        expected_state: u32,
-        tool: Option<&str>,
-    ) -> Result<Vec<ResidentDrop>, ScriptOperationFailure> {
-        let air = self
+        let position = BlockPos {
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+        };
+        let expected_token = self
+            .read
+            .block_mutation_token(position)
+            .ok_or(ScriptOperationFailure::Unloaded)?;
+        let new_state = self
             .air_state()
             .ok_or(ScriptOperationFailure::RuntimeUnavailable)?;
-        let Some((current, _)) = self.loaded_block(dimension, pos) else {
-            return Err(ScriptOperationFailure::Unloaded);
-        };
-        if current.0 != expected_state {
-            return Err(ScriptOperationFailure::StaleRevision);
-        }
-        self.commit_edit(pos, BlockStateId(expected_state), air)?;
-        Ok(self.break_loot(pos, expected_state, tool))
+        Ok(ResidentWorldEdit {
+            precondition: ResidentBlockPrecondition {
+                pos: position,
+                expected_state: current,
+                expected_token,
+            },
+            new_state,
+            drops: self.break_loot(pos, expected_state, tool),
+            triggers_leaf_updates: path.ends_with("_log"),
+        })
     }
 
-    fn place_block(
+    fn preview_place(
         &self,
         dimension: &str,
         pos: [i32; 3],
         state: u32,
-    ) -> Result<(), ScriptOperationFailure> {
+    ) -> Result<ResidentWorldEdit, ScriptOperationFailure> {
         let Some((current, path)) = self.loaded_block(dimension, pos) else {
             return Err(ScriptOperationFailure::Unloaded);
         };
         if !Self::is_air(&path) {
             return Err(ScriptOperationFailure::Blocked);
         }
-        self.commit_edit(pos, current, BlockStateId(state))
+        let position = BlockPos {
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+        };
+        let expected_token = self
+            .read
+            .block_mutation_token(position)
+            .ok_or(ScriptOperationFailure::Unloaded)?;
+        Ok(ResidentWorldEdit {
+            precondition: ResidentBlockPrecondition {
+                pos: position,
+                expected_state: current,
+                expected_token,
+            },
+            new_state: BlockStateId(state),
+            drops: Vec::new(),
+            triggers_leaf_updates: false,
+        })
+    }
+
+    fn commit_world_edits<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        dimension: &'a str,
+        world_edits: &'a [ResidentWorldEdit],
+        receipt: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>> {
+        Box::pin(async move {
+            if dimension != RESIDENT_WORLD_DIMENSION || world_edits.is_empty() {
+                return Err(ScriptOperationFailure::InvalidRequest);
+            }
+            if world_edits.iter().any(|preview| {
+                self.zones.as_ref().is_some_and(|zones| {
+                    let position = preview.precondition.pos;
+                    zones.foreign_zone_overlaps(
+                        plugin_id,
+                        dimension,
+                        [position.x, position.y, position.z],
+                        [position.x, position.y, position.z],
+                    )
+                })
+            }) {
+                return Err(ScriptOperationFailure::Forbidden);
+            }
+            let preconditions = world_edits
+                .iter()
+                .map(|preview| crate::play::BlockEditPrecondition {
+                    pos: preview.precondition.pos,
+                    expected_state: preview.precondition.expected_state,
+                    expected_token: preview.precondition.expected_token,
+                })
+                .collect();
+            let edits = world_edits
+                .iter()
+                .map(|preview| {
+                    crate::play::BlockEdit::new(preview.precondition.pos, preview.new_state)
+                })
+                .collect();
+            let triggers_leaf_updates = world_edits
+                .iter()
+                .any(|preview| preview.triggers_leaf_updates);
+            let zone_fence = self
+                .zones
+                .as_ref()
+                .map(PluginZoneAdapter::capture_protection_fence);
+            match self
+                .simulation
+                .commit_server_owned_block_edits_with_preconditions(
+                    plugin_id,
+                    edits,
+                    Some(preconditions),
+                    triggers_leaf_updates,
+                    zone_fence,
+                    receipt,
+                )
+                .await
+            {
+                Ok(Some(decision_id)) => Ok(decision_id),
+                Ok(None) => Err(ScriptOperationFailure::StaleRevision),
+                Err(crate::play::SimulationRequestError::Precommit(
+                    mc_script::precommit::HookFailure::PermissionDenied,
+                )) => Err(ScriptOperationFailure::Forbidden),
+                Err(crate::play::SimulationRequestError::Precommit(
+                    mc_script::precommit::HookFailure::Stale,
+                )) => Err(ScriptOperationFailure::StaleRevision),
+                Err(_) => Err(ScriptOperationFailure::RuntimeUnavailable),
+            }
+        })
     }
 }
 

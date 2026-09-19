@@ -11,6 +11,7 @@ use mc_entity::{EntityId, EntityLifecycle, GoalState, Rotation, SpawnEntity, Vec
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
 use crate::play::simulation::SimulationAuthority;
 
+use super::damage_precommit::PlayerDamageSource;
 use super::entity_lifecycle::{
     move_entity_chunk_locked, remove_server_entity_locked, track_entity_chunk_locked,
 };
@@ -505,6 +506,7 @@ impl SessionRegistry {
                                 amount,
                                 source_origin: Some(contact_position),
                             },
+                            source: PlayerDamageSource::Entity(dragon_id),
                         },
                     });
                 }
@@ -643,6 +645,7 @@ impl SessionRegistry {
                                 amount: DRAGON_CLOUD_DAMAGE,
                                 source_origin: Some(source_origin),
                             },
+                            source: PlayerDamageSource::Entity(cloud_id),
                         },
                     });
                 }

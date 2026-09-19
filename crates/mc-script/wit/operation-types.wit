@@ -1,0 +1,18 @@
+interface operation-types {
+    /// Native operation refusal codes, shared by envelopes and per-member results.
+    enum operation-failure {
+        invalid-request,
+        forbidden,
+        stale-revision,
+        not-found,
+        unloaded,
+        blocked,
+        insufficient-items,
+        capacity,
+        busy,
+        runtime-unavailable,
+        operation-conflict,
+        cursor-expired,
+        unknown,
+    }
+}

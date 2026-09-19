@@ -55,6 +55,17 @@ impl ScriptGameplayEventPublisher {
         })
     }
 
+    /// Capture the immutable protection generation immediately before a player
+    /// action's existing permission check.  The plan carries it to the native
+    /// owner, which fails closed if any zone definition changes meanwhile.
+    pub(super) fn capture_block_mutation_zone_fence(
+        &self,
+    ) -> Option<crate::script::ZoneProtectionFence> {
+        self.zones
+            .as_ref()
+            .map(PluginZoneAdapter::capture_protection_fence)
+    }
+
     pub(super) async fn publish_block_broken(
         &self,
         blocks: &BlockRegistry,

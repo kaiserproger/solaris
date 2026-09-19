@@ -14,8 +14,8 @@
 macro_rules! export_plugin {
     ($plugin:ty) => {
         const _: () = {
-            use $crate::{events as __events, lifecycle as __lifecycle};
             use std::cell::RefCell;
+            use $crate::{events as __events, lifecycle as __lifecycle, precommit as __precommit};
 
             /// The marker type the generated ABI exports stand for.
             struct SolarisPlugin;
@@ -37,7 +37,7 @@ macro_rules! export_plugin {
             impl __lifecycle::Guest for SolarisPlugin {
                 fn configure(
                     config: String,
-                ) -> Result<Option<$crate::RulePlan>, $crate::PluginError> {
+                ) -> Result<Option<$crate::StartupContribution>, $crate::PluginError> {
                     let config = $crate::Config::new(&config);
                     with_plugin(|plugin| {
                         <$plugin as $crate::Plugin>::configure(plugin, &config).map_err(Into::into)
@@ -69,6 +69,30 @@ macro_rules! export_plugin {
                 ) -> Result<Vec<$crate::Command>, $crate::PluginError> {
                     with_plugin(|plugin| {
                         <$plugin as $crate::Plugin>::on_events(plugin, &context, &events)
+                            .map_err(Into::into)
+                    })
+                }
+            }
+
+            /// The two pre-commit hooks. Each forwards one question into the
+            /// instance's plugin value and returns the decision it answered: the
+            /// ABI has no way to carry a command out of this phase, which is what
+            /// makes a hook an answer about an effect rather than the effect.
+            impl __precommit::Guest for SolarisPlugin {
+                fn before_build(
+                    context: $crate::BuildContext,
+                ) -> Result<$crate::BuildDecision, $crate::PluginError> {
+                    with_plugin(|plugin| {
+                        <$plugin as $crate::Plugin>::before_build(plugin, &context)
+                            .map_err(Into::into)
+                    })
+                }
+
+                fn before_damage(
+                    context: $crate::DamageContext,
+                ) -> Result<$crate::DamageDecision, $crate::PluginError> {
+                    with_plugin(|plugin| {
+                        <$plugin as $crate::Plugin>::before_damage(plugin, &context)
                             .map_err(Into::into)
                     })
                 }

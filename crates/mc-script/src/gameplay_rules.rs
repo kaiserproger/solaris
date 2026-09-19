@@ -1,13 +1,10 @@
 //! The startup rule contract: what a plugin deployment contributes to a world's
 //! worldgen and spawning.
 //!
-//! This module is deliberately independent of any script runtime. The Luau host
-//! parses `rules.lua` into [`GameplayRules`] and the WASM component host converts
-//! a component's `rule-plan` answer into the same type, so neither runtime is a
-//! precondition for the contract the world is opened against. What is runtime
-//! specific stays with its runtime: reading `rules.lua` lives in
-//! `lua::gameplay_rules`, and lifting a `rule-plan` out of a component lives in
-//! `mc-plugin-host`.
+//! This module is independent of guest execution. The component host converts a
+//! component's `rule-plan` answer into [`GameplayRules`] before opening the
+//! world. Its representation is the compatibility boundary, not an artifact of
+//! the guest runtime.
 //!
 //! The type is also the world-compatibility boundary: [`GameplayRules::contract_name`]
 //! is persisted in the world contract and compared on every reopen, so two
@@ -186,9 +183,8 @@ pub enum GameplayRulesError {
 impl GameplayRulesError {
     /// The operator-facing message.
     ///
-    /// One wording for both runtimes: the same plan must read the same refusal
-    /// whether a `rules.lua` or a component declared it. The wording therefore
-    /// names the plan, not the file one runtime happens to read it from.
+    /// One wording for the component contract: the same plan always produces
+    /// the same refusal, independent of the package that declared it.
     #[must_use]
     pub fn message(self) -> &'static str {
         match self {
@@ -238,22 +234,22 @@ impl GameplayRules {
 
     /// The world contract's fingerprint of these rules.
     ///
-    /// Sha256 over canonical TOML, exactly as it was produced before the Luau
-    /// host and the component host existed side by side: changing the prefix, the
-    /// hashing or the serialized field set would refuse every world already on
-    /// disk, because the value is persisted and compared on every reopen.
+    /// Sha256 over canonical TOML. The `component-rules` prefix identifies the
+    /// component-only deployment contract; changing its hashing or serialized
+    /// field set changes the persisted world contract and therefore rejects an
+    /// incompatible reopen.
     #[must_use]
     pub fn contract_name(&self) -> String {
         let canonical = toml::to_string(self).expect("validated rule plan is serializable");
-        format!("luau-rules:{:x}", Sha256::digest(canonical.as_bytes()))
+        format!("component-rules:{:x}", Sha256::digest(canonical.as_bytes()))
     }
 
     /// Whether these rules can be materialized.
     ///
     /// Every category, list, name and numeric bound a world-side owner relies on
     /// is checked here, so a plan that reaches materialization carries only
-    /// values the native owners can bound. Both the Luau host and the component
-    /// host run this and nothing else.
+    /// values the native owners can bound. The component host runs this before
+    /// materializing the deployment.
     pub fn validate(&self) -> Result<(), GameplayRulesError> {
         if self.spawning.is_empty()
             && self.trees.is_empty()

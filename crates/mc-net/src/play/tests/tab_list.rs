@@ -54,6 +54,7 @@ async fn login_frames(
         None,
         None,
         None,
+        None,
     )
     .await;
     assert!(matches!(result, Err(ConnectionError::Eof)));
