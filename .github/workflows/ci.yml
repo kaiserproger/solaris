@@ -68,6 +68,8 @@ jobs:
           ref: ${{ env.SOLARIS_LOADER_REVISION }}
           path: solaris-loader
       - uses: dtolnay/rust-toolchain@1.94
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: solaris -> target
@@ -96,6 +98,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       SOLARIS_CLIENT_JAR: ${{ github.workspace }}/solaris-loader/.analysis/client.jar
+      SOLARIS_HARNESS_MEMORY_MAX: 8G
     defaults:
       run:
         working-directory: solaris
