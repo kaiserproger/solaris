@@ -706,6 +706,10 @@ pub struct ScriptStructureSnapshot {
     pub rotation: u16,
     pub reserved_footprint: [i32; 3],
     pub stages: Vec<ScriptStructureStagePlan>,
+    /// Zero-based stage currently accepting work, or `stages.len()` when complete.
+    pub current_stage_index: u32,
+    /// Work committed in `current_stage_index`, or zero at the terminal index.
+    pub completed_work_units: u64,
     pub resource_plan_hash: String,
     pub reservation_ref: Option<String>,
     pub watermark: u64,
@@ -727,6 +731,8 @@ impl ScriptStructureSnapshot {
         rotation: u16,
         reserved_footprint: [i32; 3],
         stages: Vec<ScriptStructureStagePlan>,
+        current_stage_index: u32,
+        completed_work_units: u64,
         resource_plan_hash: String,
         reservation_ref: Option<String>,
         watermark: u64,
@@ -744,6 +750,8 @@ impl ScriptStructureSnapshot {
             rotation,
             reserved_footprint,
             stages,
+            current_stage_index,
+            completed_work_units,
             resource_plan_hash,
             reservation_ref,
             watermark,
@@ -769,6 +777,19 @@ impl ScriptStructureSnapshot {
             if !stages.insert(stage.stage.as_str()) {
                 return Err(ScriptDtoError::InvalidBounds);
             }
+        }
+        let terminal_stage_index = self.stages.len() as u32;
+        if self.current_stage_index > terminal_stage_index
+            || (self.current_stage_index == terminal_stage_index && self.completed_work_units != 0)
+            || (self.state == ScriptStructureState::Committed
+                && self.current_stage_index != terminal_stage_index)
+        {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        if let Some(stage) = self.stages.get(self.current_stage_index as usize)
+            && self.completed_work_units > stage.work_units
+        {
+            return Err(ScriptDtoError::InvalidBounds);
         }
         validate_hex_hash("structure resource plan hash", &self.resource_plan_hash)?;
         if let Some(reservation_ref) = &self.reservation_ref {

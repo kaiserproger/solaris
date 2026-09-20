@@ -258,7 +258,7 @@ mod tests {
         use crate::script::storage::world_inventory::InventoryRuntime;
         use mc_script::{ScriptOperation, ScriptOperationRequest, ScriptResidentOperation};
 
-        const OWNER: &str = "solaris-settlements";
+        const OWNER: &str = "settlement-authority-test";
 
         let registry = std::sync::Arc::new(SessionRegistry::new());
         let authority = SimulationAuthority::for_test();
@@ -418,7 +418,7 @@ mod tests {
             records[0].snapshot.goal,
             mc_entity::GoalState::FollowPosition {
                 target: Vec3::new(72.5, 66.0, 8.5),
-                speed: 0.3,
+                speed: 3.0,
             }
         );
         let merchant = records[0]

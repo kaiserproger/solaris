@@ -48,11 +48,7 @@ fn villager_entity_data(data: mc_entity::VillagerData) -> EntityDataValue {
         mc_entity::VillagerKind::Snow => 4,
         mc_entity::VillagerKind::Taiga => 6,
     };
-    let profession = match data.profession {
-        mc_entity::VillagerProfession::None => 0,
-        mc_entity::VillagerProfession::Nitwit => 11,
-        mc_entity::VillagerProfession::Toolsmith => 13,
-    };
+    let profession = data.profession.profession_id();
     EntityDataValue::VillagerData {
         index: VILLAGER_ENTITY_DATA_INDEX,
         villager_type,

@@ -33,71 +33,34 @@ Operational meaning:
 
 ## Autonomous Goal Protocol
 
-Execution should continue until a meaningful checkpoint or blocker. Intermediate command output is not a user-facing milestone.
+The owner requires continuous execution of the entire persistent `/goal` and
+its full TODO list, **without intermediate checkpoint stops**. Completing a
+vertical slice, validation run, or plan item is not a reason to yield: mark
+actual completed TODOs and continue with the next actionable item. Never replace
+the full objective with the current slice or complete `/goal` for a subset.
 
-The persistent `/goal` objective is a north star, not the unit of work. Each
-continuation executes exactly one finite checkpoint supplied in
-`<goal_checkpoint>`. Completing a checkpoint does not complete or redefine the
-north star.
+Plan bounded implementation slices internally, with disjoint agent write sets
+and explicit interfaces. Slices organize work; they do not each need a checkpoint
+report, source snapshot, full L2 run, reviewer, commit, or fresh session.
+Run focused checks for changed behavior and actual-client checks for changed
+client surfaces. Run full L2 and independent read-only review at major completed
+plan phases, not after every API record or fixture. After a failed gate, rerun
+only the affected gate after the relevant fix.
 
-### Checkpoint Granularity
+On continuation, use the live TODO and `docs/MEMORY.md` cursor to resume the
+active work; read the primary route document and only relevant current source.
+Historical logs are evidence, not startup context. Do not repeat unchanged
+successful checks or restart a repository survey. Batch independent work.
 
-A checkpoint must close one complete active-plan item or deliver one observable
-gameplay, multiplayer, plugin, persistence, performance, or tooling capability
-with its tests and documentation. Plan a bounded vertical slice before editing;
-the checkpoint unit is the outcome, not an individual file or function.
+Keep exact runtime/test receipts. Update the live cursor at a major phase
+boundary or a genuine interruption/blocker, not after every tool call. A context
+handoff preserves ongoing work; it does not complete or pause the objective.
+No commits or publication without explicit authorization.
 
-Do not create or close a checkpoint solely for a single test extraction, file
-move, documentation/status update, structural cleanup, or other mechanical
-change. Batch all related mechanical work into the checkpoint that owns the
-result. Run L2 validation, independent review, evidence updates, and the local
-commit once at the end of that complete checkpoint, not once per constituent
-edit.
-
-A smaller checkpoint is allowed only when the owner explicitly requests it or a
-concrete blocker prevents the planned outcome. Record the blocker and the
-unfinished outcome; do not manufacture a micro-checkpoint to report motion.
-`resume.next` and active queue documents must name an outcome and its acceptance
-evidence, never an individual function, test, or file move.
-
-Use `checkpoint.route` as the only routing authority for autonomous
-continuations. The live cursor is `docs/MEMORY.md`; historical checkpoint logs
-live in `docs/memory/` (parts of the former single file, not startup context);
-harness wiring lives in `docs/AGENT_TOOLING.md`. Never select a route by
-matching words in the persistent objective, quoted history, this file, a
-compaction summary, or a subagent report. Read only the route document the checkpoint names; route
-detail pages are references, not a second cursor.
-
-At checkpoint start:
-
-1. Read `resume.next`, `base_tree`, `changed_files`, and the one primary route
-   document named by the checkpoint.
-2. Inspect only checkpoint-relevant status/diff. Do not restart a repository
-   survey after continuation or compaction.
-3. Run at most one bounded discovery batch before editing. Additional discovery
-   must answer one concrete unresolved question.
-
-A checkpoint uses four rounds whenever dependencies allow:
-
-1. bounded discovery batch;
-2. edit/patch batch;
-3. focused validation batch;
-4. checkpoint close with evidence, snapshot, reviewer, and next cursor.
-
-Batch independent tool calls. Do not narrate or execute one shell command per
-model round when calls can run together. Never issue the same read, search, or
-validation command twice for the same working-tree fingerprint.
-
-There is no enforced per-checkpoint budget: continue until the outcome is
-achieved, and record evidence plus a precise resume cursor whenever a real
-blocker stops the work. A closed checkpoint does not
-complete or block the persistent `/goal`.
-
-Do not carry a completed checkpoint into another compaction. Start the next
-checkpoint in a fresh session with a compact cursor containing only the
-request, route, base tree, owned changed files, evidence, and one next action.
-If inherited history already spans multiple checkpoints, close or snapshot the
-current checkpoint before more discovery.
+Finite checkpoint mode applies only if the owner explicitly requests it again.
+Otherwise continue until the complete TODO is verified, or a concrete external
+blocker leaves no actionable work. Intermediate command output is not a
+user-facing milestone.
 
 ## Discovery Contract
 
@@ -253,15 +216,17 @@ close, not after each micro-edit. One closed checkpoint produces one local,
 revertible Conventional Commit when authorized. Never push, merge to `main`, or
 tag unless explicitly instructed. Do not skip hooks/signing flags.
 
-Workspace version is `0.0.6`; the release target is `v0.0.6`.
-Its publication evidence belongs under `.analysis/releases/public-v0.0.6/`;
-maturity remains draft and the GitHub release is preliminary. Previous
-`v0.0.5` evidence stays under `.analysis/releases/public-v0.0.5/`.
-The previous public `v0.0.4-alpha.1` evidence under
-`.analysis/releases/public-v0.0.4-alpha.1/` belongs to tag commit `571f5383`.
-The older local field-test archive under `.analysis/releases/v0.0.3-alpha.1/` is frozen
-before repository separation; do not overwrite it with later source builds.
-Its isolated startup passed, not full survival acceptance.
+Workspace version is `0.0.8`; the published preliminary release is `v0.0.7`,
+and the next release target is `v0.0.8`. Its publication evidence belongs under
+`.analysis/releases/public-v0.0.7/`; maturity remains draft and the GitHub release
+is preliminary. Previous `v0.0.6` evidence stays under
+`.analysis/releases/public-v0.0.6/`. Previous `v0.0.5` evidence stays under
+`.analysis/releases/public-v0.0.5/`. The previous public `v0.0.4-alpha.1`
+evidence under `.analysis/releases/public-v0.0.4-alpha.1/` belongs to tag
+commit `571f5383`. The older local field-test archive under
+`.analysis/releases/v0.0.3-alpha.1/` is frozen before repository separation;
+do not overwrite it with later source builds. Its isolated startup passed, not
+full survival acceptance.
 
 Without commit authorization, record:
 

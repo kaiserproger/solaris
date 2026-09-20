@@ -359,3 +359,62 @@ fn nonfinite_collision_contact_remains_fail_closed() {
         );
     }
 }
+
+#[test]
+fn ground_pathing_blocks_fluid_cells_and_spares_swimmers() {
+    let air = vanilla_block_state_id("minecraft:air", &[]);
+    let stone = vanilla_block_state_id("minecraft:stone", &[]);
+    let water = vanilla_block_state_id("minecraft:water", &[("level", "0")]);
+    let registry = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+            .expect("embedded vanilla blocks build a registry"),
+    );
+    let mut world = mc_world::WorldStorage::in_memory(registry);
+    let chunk_pos = ChunkPos { x: 0, z: 0 };
+    let mut chunk = Chunk::empty(
+        chunk_pos,
+        BlockStateId(air),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    for x in 1..=4_u8 {
+        let _ = chunk.set_block(x, 62, 1, BlockStateId(stone));
+    }
+    let _ = chunk.set_block(2, 63, 1, BlockStateId(water));
+    let _ = chunk.set_block(3, 63, 1, BlockStateId(water));
+    world.insert_generated_chunk(chunk_pos, chunk).unwrap();
+
+    let materials = mc_physics::BlockMaterialIds::new(air, Some(water), None);
+    let world_read = world.read_view();
+    let snapshot = world_read.snapshot_chunks(&[chunk_pos]);
+    let ground_entity = EntityId(1);
+    let swimmer = EntityId(2);
+    let active_chunks = HashSet::from([(0, 0)]);
+    let terrain_pathing_entities = HashSet::from([ground_entity]);
+    let entity_aabbs = HashMap::from([
+        (ground_entity, mc_physics::Aabb::COW),
+        (swimmer, mc_physics::Aabb::COW),
+    ]);
+    let probe = LoadedChunkPathingProbe::new(
+        &active_chunks,
+        &terrain_pathing_entities,
+        &entity_aabbs,
+        Some(LoadedTerrainPathingProbe::new(&snapshot, &materials)),
+    );
+
+    // Dry ground stays walkable for the ground pather.
+    assert_eq!(
+        probe.can_entity_stand_at(ground_entity, Vec3::new(1.5, 63.0, 1.5)),
+        PathingProbeResult::Walkable
+    );
+    // A pond surface cell is no longer a stand target: ground mobs must not
+    // plan across water.
+    assert_eq!(
+        probe.can_entity_stand_at(ground_entity, Vec3::new(2.5, 63.0, 1.5)),
+        PathingProbeResult::Blocked
+    );
+    // Swimmers are not terrain pathers; their aquatic steering is untouched.
+    assert_eq!(
+        probe.can_entity_stand_at(swimmer, Vec3::new(2.5, 63.0, 1.5)),
+        PathingProbeResult::Walkable
+    );
+}

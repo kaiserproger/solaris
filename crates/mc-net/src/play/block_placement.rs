@@ -135,6 +135,18 @@ pub(super) fn plan_block_placement(
             chest::placement(blocks, snapshot, pos, placed, player_pose, direction)?,
         );
     }
+
+    if placed.block.id.path().ends_with("_bed") {
+        return plan_bed_placement(
+            blocks,
+            snapshot,
+            pos,
+            target_state,
+            placed,
+            player_pose,
+            air,
+        );
+    }
     if is_stair_identity(placed) {
         if !matches!(
             classify_stair_state(blocks, placed_state),
@@ -982,6 +994,73 @@ pub(super) fn door_half_state(
     set_prop_if_present(&mut props, "open", "false");
     set_prop_if_present(&mut props, "powered", "false");
     blocks.by_name_and_props(&state.block.id, &props)
+}
+
+/// The bed state with one half selected, unoccupied and player-oriented —
+/// the bed counterpart of [`door_half_state`].
+pub(super) fn bed_half_state(
+    blocks: &BlockRegistry,
+    state: &BlockState,
+    part: &str,
+    facing: &str,
+) -> Option<BlockStateId> {
+    let mut props = state.properties.clone();
+    set_prop_if_present(&mut props, "part", part);
+    set_prop_if_present(&mut props, "facing", facing);
+    set_prop_if_present(&mut props, "occupied", "false");
+    blocks.by_name_and_props(&state.block.id, &props)
+}
+
+/// Vanilla `BedBlock.getPlacementState` + `setPlacedBy`: the clicked cell
+/// becomes the foot oriented along the player's horizontal facing and the
+/// head is pasted one step further along that facing. The head cell must be
+/// air exactly like the door's upper half; the generic snapshot positions
+/// already cache all four horizontal neighbours, so the head is readable.
+fn plan_bed_placement(
+    blocks: &BlockRegistry,
+    snapshot: &WorldReadSnapshot,
+    pos: BlockPos,
+    target_state: BlockStateId,
+    placed: &BlockState,
+    player_pose: PlayerPose,
+    air: BlockStateId,
+) -> Option<PlannedBlockPlacement> {
+    let facing = horizontal_facing_from_yaw(player_pose.yaw);
+    let (dx, dz) = super::beds::horizontal_step(facing)?;
+    let head_pos = BlockPos {
+        x: pos.x + dx,
+        z: pos.z + dz,
+        ..pos
+    };
+    let head_token = match snapshot.get_cached_block(head_pos) {
+        Some(state_id) if state_id == air => snapshot.block_mutation_token(head_pos),
+        Some(_) | None => None,
+    }?;
+    let foot = bed_half_state(blocks, placed, "foot", facing)?;
+    let head = bed_half_state(blocks, placed, "head", facing)?;
+    append_stair_transition_to_placement(
+        blocks,
+        snapshot,
+        pos,
+        target_state,
+        PlannedBlockPlacement {
+            edits: vec![
+                BlockEdit {
+                    pos,
+                    new_state: foot,
+                },
+                BlockEdit {
+                    pos: head_pos,
+                    new_state: head,
+                },
+            ],
+            additional_preconditions: vec![BlockEditPrecondition {
+                pos: head_pos,
+                expected_state: air,
+                expected_token: head_token,
+            }],
+        },
+    )
 }
 
 fn set_prop_if_present(props: &mut [(String, String)], name: &str, value: &str) {

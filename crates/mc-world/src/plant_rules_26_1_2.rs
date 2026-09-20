@@ -653,7 +653,135 @@ pub fn bonemeal_growth_edits(
     if let Some(edits) = stem_fruit_edits(blocks, world, pos, state) {
         return Some(edits);
     }
-    sapling_tree_edits(blocks, world, pos, state, tree_seed)
+    if let Some(edits) = sapling_tree_edits(blocks, world, pos, state, tree_seed) {
+        return Some(edits);
+    }
+    grass_block_bonemeal_edits(blocks, world, pos, state, tree_seed)
+}
+
+/// Vanilla 26.1 lets bone meal on `grass_block` roll a 45% attempt gate and then
+/// scatter vegetation in a random walk around the clicked block. Solaris keeps
+/// the gate and the ±3 neighbourhood reach but replaces the walk with
+/// deterministic picks derived from the tree seed: candidate supports are only
+/// grass_block/dirt-family soil with an air plant cell, the clicked grass_block
+/// itself is never edited, and a failed attempt plans nothing.
+pub fn grass_block_bonemeal_edits(
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
+    tree_seed: u64,
+) -> Option<Vec<PlantBlockEdit>> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() != "minecraft:grass_block" {
+        return None;
+    }
+    let air = named_block_default(blocks, "minecraft:air")?;
+    let above = crate::BlockPos {
+        y: pos.y.checked_add(1)?,
+        ..pos
+    };
+    if world.get_cached_block(above) != Some(air) {
+        return None;
+    }
+
+    const GRASS_BONEMEAL_SALT: u64 = 0x4752_4153_5353_5F45; // "GRASS_SE"
+    let attempt_seed = tree_seed ^ GRASS_BONEMEAL_SALT;
+    if splitmix64(attempt_seed) % 100 >= 45 {
+        return None;
+    }
+
+    let short_grass = named_block_default(blocks, "minecraft:short_grass")?;
+    let poppy = named_block_default(blocks, "minecraft:poppy")?;
+    let dandelion = named_block_default(blocks, "minecraft:dandelion")?;
+    let tall_grass_lower = named_block_default(blocks, "minecraft:tall_grass")?;
+    let tall_grass_upper =
+        tree_state_with_props(blocks, "minecraft:tall_grass", &[("half", "upper")])?;
+
+    let mut edits = Vec::new();
+    let mut placed = Vec::new();
+    for attempt in 0..8u64 {
+        let stream = attempt_seed ^ attempt.rotate_left(19);
+        let dx = (splitmix64(stream) % 7) as i32 - 3;
+        let dz = (splitmix64(stream.rotate_left(17)) % 7) as i32 - 3;
+        let dy = (splitmix64(stream.rotate_left(37)) % 5) as i32 - 3;
+        let (Some(soil_x), Some(soil_y), Some(soil_z)) = (
+            pos.x.checked_add(dx),
+            pos.y.checked_add(dy),
+            pos.z.checked_add(dz),
+        ) else {
+            continue;
+        };
+        let support = crate::BlockPos {
+            x: soil_x,
+            y: soil_y,
+            z: soil_z,
+        };
+        let Some(plant_y) = soil_y.checked_add(1) else {
+            continue;
+        };
+        let plant_cell = crate::BlockPos {
+            x: soil_x,
+            y: plant_y,
+            z: soil_z,
+        };
+        if placed.contains(&plant_cell) {
+            continue;
+        }
+        let supported = matches!(
+            world.get_cached_block(support).and_then(|soil| blocks.by_id(soil)),
+            Some(soil) if is_grass_scatter_support(soil.block.id.path())
+        );
+        if !supported || world.get_cached_block(plant_cell) != Some(air) {
+            continue;
+        }
+        match splitmix64(stream.rotate_left(53)) % 10 {
+            0 => {
+                let Some(top_y) = plant_y.checked_add(1) else {
+                    continue;
+                };
+                let top_cell = crate::BlockPos {
+                    x: soil_x,
+                    y: top_y,
+                    z: soil_z,
+                };
+                if world.get_cached_block(top_cell) != Some(air) {
+                    continue;
+                }
+                placed.push(top_cell);
+                edits.push(PlantBlockEdit {
+                    pos: plant_cell,
+                    new_state: tall_grass_lower,
+                });
+                edits.push(PlantBlockEdit {
+                    pos: top_cell,
+                    new_state: tall_grass_upper,
+                });
+            }
+            1 => edits.push(PlantBlockEdit {
+                pos: plant_cell,
+                new_state: poppy,
+            }),
+            2 => edits.push(PlantBlockEdit {
+                pos: plant_cell,
+                new_state: dandelion,
+            }),
+            _ => edits.push(PlantBlockEdit {
+                pos: plant_cell,
+                new_state: short_grass,
+            }),
+        }
+        placed.push(plant_cell);
+    }
+
+    if edits.is_empty() { None } else { Some(edits) }
+}
+
+fn is_grass_scatter_support(path: &str) -> bool {
+    matches!(
+        path,
+        "grass_block" | "dirt" | "coarse_dirt" | "rooted_dirt" | "podzol" | "mycelium"
+    )
 }
 
 pub fn stem_fruit_edits(

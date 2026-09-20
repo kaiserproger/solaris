@@ -32,7 +32,7 @@ use crate::settlement::{
     discover_settlement_deployment_with_hashes,
 };
 
-const OWNER: &str = "solaris-settlements";
+const OWNER: &str = "settlement-test";
 const SEED: i64 = 7;
 const WORLD_IDENTITY: &str = "settlement-wiring-world";
 
@@ -579,92 +579,4 @@ async fn one_home_poi_binds_at_most_one_resident_site() {
         .await
         .unwrap();
     assert_eq!(outcome.failure(), None, "re-reservation: {outcome:?}");
-}
-
-/// The vanilla block report the shipped catalog is validated against.
-///
-/// The search order is the server's own (`crates/mc-server/src/content_cache.rs`,
-/// `ContentSearch::candidates`): an explicit `SOLARIS_CONTENT_CACHE` first — an
-/// operator who names a cache does not want another standing in for it — then the
-/// standard managed cache (`$XDG_DATA_HOME`/`~/.local/share` +
-/// `solaris/content/<release>`), then the workspace sidecar `data/vanilla`. This
-/// helper only looks for `reports/blocks.json`, so unlike the server it does not
-/// re-run `validate_content_cache`'s completeness check; a machine with no cache
-/// is told exactly that instead of failing on a missing path.
-fn vanilla_blocks_report(repository: &Path) -> Vec<BlockReport> {
-    let mut roots = Vec::new();
-    if let Ok(dir) = std::env::var("SOLARIS_CONTENT_CACHE") {
-        roots.push(std::path::PathBuf::from(dir));
-    }
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
-        })
-    {
-        roots.push(
-            data_home
-                .join("solaris/content")
-                .join(mc_protocol::TARGET_RELEASE),
-        );
-    }
-    roots.push(repository.join("data/vanilla"));
-    let Some(path) = roots
-        .iter()
-        .map(|root| root.join("reports/blocks.json"))
-        .find(|path| path.is_file())
-    else {
-        panic!(
-            "no vanilla block report to validate the shipped catalog against; checked {roots:?} \
-             (run `mc-server content import` or tools/extract-vanilla-data.sh, or set \
-             SOLARIS_CONTENT_CACHE)"
-        );
-    };
-    mc_data::blocks::load_blocks_report(path).expect("the vanilla block report parses")
-}
-
-/// The shipped first-party package must pass the frozen loader unchanged.
-///
-/// Skipped only when the sibling plugin checkout is absent: the core repository
-/// never compiles authored data, so a missing sibling is not a failure. When it
-/// is present this pins the real `structures/*.toml` contract, including the
-/// `solaris:` content namespace of a `solaris-settlements` package.
-#[tokio::test]
-async fn shipped_settlement_package_is_accepted() {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let package_dir = repository.join("../solaris-default-plugins/solaris-settlements");
-    if !package_dir.is_dir() {
-        return;
-    }
-    let report = vanilla_blocks_report(&repository);
-    let registry = BlockRegistry::from_report(&report).unwrap();
-    let deployed = PluginPackage::new(
-        "solaris-settlements",
-        package_dir,
-        vec!["world_sites".to_owned(), "structure_operations".to_owned()],
-    );
-    let deployment = discover_settlement_deployment(&[deployed], &registry)
-        .expect("the shipped catalog validates")
-        .expect("the shipped package declares the settlement profile");
-    assert_eq!(deployment.plugin_id(), "solaris-settlements");
-
-    let runtime = runtime_for(&deployment);
-    let dir = tempfile::tempdir().unwrap();
-    let mut storage = PluginStorage::open(dir.path()).unwrap();
-    let outcome = runtime
-        .execute_settlement_operation(
-            &mut storage,
-            "solaris-settlements",
-            &settlement(ScriptSettlementOperation::ListSites {
-                cursor: None,
-                limit: 64,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(outcome.failure(), None, "list: {outcome:?}");
-    assert!(
-        !page_of(&outcome).is_empty(),
-        "the shipped catalog lays out at least one site"
-    );
 }

@@ -565,7 +565,11 @@ pub fn cancel_timer(timer_id: &str) -> Command {
 
 /// One diagnostic line.
 pub fn log(level: LogLevel, message: &str) {
+    #[cfg(target_arch = "wasm32")]
     host::log(level, message);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (level, message);
 }
 
 /// The plugin id the host bound to this instance.

@@ -148,13 +148,13 @@ fn supported_profession_offer(
         .world_read
         .get_cached_block(villager_job_site_block_pos(job_site))?;
     let block = &context.blocks.by_id(state)?.block.id;
-    match mc_data::villager_trades_26_1_2::supported_profession_for_job_site_26_1_2(block)? {
-        "toolsmith" => Some(mc_entity::RegionalVillagerProfessionOffer {
-            profession: mc_entity::VillagerProfession::Toolsmith,
-            merchant: cached_merchant?.clone(),
-        }),
-        _ => None,
-    }
+    let profession = mc_entity::VillagerProfession::from_name(
+        mc_data::villager_trades_26_1_2::supported_profession_for_job_site_26_1_2(block)?,
+    )?;
+    Some(mc_entity::RegionalVillagerProfessionOffer {
+        profession,
+        merchant: cached_merchant?.clone(),
+    })
 }
 
 fn regional_profession_offers_by_block_state(
@@ -1477,7 +1477,8 @@ impl SessionRegistry {
         Option<RegionallyCommittedEntityMovement>,
         mc_entity::LaneCommitTimings,
     ) {
-        let output = self.entities.commit_owned_region_physics(prepared);
+        let (output, fall_landings) = self.entities.commit_owned_region_physics(prepared);
+        super::entity_combat::resolve_entity_fall_damage(self, &fall_landings);
         self.simulation_inputs
             .insert_terrain_pathing(output.terrain_pathing_additions);
         let queries = output
@@ -1806,6 +1807,7 @@ impl SessionRegistry {
                     .iter()
                     .chain(&inner.natural_ground_mobs)
                     .chain(&inner.natural_aquatic_mobs)
+                    .chain(&inner.smooth_aquatic_mobs)
                     .copied()
                     .collect::<HashSet<_>>()
             };
@@ -2271,7 +2273,8 @@ impl SessionRegistry {
             let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
             let smooth_natural_mob = inner.natural_hostile_mobs.contains(&step.id)
                 || inner.natural_ground_mobs.contains(&step.id)
-                || inner.natural_aquatic_mobs.contains(&step.id);
+                || inner.natural_aquatic_mobs.contains(&step.id)
+                || inner.smooth_aquatic_mobs.contains(&step.id);
             if !ordinary_tracking_turn && !latency_sensitive && !smooth_natural_mob {
                 continue;
             }
@@ -2428,6 +2431,7 @@ impl SessionRegistry {
             && session_inner.natural_hostile_mobs.is_empty()
             && session_inner.natural_ground_mobs.is_empty()
             && session_inner.natural_aquatic_mobs.is_empty()
+            && session_inner.smooth_aquatic_mobs.is_empty()
         {
             None
         } else {
@@ -2438,9 +2442,9 @@ impl SessionRegistry {
                         motion.is_arrow
                             || motion.is_item
                             || motion.is_experience
-                            || session_inner.natural_hostile_mobs.contains(&motion.id)
                             || session_inner.natural_ground_mobs.contains(&motion.id)
                             || session_inner.natural_aquatic_mobs.contains(&motion.id)
+                            || session_inner.smooth_aquatic_mobs.contains(&motion.id)
                     })
                     .collect::<Vec<_>>(),
             )

@@ -1562,3 +1562,40 @@ fn serverbound_client_command_respawn_layout_matches_javap() {
     );
     assert!(cursor.is_empty());
 }
+
+#[test]
+fn serverbound_set_creative_mode_slot_id_and_layout_match_local_vanilla() {
+    // game-SB index 56 per `javap` of vanilla 26.1.2's GameProtocols
+    // serverbound builder, cross-checked against the pinned
+    // PLAYER_ACTION (41 = 0x29) and SET_CARRIED_ITEM (53 = 0x35) ids.
+    assert_eq!(ServerboundSetCreativeModeSlot::ID, 0x38);
+    let packet = ServerboundSetCreativeModeSlot {
+        slot: 36,
+        item_stack: ItemStack::new(1, 64),
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    // slot 36 as big-endian i16, then the ItemStack slot payload:
+    // count = 64 (0x40), item_id = 1, add-patch count 0, remove-patch
+    // count 0 — the vanilla `OPTIONAL_UNTRUSTED_STREAM_CODEC` layout.
+    assert_eq!(buf, vec![0x00, 0x24, 0x40, 0x01, 0x00, 0x00]);
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundSetCreativeModeSlot::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_set_creative_mode_slot_round_trip() {
+    round_trip(ServerboundSetCreativeModeSlot {
+        slot: 45,
+        item_stack: ItemStack::new(28, 64).with_damage(7),
+    });
+    // Creative drop/destroy action: negative slot, empty payload.
+    round_trip(ServerboundSetCreativeModeSlot {
+        slot: -1,
+        item_stack: ItemStack::EMPTY,
+    });
+}

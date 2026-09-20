@@ -5047,18 +5047,20 @@ fn loaded_chunk_pathing_probe_supports_an_exact_fence_top_contact() {
 }
 
 #[test]
-fn loaded_chunk_pathing_probe_keeps_bottom_layer_fluid_walkable() {
+fn loaded_chunk_pathing_probe_blocks_fluid_cells_for_ground_pathers() {
     let water = vanilla_block_state_id("minecraft:water", &[("level", "0")]);
     let (world_read, materials) =
         vanilla_collision_pathing_world(&[(1, mc_world::chunk::MIN_Y, 1, water)]);
     let materials = materials.with_water_states(vec![water]);
     with_terrain_pathing_probe(&world_read, &materials, |probe, entity_id| {
+        // Ground mobs must not plan through fluid: a fluid-touch cell is an
+        // obstacle for terrain pathing, even at the world's bottom layer.
         assert_eq!(
             probe.can_entity_stand_at(
                 entity_id,
                 Vec3::new(1.5, f64::from(mc_world::chunk::MIN_Y), 1.5),
             ),
-            PathingProbeResult::Walkable
+            PathingProbeResult::Blocked
         );
     });
 }
@@ -9696,6 +9698,7 @@ fn moving_arrow_damages_player_target_but_not_owner() {
         PlayerPose::new(0.5, 64.0, 1.5),
     )));
     registry.register_player_persistence(target_id, Arc::clone(&target_state));
+    registry.clear_closing_sessions_for_test();
     let arrow_id = match &registry.spawn_arrow_for_test(
         Some(owner_id),
         1,
@@ -9815,6 +9818,7 @@ fn shielded_player_hit_commits_shield_and_arrow_state_together() {
         .get_mut(&target)
         .expect("shield target remains registered")
         .tx = target_tx;
+    registry.clear_closing_sessions_for_test();
 
     registry.apply_entity_physics_and_dispatch(
         10,
@@ -11092,6 +11096,42 @@ fn compatible_ready_item_drops_merge_once_and_publish_exact_survivor() {
         &dispatch.command,
         OutboundCommand::DespawnEntity(snapshot) if snapshot.id == second_id
     )));
+}
+
+#[test]
+fn item_merge_sweep_examines_bounded_work_for_large_piles() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    let observer = register_test_session(&registry, "MergeBudgetObserver");
+    assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+    // Far more compatible drops in one pile than a single sweep may examine.
+    // Without the scan budget every drop would merge away in this one sweep.
+    let drops = 600;
+    for _ in 0..drops {
+        registry.spawn_item_drop(1, Vec3::new(10.5, 64.0, 0.5), EntityItemStack::new(42, 1));
+    }
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS + 1);
+
+    let dispatches = registry.item_pickup_ready_dispatches_owned(
+        &SimulationAuthority::for_test(),
+        ITEM_PICKUP_DELAY_TICKS + 1,
+    );
+
+    let merged = dispatches
+        .iter()
+        .filter(|dispatch| matches!(dispatch.command, OutboundCommand::DespawnEntity(_)))
+        .count();
+    assert!(merged > 0, "the sweep must still make merge progress");
+    let remaining = registry
+        .lock_entities("count remaining pile items")
+        .snapshots_vec()
+        .iter()
+        .filter(|entity| entity.type_name == "minecraft:item")
+        .count();
+    assert!(
+        remaining > drops / 2,
+        "one merge sweep must not consume an unbounded pile: merged {merged} of {drops}"
+    );
 }
 
 #[test]
@@ -14292,6 +14332,76 @@ async fn reliable_visibility_backlog_overflow_closes_session() {
         start.reliable_command_retries_in_flight
     );
 }
+#[tokio::test]
+async fn reliable_backlog_overflow_shed_is_terminal_until_disconnect() {
+    let registry = SessionRegistry::new();
+    let start = registry.pressure_snapshot();
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+        .expect("fill recipient queue");
+    let pressure_metrics = test_pressure(&registry);
+    let retry_completed = pressure_metrics.reliable_retry_completed.notified();
+    let recipient = test_recipient(&registry, 98, tx);
+    let spawn_dispatch = |index: u64| VisibilityDispatch {
+        recipient: recipient.clone(),
+        command: OutboundCommand::SpawnPlayer(PlayerEntitySnapshot {
+            session_id: 9_800 + index,
+            entity_id: i32::try_from(9_800 + index).unwrap(),
+            uuid: uuid::Uuid::nil(),
+            name: format!("TerminalShed{index}"),
+            properties: Vec::new(),
+            pose: PlayerPose::new(0.5, 64.0, 0.5),
+            game_mode: GameMode::Survival,
+        }),
+    };
+
+    dispatch_visibility_commands((0..17).map(spawn_dispatch).collect());
+
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
+    ));
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::DisconnectPlayer { reason })
+            if reason == RELIABLE_RETRY_OVERFLOW_REASON
+    ));
+    retry_completed.await;
+
+    // Once the backlog shed, further reliable traffic must be dropped
+    // without re-arming another retry queue, shedding again, or growing the
+    // drop counters. Repeated sheds were the kick loop: the close never
+    // became terminal.
+    dispatch_visibility_commands(vec![spawn_dispatch(30)]);
+    let pressure = registry.pressure_snapshot();
+    assert_eq!(
+        pressure.reliable_command_retries,
+        start.reliable_command_retries + 1
+    );
+    assert_eq!(
+        pressure.reliable_command_drops,
+        start.reliable_command_drops + 17
+    );
+    assert_eq!(
+        pressure.slow_client_pressure_sheds,
+        start.slow_client_pressure_sheds + 1
+    );
+    assert!(rx.try_recv().is_err(), "closing session must stay quiet");
+
+    // The disconnect command itself must still pass so the announced kick
+    // stays deliverable.
+    dispatch_visibility_commands(vec![VisibilityDispatch {
+        recipient: recipient.clone(),
+        command: OutboundCommand::DisconnectPlayer {
+            reason: "terminal kick".to_string(),
+        },
+    }]);
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::DisconnectPlayer { reason })
+            if reason == "terminal kick"
+    ));
+}
 
 #[tokio::test]
 async fn disconnect_player_retries_are_bounded_per_slow_recipient() {
@@ -15167,4 +15277,356 @@ fn squid_first_melee_hit_damages_and_notifies_observers() {
             "{type_name} first hit must publish updated health"
         );
     }
+}
+
+#[tokio::test]
+async fn coalescing_position_then_velocity_keeps_queued_velocity() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+        .expect("fill recipient queue");
+    let recipient = test_recipient(&registry, 96, tx);
+    let movement = |position_x: f64, velocity: Vec3, send_velocity: bool| ServerEntityMove {
+        id: EntityId(42),
+        position: Vec3::new(position_x, 64.0, 0.0),
+        wire_move: Some(crate::play::wire_entities::ServerEntityWireMove::Position {
+            delta: Vec3::new(position_x, 0.0, 0.0),
+        }),
+        velocity,
+        rotation: Rotation::ZERO,
+        on_ground: true,
+        send_velocity,
+        send_head_rotation: false,
+    };
+
+    dispatch_visibility_commands(vec![
+        VisibilityDispatch {
+            recipient: recipient.clone(),
+            command: OutboundCommand::MoveEntityRelative(movement(0.25, Vec3::ZERO, false)),
+        },
+        VisibilityDispatch {
+            recipient,
+            command: OutboundCommand::MoveEntityRelative(movement(
+                0.5,
+                Vec3::new(0.4, 0.3, 0.0),
+                true,
+            )),
+        },
+    ]);
+
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
+    ));
+    let movement = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("movement backlog must progress before the failure timeout");
+    assert!(matches!(
+        movement,
+        Some(OutboundCommand::MoveEntitiesRelative(movements))
+            if matches!(
+                movements.as_slice(),
+                [ServerEntityMove {
+                    velocity,
+                    send_velocity: true,
+                    ..
+                }] if *velocity == Vec3::new(0.4, 0.3, 0.0)
+            )
+    ));
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn coalescing_velocity_then_position_keeps_velocity_and_newest_position() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+        .expect("fill recipient queue");
+    let recipient = test_recipient(&registry, 96, tx);
+    let movement = |position_x: f64, velocity: Vec3, send_velocity: bool| ServerEntityMove {
+        id: EntityId(42),
+        position: Vec3::new(position_x, 64.0, 0.0),
+        wire_move: Some(crate::play::wire_entities::ServerEntityWireMove::Position {
+            delta: Vec3::new(position_x, 0.0, 0.0),
+        }),
+        velocity,
+        rotation: Rotation::ZERO,
+        on_ground: true,
+        send_velocity,
+        send_head_rotation: false,
+    };
+
+    dispatch_visibility_commands(vec![
+        VisibilityDispatch {
+            recipient: recipient.clone(),
+            command: OutboundCommand::MoveEntityRelative(movement(
+                0.25,
+                Vec3::new(0.4, 0.3, 0.0),
+                true,
+            )),
+        },
+        VisibilityDispatch {
+            recipient,
+            command: OutboundCommand::MoveEntityRelative(movement(0.5, Vec3::ZERO, false)),
+        },
+    ]);
+
+    assert!(matches!(
+        rx.recv().await,
+        Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
+    ));
+    let movement = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("movement backlog must progress before the failure timeout");
+    assert!(matches!(
+        movement,
+        Some(OutboundCommand::MoveEntitiesRelative(movements))
+            if matches!(
+                movements.as_slice(),
+                [ServerEntityMove {
+                    position,
+                    velocity,
+                    send_velocity: true,
+                    wire_move: Some(crate::play::wire_entities::ServerEntityWireMove::Absolute {
+                        position: absolute,
+                    }),
+                    ..
+                }] if *velocity == Vec3::new(0.4, 0.3, 0.0)
+                    && *position == Vec3::new(0.5, 64.0, 0.0)
+                    && *absolute == Vec3::new(0.5, 64.0, 0.0)
+            )
+    ));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn owner_item_pickup_block_expires_after_vanilla_40_ticks() {
+    let registry = SessionRegistry::new();
+    let owner = register_test_session(&registry, "OwnerBlockOwner");
+    let item_id = {
+        let mut entities = registry.lock_entities("seed owner-block item");
+        let mut drop = mc_entity::SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.0, 0.5));
+        drop.item_stack = Some(mc_entity::EntityItemStack::new(1, 3));
+        entities.spawn(drop)
+    };
+
+    super::pickups::block_item_pickup_for_owner_locked(
+        &mut registry.lock_session_entities("apply owner block"),
+        item_id,
+        owner,
+    );
+
+    let entities = registry.lock_entities("inspect owner block expiry");
+    let snapshot = entities.snapshot(item_id).expect("item entity exists");
+    let block = snapshot
+        .retained
+        .item_pickup_owner_block
+        .expect("owner block retained");
+    assert_eq!(block.owner_session, owner);
+    assert_eq!(
+        block.expires_tick, 40,
+        "vanilla player drop pickup delay is 40 ticks (2s), not 100"
+    );
+}
+
+fn throwable_release_test_plan(
+    game_mode: GameMode,
+    held_slot: usize,
+    expected_held: ItemStack,
+) -> crate::play::simulation::ThrowableItemReleasePlan {
+    crate::play::simulation::ThrowableItemReleasePlan {
+        held_slot,
+        expected_held,
+        game_mode,
+        entity_type_id: 120,
+        entity_type_name: "minecraft:snowball".to_owned(),
+        position: Vec3::new(0.5, 65.62, 0.5),
+        velocity: Vec3::new(0.0, 0.0, 1.5),
+        rotation: Rotation {
+            yaw: 180.0,
+            pitch: 0.0,
+            head_yaw: 180.0,
+        },
+    }
+}
+
+#[test]
+fn commit_throwable_item_release_spawns_snowball_and_debits_one_in_survival() {
+    let registry = SessionRegistry::new();
+    let session = register_test_session(&registry, "SnowballThrower");
+    let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5));
+    persisted.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(1, 16);
+    registry.register_player_persistence(session, Arc::new(Mutex::new(persisted)));
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+
+    let committed = registry
+        .commit_throwable_item_release(
+            &SimulationAuthority::for_test(),
+            session,
+            &throwable_release_test_plan(
+                GameMode::Survival,
+                PlayerInventory::HOTBAR_BASE,
+                ItemStack::new(1, 16),
+            ),
+        )
+        .expect("survival snowball release commits");
+
+    assert_eq!(
+        committed.changed_slots,
+        vec![(PlayerInventory::HOTBAR_BASE, ItemStack::new(1, 15))]
+    );
+    assert!(!committed.dispatches.is_empty());
+    let snowball_id = committed
+        .dispatches
+        .iter()
+        .filter_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(entity) => Some(entity.id),
+            _ => None,
+        })
+        .next()
+        .expect("snowball spawn dispatch");
+    let entities = registry.lock_entities("inspect committed snowball");
+    let snapshot = entities.snapshot(snowball_id).expect("snowball exists");
+    assert_eq!(snapshot.type_name, "minecraft:snowball");
+    assert_eq!(snapshot.velocity, Vec3::new(0.0, 0.0, 1.5));
+    assert!(snapshot.retained.throwable_projectile_state.is_some());
+    assert_eq!(
+        committed.inventory.slots[PlayerInventory::HOTBAR_BASE].count,
+        15
+    );
+}
+
+#[test]
+fn commit_throwable_item_release_in_creative_spawns_without_debiting() {
+    let registry = SessionRegistry::new();
+    let session = register_test_session(&registry, "CreativeSnowballThrower");
+    let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5));
+    persisted.game_mode = GameMode::Creative;
+    persisted.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(1, 16);
+    registry.register_player_persistence(session, Arc::new(Mutex::new(persisted)));
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+
+    let committed = registry
+        .commit_throwable_item_release(
+            &SimulationAuthority::for_test(),
+            session,
+            &throwable_release_test_plan(
+                GameMode::Creative,
+                PlayerInventory::HOTBAR_BASE,
+                ItemStack::new(1, 16),
+            ),
+        )
+        .expect("creative snowball release commits");
+
+    assert!(committed.changed_slots.is_empty());
+    assert_eq!(
+        committed.inventory.slots[PlayerInventory::HOTBAR_BASE].count,
+        16
+    );
+    assert!(!committed.dispatches.is_empty());
+}
+
+#[test]
+fn commit_boat_placement_spawns_vehicle_and_debits_one_in_survival() {
+    let registry = SessionRegistry::new();
+    let session = register_test_session(&registry, "BoatPlacer");
+    let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5));
+    persisted.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(1, 1);
+    registry.register_player_persistence(session, Arc::new(Mutex::new(persisted)));
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+
+    let committed = registry
+        .commit_boat_placement(
+            &SimulationAuthority::for_test(),
+            session,
+            &crate::play::simulation::BoatPlacementPlan {
+                held_slot: PlayerInventory::HOTBAR_BASE,
+                expected_held: ItemStack::new(1, 1),
+                game_mode: GameMode::Survival,
+                entity_type_id: 89,
+                entity_type_name: "minecraft:oak_boat".to_owned(),
+                position: Vec3::new(4.5, 64.0, 4.5),
+                rotation: Rotation {
+                    yaw: 90.0,
+                    pitch: 0.0,
+                    head_yaw: 90.0,
+                },
+            },
+        )
+        .expect("survival boat placement commits");
+
+    assert_eq!(
+        committed.changed_slots,
+        vec![(PlayerInventory::HOTBAR_BASE, ItemStack::EMPTY)]
+    );
+    assert!(!committed.dispatches.is_empty());
+    let boat_id = committed
+        .dispatches
+        .iter()
+        .filter_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(entity) => Some(entity.id),
+            _ => None,
+        })
+        .next()
+        .expect("boat spawn dispatch");
+    let entities = registry.lock_entities("inspect committed boat");
+    let snapshot = entities.snapshot(boat_id).expect("boat exists");
+    assert_eq!(snapshot.type_name, "minecraft:oak_boat");
+    assert_eq!(
+        snapshot.vehicle,
+        Some(mc_entity::VehicleState {
+            kind: mc_entity::VehicleKind::Boat,
+            passenger: None,
+        })
+    );
+    assert_eq!(snapshot.rotation.yaw, 90.0);
+}
+
+#[test]
+fn command_spawned_aquatic_mobs_join_smooth_publication_set() {
+    let registry = SessionRegistry::new();
+    let viewer = register_test_session(&registry, "AquaSpawner");
+    assert!(registry.mark_loaded(viewer, (0, 0)).is_empty());
+    let dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:salmon".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    let salmon = match &dispatches[0].command {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected salmon spawn dispatch, got {other:?}"),
+    };
+
+    assert!(
+        registry
+            .lock_inner("inspect smooth aquatic membership")
+            .smooth_aquatic_mobs
+            .contains(&salmon),
+        "command-spawned fish must publish every tick"
+    );
+    assert!(
+        !registry
+            .lock_inner("inspect natural aquatic membership")
+            .natural_aquatic_mobs
+            .contains(&salmon),
+        "command spawns must stay out of natural despawn/cap accounting"
+    );
+
+    let cow_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        4,
+        "minecraft:cow".to_owned(),
+        Vec3::new(1.5, 64.0, 0.5),
+    );
+    let cow = match &cow_dispatches[0].command {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected cow spawn dispatch, got {other:?}"),
+    };
+    assert!(
+        !registry
+            .lock_inner("inspect smooth aquatic membership for cow")
+            .smooth_aquatic_mobs
+            .contains(&cow)
+    );
 }

@@ -98,6 +98,7 @@ mod powder_snow_long_fall;
 mod real_door_sidecar;
 mod redstone_pistons;
 mod rejected_inventory_drag;
+mod respawn_validation;
 mod scheduled_buttons;
 mod scheduled_hoppers;
 mod script_inventory_owner;
@@ -495,6 +496,7 @@ fn crop_test_registry() -> mc_world::BlockRegistry {
     mc_world::BlockRegistry::from_report(&crop_test_reports()).unwrap()
 }
 
+/// Flowing fluid blockstates: `level` 0..=max_level on contiguous ids.
 fn fluid_block(first_id: u32, name: &str, max_level: u8) -> BlockReport {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -516,12 +518,33 @@ fn fluid_block(first_id: u32, name: &str, max_level: u8) -> BlockReport {
     }
 }
 
+/// [`fluid_block`] plus the vanilla falling state (level 8) at
+/// `falling_id`, kept out of the contiguous range so long-standing state
+/// ids stay stable.
+fn fluid_block_with_falling(
+    first_id: u32,
+    name: &str,
+    max_level: u8,
+    falling_id: u32,
+) -> BlockReport {
+    let mut report = fluid_block(first_id, name, max_level);
+    report
+        .properties
+        .get_mut("level")
+        .expect("fluid blocks have a level property")
+        .push("8".to_string());
+    report
+        .states
+        .push(state(falling_id, false, &[("level", "8")]));
+    report
+}
+
 fn fluid_test_reports() -> Vec<BlockReport> {
     vec![
         simple_block(0, "minecraft:air"),
         simple_block(1, "minecraft:stone"),
-        fluid_block(2, "minecraft:water", 7),
-        fluid_block(10, "minecraft:lava", 3),
+        fluid_block_with_falling(2, "minecraft:water", 7, 27),
+        fluid_block_with_falling(10, "minecraft:lava", 3, 28),
         simple_block(14, "minecraft:obsidian"),
         simple_block(15, "minecraft:cobblestone"),
         simple_block(16, "minecraft:sand"),

@@ -230,10 +230,9 @@ pub(crate) fn discover_settlement_deployment_with_hashes(
         });
     }
     let files = read_blueprint_files(owner.plugin_id(), &directory)?;
-    // Authored ids use the package's content namespace, which is not always the
-    // package id (`solaris-settlements` ships `solaris:*` blueprints). The
-    // namespace is taken from the catalog itself and every file must agree with
-    // it, so the loader still rejects a mixed or foreign namespace.
+    // A catalog's content namespace need not match its package id. The namespace
+    // comes from the catalog itself and every file must agree with it, so the
+    // loader rejects mixed or foreign namespaces.
     let namespace = catalog_namespace(&files).unwrap_or_else(|| owner.plugin_id().to_owned());
     let catalog =
         BlueprintCatalog::from_files_with_hashes(registry, &namespace, &files, expected_hashes)

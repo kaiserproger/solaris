@@ -541,6 +541,7 @@ impl StructureTemplate {
         let parsed = parse_blocks(path, require(compound, path, "blocks")?, &palette, registry)?;
         let mut template = Self::new(size, parsed.blocks);
         template.villager_markers = parsed.villager_markers;
+        template.chests = parsed.chests;
         template.jigsaws = parsed.jigsaws;
         template.entities = parse_entities(path, compound)?;
         Ok(template)
@@ -1265,6 +1266,7 @@ struct ParsedBlocks {
     blocks: Vec<TemplateBlock>,
     villager_markers: Vec<[i32; 3]>,
     jigsaws: Vec<TemplateJigsaw>,
+    chests: Vec<TemplateChest>,
 }
 
 fn parse_blocks(
@@ -1277,6 +1279,7 @@ fn parse_blocks(
     let mut blocks = Vec::new();
     let mut villager_markers = Vec::new();
     let mut jigsaws = Vec::new();
+    let mut chests = Vec::new();
     for entry in &list.elements {
         let compound = expect_compound(path, entry, "blocks[]")?;
         let pos = expect_int_triplet(path, require(compound, path, "pos")?, "blocks[].pos")?;
@@ -1291,6 +1294,19 @@ fn parse_blocks(
         match state {
             TemplatePaletteEntry::Block(state) => {
                 blocks.push(TemplateBlock { pos, state: *state });
+                // Vanilla `StructureTemplate` stores every block's parsed
+                // block-entity payload in `blocks[].nbt`; this loader used to
+                // read it only for jigsaws, so village chest blocks pasted as
+                // BE-less states (invisible to the client). Lift chest
+                // containers here so `place_piece` pastes them through
+                // `PieceWriter::set_chest` like the hand-declared toolsmith
+                // chest. Bed halves need no lift: vanilla's bed block entity
+                // carries no payload (the colour lives in the block id, e.g.
+                // `white_bed`), and `mc_world::wire::client_block_entities`
+                // synthesizes the client-render record from the block state.
+                if let Some(chest) = template_chest_from_nbt(pos, compound, registry, *state) {
+                    chests.push(chest);
+                }
             }
             TemplatePaletteEntry::Jigsaw(jigsaw_state) => {
                 let jigsaw = parse_template_jigsaw(path, pos, *jigsaw_state, compound, registry)?;
@@ -1306,6 +1322,50 @@ fn parse_blocks(
         blocks,
         villager_markers,
         jigsaws,
+        chests,
+    })
+}
+
+/// A template chest block's paste-time entity: the `LootTable` the vanilla
+/// village templates author on their chests (`blocks[].nbt`), with empty fixed
+/// contents because vanilla rolls the table at paste time instead of shipping
+/// stacks. `LootTableSeed` is deliberately ignored — `place_piece` re-draws it
+/// from the structure's placement random. Only chest-family containers lift;
+/// the templates' other block entities are either payloadless (beds — their
+/// client-render record is synthesized from the block state at wire time) or
+/// unmodelled here.
+fn template_chest_from_nbt(
+    pos: [i32; 3],
+    compound: &[(String, Tag)],
+    registry: &BlockRegistry,
+    state: BlockStateId,
+) -> Option<TemplateChest> {
+    if !registry
+        .by_id(state)
+        .is_some_and(|state| matches!(state.block.id.path(), "chest" | "trapped_chest"))
+    {
+        return None;
+    }
+    let nbt = compound
+        .iter()
+        .find(|(key, _)| key == "nbt")
+        .and_then(|(_, tag)| match tag {
+            Tag::Compound(fields) => Some(fields),
+            _ => None,
+        })?;
+    let loot_table = nbt.iter().find_map(|(key, value)| {
+        if key == "LootTable"
+            && let Tag::String(text) = value
+        {
+            Identifier::parse(text.clone()).ok()
+        } else {
+            None
+        }
+    });
+    Some(TemplateChest {
+        pos,
+        chest: ChestBlockEntity::default(),
+        loot_table,
     })
 }
 
@@ -1564,6 +1624,8 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use mc_data::blocks::{BlockReport, BlockStateReport};
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
@@ -1682,6 +1744,126 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn template_chest_nbt_lifts_loot_table_and_skips_undeclared_blocks() {
+        let registry = BlockRegistry::from_report(&[
+            BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:chest").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 1,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 2,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+        ])
+        .unwrap();
+        let root = Tag::Compound(vec![
+            ("size".into(), Tag::List(int_triplet([1, 2, 3]))),
+            (
+                "palette".into(),
+                Tag::List(mc_nbt::ListTag {
+                    element_type: mc_nbt::tag_type::COMPOUND,
+                    elements: vec![
+                        Tag::Compound(vec![("Name".into(), Tag::String("minecraft:air".into()))]),
+                        Tag::Compound(vec![("Name".into(), Tag::String("minecraft:chest".into()))]),
+                        Tag::Compound(vec![("Name".into(), Tag::String("minecraft:stone".into()))]),
+                    ],
+                }),
+            ),
+            (
+                "blocks".into(),
+                Tag::List(mc_nbt::ListTag {
+                    element_type: mc_nbt::tag_type::COMPOUND,
+                    elements: vec![
+                        Tag::Compound(vec![
+                            ("pos".into(), Tag::List(int_triplet([0, 0, 0]))),
+                            ("state".into(), Tag::Int(0)),
+                        ]),
+                        // The village small-house chest: block state plus a
+                        // loot-table payload the loader must keep.
+                        Tag::Compound(vec![
+                            ("pos".into(), Tag::List(int_triplet([0, 0, 1]))),
+                            ("state".into(), Tag::Int(1)),
+                            (
+                                "nbt".into(),
+                                Tag::Compound(vec![
+                                    ("id".into(), Tag::String("minecraft:chest".into())),
+                                    (
+                                        "LootTable".into(),
+                                        Tag::String(
+                                            "minecraft:chests/village/village_plains_house".into(),
+                                        ),
+                                    ),
+                                ]),
+                            ),
+                        ]),
+                        // A chest block with no block-entity payload stays
+                        // BE-less: only template-declared containers lift.
+                        Tag::Compound(vec![
+                            ("pos".into(), Tag::List(int_triplet([0, 0, 2]))),
+                            ("state".into(), Tag::Int(1)),
+                        ]),
+                        // A non-chest block's payload is not a chest.
+                        Tag::Compound(vec![
+                            ("pos".into(), Tag::List(int_triplet([0, 1, 0]))),
+                            ("state".into(), Tag::Int(2)),
+                            (
+                                "nbt".into(),
+                                Tag::Compound(vec![(
+                                    "id".into(),
+                                    Tag::String("minecraft:bed".into()),
+                                )]),
+                            ),
+                        ]),
+                    ],
+                }),
+            ),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("village_chest.nbt");
+        std::fs::write(&path, named_nbt_bytes(&root)).unwrap();
+
+        let template = StructureTemplate::from_nbt_file(&path, &registry).unwrap();
+
+        assert_eq!(
+            template.chests(),
+            &[TemplateChest {
+                pos: [0, 0, 1],
+                chest: ChestBlockEntity::default(),
+                loot_table: Some(
+                    Identifier::parse("minecraft:chests/village/village_plains_house").unwrap()
+                ),
+            }],
+            "exactly the template-declared chest lifts, with its loot table"
+        );
+    }
+
+    fn int_triplet(values: [i32; 3]) -> mc_nbt::ListTag {
+        mc_nbt::ListTag {
+            element_type: mc_nbt::tag_type::INT,
+            elements: values.into_iter().map(Tag::Int).collect(),
+        }
     }
 
     #[test]

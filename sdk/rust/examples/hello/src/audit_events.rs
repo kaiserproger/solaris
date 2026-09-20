@@ -1,12 +1,12 @@
-//! P3 audit fixture: the world observations `solaris-audit` records, delivered to a
-//! component instead of Luau.
+//! P3 audit fixture: world observations delivered to a test component instead of
+//! a product guest.
 //!
-//! `mode = "audit-events"` runs this module. It is the audit consumer's own shape,
+//! `mode = "audit-events"` runs this module. It is a bounded audit consumer
 //! reduced to what a test can read off the wire: every world observation the
 //! package subscribed to is appended to a bounded history with the tick of the
-//! batch that carried it - the audit's own monotonic stamp - and reported twice,
-//! once as the observation arrives and once when a player asks for the history with
-//! `audit report`.
+//! batch that carried it - the fixture's monotonic stamp - and reported twice,
+//! once as the observation arrives and once when a player asks for the history
+//! with `audit report`.
 //!
 //! The tick is the batch's `EventContext`, not an event of its own. The server's
 //! pushed simulation tick is the clock the host stamps every batch with (and the

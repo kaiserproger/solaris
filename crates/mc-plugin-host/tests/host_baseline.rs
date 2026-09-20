@@ -21,6 +21,9 @@
 
 mod fixture;
 
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mc_plugin_host::bindings::exports::solaris::plugin::events::{
@@ -28,9 +31,10 @@ use mc_plugin_host::bindings::exports::solaris::plugin::events::{
 };
 use mc_plugin_host::bindings::exports::solaris::plugin::lifecycle::InitContext;
 use mc_plugin_host::{
-    CompiledPlugin, HostServices, LogLevel, PluginInstance, PluginLimits, PluginStartup, engine,
-    linker,
+    CompiledPlugin, DeploymentConfig, DiscoveryMode, HostQueues, HostServices, LogLevel,
+    PlayerSessions, PluginInstance, PluginLimits, PluginStartup, engine, linker, start_deployment,
 };
+use mc_script::{ScriptCommand, ScriptEvent, ScriptPlayerContext, ScriptPlayerId};
 
 /// The plugin id the baseline instance is bound to.
 const PLUGIN_ID: &str = "hello";
@@ -79,6 +83,45 @@ impl HostServices for Services {
     fn plugin_id(&self) -> &str {
         &self.id
     }
+}
+
+/// The live-session lookup the deployment path needs for event admission.
+struct Sessions;
+
+impl PlayerSessions for Sessions {
+    fn session_of(&self, player: &str) -> Option<u64> {
+        (player == PLAYER).then_some(SESSION)
+    }
+}
+
+/// Build the same strict package directory an operator deploys.
+fn write_package(root: &Path, bytes: &[u8]) {
+    let package = root.join(PLUGIN_ID);
+    std::fs::create_dir_all(&package).expect("package directory");
+    std::fs::write(
+        package.join("plugin.toml"),
+        format!(
+            "id = \"{PLUGIN_ID}\"\nname = \"P0 baseline\"\nversion = \"0.1.0\"\napi = \"{API_VERSION}\"\nevents = [\"player.joined\"]\nplayer_commands = [\"hello\"]\n"
+        ),
+    )
+    .expect("package manifest");
+    std::fs::write(package.join("plugin.wasm"), bytes).expect("component artifact");
+    std::fs::write(package.join("config.toml"), CONFIG).expect("package configuration");
+}
+
+/// Kernel-provided CPU model, retained as measurement context rather than a
+/// portability assertion.
+fn cpu_model() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|cpuinfo| {
+            cpuinfo.lines().find_map(|line| {
+                line.split_once(':')
+                    .filter(|(key, _)| key.trim() == "model name")
+                    .map(|(_, value)| value.trim().to_owned())
+            })
+        })
+        .unwrap_or_else(|| "unreported".to_owned())
 }
 
 /// The process's peak resident set, in KiB, as the kernel reports it.
@@ -133,8 +176,8 @@ fn joined_context() -> EventContext {
     }
 }
 
-#[test]
-fn the_p0_baseline_reports_what_a_callback_compile_and_instance_cost() {
+#[tokio::test]
+async fn the_p0_baseline_reports_what_a_callback_compile_and_instance_cost() {
     // The first sample is taken before this process has touched a component, so
     // the second one is the peak that hosting an instance added.
     let peak_before_kib = peak_rss_kib();
@@ -275,7 +318,83 @@ fn the_p0_baseline_reports_what_a_callback_compile_and_instance_cost() {
     let calls_hosted = plugin.state().calls();
     let guest_log_lines = plugin.state().services().lines;
 
+    // The deployment measurement uses a package directory and the real bounded
+    // queues. It is deliberately separate from the direct callback sample above:
+    // its counters describe the worker path, while callback percentiles remain a
+    // single-store workload.
+    let root = tempfile::tempdir().expect("deployment root");
+    write_package(root.path(), &bytes);
+    let queues = HostQueues::default();
+    let deployment = mc_plugin_host::discover(
+        &DeploymentConfig {
+            root: root.path().to_path_buf(),
+            mode: DiscoveryMode::Strict,
+            expected: vec![PLUGIN_ID.to_owned()],
+            grants: BTreeMap::new(),
+            require_grants: false,
+            precommit_hooks: Vec::new(),
+        },
+        &limits,
+    )
+    .expect("strict package discovery")
+    .into_packages();
+    let host = start_deployment(deployment, limits, queues, Arc::new(Sessions))
+        .expect("the bounded deployment starts");
+    let boundary = host.boundary().clone();
+    let player = ScriptPlayerContext::try_new(PLAYER, PLAYER_NAME, false, 0.0, 64.0, 0.0)
+        .expect("baseline player context");
+    boundary
+        .try_enqueue_event(ScriptEvent::player_joined_with_context(
+            ScriptPlayerId::new(SESSION),
+            player,
+        ))
+        .expect("the measured event enters the bounded queue");
+    let command = match tokio::time::timeout(Duration::from_secs(10), boundary.recv_command()).await
+    {
+        Ok(Some(command)) => command,
+        Ok(None) => {
+            let _ = host.stop();
+            panic!("the deployment closed its command channel before answering");
+        }
+        Err(_) => {
+            let _ = host.stop();
+            panic!("the deployment did not answer the queued event");
+        }
+    };
+    assert!(
+        matches!(command, ScriptCommand::HostAttached { .. }),
+        "the worker publishes host-owned, admitted output"
+    );
+    let deployment_counters = host.stop();
+    assert_eq!(deployment_counters.len(), 1, "one package was hosted");
+    let (_, deployment_counters) = &deployment_counters[0];
+    assert_eq!(
+        deployment_counters.events_delivered, 1,
+        "the worker delivered the one measured event"
+    );
+    assert_eq!(
+        deployment_counters.commands_submitted, 1,
+        "the worker admitted the fixture's one command"
+    );
+    assert_eq!(
+        deployment_counters.commands_refused, 0,
+        "the baseline workload stays within every admission bound"
+    );
+
     println!("--- P0 host baseline (mc-plugin-host) ---");
+    println!(
+        "environment: {} {} | target {} | CPU {} | logical CPUs {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::var("TARGET").unwrap_or_else(|_| "test profile target unreported".to_owned()),
+        cpu_model(),
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(0),
+    );
+    println!(
+        "build: cargo test debug profile; world seed: n/a (host-only component workload opens no world)"
+    );
     println!(
         "guest: fixture component, {} bytes, contract {API_VERSION}",
         bytes.len()
@@ -307,12 +426,20 @@ fn the_p0_baseline_reports_what_a_callback_compile_and_instance_cost() {
         mc_plugin_host::host::EPOCH_INTERVAL.as_millis()
     );
     println!(
-        "counters reachable without a deployment directory: calls {calls_measured} through the measured run, {calls_hosted} with the shutdown call | staged commands in the last answer {} | guest log lines through the host import {} | log_lines_dropped {}",
+        "queues: host event capacity {} | command capacity {}; deployed workload enqueued 1 event and received 1 command",
+        queues.events, queues.commands
+    );
+    println!(
+        "deployment counters: calls {} | events delivered {} | commands submitted {} | commands refused {}",
+        deployment_counters.calls,
+        deployment_counters.events_delivered,
+        deployment_counters.commands_submitted,
+        deployment_counters.commands_refused,
+    );
+    println!(
+        "counters reachable without a deployment directory: calls {calls_measured} through the direct measured run, {calls_hosted} with the shutdown call | staged commands in the last answer {} | guest log lines through the host import {} | log_lines_dropped {}",
         commands.len(),
         guest_log_lines,
         log_lines_dropped
-    );
-    println!(
-        "not reported: InstanceDiagnostics (events_delivered, commands_submitted, commands_refused). It is the deployment's own accounting in src/host.rs and is only reachable by starting a deployment - a package directory, the host thread and the boundary - which this baseline deliberately does not do; the deployment tests cover those counters."
     );
 }

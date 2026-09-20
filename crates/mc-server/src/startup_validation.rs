@@ -136,7 +136,7 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
             config.chunk_pipeline.chunk_generate_rate,
         ),
     ] {
-        if value == 0 || value > MAX_CHUNK_RATE {
+        if value != u32::MAX && (value == 0 || value > MAX_CHUNK_RATE) {
             bail!("{field}={value} must be between 1 and {MAX_CHUNK_RATE}");
         }
     }

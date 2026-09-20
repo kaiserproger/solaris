@@ -21,7 +21,9 @@ pub const VILLAGER_BREEDING_WILLINGNESS_POINTS: u16 = 12;
 pub const VILLAGER_EXCESS_FOOD_POINTS: u16 = 24;
 pub const VILLAGER_BIRTH_DELAY_MIN_TICKS: u16 = 275;
 pub const VILLAGER_BIRTH_DELAY_RANDOM_BOUND: u16 = 50;
-pub const VILLAGER_COURTSHIP_SPEED: f64 = 0.3;
+/// Blocks per second (movement-speed attribute x10): courtship keeps pace
+/// with ordinary villager walking instead of crawling.
+pub const VILLAGER_COURTSHIP_SPEED: f64 = 3.0;
 pub const VILLAGER_PARENT_COOLDOWN_TICKS: i32 = 6_000;
 pub const VILLAGER_BABY_START_AGE_TICKS: i32 = -24_000;
 pub const VILLAGER_BREAD_SEARCH_RADIUS: f64 = 3.0;

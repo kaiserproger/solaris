@@ -699,3 +699,163 @@ fn fluid_wash_drops_resolve_poppy_item_and_skip_upper_half() {
 
     assert_eq!(drops, vec![(pos, mc_entity::EntityItemStack::new(70, 1))]);
 }
+
+/// A steady pour onto an open floor: source block 6 cells above the floor,
+/// 15x15 stone ground, everything else air.
+fn poured_column_world() -> (
+    mc_data::block_facts::BlockFactsTable,
+    Arc<mc_world::BlockRegistry>,
+    mc_world::WorldStorage,
+    mc_world::BlockPos,
+) {
+    let facts = fluid_test_facts();
+    let registry = Arc::new(fluid_test_registry());
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let source = mc_world::BlockPos { x: 8, y: 70, z: 8 };
+    seed_fluid_test_floor(&mut world, 1..=15, source.y - 7, 1..=15);
+    world.set_block_at(source, BlockStateId(2)).unwrap();
+    (facts, registry, world, source)
+}
+
+fn step_poured_column(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    world: &mut mc_world::WorldStorage,
+    source: mc_world::BlockPos,
+    steps: usize,
+) {
+    for _ in 0..steps {
+        for y in (source.y - 7)..=source.y {
+            run_fluid_test_step(blocks, facts, world, 1..=15, y, 1..=15);
+        }
+    }
+}
+
+#[test]
+fn falling_column_reaches_bottom_at_full_strength() {
+    let (facts, registry, mut world, source) = poured_column_world();
+    let blocks = registry.as_ref();
+    let falling = facts.fluid(27).unwrap();
+    assert!(
+        !falling.source,
+        "the falling state must not parse as a source"
+    );
+
+    step_poured_column(blocks, &facts, &mut world, source, 8);
+
+    let bottom = mc_world::BlockPos {
+        x: 8,
+        y: source.y - 6,
+        z: 8,
+    };
+    assert_eq!(
+        world.get_block(bottom).unwrap().unwrap(),
+        BlockStateId(27),
+        "the column must reach the floor at full falling strength"
+    );
+    for side_x in [7, 9] {
+        assert_eq!(
+            world
+                .get_block(mc_world::BlockPos {
+                    x: side_x,
+                    y: source.y - 6,
+                    z: 8,
+                })
+                .unwrap()
+                .unwrap(),
+            BlockStateId(3),
+            "falling water must spread the floor ring at level 1"
+        );
+    }
+}
+
+#[test]
+fn pouring_column_does_not_flip_flop_levels() {
+    let (facts, registry, mut world, source) = poured_column_world();
+    let blocks = registry.as_ref();
+    let tracked = mc_world::BlockPos { x: 8, y: 67, z: 8 };
+    let mut settled_state: Option<BlockStateId> = None;
+    for _ in 0..20 {
+        step_poured_column(blocks, &facts, &mut world, source, 1);
+        let state = world.get_block(tracked).unwrap().unwrap();
+        if facts.fluid(state.0).is_some() {
+            match settled_state {
+                None => settled_state = Some(state),
+                Some(previous) => assert_eq!(
+                    previous, state,
+                    "column cell must not alternate levels while the pour is steady"
+                ),
+            }
+        }
+    }
+    assert_eq!(
+        settled_state,
+        Some(BlockStateId(27)),
+        "column cell must hold the falling state"
+    );
+}
+
+#[test]
+fn deep_pool_cells_survive_without_air_refill_cycle() {
+    let (facts, registry, mut world, source) = poured_column_world();
+    let blocks = registry.as_ref();
+    step_poured_column(blocks, &facts, &mut world, source, 30);
+
+    use std::collections::HashMap;
+    let mut settled = HashMap::new();
+    for x in 1..=15 {
+        for y in (source.y - 6)..=source.y {
+            for z in 1..=15 {
+                let pos = mc_world::BlockPos { x, y, z };
+                if let Ok(Some(state)) = world.get_block(pos)
+                    && facts.fluid(state.0).is_some()
+                {
+                    settled.insert(pos, state);
+                }
+            }
+        }
+    }
+    assert!(
+        settled.contains_key(&mc_world::BlockPos {
+            x: 8,
+            y: source.y - 6,
+            z: 8,
+        }),
+        "the deep pool bottom must stay fluid"
+    );
+    assert!(
+        settled.len() > 100,
+        "a 4-deep pool must fill broadly, filled {} cells",
+        settled.len()
+    );
+
+    for _ in 0..15 {
+        step_poured_column(blocks, &facts, &mut world, source, 1);
+        for (&pos, &state) in &settled {
+            let current = world.get_block(pos).unwrap().unwrap();
+            assert!(
+                facts.fluid(current.0).is_some(),
+                "cell ({},{},{}) died to air: die-and-refill cycle",
+                pos.x,
+                pos.y,
+                pos.z
+            );
+            assert_eq!(
+                current, state,
+                "settled cell ({},{},{}) keeps flip-flopping",
+                pos.x, pos.y, pos.z
+            );
+        }
+    }
+}

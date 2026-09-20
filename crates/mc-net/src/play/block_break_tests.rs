@@ -277,6 +277,90 @@ fn removing_each_inner_and_outer_trigger_recomputes_the_surviving_stair() {
     }
 }
 
+fn bed_test_registry() -> Arc<mc_world::BlockRegistry> {
+    let mut states = Vec::new();
+    let mut id = 2;
+    for occupied in ["true", "false"] {
+        for part in ["head", "foot"] {
+            for facing in ["north", "south", "west", "east"] {
+                states.push(block_state_report(
+                    id,
+                    id == 10,
+                    &[("occupied", occupied), ("part", part), ("facing", facing)],
+                ));
+                id += 1;
+            }
+        }
+    }
+    Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block_report(0, "minecraft:air"),
+            simple_block_report(1, "minecraft:stone"),
+            BlockReport {
+                id: Identifier::parse("minecraft:white_bed").unwrap(),
+                properties: property_schema(&[
+                    ("occupied", &["true", "false"]),
+                    ("part", &["head", "foot"]),
+                    ("facing", &["north", "south", "west", "east"]),
+                ]),
+                states,
+            },
+        ])
+        .unwrap(),
+    )
+}
+
+fn bed_state(blocks: &mc_world::BlockRegistry, part: &str, facing: &str) -> mc_world::BlockStateId {
+    blocks
+        .by_name_and_props(
+            &Identifier::parse("minecraft:white_bed").unwrap(),
+            &[
+                ("occupied".to_string(), "false".to_string()),
+                ("part".to_string(), part.to_string()),
+                ("facing".to_string(), facing.to_string()),
+            ],
+        )
+        .unwrap()
+}
+
+#[test]
+fn breaking_one_bed_half_removes_the_other_half() {
+    let blocks = bed_test_registry();
+    let air = mc_world::BlockStateId(0);
+    let foot_pos = mc_world::BlockPos { x: 8, y: 64, z: 8 };
+    let head_pos = mc_world::BlockPos { x: 8, y: 64, z: 7 };
+    let foot = bed_state(&blocks, "foot", "north");
+    let head = bed_state(&blocks, "head", "north");
+    let mut world = stair_test_world(Arc::clone(&blocks));
+    world.set_block_at(foot_pos, foot).unwrap();
+    world.set_block_at(head_pos, head).unwrap();
+
+    let foot_edits = plan_break_block_edits(&blocks, &world, foot_pos, foot, air, air);
+    assert!(
+        foot_edits.contains(&BlockEdit {
+            pos: foot_pos,
+            new_state: air,
+        }),
+        "edits={foot_edits:?}"
+    );
+    assert!(
+        foot_edits.contains(&BlockEdit {
+            pos: head_pos,
+            new_state: air,
+        }),
+        "breaking the foot must clear the head: edits={foot_edits:?}"
+    );
+
+    let head_edits = plan_break_block_edits(&blocks, &world, head_pos, head, air, air);
+    assert!(
+        head_edits.contains(&BlockEdit {
+            pos: foot_pos,
+            new_state: air,
+        }),
+        "breaking the head must clear the foot: edits={head_edits:?}"
+    );
+}
+
 #[test]
 fn removing_outer_trigger_reveals_the_remaining_inner_shape() {
     let blocks = stair_test_registry();

@@ -4,7 +4,7 @@ Solaris is an authoritative Minecraft Java Edition server written in Rust. It
 targets the vanilla **Minecraft Java Edition 26.1.2** protocol and also supports
 optional client content through Solaris Loader.
 
-> **Development status:** **`v0.0.6`** is a preliminary release.
+> **Development status:** **`v0.0.7`** is a preliminary release.
 > Maturity remains **draft**, not release-ready. Solaris is suitable for
 > testing, plugin development, and bounded multiplayer field tests; it is not a
 > production-safe replacement for vanilla, Paper, Fabric, Forge, or NeoForge.
@@ -17,17 +17,17 @@ generates and stores a bounded block-coordinate region before startup. The
 standard plugin pack is explicitly opt-in; see
 [plugin installation](docs/PLUGINS.md#standard-plugin-pack).
 
-## Install v0.0.6 (Linux)
+## Install v0.0.7 (Linux)
 
 Published archives are available for Linux x86_64 and AArch64. Pin the release
 because GitHub's `latest` alias does not resolve prereleases:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.6/install.sh | \
-  SOLARIS_VERSION="v0.0.6" bash
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.7/install.sh | \
+  SOLARIS_VERSION="v0.0.7" bash
 
 curl -fsSLo server.toml \
-  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.6/example.toml
+  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.7/example.toml
 solaris --check --config server.toml
 solaris --config server.toml
 ```
@@ -37,14 +37,14 @@ installs to `$HOME/.local/bin` for a regular user and `/usr/local/bin` for root;
 set `SOLARIS_INSTALL_DIR` to override that destination. Windows and macOS do
 not currently have prebuilt archives.
 
-**Upgrading from alpha-3:** back up the existing world and configuration first.
-Alpha-4 uses Solaris world-contract schema 4 and worldgen revision 24; an older
-Solaris world contract is rejected rather than silently mixing generation.
-Use a fresh `[data].world_dir`. Do not delete or hand-edit the old world's
-contract to bypass the check. Changing an effective startup `rules.lua` plan
-also requires a fresh world directory.
+**Upgrading from an earlier Solaris release:** back up the existing world and
+configuration first. Solaris validates its persisted world contract and rejects
+an incompatible world rather than silently mixing generation. Use a fresh
+`[data].world_dir` when that contract changes. Do not delete or hand-edit the
+old world's contract to bypass the check. Changing an effective component
+startup contribution also requires a fresh world directory.
 
-## Build and run the v0.0.6 development tree
+## Build and run the v0.0.8 development tree
 
 Use the repository's debug profile for development:
 
@@ -135,10 +135,11 @@ Detailed examples are in
   only after more than 60 continuous seconds of overload or stable recovery.
   Each step starts a fresh window; `--check` prints normalized limits and the
   `scale_down_after_seconds` / `scale_up_after_seconds` policy.
-- **Plugins:** external Luau packages are discovered below
-  `[plugins].directory` (normally `plugins/`). Deploy selected packages from
-  the sibling `solaris-default-plugins` repository. Use strict deployment and
-  an exact `expected` list for a controlled server.
+- **Plugins:** external Wasmtime component packages are discovered below
+  `[plugins].directory` (normally `plugins/`). Each package supplies
+  `plugin.toml`, `plugin.wasm`, optional `config.toml`, and declared resources.
+  Use strict deployment, an exact `expected` list, and explicit capability
+  grants for a controlled server.
 - **Vanilla data:** required baseline data is embedded. Setting
   `[data].vanilla_data_dir` opts into an authoritative extracted sidecar, which
   must be complete and exactly match 26.1.2.
@@ -149,22 +150,26 @@ world, operator, autoscale, and check-output guidance.
 
 ## Plugins and Solaris Loader
 
-Solaris runs sandboxed, strict Luau plugins under current API `0.6.0`. Plugins
-without a `[client]` bundle are `server_only` and accept an ordinary vanilla
-26.1.2 client. A plugin with client bundles is `server_and_client`; connecting
-players must install the matching Solaris Loader adapter and approve the
-requested permissions.
+Solaris runs Wasmtime components implementing `solaris:plugin@0.7.0`. The
+out-of-tree `sdk/rust/` workspace contains the generic Rust SDK and examples;
+product guest source belongs to its own repository. Production core loads
+encoded `plugin.wasm` artifacts and neither compiles product source nor requires
+a sibling checkout.
+
+Packages without a `[client]` bundle are `server_only` and accept an ordinary
+vanilla 26.1.2 client. A package with client bundles is `server_and_client`;
+connecting players must install the matching Solaris Loader adapter and approve
+the requested permissions.
 
 - Operator and author guide: [`docs/PLUGINS.md`](docs/PLUGINS.md)
+- First-party product source: sibling `../solaris-default-plugins/sources/`
 - Fabric/NeoForge/Forge client installation: [`docs/SOLARIS_LOADER.md`](docs/SOLARIS_LOADER.md)
-- Inspectable packages: [`solaris-default-plugins`](https://github.com/kaiserproger/solaris-default-plugins)
 
-Solaris Loader is not needed for a server whose selected plugins are all
-`server_only`. `solaris --check --config server.toml` reports each discovered
-plugin's deployment, supported loaders, requested permissions, bundle identity,
-and artifact size. Core declares Loader wire **3** with artifact index schema
-**2**; a Loader build that speaks an older wire is refused rather than silently
-served reduced content.
+Solaris Loader is not needed for a server whose selected packages are all
+`server_only`. `solaris --check --config server.toml` validates component
+packages and prints the checked ids. Core declares Loader wire **3** with
+artifact index schema **2**; a Loader build that speaks an older wire is
+refused rather than silently served reduced content.
 
 ## Current alpha boundaries
 
@@ -220,39 +225,36 @@ that era.
 - [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — design and compatibility scope
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — target runtime design
 - [`docs/OPERATING.md`](docs/OPERATING.md) — network, auth, world, operator, and check output
-- [`docs/PLUGINS.md`](docs/PLUGINS.md) — Luau API `0.6.0` reference
+- [`docs/PLUGINS.md`](docs/PLUGINS.md) — component package and API `0.7.0` guide
 - [`docs/SOLARIS_LOADER.md`](docs/SOLARIS_LOADER.md) — client Loader installation
 - [`docs/VILLAGE_GENERATION.md`](docs/VILLAGE_GENERATION.md) — vanilla village generation and its declared divergence
 - [`docs/MEMORY.md`](docs/MEMORY.md) — current work and evidence cursor
 - [`docs/DEFINITION_OF_DONE.md`](docs/DEFINITION_OF_DONE.md) — readiness labels and the evidence matrix
 - [`docs/AGENT_TOOLING.md`](docs/AGENT_TOOLING.md) — harness wiring, profiles, and receipts
 - [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) and [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — the readiness claim and the recorded evidence behind it
-- [Current preliminary release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.6) — binaries and checksums; [changelog](docs/releases/v0.0.6.md)
+- [Current preliminary release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.7) — binaries and checksums; [changelog](docs/releases/v0.0.7.md)
 
 ## Repository layout
 
 ```text
-crates/                              Rust workspace
+crates/                              Rust server workspace
+sdk/rust/                            Out-of-tree Rust guest SDK and packages
 ../solaris-loader/                   Independent Loader/real-client Gradle repo
-../solaris-default-plugins/          Independent Luau package repo
 examples/loader-live-gate/           Loader-required integration fixture
 docs/                                contracts, guides, ADRs, and evidence
 tools/                               extraction and validation tools
 ```
 
-Core production builds need neither sibling repository. Java/client validation
-needs `../solaris-loader` (override with `SOLARIS_LOADER_ROOT`); integration tests
-of first-party plugin behavior need `../solaris-default-plugins`. Clone the
-companion repositories next to this checkout:
+Production core builds and deployments need no sibling repository. Java/client
+validation needs `../solaris-loader` (override with `SOLARIS_LOADER_ROOT`):
 
 ```sh
 git clone https://github.com/kaiserproger/solaris-loader.git ../solaris-loader
-git clone https://github.com/kaiserproger/solaris-default-plugins.git ../solaris-default-plugins
 ```
 
-Each repository owns its sources, development instructions and Git history.
-Hosted CI checks out this same sibling layout. Server tags and commit IDs do
-not identify Loader or plugin revisions; use compatible revisions together.
+The Loader owns its sources, development instructions, and Git history. Server
+tags and commit IDs do not identify Loader revisions; use compatible revisions
+together.
 
 ## License
 

@@ -328,6 +328,13 @@ pub(super) fn arrow_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<
         .and_then(|id| i32::try_from(id).ok())
 }
 
+pub(super) fn snowball_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let snowball = mc_data::Identifier::parse("minecraft:snowball").expect("static identifier");
+    entity_types
+        .id_of(&snowball)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
 pub(super) fn small_fireball_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
     let small_fireball =
         mc_data::Identifier::parse("minecraft:small_fireball").expect("static identifier");

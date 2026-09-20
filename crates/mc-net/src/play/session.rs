@@ -1,3 +1,22 @@
+//! # Session authority map
+//!
+//! `SessionRegistry` coordinates connection membership, shared authoritative
+//! player state, regional-owner access, and publication. It does not become a
+//! second mutable entity store: regional lanes own entity mutation and this
+//! module retains only the access wrapper and derived publication state needed
+//! by its callers.
+//!
+//! `SessionRegistryInner` groups connection membership, shared player state,
+//! visibility/publication projections, and scheduling or claim indexes. World
+//! clock/weather values and test probes live on `SessionRegistry`. Published
+//! snapshots and indexes are derived data, not duplicate authority. Commit and
+//! publication code lives in the focused `session/*_authority.rs`,
+//! `visibility.rs`, and `entity_owner.rs` modules.
+//!
+//! `lock_entities` creates regional-owner access. `SessionEntityGuards` combines
+//! that access with the session mutex for local operations; it is not a
+//! universal atomic transaction across regional owners or world storage.
+
 use super::combat::{ActiveShield, PlayerHurtResistance};
 use super::persistence::PlayerPersistedState;
 #[cfg(test)]
@@ -30,6 +49,8 @@ mod chunk_view_authority;
 mod combat_load_tests;
 mod container_state;
 mod container_views;
+mod creative_slot;
+pub(in crate::play) use creative_slot::handle_creative_mode_slot;
 #[cfg(test)]
 #[path = "session/death_policy_tests.rs"]
 mod death_policy_tests;
@@ -429,6 +450,7 @@ struct DisconnectedPlayerPersistence {
     state: Arc<Mutex<PlayerPersistedState>>,
 }
 
+// Connection membership and connection-local session state.
 #[derive(Debug, Default)]
 struct SessionRegistryInner {
     next_id: SessionId,
@@ -440,6 +462,11 @@ struct SessionRegistryInner {
     natural_hostile_mobs: HashSet<EntityId>,
     natural_ground_mobs: HashSet<EntityId>,
     natural_aquatic_mobs: HashSet<EntityId>,
+    /// Aquatic mobs granted every-tick movement publication without natural-set
+    /// membership (command spawns). Natural spawns already ride the
+    /// `natural_aquatic_mobs` smooth set; this set keeps the despawn and
+    /// water-mob-cap semantics of that set untouched.
+    smooth_aquatic_mobs: HashSet<EntityId>,
     natural_mob_no_action_since_tick: HashMap<EntityId, u64>,
     sheep_entities: HashSet<EntityId>,
     villager_entities: HashSet<EntityId>,
@@ -448,11 +475,13 @@ struct SessionRegistryInner {
     area_effect_cloud_entities: HashSet<EntityId>,
     evoker_fang_entities: HashSet<EntityId>,
     evoker_fang_count: Arc<AtomicUsize>,
+    // Derived visibility/publication projections and simulation input.
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
     simulation_inputs: Arc<SimulationInputPublication>,
     entity_movement_trackers: Arc<EntityMovementTrackers>,
     arrow_tick_scratch: projectiles::ArrowTickScratch,
+    // Scheduling, claim, and entity-classification indexes.
     pending_projectile_damage: HashMap<EntityId, Instant>,
     #[cfg(test)]
     spawned_entity_chunks: HashSet<(i32, i32)>,
@@ -474,6 +503,7 @@ struct SessionRegistryInner {
     primed_tnt_deadlines: BTreeMap<u64, BTreeSet<EntityId>>,
     primed_tnt_deadline_by_id: HashMap<EntityId, u64>,
     last_primed_tnt_claim_tick: Option<u64>,
+    // Shared authoritative player state and player lifecycle.
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     player_effect_sessions: HashSet<SessionId>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
@@ -483,6 +513,7 @@ struct SessionRegistryInner {
     next_disconnected_player_generation: u64,
     sleeping_sessions: HashMap<SessionId, SleepingState>,
     spectator_sessions: HashSet<SessionId>,
+    creative_sessions: HashSet<SessionId>,
     dead_sessions: HashSet<SessionId>,
     client_unloaded_sessions: HashSet<SessionId>,
     keep_inventory: bool,
@@ -497,6 +528,7 @@ impl SessionRegistryInner {
         let alive = !self.dead_sessions.contains(&id);
         let targetable = alive
             && !self.spectator_sessions.contains(&id)
+            && !self.creative_sessions.contains(&id)
             && !self.client_unloaded_sessions.contains(&id);
         if let Some(session) = self.sessions.get(&id) {
             session
@@ -571,6 +603,11 @@ pub(super) enum SessionPreparedChunkClaimResult {
 }
 
 #[derive(Debug)]
+/// Coordinating facade for session membership, projections, and owner access.
+///
+/// The fields below intentionally separate regional-owner access, publication
+/// state, world values, and scheduling signals rather than presenting them as
+/// one mutable authority.
 pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
     simulation_inputs: Arc<SimulationInputPublication>,
@@ -597,6 +634,7 @@ pub(crate) struct SessionRegistry {
     hostile_shulker_bullet_entity_type_id: AtomicI32,
     hostile_evoker_fangs_entity_type_id: AtomicI32,
     prepared_cache: Mutex<PreparedChunkCache>,
+    /// Access to regional owners; regional lanes retain entity mutation authority.
     entities: SessionEntityOwners,
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
     world_chunk_journal_failure: tokio::sync::watch::Sender<bool>,
@@ -610,6 +648,7 @@ pub(crate) struct SessionRegistry {
     campfire_cooking: Arc<Mutex<HashMap<mc_world::BlockPos, CampfireCookingState>>>,
     pressure_observation: Arc<SessionPressureObservation>,
     outbound_pressure: Arc<OutboundPressureMetrics>,
+    // World clock/weather and simulation-wide values.
     world_time: AtomicU64,
     daylight_cycle_enabled: AtomicBool,
     weather_kind: AtomicU8,
@@ -632,6 +671,7 @@ pub(crate) struct SessionRegistry {
     prepared_changed: tokio::sync::Notify,
     last_save_report: Mutex<Option<crate::operator_metrics::RetainedSaveReport>>,
     natural_spawn_report: Mutex<Option<crate::operator_metrics::RetainedNaturalSpawnReport>>,
+    // Test-only probes; they do not participate in runtime authority.
     #[cfg(test)]
     prepared_claim_calls: AtomicU64,
     #[cfg(test)]
@@ -1568,6 +1608,8 @@ impl SessionRegistry {
         }
     }
 
+    /// Returns a regional-owner access wrapper; it does not lock or own a
+    /// second entity store.
     fn lock_entities(&self, operation: &'static str) -> EntityStoreGuard<'_> {
         let _ = operation;
         EntityStoreGuard {
@@ -1591,6 +1633,8 @@ impl SessionRegistry {
         filter_current_expected_entity_snapshots(expected, current)
     }
 
+    /// Combines session-local state with regional-owner access for this local
+    /// operation; it is not a universal cross-owner transaction.
     fn lock_session_entities(&self, operation: &'static str) -> SessionEntityGuards<'_> {
         let entities = self.lock_entities(operation);
         let inner = self.lock_inner(operation);
@@ -2049,6 +2093,14 @@ impl SessionRegistry {
         self.outbound_pressure.record_slow_client_pressure_shed();
     }
 
+    /// Test-only escape hatch for the terminal reliable shed: setup traffic
+    /// through tiny test channels can close sessions before the commit path
+    /// under test runs.
+    #[cfg(test)]
+    pub(in crate::play) fn clear_closing_sessions_for_test(&self) {
+        self.outbound_pressure.clear_closing_sessions_for_test();
+    }
+
     #[cfg(test)]
     pub(crate) fn set_sheep_sheared_for_test(&self, entity_id: EntityId, sheared: bool) -> bool {
         let mut inner = self.lock_session_entities("set test sheep sheared state");
@@ -2439,9 +2491,6 @@ fn entity_kill_drop_stacks(
     drops
 }
 
-const PLAYER_MELEE_KNOCKBACK_HORIZONTAL: f64 = 0.45 / mc_physics::TICK_SECONDS;
-const PLAYER_MELEE_KNOCKBACK_VERTICAL: f64 = 0.20 / mc_physics::TICK_SECONDS;
-
 fn apply_player_melee_knockback_locked(
     inner: &mut SessionEntityGuards<'_>,
     target_id: EntityId,
@@ -2450,18 +2499,24 @@ fn apply_player_melee_knockback_locked(
     let Some(target) = inner.entities.snapshot(target_id) else {
         return Vec::new();
     };
-    let dx = target.position.x - player_position.x;
-    let dz = target.position.z - player_position.z;
-    let horizontal = dx.hypot(dz);
-    if horizontal <= f64::EPSILON {
+    let Some(knockback) = mc_entity::player_combat_26_1_2::melee_knockback_with_momentum(
+        target.position.x,
+        target.position.z,
+        target.on_ground,
+        target.velocity,
+        player_position,
+    ) else {
         return Vec::new();
-    }
-    let velocity = Vec3::new(
-        target.velocity.x + dx / horizontal * PLAYER_MELEE_KNOCKBACK_HORIZONTAL,
-        (target.velocity.y + PLAYER_MELEE_KNOCKBACK_VERTICAL).max(PLAYER_MELEE_KNOCKBACK_VERTICAL),
-        target.velocity.z + dz / horizontal * PLAYER_MELEE_KNOCKBACK_HORIZONTAL,
-    );
-    apply_entity_velocity_locked(inner, target_id, velocity)
+    };
+    apply_entity_velocity_locked(
+        inner,
+        target_id,
+        Vec3::new(
+            knockback.x / mc_physics::TICK_SECONDS,
+            knockback.y / mc_physics::TICK_SECONDS,
+            knockback.z / mc_physics::TICK_SECONDS,
+        ),
+    )
 }
 
 fn apply_entity_velocity_locked(

@@ -100,6 +100,10 @@ pub fn solaris_required_block_entity_types() -> BlockEntityTypeRegistry {
         ("minecraft:campfire", 33),
         ("minecraft:sign", 7),
         ("minecraft:hanging_sign", 8),
+        // Vanilla renders beds exclusively through their block entity
+        // (`BedBlockEntityRenderer`); without it the client draws nothing
+        // where the two bed halves stand.
+        ("minecraft:bed", 25),
     ]
     .into_iter()
     .map(|(id, protocol_id)| BlockEntityTypeReport {
@@ -125,8 +129,19 @@ mod tests {
             "minecraft:blast_furnace",
             "minecraft:campfire",
             "minecraft:sign",
+            "minecraft:bed",
         ] {
             assert!(registry.id_of(&Identifier::parse(id).unwrap()).is_some());
         }
+    }
+
+    #[test]
+    fn bed_block_entity_type_matches_vanilla_protocol_id() {
+        let registry = solaris_required_block_entity_types();
+        assert_eq!(
+            registry.id_of(&Identifier::parse("minecraft:bed").unwrap()),
+            Some(25),
+            "26.1 registries.json block_entity_type protocol id for minecraft:bed"
+        );
     }
 }

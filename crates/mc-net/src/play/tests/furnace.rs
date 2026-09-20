@@ -917,6 +917,7 @@ async fn owner_furnace_tick_pushes_to_all_viewers_without_losing_click() {
     clicker.session_id = clicker_id;
     ticker.sessions.mark_loaded(ticker_id, (0, 0));
     ticker.sessions.mark_loaded(clicker_id, (0, 0));
+    ticker.sessions.clear_closing_sessions_for_test();
     assert_eq!(
         ticker.sessions.register_furnace_viewer(ticker_id, position),
         1

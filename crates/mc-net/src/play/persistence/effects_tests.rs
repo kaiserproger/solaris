@@ -11,7 +11,10 @@ use mc_protocol::packets::play::ClientboundUpdateEntityEffect;
 use crate::login::{LoggedInProfile, offline_uuid};
 use crate::play::session::SessionRegistry;
 use crate::play::simulation::SimulationAuthority;
-use crate::play::{OutboundCommand, PlayerPose, dispatch_visibility_commands};
+use crate::play::{
+    OutboundCommand, PlayerPose, dispatch_visibility_commands,
+    wire_entities::send_player_effect_command,
+};
 
 use super::super::{PlayerPersistedState, load_player_state, save_player_state};
 
@@ -100,7 +103,7 @@ async fn saved_unsorted_effects_restore_hidden_behaviour_and_notify_owner_and_tr
                     continue;
                 }
                 let mut wire = Vec::new();
-                crate::play::send_player_effect_command(&mut wire, Compression::Disabled, command)
+                send_player_effect_command(&mut wire, Compression::Disabled, command)
                     .await
                     .unwrap();
                 packets.push(decode_effect_packet(&wire));

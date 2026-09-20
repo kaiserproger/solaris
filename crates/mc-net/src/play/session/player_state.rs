@@ -51,6 +51,11 @@ impl SessionRegistry {
         } else {
             inner.spectator_sessions.remove(&id);
         }
+        if game_mode == GameMode::Creative {
+            inner.creative_sessions.insert(id);
+        } else {
+            inner.creative_sessions.remove(&id);
+        }
         if dead {
             inner.dead_sessions.insert(id);
         } else {

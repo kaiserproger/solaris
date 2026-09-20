@@ -35,7 +35,12 @@ const PLAYER_PICKUP_HEIGHT: f64 = 1.8;
 const PLAYER_PICKUP_TOUCH_HORIZONTAL_INFLATION: f64 = 1.0;
 const PLAYER_PICKUP_TOUCH_VERTICAL_INFLATION: f64 = 0.5;
 const ITEM_MERGE_RADIUS: f64 = 0.5;
-const PLAYER_ITEM_OWNER_PICKUP_BLOCK_TICKS: u64 = 100;
+// Bounds full-snapshot examinations per merge sweep. A TNT cascade piles
+// hundreds of item entities into one chunk; an unbounded scan is O(pile^2)
+// snapshot clones under the session registry lock and blew the M39 hold
+// budget. Unexamined leftovers stay eligible on the next sweep.
+const ITEM_MERGE_SCAN_BUDGET: usize = 256;
+const PLAYER_ITEM_OWNER_PICKUP_BLOCK_TICKS: u64 = 40;
 static NEXT_ITEM_PICKUP_CLAIM: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -1336,8 +1341,12 @@ pub(super) fn merge_item_entities_locked(
     let mut consumed_ids = HashSet::new();
     let mut dispatches = Vec::new();
     let radius_sq = ITEM_MERGE_RADIUS * ITEM_MERGE_RADIUS;
-
+    let mut remaining_scans = ITEM_MERGE_SCAN_BUDGET;
     for &ready_id in ready_ids {
+        if remaining_scans == 0 {
+            break;
+        }
+        remaining_scans -= 1;
         if consumed_ids.contains(&ready_id) {
             continue;
         }
@@ -1364,6 +1373,10 @@ pub(super) fn merge_item_entities_locked(
             if candidate_id == ready_id || consumed_ids.contains(&candidate_id) {
                 continue;
             }
+            if remaining_scans == 0 {
+                break;
+            }
+            remaining_scans -= 1;
             let Some(candidate) = inner.entities.snapshot(candidate_id) else {
                 continue;
             };

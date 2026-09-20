@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -127,9 +127,7 @@ pub(in crate::play) enum OutboundCommand {
         entity_id: i32,
         effect_id: i32,
     },
-    PlayerSurvivalChanged {
-        survival: crate::play::survival::SurvivalState,
-    },
+    PlayerSurvivalChanged,
     PlayerDamageCommitted {
         publication: Box<PlayerDamagePublication>,
         hurt_event: PlayerHurtEvent,
@@ -202,7 +200,6 @@ pub(in crate::play) enum OutboundCommand {
 
 #[derive(Debug)]
 pub(in crate::play) struct PlayerDamagePublication {
-    pub(in crate::play) expected_health: f32,
     pub(in crate::play) health: f32,
     pub(in crate::play) inventory: Vec<PlayerInventorySlotDelta>,
     pub(in crate::play) carried_item: Option<PlayerCarriedItemDelta>,
@@ -223,19 +220,16 @@ pub(in crate::play) struct ShieldCooldownPublication {
 #[derive(Debug)]
 pub(in crate::play) struct PlayerInventorySlotDelta {
     pub(in crate::play) slot: usize,
-    pub(in crate::play) expected: ItemStack,
     pub(in crate::play) updated: ItemStack,
 }
 
 #[derive(Debug)]
 pub(in crate::play) struct PlayerCarriedItemDelta {
-    pub(in crate::play) expected: ItemStack,
     pub(in crate::play) updated: ItemStack,
 }
 
 #[derive(Debug)]
 pub(in crate::play) struct PlayerXpDelta {
-    pub(in crate::play) expected: XpState,
     pub(in crate::play) updated: XpState,
 }
 
@@ -271,7 +265,7 @@ impl OutboundCommand {
             | Self::DamagePlayer { .. }
             | Self::ApplyPlayerEffect { .. }
             | Self::RemovePlayerEffect { .. }
-            | Self::PlayerSurvivalChanged { .. }
+            | Self::PlayerSurvivalChanged
             | Self::PlayerDamageCommitted { .. }
             | Self::TakeItemEntity { .. }
             | Self::PickupCandidates(_)
@@ -518,6 +512,12 @@ pub(super) struct OutboundPressureMetrics {
     change_generation: AtomicU64,
     changed: tokio::sync::Notify,
     reliable_retry_queues: Mutex<HashMap<SessionId, ReliableRetryQueue>>,
+    /// Sessions whose reliable lane shed its backlog. The shed is terminal:
+    /// the queue entry is evicted once its worker drains, so this set — not
+    /// the evicted entry — must remember the closing decision, or the next
+    /// tick's reliable burst re-arms a fresh queue and overflows again
+    /// forever.
+    closing_sessions: Mutex<HashSet<SessionId>>,
     #[cfg(test)]
     pub(super) reliable_retry_completed: tokio::sync::Notify,
     #[cfg(test)]
@@ -537,6 +537,7 @@ impl Default for OutboundPressureMetrics {
             change_generation: AtomicU64::new(0),
             changed: tokio::sync::Notify::new(),
             reliable_retry_queues: Mutex::new(HashMap::new()),
+            closing_sessions: Mutex::new(HashSet::new()),
             #[cfg(test)]
             reliable_retry_completed: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -550,6 +551,31 @@ impl OutboundPressureMetrics {
         &self,
     ) -> MutexGuard<'_, HashMap<SessionId, ReliableRetryQueue>> {
         lock_authoritative_mutex(&self.reliable_retry_queues, "play.reliable_retry_queues")
+    }
+
+    fn lock_closing_sessions(&self) -> MutexGuard<'_, HashSet<SessionId>> {
+        lock_authoritative_mutex(&self.closing_sessions, "play.closing_sessions")
+    }
+
+    /// Test-only escape hatch: setup traffic through tiny test channels can
+    /// trip the terminal reliable shed before the behavior under test runs.
+    #[cfg(test)]
+    pub(super) fn clear_closing_sessions_for_test(&self) {
+        self.lock_closing_sessions().clear();
+    }
+
+    /// Record that the recipient's reliable lane shed its backlog and is
+    /// closing. Terminal until the session unregisters.
+    fn mark_session_closing(&self, session_id: SessionId) {
+        self.lock_closing_sessions().insert(session_id);
+    }
+
+    pub(super) fn session_is_closing(&self, session_id: SessionId) -> bool {
+        self.lock_closing_sessions().contains(&session_id)
+    }
+
+    pub(super) fn clear_session_closing(&self, session_id: SessionId) {
+        self.lock_closing_sessions().remove(&session_id);
     }
 
     fn record_reliable_retry_in_flight(&self, current: u64) {
@@ -810,6 +836,14 @@ fn try_coalesce_entity_movements(
 
 fn merge_entity_movement(existing: &mut ServerEntityMove, mut incoming: ServerEntityMove) {
     let send_position_or_rotation = existing.wire_move.is_some() || incoming.wire_move.is_some();
+    if !incoming.send_velocity {
+        // `incoming` did not supersede the entity's velocity: its velocity
+        // still matches the last value the tracker sent, so the velocity
+        // queued by `existing` (e.g. a knockback impulse) is still the one
+        // the wire owes this viewer. Copying `incoming.velocity` here would
+        // silently rewrite that impulse before it is ever encoded.
+        incoming.velocity = existing.velocity;
+    }
     incoming.send_velocity |= existing.send_velocity;
     incoming.send_head_rotation |= existing.send_head_rotation;
     if send_position_or_rotation {
@@ -1152,6 +1186,7 @@ fn drain_ordered_queue(state: &mut OrderedDispatchQueue) {
                     .sum::<usize>();
                 state.pending.clear();
                 state.closing = true;
+                target.pressure.mark_session_closing(target.id);
                 target.pressure.record_reliable_command_drops(dropped);
                 dispatch_unordered_command(
                     &target.recipient(),
@@ -1187,6 +1222,7 @@ fn shed_ordered_overflow(state: &mut OrderedDispatchQueue, target: &OrderedDispa
 
     state.pending.clear();
     state.closing = true;
+    target.pressure.mark_session_closing(target.id);
     target
         .pressure
         .record_reliable_command_drops(pending_commands);
@@ -1235,6 +1271,15 @@ fn dispatch_best_effort_command(recipient: &SessionRecipient, command: OutboundC
 }
 
 fn dispatch_reliable_command(recipient: &SessionRecipient, command: OutboundCommand) {
+    // A session that shed its reliable backlog is closing: silently drop
+    // further reliable traffic so the overflow cannot re-arm a fresh retry
+    // queue. The disconnect itself must still pass, or the kick announced by
+    // the shed would never be delivered.
+    if recipient.pressure.session_is_closing(recipient.id)
+        && !matches!(command, OutboundCommand::DisconnectPlayer { .. })
+    {
+        return;
+    }
     let mut worker_id = None;
     let mut enqueue_result = ReliableEnqueueResult::Queued;
     {
@@ -1272,6 +1317,7 @@ fn dispatch_reliable_command(recipient: &SessionRecipient, command: OutboundComm
         ReliableEnqueueResult::Shed { dropped } => {
             recipient.pressure.record_reliable_command_drops(dropped);
             recipient.pressure.record_slow_client_pressure_shed();
+            recipient.pressure.mark_session_closing(recipient.id);
             warn!(
                 recipient = recipient.id,
                 dropped, "reliable outbound backlog exceeded its bound; closing session"

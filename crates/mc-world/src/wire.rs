@@ -66,6 +66,7 @@ use crate::chunk::{
     LIGHT_LAYER_BYTES, SECTION_COUNT,
 };
 use crate::light::{ChunkLight, LightLayer};
+use crate::section::SECTION_DIM;
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
 /// Bits per entry vanilla 26.1.2 expects in `GlobalPalette` (direct)
@@ -163,6 +164,28 @@ pub fn client_block_entities(
             pos: *pos,
             type_name,
             nbt: chest_update_tag(chest, items),
+        });
+    }
+
+    // Vanilla renders beds exclusively through a block entity, but the bed
+    // block entity itself carries no payload (`BedBlockEntity` saves only the
+    // id/position metadata): the colour lives in the block id (`white_bed` …
+    // `black_bed`), so there is nothing to derive from the biome and no white
+    // default to fall back to — every bed half found in the sections gets an
+    // empty update-tag record. Halves that already carry a stored block
+    // entity (e.g. an Anvil import) are skipped, and furnace/chest records
+    // above keep their positions, so no position is emitted twice.
+
+    let mut beds: Vec<_> = bed_block_positions(chunk, registry)
+        .into_iter()
+        .filter(|pos| !records.iter().any(|record| record.pos == *pos))
+        .collect();
+    beds.sort_by_key(|pos| (pos.x, pos.y, pos.z));
+    for pos in beds {
+        records.push(BlockEntityWireRecord {
+            pos,
+            type_name: Identifier::parse("minecraft:bed").expect("static bed identifier"),
+            nbt: Tag::Compound(Vec::new()),
         });
     }
 
@@ -286,6 +309,44 @@ fn furnace_update_tag(furnace: &FurnaceBlockEntity, items: &ItemRegistry) -> Tag
 
 fn chest_update_tag(chest: &ChestBlockEntity, items: &ItemRegistry) -> Tag {
     Tag::Compound(vec![("Items".into(), item_list_tag(&chest.slots, items))])
+}
+
+/// Absolute positions of every bed half in the chunk, section by section.
+///
+/// Sections whose palette holds no bed state are skipped without touching
+/// their packed storage, so chunks without beds pay one small palette scan.
+fn bed_block_positions(chunk: &Chunk, registry: &BlockRegistry) -> Vec<BlockPos> {
+    let is_bed_state = |state: crate::block::BlockStateId| {
+        registry
+            .by_id(state)
+            .is_some_and(|state| state.block.id.path().ends_with("_bed"))
+    };
+    let min_y = chunk.geometry().min_y();
+    let mut beds = Vec::new();
+    for (section_index, section) in chunk.sections.iter().enumerate() {
+        let contains_bed = match section.palette() {
+            Some(palette) => palette.iter().copied().any(is_bed_state),
+            None => is_bed_state(section.get(0, 0, 0)),
+        };
+        if !contains_bed {
+            continue;
+        }
+        let base_y = min_y + (section_index as i32) * SECTION_DIM as i32;
+        for sy in 0..SECTION_DIM as u8 {
+            for sz in 0..SECTION_DIM as u8 {
+                for sx in 0..SECTION_DIM as u8 {
+                    if is_bed_state(section.get(sx, sy, sz)) {
+                        beds.push(BlockPos {
+                            x: chunk.pos.x * SECTION_DIM as i32 + i32::from(sx),
+                            y: base_y + i32::from(sy),
+                            z: chunk.pos.z * SECTION_DIM as i32 + i32::from(sz),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    beds
 }
 
 fn item_list_tag(slots: &[FurnaceSlot], items: &ItemRegistry) -> Tag {
@@ -961,6 +1022,152 @@ mod tests {
                     | "solaris_cooking_total"
             )
         }));
+    }
+
+    fn air_bed_registry() -> BlockRegistry {
+        let facing = ["north", "south", "west", "east"];
+        let part = ["head", "foot"];
+        let occupied = ["true", "false"];
+        let mut states = Vec::new();
+        let mut id = 1;
+        for is_occupied in &occupied {
+            for bed_part in &part {
+                for direction in &facing {
+                    states.push(BlockStateReport {
+                        id,
+                        default: id == 1,
+                        properties: BTreeMap::from([
+                            ("facing".to_string(), (*direction).to_string()),
+                            ("part".to_string(), (*bed_part).to_string()),
+                            ("occupied".to_string(), (*is_occupied).to_string()),
+                        ]),
+                    });
+                    id += 1;
+                }
+            }
+        }
+        BlockRegistry::from_report(&[
+            BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:white_bed").unwrap(),
+                properties: BTreeMap::from([
+                    (
+                        "facing".to_string(),
+                        facing.iter().map(|v| v.to_string()).collect(),
+                    ),
+                    (
+                        "part".to_string(),
+                        part.iter().map(|v| v.to_string()).collect(),
+                    ),
+                    (
+                        "occupied".to_string(),
+                        occupied.iter().map(|v| v.to_string()).collect(),
+                    ),
+                ]),
+                states,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn client_block_entities_synthesize_bed_records_from_block_states() {
+        let registry = air_bed_registry();
+        let items = item_registry();
+        let bed_state = |part: &str| {
+            registry
+                .by_name_and_props(
+                    &Identifier::parse("minecraft:white_bed").unwrap(),
+                    &[
+                        ("facing".to_string(), "north".to_string()),
+                        ("part".to_string(), part.to_string()),
+                        ("occupied".to_string(), "false".to_string()),
+                    ],
+                )
+                .expect("bed state resolves")
+        };
+        let mut chunk = empty_chunk();
+        let foot_pos = BlockPos { x: 2, y: 64, z: 3 };
+        let head_pos = BlockPos { x: 2, y: 64, z: 2 };
+        chunk.set_block(2, 64, 3, bed_state("foot")).unwrap();
+        chunk.set_block(2, 64, 2, bed_state("head")).unwrap();
+
+        let records = client_block_entities(&chunk, &registry, &items);
+
+        let mut positions: Vec<_> = records.iter().map(|record| record.pos).collect();
+        positions.sort_by_key(|pos| (pos.x, pos.y, pos.z));
+        assert_eq!(positions, vec![head_pos, foot_pos]);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.type_name.as_str() == "minecraft:bed")
+        );
+        // Vanilla's bed block entity carries no payload: the empty update tag
+        // is the whole record, the block state carries part/facing/colour.
+        assert!(
+            records
+                .iter()
+                .all(|record| record.nbt == Tag::Compound(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn stored_bed_block_entities_are_not_duplicated_by_synthesis() {
+        let registry = air_bed_registry();
+        let items = item_registry();
+        let bed_state = |part: &str| {
+            registry
+                .by_name_and_props(
+                    &Identifier::parse("minecraft:white_bed").unwrap(),
+                    &[
+                        ("facing".to_string(), "north".to_string()),
+                        ("part".to_string(), part.to_string()),
+                        ("occupied".to_string(), "false".to_string()),
+                    ],
+                )
+                .expect("bed state resolves")
+        };
+        let mut chunk = empty_chunk();
+        let foot_pos = BlockPos { x: 2, y: 64, z: 3 };
+        let _head_pos = BlockPos { x: 2, y: 64, z: 2 };
+        chunk.set_block(2, 64, 3, bed_state("foot")).unwrap();
+        chunk.set_block(2, 64, 2, bed_state("head")).unwrap();
+        let tag = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:bed".into())),
+            ("x".into(), Tag::Int(foot_pos.x)),
+            ("y".into(), Tag::Int(foot_pos.y)),
+            ("z".into(), Tag::Int(foot_pos.z)),
+        ]);
+        let mut bytes = Vec::new();
+        mc_nbt::write_network(&mut bytes, &tag).expect("encode bed block entity");
+        chunk.block_entities.insert(foot_pos, bytes);
+
+        let records = client_block_entities(&chunk, &registry, &items);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.pos == foot_pos)
+                .count(),
+            1,
+            "the stored bed record must not be emitted twice"
+        );
+    }
+
+    #[test]
+    fn client_block_entities_leave_bedless_chunks_empty() {
+        let chunk = empty_chunk();
+        let records = client_block_entities(&chunk, &air_bed_registry(), &item_registry());
+        assert!(records.is_empty());
     }
 
     #[test]

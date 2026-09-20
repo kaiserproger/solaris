@@ -289,8 +289,10 @@ impl SessionRegistry {
             session.combat_target.close(session.pose);
             let dropped = session.ordered_dispatch.close();
             session.pressure.record_reliable_command_drops(dropped);
+            session.pressure.clear_session_closing(id);
             inner.sleeping_sessions.remove(&id);
             inner.spectator_sessions.remove(&id);
+            inner.creative_sessions.remove(&id);
             inner.dead_sessions.remove(&id);
             inner.client_unloaded_sessions.remove(&id);
             inner.loader_views.disconnect(id);

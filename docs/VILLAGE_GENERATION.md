@@ -166,13 +166,13 @@ value is part of the persisted world identity, so changing it means a fresh
 | Value | What places villages |
 | --- | --- |
 | `vanilla` (default) | Core Solaris generates the five vanilla village structures above, decor included: the startup path loads the `minecraft:villages` closure from the derived content cache, compiles its feature elements, validates every reachable piece against the block registry, and attaches the plan source to the terrain generator. |
-| A deployed Luau settlement plan | The plan's worldgen declaration wins. Its descriptor string — profile, owner, buildings, inhabitants, extensions — is the recorded settlement identity. |
+| A deployed component settlement plan | The plan's worldgen declaration wins. Its descriptor string — profile, owner, buildings, inhabitants, extensions — is the recorded settlement identity. |
 | `plains_village_prototype` | Interim opt-in, still present because its composite is not yet removable (see below). It attaches no core villages and is not vanilla village generation. |
 
-**A deployed Luau settlement plan wins, and nothing is placed twice.** Core
+**A deployed component settlement plan wins, and nothing is placed twice.** Core
 villages attach to exactly one configuration: `settlement_profile = "vanilla"`
-with no deployed Luau settlement plan. A deployed plan owns settlement content,
-so startup attaches no plan source and logs that the plugin owns it; the
+with no deployed component settlement plan. A deployed plan owns settlement
+content, so startup attaches no plan source and logs that a package owns it; the
 `plains_village_prototype` profile keeps its own structure rules and likewise
 attaches no core villages. Two plugins claiming the same profile fail startup
 rather than resolving by load order, and a deployed set carrying no plan leaves
@@ -180,11 +180,11 @@ the config value in charge.
 
 The catalogue-driven path is separate from worldgen placement: a package that
 declares `world_sites` and `structure_operations` and ships an authored
-`structures/` catalogue places and stages its own settlements at runtime through
-the world-storage kernel rather than through the structure rules. The shipped
-`solaris-settlements` package declares no `[worldgen]` selector, so installing
-it does not change the worldgen settlement identity. See
-[Luau Plugins](PLUGINS.md) for that path.
+`structures/` catalogue places and stages settlements at runtime through the
+world-storage kernel rather than through the structure rules. A package without
+a `[worldgen]` selector does not change the worldgen settlement identity. Core
+does not bind that rule to any product id. See [Plugin packages](PLUGINS.md) for
+that path.
 
 `plains_village_prototype` was the interim opt-in. It combined three vanilla
 plains templates (`plains_fountain_01`, `plains_small_house_1`,
@@ -194,14 +194,13 @@ the piece NBT, and placed no desert, savanna, snowy or taiga villages. It is not
 vanilla village generation and the default profile no longer needs it.
 
 **Its removal is not done, and this is the unresolved part of the checkpoint.**
-The composite is still the mechanism a deployed Luau settlement plan
+The composite is still the mechanism a deployed legacy settlement plan
 materializes its buildings through (`structure_rules_for_startup` maps the
 plan's `PlainsFountain`/`PlainsSmallHouse`/`PlainsToolsmith` templates onto
 `PlainsVillagePrototypePart` and builds `StructureRules::plains_village_prototype`),
-so deleting it now would delete the plugin settlement route with it. Removing the
-profile and the composite requires the plugin path to place plan buildings
-through its own mechanism first; until that exists, the profile and the composite
-stay, and this page does not claim they are permanent.
+so deleting it now would delete that route. Removing the profile and composite
+requires the last plan user to place buildings through its own mechanism first;
+until then, the profile and this page do not claim it is permanent.
 
 ## Declared divergence: terrain adaptation
 

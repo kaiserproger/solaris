@@ -7140,7 +7140,7 @@ mod tests {
         };
         let resources = ChunkPipelineResources::with_limits(8, 8);
         for _ in 0..5 {
-            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
+            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, None, false);
         }
         assert_eq!(resources.prepare_limit(), 2);
         let mut stream = ChunkStreamState::new(

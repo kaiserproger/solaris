@@ -9,7 +9,7 @@ async fn background_scale_up_wakes_queued_preparation() {
     let first = resources.acquire_prepare_request().await.unwrap();
     let second = resources.acquire_prepare_request().await.unwrap();
     let third = resources.acquire_prepare_request().await.unwrap();
-    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
+    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, None, false);
     assert!(resources.try_acquire_prepare_request().is_none());
 
     let mut fourth = std::pin::pin!(resources.acquire_prepare_request());
@@ -18,7 +18,7 @@ async fn background_scale_up_wakes_queued_preparation() {
         Poll::Ready(())
     })
     .await;
-    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleUp, false);
+    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleUp, None, false);
     let fourth = tokio::time::timeout(Duration::from_secs(1), fourth)
         .await
         .expect("scale-up wakes queued preparation")
@@ -32,7 +32,7 @@ async fn background_scale_down_preserves_inflight_and_wakes_after_release() {
     let resources = ChunkPipelineResources::with_limits(1, 3);
     let first = resources.acquire_prepare_request().await.unwrap();
     let second = resources.acquire_prepare_request().await.unwrap();
-    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
+    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, None, false);
     let mut waiting = std::pin::pin!(resources.acquire_prepare_request());
     std::future::poll_fn(|cx| {
         assert!(waiting.as_mut().poll(cx).is_pending());
@@ -62,7 +62,7 @@ async fn foreground_cpu_progresses_while_background_preparation_is_limited() {
     let resources = ChunkPipelineResources::with_limits(1, 2);
     let background_request = resources.acquire_prepare_request().await.unwrap();
     let background_cpu = resources.acquire_cpu().await.unwrap();
-    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false);
+    resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, None, false);
 
     let mut waiting_background = std::pin::pin!(resources.acquire_prepare_request());
     std::future::poll_fn(|cx| {
@@ -104,7 +104,7 @@ async fn background_saturation_preserves_foreground_cpu_headroom() {
         crate::AutoscaleAction::Hold,
         crate::AutoscaleAction::ScaleUp,
     ] {
-        resources.apply_runtime_control_action(action, false);
+        resources.apply_runtime_control_action(action, None, false);
         let mut background = Vec::new();
         while let Some(request) = resources.try_acquire_prepare_request() {
             let cpu = resources

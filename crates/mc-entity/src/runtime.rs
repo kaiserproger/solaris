@@ -1379,11 +1379,12 @@ impl EntityRuntime {
             }
 
             let gameplay = entity.get::<GameplayDecisionState>();
-            let panic_since = entity.get::<AnimalState>().and_then(|_| {
-                gameplay
-                    .and_then(|state| state.last_damage_tick)
-                    .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
-            });
+            let panic_since = damage_panic_since(
+                entity.get::<AnimalState>().is_some(),
+                &entity_type.name,
+                gameplay.and_then(|state| state.last_damage_tick),
+                tick,
+            );
             if inputs.terrain_pathing_entities.contains(&id)
                 || crate::aquatic_motion::Swimmer::for_type(&entity_type.name)
                     != crate::aquatic_motion::Swimmer::Other
@@ -1521,11 +1522,12 @@ impl EntityRuntime {
             .filter_map(
                 |(identity, transform, motion, _, goal, path, animal, gameplay, entity_type)| {
                     let goal = goal_overrides.get(&identity.id).unwrap_or(&goal.0);
-                    let panic_since = animal.and_then(|_| {
-                        gameplay
-                            .and_then(|state| state.last_damage_tick)
-                            .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
-                    });
+                    let panic_since = damage_panic_since(
+                        animal.is_some(),
+                        &entity_type.name,
+                        gameplay.and_then(|state| state.last_damage_tick),
+                        tick,
+                    );
                     goal_pathing_request(
                         identity,
                         transform,
@@ -1565,12 +1567,15 @@ impl EntityRuntime {
         let motion = entity.get::<MotionState>()?;
         let goal = entity.get::<AiGoalState>()?;
         let path = entity.get::<AiPathState>()?;
-        let panic_since = entity.get::<AnimalState>().and_then(|_| {
+        let entity_type = entity.get::<EntityTypeState>()?;
+        let panic_since = damage_panic_since(
+            entity.get::<AnimalState>().is_some(),
+            &entity_type.name,
             entity
                 .get::<GameplayDecisionState>()
-                .and_then(|state| state.last_damage_tick)
-                .filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
-        });
+                .and_then(|state| state.last_damage_tick),
+            tick,
+        );
         goal_pathing_request(
             identity,
             transform,
@@ -1579,7 +1584,7 @@ impl EntityRuntime {
             path,
             tick,
             panic_since,
-            &entity.get::<EntityTypeState>()?.name,
+            &entity_type.name,
         )
     }
 
@@ -1873,34 +1878,26 @@ fn goal_pathing_request(
             );
             (target, Some(epoch), *speed)
         }
-        GoalState::FollowPosition { target, speed } if *speed != 0.0 => (*target, None, *speed),
+        GoalState::FollowPosition { target, speed } if *speed != 0.0 => {
+            if let Some(damage_tick) = panic_since {
+                let (target, epoch) =
+                    panic_flee_target(identity, transform, motion, path, tick, damage_tick);
+                (
+                    target,
+                    Some(epoch),
+                    *speed * crate::natural_spawn_26_1_2::panic_speed_multiplier_26_1_2(type_name),
+                )
+            } else {
+                (*target, None, *speed)
+            }
+        }
         GoalState::Wander {
             speed,
             period_ticks,
         } => {
             if let Some(damage_tick) = panic_since {
-                let epoch = damage_tick + tick.saturating_sub(damage_tick) / 20;
-                let target = if path.0.has_target && path.0.target_epoch == Some(epoch) {
-                    path.0.target
-                } else {
-                    let horizontal = motion.velocity.x.hypot(motion.velocity.z);
-                    if horizontal > f64::EPSILON {
-                        Vec3::new(
-                            transform.position.x + motion.velocity.x / horizontal * 8.0,
-                            transform.position.y,
-                            transform.position.z + motion.velocity.z / horizontal * 8.0,
-                        )
-                    } else {
-                        crate::wander_pathing_target(
-                            identity.id,
-                            transform.position,
-                            path.0,
-                            tick,
-                            *period_ticks,
-                        )
-                        .0
-                    }
-                };
+                let (target, epoch) =
+                    panic_flee_target(identity, transform, motion, path, tick, damage_tick);
                 (
                     target,
                     Some(epoch),
@@ -1933,6 +1930,48 @@ fn goal_pathing_request(
         aquatic: matches!(goal, GoalState::AquaticWander { .. })
             .then(|| crate::aquatic_motion::Swimmer::for_type(type_name)),
     })
+}
+
+/// Panic flee target shared by `Wander` and `FollowPosition` goals: run ~8
+/// blocks along the knockback direction, re-aiming once per second of panic.
+fn panic_flee_target(
+    identity: &StableIdentity,
+    transform: &TransformState,
+    motion: &MotionState,
+    path: &AiPathState,
+    tick: u64,
+    damage_tick: u64,
+) -> (Vec3, u64) {
+    let epoch = damage_tick + tick.saturating_sub(damage_tick) / 20;
+    let target = if path.0.has_target && path.0.target_epoch == Some(epoch) {
+        path.0.target
+    } else {
+        let horizontal = motion.velocity.x.hypot(motion.velocity.z);
+        if horizontal > f64::EPSILON {
+            Vec3::new(
+                transform.position.x + motion.velocity.x / horizontal * 8.0,
+                transform.position.y,
+                transform.position.z + motion.velocity.z / horizontal * 8.0,
+            )
+        } else {
+            crate::wander_pathing_target(identity.id, transform.position, path.0, tick, 0).0
+        }
+    };
+    (target, epoch)
+}
+
+/// Damage-panic window: animals and villagers flee for ~100 ticks after the
+/// last hurt; other species have no panic goal here yet.
+fn damage_panic_since(
+    has_animal_state: bool,
+    type_name: &str,
+    last_damage_tick: Option<u64>,
+    tick: u64,
+) -> Option<u64> {
+    if !(has_animal_state || type_name == "minecraft:villager") {
+        return None;
+    }
+    last_damage_tick.filter(|damage_tick| tick.saturating_sub(*damage_tick) < 100)
 }
 
 impl EntitySchedules {
@@ -2675,9 +2714,18 @@ fn entity_physics_kind(
             acceleration_power_bits: state.acceleration_power.to_bits(),
         }
     } else if let Some(state) = throwable_projectile_state {
+        // Splash potions fly on the witch's 0.05 gravity; every other
+        // throwable (snowball today) uses the vanilla ThrowableProjectile
+        // default of 0.03. Keep in lockstep with the resolve lane's
+        // per-type gravity in play/session/projectiles.rs.
+        let gravity = if type_name == "minecraft:splash_potion" {
+            0.05_f64
+        } else {
+            crate::projectile_26_1_2::THROWABLE_DEFAULT_GRAVITY
+        };
         EntityPhysicsKind::ThrowableProjectile {
             revision: Some(state.projectile.revision),
-            gravity_bits: 0.05_f64.to_bits(),
+            gravity_bits: gravity.to_bits(),
         }
     } else if crate::aquatic_motion::Swimmer::for_type(type_name)
         == crate::aquatic_motion::Swimmer::Fish
@@ -2689,6 +2737,8 @@ fn entity_physics_kind(
         EntityPhysicsKind::SquidLiving
     } else if entity_type.aquatic_physics {
         EntityPhysicsKind::AquaticLiving
+    } else if type_name == "minecraft:item" {
+        EntityPhysicsKind::Item
     } else if type_name == "minecraft:falling_block" {
         EntityPhysicsKind::FallingBlock
     } else if ordinary_living {
@@ -4014,7 +4064,7 @@ fn apply_goal_to_entity(
                 .map_or(*speed, |planned| planned.speed);
             motion.velocity.x = direction.x * speed;
             motion.velocity.z = direction.z * speed;
-            face_horizontal_motion(&mut transform.rotation, motion.velocity);
+            face_motion_or_goal_direction(&mut transform.rotation, motion.velocity, direction);
         }
         GoalState::AquaticWander { .. } => {
             motion.velocity = crate::aquatic_motion::apply_goal(
@@ -4043,7 +4093,7 @@ fn apply_goal_to_entity(
             };
             motion.velocity.x = direction.x * speed;
             motion.velocity.z = direction.z * speed;
-            face_horizontal_motion(&mut transform.rotation, motion.velocity);
+            face_motion_or_goal_direction(&mut transform.rotation, motion.velocity, direction);
         }
         GoalState::FollowPosition { target, speed } => {
             let vertical_velocity = motion.velocity.y;
@@ -4062,6 +4112,11 @@ fn apply_goal_to_entity(
                 }
                 .horizontal_normalized()
             };
+            // The request carries the panic-multiplied speed; outside panic
+            // it equals the goal speed.
+            let speed = pathing_result
+                .and_then(|result| result.request.as_ref())
+                .map_or(*speed, |planned| planned.speed);
             motion.velocity.x = direction.x * speed;
             motion.velocity.y = if direction.y != 0.0 {
                 direction.y * speed
@@ -4069,18 +4124,7 @@ fn apply_goal_to_entity(
                 vertical_velocity
             };
             motion.velocity.z = direction.z * speed;
-            let facing = if *speed == 0.0 {
-                direction
-            } else {
-                motion.velocity
-            };
-            if *speed == 0.0 && facing.horizontal_len() > f64::EPSILON {
-                let yaw = crate::yaw_from_velocity(facing);
-                transform.rotation.yaw = yaw;
-                transform.rotation.head_yaw = yaw;
-            } else {
-                face_horizontal_motion(&mut transform.rotation, facing);
-            }
+            face_motion_or_goal_direction(&mut transform.rotation, motion.velocity, direction);
         }
     }
     stats.decisions_applied += 1;
@@ -4098,6 +4142,19 @@ fn face_horizontal_motion(rotation: &mut Rotation, velocity: Vec3) {
         target,
         MOB_HEAD_YAW_TURN_PER_TICK,
     );
+}
+
+/// Faces actual horizontal motion; when a mob is stationary it snaps to its
+/// goal direction instead, so facing-gated behavior (hostile attack arcs)
+/// still engages while the mob stands still.
+fn face_motion_or_goal_direction(rotation: &mut Rotation, velocity: Vec3, direction: Vec3) {
+    if velocity.horizontal_len() > f64::EPSILON {
+        face_horizontal_motion(rotation, velocity);
+    } else if direction.horizontal_len() > f64::EPSILON {
+        let yaw = crate::yaw_from_velocity(direction);
+        rotation.yaw = yaw;
+        rotation.head_yaw = yaw;
+    }
 }
 
 fn integrate_positions(world: &mut World) {
@@ -4469,12 +4526,14 @@ mod tests {
                 .villager_job_site,
             None
         );
+        // Brainless villagers no longer invent a self-pointing job site:
+        // POIs are world-registered claims, and missing ones stay missing.
         assert_eq!(
             runtime
                 .simulation_projection(EntityId(11))
                 .expect("implicit-brain villager projection")
                 .villager_job_site,
-            Some(implicit_brain.position)
+            None
         );
     }
 

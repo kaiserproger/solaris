@@ -3,6 +3,8 @@ use mc_world::BlockStateId;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
+use super::entity_physics_class::entity_type_uses_aquatic_physics;
+
 use crate::play::is_hostile_entity;
 use crate::play::simulation::SimulationAuthority;
 use crate::play::spawn::chunk_pos_from_coords;
@@ -361,6 +363,7 @@ pub(super) fn spawn_command_entity_locked(
     mob_behaviors: &mc_data::mob_behavior_26_1_2::MobBehaviorTable,
 ) -> (EntityId, Vec<VisibilityDispatch>) {
     let hostile = is_hostile_entity(&entity_type_name);
+    let smooth_aquatic = entity_type_uses_aquatic_physics(&entity_type_name);
     let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
     apply_entity_facts(&mut entity);
     apply_default_mob_goal(&mut entity, mob_behaviors);
@@ -374,6 +377,9 @@ pub(super) fn spawn_command_entity_locked(
     }
     if is_sheep {
         inner.sheep_entities.insert(id);
+    }
+    if smooth_aquatic {
+        inner.smooth_aquatic_mobs.insert(id);
     }
     update_breeding_tick_tracking_locked(inner, id, animal);
     inner
@@ -561,6 +567,7 @@ pub(super) fn clear_removed_entity_tracking_locked(
     inner.natural_hostile_mobs.remove(&entity_id);
     inner.natural_ground_mobs.remove(&entity_id);
     inner.natural_aquatic_mobs.remove(&entity_id);
+    inner.smooth_aquatic_mobs.remove(&entity_id);
     inner.natural_mob_no_action_since_tick.remove(&entity_id);
     inner.sheep_entities.remove(&entity_id);
     inner.villager_entities.remove(&entity_id);

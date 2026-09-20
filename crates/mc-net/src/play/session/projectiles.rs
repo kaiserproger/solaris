@@ -68,6 +68,19 @@ const BREEZE_WIND_CHARGE_ENTITY_DAMAGE: f32 = 1.0;
 const WITHER_SKULL_ENTITY_DAMAGE: f32 = 8.0;
 const WITCH_HARMING_DAMAGE: f32 = 6.0;
 const WITCH_SPLASH_POTION_GRAVITY: f64 = 0.05;
+
+/// Per-type throwable gravity. The witch's splash potions fly on 0.05; every
+/// other throwable (snowball today) uses the vanilla ThrowableProjectile
+/// default of 0.03. Keep in lockstep with the physics lane's per-type gravity
+/// in mc-entity/runtime.rs `entity_physics_kind`.
+fn throwable_gravity(type_name: &str) -> f64 {
+    if type_name == "minecraft:splash_potion" {
+        WITCH_SPLASH_POTION_GRAVITY
+    } else {
+        mc_entity::projectile_26_1_2::THROWABLE_DEFAULT_GRAVITY
+    }
+}
+
 const WITCH_SLOWNESS_DURATION_TICKS: i32 = 1_800;
 const WITCH_POISON_DURATION_TICKS: i32 = 900;
 const WITCH_WEAKNESS_DURATION_TICKS: i32 = 1_800;
@@ -227,6 +240,42 @@ pub(super) fn spawn_arrow_locked(
             .expect("finite spawned arrow must produce a valid kernel state"),
     );
     let aabb = entity_aabb(&entity.type_name);
+    let id = inner.entities.spawn(entity);
+    inner
+        .entity_type_aabbs
+        .entry(entity_type_id)
+        .or_insert(aabb);
+    track_entity_chunk_locked(inner, id, position);
+    initialize_entity_wire_state_locked(inner, id);
+    let dispatches = spawn_entity_visibility_locked(inner, id);
+    (id, dispatches)
+}
+
+/// Spawns a player-thrown throwable item projectile (snowball today) with the
+/// same wire/visibility fanout as arrows.
+pub(super) fn spawn_throwable_projectile_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    owner_session: Option<SessionId>,
+    entity_type_id: i32,
+    type_name: &str,
+    position: Vec3,
+    velocity: Vec3,
+    rotation: Rotation,
+) -> (EntityId, Vec<VisibilityDispatch>) {
+    let owner = owner_session
+        .and_then(|session_id| inner.sessions.get(&session_id))
+        .map(|session| projectile_identity(EntityId(session.entity_id)));
+    let mut entity = SpawnEntity::new(entity_type_id, type_name, position);
+    entity.velocity = velocity;
+    entity.rotation = rotation;
+    entity.on_ground = false;
+    apply_entity_facts(&mut entity);
+    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
+    entity.retained.throwable_projectile_state = Some(
+        initial_throwable_projectile_state(owner, type_name, position, velocity, rotation)
+            .expect("finite spawned throwable must produce a valid kernel state"),
+    );
+    let aabb = entity_aabb(type_name);
     let id = inner.entities.spawn(entity);
     inner
         .entity_type_aabbs
@@ -576,8 +625,16 @@ pub(super) fn resolve_throwable_projectile_hits_locked<'a>(
         if expected.position != motion.position
             || expected.velocity != motion.velocity
             || expected.on_ground != motion.on_ground
-            || expected.type_name != "minecraft:splash_potion"
         {
+            continue;
+        }
+        // The witch is the only mob that throws splash potions; player-thrown
+        // snowballs ride the same kernel with their own gravity and no potion
+        // payload on impact.
+        if !matches!(
+            expected.type_name.as_str(),
+            "minecraft:splash_potion" | "minecraft:snowball"
+        ) {
             continue;
         }
         let Some(state) = expected.retained.throwable_projectile_state else {
@@ -618,7 +675,7 @@ pub(super) fn resolve_throwable_projectile_hits_locked<'a>(
             &next_state,
             ThrowableTickInput {
                 stamp,
-                gravity: WITCH_SPLASH_POTION_GRAVITY,
+                gravity: throwable_gravity(&expected.type_name),
                 no_gravity: false,
                 in_water: fact.in_water,
                 owner_collision,
@@ -642,13 +699,6 @@ pub(super) fn resolve_throwable_projectile_hits_locked<'a>(
             _ => None,
         };
         let next_projectile = throwable_projectile_snapshot_with_state(&expected, next_state);
-        let accepted_step = EntityPhysicsStep {
-            id: step.id,
-            position: next_projectile.position,
-            velocity: next_projectile.velocity,
-            on_ground: false,
-            horizontal_collision: false,
-        };
         let potion_kind = expected
             .retained
             .witch_potion
@@ -660,53 +710,69 @@ pub(super) fn resolve_throwable_projectile_hits_locked<'a>(
             HitTarget::Miss => None,
         };
         let did_hit = hit_location.is_some();
-        let committed = match (hit, selected_target) {
-            (
-                HitTarget::Entity { entity, .. },
-                Some(HurtingProjectileTarget::Entity(entity_id)),
-            ) if entity == projectile_entity(entity_id) => {
-                let Some(candidate_index) = scratch
-                    .candidates
-                    .iter()
-                    .position(|snapshot| snapshot.id == entity_id)
-                else {
-                    continue;
-                };
-                let target = scratch.candidates.swap_remove(candidate_index);
-                commit_witch_potion_entity_hit_locked(
-                    registry,
-                    &mut inner,
-                    expected,
-                    next_projectile,
-                    target,
-                    potion_kind,
-                    dispatches,
-                )
-            }
-            (
-                HitTarget::Entity { entity, .. },
-                Some(HurtingProjectileTarget::Player {
-                    session,
-                    entity: player_entity,
-                }),
-            ) if entity == projectile_entity(player_entity) => {
-                commit_witch_potion_player_hit_locked(
-                    registry,
-                    &mut inner,
-                    ProjectilePlayerHit {
-                        expected_projectile: expected,
-                        next_projectile,
-                        target_session: session,
-                        source_origin: start,
-                    },
-                    potion_kind,
-                    dispatches,
-                )
-            }
-            (HitTarget::Block { .. }, _) | (HitTarget::Miss, _) => inner
+        let accepted_step = EntityPhysicsStep {
+            id: step.id,
+            position: next_projectile.position,
+            velocity: next_projectile.velocity,
+            on_ground: false,
+            horizontal_collision: false,
+        };
+        let committed = if expected.type_name == "minecraft:snowball" {
+            // Snowballs carry no potion payload: advancing the kernel state
+            // is all a tick commits; the shared did-hit removal below
+            // despawns the snowball on any impact.
+            inner
                 .entities
-                .replace_snapshot_if_current(expected, next_projectile),
-            _ => false,
+                .replace_snapshot_if_current(expected, next_projectile)
+        } else {
+            match (hit, selected_target) {
+                (
+                    HitTarget::Entity { entity, .. },
+                    Some(HurtingProjectileTarget::Entity(entity_id)),
+                ) if entity == projectile_entity(entity_id) => {
+                    let Some(candidate_index) = scratch
+                        .candidates
+                        .iter()
+                        .position(|snapshot| snapshot.id == entity_id)
+                    else {
+                        continue;
+                    };
+                    let target = scratch.candidates.swap_remove(candidate_index);
+                    commit_witch_potion_entity_hit_locked(
+                        registry,
+                        &mut inner,
+                        expected,
+                        next_projectile,
+                        target,
+                        potion_kind,
+                        dispatches,
+                    )
+                }
+                (
+                    HitTarget::Entity { entity, .. },
+                    Some(HurtingProjectileTarget::Player {
+                        session,
+                        entity: player_entity,
+                    }),
+                ) if entity == projectile_entity(player_entity) => {
+                    commit_witch_potion_player_hit_locked(
+                        registry,
+                        &mut inner,
+                        ProjectilePlayerHit {
+                            expected_projectile: expected,
+                            next_projectile,
+                            target_session: session,
+                            source_origin: start,
+                        },
+                        potion_kind,
+                        dispatches,
+                    )
+                }
+                (HitTarget::Block { .. }, _) | (HitTarget::Miss, _) => inner
+                    .entities
+                    .replace_snapshot_if_current(expected, next_projectile),
+                _ => false,
+            }
         };
         if !committed {
             continue;

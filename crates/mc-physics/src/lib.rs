@@ -789,12 +789,13 @@ pub fn step_entity<S: BlockSampler>(
         }
     }
     if in_fluid {
-        // Living bodies sink gently and swim upward only below the shallow
-        // immersion threshold. Requiring a submerged head would hold breathing
-        // animals underwater; applying lift at any overlap walks them on water.
+        // Living bodies sink gently like vanilla (`gravity / 16` effective
+        // water gravity). The bounded swim drive only assists a body already
+        // swimming upward (a FloatGoal-style impulse): passive immersion keeps
+        // sinking instead of pinning just below the surface.
         if config.jump_speed > 0.0 && config.water_buoyancy > 0.0 {
             body.velocity.y -= WATER_SINK_BLOCKS_PER_SECOND_SQUARED * config.tick_seconds;
-            if fluid_reaches_swim_threshold(body, sampler) {
+            if body.velocity.y > 0.0 && fluid_reaches_swim_threshold(body, sampler) {
                 body.velocity.y += config.water_buoyancy * config.tick_seconds;
             }
         } else {

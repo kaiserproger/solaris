@@ -1643,6 +1643,7 @@ impl SessionRegistry {
                     .filter(|(session_id, _)| {
                         !inner.dead_sessions.contains(session_id)
                             && !inner.spectator_sessions.contains(session_id)
+                            && !inner.creative_sessions.contains(session_id)
                             && !inner.client_unloaded_sessions.contains(session_id)
                     })
                     .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
@@ -1973,7 +1974,12 @@ impl SessionRegistry {
                         3.0
                     },
                 },
-                MobCombatPolicy::None | MobCombatPolicy::UnsupportedSpecial => continue,
+                // Snow golems carry a data-only ranged-snowball policy slot;
+                // the snowball throw wiring lands separately and they are not
+                // members of the hostile scan set today.
+                MobCombatPolicy::Snowball
+                | MobCombatPolicy::None
+                | MobCombatPolicy::UnsupportedSpecial => continue,
             };
             // Draw-pose aggressive is evaluated every tick for every loaded
             // bow skeleton from this same budgeted fetch — no due-gating, no

@@ -200,9 +200,9 @@ impl WorldgenMode {
     }
 }
 
-/// Hill-noise terrain. Holds the resolved state ids of the four
-/// block types it emits so `generate` is allocation-free past the
-/// `Chunk::empty` it returns.
+/// Vanilla-like terrain generator. Holds the resolved state ids of every block
+/// state it emits, so `generate` is allocation-free after the `Chunk::empty`
+/// allocation it returns.
 pub struct TerrainGenerator {
     seed: i64,
     geometry: ChunkGeometry,

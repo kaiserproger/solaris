@@ -166,6 +166,29 @@ impl DurableStructure {
         self.stages.get(self.stage_index)
     }
 
+    /// Progress exposed to scripts directly from the durable construction record.
+    ///
+    /// The terminal stage index is one past the final authored stage and has no
+    /// in-stage work, so a recovered worker does not need to infer completion
+    /// from lifecycle state or aggregate material accounting.
+    fn snapshot_progress(&self) -> (u32, u64) {
+        let current_stage_index =
+            u32::try_from(self.stage_index).expect("structure stage count is bounded");
+        if self.stage_index == self.stages.len() {
+            return (current_stage_index, 0);
+        }
+        let completed_prior_stages = self.stages[..self.stage_index]
+            .iter()
+            .try_fold(0_u64, |total, stage| total.checked_add(stage.work_units))
+            .expect("durable structure progress is validated");
+        (
+            current_stage_index,
+            self.built_blocks
+                .checked_sub(completed_prior_stages)
+                .expect("durable structure progress is validated"),
+        )
+    }
+
     /// Reserved territory of the placed blueprint, in world coordinates.
     fn bounds(&self) -> ScriptSurveyBounds {
         bounds_of(self.origin, self.reserved_footprint)
@@ -811,11 +834,20 @@ fn validate_structure(structure: &DurableStructure) -> Result<(), PluginStorageS
             .checked_add(stage.work_units)
             .ok_or(PluginStorageStartError::Malformed("settlement work"))?;
     }
-    if structure.built_blocks > total
-        || (structure.stage_index == structure.stages.len() && structure.built_blocks != total)
-        || (structure.state == ScriptStructureState::Committed
-            && structure.stage_index != structure.stages.len())
-    {
+    let completed_prior_stages = structure.stages[..structure.stage_index]
+        .iter()
+        .try_fold(0_u64, |total, stage| total.checked_add(stage.work_units))
+        .ok_or(PluginStorageStartError::Malformed("settlement work"))?;
+    let terminal = structure.stage_index == structure.stages.len();
+    let progress_is_valid = if terminal {
+        structure.built_blocks == total && structure.state == ScriptStructureState::Committed
+    } else {
+        let stage_end = completed_prior_stages
+            .checked_add(structure.stages[structure.stage_index].work_units)
+            .ok_or(PluginStorageStartError::Malformed("settlement work"))?;
+        structure.built_blocks >= completed_prior_stages && structure.built_blocks < stage_end
+    };
+    if !progress_is_valid || (structure.state == ScriptStructureState::Committed && !terminal) {
         return Err(PluginStorageStartError::Malformed("settlement progress"));
     }
     validate_material_counts(&structure.consumed)?;
@@ -2272,7 +2304,12 @@ impl super::InventoryRuntime {
             return Ok(rejected(ScriptOperationFailure::Blocked));
         }
         if record.revision != expected_revision {
-            return Ok(rejected(ScriptOperationFailure::StaleRevision));
+            return Ok(ScriptOperationOutcome::rejected_with_payload(
+                ScriptOperationFailure::StaleRevision,
+                settlement_payload(ScriptSettlementResult::Structure {
+                    structure: Box::new(structure_snapshot(storage, record)),
+                }),
+            ));
         }
         let Some(planned_stage) = record.stage() else {
             return Ok(rejected(ScriptOperationFailure::Blocked));
@@ -3202,6 +3239,7 @@ fn structure_snapshot(
         None if structure.is_active() => planned_remaining(structure),
         None => BTreeMap::new(),
     };
+    let (current_stage_index, completed_work_units) = structure.snapshot_progress();
     ScriptStructureSnapshot::new(
         structure.structure_id.clone(),
         structure.blueprint_id.clone(),
@@ -3212,6 +3250,8 @@ fn structure_snapshot(
         structure.rotation,
         structure.reserved_footprint,
         structure.stages.clone(),
+        current_stage_index,
+        completed_work_units,
         structure.resource_plan_hash.clone(),
         structure.reservation_ref.clone(),
         structure.watermark,

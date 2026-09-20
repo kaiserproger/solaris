@@ -11,27 +11,14 @@ pub(super) fn apply_runtime_control_decision(
     draining: bool,
 ) -> Result<(), RuntimeControlApplyError> {
     let previous_prepare_limit = resources.prepare_limit();
-    if decision.action == crate::AutoscaleAction::Hold {
-        // Hold is the per-tick steady state. Avoid a synchronous regional-owner
-        // command that would invalidate read routes without changing capacity.
-        if decision.pressure == Some(crate::AutoscalePressure::Memory) {
-            let removed = sessions.shed_prepared_chunks();
-            if removed > 0 {
-                debug!(removed, "memory pressure released shared prepared chunks");
-            }
-        }
-        return Ok(());
-    }
-    // Chunk pressure includes requests still waiting for CPU admission. Reduce
-    // producer rates through the controller limits, not their drain capacity.
-    let cpu_action = if decision.action == crate::AutoscaleAction::ScaleDown
-        && decision.pressure == Some(crate::AutoscalePressure::ChunkQueue)
-    {
-        crate::AutoscaleAction::Hold
-    } else {
-        decision.action
-    };
-    let prepare_limit = resources.apply_runtime_control_action(cpu_action, draining);
+    // Chunk pressure includes requests still waiting for CPU admission. The
+    // resources layer owns the physical response: it holds background drain
+    // capacity under chunk pressure and grows the shared pools toward the
+    // policy ceilings while one worker demonstrably cannot keep up. Holds
+    // still apply so fully-idle adaptive pools can shrink back toward one
+    // worker.
+    let prepare_limit =
+        resources.apply_runtime_control_action(decision.action, decision.pressure, draining);
     if draining {
         let entity_owner_lanes = sessions.reconfigure_entity_owner_lanes(1);
         if entity_owner_lanes != 1 {

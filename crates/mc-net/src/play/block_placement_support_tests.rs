@@ -295,3 +295,103 @@ fn standing_torch_uses_full_up_face_of_top_stair() {
         .is_some()
     );
 }
+
+#[test]
+fn bed_placement_places_foot_and_head_along_the_player_facing() {
+    let blocks = canonical_blocks();
+    let air = blocks
+        .block(&Identifier::parse("minecraft:air").unwrap())
+        .unwrap()
+        .default;
+    let bed = block_state(
+        &blocks,
+        "minecraft:white_bed",
+        &[("facing", "north"), ("occupied", "false"), ("part", "foot")],
+    );
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    let pos = BlockPos { x: 4, y: 64, z: 4 };
+    let support = BlockPos { y: 63, ..pos };
+    let head = BlockPos { z: 3, ..pos };
+    let snapshot = placement_snapshot_for_test(Arc::clone(&blocks), &[(support, stone)]);
+    let mut pose = PlayerPose::new(4.5, 64.0, 4.5);
+    pose.yaw = 180.0; // facing north: the head goes one step north
+
+    let plan = plan_block_placement(
+        &blocks,
+        bed,
+        Some(&snapshot),
+        pos,
+        pose,
+        Direction::Up,
+        1.0,
+        air,
+    )
+    .expect("a bed fits on flat open ground");
+
+    assert_eq!(plan.edits.len(), 2, "foot and head");
+    assert_eq!(plan.edits[0].pos, pos);
+    let foot_state = blocks.by_id(plan.edits[0].new_state).unwrap();
+    assert_eq!(
+        foot_state.properties.iter().find(|(key, _)| key == "part"),
+        Some(&("part".to_string(), "foot".to_string())),
+        "the clicked cell is the foot half"
+    );
+    assert_eq!(plan.edits[1].pos, head);
+    let head_state = blocks.by_id(plan.edits[1].new_state).unwrap();
+    assert_eq!(
+        head_state.properties.iter().find(|(key, _)| key == "part"),
+        Some(&("part".to_string(), "head".to_string()))
+    );
+    assert_eq!(
+        head_state
+            .properties
+            .iter()
+            .find(|(key, _)| key == "facing"),
+        Some(&("facing".to_string(), "north".to_string()))
+    );
+    assert_eq!(plan.additional_preconditions.len(), 1);
+    assert_eq!(plan.additional_preconditions[0].pos, head);
+    assert_eq!(plan.additional_preconditions[0].expected_state, air);
+}
+
+#[test]
+fn bed_placement_rejects_when_the_head_cell_is_blocked() {
+    let blocks = canonical_blocks();
+    let air = blocks
+        .block(&Identifier::parse("minecraft:air").unwrap())
+        .unwrap()
+        .default;
+    let bed = blocks
+        .block(&Identifier::parse("minecraft:white_bed").unwrap())
+        .unwrap()
+        .default;
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    let pos = BlockPos { x: 4, y: 64, z: 4 };
+    let support = BlockPos { y: 63, ..pos };
+    let head = BlockPos { z: 3, ..pos };
+    let mut pose = PlayerPose::new(4.5, 64.0, 4.5);
+    pose.yaw = 180.0; // facing north: the head goes one step north
+    let snapshot =
+        placement_snapshot_for_test(Arc::clone(&blocks), &[(support, stone), (head, stone)]);
+
+    assert!(
+        plan_block_placement(
+            &blocks,
+            bed,
+            Some(&snapshot),
+            pos,
+            pose,
+            Direction::Up,
+            1.0,
+            air,
+        )
+        .is_none(),
+        "a bed with no room for its head must not place a lone foot half"
+    );
+}

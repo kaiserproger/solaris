@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mc_entity::villager_26_1_2::{VillagerBrainState, VillagerPoiSet};
+use mc_entity::villager_26_1_2::{VillagerBrainState, VillagerPoiSet, VillagerScheduleKind};
+use mc_entity::villager_population_26_1_2::VillagerPopulationState;
 use mc_entity::{GoalState, SpawnEntity, Vec3, VillagerData, VillagerKind, VillagerProfession};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
@@ -73,8 +74,6 @@ async fn embedded_village_defense_spawns_golem_and_attacks_hostile_over_tcp() {
         .await
         .expect("connect to play");
     drain_until_chunk(&mut client, (0, 0)).await;
-    // The observer must survive the ravager: a dead session clears the active
-    // simulation selection and freezes the pursuit before the golem arrives.
     client
         .write_packet(&ServerboundChatCommand {
             command: "gamemode creative".to_string(),
@@ -83,22 +82,38 @@ async fn embedded_village_defense_spawns_golem_and_attacks_hostile_over_tcp() {
         .expect("switch observer to creative");
 
     let village_origin = Vec3::new(spawn.x + 5.0, spawn.y, spawn.z + 5.0);
-    let villagers = [
-        village_origin,
-        Vec3::new(village_origin.x + 1.5, village_origin.y, village_origin.z),
-        Vec3::new(village_origin.x, village_origin.y, village_origin.z + 1.5),
-    ];
-    let threat_position = Vec3::new(village_origin.x, village_origin.y, village_origin.z + 4.0);
-    let mut entities = villagers
-        .into_iter()
-        .map(|position| recently_slept_villager(villager_type_id, position))
+    let mut entities = (0..3)
+        .flat_map(|x| {
+            (0..3).map(move |z| {
+                recently_slept_villager(
+                    villager_type_id,
+                    Vec3::new(
+                        village_origin.x + f64::from(x) * 1.5,
+                        village_origin.y,
+                        village_origin.z + f64::from(z) * 1.5,
+                    ),
+                )
+            })
+        })
         .collect::<Vec<_>>();
-    let mut threat = SpawnEntity::new(ravager_type_id, "minecraft:ravager", threat_position);
-    threat.goal = GoalState::Idle;
-    entities.push(threat);
+    entities.extend((0..3).flat_map(|x| {
+        (0..3).map(move |z| {
+            let mut threat = SpawnEntity::new(
+                ravager_type_id,
+                "minecraft:ravager",
+                Vec3::new(
+                    village_origin.x + f64::from(x) * 1.5,
+                    village_origin.y,
+                    village_origin.z + f64::from(z) * 1.5 + 4.0,
+                ),
+            );
+            threat.goal = GoalState::Idle;
+            threat
+        })
+    }));
     let seeded = load_bench.seed_spawn_entities(entities);
-    assert_eq!(seeded.entities, 4);
-    assert_eq!(seeded.hostile_entities, 1);
+    assert_eq!(seeded.entities, 18);
+    assert_eq!(seeded.hostile_entities, 9);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut golem_id = None;
@@ -149,11 +164,13 @@ fn recently_slept_villager(type_id: i32, position: Vec3) -> SpawnEntity {
         VillagerProfession::None,
         1,
     ));
+    entity.retained.villager_population = Some(VillagerPopulationState::adult());
     let mut brain = VillagerBrainState::adult(VillagerPoiSet {
         home: Some(position),
         job_site: None,
         meeting_point: Some(position),
     });
+    brain.schedule = VillagerScheduleKind::Adult;
     brain.last_slept_tick = Some(0);
     entity.retained.villager_brain = Some(brain);
     entity.goal = GoalState::Idle;

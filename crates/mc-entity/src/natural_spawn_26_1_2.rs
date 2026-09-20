@@ -440,6 +440,8 @@ pub fn panic_speed_multiplier_26_1_2(type_name: &str) -> f64 {
     match type_name {
         "minecraft:sheep" | "minecraft:pig" => 1.25,
         "minecraft:chicken" => 1.4,
+        // Villager registers `PanicGoal(this, 2.0)` in `registerGoals`.
+        "minecraft:villager" => 2.0,
         _ => 2.0,
     }
 }

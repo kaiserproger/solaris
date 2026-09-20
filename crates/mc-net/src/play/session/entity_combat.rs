@@ -1335,3 +1335,69 @@ fn damage_expected_server_entity_locked(
         },
     )
 }
+
+/// Vanilla `LivingEntity#fall` / `calculateFallDamage`: one damage point per
+/// block beyond the three-block safe height, rounded up to whole points.
+#[must_use]
+pub(super) fn entity_fall_damage_amount(fall_distance: f64) -> Option<f32> {
+    if !fall_distance.is_finite() || fall_distance <= super::entity_owner::ENTITY_FALL_SAFE_HEIGHT {
+        return None;
+    }
+    Some((fall_distance - super::entity_owner::ENTITY_FALL_SAFE_HEIGHT).ceil() as f32)
+}
+
+/// Apply vanilla fall damage for landings observed on the committed region
+/// physics stream and fire the matching `EntityHurt` (or death) feedback.
+pub(super) fn resolve_entity_fall_damage(
+    sessions: &SessionRegistry,
+    landings: &[super::entity_owner::EntityFallLanding],
+) {
+    if landings.is_empty() {
+        return;
+    }
+    let mut dispatches = {
+        let mut inner = sessions.lock_session_entities("entity fall damage");
+        let mut dispatches = Vec::new();
+        for landing in landings {
+            let Some(amount) = entity_fall_damage_amount(landing.fall_distance) else {
+                continue;
+            };
+            let Some(expected) = inner.entities.snapshot(landing.id) else {
+                continue;
+            };
+            // Items, XP orbs, arrows and healthless specials never take fall
+            // damage; the tracker already skips the streaming exceptions.
+            if expected.item_stack.is_some()
+                || expected.lifecycle != EntityLifecycle::Alive
+                || server_entity_snapshot_from(expected.clone())
+                    .health
+                    .is_none()
+            {
+                continue;
+            }
+            let rewards = entity_kill_rewards_locked(&inner, &expected);
+            if let Some(mut outcome) =
+                attack_server_entity_locked(&mut inner, landing.id, amount, None, &rewards, None)
+            {
+                dispatches.append(outcome.dispatches_mut());
+            }
+        }
+        dispatches
+    };
+    sessions.append_spawned_xp_pickup_candidates(&mut dispatches);
+    super::dispatch_visibility_commands(dispatches);
+}
+#[cfg(test)]
+mod fall_damage_tests {
+    use super::*;
+
+    #[test]
+    fn fall_damage_amounts_follow_vanilla_safe_height() {
+        assert_eq!(entity_fall_damage_amount(3.0), None);
+        assert_eq!(entity_fall_damage_amount(2.5), None);
+        assert_eq!(entity_fall_damage_amount(f64::NAN), None);
+        assert_eq!(entity_fall_damage_amount(3.5), Some(1.0));
+        assert_eq!(entity_fall_damage_amount(4.0), Some(1.0));
+        assert_eq!(entity_fall_damage_amount(10.0), Some(7.0));
+    }
+}

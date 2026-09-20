@@ -2251,6 +2251,28 @@ async fn run_storage_actor(
                         && (!resume_handles.is_empty() || !resume_endpoints.is_empty())
                         && outcome.state() == mc_script::ScriptOperationState::Committed;
                     inventory.refresh_warehouse_reservation_floors(&storage);
+                    // The inline resume commits before the answer is
+                    // enqueued, so its receipt always precedes the answer in
+                    // the boundary queue: the guest adopts the resumed
+                    // revision before any command staged from the answer can
+                    // fence on the pre-resume one.
+                    if resume_after_transfer
+                        && !resume_paused_resident_work(
+                            &mut storage,
+                            &inventory,
+                            &events,
+                            &shutdown,
+                            &stopped,
+                            &mut commands,
+                            ResidentWorkWake::Inventory {
+                                handles: resume_handles,
+                                endpoints: resume_endpoints,
+                            },
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     let event = match command.operation_result(outcome) {
                         Ok(event) => event,
                         Err(error) => {
@@ -2271,23 +2293,6 @@ async fn run_storage_actor(
                         warn!(?error, "owned inventory receipt acknowledgement failed");
                         stopped.mark_failed();
                         fail_queued_storage_commands(&mut commands, &events).await;
-                        return;
-                    }
-                    if resume_after_transfer
-                        && !resume_paused_resident_work(
-                            &mut storage,
-                            &inventory,
-                            &events,
-                            &shutdown,
-                            &stopped,
-                            &mut commands,
-                            ResidentWorkWake::Inventory {
-                                handles: resume_handles,
-                                endpoints: resume_endpoints,
-                            },
-                        )
-                        .await
-                    {
                         return;
                     }
                     delivery

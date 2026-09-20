@@ -1557,6 +1557,8 @@ async fn prepare_builds_nothing_and_cancel_preserves_built_blocks() {
     assert_eq!(fixture.world.built_total(), 0);
     assert!(structure.consumed.is_empty());
     assert_eq!(structure.watermark, 0);
+    assert_eq!(structure.current_stage_index, 0);
+    assert_eq!(structure.completed_work_units, 0);
     assert_eq!(
         structure.stages.len(),
         2,
@@ -1635,6 +1637,8 @@ async fn prepare_builds_nothing_and_cancel_preserves_built_blocks() {
     let running = structure_of(&status);
     assert_eq!(running.state, ScriptStructureState::Running);
     assert_eq!(running.consumed[0].quantity, 2, "two stone were spent");
+    assert_eq!(running.current_stage_index, 0);
+    assert_eq!(running.completed_work_units, 2);
 
     let outcome = fixture
         .execute(
@@ -2022,6 +2026,10 @@ async fn competing_structure_portions_admit_only_one_revision() {
         Some(ScriptOperationFailure::StaleRevision),
         "the second contender cannot reuse the consumed structure revision"
     );
+    let current = structure_of(&refused);
+    assert_eq!(current.revision, receipt_of(&accepted).revision);
+    assert_eq!(current.current_stage_index, 0);
+    assert_eq!(current.completed_work_units, 1);
     assert_eq!(fixture.world.built_blocks(&structure.structure_id), 1);
     let (_, reservation) = storage
         .settlement_reservation(OWNER, "res-competing")
@@ -3154,6 +3162,8 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
         let committed = structure_of(&status);
         assert_eq!(committed.watermark, 2, "one receipt per stage");
         assert_eq!(committed.consumed.len(), 2);
+        assert_eq!(committed.current_stage_index, committed.stages.len() as u32);
+        assert_eq!(committed.completed_work_units, 0);
         (prepared, projection)
     };
 

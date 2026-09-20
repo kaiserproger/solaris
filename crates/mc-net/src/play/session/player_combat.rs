@@ -21,6 +21,7 @@ use super::projectiles::{
 use super::sleep::{
     SleepWakeReason, SleepingPlayer, defer_staged_sleep_dispatches_locked, stage_sleep_wake_locked,
 };
+use super::visibility::player_death_visibility_locked;
 use super::{
     CommittedPlayerAttackCosts, EntityAttackOutcome, PlayerAttackResult, ServerEntityPlayerAttack,
     SessionEntityGuards, SessionId, SessionRegistry, session_recipients, visible_observers_locked,
@@ -36,6 +37,7 @@ use crate::play::inventory::{
     inventory_damage_after_protection,
 };
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority, SimulationCommand};
+use crate::play::survival::SurvivalState;
 use crate::play::{GameMode, PlayerPose};
 use mc_data::ItemStack;
 use mc_entity::{EntityId, Vec3};
@@ -384,8 +386,8 @@ impl SessionRegistry {
                     duration,
                 })
         });
-        let Some((mut committed, committed_attacker_costs, staged_damage_wake)) = self
-            .commit_player_attack(
+        let Some((mut committed, committed_attacker_costs, staged_damage_wake, death_dispatches)) =
+            self.commit_player_attack(
                 authority,
                 PlayerAttackCommit {
                     attacker_session,
@@ -404,7 +406,6 @@ impl SessionRegistry {
         };
 
         let publication = PlayerDamagePublication {
-            expected_health: target_plan.expected_survival.health,
             health: committed.survival.health,
             inventory: target_plan
                 .expected_inventory
@@ -413,20 +414,17 @@ impl SessionRegistry {
                 .zip(&committed.inventory.slots)
                 .enumerate()
                 .filter(|(_, (expected, updated))| expected != updated)
-                .map(|(slot, (expected, updated))| PlayerInventorySlotDelta {
+                .map(|(slot, (_, updated))| PlayerInventorySlotDelta {
                     slot,
-                    expected: expected.clone(),
                     updated: updated.clone(),
                 })
                 .collect(),
-            carried_item: (target_plan.expected_carried_item != committed.carried_item).then(
-                || PlayerCarriedItemDelta {
-                    expected: target_plan.expected_carried_item.clone(),
+            carried_item: (target_plan.expected_carried_item != committed.carried_item).then_some(
+                PlayerCarriedItemDelta {
                     updated: committed.carried_item,
                 },
             ),
-            xp: (target_plan.expected_xp != committed.xp).then(|| PlayerXpDelta {
-                expected: target_plan.expected_xp.clone(),
+            xp: (target_plan.expected_xp != committed.xp).then_some(PlayerXpDelta {
                 updated: committed.xp,
             }),
             died: committed.died,
@@ -473,6 +471,7 @@ impl SessionRegistry {
                     }),
             );
         }
+        dispatches.extend(death_dispatches);
         if let Some(sleeper) = staged_damage_wake {
             self.defer_staged_sleep_dispatches(target_session, &mut dispatches);
             dispatches = self.completed_sleep_dispatches(vec![sleeper], None);
@@ -719,6 +718,7 @@ impl SessionRegistry {
             && state.xp == target_fence.xp
     }
 
+    #[allow(clippy::type_complexity)]
     fn commit_player_attack(
         &self,
         _authority: &SimulationAuthority,
@@ -727,6 +727,7 @@ impl SessionRegistry {
         crate::play::simulation::CommittedPlayerSurvival,
         Option<CommittedPlayerAttackCosts>,
         Option<SleepingPlayer>,
+        Vec<VisibilityDispatch>,
     )> {
         let PlayerAttackCommit {
             attacker_session,
@@ -857,11 +858,34 @@ impl SessionRegistry {
                 .player_hurt_resistance
                 .insert(target_session, next_resistance);
         }
+        let death_dispatches = if committed_target.died {
+            player_death_visibility_locked(&mut inner, target_session)
+        } else {
+            Default::default()
+        };
         drop(target_state);
         drop(attacker_state);
         drop(inner);
         self.append_spawned_xp_pickup_candidates(&mut committed_target.dispatches);
-        Some((committed_target, committed_attacker, staged_damage_wake))
+        Some((
+            committed_target,
+            committed_attacker,
+            staged_damage_wake,
+            death_dispatches,
+        ))
+    }
+
+    /// Authoritative survival inventory and health for one session, for
+    /// connection-side resyncs after a rejected commit: the registry copy is
+    /// the truth the session cache and the client must converge to.
+    pub(in crate::play) fn authoritative_player_survival_state(
+        &self,
+        id: SessionId,
+    ) -> Option<(PlayerInventory, SurvivalState)> {
+        let inner = self.lock_inner("read authoritative player survival state");
+        let state = inner.player_persistence.get(&id)?.clone();
+        let state = lock_authoritative_mutex(&state, "play.player_persistence");
+        Some((state.inventory.clone(), state.survival))
     }
 }
 
@@ -1192,7 +1216,6 @@ pub(super) fn commit_projectile_player_damage_locked(
             .insert(target_session, next_resistance);
     }
     let publication = PlayerDamagePublication {
-        expected_health: target_plan.expected_survival.health,
         health: committed.survival.health,
         inventory: target_plan
             .expected_inventory
@@ -1201,20 +1224,17 @@ pub(super) fn commit_projectile_player_damage_locked(
             .zip(&committed.inventory.slots)
             .enumerate()
             .filter(|(_, (expected, updated))| expected != updated)
-            .map(|(slot, (expected, updated))| PlayerInventorySlotDelta {
+            .map(|(slot, (_, updated))| PlayerInventorySlotDelta {
                 slot,
-                expected: expected.clone(),
                 updated: updated.clone(),
             })
             .collect(),
-        carried_item: (target_plan.expected_carried_item != committed.carried_item).then(|| {
+        carried_item: (target_plan.expected_carried_item != committed.carried_item).then_some(
             PlayerCarriedItemDelta {
-                expected: target_plan.expected_carried_item.clone(),
                 updated: committed.carried_item,
-            }
-        }),
-        xp: (target_plan.expected_xp != committed.xp).then(|| PlayerXpDelta {
-            expected: target_plan.expected_xp.clone(),
+            },
+        ),
+        xp: (target_plan.expected_xp != committed.xp).then_some(PlayerXpDelta {
             updated: committed.xp,
         }),
         died: committed.died,
@@ -1282,6 +1302,9 @@ pub(super) fn commit_projectile_player_damage_locked(
                 }),
         );
     }
+    if committed.died {
+        damage_dispatches.extend(player_death_visibility_locked(inner, target_session));
+    }
     if let Some(sleeper) = staged_damage_wake {
         defer_staged_sleep_dispatches_locked(inner, target_session, &mut damage_dispatches);
         damage_dispatches.push(VisibilityDispatch {
@@ -1318,7 +1341,7 @@ mod tests {
         damage_active_shield_slots, shield_use_matches, shield_use_matches_slot,
     };
     use crate::play::persistence::PlayerPersistedState;
-    use crate::play::session::SessionRegistry;
+    use crate::play::session::{ENTITY_EVENT_DEATH, SessionRegistry};
     use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
     use crate::play::{GameMode, PlayerInventory, PlayerPose};
 
@@ -2099,5 +2122,114 @@ mod tests {
             &dispatch.command,
             OutboundCommand::PlayerDamageCommitted { .. }
         )));
+    }
+
+    #[test]
+    fn lethal_pvp_hit_hides_target_from_observers_until_respawn() {
+        let (items, facts, _, stone) = shield_items();
+        let registry = SessionRegistry::new();
+        registry.configure_player_combat(None, None, Arc::new(items), Arc::new(facts));
+
+        let attacker_pose = PlayerPose::new(0.5, 64.0, 0.5);
+        let mut attacker_state = PlayerPersistedState::new_default(attacker_pose);
+        attacker_state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(stone, 1);
+        let attacker = register_player(&registry, "LethalHitAtk", attacker_pose, attacker_state);
+        let target_pose = PlayerPose::new(0.5, 64.0, 1.5);
+        let target = register_player(
+            &registry,
+            "LethalHitDef",
+            target_pose,
+            PlayerPersistedState::new_default(target_pose),
+        );
+        // Mirror what the visibility refresh establishes for co-located
+        // players: the attacker has the target's chunk loaded and tracks it.
+        {
+            let mut inner = registry.lock_inner("stage lethal-hit visibility");
+            let attacker_session = inner.sessions.get_mut(&attacker).expect("attacker session");
+            attacker_session.loaded.insert((0, 0));
+            attacker_session.visible_players.insert(target);
+        }
+        let target_entity = {
+            let inner = registry.lock_inner("read lethal-hit target entity");
+            EntityId(inner.sessions[&target].entity_id)
+        };
+        let authority_tick = registry.simulation_tick();
+
+        let result = registry.player_attack_entity(
+            &SimulationAuthority::for_test(),
+            PlayerEntityAttack {
+                attacker_session: attacker,
+                entity_id: target_entity,
+                amount: mc_entity::player_survival_26_1_2::MAX_HEALTH * 2.0,
+                attacker_costs: None,
+                authority_tick,
+                hook_approval: None,
+            },
+        );
+        let PlayerAttackResult::Damaged(outcome) = result else {
+            panic!("lethal pvp hit must reach the player damage publication")
+        };
+        let EntityAttackOutcome::PlayerDamaged {
+            dispatches,
+            damage_applied,
+            ..
+        } = *outcome
+        else {
+            panic!("player target must use player damage publication")
+        };
+        assert!(damage_applied, "the lethal blow must commit");
+
+        let death_idx = dispatches
+            .iter()
+            .position(|dispatch| {
+                matches!(
+                    &dispatch.command,
+                    OutboundCommand::EntityEvent {
+                        entity_id,
+                        event_id: ENTITY_EVENT_DEATH,
+                    } if *entity_id == target_entity.0
+                )
+            })
+            .expect("observers must receive the death animation event");
+        let despawn_idx = dispatches
+            .iter()
+            .position(|dispatch| {
+                matches!(
+                    &dispatch.command,
+                    OutboundCommand::DespawnPlayer(snapshot) if snapshot.session_id == target
+                )
+            })
+            .expect("observers must receive the corpse despawn");
+        assert!(
+            death_idx < despawn_idx,
+            "the death animation must precede the hide"
+        );
+        assert_eq!(
+            dispatches[death_idx].recipient.id, attacker,
+            "the death event targets the observer, not the victim"
+        );
+        assert!(
+            !dispatches
+                .iter()
+                .any(|dispatch| matches!(dispatch.command, OutboundCommand::PlayerInfoRemove(_))),
+            "the tab list entry must survive death"
+        );
+        {
+            let inner = registry.lock_inner("verify lethal-hit visibility removal");
+            assert!(!inner.sessions[&attacker].visible_players.contains(&target));
+        }
+
+        let respawn = registry.respawn_player_visibility(target);
+        assert!(
+            respawn.iter().any(|dispatch| matches!(
+                &dispatch.command,
+                OutboundCommand::SpawnPlayer(snapshot) if snapshot.session_id == target
+            )),
+            "respawn must re-publish the player through the spawn publication"
+        );
+        {
+            let inner = registry.lock_inner("verify respawn visibility restore");
+            assert!(inner.sessions[&attacker].visible_players.contains(&target));
+        }
     }
 }

@@ -353,30 +353,31 @@ pub(super) fn apply_player_damage_publication(
     let old_survival = *survival_state;
     let old_xp = xp_state.clone();
     let shield_cooldown = publication.shield_cooldown.clone();
-    let health_accepted = survival_state.health == publication.expected_health;
-    if health_accepted {
-        survival_state.health = publication.health;
-    }
-    if let Some(xp) = publication.xp
-        && *xp_state == xp.expected
-    {
+    // The simulation already committed this damage, so the registry value is
+    // authoritative: a local divergence (e.g. a local-only regen or a lost
+    // commit) must realign to the committed result instead of silently
+    // dropping the publication — a drop would desync the victim HUD forever,
+    // because every later publication carries registry-derived values the
+    // local state never matches again.
+    survival_state.health = publication.health;
+    if let Some(xp) = publication.xp {
         *xp_state = xp.updated;
     }
 
     let mut changed_slots = Vec::new();
     if let Some(state) = interaction {
         for delta in publication.inventory {
+            // The publication carries the registry-committed slots: apply
+            // them even where the session cache diverged and surface every
+            // changed slot to the client — a silent skip would fossilize the
+            // ghost stack the registry no longer has.
             let Some(slot) = state.inventory.slots.get_mut(delta.slot) else {
                 continue;
             };
-            if *slot == delta.expected {
-                *slot = delta.updated.clone();
-                changed_slots.push((delta.slot, delta.updated));
-            }
+            *slot = delta.updated.clone();
+            changed_slots.push((delta.slot, delta.updated));
         }
-        if let Some(delta) = publication.carried_item
-            && state.carried_item == delta.expected
-        {
+        if let Some(delta) = publication.carried_item {
             state.carried_item = delta.updated;
         }
         if publication.shield_blocked
@@ -389,7 +390,7 @@ pub(super) fn apply_player_damage_publication(
         } else {
             refresh_shield_use_state(state);
         }
-        if health_accepted && publication.died {
+        if publication.died {
             state.pending_break = None;
             state.pending_use = None;
             clear_shield_use(state);
@@ -400,10 +401,10 @@ pub(super) fn apply_player_damage_publication(
         changed_slots,
         survival_changed: old_survival != *survival_state,
         xp_changed: old_xp != *xp_state,
-        died: health_accepted && publication.died,
-        fresh_hurt: health_accepted && publication.fresh_hurt,
+        died: publication.died,
+        fresh_hurt: publication.fresh_hurt,
         shield_cooldown,
-        knockback: health_accepted.then_some(publication.knockback).flatten(),
+        knockback: publication.knockback,
     }
 }
 
@@ -621,9 +622,78 @@ mod tests {
     use mc_protocol::packets::play::ClientboundSetHealth;
 
     use super::{
-        Compression, GameMode, PlayerDamageApplication, PlayerDamageKind, PlayerDamageRequest,
-        PlayerPose, SurvivalState, XpState, apply_unhooked_player_damage_for_test,
+        Compression, GameMode, MeleeKnockback, PlayerDamageApplication, PlayerDamageKind,
+        PlayerDamagePublication, PlayerDamageRequest, PlayerPose, SurvivalState, XpState,
+        apply_player_damage_publication, apply_unhooked_player_damage_for_test,
     };
+
+    #[test]
+    fn damage_publication_realigns_diverged_expected_health() {
+        let mut survival = SurvivalState::FULL;
+        survival.health = 20.0; // local-only regen diverged from the registry
+        let mut xp = XpState::default();
+        let knockback = MeleeKnockback {
+            x: 0.25,
+            y: 0.4,
+            z: 0.75,
+        };
+        let applied = apply_player_damage_publication(
+            None,
+            &mut survival,
+            &mut xp,
+            PlayerDamagePublication {
+                health: 16.0,
+                inventory: Vec::new(),
+                carried_item: None,
+                xp: None,
+                died: false,
+                fresh_hurt: true,
+                shield_blocked: false,
+                shield_cooldown: None,
+                knockback: Some(knockback),
+            },
+        );
+        assert_eq!(
+            survival.health, 16.0,
+            "committed damage must apply over a diverged expected value"
+        );
+        assert!(
+            applied.survival_changed,
+            "realigned damage must rewrite the victim SetHealth"
+        );
+        assert!(applied.fresh_hurt);
+        assert_eq!(applied.knockback, Some(knockback));
+        assert!(!applied.died);
+    }
+
+    #[test]
+    fn lethal_damage_publication_reports_death_without_expected_health_gate() {
+        let mut survival = SurvivalState::FULL;
+        survival.health = 1.5; // diverged below the registry's committed value
+        let mut xp = XpState::default();
+        let applied = apply_player_damage_publication(
+            None,
+            &mut survival,
+            &mut xp,
+            PlayerDamagePublication {
+                health: 0.0,
+                inventory: Vec::new(),
+                carried_item: None,
+                xp: None,
+                died: true,
+                fresh_hurt: true,
+                shield_blocked: false,
+                shield_cooldown: None,
+                knockback: None,
+            },
+        );
+        assert_eq!(survival.health, 0.0);
+        assert!(
+            applied.died,
+            "death must not be gated on the expected-health CAS"
+        );
+        assert!(applied.survival_changed);
+    }
 
     #[tokio::test]
     async fn common_environmental_damage_writes_health_and_invalid_sources_fail_closed() {

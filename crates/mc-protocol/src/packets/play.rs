@@ -5293,6 +5293,44 @@ impl Packet for ServerboundSetCarriedItem {
     }
 }
 
+/// `Serverbound Set Creative Mode Slot` (SB). While in creative mode the
+/// client reports the FULL new stack for a player-inventory slot — taking
+/// an item from the creative menu, overwriting a slot, or destroying the
+/// slot's stack (empty payload). A negative `slot` is the creative
+/// drop/destroy action. Per ADR 0002, verified against `javap -p` of the
+/// unobfuscated 26.1.2 jar:
+/// `ServerboundSetCreativeModeSlotPacket(short slotNum, ItemStack
+/// itemStack)` with `STREAM_CODEC = composite(ByteBufCodecs.SHORT,
+/// ItemStack.OPTIONAL_UNTRUSTED_STREAM_CODEC)` (wrapped by
+/// `validatedStreamCodec`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundSetCreativeModeSlot {
+    pub slot: i16,
+    pub item_stack: ItemStack,
+}
+
+impl Packet for ServerboundSetCreativeModeSlot {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // SERVERBOUND_SET_CREATIVE_MODE_SLOT at game-SB index 56 = wire id
+    // 0x38. Cross-checked against the pinned ids of the same builder
+    // lambda: SERVERBOUND_PLAYER_ACTION at index 41 = 0x29 and
+    // SERVERBOUND_SET_CARRIED_ITEM at index 53 = 0x35.
+    const ID: i32 = 0x38;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i16(self.slot);
+        self.item_stack.encode(buf)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            slot: buf.read_i16()?,
+            item_stack: ItemStack::decode(buf)?,
+        })
+    }
+}
+
 /// `Serverbound Place Recipe` (SB). Per local 26.1.2 `javap`:
 /// `ServerboundPlaceRecipePacket(int containerId, RecipeDisplayId recipe,
 /// boolean useMaxItems)`, encoded as container-id VarInt, recipe display

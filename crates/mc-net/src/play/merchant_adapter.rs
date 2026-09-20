@@ -1,4 +1,22 @@
-use super::*;
+use super::containers::{
+    MerchantWindow, merchant_input_from_projection, merchant_input_projection,
+    merchant_menu_title_nbt, refresh_selected_offer, store_active_container,
+};
+use super::{
+    ActiveContainer, ConnectionError, ContainerClickAction, ContainerPlayerPlan, InteractionState,
+    MERCHANT_MENU_TYPE_ID, MerchantInputPlan, MerchantTradeDestination, MerchantTradePlan,
+    PlayerInventoryCommitOutcome, PlayerPose, can_stack, classify_container_click,
+    client_carried_item_matches, item_max_stack, next_container_id, select_merchant_offer,
+    write_merchant_window,
+};
+use crate::connection::write_packet;
+use mc_data::ItemStack;
+use mc_entity::EntityId;
+use mc_protocol::packets::play::{
+    ClientboundOpenScreen, ServerboundContainerClick, ServerboundSelectTrade,
+};
+use tokio::io::AsyncWriteExt;
+use tracing::debug;
 
 pub(super) async fn open_merchant_container<W>(
     state: &mut InteractionState,
@@ -245,7 +263,7 @@ where
             window.inputs = merchant_input_from_projection(committed.merchant_input);
             window.merchant = committed.merchant;
             window.gossip = committed.gossip;
-            super::containers::refresh_selected_offer(&state.items, &state.item_facts, &mut window);
+            refresh_selected_offer(&state.items, &state.item_facts, &mut window);
             window.state_id = window.state_id.wrapping_add(1);
         }
         Ok(None) => {

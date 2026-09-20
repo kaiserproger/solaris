@@ -17,6 +17,7 @@ use crate::error::ConnectionError;
 use crate::server::ServerConfig;
 use crate::{RuntimeControlHandle, connection::write_packet};
 
+use super::beds::plan_loaded_bed_interaction;
 use super::block_edit_commit::apply_visible_block_edit_batch_conditionally;
 use super::chunk_stream::ChunkStreamState;
 use super::combat::{PlayerDamageKind, PlayerDamageRequest};
@@ -34,6 +35,7 @@ use super::player_damage_adapter::{
 use super::session::damage_precommit::PlayerDamageSource;
 use super::session::{SessionRegistry, WeatherKind, dispatch_visibility_commands};
 use super::simulation::SimulationHandle;
+use super::spawn::validated_respawn_y;
 use super::survival::SurvivalState;
 use super::{
     BlockEdit, InteractionState, PlayerPose, air_state_id, clear_shield_use,
@@ -848,6 +850,57 @@ where
     write_packet(writer, &player_abilities_for_mode(requested), compression).await
 }
 
+/// Re-resolve a stored respawn pose against the live world before the
+/// teleport: a recorded bed may have been mined and terrain can have changed
+/// since the pose was captured.
+///
+/// A bed that still exists keeps its freshly computed respawn pose. Anything
+/// else is surface-re-scanned at the stored column with the login path's
+/// support and body-cell rules; when even that fails (spawn chunk missing or
+/// no valid surface) the surface-validated world spawn is used, and only a
+/// world that cannot answer at all leaves the stored pose untouched.
+pub(super) fn validate_respawn_pose(state: &InteractionState, stored: PlayerPose) -> PlayerPose {
+    let stored_bed = mc_world::BlockPos {
+        x: stored.x.floor() as i32,
+        y: (stored.y - 1.0) as i32,
+        z: stored.z.floor() as i32,
+    };
+    if let Some((bed_pose, _)) =
+        plan_loaded_bed_interaction(&state.world_read, &state.blocks, stored_bed)
+    {
+        return bed_pose;
+    }
+    if let Some(y) = validated_respawn_y(
+        &state.blocks,
+        &state.block_facts,
+        state.block_light.as_deref(),
+        &state.world_read,
+        stored.x.floor() as i32,
+        stored.z.floor() as i32,
+    ) {
+        let mut pose = PlayerPose::new(stored.x, f64::from(y), stored.z);
+        pose.yaw = stored.yaw;
+        pose.pitch = stored.pitch;
+        return pose;
+    }
+    let spawn = state.world_read.spawn();
+    if let Some(y) = validated_respawn_y(
+        &state.blocks,
+        &state.block_facts,
+        state.block_light.as_deref(),
+        &state.world_read,
+        spawn.block_x,
+        spawn.block_z,
+    ) {
+        return PlayerPose::new(
+            f64::from(spawn.block_x) + 0.5,
+            f64::from(y),
+            f64::from(spawn.block_z) + 0.5,
+        );
+    }
+    stored
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_client_command<W>(
     writer: &mut W,
@@ -869,6 +922,13 @@ where
 {
     match command.action {
         ClientCommandAction::PerformRespawn => {
+            let stored_respawn_pose = respawn_pose;
+            // Re-resolve the stored spawn against the live world: a recorded
+            // bed may have been mined and terrain can have changed since the
+            // pose was captured, so never replay its Y verbatim.
+            let respawn_pose = interaction.as_deref().map_or(stored_respawn_pose, |state| {
+                validate_respawn_pose(state, stored_respawn_pose)
+            });
             if !survival_state.is_dead() {
                 return Ok(());
             }
@@ -892,6 +952,11 @@ where
                     return Ok(());
                 }
                 state.pending_break = None;
+                if respawn_pose != stored_respawn_pose
+                    && let Err(error) = state.simulation.commit_respawn_pose(respawn_pose).await
+                {
+                    warn!(?error, "corrected respawn pose commit failed");
+                }
             } else {
                 *survival_state = SurvivalState::FULL;
             }

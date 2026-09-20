@@ -572,6 +572,8 @@ async fn cross_region_scheduled_task_finishes_while_journal_writer_is_blocked() 
                 light_table: None,
                 leaf_trigger_tick: None,
             },
+            None,
+            None,
         )
         .await
     });
@@ -675,12 +677,14 @@ async fn known_cross_region_append_failure_closes_reserved_decision_empty() {
             light_table: None,
             leaf_trigger_tick: None,
         },
+        None,
+        None,
     )
     .await
     .expect("known append failure closes its reservation")
     .expect("known append failure is a rejected resident transaction");
 
-    assert!(outcome.applied.is_empty());
+    assert!(outcome.0.applied.is_empty());
     assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
     assert_eq!(read.get_cached_block(east), Some(BlockStateId(1)));
     assert_eq!(

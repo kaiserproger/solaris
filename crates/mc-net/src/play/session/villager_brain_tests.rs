@@ -301,7 +301,7 @@ fn schedule_transitions_are_data_driven_and_do_not_write_unchanged_ticks() {
         meeting.goal,
         GoalState::FollowPosition {
             target: Vec3::new(4.5, 64.0, 4.5),
-            speed: 0.3,
+            speed: 3.0,
         }
     );
     assert_eq!(
@@ -380,7 +380,7 @@ fn unsupported_job_site_keeps_villager_unemployed_without_merchant_state() {
     let registry = SessionRegistry::new();
     let (_session, mut outbound) = register_profession_observer(&registry);
     let id = install_unemployed_villager(&registry);
-    let (blocks, world_read) = profession_world("minecraft:blast_furnace");
+    let (blocks, world_read) = profession_world("minecraft:stone");
     let items = mc_data::items::solaris_required_items();
     let due_tick = (20 - u64::from(id.0.unsigned_abs()) % 20) % 20;
 

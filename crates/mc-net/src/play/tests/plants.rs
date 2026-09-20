@@ -11,7 +11,7 @@ use super::{
     farmland_trample_pos, fluid_test_facts, fluid_test_registry, handle_block_item_placement,
     insert_fluid_test_chunk, interaction_state_for_blocks, interaction_state_for_items,
     maybe_trample_farmland, next_crop_growth_state, pack_block_pos, plan_break_block_edits,
-    plan_break_edit_preconditions, plan_hoe_tilling, plan_loaded_bonemeal_growth,
+    plan_break_edit_preconditions, plan_flint_fire, plan_hoe_tilling, plan_loaded_bonemeal_growth,
     plan_loaded_plant_harvest, plan_place_block_edits, plan_survival_break_drops,
     player_pose_collides_with_solid, prop_schema, random_tick_edit, random_tick_edit_seeded,
     register_ticketed_button_session, simple_block, simulation_channel, state, sweet_berry_harvest,
@@ -3515,4 +3515,61 @@ async fn hoe_tilling_plan_does_not_wait_for_writer_and_guards_the_block_above() 
         "a block placed above after planning must reject tilling"
     );
     assert_eq!(storage.get_cached_block(clicked), Some(BlockStateId(1)));
+}
+
+#[tokio::test]
+async fn flint_fire_plan_targets_the_top_face_and_guards_both_cells() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:stone"),
+            simple_block(2, "minecraft:fire"),
+        ])
+        .unwrap(),
+    );
+    let storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let world_read = storage.read_view();
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let mut state = interaction_state_for_items(Arc::new(ItemRegistry::default()));
+    state.blocks = Arc::clone(&blocks);
+    state.world = Arc::clone(&world);
+    state.world_read = world_read;
+
+    let clicked = mc_world::BlockPos { x: 2, y: 64, z: 2 };
+    let above = mc_world::BlockPos { y: 65, ..clicked };
+    let mut storage = world.lock().await;
+    let cpos = ChunkPos { x: 0, z: 0 };
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(clicked, BlockStateId(1)).unwrap();
+
+    let plan = plan_flint_fire(&state, clicked, BlockStateId(2)).expect("stone top face plan");
+    assert_eq!(plan.fire_pos, above);
+    assert_eq!(plan.edits.len(), 1);
+    assert_eq!(plan.edits[0].pos, above);
+    assert_eq!(plan.edits[0].new_state, BlockStateId(2));
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|guard| guard.pos == clicked && guard.expected_state == BlockStateId(1))
+    );
+    assert!(
+        plan.preconditions
+            .iter()
+            .any(|guard| guard.pos == above && guard.expected_state == BlockStateId(0))
+    );
+
+    storage.set_block_at(above, BlockStateId(1)).unwrap();
+    assert!(
+        plan_flint_fire(&state, clicked, BlockStateId(2)).is_none(),
+        "a solid block above leaves no room for fire"
+    );
 }

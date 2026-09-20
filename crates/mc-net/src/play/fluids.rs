@@ -15,6 +15,23 @@ use super::{
 pub(super) const WATER_FLOW_DELAY_TICKS: u64 = 5;
 const LAVA_FLOW_DELAY_TICKS: u64 = 30;
 
+/// Blockstate `level` that marks vanilla falling fluid: full strength,
+/// full-height rendering, unlimited downward travel, and it spreads
+/// sideways at full strength. Not a source — it cannot be scooped and it
+/// sustains itself only through the support rules in
+/// [`fluid_has_source_path`].
+const FALLING_LEVEL: u8 = 8;
+
+/// Flow strength: 0 is full (sources and falling fluid), 1..=7 is the
+/// remaining horizontal spread distance of flowing fluid.
+fn fluid_flow_level(fluid: FluidStateFacts) -> u8 {
+    if fluid.source || fluid.level >= FALLING_LEVEL {
+        0
+    } else {
+        fluid.level
+    }
+}
+
 pub(super) fn scheduled_fluid_planning_chunks(ticks: &[ScheduledFluidTick]) -> Vec<ChunkPos> {
     let mut positions = HashSet::new();
     for tick in ticks {
@@ -182,7 +199,11 @@ pub(super) fn supported_flow_state(
         .and_then(|state| facts.fluid(state.0))
         .is_some_and(|above| above.kind == fluid.kind)
     {
-        return fluid_state_with_level(blocks, fluid.kind, 1);
+        // Vanilla: the same fluid above makes this cell falling water —
+        // full strength, supported unconditionally, and it spreads
+        // sideways at full strength. This is exactly what downward spread
+        // installs, so re-ticking never corrects it back and forth.
+        return fluid_state_with_level(blocks, fluid.kind, FALLING_LEVEL);
     }
 
     let next_level = horizontal_fluid_neighbours(pos)
@@ -191,9 +212,9 @@ pub(super) fn supported_flow_state(
             let state = world.get_cached_block(neighbour)?;
             let other = facts.fluid(state.0)?;
             (other.kind == fluid.kind && fluid_has_source_path(facts, world, neighbour, other, 0))
-                .then_some(other)
+                .then_some(fluid_flow_level(other))
         })
-        .map(|other| other.level.saturating_add(1))
+        .map(|level| level.saturating_add(1))
         .min();
 
     match next_level {
@@ -204,6 +225,12 @@ pub(super) fn supported_flow_state(
     }
 }
 
+/// Vanilla water support: a flowing cell is sustained by a source reached
+/// through a strictly-weakening horizontal chain, or by the same fluid
+/// above (falling water, which vanilla supports unconditionally). Vertical
+/// support is unbounded — only horizontal steps consume the spread-distance
+/// budget — so deep columns and pools keep their support path instead of
+/// dying to air and being refilled a few ticks later.
 fn fluid_has_source_path(
     facts: &BlockFactsTable,
     world: &impl BlockPlanningRead,
@@ -215,7 +242,18 @@ fn fluid_has_source_path(
     let mut pending = VecDeque::from([(pos, fluid, depth)]);
     let mut visited = HashSet::new();
     while let Some((pos, fluid, depth)) = pending.pop_front() {
-        if fluid.source {
+        if fluid.source || fluid.level >= FALLING_LEVEL {
+            return true;
+        }
+        let above = BlockPos {
+            y: pos.y + 1,
+            ..pos
+        };
+        if world
+            .get_cached_block(above)
+            .and_then(|state| facts.fluid(state.0))
+            .is_some_and(|above_fluid| above_fluid.kind == fluid.kind)
+        {
             return true;
         }
         if depth > max_depth || !visited.insert(pos) {
@@ -223,18 +261,7 @@ fn fluid_has_source_path(
         }
 
         let next_depth = depth.saturating_add(1);
-        let above = BlockPos {
-            y: pos.y + 1,
-            ..pos
-        };
-        if let Some(above_fluid) = world
-            .get_cached_block(above)
-            .and_then(|state| facts.fluid(state.0))
-            .filter(|above_fluid| above_fluid.kind == fluid.kind)
-        {
-            pending.push_back((above, above_fluid, next_depth));
-        }
-
+        let current_level = fluid_flow_level(fluid);
         pending.extend(
             horizontal_fluid_neighbours(pos)
                 .into_iter()
@@ -242,7 +269,7 @@ fn fluid_has_source_path(
                     let other = world
                         .get_cached_block(neighbour)
                         .and_then(|state| facts.fluid(state.0))?;
-                    (other.kind == fluid.kind && other.level < fluid.level)
+                    (other.kind == fluid.kind && fluid_flow_level(other) < current_level)
                         .then_some((neighbour, other, next_depth))
                 }),
         );
@@ -257,34 +284,45 @@ fn fluid_spread_edits(
     pos: BlockPos,
     fluid: FluidStateFacts,
 ) -> Vec<BlockEdit> {
-    let next_level = if fluid.source { 1 } else { fluid.level + 1 };
-    if next_level > max_flow_level(fluid.kind) {
-        return Vec::new();
-    }
-    let Some(next_state) = fluid_state_with_level(blocks, fluid.kind, next_level) else {
-        return Vec::new();
-    };
+    // Vanilla: fluid flowing down always lands at full strength — the
+    // falling state, which falls indefinitely and keeps spreading sideways
+    // at full strength ("spreads 7 at level 8"). Horizontal flow weakens
+    // by one level per step and stops past the max flow level. A falling
+    // column whose cell below is already falling just continues, so
+    // mid-air columns never grow side sheets; flowing fluid below blocks
+    // the fall and turns it into sideways spread instead.
     let below = BlockPos {
         y: pos.y - 1,
         ..pos
     };
-    let mut targets = Vec::new();
-    if can_flow_into(blocks, facts, world, below, fluid.kind, next_level) {
-        targets.push(below);
-    } else {
-        targets.extend(
-            horizontal_fluid_neighbours(pos)
-                .into_iter()
-                .filter(|&target| {
-                    can_flow_into(blocks, facts, world, target, fluid.kind, next_level)
-                }),
-        );
+    let flow_level = fluid_flow_level(fluid);
+    let mut targets: Vec<(BlockPos, BlockStateId)> = Vec::new();
+    let falls_down = fluid_state_with_level(blocks, fluid.kind, FALLING_LEVEL)
+        .filter(|_| can_flow_below(blocks, facts, world, below, fluid.kind));
+    match falls_down {
+        Some(falling_state) => {
+            if world.get_cached_block(below) != Some(falling_state) {
+                targets.push((below, falling_state));
+            }
+        }
+        None => {
+            let side_level = flow_level.saturating_add(1);
+            if side_level <= max_flow_level(fluid.kind)
+                && let Some(side_state) = fluid_state_with_level(blocks, fluid.kind, side_level)
+            {
+                for target in horizontal_fluid_neighbours(pos) {
+                    if can_flow_into(blocks, facts, world, target, fluid.kind, side_level) {
+                        targets.push((target, side_state));
+                    }
+                }
+            }
+        }
     }
     let mut edits: Vec<BlockEdit> = targets
         .iter()
-        .map(|&target| BlockEdit {
+        .map(|&(target, new_state)| BlockEdit {
             pos: target,
-            new_state: next_state,
+            new_state,
         })
         .collect();
     // A washed plant stops supporting whatever stood on it (upper double
@@ -292,7 +330,7 @@ fn fluid_spread_edits(
     // break-path cascade. Drops resolve at commit from the previous states.
     if fluid.kind == FluidKind::Water {
         let air = air_state_id(blocks);
-        for &target in &targets {
+        for &(target, _) in &targets {
             if world
                 .get_cached_block(target)
                 .is_some_and(|state| is_water_washable_plant(blocks, state))
@@ -329,7 +367,32 @@ fn can_flow_into(
     world: &impl BlockPlanningRead,
     pos: BlockPos,
     kind: FluidKind,
-    new_level: u8,
+    new_flow_level: u8,
+) -> bool {
+    let Some(state) = world.get_cached_block(pos) else {
+        return false;
+    };
+    if state == air_state_id(blocks) {
+        return true;
+    }
+    if kind == FluidKind::Water && is_water_washable_plant(blocks, state) {
+        return true;
+    }
+    facts.fluid(state.0).is_some_and(|fluid| {
+        fluid.kind == kind && !fluid.source && fluid_flow_level(fluid) > new_flow_level
+    })
+}
+
+/// Vanilla down-flow: fluid falls into air (and plants it washes away), and
+/// a falling column continues through falling fluid beneath it. Flowing
+/// fluid below blocks the fall — the fluid spreads sideways there instead —
+/// so sheets never punch falling columns into pools.
+fn can_flow_below(
+    blocks: &BlockRegistry,
+    facts: &BlockFactsTable,
+    world: &impl BlockPlanningRead,
+    pos: BlockPos,
+    kind: FluidKind,
 ) -> bool {
     let Some(state) = world.get_cached_block(pos) else {
         return false;
@@ -342,7 +405,7 @@ fn can_flow_into(
     }
     facts
         .fluid(state.0)
-        .is_some_and(|fluid| fluid.kind == kind && !fluid.source && fluid.level > new_level)
+        .is_some_and(|fluid| fluid.kind == kind && fluid.level >= FALLING_LEVEL)
 }
 
 pub(super) fn plan_fluid_ticks_near_applied(

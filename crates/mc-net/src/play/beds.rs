@@ -323,7 +323,7 @@ fn chunk_pos(pos: BlockPos) -> ChunkPos {
     }
 }
 
-fn horizontal_step(facing: &str) -> Option<(i32, i32)> {
+pub(in crate::play) fn horizontal_step(facing: &str) -> Option<(i32, i32)> {
     match facing {
         "north" => Some((0, -1)),
         "south" => Some((0, 1)),

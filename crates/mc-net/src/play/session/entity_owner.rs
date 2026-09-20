@@ -7,6 +7,10 @@ pub(super) struct SessionEntityOwners {
     observation: Arc<SessionPressureObservation>,
     failure: Arc<EntityOwnerFailureState>,
     journal_failures: Arc<EntityJournalFailureTracker>,
+    /// Airborne descent tracking for committed region-lane motion; the
+    /// kernel resets retained fall distance on landing without consuming it.
+    fall_tracking: Mutex<HashMap<EntityId, FallTrack>>,
+    pending_fall_landings: Mutex<Vec<EntityFallLanding>>,
     #[cfg(test)]
     owner_requests: Arc<AtomicU64>,
 }
@@ -283,6 +287,8 @@ impl SessionEntityOwners {
             observation,
             failure,
             journal_failures,
+            fall_tracking: Mutex::new(HashMap::new()),
+            pending_fall_landings: Mutex::new(Vec::new()),
             #[cfg(test)]
             owner_requests,
         })
@@ -326,12 +332,76 @@ impl SessionEntityOwners {
     ) -> mc_entity::RegionalEntityTickOutput {
         self.call(|handle| handle.tick_owned_regions(input))
     }
-
     pub(super) fn commit_owned_region_physics(
         &self,
         prepared: mc_entity::RegionalPreparedEntityPhysics,
-    ) -> mc_entity::RegionalEntityPhysicsOutput {
-        self.call(|handle| handle.commit_owned_region_physics(prepared))
+    ) -> (
+        mc_entity::RegionalEntityPhysicsOutput,
+        Vec<EntityFallLanding>,
+    ) {
+        let output = self.resolve(self.handle.commit_owned_region_physics(prepared));
+        self.observe_entity_fall_landings(&output.committed_motion);
+        let landings = self.take_entity_fall_landings();
+        (output, landings)
+    }
+
+    pub(super) fn take_entity_fall_landings(&self) -> Vec<EntityFallLanding> {
+        std::mem::take(
+            &mut *self
+                .pending_fall_landings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Track committed region-lane motion for airborne descent and record a
+    /// landing once a tracked body touches ground. The kernel resets retained
+    /// fall distance on landing without consuming it, so the committed
+    /// kinematics stream is the only place the landing impact is observable.
+    fn observe_entity_fall_landings(&self, committed_motion: &[mc_entity::EntityTrackingMotion]) {
+        let mut track = self
+            .fall_tracking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending = self
+            .pending_fall_landings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for motion in committed_motion {
+            if motion.is_item || motion.is_experience || motion.is_arrow {
+                // Non-living exceptional entities never take fall damage.
+                continue;
+            }
+            if !motion.position.y.is_finite() {
+                track.remove(&motion.id);
+                continue;
+            }
+            match track.get_mut(&motion.id) {
+                Some(entry) => {
+                    entry.drop += (entry.last_y - motion.position.y).max(0.0);
+                    entry.last_y = motion.position.y;
+                    if motion.on_ground {
+                        if entry.drop > ENTITY_FALL_SAFE_HEIGHT {
+                            pending.push(EntityFallLanding {
+                                id: motion.id,
+                                fall_distance: entry.drop,
+                            });
+                        }
+                        track.remove(&motion.id);
+                    }
+                }
+                None if !motion.on_ground => {
+                    track.insert(
+                        motion.id,
+                        FallTrack {
+                            last_y: motion.position.y,
+                            drop: 0.0,
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
     }
 
     pub(super) fn versioned_snapshots_are_current(
@@ -450,6 +520,24 @@ enum SelectedKinematicsCommit {
     Unavailable,
     Rejected(Option<Vec<EntityMotionState>>),
     Committed(Vec<EntityKinematics>),
+}
+
+/// A committed physics landing whose accumulated fall distance crossed the
+/// vanilla safe height, ready for damage resolution by the session layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct EntityFallLanding {
+    pub(super) id: EntityId,
+    pub(super) fall_distance: f64,
+}
+
+/// Vanilla `LivingEntity` safe fall height in blocks: falls beyond three
+/// blocks deal one damage point per additional block.
+pub(super) const ENTITY_FALL_SAFE_HEIGHT: f64 = 3.0;
+
+#[derive(Debug, Clone, Copy)]
+struct FallTrack {
+    last_y: f64,
+    drop: f64,
 }
 
 pub(super) struct EntityOwnerAccess {
@@ -1862,6 +1950,63 @@ fn entity_snapshot_view(snapshot: &EntitySnapshot) -> mc_entity::EntityView<'_> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fall_tracker_reports_landing_distance_and_clears_on_landing() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let motion = |id: EntityId, y: f64, on_ground: bool| mc_entity::EntityTrackingMotion {
+            id,
+            position: Vec3::new(0.5, y, 0.5),
+            rotation: Rotation {
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+            },
+            velocity: Vec3::ZERO,
+            on_ground,
+            is_item: false,
+            is_experience: false,
+            is_arrow: false,
+            sends_velocity: true,
+        };
+        let faller = EntityId(9);
+
+        // Two airborne commits accumulate 3 + 1 blocks of descent.
+        owners.observe_entity_fall_landings(&[motion(faller, 66.0, false)]);
+        assert!(owners.take_entity_fall_landings().is_empty());
+        owners.observe_entity_fall_landings(&[motion(faller, 63.0, false)]);
+        assert!(owners.take_entity_fall_landings().is_empty());
+
+        // The landing commit reports the accumulated fall distance once.
+        owners.observe_entity_fall_landings(&[motion(faller, 62.0, true)]);
+        assert_eq!(
+            owners.take_entity_fall_landings(),
+            vec![EntityFallLanding {
+                id: faller,
+                fall_distance: 4.0,
+            }]
+        );
+
+        // Landing clears the tracker; a grounded body never re-reports.
+        owners.observe_entity_fall_landings(&[motion(faller, 62.0, true)]);
+        assert!(owners.take_entity_fall_landings().is_empty());
+
+        // Falls within the safe height produce no landing at all.
+        owners.observe_entity_fall_landings(&[motion(faller, 64.0, false)]);
+        owners.observe_entity_fall_landings(&[motion(faller, 63.0, true)]);
+        assert!(owners.take_entity_fall_landings().is_empty());
+
+        // Item entities never enter the tracker.
+        let item = mc_entity::EntityTrackingMotion {
+            is_item: true,
+            ..motion(EntityId(10), 70.0, false)
+        };
+        owners.observe_entity_fall_landings(&[item]);
+        owners.observe_entity_fall_landings(&[motion(EntityId(10), 60.0, true)]);
+        assert!(owners.take_entity_fall_landings().is_empty());
+    }
 
     #[test]
     fn try_owner_result_reports_runtime_fatal_and_returns_typed_errors() {

@@ -11,7 +11,9 @@ use crate::{EntityId, GoalState, Vec3};
 
 const DAY_LENGTH: i64 = 24_000;
 const MAX_SCHEDULE_ENTRIES: usize = 32;
-const MAX_WALK_SPEED: f64 = 4.0;
+/// Upper bound for goal speeds in blocks per second (`MobBehaviorTable`'s
+/// `MAX_SPEED` convention); vanilla-equivalent villager walk is ~5.0.
+const MAX_WALK_SPEED: f64 = 8.0;
 const MAX_WANDER_PERIOD_TICKS: u32 = 24_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -27,6 +29,8 @@ pub enum VillagerActivity {
     Play,
     Rest,
     Meet,
+    /// Runtime-reactive state after being hurt; never schedulable.
+    Panic,
     Controlled,
 }
 
@@ -95,16 +99,17 @@ impl VillagerPoiSet {
     }
 }
 
+/// Villagers start with no POI claims at all: beds and job sites are
+/// world-registered claims assigned per villager (never inferred from the
+/// villager's own position). Planning falls back to idle wander for any
+/// missing POI until a claim is assigned.
 #[must_use]
 pub fn default_villager_pois(
     position: Vec3,
     profession: crate::VillagerProfession,
 ) -> VillagerPoiSet {
-    VillagerPoiSet {
-        home: Some(position),
-        job_site: (profession != crate::VillagerProfession::None).then_some(position),
-        meeting_point: Some(position),
-    }
+    let _ = (position, profession);
+    VillagerPoiSet::default()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,13 +274,18 @@ impl VillagerBrainProfile {
                     activity: VillagerActivity::Rest,
                 },
             ],
-            idle_wander_speed: 0.3,
+            // Blocks per second: the `passive_ground_wander_speed` convention
+            // (movement-speed attribute x10). Vanilla villagers stroll at
+            // their full 0.5 MOVEMENT_SPEED attribute; the remaining
+            // activities keep their authored attribute-scale values (0.36
+            // play, 0.3 work/meet/rest) under the same conversion.
+            idle_wander_speed: 5.0,
             idle_wander_period_ticks: 80,
-            play_wander_speed: 0.36,
+            play_wander_speed: 3.6,
             play_wander_period_ticks: 40,
-            work_speed: 0.3,
-            meet_speed: 0.3,
-            rest_speed: 0.3,
+            work_speed: 3.0,
+            meet_speed: 3.0,
+            rest_speed: 3.0,
         }
     }
 
@@ -450,7 +460,9 @@ fn scheduled_goal(
                 period_ticks: profile.idle_wander_period_ticks,
             },
         ),
-        VillagerActivity::Controlled => unreachable!("controlled is not schedulable"),
+        VillagerActivity::Panic | VillagerActivity::Controlled => {
+            unreachable!("panic and controlled are runtime states, not schedulable")
+        }
     }
 }
 
@@ -492,7 +504,10 @@ fn validate_schedule(
         {
             return Err(VillagerBrainError::InvalidScheduleOrder(kind));
         }
-        if entry.activity == VillagerActivity::Controlled {
+        if matches!(
+            entry.activity,
+            VillagerActivity::Controlled | VillagerActivity::Panic
+        ) {
             return Err(VillagerBrainError::UnsupportedScheduledActivity(
                 entry.activity,
             ));
@@ -543,7 +558,7 @@ mod tests {
         for (day_time, expected_activity, target) in cases {
             let plan = plan_villager_brain(&state, &profile, 1, day_time).unwrap();
             assert_eq!(plan.state.activity, expected_activity);
-            assert_eq!(plan.goal, GoalState::FollowPosition { target, speed: 0.3 });
+            assert_eq!(plan.goal, GoalState::FollowPosition { target, speed: 3.0 });
         }
     }
 
@@ -579,7 +594,7 @@ mod tests {
             expired.goal,
             GoalState::FollowPosition {
                 target: pois().job_site.unwrap(),
-                speed: 0.3,
+                speed: 3.0,
             }
         );
     }
@@ -651,6 +666,45 @@ mod tests {
         assert_eq!(plan.state.last_slept_tick, Some(123));
         assert!(plan.state.recently_slept(24_122));
         assert!(!plan.state.recently_slept(24_123));
+    }
+
+    #[test]
+    fn vanilla_profile_speeds_are_blocks_per_second_after_the_attribute_conversion() {
+        // Goal speed is consumed as blocks/second (`request.speed *
+        // PathingBudget::TICK_SECONDS`). Vanilla villagers stroll at their
+        // full 0.5 MOVEMENT_SPEED attribute; the x10 conversion mirrors
+        // `passive_ground_wander_speed`.
+        let profile = VillagerBrainProfile::vanilla_26_1_2();
+        assert_eq!(profile.idle_wander_speed, 5.0);
+        assert_eq!(profile.play_wander_speed, 3.6);
+        assert_eq!(profile.work_speed, 3.0);
+        assert_eq!(profile.meet_speed, 3.0);
+        assert_eq!(profile.rest_speed, 3.0);
+
+        let state = VillagerBrainState::adult(VillagerPoiSet::default());
+        let plan = plan_villager_brain(&state, &profile, 1, 0).unwrap();
+        assert_eq!(
+            plan.goal,
+            GoalState::Wander {
+                speed: 5.0,
+                period_ticks: 80,
+            }
+        );
+    }
+
+    #[test]
+    fn panic_is_a_runtime_activity_and_never_schedulable() {
+        let mut profile = VillagerBrainProfile::vanilla_26_1_2();
+        profile.adult_schedule = vec![VillagerScheduleEntry {
+            day_time: 0,
+            activity: VillagerActivity::Panic,
+        }];
+        assert_eq!(
+            profile.validate(),
+            Err(VillagerBrainError::UnsupportedScheduledActivity(
+                VillagerActivity::Panic
+            ))
+        );
     }
 
     #[test]

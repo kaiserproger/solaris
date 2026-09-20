@@ -71,9 +71,10 @@ use mc_protocol::packets::play::{
     ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundPlayerCommand,
     ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundRecipeBookChangeSettings,
     ServerboundRecipeBookSeenRecipe, ServerboundResourcePack, ServerboundSelectTrade,
-    ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundSwing, ServerboundUseItem,
-    ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition, SetEntityMotion,
-    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ServerboundSetCarriedItem, ServerboundSetCreativeModeSlot, ServerboundSignUpdate,
+    ServerboundSwing, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
+    SetDefaultSpawnPosition, SetEntityMotion, SynchronizePlayerPosition, pack_section_pos,
+    pack_section_relative_pos, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{
@@ -128,6 +129,7 @@ mod containers;
 mod explosions;
 mod falling_blocks;
 mod fluids;
+mod ingress;
 mod ingress_rate;
 mod inhabited_time;
 #[cfg(test)]
@@ -136,6 +138,8 @@ mod inventory;
 mod item_blocks;
 mod lighting;
 mod liveness;
+
+pub(crate) use ingress::*;
 mod merchant_adapter;
 mod movement;
 #[cfg(test)]
@@ -252,7 +256,7 @@ use simulation::{
     ActiveShieldTransition, AnimalFeedPlan, AuthoritativePlayerStateSnapshot, BowReleasePlan,
     CommittedPlayerPose, FoodUsePlan, MerchantTradeDestination, MerchantTradePlan,
     PlayerSurvivalCommitOutcome, PlayerSurvivalPlan, SelectedItemDropPlan, SheepShearPlan,
-    ZombieVillagerCurePlan,
+    ThrowableItemReleasePlan, ZombieVillagerCurePlan,
 };
 pub use simulation::{EntityEffectHandle, EntityEffectRequestError};
 
@@ -379,8 +383,7 @@ use containers::{
     repair_item_crafting_result, set_chest_menu_stack, stack_to_furnace_slot,
 };
 use containers::{
-    merchant_input_from_projection, merchant_input_projection, merchant_menu_title_nbt,
-    merchant_protocol_offers, merchant_wire_items, select_merchant_offer,
+    merchant_input_projection, merchant_protocol_offers, merchant_wire_items, select_merchant_offer,
 };
 #[cfg(test)]
 use fluids::{WATER_FLOW_DELAY_TICKS, fluid_tick_edits, fluid_wash_drops, supported_flow_state};
@@ -455,6 +458,7 @@ use scheduled_blocks::{
     insert_hopper_stack_into_campfire,
 };
 use script_gameplay_events::ScriptGameplayEventPublisher;
+use session::OutboundCommand::PlayerSurvivalChanged;
 use session::damage_precommit::PlayerDamageSource;
 use session::{
     EntityAttackOutcome, OutboundCommand, OutboundLightUpdate, PlayerAttackResult,
@@ -478,7 +482,8 @@ use survival::{
     available_arrow_slot, block_break_is_denied, bow_draw_power, entity_item_stack,
     falling_block_entity_type_id, held_bow_max_damage, held_food_use, is_bow_item,
     is_hostile_entity, item_entity_type_id, item_use_ticks, mob_drop_stacks_from_seed,
-    mob_xp_value, pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
+    mob_xp_value, pending_use_is_complete, pending_use_matches, snowball_entity_type_id,
+    xp_orb_entity_type_id,
 };
 #[cfg(test)]
 use survival::{block_drop_stacks_from, is_durability_tool_path, max_tool_damage_for_path};
@@ -490,7 +495,7 @@ use toggles::{ToggleBlockPlan, plan_toggle_block_interaction_with_protection};
 #[cfg(test)]
 use use_item_on_adapter::{
     UseItemOnNoOpReason, UseItemOnOutcome, UseItemOnResyncOptions, classify_use_item_on_preflight,
-    consume_bonemeal_after_growth, handle_block_item_placement, plan_hoe_tilling,
+    consume_bonemeal_after_growth, handle_block_item_placement, plan_flint_fire, plan_hoe_tilling,
     plan_loaded_bonemeal_growth, plan_loaded_plant_harvest, plan_place_block_edits,
     reject_use_item_on_with_resync,
 };
@@ -498,7 +503,7 @@ use use_item_on_adapter::{ack_use_item_noop, handle_sign_update, handle_use_item
 use wire_entities::{
     send_entities_despawn, send_entity_data, send_entity_health, send_entity_hurt,
     send_entity_relative_move, send_entity_spawn, send_player_animation, send_player_despawn,
-    send_player_effect_command, send_player_move, send_player_spawn_synced, send_take_item_entity,
+    send_player_move, send_player_spawn_synced, send_take_item_entity,
 };
 
 #[cfg(test)]
@@ -5197,11 +5202,23 @@ where
         Ok(Some(outcome)) => match *outcome {
             PlayerSurvivalCommitOutcome::Committed(committed) => committed,
             PlayerSurvivalCommitOutcome::Rejected(authoritative) => {
+                // The registry returned its authoritative copy: adopt it so
+                // the rejection cannot fossilize diverged session state into
+                // ghost inventory. Rolling the session back to its own
+                // pre-commit snapshot (the old behavior) would keep the
+                // stacks the registry already dropped.
+                let client_view = expected_inventory.slots.clone();
                 if shield_transition_requested {
                     restore_authoritative_shield_state(state, *authoritative);
                 } else {
-                    state.inventory = *expected_inventory;
+                    state.inventory = authoritative.inventory;
+                    state.carried_item = authoritative.carried_item;
                     refresh_shield_use_state(state);
+                }
+                if state.inventory.slots != client_view {
+                    // The client still displays the stale session snapshot:
+                    // push the authoritative content with a bumped state id.
+                    write_inventory_content(state, writer).await?;
                 }
                 debug!("player survival transition rejected because owner state changed");
                 return Ok(PlayerSurvivalUpdateOutcome::Rejected);
@@ -5240,6 +5257,7 @@ where
         .filter(|(_, (before, after))| before != after)
         .map(|(slot, (_, after))| (slot, after.clone()))
         .collect::<Vec<_>>();
+    let was_dead = survival_state.is_dead();
     let survival_changed = *survival_state != committed.survival;
     let xp_changed = *xp_state != committed.xp;
     *survival_state = committed.survival;
@@ -5251,7 +5269,11 @@ where
         state.pending_break = None;
         state.pending_use = None;
         clear_shield_use(state);
+        // The registry commit learned died=true: hide the corpse from every
+        // observer exactly like the PvP publication path does.
+        dispatch_visibility_commands(state.sessions.player_death_visibility(state.session_id));
     }
+    let respawned = was_dead && !committed.survival.is_dead();
     if survival_changed && write_health {
         write_packet(writer, &survival_state.as_packet(), state.compression).await?;
     }
@@ -5262,6 +5284,12 @@ where
     }
     if xp_changed {
         write_packet(writer, &xp_state.as_packet(), state.compression).await?;
+    }
+    if respawned {
+        // Restore the respawned player to its viewers through the regular
+        // spawn publication; the death hide removed it from every observer,
+        // so the later teleport move alone would never re-add it.
+        dispatch_visibility_commands(state.sessions.respawn_player_visibility(state.session_id));
     }
     Ok(PlayerSurvivalUpdateOutcome::Committed)
 }
@@ -8665,7 +8693,9 @@ async fn commit_cross_region_scheduled_block_tick(
     mutation: &mc_world::WorldMutationView,
     world_tick: u64,
     commit: ResidentBlockCommit<'_>,
-) -> Result<Option<BlockEditBatchOutcome>, ()> {
+    plugin_receipt: Option<Vec<u8>>,
+    zone_fence: Option<crate::script::ZoneProtectionFence>,
+) -> Result<Option<(BlockEditBatchOutcome, Option<u64>)>, ()> {
     let Some(journal) = sessions.world_chunk_journal() else {
         warn!("cross-region scheduled block transaction requires a world journal");
         sessions.report_world_chunk_journal_failure();
@@ -8679,6 +8709,8 @@ async fn commit_cross_region_scheduled_block_tick(
     let leaf_trigger_tick = commit.leaf_trigger_tick;
     let runtime = tokio::runtime::Handle::current();
     let failure = sessions.world_chunk_journal_failure_reporter();
+    let plugin_receipt = plugin_receipt.clone();
+    let zone_fence = zone_fence.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let fail_stop = || {
             failure.send_replace(true);
@@ -8691,6 +8723,22 @@ async fn commit_cross_region_scheduled_block_tick(
                 return fail_stop();
             }
         };
+        if let Err(error) = runtime.block_on(journal.wait_for_append_turn(decision_id)) {
+            warn!(%error, "cross-region scheduled block journal append turn failed");
+            return fail_stop();
+        }
+        let close_empty = || {
+            journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, Vec::new())])
+        };
+        if zone_fence.as_ref().is_some_and(|fence| !fence.is_current()) {
+            return match close_empty() {
+                Ok(()) => Ok(Some((BlockEditBatchOutcome::default(), None))),
+                Err(error) => {
+                    warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block revoked fence closure failed");
+                    fail_stop()
+                }
+            };
+        }
         let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
             Some(decision_id),
             &mc_world::ResidentScheduledBlockTickPlan {
@@ -8701,20 +8749,13 @@ async fn commit_cross_region_scheduled_block_tick(
                 leaf_trigger_tick,
             },
         );
-        if let Err(error) = runtime.block_on(journal.wait_for_append_turn(decision_id)) {
-            warn!(%error, "cross-region scheduled block journal append turn failed");
-            return fail_stop();
-        }
-        let close_empty = || {
-            journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, Vec::new())])
-        };
         let transaction = match prepared {
             mc_world::resident::ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(
                 transaction,
             ) => transaction,
             mc_world::resident::ResidentCrossRegionScheduledBlockTickPrepareResult::Stale => {
                 return match close_empty() {
-                    Ok(()) => Ok(Some(BlockEditBatchOutcome::default())),
+                    Ok(()) => Ok(Some((BlockEditBatchOutcome::default(), None))),
                     Err(error) => {
                         warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block stale reservation closure failed");
                         fail_stop()
@@ -8732,16 +8773,27 @@ async fn commit_cross_region_scheduled_block_tick(
             }
         };
         match transaction.commit_durably(|snapshots| {
-            journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, snapshots)])
+            if let Some(receipt) = plugin_receipt.as_ref() {
+                journal.record_reserved_decisions(
+                    world_tick,
+                    vec![(decision_id, snapshots, Some(receipt.clone()))],
+                )
+            } else {
+                journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, snapshots)])
+            }
         }) {
             mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Applied(
                 applied,
-            ) => Ok(block_edit_commit::resident_block_edit_result_outcome(
-                mc_world::ResidentBlockEditBatchResult::Applied(applied),
-            )),
+            ) => Ok(Some((
+                block_edit_commit::resident_block_edit_result_outcome(
+                    mc_world::ResidentBlockEditBatchResult::Applied(applied),
+                )
+                .expect("applied cross-region block transaction has an outcome"),
+                Some(decision_id),
+            ))),
             mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Stale => {
                 match close_empty() {
-                    Ok(()) => Ok(Some(BlockEditBatchOutcome::default())),
+                    Ok(()) => Ok(Some((BlockEditBatchOutcome::default(), None))),
                     Err(error) => {
                         warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block stale commit closure failed");
                         fail_stop()
@@ -8764,7 +8816,7 @@ async fn commit_cross_region_scheduled_block_tick(
                     return fail_stop();
                 }
                 match close_empty() {
-                    Ok(()) => Ok(Some(BlockEditBatchOutcome::default())),
+                    Ok(()) => Ok(Some((BlockEditBatchOutcome::default(), None))),
                     Err(error) => {
                         warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block failed reservation closure");
                         fail_stop()
@@ -10384,10 +10436,12 @@ async fn run_scheduled_block_ticks_owned(
                         light_table: table,
                         leaf_trigger_tick: Some(world_tick.saturating_add(1)),
                     },
+                    None,
+                    None,
                 )
                 .await
                 {
-                    Ok(Some(boundary_outcome)) => {
+                    Ok(Some((boundary_outcome, _))) => {
                         append_resident_block_outcome(&mut outcome, boundary_outcome);
                     }
                     Ok(None) => {}
@@ -11722,6 +11776,17 @@ async fn handle_use_item<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    if survival_state.is_dead() {
+        return ack_use_item_noop(writer, state.compression, action.sequence, "dead_player").await;
+    }
+
+    let held_slot = hand_inventory_slot(state, action.hand);
+    // Throwable items (snowball) throw immediately in survival and creative,
+    // so they are checked before the survival-only branches below.
+    if handle_throwable_item_use(state, writer, game_mode, player_pose, action, held_slot).await? {
+        return Ok(());
+    }
+
     if game_mode != GameMode::Survival {
         return ack_use_item_noop(
             writer,
@@ -11731,15 +11796,11 @@ where
         )
         .await;
     }
-    if survival_state.is_dead() {
-        return ack_use_item_noop(writer, state.compression, action.sequence, "dead_player").await;
-    }
 
     if start_shield_use(state, action.hand) {
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
-    let held_slot = hand_inventory_slot(state, action.hand);
     if is_bow_item(state, held_slot) {
         let held_item_id = state.inventory.slots[held_slot].item_id;
         state.pending_break = None;
@@ -11781,6 +11842,95 @@ where
         kind: UseKind::Food(rule),
     });
     write_block_ack(writer, state.compression, action.sequence).await
+}
+
+/// `minecraft:snowball` and other ThrowableItem uses: spawn the projectile at
+/// eye height along the packet's look vector, consume one item in survival
+/// (none in creative, per the bow precedent), and acknowledge the sequence.
+/// Egg and ender pearl throws are later work and stay unhandled here.
+async fn handle_throwable_item_use<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    player_pose: PlayerPose,
+    action: ServerboundUseItem,
+    held_slot: usize,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if !matches!(game_mode, GameMode::Survival | GameMode::Creative) {
+        return Ok(false);
+    }
+    let held = match state.inventory.slots.get(held_slot) {
+        Some(held) if !held.is_empty() => held.clone(),
+        _ => return Ok(false),
+    };
+    let is_snowball = state
+        .items
+        .name_of(held.item_id)
+        .is_some_and(|item| item.as_str() == "minecraft:snowball");
+    if !is_snowball {
+        return Ok(false);
+    }
+    if !action.y_rot.is_finite() || !action.x_rot.is_finite() {
+        return ack_use_item_noop(writer, state.compression, action.sequence, "invalid_look")
+            .await
+            .map(|()| true);
+    }
+    let Some(entity_type_id) = snowball_entity_type_id(&state.entity_types) else {
+        return Ok(false);
+    };
+
+    state.pending_break = None;
+    state.pending_use = None;
+    let position = arrow_spawn_position(player_pose);
+    let velocity = throwable_item_throw_velocity(action.y_rot, action.x_rot);
+    let rotation = Rotation {
+        yaw: action.y_rot,
+        pitch: action.x_rot,
+        head_yaw: action.y_rot,
+    };
+    match state
+        .simulation
+        .commit_throwable_item_release(ThrowableItemReleasePlan {
+            held_slot,
+            expected_held: held,
+            game_mode,
+            entity_type_id,
+            entity_type_name: "minecraft:snowball".to_owned(),
+            position,
+            velocity,
+            rotation,
+        })
+        .await
+    {
+        Ok(Some(committed)) => {
+            state.inventory = committed.inventory;
+            write_inventory_slot_updates(state, writer, committed.changed_slots).await?;
+        }
+        Ok(None) => {
+            debug!("throwable item release rejected because player state changed");
+        }
+        Err(error) => {
+            debug!(?error, "simulation throwable item release request rejected");
+        }
+    }
+    write_block_ack(writer, state.compression, action.sequence).await?;
+    Ok(true)
+}
+
+/// Vanilla ThrowableItemProjectile throw speed: 1.5 blocks per tick.
+fn throwable_item_throw_velocity(y_rot: f32, x_rot: f32) -> Vec3 {
+    const THROWABLE_ITEM_THROW_SPEED: f64 = 1.5;
+    let yaw = f64::from(y_rot).to_radians();
+    let pitch = f64::from(x_rot).to_radians();
+    let pitch_cos = pitch.cos();
+    Vec3::new(
+        THROWABLE_ITEM_THROW_SPEED * -yaw.sin() * pitch_cos,
+        THROWABLE_ITEM_THROW_SPEED * -pitch.sin(),
+        THROWABLE_ITEM_THROW_SPEED * yaw.cos() * pitch_cos,
+    )
 }
 
 async fn complete_food_use<W>(
@@ -11826,6 +11976,9 @@ where
         Ok(Some(committed)) => committed,
         Ok(None) => {
             debug!("food use rejected because player state changed");
+            // A silent reject here would leave the client holding (and
+            // re-trying to eat) a stack the registry no longer has.
+            resync_authoritative_player_state(state, writer, survival_state).await?;
             return Ok(());
         }
         Err(error) => {
@@ -11837,6 +11990,41 @@ where
     *survival_state = committed.survival;
     write_inventory_slot_updates(state, writer, committed.changed_slots).await?;
     write_packet(writer, &survival_state.as_packet(), state.compression).await
+}
+
+/// Converge the session cache and the client to the registry's authoritative
+/// survival state after a rejected commit. The registry copy is the truth:
+/// without this resync a divergence caught by the CAS stays visible forever
+/// as ghost stacks the registry rejects on use.
+async fn resync_authoritative_player_state<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    survival_state: &mut SurvivalState,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some((inventory, survival)) = state
+        .sessions
+        .authoritative_player_survival_state(state.session_id)
+    else {
+        return Ok(());
+    };
+    let inventory_diverged = state.inventory.slots != inventory.slots;
+    let survival_diverged = *survival_state != survival;
+    if !inventory_diverged && !survival_diverged {
+        return Ok(());
+    }
+    state.inventory = inventory;
+    refresh_shield_use_state(state);
+    *survival_state = survival;
+    if survival_diverged {
+        write_packet(writer, &survival_state.as_packet(), state.compression).await?;
+    }
+    if inventory_diverged {
+        write_inventory_content(state, writer).await?;
+    }
+    Ok(())
 }
 
 async fn tick_pending_use<W>(
@@ -11917,1254 +12105,6 @@ where
         new_cz = new_center.1,
         "chunk view center updated from movement"
     );
-    Ok(())
-}
-
-struct PlayerMovementIngressContext<'a, W> {
-    writer: &'a mut W,
-    compression: Compression,
-    interaction: Option<&'a mut InteractionState>,
-    sessions: &'a SessionRegistry,
-    session_id: SessionId,
-    dimension: &'a str,
-    chunk_stream: &'a mut Option<ChunkStreamState>,
-    simulation: &'a SimulationHandle,
-    script_zone_observer: &'a mut Option<ScriptZoneObserver>,
-    survival_state: &'a mut SurvivalState,
-    xp_state: &'a mut XpState,
-    game_mode: GameMode,
-    player_pose: &'a mut PlayerPose,
-    current_tick: u64,
-    next_teleport_id: &'a mut i32,
-    pending_teleport: &'a mut Option<PendingTeleport>,
-}
-
-async fn handle_accepted_absolute_movement<W>(
-    context: PlayerMovementIngressContext<'_, W>,
-    movement: AcceptedAbsoluteMovement,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let PlayerMovementIngressContext {
-        writer,
-        compression,
-        sessions,
-        session_id,
-        dimension,
-        chunk_stream,
-        mut interaction,
-        script_zone_observer,
-        simulation,
-        survival_state,
-        xp_state,
-        game_mode,
-        player_pose,
-        current_tick,
-        next_teleport_id,
-        pending_teleport,
-    } = context;
-    let movement = normalize_absolute_player_movement(movement)?;
-    let old_center = player_pose.chunk_pos();
-    let old_pose = *player_pose;
-    let mut new_pose = *player_pose;
-    new_pose.x = movement.x;
-    new_pose.y = movement.y;
-    new_pose.z = movement.z;
-    if let Some((yaw, pitch)) = movement.yaw_pitch {
-        new_pose.yaw = yaw;
-        new_pose.pitch = pitch;
-    }
-    new_pose.flags = movement.flags;
-    refresh_player_water_state(interaction.as_deref(), &mut new_pose).await;
-    refresh_player_fall_state(old_pose, &mut new_pose);
-    if game_mode != GameMode::Spectator
-        && correct_player_collision(
-            interaction.as_deref(),
-            writer,
-            compression,
-            old_pose,
-            new_pose,
-            current_tick,
-            next_teleport_id,
-            pending_teleport,
-        )
-        .await?
-    {
-        *player_pose = old_pose;
-        return Ok(());
-    }
-
-    let exhaustion = if game_mode == GameMode::Survival {
-        movement_exhaustion(old_pose, new_pose)
-    } else {
-        0.0
-    };
-    let committed_pose =
-        match commit_authoritative_player_movement(simulation, new_pose, exhaustion).await {
-            Ok(committed) => committed,
-            Err(SimulationRequestError::PlayerMovementRejected(reason)) => {
-                warn!(
-                    ?reason,
-                    "authoritative player movement rejected; correcting client pose"
-                );
-                let teleport_id = next_player_teleport_id(next_teleport_id);
-                send_player_position_sync(writer, compression, teleport_id, old_pose).await?;
-                *pending_teleport = Some(PendingTeleport::new(teleport_id, current_tick));
-                return Ok(());
-            }
-            Err(error) => return Err(simulation_pose_commit_error(error)),
-        };
-    *player_pose = new_pose;
-    if let Some(observer) = script_zone_observer.as_mut() {
-        observer.observe(*player_pose).await;
-    }
-    if game_mode == GameMode::Survival {
-        committed_pose.apply_resources_to(survival_state);
-        if committed_pose.resources_changed {
-            write_packet(writer, &survival_state.as_packet(), compression).await?;
-        }
-    }
-    if game_mode == GameMode::Survival
-        && let Some(state) = interaction.as_deref_mut()
-    {
-        maybe_trample_farmland(state, writer, old_pose, *player_pose).await?;
-    }
-    if game_mode == GameMode::Survival {
-        apply_fall_damage(
-            sessions,
-            session_id,
-            dimension,
-            interaction.as_deref_mut(),
-            writer,
-            compression,
-            survival_state,
-            xp_state,
-            old_pose,
-            *player_pose,
-        )
-        .await?;
-    }
-    let new_center = player_pose.chunk_pos();
-    replan_after_movement(
-        writer,
-        compression,
-        chunk_stream,
-        interaction,
-        old_center,
-        new_center,
-        player_pose.yaw,
-    )
-    .await?;
-    Ok(())
-}
-
-fn is_serverbound_movement_packet(id: i32) -> bool {
-    matches!(
-        id,
-        ServerboundMovePlayerPos::ID
-            | ServerboundMovePlayerPosRot::ID
-            | ServerboundMovePlayerRot::ID
-            | ServerboundMovePlayerStatusOnly::ID
-    )
-}
-
-async fn handle_serverbound_movement<W>(
-    context: PlayerMovementIngressContext<'_, W>,
-    frame: mc_protocol::RawFrame,
-    client_loaded: bool,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    if !client_loaded {
-        return Ok(());
-    }
-    let packet_name = match frame.id {
-        ServerboundMovePlayerPos::ID => "ServerboundMovePlayerPos",
-        ServerboundMovePlayerPosRot::ID => "ServerboundMovePlayerPosRot",
-        ServerboundMovePlayerRot::ID => "ServerboundMovePlayerRot",
-        ServerboundMovePlayerStatusOnly::ID => "ServerboundMovePlayerStatusOnly",
-        _ => unreachable!("movement helper only accepts movement packet ids"),
-    };
-    if guard_pending_teleport_movement(context.pending_teleport, packet_name) {
-        return Ok(());
-    }
-    let mut body = frame.body;
-    match frame.id {
-        ServerboundMovePlayerPos::ID => {
-            let movement = ServerboundMovePlayerPos::decode(&mut body)?;
-            handle_accepted_absolute_movement(
-                context,
-                AcceptedAbsoluteMovement {
-                    x: movement.x,
-                    y: movement.y,
-                    z: movement.z,
-                    yaw_pitch: None,
-                    flags: movement.flags,
-                },
-            )
-            .await
-        }
-        ServerboundMovePlayerPosRot::ID => {
-            let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
-            handle_accepted_absolute_movement(
-                context,
-                AcceptedAbsoluteMovement {
-                    x: movement.x,
-                    y: movement.y,
-                    z: movement.z,
-                    yaw_pitch: Some((movement.yaw, movement.pitch)),
-                    flags: movement.flags,
-                },
-            )
-            .await
-        }
-        ServerboundMovePlayerRot::ID => {
-            let movement = ServerboundMovePlayerRot::decode(&mut body)?;
-            validate_player_rotation(movement.yaw, movement.pitch)?;
-            let PlayerMovementIngressContext {
-                writer,
-                compression,
-                interaction,
-                chunk_stream,
-                simulation,
-                player_pose,
-                ..
-            } = context;
-            let old_pose = *player_pose;
-            player_pose.yaw = movement.yaw;
-            player_pose.pitch = movement.pitch;
-            player_pose.flags = movement.flags;
-            commit_authoritative_player_pose(simulation, player_pose, old_pose).await?;
-            let center = player_pose.chunk_pos();
-            replan_after_movement(
-                writer,
-                compression,
-                chunk_stream,
-                interaction,
-                center,
-                center,
-                player_pose.yaw,
-            )
-            .await
-        }
-        ServerboundMovePlayerStatusOnly::ID => {
-            let movement = ServerboundMovePlayerStatusOnly::decode(&mut body)?;
-            let PlayerMovementIngressContext {
-                simulation,
-                player_pose,
-                ..
-            } = context;
-            let old_pose = *player_pose;
-            player_pose.flags = movement.flags;
-            commit_authoritative_player_pose(simulation, player_pose, old_pose).await
-        }
-        _ => unreachable!("movement helper only accepts movement packet ids"),
-    }
-}
-
-struct PlayerStateIngressContext<'a, W> {
-    writer: &'a mut W,
-    compression: Compression,
-    interaction: Option<&'a mut InteractionState>,
-    simulation: &'a SimulationHandle,
-    sessions: &'a SessionRegistry,
-    session_id: SessionId,
-    script_gameplay_events: Option<&'a ScriptGameplayEventPublisher>,
-    game_mode: &'a mut GameMode,
-    survival_state: &'a mut SurvivalState,
-    xp_state: &'a mut XpState,
-    player_pose: &'a mut PlayerPose,
-    next_teleport_id: &'a mut i32,
-    pending_teleport: &'a mut Option<PendingTeleport>,
-}
-
-fn is_serverbound_player_state_packet(id: i32) -> bool {
-    matches!(
-        id,
-        ServerboundPlayerAction::ID | ServerboundPlayerCommand::ID | ServerboundPlayerInput::ID
-    )
-}
-
-async fn handle_serverbound_player_state<W>(
-    context: PlayerStateIngressContext<'_, W>,
-    frame: mc_protocol::RawFrame,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let PlayerStateIngressContext {
-        writer,
-        compression,
-        mut interaction,
-        simulation,
-        sessions,
-        session_id,
-        script_gameplay_events,
-        game_mode,
-        survival_state,
-        xp_state,
-        player_pose,
-        next_teleport_id,
-        pending_teleport,
-    } = context;
-    let mut body = frame.body;
-    match frame.id {
-        ServerboundPlayerAction::ID => {
-            let action = ServerboundPlayerAction::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                handle_player_action(
-                    state,
-                    writer,
-                    script_gameplay_events,
-                    *game_mode,
-                    survival_state,
-                    xp_state,
-                    *player_pose,
-                    action,
-                )
-                .await?;
-            } else {
-                debug!(
-                    action = ?action.action,
-                    sequence = action.sequence,
-                    "PlayerAction ignored — no world configured"
-                );
-            }
-        }
-        ServerboundPlayerCommand::ID => {
-            let command = ServerboundPlayerCommand::decode(&mut body)?;
-            let old_pose = *player_pose;
-            match command.action {
-                PlayerCommandAction::StartSprinting => player_pose.sprinting = true,
-                PlayerCommandAction::StopSprinting => player_pose.sprinting = false,
-                PlayerCommandAction::PressShiftKey => player_pose.shifting = true,
-                PlayerCommandAction::ReleaseShiftKey => player_pose.shifting = false,
-                PlayerCommandAction::StopSleeping => {
-                    if let Some(bed) = sessions.request_sleep_wake(session_id)
-                        && let Some(state) = interaction.as_deref_mut()
-                    {
-                        wake_player_from_bed(
-                            WakePlayerFromBedContext {
-                                state,
-                                writer,
-                                compression,
-                                simulation,
-                                player_pose,
-                                next_teleport_id,
-                                pending_teleport,
-                                game_mode,
-                            },
-                            bed,
-                        )
-                        .await?;
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
-            refresh_player_water_state(interaction.as_deref(), player_pose).await;
-            commit_authoritative_player_pose(simulation, player_pose, old_pose).await?;
-        }
-        ServerboundPlayerInput::ID => {
-            let input = ServerboundPlayerInput::decode(&mut body)?.input;
-            let old_pose = *player_pose;
-            player_pose.input = input;
-            player_pose.sprinting = input.sprint;
-            player_pose.shifting = input.shift;
-            refresh_player_water_state(interaction.as_deref(), player_pose).await;
-            commit_authoritative_player_pose(simulation, player_pose, old_pose).await?;
-        }
-        _ => unreachable!("player state helper only accepts player-state packet ids"),
-    }
-    Ok(())
-}
-
-struct PlayerUseIngressContext<'a, W> {
-    writer: &'a mut W,
-    interaction: Option<&'a mut InteractionState>,
-    script_gameplay_events: Option<&'a ScriptGameplayEventPublisher>,
-    game_mode: GameMode,
-    survival_state: &'a mut SurvivalState,
-    xp_state: &'a mut XpState,
-    player_pose: PlayerPose,
-    respawn_pose: &'a mut PlayerPose,
-    client_loaded: bool,
-}
-
-fn is_serverbound_use_interaction_packet(id: i32) -> bool {
-    matches!(
-        id,
-        ServerboundUseItemOn::ID
-            | ServerboundUseItem::ID
-            | ServerboundSignUpdate::ID
-            | ServerboundAttack::ID
-            | ServerboundInteract::ID
-            | ServerboundSwing::ID
-    )
-}
-
-async fn handle_serverbound_use_interaction<W>(
-    context: PlayerUseIngressContext<'_, W>,
-    frame: mc_protocol::RawFrame,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let PlayerUseIngressContext {
-        writer,
-        mut interaction,
-        script_gameplay_events,
-        game_mode,
-        survival_state,
-        xp_state,
-        player_pose,
-        respawn_pose,
-        client_loaded,
-    } = context;
-    let mut body = frame.body;
-    match frame.id {
-        ServerboundUseItemOn::ID => {
-            let use_on = ServerboundUseItemOn::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                Box::pin(handle_use_item_on(
-                    state,
-                    writer,
-                    script_gameplay_events,
-                    game_mode,
-                    *survival_state,
-                    xp_state,
-                    player_pose,
-                    respawn_pose,
-                    use_on,
-                ))
-                .await?;
-            } else {
-                debug!(
-                    sequence = use_on.sequence,
-                    "UseItemOn ignored — no world configured"
-                );
-            }
-        }
-        ServerboundUseItem::ID => {
-            let use_item = ServerboundUseItem::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                handle_use_item(
-                    state,
-                    writer,
-                    script_gameplay_events,
-                    game_mode,
-                    survival_state,
-                    player_pose,
-                    use_item,
-                )
-                .await?;
-            } else {
-                debug!(
-                    sequence = use_item.sequence,
-                    "UseItem ignored — no world configured"
-                );
-            }
-        }
-        ServerboundSignUpdate::ID => {
-            let sign_update = ServerboundSignUpdate::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                handle_sign_update(state, writer, sign_update).await?;
-            } else {
-                debug!("SignUpdate ignored — no world configured");
-            }
-        }
-        ServerboundAttack::ID => {
-            let attack = ServerboundAttack::decode(&mut body)?;
-            if !client_loaded {
-                debug!(
-                    entity_id = attack.entity_id,
-                    "Attack ignored while client is loading"
-                );
-            } else if let Some(state) = interaction.as_deref_mut() {
-                handle_attack(
-                    state,
-                    writer,
-                    game_mode,
-                    survival_state,
-                    xp_state,
-                    player_pose,
-                    attack,
-                )
-                .await?;
-            } else {
-                debug!(
-                    entity_id = attack.entity_id,
-                    "Attack ignored — no world configured"
-                );
-            }
-        }
-        ServerboundInteract::ID => {
-            let interact = ServerboundInteract::decode(&mut body)?;
-            if !client_loaded {
-                debug!(
-                    entity_id = interact.entity_id,
-                    "Interact ignored while client is loading"
-                );
-            } else if let Some(state) = interaction {
-                handle_interact(state, writer, script_gameplay_events, interact).await?;
-            } else {
-                debug!(
-                    entity_id = interact.entity_id,
-                    "Interact ignored — no world configured"
-                );
-            }
-        }
-        ServerboundSwing::ID => {
-            let _ = ServerboundSwing::decode(&mut body)?;
-        }
-        _ => unreachable!("use/interact helper only accepts use/interact packet ids"),
-    }
-    Ok(())
-}
-
-struct ContainerIngressContext<'a, W> {
-    writer: &'a mut W,
-    interaction: Option<&'a mut InteractionState>,
-    script_gameplay_events: Option<&'a ScriptGameplayEventPublisher>,
-    scripts: Option<&'a ScriptEventSink>,
-    session_id: SessionId,
-    player_uuid: &'a str,
-    player_name: &'a str,
-    permissions: CommandPermissions,
-    game_mode: GameMode,
-    survival_state: &'a mut SurvivalState,
-    xp_state: &'a mut XpState,
-    player_pose: PlayerPose,
-}
-
-fn is_serverbound_container_packet(id: i32) -> bool {
-    matches!(
-        id,
-        ServerboundPlaceRecipe::ID
-            | ServerboundSelectTrade::ID
-            | ServerboundContainerButtonClick::ID
-            | ServerboundContainerClick::ID
-            | ServerboundContainerClose::ID
-    )
-}
-
-async fn handle_serverbound_container<W>(
-    context: ContainerIngressContext<'_, W>,
-    frame: mc_protocol::RawFrame,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let ContainerIngressContext {
-        writer,
-        mut interaction,
-        script_gameplay_events,
-        scripts,
-        session_id,
-        player_uuid,
-        player_name,
-        permissions,
-        game_mode,
-        survival_state,
-        xp_state,
-        player_pose,
-    } = context;
-    let mut body = frame.body;
-    match frame.id {
-        ServerboundPlaceRecipe::ID => {
-            let recipe = ServerboundPlaceRecipe::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                handle_place_recipe(
-                    state,
-                    writer,
-                    script_gameplay_events,
-                    player_pose,
-                    game_mode,
-                    *survival_state,
-                    recipe,
-                )
-                .await?;
-            } else {
-                debug!(
-                    recipe = recipe.recipe_display_id,
-                    "PlaceRecipe ignored — no world configured"
-                );
-            }
-        }
-        ServerboundSelectTrade::ID => {
-            let selection = ServerboundSelectTrade::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                handle_select_trade(state, writer, selection).await?;
-            } else {
-                debug!(
-                    offer_index = selection.offer_index,
-                    "SelectTrade ignored - no world configured"
-                );
-            }
-        }
-        ServerboundContainerButtonClick::ID => {
-            let click = ServerboundContainerButtonClick::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                handle_container_button_click(
-                    state,
-                    writer,
-                    game_mode,
-                    survival_state,
-                    xp_state,
-                    player_pose,
-                    click,
-                )
-                .await?;
-            } else {
-                debug!(
-                    container_id = click.container_id,
-                    button_id = click.button_id,
-                    "ContainerButtonClick ignored - no world configured"
-                );
-            }
-        }
-        ServerboundContainerClick::ID => {
-            let click = ServerboundContainerClick::decode(&mut body)?;
-            if let Some(state) = interaction.as_deref_mut() {
-                // Keep the large click future out of the enclosing ingress/play-loop frames.
-                Box::pin(handle_container_click(
-                    state,
-                    writer,
-                    ContainerClickContext {
-                        game_mode,
-                        survival_state: *survival_state,
-                        xp_state: &*xp_state,
-                        player_pose,
-                        script_events: script_gameplay_events,
-                        scripts,
-                        script_player_id: ScriptPlayerId::new(session_id),
-                        script_context: script_player_context_from_values(
-                            player_uuid,
-                            player_name,
-                            permissions,
-                            player_pose,
-                        ),
-                    },
-                    click,
-                ))
-                .await?;
-            } else {
-                debug!(
-                    container_id = click.container_id,
-                    slot = click.slot_num,
-                    "ContainerClick ignored — no world configured"
-                );
-            }
-        }
-        ServerboundContainerClose::ID => {
-            let close = ServerboundContainerClose::decode(&mut body)?;
-            if let Some(state) = interaction {
-                let script_close = state.active_container.as_ref().and_then(|active| {
-                    let ActiveContainer::Script(window) = active else {
-                        return None;
-                    };
-                    Some(client_close_matches(
-                        window.container_id,
-                        close.container_id,
-                    ))
-                });
-                let should_store = state
-                    .active_container
-                    .as_ref()
-                    .is_some_and(|active| active.container_id() == close.container_id);
-                if script_close == Some(true) || (script_close.is_none() && should_store) {
-                    store_active_container(state, player_pose).await?;
-                } else if script_close == Some(false) {
-                    let Some(ActiveContainer::Script(window)) = state.active_container.take()
-                    else {
-                        unreachable!("script close classification requires a script window")
-                    };
-                    write_script_menu_content(state, writer, &window).await?;
-                    state.active_container = Some(ActiveContainer::Script(window));
-                } else if close.container_id == 0 {
-                    store_inventory_crafting_inputs(state, player_pose).await?;
-                }
-            }
-            debug!(
-                container_id = close.container_id,
-                "container close acknowledged"
-            );
-        }
-        _ => unreachable!("container helper only accepts container packet ids"),
-    }
-    Ok(())
-}
-
-struct PlayerControlIngressContext<'a, W> {
-    writer: &'a mut W,
-    compression: Compression,
-    interaction: Option<&'a mut InteractionState>,
-    chunk_stream: &'a mut Option<ChunkStreamState>,
-    simulation: &'a SimulationHandle,
-    sessions: &'a SessionRegistry,
-    session_id: SessionId,
-    player_pose: &'a mut PlayerPose,
-    respawn_pose: PlayerPose,
-    survival_state: &'a mut SurvivalState,
-    xp_state: &'a mut XpState,
-    respawn: &'a ClientboundRespawn,
-    next_teleport_id: &'a mut i32,
-    pending_teleport: &'a mut Option<PendingTeleport>,
-    client_load: &'a mut ClientLoadGate,
-    breathing_state: &'a mut PlayerBreathingState,
-    game_mode: &'a mut GameMode,
-    permissions: CommandPermissions,
-}
-
-fn is_serverbound_player_control_packet(id: i32) -> bool {
-    matches!(
-        id,
-        ServerboundSetCarriedItem::ID
-            | ServerboundClientCommand::ID
-            | ServerboundChangeGameMode::ID
-    )
-}
-
-async fn handle_serverbound_player_control<W>(
-    context: PlayerControlIngressContext<'_, W>,
-    frame: mc_protocol::RawFrame,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let PlayerControlIngressContext {
-        writer,
-        compression,
-        mut interaction,
-        chunk_stream,
-        simulation,
-        sessions,
-        session_id,
-        player_pose,
-        respawn_pose,
-        survival_state,
-        xp_state,
-        respawn,
-        next_teleport_id,
-        pending_teleport,
-        client_load,
-        breathing_state,
-        game_mode,
-        permissions,
-    } = context;
-    let mut body = frame.body;
-    match frame.id {
-        ServerboundSetCarriedItem::ID => {
-            let pick = ServerboundSetCarriedItem::decode(&mut body)?;
-            if (0..=8).contains(&pick.slot) {
-                let slot = pick.slot as u8;
-                simulation
-                    .commit_selected_hotbar_slot(slot)
-                    .await
-                    .map_err(|error| {
-                        warn!(?error, slot, "hotbar selection owner commit failed");
-                        ConnectionError::RuntimeUnavailable {
-                            operation: "committing hotbar selection",
-                        }
-                    })?;
-                if let Some(state) = interaction.as_deref_mut() {
-                    state.pending_break = None;
-                    state.pending_use = None;
-                    clear_shield_use(state);
-                    debug!(slot, "hotbar selection updated");
-                }
-            } else {
-                debug!(slot = pick.slot, "invalid hotbar selection ignored");
-            }
-        }
-        ServerboundClientCommand::ID => {
-            let command = ServerboundClientCommand::decode(&mut body)?;
-            let was_dead = survival_state.is_dead();
-            handle_client_command(
-                writer,
-                compression,
-                interaction.as_deref_mut(),
-                chunk_stream,
-                player_pose,
-                respawn_pose,
-                survival_state,
-                xp_state,
-                respawn,
-                next_teleport_id,
-                pending_teleport,
-                sessions.simulation_tick(),
-                command,
-            )
-            .await?;
-            if was_dead && !survival_state.is_dead() {
-                client_load.restart_after_respawn();
-                if breathing_state.reset() {
-                    publish_player_air_supply(sessions, session_id, *breathing_state);
-                }
-            }
-            if was_dead && !survival_state.is_dead() {
-                commit_authoritative_player_teleport(simulation, *player_pose).await?;
-            }
-        }
-        ServerboundChangeGameMode::ID => {
-            let command = ServerboundChangeGameMode::decode(&mut body)?;
-            prepare_game_mode_transition(interaction, *game_mode, command.mode, permissions);
-            apply_game_mode(
-                writer,
-                compression,
-                simulation,
-                game_mode,
-                command.mode,
-                permissions,
-            )
-            .await?;
-            sessions.update_player_game_mode(session_id, *game_mode);
-            if let Some(entry) = sessions.tab_list_entry(session_id) {
-                dispatch_visibility_commands(sessions.broadcast_player_info_update(
-                    PlayerInfoUpdate {
-                        actions: PlayerInfoActions::UPDATE_GAME_MODE,
-                        entries: vec![entry],
-                    },
-                ));
-            }
-        }
-        _ => unreachable!("player control helper only accepts player-control packet ids"),
-    }
-    Ok(())
-}
-
-struct ClientMetadataIngressContext<'a, W> {
-    writer: &'a mut W,
-    compression: Compression,
-    chunk_stream: &'a mut Option<ChunkStreamState>,
-    sessions: &'a SessionRegistry,
-    session_id: SessionId,
-    config: &'a ServerConfig,
-    server_view_distance: i32,
-    player_pose: PlayerPose,
-    effective_client_view_distance: &'a mut i32,
-    client_brand: &'a mut Option<String>,
-    client_preferences: &'a mut Option<ClientPreferences>,
-    scripts: Option<&'a ScriptEventSink>,
-    loader_eligible: bool,
-    client_load: &'a mut ClientLoadGate,
-}
-
-fn is_serverbound_client_metadata_packet(id: i32) -> bool {
-    matches!(
-        id,
-        ServerboundRecipeBookChangeSettings::ID
-            | ServerboundRecipeBookSeenRecipe::ID
-            | ServerboundClientInformation::ID
-            | ServerboundCustomPayload::ID
-            | ServerboundResourcePack::ID
-            | ServerboundChatAck::ID
-            | ServerboundChunkBatchReceived::ID
-            | ServerboundClientTickEnd::ID
-            | ServerboundPlayerLoaded::ID
-    )
-}
-
-async fn handle_serverbound_client_metadata<W>(
-    context: ClientMetadataIngressContext<'_, W>,
-    frame: mc_protocol::RawFrame,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let ClientMetadataIngressContext {
-        writer,
-        compression,
-        chunk_stream,
-        sessions,
-        session_id,
-        config,
-        server_view_distance,
-        player_pose,
-        effective_client_view_distance,
-        client_brand,
-        client_preferences,
-        scripts,
-        loader_eligible,
-        client_load,
-    } = context;
-    let mut body = frame.body;
-    match frame.id {
-        ServerboundRecipeBookChangeSettings::ID => {
-            let settings = ServerboundRecipeBookChangeSettings::decode(&mut body)?;
-            debug!(
-                book_type = ?settings.book_type,
-                open = settings.is_open,
-                filtering = settings.is_filtering,
-                "recipe book settings noted"
-            );
-        }
-        ServerboundRecipeBookSeenRecipe::ID => {
-            let seen = ServerboundRecipeBookSeenRecipe::decode(&mut body)?;
-            debug!(
-                recipe = seen.recipe_display_id,
-                "recipe book seen recipe noted"
-            );
-        }
-        ServerboundClientInformation::ID => {
-            let information = ServerboundClientInformation::decode(&mut body)?.information;
-            let preferences = ClientPreferences::from_packet(
-                information,
-                server_view_distance,
-                client_brand.clone(),
-            );
-            debug!(
-                language = %preferences.language,
-                requested_view_distance = preferences.requested_view_distance,
-                clamped_view_distance = preferences.clamped_view_distance,
-                chat_visibility = ?preferences.chat_visibility,
-                chat_colors = preferences.chat_colors,
-                model_customisation = preferences.model_customisation,
-                main_hand = ?preferences.main_hand,
-                text_filtering_enabled = preferences.text_filtering_enabled,
-                allows_listing = preferences.allows_listing,
-                particle_status = ?preferences.particle_status,
-                brand = ?preferences.brand,
-                "client information updated"
-            );
-            if preferences.clamped_view_distance != *effective_client_view_distance {
-                *effective_client_view_distance = preferences.clamped_view_distance;
-                if let Some(stream) = chunk_stream.as_mut() {
-                    let unloads = stream
-                        .replan_view_distance(*effective_client_view_distance, player_pose.yaw);
-                    for (chunk_x, chunk_z) in unloads {
-                        write_packet(writer, &ForgetLevelChunk { chunk_x, chunk_z }, compression)
-                            .await?;
-                        stream.log_chunk_unload(chunk_x, chunk_z, "client_information");
-                    }
-                }
-            }
-            *client_preferences = Some(preferences);
-        }
-        ServerboundCustomPayload::ID => match classify_play_custom_payload(body)? {
-            PlayCustomPayloadAction::Brand(brand) => {
-                debug!(brand = %brand, "client brand noted");
-                if let Some(preferences) = client_preferences.as_mut() {
-                    preferences.brand = Some(brand.clone());
-                }
-                if let Some(scripts) = scripts {
-                    match ScriptEvent::client_brand(ScriptPlayerId::new(session_id), &brand) {
-                        Ok(event) => scripts.enqueue_event(event),
-                        Err(error) => debug!(?error, "client brand event rejected"),
-                    }
-                }
-                *client_brand = Some(brand);
-            }
-            PlayCustomPayloadAction::LoaderView(payload) => {
-                if let Err(error) = session::route_client_loader_view_request(
-                    scripts,
-                    sessions,
-                    session_id,
-                    loader_eligible,
-                    config.loader_manifest.as_deref(),
-                    payload.as_ref(),
-                )
-                .await
-                {
-                    debug!(
-                        ?error,
-                        player_id = session_id,
-                        "Loader view request rejected"
-                    );
-                }
-            }
-            PlayCustomPayloadAction::Unknown { channel, payload } => {
-                if let Some(scripts) = scripts
-                    && scripts.boundary().allows_custom_payload(&channel)
-                {
-                    scripts.enqueue_custom_payload(
-                        ScriptPlayerId::new(session_id),
-                        ScriptProtocolPhase::Play,
-                        &channel,
-                        payload.to_vec(),
-                    );
-                } else {
-                    debug!(channel = %channel, len = payload.len(), "custom payload ignored");
-                }
-            }
-            PlayCustomPayloadAction::Oversized { len } => {
-                warn!(
-                    len,
-                    max = MAX_SCRIPT_CUSTOM_PAYLOAD_BYTES,
-                    "oversized custom payload rejected before decode"
-                );
-            }
-        },
-        ServerboundResourcePack::ID => {
-            let status = ServerboundResourcePack::decode(&mut body)?.status;
-            debug!(
-                id = %status.id,
-                action = ?status.action,
-                terminal = status.action.is_terminal(),
-                "resource-pack status noted"
-            );
-        }
-        ServerboundChatAck::ID => {
-            let ack = ServerboundChatAck::decode(&mut body)?;
-            debug!(offset = ack.offset, "chat acknowledgement ignored");
-        }
-        ServerboundChunkBatchReceived::ID => {
-            let packet = ServerboundChunkBatchReceived::decode(&mut body)?;
-            debug!(
-                desired_chunks_per_tick = packet.desired_chunks_per_tick,
-                "client chunk-batch preference noted"
-            );
-        }
-        ServerboundClientTickEnd::ID => {
-            let _ = ServerboundClientTickEnd::decode(&mut body)?;
-        }
-        ServerboundPlayerLoaded::ID => {
-            let _ = ServerboundPlayerLoaded::decode(&mut body)?;
-            client_load.acknowledge();
-            let completed_respawn_load = sessions.mark_client_loaded(session_id);
-            debug!(completed_respawn_load, "client reported player loaded");
-        }
-        _ => unreachable!("client metadata helper only accepts client metadata packet ids"),
-    }
-    Ok(())
-}
-
-struct ChatCommandIngressContext<'a, W> {
-    writer: &'a mut W,
-    compression: Compression,
-    scripts: Option<&'a ScriptEventSink>,
-    session_id: SessionId,
-    dimension: &'a str,
-    player_uuid: &'a str,
-    player_name: &'a str,
-    permissions: CommandPermissions,
-    player_pose: &'a mut PlayerPose,
-    game_mode: &'a mut GameMode,
-    survival_state: &'a mut SurvivalState,
-    xp_state: &'a mut XpState,
-    config: &'a ServerConfig,
-    sessions: &'a SessionRegistry,
-    simulation: &'a SimulationHandle,
-    interaction: Option<&'a mut InteractionState>,
-    runtime_control: Option<&'a RuntimeControlHandle>,
-    chunk_pipeline_resources: &'a ChunkPipelineResources,
-    chunk_stream: &'a mut Option<ChunkStreamState>,
-    next_teleport_id: &'a mut i32,
-    pending_teleport: &'a mut Option<PendingTeleport>,
-}
-
-fn is_serverbound_chat_command_packet(id: i32) -> bool {
-    matches!(
-        id,
-        ServerboundCommandSuggestion::ID | ServerboundChat::ID | ServerboundChatCommand::ID
-    )
-}
-
-/// Re-resolve live operator authority for a connected player.
-///
-/// The console can grant or revoke operator status while a player is online;
-/// the refreshed command tree keeps client suggestions in step.
-async fn refresh_live_permissions<W>(
-    writer: &mut W,
-    compression: Compression,
-    scripts: Option<&ScriptEventSink>,
-    config: &ServerConfig,
-    player_uuid: &str,
-    player_name: &str,
-    login_resolved: CommandPermissions,
-) -> Result<CommandPermissions, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let live =
-        config
-            .command_permissions
-            .live_permissions_for(player_name, player_uuid, login_resolved);
-    if live != login_resolved {
-        let plugin_roots = scripts.map_or_else(Vec::new, ScriptEventSink::player_command_roots);
-        let operator_roots = scripts.map_or_else(Vec::new, ScriptEventSink::operator_command_roots);
-        write_packet(
-            writer,
-            &command_tree_packet_with_plugin_roots(live, &plugin_roots, &operator_roots),
-            compression,
-        )
-        .await?;
-    }
-    Ok(live)
-}
-
-async fn handle_serverbound_chat_command<W>(
-    context: ChatCommandIngressContext<'_, W>,
-    frame: mc_protocol::RawFrame,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let ChatCommandIngressContext {
-        writer,
-        compression,
-        scripts,
-        session_id,
-        dimension,
-        player_uuid,
-        player_name,
-        permissions,
-        player_pose,
-        game_mode,
-        survival_state,
-        xp_state,
-        config,
-        sessions,
-        simulation,
-        interaction,
-        runtime_control,
-        chunk_pipeline_resources,
-        chunk_stream,
-        next_teleport_id,
-        pending_teleport,
-    } = context;
-    let permissions = refresh_live_permissions(
-        writer,
-        compression,
-        scripts,
-        config,
-        player_uuid,
-        player_name,
-        permissions,
-    )
-    .await?;
-    let mut body = frame.body;
-    match frame.id {
-        ServerboundCommandSuggestion::ID => {
-            let request = ServerboundCommandSuggestion::decode(&mut body)?;
-            let plugin_command_roots =
-                scripts.map_or_else(Vec::new, ScriptEventSink::player_command_roots);
-            let operator_plugin_command_roots =
-                scripts.map_or_else(Vec::new, ScriptEventSink::operator_command_roots);
-            let suggestions = command_suggestions_with_plugin_roots(
-                &request.command,
-                permissions,
-                &plugin_command_roots,
-                &operator_plugin_command_roots,
-            );
-            debug!(
-                request_id = request.id,
-                command = %request.command,
-                count = suggestions.suggestions.len(),
-                "command suggestions requested"
-            );
-            write_packet(
-                writer,
-                &ClientboundCommandSuggestions {
-                    id: request.id,
-                    start: suggestions.start,
-                    length: suggestions.length,
-                    suggestions: suggestions
-                        .suggestions
-                        .into_iter()
-                        .map(|text| mc_protocol::packets::play::CommandSuggestionEntry {
-                            text,
-                            tooltip_nbt: None,
-                        })
-                        .collect(),
-                },
-                compression,
-            )
-            .await?;
-        }
-        ServerboundChat::ID => {
-            let chat = ServerboundChat::decode(&mut body)?;
-            if chat.message.eq_ignore_ascii_case("blink") {
-                debug!(
-                    target: "solaris::chunk_visibility",
-                    event = "chunk_blink_marker",
-                    session_id,
-                    player_name,
-                    player_uuid,
-                    tick = sessions.simulation_tick(),
-                    pose = ?player_pose,
-                    "player reported chunk blink"
-                );
-            }
-            if let Some(scripts) = scripts {
-                scripts.enqueue_event(ScriptEvent::player_chat_with_context(
-                    ScriptPlayerId::new(session_id),
-                    chat.message.clone(),
-                    script_player_context_from_values(
-                        player_uuid,
-                        player_name,
-                        permissions,
-                        *player_pose,
-                    ),
-                ));
-            }
-            dispatch_visibility_commands(
-                sessions.broadcast_system_chat(format!("<{}> {}", player_name, chat.message)),
-            );
-        }
-        ServerboundChatCommand::ID => {
-            let command = ServerboundChatCommand::decode(&mut body)?;
-            if let Some(scripts) = scripts {
-                match scripts.enqueue_player_command_with_context(
-                    session_id,
-                    script_player_context_from_values(
-                        player_uuid,
-                        player_name,
-                        permissions,
-                        *player_pose,
-                    ),
-                    &command.command,
-                ) {
-                    mc_script::PlayerCommandAdmission::Enqueued => {
-                        debug!(command = %command.command, "player command routed to component plugin");
-                        return Ok(());
-                    }
-                    mc_script::PlayerCommandAdmission::Dropped => {
-                        debug!(
-                            command = %command.command,
-                            "player command dropped because the component event queue is full"
-                        );
-                        return Ok(());
-                    }
-                    mc_script::PlayerCommandAdmission::PermissionDenied => {
-                        send_command_feedback(
-                            writer,
-                            compression,
-                            command_error_message(CommandError::PermissionDenied),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-            execute_player_command(
-                writer,
-                compression,
-                &command.command,
-                permissions,
-                game_mode,
-                survival_state,
-                xp_state,
-                config,
-                sessions,
-                session_id,
-                dimension,
-                simulation,
-                interaction,
-                player_pose,
-                runtime_control,
-                chunk_pipeline_resources,
-                chunk_stream,
-                next_teleport_id,
-                pending_teleport,
-            )
-            .await?;
-        }
-        _ => unreachable!("chat/command helper only accepts chat/command packet ids"),
-    }
     Ok(())
 }
 
@@ -13587,25 +12527,6 @@ where
     .await
 }
 
-/// Applies an authoritative survival snapshot to the connection state,
-/// forwarding to the client only when the visible health packet changes.
-async fn sync_survival<W>(
-    writer: &mut W,
-    compression: Compression,
-    survival_state: &mut SurvivalState,
-    survival: SurvivalState,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let health_changed = survival_state.as_packet() != survival.as_packet();
-    *survival_state = survival;
-    if health_changed {
-        write_packet(writer, &survival_state.as_packet(), compression).await?;
-    }
-    Ok(())
-}
-
 async fn send_explosion_command<W>(
     writer: &mut W,
     compression: Compression,
@@ -13926,6 +12847,20 @@ async fn wait_for_chunk_stream_wake(
         () = sessions.wait_for_prepared_change(prepared_generation) => {}
         () = memory_changed => {}
     }
+}
+
+async fn publish_survival<W>(
+    interaction: &mut Option<&mut InteractionState>,
+    writer: &mut W,
+    survival_state: &mut SurvivalState,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(state) = interaction.as_deref_mut() {
+        resync_authoritative_player_state(state, writer, survival_state).await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14341,6 +13276,42 @@ where
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
+fn build_script_plumbing(
+    zones: Option<PluginZoneAdapter>,
+    scripts: Option<&ScriptEventSink>,
+    session_id: SessionId,
+    player_uuid: &str,
+    player_name: &str,
+    permissions: CommandPermissions,
+    dimension: String,
+) -> (
+    Option<ScriptZoneObserver>,
+    Option<ScriptGameplayEventPublisher>,
+) {
+    (
+        zones.clone().map(|zones| ScriptZoneObserver {
+            zones,
+            player_id: ScriptPlayerId::new(session_id),
+            uuid: player_uuid.to_owned(),
+            username: player_name.to_owned(),
+            permissions,
+            dimension: dimension.clone(),
+            revision: 0,
+        }),
+        scripts.map(|sink| {
+            ScriptGameplayEventPublisher::new(
+                sink.clone(),
+                ScriptPlayerId::new(session_id),
+                player_uuid.to_owned(),
+                player_name.to_owned(),
+                permissions,
+                dimension,
+            )
+            .with_zones(zones)
+        }),
+    )
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn play_loop_inner<R, W>(
@@ -14387,29 +13358,15 @@ where
 
     let mut keepalive = KeepAliveTracker::new();
     let mut ingress_limiter = ingress_rate::PlayIngressLimiter::new(Instant::now());
-    let mut script_zone_observer = script_zones.clone().map(|zones| ScriptZoneObserver {
-        zones,
-        player_id: ScriptPlayerId::new(session_id),
-        uuid: player_uuid.clone(),
-        username: player_name.clone(),
+    let (mut script_zone_observer, script_gameplay_events) = build_script_plumbing(
+        script_zones.clone(),
+        scripts.as_ref(),
+        session_id,
+        &player_uuid,
+        &player_name,
         permissions,
-        dimension: respawn.dimension_name.to_string(),
-        revision: 0,
-    });
-    let script_gameplay_events = scripts.as_ref().map(|sink| {
-        ScriptGameplayEventPublisher::new(
-            sink.clone(),
-            ScriptPlayerId::new(session_id),
-            player_uuid.clone(),
-            player_name.clone(),
-            permissions,
-            respawn.dimension_name.to_string(),
-        )
-        .with_zones(script_zones.clone())
-    });
-    if let Some(observer) = script_zone_observer.as_mut() {
-        observer.observe(player_pose).await;
-    }
+        respawn.dimension_name.to_string(),
+    );
     let mut food_tick_timer: u32 = 0;
     let mut breathing_state = PlayerBreathingState::default();
     let mut client_load = ClientLoadGate::default();
@@ -14561,13 +13518,6 @@ where
                             )
                             .await?;
                         }
-                    }
-                    Some(command @ (OutboundCommand::ApplyPlayerEffect { .. }
-                        | OutboundCommand::RemovePlayerEffect { .. })) => {
-                        send_player_effect_command(writer, compression, command).await?;
-                    }
-                    Some(OutboundCommand::PlayerSurvivalChanged { survival }) => {
-                        sync_survival(writer, compression, &mut survival_state, survival).await?;
                     }
                     Some(OutboundCommand::PlayerDamageCommitted { publication, hurt_event }) => {
                         publish_committed_player_damage(
@@ -14788,6 +13738,16 @@ where
                         )
                         .await?;
                     }
+                    Some(PlayerSurvivalChanged) => {
+                        publish_survival(&mut interaction, writer, &mut survival_state).await?;
+                    }
+                    Some(
+                        command @ (OutboundCommand::ApplyPlayerEffect { .. }
+                        | OutboundCommand::RemovePlayerEffect { .. }),
+                    ) => {
+                        wire_entities::send_player_effect_command(writer, compression, command)
+                            .await?;
+                    }
                     Some(command @ OutboundCommand::Explosion(_)) => {
                         send_explosion_command(writer, compression, game_mode, command).await?;
                     }
@@ -14940,6 +13900,17 @@ where
                             pending_teleport: &mut pending_teleport,
                         },
                         frame,
+                    )
+                    .await?;
+                } else if frame.id == ServerboundSetCreativeModeSlot::ID {
+                    let mut body = frame.body;
+                    let packet = ServerboundSetCreativeModeSlot::decode(&mut body)?;
+                    session::handle_creative_mode_slot(
+                        interaction.as_deref_mut(),
+                        writer,
+                        game_mode,
+                        player_pose,
+                        packet,
                     )
                     .await?;
                 } else if is_serverbound_use_interaction_packet(frame.id) {

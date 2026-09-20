@@ -25,6 +25,168 @@
 | [`docs/memory/log-08-audit-closeout-and-inhabitants.md`](memory/log-08-audit-closeout-and-inhabitants.md) | 4202–4400 | Закрытие аудита ядра и жители деревень из маркеров частей (закрытый чекпоинт 09-15). |
 
 
+## v0.0.8 release candidate (2026-09-20)
+
+**Versioning.** `v0.0.7` is already published at `9e5e20e4`; the next release
+therefore targets `v0.0.8`, never retags the published version.
+
+**Outcome.** The harness now reports live stage start/exit records; native
+Linux links use mold without leaking flags into nested Wasm guest builds;
+default Rust components are deployed by the sibling package repository; guest
+fixture builds serialize only their shared Cargo artifact writes. The final
+repair restores outbound player survival updates and effect packet dispatch.
+
+**Evidence.**
+- `python3 -m tools.harness run correctness`:
+  `.analysis/validation/20260920T030823-correctness-sbbjo0y4/result.json`
+  — passed.
+- `cargo test -p mc-net --lib` — 2301 passed, 8 ignored.
+- TCP regressions: shulker effect lifecycle and village golem spawn/attack —
+  passed inside the final correctness receipt.
+- Independent read-only review `CoreCheckpointReview`: two P1 findings
+  (survival-effect dispatch and Wasm-inherited mold flag) fixed before final
+  L2; no remaining static blocker in core or the five converted default
+  component packages.
+
+**Publication blocker.** The core worktree contains 104 modified or untracked
+paths, including owner files outside this release slice. The converted sibling
+default-plugin packages are also uncommitted while CI remains pinned to their
+earlier revision `2d51ae5559cdd5b7cbab32888ef2b11d931e3e6e`. No commit, tag, push,
+or publication is safe until the exact core release set and the sibling
+publication decision are authorized.
+
+**Release scope and maturity.** This is a draft release. No fresh graphical
+client, oracle, performance, or manual owner gate was run. The converted
+packages (`solaris-permissions`, `solaris-essentials`, `solaris-economy`,
+`solaris-towns`, `solaris-audit`) were statically verified by the independent
+review; their Wasm binaries were not independently executed in this close.
+
+**CP-014 boundary correction and source-owned component migration.**
+`solaris-default-plugins` owns the first-party `solaris-settlements` product.
+The core server and SDK contain only generic SDK/fixture code: they neither
+build, package, test, nor import a first-party settlement component. Generic
+durable world, inventory, resident-work, structure, and receipt boundaries
+remain available to every plugin without product dependency.
+
+The previous component source was recovered from the saved session unified diff
+and verified against its original Git blob
+`3b152101304c1a1f052bd6848ea13b0141e913e2`; it now lives in
+`../solaris-default-plugins/sources/solaris-settlements/`. The deployed sibling
+package now has API 0.7 `entry = "plugin.wasm"` and only the capabilities its
+component uses. `main.lua`, legacy config, and client bundle are removed from
+the deployable directory; the legacy Luau source is retained only under
+`sources/solaris-settlements/legacy/` as porting input. Authoring blueprints
+remain under `structures/`.
+
+Focused core extraction checks passed: `cargo fmt --all -- --check`;
+`cargo test -p mc-net resident_settlement` (17);
+`cargo test -p mc-net settlement_tests` (53); the generated-inhabitant
+authority test (1); and
+`.analysis/validation/20260920T081931-code-health-_j4x8m7h/result.json`
+(`passed`). The sibling source now passes its 8 component behavior tests and a
+`wasm32-unknown-unknown --release` build. The generated package passed
+`cargo run -p mc-server -- --check --config
+/tmp/solaris-settlement-component-check/server.toml`, which strictly loaded
+only `solaris-settlements` with its declared grants.
+
+The sibling component now persists owner-scoped settlement creation, roles,
+condition, supported site adoption, generic-core survey tokens/tags, a bounded
+index of named project buildings, selected specialties, and named residents.
+`/settlement project` re-reads its exact site immediately before preparing a
+structure, so its revision fence is current rather than the adoption-era value;
+a committed plan is stored under a generated building name such as
+`warehouse_1`. `/settlement fund <name> <building>` and `advance <name>
+<building>` authorize the owner or steward, select only that durable building,
+then re-read its exact core structure before material reservation or a bounded
+core work portion. `/settlement specialize <name> ...` allows at most two legacy
+specialties only when each matching survey tag exists and its named workplace's
+current core state is `Committed`; it persists only after those exact status
+checks. `/settlement populate <name>` permits a member to exact-query an
+adopted core-authored `site_*`, reserve its first free home, and spawn its
+core-managed resident. A committed spawn is then persisted behind the same
+registry CAS fence under a generated alias such as `resident_1`; `info` exposes
+the durable aliases. If that first post-spawn CAS refuses or fails, the component
+re-reads the registry once, reapplies the same opaque handle and revision, and
+re-CASes it without creating another resident. Its command-level and state tests
+total 39; `cargo fmt --manifest-path
+../solaris-default-plugins/sources/solaris-settlements/Cargo.toml -- --check`,
+the sibling `cargo test`, a `wasm32-unknown-unknown --release` build, component
+encoding, and the strict server package check passed. Independent review found
+that the first matching workplace could be uncommitted while a later matching
+one was committed, and that a specialization status continuation could race a
+registry update. The component now queries every matching saved workplace until
+one is currently committed, and blocks concurrent registry reads during that
+continuation.
+
+The generic SDK now makes `log` a native no-op while retaining the WIT host
+import on `wasm32`, so component answer-path tests can execute without a host
+stub. `cargo test --manifest-path sdk/rust/solaris-plugin-sdk/Cargo.toml`
+passed, alongside the 39 component tests and component package check above.
+
+The independent command-port review caught three authority defects before this
+close: named fund/build selected an unrelated plugin-global structure; generated
+`village_*` sites could not reserve residents through the generic core authority;
+and project reused an adoption-era site revision. The unsafe named
+build/populate routes were removed rather than advertised; named funding and
+advancement were reintroduced only after a durable project record and exact
+core status read. A site-compatible named population route was reintroduced
+only for core-authored `site_*`; generated `village_*` sites remain unsupported.
+Adoption now rejects unsupported generated sites, and project queries its exact
+site before the core call. The current product port is
+`create → role → ruin/restore → site → adopt → survey → project → fund →
+advance → specialize → populate`; population on generated villages, family,
+job, claim, and abandonment remain unported.
+
+Adoption now uses the generic targeted site query rather than a first-page list
+scan; a storage CAS server failure is reported as unavailable, not as a version
+conflict. The corrected component rebuild, encoding, and strict package check
+also passed.
+
+Independent review found stale core-owned settlement regression wiring and two
+documentation boundary errors. The obsolete `m94-09` scenario, driver, harness
+test, and product package installation path were removed from core; only generic
+regression machinery remains. Its replacement validation passed:
+`.analysis/validation/20260920T085538-harness-check-snl7oa0g/result.json`.
+
+No real-client R0/R1 product scenario, two-observer flow, or full
+food/material lifecycle has run. The component migration proves source
+ownership, reproducible component packaging, command-flow unit behavior, and
+strict admission—not campaign readiness. CP-014 remains blocked.
+- CP-015, CP-016, CP-017, CP-018, CP-019, CP-020, CP-021, CP-022, CP-023,
+  CP-024, CP-025, CP-026, CP-027, CP-028, CP-029 remain pending.
+- CP-030, CP-031, CP-032, CP-033, CP-034, CP-035, CP-036, CP-037, CP-038,
+  CP-039, CP-040, CP-041, CP-042, CP-043 remain pending.
+- CP-044, CP-045, CP-046, CP-047, CP-048, CP-049, CP-050, CP-051, CP-052,
+  CP-053, CP-054, CP-055, CP-056, CP-057 remain pending.
+- CP-058, CP-059, CP-060, CP-061, CP-062, CP-063, CP-064, CP-065, CP-066,
+  CP-067, CP-068, CP-069 remain conditional/pending.
+- CP-070, CP-071, CP-072, CP-073, CP-074, CP-075, CP-076, CP-077, CP-078
+  remain pending.
+- CP-079, CP-080, CP-081, CP-082, CP-083, CP-084, CP-085, CP-086 remain
+  pending.
+- CP-087 remains a conditional handoff; CP-088, CP-089, CP-090, CP-091,
+  CP-092, CP-093, CP-094, CP-095, CP-096 remain pending.
+**P0 component-host revalidation (2026-09-20).** The real SDK-built component
+passes the host safety matrix: raw core-module/ABI refusal before guest code,
+pre-compilation artifact cap, fuel/epoch/memory/stack limits, bounded
+guest-to-host lifting for oversized, cumulative and nested outputs, unpublished
+trap and canonical cleanup behavior, and independent-instance isolation. The
+refreshed baseline drives a strict one-package deployment through its real
+bounded queues and records Linux x86_64 hardware/workload/RSS/latency/tick/
+queue/counter data at
+`.analysis/codex-logs/p0-revalidation-20260920/receipt.txt`: 13 focused tests
+passed. Rust 1.94 resolves Wasmtime 36.0.15 and WIT tooling 0.259. The same host
+cross-compiled for `aarch64-unknown-linux-gnu` against an isolated Ubuntu
+sysroot; the new native Arm CI job will execute the test matrix and retain its
+baseline output after a committed revision. That native execution has not been
+claimed from this workstation.
+
+**Blocker.** The canonical profile list has no settlement scenario, and
+`docs/real-client-regression/manifests/` declares none. The client MCP credential
+is absent. The sibling package rules prohibit restoring product scenario wiring
+to core. Unblock with an approved product-owned canonical R0/R1 manifest and
+client credential, then run the declared graphical scenario.
+
 ## v0.0.7 release close (2026-09-18)
 
 **State.** The requested v0.0.7 release was published as `9e5e20e4` and tag
@@ -232,38 +394,47 @@ validation:
 next: v0.0.8 core+survival outcomes (owner directive); L2 before any release close.
 ```
 
-## Checkpoint — v0.0.7 release CI repair (2026-09-19)
+## Checkpoint — v0.0.7 release CI repair, iterations 1-3 (2026-09-19)
 
-**Outcome.** The v0.0.7 tag run failed five gates because the release commit
-referenced sources it never committed (`E0583`: the whole precommit/WASM host
-source set, from `mc-script::precommit` down through `mc-plugin-host` domains
-and the harness backends). The Loader job failed independently: CI pinned the
-pre-wire-3 loader revision `3aaa9266`, whose schema-1 closed index rejects the
-schema-2 fixture index the release ships; the fix already existed as loader
-`0972926`, so `SOLARIS_LOADER_REVISION` was re-pinned to it. The resident-compat
-fixture now accepts core's native `native-resume-*` receipts as notifications
-and adopts the record revision they prove: the withdrawal removes the pause
-cause, core's resumption performs the haul, and the explicit assignment answers
-the finished watermark without a new change.
+**Outcome.** Main is red-gate-free by local evidence across four root causes:
+(1) the v0.0.7 release commit never added the precommit/WASM host source set —
+landed complete in `7f68cc2a`; (2) the Loader job pinned the pre-wire-3 loader
+`3aaa9266` — re-pinned to `0972926`; (3) the runner lacked the wasm32 target and
+both heavy jobs died with the cgroup exit-241 kill under the 4G scope — test and
+Loader jobs now run with an 8G cap; (4) the shipped live-gate fixture carried the
+unfinished loader cycle's `input_bindings`, `sounds` and prefixed action ids,
+which the pinned wire-3 index refuses — the fixture is realigned to the pinned
+contract (sounds/bindings/audio tooling stripped, `confirm` unprefixed) and
+proven green against the pinned loader-core suite plus the full six-module
+gradle command in clean worktrees. The loader side's own `input_bindings`/sounds
+cycle stays as uncommitted sibling work for its own checkpoint.
+
+## Active checkpoint — CP-014 canonical R1/R0 chain scenario (partial)
+
+**Landed (uncommitted).** `crates/mc-test-harness/tests/wasm_settlement_operations.rs`
+gains `existing_village_walks_the_chain_and_survives_a_restart`: site list →
+durable reservation → revision-fenced refresh → survey unloaded/loaded →
+warehouse prepare → materials reservation charged against the player's real
+inventory → funded advance committing a stage cell → warehouse bind → server
+save/stop → second deployment over the same world with durable receipts proving
+exact-once (re-reserve refused operation-conflict). Focused run 3/3 green twice.
+
+**Missing-API findings (recorded, not faked).** The shipped settlement component
+cannot express production at a station from warehouse inputs, worker deposit
+into the bound warehouse, or food — the plan chain's production/warehouse/food
+legs need real surface work (resident-Craft wiring into the settlement
+component or new settlement operations) before CP-014 closes. Staged building
+is drivable only through the first portion. «Точные три ревизии» read as the
+three durable revision lines (reservation, structure commit, warehouse binding)
+the scenario pins across restart.
 
 ```yaml
-base_tree: 9e5e20e4b53dbb769a38f6b1e54e4257609e9ec9
-diff_hash: 363aaa2bd6b01622b557830a51d8ac3f53317f98e3c54d5c734733eb6b7c1609
-changed_files:
-  - crates/ (complete source set: precommit, WASM plugin host, resident orders, harness tests)
-  - sdk/rust (fixture modules, resident pause-reason mapping, native-resume receipt handling)
-  - tools/harness (precommit + wasm backends, profile wiring)
-  - examples/loader-live-gate (schema-2 fixture bytes)
-  - .github/workflows/ci.yml (SOLARIS_LOADER_REVISION -> 0972926)
-  - docs/MEMORY.md
+base_tree: 32a50c9c
 validation:
-  - .analysis/validation/20260919T045930-correctness-d5lgncf6/result.json: passed
-  - .analysis/validation/20260919T045954-java-na491o4q/result.json: passed
-  - .analysis/validation/20260919T045936-fixture-check-0topwogy/result.json: passed
-  - .analysis/validation/20260919T050038-harness-check-ajkwf8we/result.json: passed
-  - .analysis/validation/20260919T050040-installer-blvlyu59/result.json: passed
-  - .analysis/validation/20260919T052812-build-j7oblm7a/result.json: passed
-next: Push the single fix commit to main; v0.0.8 work resumes at CP-014.
+  - cargo test -p mc-test-harness --test wasm_settlement_operations: 3 passed (x2)
+  - fixture-check naevnb2z/y_gmk878: passed
+  - clean-worktree gradle six-module suite against pinned loader: BUILD SUCCESSFUL
+next: CI run 35426736944 verdict, then implement the missing production/deposit/food surface for CP-014.
 ```
 
 
@@ -2519,4 +2690,43 @@ validation:
       not run; active P6 4G workspace-test blocker remains unresolved
 status: CP-007 complete; P0 and P6 remain externally blocked
 next: Begin CP-008 from the active plugins route.
+```
+
+## Checkpoint — architecture-review comprehensibility (2026-09-20)
+
+Accepted boundaries from
+`.rpiv/artifacts/architecture-reviews/2026-09-20_18-44-21_solaris-model-comprehensibility.md`
+are now localized without changing their public contracts: server configuration
+and startup composition, supervisor checkpoint/physics paths, named play
+ingress handlers, simulation/storage/entity test contracts, and the native
+script manifest/capability domain. `CommandBatch` remains in the root
+admission boundary; `manifest.rs` owns capability declarations, manifest DTOs,
+validation and capability matching.
+
+```yaml
+base_tree: 1d39e864b291eb3e8c45ba5081b6ce10d40e4c46
+implementation_diff_hash: c5c6c2d59ca57c265ab3036dce118d3fa0e38e6d450714a36e15fe877db20b28
+changed_files:
+  - AGENTS.md
+  - README.md
+  - crates/mc-net/src/{lib.rs,play.rs,play/session.rs,play/simulation.rs,play/simulation/,play/ingress.rs,play/ingress/,server.rs,server/checkpoint.rs,server/entity_physics.rs,server/tests.rs,server/tests/}
+  - crates/mc-server/src/{lib.rs,main.rs,config/,startup.rs,startup/,main_tests.rs,main_tests/,access_control_file_tests.rs}
+  - crates/mc-world/src/{storage.rs,storage/tests.rs,storage/tests/}
+  - crates/mc-entity/src/{lib.rs,tests.rs}
+  - crates/mc-script/src/{lib.rs,manifest.rs}
+  - docs/MEMORY.md
+validation:
+  - .analysis/validation/20260920T151433-test-l2f2ivvk/result.json: mc-script passed
+  - .analysis/validation/20260920T151212-test-poeyxry7/result.json: mc-entity passed
+  - .analysis/validation/20260920T150433-test-g6e_mxch/result.json: mc-world passed
+  - .analysis/validation/20260920T151456-test-h25y1lui/result.json: mc-server passed
+  - .analysis/validation/20260920T152602-fmt-108inf37/result.json: formatter passed
+  - .analysis/validation/20260920T153324-clippy-biaqd8wa/result.json: strict workspace Clippy passed
+  - .analysis/validation/20260920T153411-code-health-o5ty7qc6/result.json: code-health passed
+  - .analysis/validation/20260920T154043-correctness-7bw83l4v/result.json:
+      formatter, strict workspace Clippy, and code-health passed; workspace tests failed only at the recorded precommit assertion (2298 passed, 8 ignored)
+  - codegraph sync .: up to date
+  - ArchitectureExtractionReview: pass; no extraction-attributable regression found
+status: implementation checkpoint complete; L2 test stage blocked by the recorded mc-net precommit assertion; no commit authorized
+next: triage the recorded mc-net precommit failure before treating the full workspace gate as green
 ```

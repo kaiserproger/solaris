@@ -288,7 +288,12 @@ impl PathingProbe for LoadedChunkPathingProbe<'_> {
             }
         }
         if touches_fluid {
-            return PathingProbeResult::Walkable;
+            // Ground pathing must never plan through fluid: wander and pursuit
+            // goals treat water cells as obstacles. This branch is only reached
+            // by terrain-pathing (ground) entities — swimmers are not members
+            // of `terrain_pathing_entities` and return `Walkable` above, so
+            // fish keep their aquatic steering.
+            return PathingProbeResult::Blocked;
         }
 
         let (support_min_y, support_max_y) =

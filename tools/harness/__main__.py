@@ -346,7 +346,6 @@ CPU_QUOTA_ENV = "SOLARIS_HARNESS_CPU_QUOTA"
 MEMORY_HIGH_ENV = "SOLARIS_HARNESS_MEMORY_HIGH"
 MEMORY_MAX_ENV = "SOLARIS_HARNESS_MEMORY_MAX"
 MEMORY_SWAP_ENV = "SOLARIS_HARNESS_MEMORY_SWAP_MAX"
-TEST_THREADS_ENV = "SOLARIS_HARNESS_TEST_THREADS"
 """What one harness run may use, as systemd cgroup properties. A workspace test
 run starts about a dozen test binaries at once, each with its own in-process
 server and Lua host; unbounded, that evicts the desktop into swap and the run
@@ -449,18 +448,6 @@ def _limit(value: str, env: str) -> str | None:
     return value or None
 
 
-def _test_threads(quota: str) -> int:
-    """libtest concurrency: one thread per physical core the quota allows.
-
-    Every concurrent test carries its own in-process server and component
-    host, and one thread per physical core is the most real parallelism the
-    machine offers. ``SOLARIS_HARNESS_TEST_THREADS`` names a value instead.
-    """
-    del quota
-    explicit = os.environ.get(TEST_THREADS_ENV, "").strip()
-    if explicit.isdigit() and int(explicit) > 0:
-        return int(explicit)
-    return _physical_cores()
 
 
 def _scope_command(quota: str) -> list[str] | None:
@@ -536,10 +523,9 @@ def _exec_in_scope() -> int | None:
         )
         return None
     environment = dict(os.environ, **{CPU_SCOPE_ENV: "1"})
-    environment.setdefault("RUST_TEST_THREADS", str(_test_threads(quota)))
     print(
         f"[harness] scope CPUQuota={quota} MemoryHigh={os.environ.get(MEMORY_HIGH_ENV, DEFAULT_MEMORY_HIGH)} "
-        f"MemoryMax={memory_max} test-threads={environment['RUST_TEST_THREADS']}"
+        f"MemoryMax={memory_max}"
     )
     completed = subprocess.run(
         command,

@@ -1,8 +1,0 @@
-id = "solaris-settlements"
-name = "Solaris Settlements"
-version = "0.1.0"
-api = "0.7.0"
-events = ["operation.result"]
-capabilities = ["storage", "resident_work", "structure_operations"]
-required_features = ["resident_work", "structure_operations"]
-player_commands = ["settlement"]

@@ -18,13 +18,20 @@ mod resource_admission_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPipelinePolicy {
+    /// Per-tick dispatch cap for chunk sends. `u32::MAX` means uncapped: the
+    /// worker pool is the throttle, and runtime control may clamp the rate.
     pub chunk_send_rate: u32,
+    /// Per-tick dispatch cap for chunk loads. `u32::MAX` means uncapped.
     pub chunk_load_rate: u32,
+    /// Per-tick dispatch cap for chunk generation. `u32::MAX` means uncapped.
     pub chunk_generate_rate: u32,
     pub chunk_prepare_budget_ms: u64,
     pub chunk_prepare_batch_size: usize,
+    /// Growth ceiling for the chunk IO worker pool. Pools start at one
+    /// worker; this bounds how far sustained backlog may grow the pool.
     pub chunk_io_threads: usize,
-    /// Shared CPU capacity for chunk work and entity physics.
+    /// Growth ceiling for the shared chunk/physics CPU worker pool. Pools
+    /// start at one worker; this bounds adaptive growth, it reserves nothing.
     pub chunk_worker_threads: usize,
     pub chunk_result_queue_size: usize,
     pub region_cache_size: usize,
@@ -34,19 +41,23 @@ pub struct ChunkPipelinePolicy {
 }
 
 impl Default for ChunkPipelinePolicy {
+    /// The adaptive default. Rates are uncapped (`u32::MAX`) and both
+    /// physical pools start with a single worker; the thread fields are the
+    /// growth ceilings the runtime control plane may expand into under
+    /// sustained backlog. Nothing is reserved up front. Operators override
+    /// any field explicitly and overrides are honored verbatim.
     fn default() -> Self {
         let available = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
-        let (chunk_io_threads, cpu_worker_threads) = automatic_worker_limits(available);
         Self {
-            chunk_send_rate: 16,
-            chunk_load_rate: 64,
-            chunk_generate_rate: 32,
+            chunk_send_rate: u32::MAX,
+            chunk_load_rate: u32::MAX,
+            chunk_generate_rate: u32::MAX,
             chunk_prepare_budget_ms: 0,
             chunk_prepare_batch_size: 8,
-            chunk_io_threads,
-            chunk_worker_threads: cpu_worker_threads,
+            chunk_io_threads: available,
+            chunk_worker_threads: available,
             chunk_result_queue_size: 64,
             region_cache_size: 4,
             compression_threshold: crate::login::LOGIN_COMPRESSION_THRESHOLD,
@@ -62,9 +73,9 @@ impl ChunkPipelinePolicy {
     ///
     /// Used by in-process servers that already share a machine with other
     /// workgroups - a test binary that starts several servers, or a host that
-    /// bounded the process on purpose. It never changes the derived default
-    /// itself: a production deployment keeps `Default` unless the operator sets
-    /// an explicit bound.
+    /// bounded the process on purpose. Like `Default`, the pools start at one
+    /// worker each; the bound is the adaptive growth ceiling, never a
+    /// reservation.
     #[must_use]
     pub fn bounded(workers: usize) -> Self {
         Self {
@@ -80,6 +91,14 @@ pub(crate) struct ChunkPipelineResources {
     io_permits: Arc<Semaphore>,
     cpu_permits: Arc<Semaphore>,
     prepare_request_permits: Arc<Semaphore>,
+    /// Live IO workers in existence; the pool grows toward `io_capacity`.
+    io_live: Arc<AtomicUsize>,
+    /// Live CPU workers in existence; the pool grows toward `cpu_capacity`.
+    cpu_live: Arc<AtomicUsize>,
+    /// Consecutive fully-idle runtime-control decisions; drives pool decay.
+    idle_decision_streak: Arc<AtomicUsize>,
+    /// Adaptive growth ceilings from policy. They never reserve workers.
+    io_capacity: usize,
     cpu_capacity: usize,
     prepare_limit: Arc<AtomicUsize>,
     prepare_admission_changed: Arc<Notify>,
@@ -346,13 +365,25 @@ impl ChunkPipelineStopReasonMetrics {
         }
     }
 }
+/// Sustained full-idle runtime-control decisions after which an adaptive
+/// pool returns one step - roughly a minute of the ~50 ms control tick with
+/// no worker pickup in between.
+const IDLE_POOL_SHRINK_AFTER_DECISIONS: usize = 1_200;
 
 impl ChunkPipelineResources {
+    /// Adaptive pool: starts with a single IO and a single CPU worker; the
+    /// policy thread fields only bound how far runtime-control decisions may
+    /// grow the pools under sustained backlog.
     #[must_use]
     pub(crate) fn new(policy: ChunkPipelinePolicy) -> Self {
-        Self::with_limits(policy.chunk_io_threads, policy.chunk_worker_threads)
+        let mut resources = Self::with_limits(1, 1);
+        resources.io_capacity = policy.chunk_io_threads.max(1);
+        resources.cpu_capacity = policy.chunk_worker_threads.max(1);
+        resources
     }
 
+    /// Fixed pool sized at construction. Used by tests and callers that pin
+    /// their pools deliberately; production pools start through [`Self::new`].
     #[must_use]
     pub(crate) fn with_limits(chunk_io_threads: usize, cpu_worker_threads: usize) -> Self {
         let cpu_capacity = cpu_worker_threads.max(1);
@@ -360,6 +391,10 @@ impl ChunkPipelineResources {
             io_permits: Arc::new(Semaphore::new(chunk_io_threads.max(1))),
             cpu_permits: Arc::new(Semaphore::new(cpu_capacity)),
             prepare_request_permits: Arc::new(Semaphore::new(cpu_capacity)),
+            idle_decision_streak: Arc::new(AtomicUsize::new(0)),
+            io_live: Arc::new(AtomicUsize::new(chunk_io_threads.max(1))),
+            cpu_live: Arc::new(AtomicUsize::new(cpu_capacity)),
+            io_capacity: chunk_io_threads.max(1),
             cpu_capacity,
             prepare_limit: Arc::new(AtomicUsize::new(cpu_capacity.saturating_sub(1).max(1))),
             prepare_admission_changed: Arc::new(Notify::new()),
@@ -369,9 +404,12 @@ impl ChunkPipelineResources {
         }
     }
 
+    /// Live CPU workers in existence right now. Starts at one and follows
+    /// adaptive growth, so consumers (entity lanes, regional physics) scale
+    /// with the pool instead of a compile-time formula.
     #[must_use]
     pub(crate) fn cpu_capacity(&self) -> usize {
-        self.cpu_capacity
+        self.cpu_live.load(Ordering::Acquire)
     }
 
     #[must_use]
@@ -379,27 +417,132 @@ impl ChunkPipelineResources {
         self.prepare_limit.load(Ordering::Acquire)
     }
 
+    /// Apply one runtime-control decision step to the physical pools.
+    ///
+    /// Sustained chunk backlog (`ScaleDown` carrying `ChunkQueue` or
+    /// `FirstChunkSla`) buys one more IO and CPU worker up to the policy
+    /// ceilings - one worker demonstrably could not keep up. Draining returns
+    /// the pools toward the one-worker floor immediately, and a pool that has
+    /// been fully idle for the sustained-idle window shrinks one step per
+    /// decision. Background preparation admission keeps its existing
+    /// semantics: chunk pressure throttles producers through the controller
+    /// limits rather than the capacity left to drain work.
     pub(crate) fn apply_runtime_control_action(
         &self,
         action: crate::AutoscaleAction,
+        pressure: Option<crate::AutoscalePressure>,
         draining: bool,
     ) -> usize {
+        let grew = if draining {
+            self.idle_decision_streak.store(0, Ordering::Relaxed);
+            while self.shrink_worker_pools_one_step() {}
+            false
+        } else if action == crate::AutoscaleAction::ScaleDown
+            && matches!(
+                pressure,
+                Some(
+                    crate::AutoscalePressure::ChunkQueue | crate::AutoscalePressure::FirstChunkSla
+                )
+            )
+        {
+            self.grow_worker_pools()
+        } else {
+            false
+        };
+        if !draining && !grew {
+            self.decay_idle_worker_pools();
+        }
         let current = self.prepare_limit();
         let next = if draining {
             1
         } else {
             match action {
                 crate::AutoscaleAction::Hold => current,
+                crate::AutoscaleAction::ScaleDown
+                    if pressure == Some(crate::AutoscalePressure::ChunkQueue) =>
+                {
+                    current
+                }
                 crate::AutoscaleAction::ScaleDown => current.saturating_sub(1).max(1),
                 crate::AutoscaleAction::ScaleUp => current
                     .saturating_add(1)
-                    .min(self.cpu_capacity.saturating_sub(1).max(1)),
+                    .min(self.cpu_capacity().saturating_sub(1).max(1)),
             }
         };
         if self.prepare_limit.swap(next, Ordering::AcqRel) != next {
             self.prepare_admission_changed.notify_waiters();
         }
         next
+    }
+
+    /// One sustained-backlog step: add one worker per pool up to the policy
+    /// ceilings. Returns true when any pool grew.
+    fn grow_worker_pools(&self) -> bool {
+        let mut grew = false;
+        if self.cpu_live.load(Ordering::Acquire) < self.cpu_capacity {
+            self.cpu_permits.add_permits(1);
+            self.prepare_request_permits.add_permits(1);
+            self.cpu_live.fetch_add(1, Ordering::AcqRel);
+            grew = true;
+        }
+        if self.io_live.load(Ordering::Acquire) < self.io_capacity {
+            self.io_permits.add_permits(1);
+            self.io_live.fetch_add(1, Ordering::AcqRel);
+            grew = true;
+        }
+        grew
+    }
+
+    /// One step back toward the one-worker floor. Permits only leave the pool
+    /// while they are available; busy workers finish first.
+    fn shrink_worker_pools_one_step(&self) -> bool {
+        let mut shrank = false;
+        if self.cpu_live.load(Ordering::Acquire) > 1 && self.cpu_permits.forget_permits(1) == 1 {
+            self.cpu_live.fetch_sub(1, Ordering::AcqRel);
+            // Best effort: surplus background admission permits stay dormant
+            // because prepare_limit is clamped below the live CPU pool.
+            let _ = self.prepare_request_permits.forget_permits(1);
+            shrank = true;
+        }
+        if self.io_live.load(Ordering::Acquire) > 1 && self.io_permits.forget_permits(1) == 1 {
+            self.io_live.fetch_sub(1, Ordering::AcqRel);
+            shrank = true;
+        }
+        if shrank {
+            let floor = self
+                .cpu_live
+                .load(Ordering::Acquire)
+                .saturating_sub(1)
+                .max(1);
+            let clamped = self.prepare_limit().min(floor);
+            if self.prepare_limit.swap(clamped, Ordering::AcqRel) != clamped {
+                self.prepare_admission_changed.notify_waiters();
+            }
+        }
+        shrank
+    }
+
+    /// Return one pool step after the pool has been fully idle for the
+    /// sustained-idle decision streak: the backlog cleared, so stop holding
+    /// the workers. Any busy worker or pickup resets the streak.
+    fn decay_idle_worker_pools(&self) {
+        if self.io_live.load(Ordering::Acquire) <= 1 && self.cpu_live.load(Ordering::Acquire) <= 1 {
+            return;
+        }
+        let snapshot = self.metrics.snapshot();
+        let fully_idle = snapshot.active_io == 0
+            && snapshot.active_cpu == 0
+            && self.active_prepare_tasks.load(Ordering::Acquire) == 0
+            && self.active_prepare_requests.load(Ordering::Acquire) == 0;
+        if !fully_idle {
+            self.idle_decision_streak.store(0, Ordering::Relaxed);
+            return;
+        }
+        let streak = self.idle_decision_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= IDLE_POOL_SHRINK_AFTER_DECISIONS {
+            self.idle_decision_streak.store(0, Ordering::Relaxed);
+            self.shrink_worker_pools_one_step();
+        }
     }
 
     #[must_use]
@@ -526,7 +669,9 @@ impl ChunkPipelineResources {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    return true;
+                }
                 Err(observed) => active = observed,
             }
         }
@@ -543,15 +688,6 @@ impl ChunkPipelineResources {
             admission_changed: None,
         }
     }
-}
-
-/// Derive bounded worker capacity from the process-visible CPU limit.
-#[must_use]
-pub fn automatic_worker_limits(available_parallelism: usize) -> (usize, usize) {
-    let available = available_parallelism.max(1);
-    let io_workers = available.div_ceil(4);
-    let cpu_workers = available.div_ceil(2);
-    (io_workers, cpu_workers)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -931,11 +1067,128 @@ mod tests {
     }
 
     #[test]
-    fn automatic_worker_limits_reserve_runtime_cpu_and_scale_io() {
-        assert_eq!(automatic_worker_limits(1), (1, 1));
-        assert_eq!(automatic_worker_limits(4), (1, 2));
-        assert_eq!(automatic_worker_limits(8), (2, 4));
-        assert_eq!(automatic_worker_limits(32), (8, 16));
+    fn default_policy_starts_uncapped_with_single_worker_pools() {
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let policy = ChunkPipelinePolicy::default();
+        assert_eq!(policy.chunk_send_rate, u32::MAX);
+        assert_eq!(policy.chunk_load_rate, u32::MAX);
+        assert_eq!(policy.chunk_generate_rate, u32::MAX);
+        assert_eq!(policy.chunk_io_threads, available);
+        assert_eq!(policy.chunk_worker_threads, available);
+
+        let resources = ChunkPipelineResources::new(policy);
+        assert_eq!(resources.cpu_capacity(), 1);
+        assert_eq!(resources.prepare_limit(), 1);
+        let first = resources.try_acquire_cpu();
+        assert!(first.is_some(), "one idle CPU worker exists");
+        // `first` must stay held: dropping it would release the worker permit
+        // back into the pool before the second probe.
+        let second = resources.try_acquire_cpu();
+        assert!(second.is_none(), "no second worker is reserved up front");
+        drop((first, second));
+    }
+
+    #[test]
+    fn bounded_policy_caps_pools_without_reserving_them() {
+        let policy = ChunkPipelinePolicy::bounded(4);
+        assert_eq!(policy.chunk_io_threads, 1);
+        assert_eq!(policy.chunk_worker_threads, 4);
+
+        let resources = ChunkPipelineResources::new(policy);
+        assert_eq!(resources.cpu_capacity(), 1);
+        assert_eq!(resources.prepare_limit(), 1);
+    }
+
+    #[test]
+    fn sustained_chunk_backlog_grows_pools_to_the_policy_ceiling() {
+        let policy = ChunkPipelinePolicy {
+            chunk_io_threads: 2,
+            chunk_worker_threads: 3,
+            ..ChunkPipelinePolicy::default()
+        };
+        let resources = ChunkPipelineResources::new(policy);
+        for _ in 0..3 {
+            resources.apply_runtime_control_action(
+                crate::AutoscaleAction::ScaleDown,
+                Some(crate::AutoscalePressure::ChunkQueue),
+                false,
+            );
+        }
+        assert_eq!(resources.cpu_capacity(), 3);
+        assert_eq!(resources.io_live.load(Ordering::Acquire), 2);
+        // Growth buys drain capacity without loosening background admission.
+        assert_eq!(resources.prepare_limit(), 1);
+    }
+
+    #[test]
+    fn memory_and_tick_pressure_never_grow_pools() {
+        let policy = ChunkPipelinePolicy {
+            chunk_io_threads: 2,
+            chunk_worker_threads: 2,
+            ..ChunkPipelinePolicy::default()
+        };
+        let resources = ChunkPipelineResources::new(policy);
+        for pressure in [
+            crate::AutoscalePressure::Memory,
+            crate::AutoscalePressure::TickTime,
+        ] {
+            resources.apply_runtime_control_action(
+                crate::AutoscaleAction::ScaleDown,
+                Some(pressure),
+                false,
+            );
+            assert_eq!(resources.cpu_capacity(), 1);
+            assert_eq!(resources.io_live.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
+    fn sustained_idle_shrinks_pools_back_toward_one_worker() {
+        let policy = ChunkPipelinePolicy {
+            chunk_io_threads: 1,
+            chunk_worker_threads: 3,
+            ..ChunkPipelinePolicy::default()
+        };
+        let resources = ChunkPipelineResources::new(policy);
+        for _ in 0..2 {
+            resources.apply_runtime_control_action(
+                crate::AutoscaleAction::ScaleDown,
+                Some(crate::AutoscalePressure::ChunkQueue),
+                false,
+            );
+        }
+        assert_eq!(resources.cpu_capacity(), 3);
+
+        for expected in [2, 1, 1] {
+            for _ in 0..=IDLE_POOL_SHRINK_AFTER_DECISIONS {
+                resources.apply_runtime_control_action(crate::AutoscaleAction::Hold, None, false);
+            }
+            assert_eq!(resources.cpu_capacity(), expected);
+        }
+    }
+
+    #[test]
+    fn draining_returns_pools_to_the_one_worker_floor() {
+        let policy = ChunkPipelinePolicy {
+            chunk_io_threads: 2,
+            chunk_worker_threads: 3,
+            ..ChunkPipelinePolicy::default()
+        };
+        let resources = ChunkPipelineResources::new(policy);
+        for _ in 0..2 {
+            resources.apply_runtime_control_action(
+                crate::AutoscaleAction::ScaleDown,
+                Some(crate::AutoscalePressure::ChunkQueue),
+                false,
+            );
+        }
+        assert_eq!(resources.cpu_capacity(), 3);
+        resources.apply_runtime_control_action(crate::AutoscaleAction::Hold, None, true);
+        assert_eq!(resources.cpu_capacity(), 1);
+        assert_eq!(resources.io_live.load(Ordering::Acquire), 1);
+        assert_eq!(resources.prepare_limit(), 1);
     }
 
     #[test]

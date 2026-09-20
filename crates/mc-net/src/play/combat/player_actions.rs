@@ -395,6 +395,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_hand_attack_is_a_vanilla_fist_attempt_with_full_feedback() {
+        // An empty hotbar slot is a vanilla-legal 1.0-base fist attack; the
+        // attempt must reach the same outcome pipeline as a held attack.
+        assert_eq!(
+            begin_player_attack_attempt(
+                &mc_data::item_components::ItemFactsTable::default(),
+                &mc_data::items::solaris_required_items(),
+                &ItemStack::EMPTY,
+                GameMode::Survival,
+                None,
+                100,
+            ),
+            Some(1.0),
+        );
+    }
+
+    #[test]
+    fn empty_hand_attack_still_attempts_inside_the_recharge_cooldown() {
+        let damage = begin_player_attack_attempt(
+            &mc_data::item_components::ItemFactsTable::default(),
+            &mc_data::items::solaris_required_items(),
+            &ItemStack::EMPTY,
+            GameMode::Survival,
+            Some(97),
+            100,
+        )
+        .expect("empty-hand attacks attempt during the attack recharge");
+        assert!((damage - 0.592).abs() < 1.0e-6, "{damage}");
+    }
+
+    #[test]
     fn shield_disable_duration_uses_exact_weapon_and_blocking_components() {
         let axe = Identifier::parse("minecraft:iron_axe").unwrap();
         let sword = Identifier::parse("minecraft:iron_sword").unwrap();

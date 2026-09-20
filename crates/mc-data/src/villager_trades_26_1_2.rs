@@ -8,9 +8,27 @@ use crate::Identifier;
 
 pub const TOOLSMITH_JOB_SITE_26_1_2: &str = "minecraft:smithing_table";
 
+/// 26.1.2 job-site POI block to `villager_profession` registry name. Every
+/// vanilla 26.1.2 job site maps to its profession; unknown blocks fail
+/// closed so unsupported job sites never assign a profession.
 #[must_use]
 pub fn supported_profession_for_job_site_26_1_2(block: &Identifier) -> Option<&'static str> {
-    (block.as_str() == TOOLSMITH_JOB_SITE_26_1_2).then_some("toolsmith")
+    match block.as_str() {
+        "minecraft:composter" => Some("farmer"),
+        "minecraft:barrel" => Some("fisherman"),
+        "minecraft:cartography_table" => Some("cartographer"),
+        "minecraft:brewing_stand" => Some("cleric"),
+        "minecraft:lectern" => Some("librarian"),
+        "minecraft:fletching_table" => Some("fletcher"),
+        "minecraft:loom" => Some("shepherd"),
+        "minecraft:smithing_table" => Some("toolsmith"),
+        "minecraft:blast_furnace" => Some("armorer"),
+        "minecraft:grindstone" => Some("weaponsmith"),
+        "minecraft:smoker" => Some("butcher"),
+        "minecraft:cauldron" => Some("leatherworker"),
+        "minecraft:stonecutter" => Some("mason"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,16 +138,33 @@ mod tests {
     }
 
     #[test]
-    fn supported_job_site_mapping_is_exact_and_fail_closed() {
+    fn every_vanilla_job_site_maps_to_its_registry_profession() {
+        let cases = [
+            ("minecraft:composter", "farmer"),
+            ("minecraft:barrel", "fisherman"),
+            ("minecraft:cartography_table", "cartographer"),
+            ("minecraft:brewing_stand", "cleric"),
+            ("minecraft:lectern", "librarian"),
+            ("minecraft:fletching_table", "fletcher"),
+            ("minecraft:loom", "shepherd"),
+            ("minecraft:smithing_table", "toolsmith"),
+            ("minecraft:blast_furnace", "armorer"),
+            ("minecraft:grindstone", "weaponsmith"),
+            ("minecraft:smoker", "butcher"),
+            ("minecraft:cauldron", "leatherworker"),
+            ("minecraft:stonecutter", "mason"),
+        ];
+        for (job_site, profession) in cases {
+            assert_eq!(
+                supported_profession_for_job_site_26_1_2(&Identifier::parse(job_site).unwrap()),
+                Some(profession),
+                "{job_site}"
+            );
+        }
+        // Non-job-site blocks fail closed.
         assert_eq!(
             supported_profession_for_job_site_26_1_2(
-                &Identifier::parse("minecraft:smithing_table").unwrap()
-            ),
-            Some("toolsmith")
-        );
-        assert_eq!(
-            supported_profession_for_job_site_26_1_2(
-                &Identifier::parse("minecraft:blast_furnace").unwrap()
+                &Identifier::parse("minecraft:stone").unwrap()
             ),
             None
         );

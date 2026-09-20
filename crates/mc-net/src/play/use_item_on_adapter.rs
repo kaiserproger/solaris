@@ -1,8 +1,9 @@
+use mc_nbt::Tag;
 use std::sync::Arc;
 
 use mc_data::{ItemStack, items::ItemRegistry};
 use mc_domain::{Direction, GameMode, InteractionHand};
-use mc_entity::Vec3;
+use mc_entity::{Rotation, Vec3};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::play::{
@@ -27,6 +28,7 @@ use super::block_placement::{
     placement_snapshot_positions, plan_block_placement, same_slab_can_replace,
     sign_block_entity_persistent_nbt, sign_block_entity_update_nbt,
 };
+use super::block_wire::broadcast_level_event;
 use super::bucket_interactions::{handle_bucket_use_on, handle_cauldron_bucket_use_on};
 use super::campfire_adapter::handle_campfire_use_on;
 use super::explosions::{TNT_ENTITY_TYPE_NAME, TntIgnitionPlan};
@@ -36,8 +38,8 @@ use super::persistence::XpState;
 use super::scheduled_blocks::placed_hopper_ticks;
 use super::session::{dispatch_visibility_commands, within_block_reach};
 use super::simulation::{
-    SurvivalBreakDrop, SurvivalBreakHeldItem, SurvivalBreakPlan, SurvivalPlacementHeldItem,
-    SurvivalPlacementPlan,
+    BoatPlacementPlan, SurvivalBreakDrop, SurvivalBreakHeldItem, SurvivalBreakPlan,
+    SurvivalPlacementHeldItem, SurvivalPlacementPlan,
 };
 use super::survival::{
     SurvivalState, entity_item_stack, item_entity_type_id, max_tool_damage_for_path,
@@ -484,6 +486,36 @@ where
     {
         return Ok(UseItemOnOutcome::Handled);
     }
+    if handle_boat_use_on(
+        state,
+        writer,
+        game_mode,
+        player_pose,
+        action.sequence,
+        target.clicked_pos,
+        action.direction,
+        action.hand,
+    )
+    .await?
+    {
+        return Ok(UseItemOnOutcome::Handled);
+    }
+    if handle_flint_use_on(
+        state,
+        writer,
+        UseItemOnMutationContext {
+            script_events,
+            game_mode,
+        },
+        action.sequence,
+        target.clicked_pos,
+        action.direction,
+        action.hand,
+    )
+    .await?
+    {
+        return Ok(UseItemOnOutcome::Handled);
+    }
     if handle_bucket_use_on(
         state,
         writer,
@@ -723,6 +755,96 @@ where
     Ok(true)
 }
 
+/// Boat items spawn their same-named boat entity (e.g. `minecraft:oak_boat`)
+/// at the clicked face's adjacent cell, consume one item in survival, and
+/// acknowledge the sequence. The boat is a server entity from the first tick;
+/// mount/steer handling rides the existing vehicle store.
+#[allow(clippy::too_many_arguments)]
+async fn handle_boat_use_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    player_pose: PlayerPose,
+    sequence: i32,
+    clicked_pos: mc_world::BlockPos,
+    direction: Direction,
+    hand: InteractionHand,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if !matches!(game_mode, GameMode::Creative | GameMode::Survival) {
+        return Ok(false);
+    }
+    let held_slot = hand_inventory_slot(state, hand);
+    let held = state.inventory.slots[held_slot].clone();
+    if held.is_empty() {
+        return Ok(false);
+    }
+    let Some(held_name) = state.items.name_of(held.item_id) else {
+        return Ok(false);
+    };
+    let held_name = held_name.as_str();
+    if !held_name.starts_with("minecraft:") || !held_name.ends_with("_boat") {
+        return Ok(false);
+    }
+    let Ok(boat_entity) = Identifier::parse(held_name) else {
+        return Ok(false);
+    };
+    let Some(entity_type_id) = state
+        .entity_types
+        .id_of(&boat_entity)
+        .and_then(|id| i32::try_from(id).ok())
+    else {
+        return Ok(false);
+    };
+    if !player_pose.yaw.is_finite() {
+        return Ok(false);
+    }
+
+    let (dx, dy, dz) = direction.normal();
+    let position = Vec3::new(
+        f64::from(clicked_pos.x + dx) + 0.5,
+        f64::from(clicked_pos.y + dy),
+        f64::from(clicked_pos.z + dz) + 0.5,
+    );
+    let rotation = Rotation {
+        yaw: player_pose.yaw,
+        pitch: 0.0,
+        head_yaw: player_pose.yaw,
+    };
+    match state
+        .simulation
+        .commit_boat_placement(BoatPlacementPlan {
+            held_slot,
+            expected_held: held,
+            game_mode,
+            entity_type_id,
+            entity_type_name: held_name.to_owned(),
+            position,
+            rotation,
+        })
+        .await
+    {
+        Ok(Some(committed)) => {
+            state.inventory = committed.inventory;
+            write_inventory_slot_updates(state, writer, committed.changed_slots).await?;
+        }
+        Ok(None) | Err(_) => {
+            write_block_resync_then_ack(
+                state,
+                writer,
+                pack_block_pos(clicked_pos.x, clicked_pos.y, clicked_pos.z),
+                sequence,
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
+    write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
+    Ok(true)
+}
+
 pub(super) fn plan_hoe_tilling(
     state: &InteractionState,
     clicked_pos: mc_world::BlockPos,
@@ -767,6 +889,235 @@ fn item_is_hoe(items: &ItemRegistry, item_id: u32) -> bool {
     items
         .name_of(item_id)
         .is_some_and(|item| item.path().ends_with("_hoe"))
+}
+
+/// Flint and steel lights fire on the top face of the clicked block. The fire
+/// block persists; burnout and spread stay with the random-tick fire family.
+pub(super) struct FlintFirePlan {
+    pub(super) fire_pos: mc_world::BlockPos,
+    pub(super) edits: Vec<BlockEdit>,
+    pub(super) preconditions: Vec<BlockEditPrecondition>,
+}
+
+async fn handle_flint_use_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    context: UseItemOnMutationContext<'_>,
+    sequence: i32,
+    clicked_pos: mc_world::BlockPos,
+    direction: Direction,
+    hand: InteractionHand,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if hand != InteractionHand::MainHand || direction != Direction::Up {
+        return Ok(false);
+    }
+    let held = state.inventory.slots[hand_inventory_slot(state, hand)].clone();
+    if held.is_empty() {
+        return Ok(false);
+    }
+    let Some(held_name) = state.items.name_of(held.item_id) else {
+        return Ok(false);
+    };
+    if held_name.as_str() != "minecraft:flint_and_steel" {
+        return Ok(false);
+    }
+    let Some(fire) = default_block_state(&state.blocks, "minecraft:fire") else {
+        return Ok(false);
+    };
+    let Some(plan) = plan_flint_fire(state, clicked_pos, fire) else {
+        return Ok(false);
+    };
+    let max_damage = if context.game_mode == GameMode::Survival {
+        state
+            .item_facts
+            .get(held_name)
+            .and_then(|facts| facts.max_damage)
+            .and_then(|value| i32::try_from(value).ok())
+    } else {
+        None
+    };
+    let zone_fence = context
+        .script_events
+        .and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
+    if context
+        .script_events
+        .is_some_and(|events| !events.block_mutation_allowed(plan.fire_pos))
+    {
+        write_block_ack(writer, state.compression, sequence).await?;
+        return Ok(true);
+    }
+    let committed = match state
+        .simulation
+        .commit_survival_break(SurvivalBreakPlan {
+            edits: plan.edits,
+            preconditions: plan.preconditions,
+            blocks: Arc::clone(&state.blocks),
+            block_facts: Arc::clone(&state.block_facts),
+            falling_block_entity_type_id: None,
+            held: SurvivalBreakHeldItem {
+                hotbar_slot: state.selected_hotbar_slot(),
+                expected: held,
+                max_damage,
+            },
+            drops: Vec::new(),
+            hook_approval: None,
+            zone_fence,
+        })
+        .await
+    {
+        Ok(Some(committed)) => committed,
+        Ok(None) | Err(_) => {
+            write_block_resync_then_ack(
+                state,
+                writer,
+                pack_block_pos(plan.fire_pos.x, plan.fire_pos.y, plan.fire_pos.z),
+                sequence,
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+
+    state.inventory = committed.inventory;
+    let changed_slots = committed.changed_slots;
+    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
+    let outcome =
+        finalize_visible_block_edit_outcome(state, writer, committed.block, false).await?;
+    write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
+    if !outcome.applied.is_empty() && !changed_slots.is_empty() {
+        write_inventory_slot_updates(state, writer, changed_slots).await?;
+    }
+    Ok(true)
+}
+
+pub(super) fn plan_flint_fire(
+    state: &InteractionState,
+    clicked_pos: mc_world::BlockPos,
+    fire: mc_world::BlockStateId,
+) -> Option<FlintFirePlan> {
+    let above_pos = mc_world::BlockPos {
+        y: clicked_pos.y.checked_add(1)?,
+        ..clicked_pos
+    };
+    let snapshot = loaded_block_snapshot(state, &[clicked_pos, above_pos]);
+    let clicked = snapshot.get_cached_block(clicked_pos)?;
+    let above = snapshot.get_cached_block(above_pos)?;
+    let air = air_state_id(&state.blocks);
+    if clicked == air || above != air {
+        return None;
+    }
+    Some(FlintFirePlan {
+        fire_pos: above_pos,
+        edits: vec![BlockEdit {
+            pos: above_pos,
+            new_state: fire,
+        }],
+        preconditions: vec![
+            BlockEditPrecondition {
+                pos: clicked_pos,
+                expected_state: clicked,
+                expected_token: snapshot.block_mutation_token(clicked_pos)?,
+            },
+            BlockEditPrecondition {
+                pos: above_pos,
+                expected_state: above,
+                expected_token: snapshot.block_mutation_token(above_pos)?,
+            },
+        ],
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GolemBuildKind {
+    Snow,
+    Iron,
+}
+
+/// Vanilla golem construction: placing a carved pumpkin (or jack o'lantern)
+/// completes a snow golem on a vertical pair of snow blocks, or an iron golem
+/// on the 4-block T. The body cells are consumed by the same conditional
+/// placement commit that places the pumpkin, so a concurrent edit anywhere in
+/// the pattern rejects the whole batch.
+fn plan_golem_construction(
+    state: &InteractionState,
+    pumpkin_pos: mc_world::BlockPos,
+    placed_state: mc_world::BlockStateId,
+) -> Option<(GolemBuildKind, Vec<BlockEdit>, Vec<BlockEditPrecondition>)> {
+    let placed_path = state.blocks.by_id(placed_state)?.block.id.path().to_owned();
+    if placed_path != "carved_pumpkin" && placed_path != "jack_o_lantern" {
+        return None;
+    }
+    let probe = |dy: i32| -> mc_world::BlockPos {
+        mc_world::BlockPos {
+            y: pumpkin_pos.y - dy,
+            ..pumpkin_pos
+        }
+    };
+    let below_1 = probe(1);
+    let below_2 = probe(2);
+    let arm_north = mc_world::BlockPos {
+        z: below_1.z.checked_sub(1)?,
+        ..below_1
+    };
+    let arm_south = mc_world::BlockPos {
+        z: below_1.z.checked_add(1)?,
+        ..below_1
+    };
+    let arm_west = mc_world::BlockPos {
+        x: below_1.x.checked_sub(1)?,
+        ..below_1
+    };
+    let arm_east = mc_world::BlockPos {
+        x: below_1.x.checked_add(1)?,
+        ..below_1
+    };
+    let snapshot = loaded_block_snapshot(
+        state,
+        &[below_1, below_2, arm_north, arm_south, arm_west, arm_east],
+    );
+    let is_block = |pos, path: &str| {
+        snapshot
+            .get_cached_block(pos)
+            .and_then(|state_id| state.blocks.by_id(state_id))
+            .is_some_and(|block| block.block.id.path() == path)
+    };
+    let (kind, body_cells) = if is_block(below_1, "snow_block") && is_block(below_2, "snow_block") {
+        (GolemBuildKind::Snow, vec![below_1, below_2])
+    } else if is_block(below_1, "iron_block") && is_block(below_2, "iron_block") {
+        let arms_along_x = is_block(arm_west, "iron_block") && is_block(arm_east, "iron_block");
+        let arms_along_z = is_block(arm_north, "iron_block") && is_block(arm_south, "iron_block");
+        let arms = if arms_along_x {
+            vec![arm_west, arm_east]
+        } else if arms_along_z {
+            vec![arm_north, arm_south]
+        } else {
+            return None;
+        };
+        (
+            GolemBuildKind::Iron,
+            vec![below_1, below_2, arms[0], arms[1]],
+        )
+    } else {
+        return None;
+    };
+    let air = air_state_id(&state.blocks);
+    let mut edits = Vec::with_capacity(body_cells.len());
+    let mut preconditions = Vec::with_capacity(body_cells.len());
+    for pos in body_cells {
+        edits.push(BlockEdit {
+            pos,
+            new_state: air,
+        });
+        preconditions.push(BlockEditPrecondition {
+            pos,
+            expected_state: snapshot.get_cached_block(pos)?,
+            expected_token: snapshot.block_mutation_token(pos)?,
+        });
+    }
+    Some((kind, edits, preconditions))
 }
 
 fn default_block_state(blocks: &BlockRegistry, id: &str) -> Option<mc_world::BlockStateId> {
@@ -900,10 +1251,10 @@ pub(super) fn plan_loaded_bonemeal_growth(
     clicked_pos: mc_world::BlockPos,
     sequence: i32,
 ) -> Option<(Vec<BlockEdit>, Vec<BlockEditPrecondition>)> {
-    let west = clicked_pos.x.checked_sub(2)?;
-    let east = clicked_pos.x.checked_add(2)?;
-    let north = clicked_pos.z.checked_sub(2)?;
-    let south = clicked_pos.z.checked_add(2)?;
+    let west = clicked_pos.x.checked_sub(3)?;
+    let east = clicked_pos.x.checked_add(3)?;
+    let north = clicked_pos.z.checked_sub(3)?;
+    let south = clicked_pos.z.checked_add(3)?;
     clicked_pos.y.checked_add(7)?;
     let snapshot = loaded_block_snapshot(
         state,
@@ -1073,7 +1424,8 @@ where
             clicked,
             action.direction,
             action.cursor_y,
-        ) {
+        ) || block_state_is_replaceable(state, clicked)
+        {
             clicked_pos
         } else {
             adjacent_pos
@@ -1091,6 +1443,7 @@ where
                 target_state,
                 air,
             )
+            && !block_state_is_replaceable(state, target_state)
         {
             break 'placement Ok(None);
         }
@@ -1125,7 +1478,7 @@ where
                     z: tz,
                 },
                 UseItemOnNoOpReason::TargetBlockedOrUnplaceable,
-                UseItemOnResyncOptions::WITH_BUCKET,
+                UseItemOnResyncOptions::WITH_HELD_ITEM,
             )
             .await;
         }
@@ -1178,9 +1531,13 @@ where
         .await;
     };
     let PlannedBlockPlacement {
-        edits,
+        mut edits,
         additional_preconditions,
     } = plan;
+    let golem_construction = plan_golem_construction(state, target_pos, placed_state);
+    if let Some((_, golem_edits, _)) = &golem_construction {
+        edits.extend(golem_edits.iter().copied());
+    }
     let zone_fence =
         script_events.and_then(ScriptGameplayEventPublisher::capture_block_mutation_zone_fence);
     if script_events.is_some_and(|events| {
@@ -1220,6 +1577,16 @@ where
             .any(|existing| existing.pos == precondition.pos)
         {
             preconditions.push(precondition);
+        }
+    }
+    if let Some((_, _, golem_preconditions)) = &golem_construction {
+        for precondition in golem_preconditions {
+            if !preconditions
+                .iter()
+                .any(|existing| existing.pos == precondition.pos)
+            {
+                preconditions.push(*precondition);
+            }
         }
     }
     let committed = match state
@@ -1292,6 +1659,52 @@ where
     write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
     if outcome.applied.is_empty() {
         return Ok(());
+    }
+    if let Some((golem_kind, _, _)) = golem_construction {
+        let (name, y_offset) = match golem_kind {
+            GolemBuildKind::Snow => ("minecraft:snow_golem", 1.0),
+            GolemBuildKind::Iron => ("minecraft:iron_golem", 0.0),
+        };
+        if let Ok(golem_entity) = Identifier::parse(name)
+            && let Some(entity_type_id) = state
+                .entity_types
+                .id_of(&golem_entity)
+                .and_then(|id| i32::try_from(id).ok())
+        {
+            let position = Vec3::new(
+                f64::from(target_pos.x) + 0.5,
+                f64::from(target_pos.y.saturating_sub(1)) + y_offset,
+                f64::from(target_pos.z) + 0.5,
+            );
+            if let Ok(dispatches) = state
+                .simulation
+                .spawn_command_entity(entity_type_id, name.to_owned(), position)
+                .await
+            {
+                dispatch_visibility_commands(dispatches);
+            }
+        }
+    }
+    let bed_block_entity_type = mc_data::block_entity_types::solaris_required_block_entity_types()
+        .id_of(&Identifier::parse("minecraft:bed").expect("static identifier"))
+        .and_then(|id| i32::try_from(id).ok());
+    for edit in &outcome.applied {
+        let is_bed = state
+            .blocks
+            .by_id(edit.new_state)
+            .is_some_and(|block| block.block.id.path().ends_with("_bed"));
+        if !is_bed {
+            continue;
+        }
+        let Some(bed_block_entity_type) = bed_block_entity_type else {
+            break;
+        };
+        dispatch_visibility_commands(state.sessions.block_entity_data_dispatches(
+            edit.pos,
+            None,
+            bed_block_entity_type,
+            Tag::Compound(Vec::new()),
+        ));
     }
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
     write_inventory_slot_updates(state, writer, changed_slots).await?;
@@ -1380,6 +1793,19 @@ fn bucket_held_slot_resync(
         .is_some()
         || Some(held.item_id) == state.item_to_block.empty_bucket_item();
     is_bucket.then(|| (held_slot as i16, held.clone()))
+}
+
+/// Vanilla replaceClicked: a replaceable clicked or target cell (short grass,
+/// ferns, water, ...) is overwritten by the placement instead of blocking it.
+fn block_state_is_replaceable(state: &InteractionState, state_id: mc_world::BlockStateId) -> bool {
+    state.blocks.by_id(state_id).is_some_and(|block| {
+        block.block.id.path() == "air"
+            || state.tags.contains_raw_id(
+                "minecraft:block",
+                "minecraft:replaceable",
+                block.block.raw_id,
+            )
+    })
 }
 
 fn held_item_slot_resync(
@@ -1487,6 +1913,7 @@ where
         return Ok(true);
     };
     state.inventory = committed.inventory;
+    broadcast_level_event(state, clicked_pos, 1505, 15, None);
     let outcome =
         finalize_visible_block_edit_outcome(state, writer, committed.block, false).await?;
     write_block_ack(writer, state.compression, sequence).await?;

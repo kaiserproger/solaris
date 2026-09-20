@@ -61,11 +61,11 @@ cgroup, so each bound is a total, not a per-process, allowance.
 | `MemoryHigh` | `off` (no throttle) | `SOLARIS_HARNESS_MEMORY_HIGH` |
 | `MemoryMax` | `4G` | `SOLARIS_HARNESS_MEMORY_MAX` |
 | `MemorySwapMax` | `1G` | `SOLARIS_HARNESS_MEMORY_SWAP_MAX` |
-| libtest threads (`RUST_TEST_THREADS`) | one per physical core | `SOLARIS_HARNESS_TEST_THREADS` |
 
 ```sh
 python3 -m tools.harness run correctness              # the defaults above
 SOLARIS_HARNESS_CPU_QUOTA=150% python3 -m tools.harness run test
+python3 -m tools.harness run test -- -p mc-net --lib player_attack  # focused Rust loop
 SOLARIS_HARNESS_MEMORY_MAX=12G python3 -m tools.harness client   # heavier client runs
 SOLARIS_HARNESS_CPU_QUOTA=off  python3 -m tools.harness run test  # unbounded, opt-out
 ```
@@ -135,7 +135,7 @@ own result either way.
 | Profiles | Coverage and recipe |
 |---|---|
 | `correctness` | Rust L2: formatter, strict workspace Clippy, code-health, workspace/all-target tests. `python3 -m tools.harness run correctness` |
-| `fmt`, `clippy`, `code-health`, `test` | The individual Rust gates; CI uses the same profiles. |
+| `fmt`, `clippy`, `code-health`, `test` | The individual Rust gates; CI uses the same profiles. `test` accepts trailing Cargo test selectors after `--`, for example `python3 -m tools.harness run test -- -p mc-net --lib player_attack`; its no-argument form remains the full workspace/all-target gate. |
 | `harness-check` | Fail-closed receipt/process lifecycle regressions plus private shell-engine syntax (`bash -n` over every backend). `python3 -m tools.harness run harness-check` |
 | `build` | Debug server build (`cargo build --bin mc-server`); `--release` explicitly selects the locked release workspace build (`cargo build --locked --release --workspace`). `python3 -m tools.harness run build --release` |
 | `java` | Gradle bridge/agent/Loader module tests (`:bridge-core`, `:java-agent`, `:loader-core`, `:loader-fabric`, `:loader-neoforge`, `:loader-forge`). Requires a Minecraft client jar via `SOLARIS_CLIENT_JAR` or the Loader's documented local path. CI downloads the version declared in Loader `gradle.properties` and verifies Mojang's SHA-1 before testing. `python3 -m tools.harness run java` |

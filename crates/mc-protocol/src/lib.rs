@@ -7,13 +7,10 @@
 //! The crate is organised in layers, each building on the previous:
 //!
 //! 1. [`codec`] — primitive value encode/decode (varint, string, uuid, …).
-//!    This is the only layer touched by M1.a; framing, packet structs and
-//!    state-aware dispatch arrive in later sub-milestones (see
-//!    `docs/milestones/M1.md`).
-//! 2. *(M1.b)* `frame` — length-prefixed framing on top of the codec layer,
-//!    optionally with zlib compression and AES/CFB8 encryption.
-//! 3. *(M1.c+)* `packets` — typed structs for every serverbound and
-//!    clientbound packet we care about, grouped by connection state.
+//! 2. [`frame`] — length-prefixed framing over the codec layer, optionally with
+//!    zlib compression and AES/CFB8 encryption.
+//! 3. [`packets`] — typed serverbound and clientbound packets grouped by
+//!    connection state.
 
 pub mod codec;
 mod error;

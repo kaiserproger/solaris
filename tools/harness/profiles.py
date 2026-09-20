@@ -68,6 +68,12 @@ def _run_command(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            print(
+                f"[harness] stage={log_name.removesuffix('.log')} starting "
+                f"pid={proc.pid} command={' '.join(str(part) for part in argv)} "
+                f"log={ctx.logs[-1]}",
+                flush=True,
+            )
             try:
                 returncode = proc.wait()
             except BaseException:
@@ -76,11 +82,17 @@ def _run_command(
     finally:
         if proc is not None:
             ctx.exits[-1] = proc.returncode
+    duration_seconds = time.time() - started
+    print(
+        f"[harness] stage={log_name.removesuffix('.log')} exit={returncode} "
+        f"in {duration_seconds:.1f}s log={ctx.logs[-1]}",
+        flush=True,
+    )
     if returncode != 0:
         raise RuntimeError(
             f"{' '.join(str(part) for part in argv)} exited {returncode}; see {log_path}"
         )
-    return {"duration_seconds": time.time() - started}
+    return {"duration_seconds": duration_seconds}
 
 
 def _merge_details(into: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
@@ -135,9 +147,12 @@ def run_code_health(ctx: ProfileContext) -> dict[str, Any]:
 
 
 def run_test(ctx: ProfileContext) -> dict[str, Any]:
-    return _run_command(
-        ["cargo", "test", "--workspace", "--all-targets"], ctx, "test.log"
+    argv = (
+        ["cargo", "test", *ctx.extra_args]
+        if ctx.extra_args
+        else ["cargo", "test", "--workspace", "--all-targets"]
     )
+    return _run_command(argv, ctx, "test.log")
 
 
 def run_correctness(ctx: ProfileContext) -> dict[str, Any]:
@@ -462,7 +477,7 @@ PROFILES: dict[str, dict[str, Any]] = {
     },
     "test": {
         "scope": "rust",
-        "description": "cargo test --workspace --all-targets",
+        "description": "cargo test --workspace --all-targets; trailing arguments run a focused Cargo test",
         "run": run_test,
     },
     "build": {

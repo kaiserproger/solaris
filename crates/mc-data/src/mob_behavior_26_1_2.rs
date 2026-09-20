@@ -36,6 +36,7 @@ pub enum MobCombatPolicy {
     SmallFireball,
     SonicBoom,
     ShulkerBullet,
+    Snowball,
     EvokerFangs,
     LargeFireball,
     WindCharge,
@@ -215,6 +216,16 @@ pub enum MobBehaviorError {
 }
 
 fn combat_policy(name: &'static str, hostile: bool) -> (MobCombatPolicy, Option<&'static str>) {
+    // Golems are constructed mobs, not `Monster`-category spawnees, but both
+    // carry attack goals in vanilla: SnowGolem registers RangedAttackGoal
+    // (snowball ~1.25 s, 10-block range) and IronGolem runs MeleeAttackGoal
+    // against hostiles (the Solaris village-defense lane owns that trigger).
+    if name == "minecraft:snow_golem" {
+        return (MobCombatPolicy::Snowball, None);
+    }
+    if name == "minecraft:iron_golem" {
+        return (MobCombatPolicy::Melee, None);
+    }
     if !hostile {
         return (MobCombatPolicy::None, None);
     }
@@ -360,5 +371,39 @@ mod tests {
             table.insert_override(unknown.clone(), profile),
             Err(MobBehaviorError::UnknownEntityType(unknown))
         );
+    }
+
+    #[test]
+    fn constructed_golems_carry_vanilla_combat_policies() {
+        let table = MobBehaviorTable::vanilla_26_1_2();
+        // SnowGolem registers RangedAttackGoal in vanilla; the Solaris snowball
+        // throw wiring consumes this slot separately from the table.
+        let snow_golem = table.get_by_name("minecraft:snow_golem").unwrap();
+        assert_eq!(snow_golem.combat, MobCombatPolicy::Snowball);
+        assert_eq!(snow_golem.special_attack, None);
+        assert_eq!(snow_golem.movement, MobMovementPolicy::GroundWander);
+        // IronGolem melee is vanilla MeleeAttackGoal; the village-defense lane
+        // owns its trigger, the table documents the default combat family.
+        let iron_golem = table.get_by_name("minecraft:iron_golem").unwrap();
+        assert_eq!(iron_golem.combat, MobCombatPolicy::Melee);
+        assert_eq!(iron_golem.special_attack, None);
+        table.validate().unwrap();
+    }
+
+    #[test]
+    fn non_monster_passives_stay_out_of_combat() {
+        let table = MobBehaviorTable::vanilla_26_1_2();
+        for passive in [
+            "minecraft:sheep",
+            "minecraft:cow",
+            "minecraft:villager",
+            "minecraft:armor_stand",
+        ] {
+            assert_eq!(
+                table.get_by_name(passive).unwrap().combat,
+                MobCombatPolicy::None,
+                "{passive} must stay non-combatant"
+            );
+        }
     }
 }

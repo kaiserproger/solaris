@@ -34,7 +34,9 @@ fn aquatic_entities_do_not_receive_generic_surface_buoyancy() {
     );
 
     assert_eq!(aquatic.body.velocity.y, 0.0);
-    assert!(generic.body.velocity.y > 0.0);
+    // A stationary living body has no upward swim drive, so it sinks under
+    // the vanilla water gravity instead of receiving surface lift.
+    assert!(generic.body.velocity.y < 0.0);
 }
 
 #[test]
@@ -81,11 +83,15 @@ fn submerged_living_body() -> EntityBody {
 fn living_bodies_stay_immersed_while_swimming() {
     // Regression: the old unconditional surface buoyancy (+7.0 blocks/s^2 on
     // any overlap) settled terrestrial bodies with their feet above the
-    // surface — the owner-observed sheep/pigs walking on water. The bounded
-    // swim model must never breach the surface over a sustained swim.
+    // surface — the owner-observed sheep/pigs walking on water. A swimming
+    // body (FloatGoal-style upward drive while submerged) must never breach
+    // the surface over a sustained bob.
     let mut body = submerged_living_body();
     let mut highest_feet = body.position.y;
     for _ in 0..500 {
+        if body.position.y < 63.4 {
+            body.velocity.y = 0.12;
+        }
         body = super::step_entity(body, &DeepWater, PhysicsConfig::living_entity()).body;
         highest_feet = highest_feet.max(body.position.y);
     }
@@ -97,8 +103,31 @@ fn living_bodies_stay_immersed_while_swimming() {
 }
 
 #[test]
-fn living_bodies_hold_near_surface_depth_instead_of_sinking() {
-    // Reaching breathing depth also rejects a no-op or sink-only replacement.
+fn swimming_living_bodies_hold_near_breathing_depth() {
+    // While the body actively swims, the bounded lift must hold it near the
+    // breathing band instead of letting it sink away or park at the surface.
+    let mut body = submerged_living_body();
+    body.position.y = 63.0;
+    for _ in 0..500 {
+        if body.position.y < 63.4 {
+            body.velocity.y = 0.12;
+        }
+        let result = super::step_entity(body, &DeepWater, PhysicsConfig::living_entity());
+        body = result.body;
+        assert!(result.in_fluid);
+        assert!(
+            (63.0..63.9).contains(&body.position.y),
+            "swimming body left the breathing band: feet at {}",
+            body.position.y
+        );
+    }
+}
+
+#[test]
+fn passive_living_bodies_sink_instead_of_hovering_at_surface() {
+    // Regression for the owner-observed surface hover: with no upward swim
+    // drive (a passive sheep that wandered into a pond), the body must keep
+    // sinking like vanilla instead of pinning just below the surface.
     let mut body = submerged_living_body();
     for _ in 0..500 {
         let result = super::step_entity(body, &DeepWater, PhysicsConfig::living_entity());
@@ -107,10 +136,11 @@ fn living_bodies_hold_near_surface_depth_instead_of_sinking() {
     }
 
     assert!(
-        (63.3..63.9).contains(&body.position.y),
-        "swimming body sank away: feet at {}",
+        body.position.y < 55.0,
+        "passive body hovered instead of sinking: feet at {}",
         body.position.y
     );
+    assert!(body.velocity.y < 0.0, "passive body stopped sinking");
 }
 
 #[test]

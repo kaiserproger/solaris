@@ -17,8 +17,112 @@ use super::entity_lifecycle::spawn_command_entity_locked;
 use super::projectiles::{
     HurtingProjectileMotionProfile, initial_hurting_projectile_state,
     initial_hurting_projectile_state_with_motion, initial_throwable_projectile_state,
-    projectile_identity, spawn_arrow_locked,
+    projectile_identity, spawn_arrow_locked, spawn_throwable_projectile_locked,
 };
+
+#[test]
+fn snowball_uses_throwable_item_gravity_and_survives_a_miss_tick() {
+    let registry = SessionRegistry::new();
+    let snowball_id;
+    {
+        let mut inner = registry.lock_session_entities("seed snowball flight");
+        snowball_id = spawn_throwable_projectile_locked(
+            &mut inner,
+            None,
+            120,
+            "minecraft:snowball",
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.1, 0.0, 0.0),
+            Rotation::ZERO,
+        )
+        .0;
+    }
+
+    registry.apply_entity_physics_with_throwable_facts_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: snowball_id,
+            position: Vec3::new(0.6, 64.0, 0.5),
+            velocity: Vec3::new(0.1, -0.03, 0.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+        &[HurtingProjectilePhysicsFact {
+            projectile_id: snowball_id,
+            block_hit: None,
+            in_water: false,
+        }],
+    );
+
+    let snapshot = registry
+        .server_entity_snapshot(snowball_id)
+        .expect("snowball survives a miss tick");
+    let gravity_scaled = 0.03 * 0.99;
+    assert!(
+        (snapshot.velocity.y + gravity_scaled).abs() < 1e-9,
+        "snowballs must fall on the 0.03 throwable-item gravity, got {}",
+        snapshot.velocity.y
+    );
+    assert!(
+        (snapshot.velocity.y + 0.05 * 0.99).abs() > 0.01,
+        "snowballs must not ride the witch potion 0.05 gravity"
+    );
+}
+
+#[test]
+fn snowball_discards_on_entity_hit_without_potion_effects() {
+    let registry = SessionRegistry::new();
+    let (snowball_id, cow_id, cow_health);
+    {
+        let mob_behaviors = registry.mob_behavior_table();
+        let mut inner = registry.lock_session_entities("seed snowball entity hit");
+        cow_id = spawn_command_entity_locked(
+            &mut inner,
+            11,
+            "minecraft:cow".to_owned(),
+            Vec3::new(1.0, 64.0, 0.5),
+            &mob_behaviors,
+        )
+        .0;
+        cow_health = inner.entities.snapshot(cow_id).expect("cow exists").health;
+        snowball_id = spawn_throwable_projectile_locked(
+            &mut inner,
+            None,
+            120,
+            "minecraft:snowball",
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.1, 0.0, 0.0),
+            Rotation::ZERO,
+        )
+        .0;
+    }
+
+    registry.apply_entity_physics_with_throwable_facts_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: snowball_id,
+            position: Vec3::new(0.6, 64.0, 0.5),
+            velocity: Vec3::new(0.099, -0.0297, 0.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+        &[HurtingProjectilePhysicsFact {
+            projectile_id: snowball_id,
+            block_hit: None,
+            in_water: false,
+        }],
+    );
+
+    assert!(
+        registry.server_entity_snapshot(snowball_id).is_none(),
+        "snowball is discarded after an entity impact"
+    );
+    let cow = registry
+        .lock_entities("inspect snowball entity hit")
+        .snapshot(cow_id)
+        .expect("cow exists");
+    assert_eq!(cow.health, cow_health, "snowballs carry no potion payload");
+}
 
 #[test]
 fn grounded_arrow_ages_in_a_dense_entity_chunk() {

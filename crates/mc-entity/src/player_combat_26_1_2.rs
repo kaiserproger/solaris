@@ -66,10 +66,26 @@ pub fn melee_knockback(
     target_on_ground: bool,
     source: Vec3,
 ) -> Option<Knockback> {
+    melee_knockback_with_momentum(target_x, target_z, target_on_ground, Vec3::ZERO, source)
+}
+
+/// Vanilla `LivingEntity#knockback` melee impulse combined with the target's
+/// current momentum: halve the prior delta, add the impulse, and cap the
+/// grounded vertical pop at 0.4. All velocities are blocks per tick, the
+/// `SetEntityMotion` wire unit.
+#[must_use]
+pub fn melee_knockback_with_momentum(
+    target_x: f64,
+    target_z: f64,
+    target_on_ground: bool,
+    target_momentum: Vec3,
+    source: Vec3,
+) -> Option<Knockback> {
     knockback_with_strength(
         target_x,
         target_z,
         target_on_ground,
+        target_momentum,
         source,
         0.400_000_005_960_464_5,
     )
@@ -82,7 +98,14 @@ pub fn shield_block_knockback(
     target_on_ground: bool,
     source: Vec3,
 ) -> Option<Knockback> {
-    knockback_with_strength(target_x, target_z, target_on_ground, source, 0.5)
+    knockback_with_strength(
+        target_x,
+        target_z,
+        target_on_ground,
+        Vec3::ZERO,
+        source,
+        0.5,
+    )
 }
 
 #[must_use]
@@ -152,6 +175,7 @@ fn knockback_with_strength(
     target_x: f64,
     target_z: f64,
     target_on_ground: bool,
+    target_momentum: Vec3,
     source: Vec3,
     strength: f64,
 ) -> Option<Knockback> {
@@ -163,9 +187,13 @@ fn knockback_with_strength(
     }
     let scale = strength / length_squared.sqrt();
     Some(Knockback {
-        x: -direction_x * scale,
-        y: if target_on_ground { 0.4 } else { 0.0 },
-        z: -direction_z * scale,
+        x: target_momentum.x * 0.5 - direction_x * scale,
+        y: if target_on_ground {
+            (target_momentum.y * 0.5 + strength).min(0.4)
+        } else {
+            target_momentum.y
+        },
+        z: target_momentum.z * 0.5 - direction_z * scale,
     })
 }
 
@@ -224,6 +252,37 @@ mod tests {
         assert!(!shield_blocks_damage_since(player, 0.0, back, 5, 0));
         assert!(!shield_blocks_damage_since(player, 0.0, None, 5, 0));
         assert!(!shield_blocks_damage_since(player, 0.0, Some(player), 5, 0,));
+    }
+
+    #[test]
+    fn melee_knockback_combines_with_target_momentum_like_vanilla() {
+        // Vanilla: halve the prior delta, add the impulse, and only cap the
+        // grounded vertical pop at 0.4 (downward momentum is preserved).
+        let knockback = melee_knockback_with_momentum(
+            0.0,
+            0.0,
+            true,
+            Vec3::new(0.2, -1.0, -0.1),
+            Vec3::new(3.0, 64.0, 0.0),
+        )
+        .unwrap();
+        assert!((knockback.x + 0.300_000_005_960_464_5).abs() < 1e-12);
+        assert!((knockback.y + 0.099_999_994_039_535_52).abs() < 1e-12);
+        assert!((knockback.z + 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn airborne_targets_keep_their_vertical_momentum_through_knockback() {
+        let knockback = melee_knockback_with_momentum(
+            0.0,
+            0.0,
+            false,
+            Vec3::new(0.0, 0.3, 0.0),
+            Vec3::new(1.0, 64.0, 0.0),
+        )
+        .unwrap();
+        assert_eq!(knockback.y, 0.3);
+        assert!((knockback.x + 0.400_000_005_960_464_5).abs() < 1e-12);
     }
 
     #[test]

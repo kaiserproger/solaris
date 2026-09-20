@@ -444,6 +444,8 @@ fn structure_snapshot(value: &ScriptStructureSnapshot) -> Option<wire::Structure
         rotation: value.rotation,
         reserved_footprint: contract_position(value.reserved_footprint),
         stages: value.stages.iter().map(stage_plan).collect(),
+        current_stage_index: value.current_stage_index,
+        completed_work_units: value.completed_work_units,
         resource_plan_hash: value.resource_plan_hash.clone(),
         reservation_ref: value.reservation_ref.clone(),
         watermark: value.watermark,

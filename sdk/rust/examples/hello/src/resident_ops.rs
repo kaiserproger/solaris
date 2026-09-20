@@ -1312,8 +1312,11 @@ impl Fixture {
                         self.unexpected("the withdrawal omitted the resident carry fence")
                     })?;
                 // Carry and work share the resident's durable order record.
-                // The transfer advanced that record, not just the player's fence.
-                self.record_revision = carry.fence.revision;
+                // The transfer advanced that record, not just the player's
+                // fence, and core's native resume may already have advanced
+                // it further: adopt whichever revision is newest so the next
+                // step never fences on a revision a receipt has superseded.
+                self.record_revision = self.record_revision.max(carry.fence.revision);
                 Ok(vec![self.report(&format!(
                     "withdraw moved={ONE_ITEM} endpoints={} revision={}",
                     inventories.len(),

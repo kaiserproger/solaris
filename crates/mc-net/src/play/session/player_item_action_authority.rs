@@ -3,20 +3,25 @@ use std::time::Instant;
 use mc_data::ItemStack;
 use mc_data::block_light::BlockLightTable;
 use mc_domain::GameMode;
-use mc_entity::{EntityItemStack, Vec3};
+use mc_entity::{EntityId, EntityItemStack, Rotation, SpawnEntity, Vec3};
 
+use super::entity_lifecycle::track_entity_chunk_locked;
+use super::entity_spawn_facts::apply_entity_facts;
 use super::explosion_authority::spawn_primed_tnt_locked;
+use super::interaction_geometry::entity_aabb;
+use super::outbound::VisibilityDispatch;
 use super::pickups::{block_item_pickup_for_owner_locked, spawn_item_drop_entity_locked};
-use super::projectiles::spawn_arrow_locked;
-use super::visibility::spawn_entity_visibility_locked;
-use super::{SessionId, SessionRegistry};
+use super::projectiles::{spawn_arrow_locked, spawn_throwable_projectile_locked};
+use super::visibility::{initialize_entity_wire_state_locked, spawn_entity_visibility_locked};
+use super::{SessionEntityGuards, SessionId, SessionRegistry};
 use crate::play::BlockEdit;
 use crate::play::block_edit_commit::apply_block_edit_batch_to_storage_conditionally;
 use crate::play::explosions::{CommittedTntIgnition, TNT_FUSE_TICKS, TntIgnitionPlan};
 use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::{
-    BowReleasePlan, CommittedBowRelease, CommittedFoodUse, CommittedSelectedItemDrop, FoodUsePlan,
-    SelectedItemDropPlan, SimulationAuthority, SimulationRequestError,
+    BoatPlacementPlan, BowReleasePlan, CommittedBoatPlacement, CommittedBowRelease,
+    CommittedFoodUse, CommittedSelectedItemDrop, CommittedThrowableItemRelease, FoodUsePlan,
+    SelectedItemDropPlan, SimulationAuthority, SimulationRequestError, ThrowableItemReleasePlan,
 };
 
 impl SessionRegistry {
@@ -337,4 +342,156 @@ impl SessionRegistry {
             dispatches,
         })
     }
+
+    pub(in crate::play) fn commit_throwable_item_release(
+        &self,
+        _authority: &SimulationAuthority,
+        actor_session: SessionId,
+        plan: &ThrowableItemReleasePlan,
+    ) -> Option<CommittedThrowableItemRelease> {
+        let mut inner = self.lock_session_entities("commit throwable item release");
+        if !inner.sessions.contains_key(&actor_session) {
+            return None;
+        }
+        let player_state = inner.player_persistence.get(&actor_session)?.clone();
+        let wait_started = Instant::now();
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
+        let mut player_state = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::PlayerPersistence,
+            "commit throwable item release",
+            wait_started,
+            guard,
+        );
+        if player_state.inventory_recovery_required || player_state.game_mode != plan.game_mode {
+            return None;
+        }
+        let selected_slot =
+            PlayerInventory::HOTBAR_BASE + usize::from(player_state.selected_hotbar_slot);
+        if (plan.held_slot != PlayerInventory::OFFHAND_SLOT && plan.held_slot != selected_slot)
+            || player_state.inventory.slots[plan.held_slot] != plan.expected_held
+        {
+            return None;
+        }
+
+        let mut inventory = player_state.inventory.clone();
+        let mut changed_slots = Vec::new();
+        if plan.game_mode == GameMode::Survival {
+            let held = &mut inventory.slots[plan.held_slot];
+            held.count = held.count.saturating_sub(1);
+            if held.count <= 0 {
+                *held = ItemStack::EMPTY;
+            }
+            changed_slots.push((plan.held_slot, held.clone()));
+        }
+
+        let (_, dispatches) = spawn_throwable_projectile_locked(
+            &mut inner,
+            Some(actor_session),
+            plan.entity_type_id,
+            plan.entity_type_name.as_str(),
+            plan.position,
+            plan.velocity,
+            plan.rotation,
+        );
+        if !changed_slots.is_empty() {
+            player_state.replace_inventory(inventory.clone());
+        }
+
+        Some(CommittedThrowableItemRelease {
+            inventory,
+            changed_slots,
+            dispatches,
+        })
+    }
+
+    pub(in crate::play) fn commit_boat_placement(
+        &self,
+        _authority: &SimulationAuthority,
+        actor_session: SessionId,
+        plan: &BoatPlacementPlan,
+    ) -> Option<CommittedBoatPlacement> {
+        let mut inner = self.lock_session_entities("commit boat placement");
+        if !inner.sessions.contains_key(&actor_session) {
+            return None;
+        }
+        let player_state = inner.player_persistence.get(&actor_session)?.clone();
+        let wait_started = Instant::now();
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
+        let mut player_state = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::PlayerPersistence,
+            "commit boat placement",
+            wait_started,
+            guard,
+        );
+        if player_state.inventory_recovery_required || player_state.game_mode != plan.game_mode {
+            return None;
+        }
+        let selected_slot =
+            PlayerInventory::HOTBAR_BASE + usize::from(player_state.selected_hotbar_slot);
+        if (plan.held_slot != PlayerInventory::OFFHAND_SLOT && plan.held_slot != selected_slot)
+            || player_state.inventory.slots[plan.held_slot] != plan.expected_held
+        {
+            return None;
+        }
+
+        let mut inventory = player_state.inventory.clone();
+        let mut changed_slots = Vec::new();
+        if plan.game_mode == GameMode::Survival {
+            let held = &mut inventory.slots[plan.held_slot];
+            held.count = held.count.saturating_sub(1);
+            if held.count <= 0 {
+                *held = ItemStack::EMPTY;
+            }
+            changed_slots.push((plan.held_slot, held.clone()));
+        }
+
+        let (_, dispatches) = spawn_boat_locked(
+            &mut inner,
+            plan.entity_type_id,
+            plan.entity_type_name.as_str(),
+            plan.position,
+            plan.rotation,
+        );
+        if !changed_slots.is_empty() {
+            player_state.replace_inventory(inventory.clone());
+        }
+
+        Some(CommittedBoatPlacement {
+            inventory,
+            changed_slots,
+            dispatches,
+        })
+    }
+}
+
+/// Spawns a boat vehicle entity at the placement position with visibility
+/// fanout, mirroring the primed-TNT spawn shape.
+pub(super) fn spawn_boat_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    entity_type_id: i32,
+    type_name: &str,
+    position: Vec3,
+    rotation: Rotation,
+) -> (EntityId, Vec<VisibilityDispatch>) {
+    let mut entity = SpawnEntity::vehicle(
+        mc_entity::VehicleKind::Boat,
+        entity_type_id,
+        type_name,
+        position,
+    );
+    apply_entity_facts(&mut entity);
+    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
+    entity.rotation = rotation;
+    let aabb = entity_aabb(type_name);
+    let entity_id = inner.entities.spawn(entity);
+    inner
+        .entity_type_aabbs
+        .entry(entity_type_id)
+        .or_insert(aabb);
+    track_entity_chunk_locked(inner, entity_id, position);
+    initialize_entity_wire_state_locked(inner, entity_id);
+    let dispatches = spawn_entity_visibility_locked(inner, entity_id);
+    (entity_id, dispatches)
 }

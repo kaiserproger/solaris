@@ -254,11 +254,16 @@ interface settlements {
 
     /// One bounded, core-owned structure snapshot.
     ///
-    /// `stages` is the authored plan in order, `watermark` counts the portions
-    /// committed so far, `consumed` and `remaining` are the material plan's two
-    /// halves, and `reservation-ref` is the inventory reservation the structure is
-    /// bound to, when it has one. `pause-reason` is present only for a structure the
-    /// owner paused because the site it was planned against changed.
+    /// `stages` is the authored plan in order. `current-stage-index` is the
+    /// zero-based stage accepting work and `completed-work-units` is the work
+    /// already committed in that stage. A completed structure instead reports the
+    /// terminal index `stages.len()` and zero completed work, so recovery never
+    /// needs to infer completion from another field. `watermark` counts the
+    /// portions committed so far, `consumed` and `remaining` are the material
+    /// plan's two halves, and `reservation-ref` is the inventory reservation the
+    /// structure is bound to, when it has one. `pause-reason` is present only for
+    /// a structure the owner paused because the site it was planned against
+    /// changed.
     ///
     /// Bounds: the two ids are 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes,
     /// `site-id` 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes and the blueprint id
@@ -278,6 +283,10 @@ interface settlements {
         rotation: u16,
         reserved-footprint: block-position,
         stages: list<structure-stage-plan>,
+        /// Zero-based active stage, or `stages.len()` for a completed structure.
+        current-stage-index: u32,
+        /// Work already committed in the active stage; zero at the terminal index.
+        completed-work-units: u64,
         resource-plan-hash: string,
         reservation-ref: option<string>,
         watermark: u64,

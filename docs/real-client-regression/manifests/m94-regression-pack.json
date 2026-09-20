@@ -570,33 +570,6 @@
       ]
     },
     {
-      "id": "m94-09-settlement-chain",
-      "title": "Settlement site, survey, committed house, and persistent resident via the default plugin set",
-      "ledger_rows": [
-        "I1",
-        "PLUGIN-SETTLEMENT"
-      ],
-      "status": "manual-pending",
-      "no_debug_commands": false,
-      "bounded_time_minutes": 15,
-      "screenshots_required": true,
-      "steps": [
-        "Start Solaris with [plugins].directory pointing at the six default packages installed into the run directory (solaris-permissions, solaris-essentials, solaris-economy, solaris-towns, solaris-audit, solaris-settlements) under strict = true on a fresh seeded world, then connect one vanilla 26.1.2 client.",
-        "Found a settlement with /settlement create <name> small and read the deterministic /settlement site <name> candidates with their site id, variant, origin, size, and building count. Every candidate origin y must be a real terrain row; a y of 0 is a failure.",
-        "Adopt one candidate with /settlement adopt <name> <site_id>, teleport the client to that origin so the plot chunks are loaded, and run /settlement survey <name> plot until it reports chunks=loaded.",
-        "Project with /settlement project <name> solaris:house_small here at the client's own position, then give the authored house_small materials (planks 314, oak_log 16, glass 10, red_bed 10, torch 2, oak_door 2, crafting_table 1, chest 1) through /give and its 255-per-call cap. Pace every /give until its own feedback line arrives: the command ingress bucket drops bursts and an unpaced chain aborts here.",
-        "Run /settlement fund <name> <building>, then /settlement build <name> <building> once and quote every answer. The package continues the remaining stages itself and the driver waits for the final committed answer, so the build command must never be repeated by hand.",
-        "Assert observed state only: /settlement info reports houses>=1, a client block scan around the anchor contains the blueprint's oak_planks, oak_log, glass, red_bed, torch, oak_door, crafting_table, and chest, and /settlement populate <name> plus /settlement info and /settlement residents report the persistent resident.",
-        "Read the resident's observed position against the terrain surface at its column and record whether it stands on the ground, floats, or is buried inside it."
-      ],
-      "expected_observations": [
-        "Every command's player-visible chat outcome is recorded from the real client, never inferred from server logs or plugin internals.",
-        "The committed building is visible to the client as the blueprint's blocks in a bounded block scan around the player anchor.",
-        "The settlement gate reacts to the committed building (houses>=1) and the persistent-resident API returns one settled resident (pop>=1) with a home point of interest.",
-        "The run exercises only the server-side settlement v1 surface: the six default packages are server_only with no client bundle, and no Loader capability is required."
-      ]
-    },
-    {
       "id": "m94-colony-villager-live-qa",
       "title": "Colony villager growth, release, rebind, follow, and bounded invalid commands",
       "ledger_rows": [

@@ -66,6 +66,8 @@ fn structure_snapshot() -> ScriptStructureSnapshot {
         rotation: 180,
         reserved_footprint: [16, 8, 16],
         stages: vec![stage_plan(2)],
+        current_stage_index: 0,
+        completed_work_units: 4,
         resource_plan_hash: "a".repeat(64),
         reservation_ref: Some("reservation-1".to_owned()),
         watermark: 3,
@@ -203,6 +205,28 @@ fn advance_structure_rejects_zero_or_excessive_work_units() {
     ));
     assert!(matches!(
         advance(513).validate(),
+        Err(ScriptDtoError::InvalidBounds)
+    ));
+
+    let mut snapshot = structure_snapshot();
+    snapshot.current_stage_index = 1;
+    assert!(matches!(
+        snapshot.validate(),
+        Err(ScriptDtoError::InvalidBounds)
+    ));
+    snapshot.current_stage_index = 0;
+    snapshot.completed_work_units = 33;
+    assert!(matches!(
+        snapshot.validate(),
+        Err(ScriptDtoError::InvalidBounds)
+    ));
+    snapshot.current_stage_index = 1;
+    snapshot.completed_work_units = 0;
+    snapshot.state = ScriptStructureState::Committed;
+    assert!(snapshot.validate().is_ok());
+    snapshot.completed_work_units = 1;
+    assert!(matches!(
+        snapshot.validate(),
         Err(ScriptDtoError::InvalidBounds)
     ));
 

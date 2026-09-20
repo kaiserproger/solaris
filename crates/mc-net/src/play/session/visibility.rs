@@ -18,8 +18,8 @@ use super::outbound::{
     SessionRecipient, VisibilityDispatch, is_bow_skeleton_type_26_1_2,
 };
 use super::{
-    PlaySession, SessionEntityGuards, SessionId, SessionRegistryInner,
-    record_entity_dispatches_locked,
+    ENTITY_EVENT_DEATH, PlaySession, SessionEntityGuards, SessionId, SessionRegistry,
+    SessionRegistryInner, record_entity_dispatches_locked,
 };
 
 pub(super) fn ordered_session_recipient(id: SessionId, session: &PlaySession) -> SessionRecipient {
@@ -479,6 +479,77 @@ pub(super) fn remove_player_visibility_locked(
                 .then(|| ordered_session_recipient(observer_id, observer))
         })
         .collect()
+}
+
+/// Death visibility for one player: the vanilla death animation (entity
+/// event 3) to every current viewer, then the entity hidden from them by
+/// dropping it from their visible-player sets and despawning it. The tab
+/// list entry intentionally stays, so no `PlayerInfoRemove` is emitted.
+///
+/// Observers stop tracking the corpse here; the respawn path restores them
+/// through [`respawn_player_visibility_locked`].
+pub(super) fn player_death_visibility_locked(
+    inner: &mut SessionRegistryInner,
+    target: SessionId,
+) -> Vec<VisibilityDispatch> {
+    let Some(session) = inner.sessions.get(&target) else {
+        return Vec::new();
+    };
+    let entity_id = session.entity_id;
+    let snapshot = session_snapshot(target, session);
+    let mut dispatches = visibility_dispatches(
+        session_recipients(inner, visible_observers_locked(inner, target)),
+        || OutboundCommand::EntityEvent {
+            entity_id,
+            event_id: ENTITY_EVENT_DEATH,
+        },
+    );
+    let recipients = remove_player_visibility_locked(inner, target);
+    dispatches.extend(visibility_dispatches(recipients, || {
+        OutboundCommand::DespawnPlayer(snapshot.clone())
+    }));
+    dispatches
+}
+
+/// Re-publish a respawned player to every viewer of its current chunk via
+/// the regular spawn publication. Observers without the chunk loaded stay
+/// hidden until their own chunk load re-evaluates visibility. The snapshot
+/// carries the registry pose, which the respawn teleport confirmation
+/// refreshes through the normal pose path.
+pub(super) fn respawn_player_visibility_locked(
+    inner: &mut SessionRegistryInner,
+    target: SessionId,
+) -> Vec<VisibilityDispatch> {
+    let Some(chunk) = inner
+        .sessions
+        .get(&target)
+        .map(|session| session.pose.chunk_pos())
+    else {
+        return Vec::new();
+    };
+    refresh_player_target_visibility_locked(inner, target, chunk, chunk)
+}
+
+impl SessionRegistry {
+    /// Hide a dead player from its viewers; see
+    /// [`player_death_visibility_locked`].
+    pub(in crate::play) fn player_death_visibility(
+        &self,
+        target: SessionId,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.lock_inner("player death visibility");
+        player_death_visibility_locked(&mut inner, target)
+    }
+
+    /// Re-publish a respawned player to its viewers; see
+    /// [`respawn_player_visibility_locked`].
+    pub(in crate::play) fn respawn_player_visibility(
+        &self,
+        target: SessionId,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.lock_inner("respawn player visibility");
+        respawn_player_visibility_locked(&mut inner, target)
+    }
 }
 
 pub(super) fn visibility_dispatches(

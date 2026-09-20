@@ -65,8 +65,13 @@ impl SessionRegistry {
                     if staged_spectator_wake.is_none() {
                         inner.spectator_sessions.insert(id);
                     }
+                    inner.creative_sessions.remove(&id);
+                } else if game_mode == GameMode::Creative {
+                    inner.spectator_sessions.remove(&id);
+                    inner.creative_sessions.insert(id);
                 } else {
                     inner.spectator_sessions.remove(&id);
+                    inner.creative_sessions.remove(&id);
                 }
             }
         }
@@ -79,6 +84,9 @@ impl SessionRegistry {
         .then(|| self.resolve_sleep_transition_locked(&mut inner))
         .flatten();
         drop(inner);
+        if matches!(event, PlayerStateEvent::GameMode(_)) {
+            self.reconcile_hostile_targets_after_live_session_change();
+        }
 
         let mut dispatches =
             self.completed_sleep_dispatches(staged_spectator_wake.into_iter().collect(), None);

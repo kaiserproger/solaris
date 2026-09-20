@@ -630,5 +630,8 @@ async fn repeated_shield_cas_conflict_refreshes_owner_state_and_fails_closed() {
         Some(&state.inventory.slots[shield_slot])
     );
     assert_eq!(survival_state, SurvivalState::FULL);
-    assert!(writer.is_empty());
+    assert!(
+        !writer.is_empty(),
+        "a fail-closed shield conflict must resync the authoritative inventory"
+    );
 }

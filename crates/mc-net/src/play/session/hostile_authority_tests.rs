@@ -1776,3 +1776,183 @@ fn skeleton_bow_draw_cycle_holds_full_pull_then_cools_down() {
     assert_eq!(transition.next, None);
     assert!(transition.shot.is_none());
 }
+
+#[test]
+fn switching_to_creative_drops_hostile_targeting_and_attacks() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "CreativeSwitch");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.register_player_persistence(
+        player,
+        Arc::new(std::sync::Mutex::new(PlayerPersistedState::new_default(
+            PlayerPose::new(0.5, 64.0, 0.5),
+        ))),
+    );
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    face_first_hostile_towards_player(&registry);
+    let due_tick = due_melee_tick(&registry);
+
+    // The survival player is targetable: the due melee turn connects.
+    let (attacks, dispatches) =
+        registry.tick_hostile_attacks(&SimulationAuthority::for_test(), due_tick, BlockStateId(0));
+    assert_eq!(attacks, 1);
+    assert!(!dispatches.is_empty());
+
+    // Switching to creative must republish the combat target as untargetable
+    // and reconcile the zombie's goal away from the player.
+    registry
+        .commit_player_state_event(
+            &SimulationAuthority::for_test(),
+            player,
+            crate::play::simulation::PlayerStateEvent::GameMode(mc_domain::GameMode::Creative),
+        )
+        .expect("creative switch commits");
+    {
+        let inner = registry.lock_inner("verify creative session classified");
+        assert!(inner.creative_sessions.contains(&player));
+    }
+    let untargetable = registry
+        .movement_recipients
+        .load_full()
+        .values()
+        .all(|publication| !publication.combat_target().is_targetable());
+    assert!(untargetable, "creative player must publish as untargetable");
+
+    for tick in due_tick + 1..=due_tick + 2 * HOSTILE_MELEE_PERIOD_TICKS {
+        let (attacks, dispatches) =
+            registry.tick_hostile_attacks(&SimulationAuthority::for_test(), tick, BlockStateId(0));
+        assert_eq!(
+            attacks, 0,
+            "creative players are never attacked at tick {tick}"
+        );
+        assert!(dispatches.is_empty());
+    }
+}
+
+#[test]
+fn committed_fall_landing_deals_vanilla_damage_and_hurt_event() {
+    let registry = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("FallWitness"),
+        name: "FallWitness".to_owned(),
+    };
+    let (outbound, mut receiver) = mpsc::channel(64);
+    let (_player, _) = registry.register(
+        &profile,
+        (0, 0),
+        2,
+        HashSet::new(),
+        outbound,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(_player, (0, 0)).is_empty());
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    dispatch_visibility_commands(spawn);
+    while receiver.try_recv().is_ok() {}
+    let zombie_id = registry
+        .persisted_entity_records()
+        .iter()
+        .find(|record| record.snapshot.type_name == "minecraft:zombie")
+        .expect("spawned zombie record")
+        .snapshot
+        .id;
+    let before = registry
+        .lock_entities("read pre-fall health")
+        .snapshot(zombie_id)
+        .expect("zombie snapshot")
+        .health;
+
+    super::entity_combat::resolve_entity_fall_damage(
+        &registry,
+        &[super::entity_owner::EntityFallLanding {
+            id: zombie_id,
+            fall_distance: 6.0,
+        }],
+    );
+
+    let after = registry
+        .lock_entities("read post-fall health")
+        .snapshot(zombie_id)
+        .expect("zombie snapshot")
+        .health;
+    assert!(
+        (before - after - 3.0).abs() < 1.0e-4,
+        "a 6-block fall deals 3 damage: {before} -> {after}"
+    );
+    let mut hurt_seen = false;
+    for _ in 0..8 {
+        match receiver.try_recv() {
+            Ok(OutboundCommand::EntityHurt { entity_id }) if entity_id == zombie_id.0 => {
+                hurt_seen = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(hurt_seen, "zombie hurt event must reach the observer");
+}
+
+#[test]
+fn shallow_fall_landing_deals_no_damage_or_feedback() {
+    let registry = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("ShallowFall"),
+        name: "ShallowFall".to_owned(),
+    };
+    let (outbound, mut receiver) = mpsc::channel(64);
+    let (_player, _) = registry.register(
+        &profile,
+        (0, 0),
+        2,
+        HashSet::new(),
+        outbound,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    dispatch_visibility_commands(spawn);
+    while receiver.try_recv().is_ok() {}
+    let zombie_id = registry
+        .persisted_entity_records()
+        .iter()
+        .find(|record| record.snapshot.type_name == "minecraft:zombie")
+        .expect("spawned zombie record")
+        .snapshot
+        .id;
+    let before = registry
+        .lock_entities("read pre-fall health")
+        .snapshot(zombie_id)
+        .expect("zombie snapshot")
+        .health;
+
+    super::entity_combat::resolve_entity_fall_damage(
+        &registry,
+        &[super::entity_owner::EntityFallLanding {
+            id: zombie_id,
+            fall_distance: 2.5,
+        }],
+    );
+
+    let after = registry
+        .lock_entities("read post-fall health")
+        .snapshot(zombie_id)
+        .expect("zombie snapshot")
+        .health;
+    assert_eq!(before, after, "falls under the safe height deal no damage");
+    assert!(receiver.try_recv().is_err(), "no hurt event for safe falls");
+}

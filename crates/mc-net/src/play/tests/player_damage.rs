@@ -310,11 +310,9 @@ fn older_victim_publication_preserves_newer_attacker_costs() {
         &mut survival,
         &mut xp,
         PlayerDamagePublication {
-            expected_health: mc_entity::player_survival_26_1_2::MAX_HEALTH,
             health: 16.0,
             inventory: vec![PlayerInventorySlotDelta {
                 slot: 5,
-                expected: ItemStack::new(42, 1),
                 updated: ItemStack::new(42, 1).with_damage(2),
             }],
             carried_item: None,
@@ -332,39 +330,4 @@ fn older_victim_publication_preserves_newer_attacker_costs() {
     assert_eq!(survival.exhaustion, 0.1);
     assert_eq!(state.inventory.held(0).unwrap().damage, Some(1));
     assert_eq!(state.inventory.slots[5].damage, Some(2));
-}
-
-#[test]
-fn stale_damage_publication_does_not_apply_health_side_effects() {
-    let mut survival = SurvivalState {
-        health: 18.0,
-        ..SurvivalState::FULL
-    };
-    let mut xp = XpState::default();
-    let knockback = melee_knockback(0.0, 2.0, true, Vec3::new(0.0, 64.0, 0.0))
-        .expect("distinct horizontal positions produce knockback");
-
-    let applied = apply_player_damage_publication(
-        None,
-        &mut survival,
-        &mut xp,
-        PlayerDamagePublication {
-            expected_health: mc_entity::player_survival_26_1_2::MAX_HEALTH,
-            health: 0.0,
-            inventory: Vec::new(),
-            carried_item: None,
-            xp: None,
-            died: true,
-            fresh_hurt: true,
-            shield_blocked: false,
-            shield_cooldown: None,
-            knockback: Some(knockback),
-        },
-    );
-
-    assert_eq!(survival.health, 18.0);
-    assert!(!applied.survival_changed);
-    assert!(!applied.died);
-    assert!(!applied.fresh_hurt);
-    assert_eq!(applied.knockback, None);
 }

@@ -21847,7 +21847,7 @@ mod tests {
                 .expect("start reciprocal courtship");
             next[index].goal = GoalState::FollowTarget {
                 target: expected[1 - index].id,
-                speed: 0.3,
+                speed: crate::villager_population_26_1_2::VILLAGER_COURTSHIP_SPEED,
             };
         }
         super::VillagerCourtshipCommit {

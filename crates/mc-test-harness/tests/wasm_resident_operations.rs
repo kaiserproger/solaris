@@ -66,7 +66,7 @@
 #[path = "../../mc-plugin-host/tests/fixture/mod.rs"]
 mod fixture;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -89,7 +89,7 @@ use mc_plugin_host::{
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ClientboundCommands, ClientboundKeepAlive, ClientboundSystemChat, ConfirmTeleportation,
-    ServerboundChatCommand, ServerboundKeepAlive, ServerboundPlayerLoaded,
+    LevelChunkWithLight, ServerboundChatCommand, ServerboundKeepAlive, ServerboundPlayerLoaded,
     SynchronizePlayerPosition,
 };
 use mc_script::{CommandCapabilities, ScriptPluginManifest};
@@ -104,7 +104,7 @@ const OBSERVER: &str = "resident-observer";
 /// The namespace the fixture's authored blueprints use. Core derives the catalog
 /// namespace from the files themselves, so a deployed catalog is always the one
 /// the author wrote, whichever package ships it.
-const CATALOG_NAMESPACE: &str = "solaris-settlements";
+const CATALOG_NAMESPACE: &str = OWNER;
 
 /// The login name of the fixture's one player. Offline mode derives the uuid from
 /// it, which is also the name of that player's durable file.
@@ -418,6 +418,9 @@ impl Running {
 struct Journal {
     chats: Vec<String>,
     next_reply: usize,
+    /// The chunks the client has actually received data for, keyed by their
+    /// coordinates: the publication a refused-unloaded spawn waits for.
+    chunks: HashSet<(i32, i32)>,
 }
 
 #[tokio::test]
@@ -470,6 +473,7 @@ async fn one_component_takes_a_real_resident_through_its_whole_used_surface() {
             walked.starts_with(&format!("{MARKER}goto committed at ")),
             "the teleport to the reserved cell is what loads it: {walked}"
         );
+        let site_chunk = goto_chunk(&walked);
         let mut retries = 0_usize;
         loop {
             let marker = action(&mut client, &mut running.log, &mut journal, "spawn").await;
@@ -497,6 +501,14 @@ async fn one_component_takes_a_real_resident_through_its_whole_used_surface() {
             );
             if marker.ends_with("unloaded") && retries < UNLOADED_RETRIES {
                 retries += 1;
+                await_chunk(
+                    &mut client,
+                    &mut running.log,
+                    &mut journal,
+                    site_chunk,
+                    "spawn",
+                )
+                .await;
                 continue;
             }
             break;
@@ -997,6 +1009,10 @@ async fn expect(
                     client.write_packet(&ConfirmTeleportation {
                         teleport_id: sync.teleport_id,
                     }).await.expect("confirm teleport");
+                } else if frame.id == LevelChunkWithLight::ID {
+                    let chunk = LevelChunkWithLight::decode(&mut frame.body)
+                        .expect("decode chunk");
+                    journal.chunks.insert((chunk.chunk_x, chunk.chunk_z));
                 } else if frame.id == ClientboundKeepAlive::ID {
                     let keepalive = ClientboundKeepAlive::decode(&mut frame.body)
                         .expect("decode keepalive");
@@ -1007,6 +1023,103 @@ async fn expect(
             }
         }
     }
+}
+
+/// Wait until the client holds the one chunk a refused spawn needs.
+///
+/// A spawn at a cell the teleport has not published yet is refused `unloaded`,
+/// and retrying without waiting races the chunk's own load: eight fast refusals
+/// spend the retries before a slow runner's loader converges, and every
+/// candidate cell loses the same race. The wait ends on the chunk's own data
+/// packet - the publication that lets the spawn succeed - never on a sleep.
+async fn await_chunk(
+    client: &mut Client,
+    log: &mut UnboundedReceiver<LogLine>,
+    journal: &mut Journal,
+    target: (i32, i32),
+    step: &str,
+) {
+    if journal.chunks.contains(&target) {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + ACTION_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "the {step} step never received chunk {target:?}; saw {:?}",
+                journal.chats
+            );
+        }
+        tokio::select! {
+            line = log.recv() => {
+                let Some(line) = line else {
+                    panic!(
+                        "the component host left before the {step} step received chunk {target:?}"
+                    );
+                };
+                assert!(
+                    !line.error,
+                    "{} reported a plugin error while the {step} step waited for chunk {target:?}: {}",
+                    line.plugin,
+                    line.message
+                );
+            }
+            frame = tokio::time::timeout(remaining, client.read_frame()) => {
+                let mut frame = match frame {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(error)) => panic!("the {step} step lost its connection: {error}"),
+                    Err(_) => panic!(
+                        "the {step} step never received chunk {target:?}; saw {:?}",
+                        journal.chats
+                    ),
+                };
+                if frame.id == ClientboundSystemChat::ID {
+                    record_chat(journal, &mut frame.body);
+                } else if frame.id == LevelChunkWithLight::ID {
+                    let chunk = LevelChunkWithLight::decode(&mut frame.body)
+                        .expect("decode chunk");
+                    let coords = (chunk.chunk_x, chunk.chunk_z);
+                    journal.chunks.insert(coords);
+                    if coords == target {
+                        return;
+                    }
+                } else if frame.id == SynchronizePlayerPosition::ID {
+                    let sync = SynchronizePlayerPosition::decode(&mut frame.body)
+                        .expect("decode teleport");
+                    client.write_packet(&ConfirmTeleportation {
+                        teleport_id: sync.teleport_id,
+                    }).await.expect("confirm teleport");
+                } else if frame.id == ClientboundKeepAlive::ID {
+                    let keepalive = ClientboundKeepAlive::decode(&mut frame.body)
+                        .expect("decode keepalive");
+                    client.write_packet(&ServerboundKeepAlive {
+                        id: keepalive.id,
+                    }).await.expect("answer keepalive");
+                }
+            }
+        }
+    }
+}
+
+/// The chunk coordinates of the cell one committed `goto` names.
+///
+/// The marker reports the teleport's position as `x/y/z`; the chunk a spawn at
+/// that cell needs is the one holding its floor.
+fn goto_chunk(line: &str) -> (i32, i32) {
+    let position = line.split(" at ").nth(1).expect("the goto position");
+    let mut coordinates = position.split('/');
+    let x = coordinates
+        .next()
+        .expect("the goto x")
+        .parse::<f64>()
+        .expect("the goto x");
+    let z = coordinates
+        .nth(1)
+        .expect("the goto z")
+        .parse::<f64>()
+        .expect("the goto z");
+    ((x.floor() as i32) >> 4, (z.floor() as i32) >> 4)
 }
 
 /// Record one system chat frame's literal text.

@@ -338,9 +338,7 @@ fn apply_player_resource_effect_locked(
     }
     (player.survival != before).then(|| VisibilityDispatch {
         recipient: ordered_session_recipient(session_id, session),
-        command: OutboundCommand::PlayerSurvivalChanged {
-            survival: player.survival,
-        },
+        command: OutboundCommand::PlayerSurvivalChanged,
     })
 }
 

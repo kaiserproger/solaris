@@ -1,6 +1,0 @@
-id = "solaris-towns"
-name = "Solaris Towns"
-version = "0.1.0"
-api = "0.7.0"
-capabilities = ["storage", "zones", "player_queries"]
-player_commands = ["town"]

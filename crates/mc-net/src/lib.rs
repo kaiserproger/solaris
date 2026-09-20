@@ -1,13 +1,15 @@
 //! # mc-net
 //!
-//! Connection management, session lifecycle.
+//! Connection management, session lifecycle, and the current networking-facing
+//! gameplay/simulation integration.
 //!
 //! Part of the Solaris engine.
 //!
-//! At M1.c this crate exposes a [`run`] entry point that listens on a TCP
-//! address, accepts vanilla 26.1 clients, completes the handshake, and —
-//! if the client asked for `Status` — answers a server-list ping. The
-//! Login → Configuration → Play path arrives in M1.d / M1.e / M1.g.
+//! [`run`] binds the listener and drives the vanilla connection path:
+//! handshake → status or login → configuration → play. `play` and its
+//! simulation integration remain in this crate today; the adapter-only
+//! destination described in `docs/ARCHITECTURE.md` is a target, not current
+//! implementation.
 
 /// Vanilla's minimum supported server view distance.
 pub const MIN_VIEW_DISTANCE: i32 = 2;
@@ -43,6 +45,8 @@ mod settlement_identity;
 #[cfg(test)]
 mod settlement_tests;
 mod status;
+#[cfg(test)]
+mod test_support;
 
 pub use autoscale_soak::{
     AutoscalePrimitiveStatus, AutoscaleSoakProfile, AutoscaleSoakReport, AutoscaleSoakScenario,
@@ -52,7 +56,7 @@ pub use chunk_pipeline::{
     ChunkLoadSource, ChunkPipelineCancellationSnapshot, ChunkPipelineGeneration,
     ChunkPipelineIdleHandle, ChunkPipelinePolicy, ChunkPipelineResourceMetrics,
     ChunkPipelineResourceSnapshot, ChunkPipelineStopReason, ChunkPipelineStopReasonCounts,
-    ChunkPriority, ChunkRequest, ChunkScheduler, PreparedChunk, automatic_worker_limits,
+    ChunkPriority, ChunkRequest, ChunkScheduler, PreparedChunk,
 };
 pub use control_plane::{
     AutoscaleAction, AutoscaleDecision, AutoscalePolicy, AutoscalePressure, AutoscaleProfile,

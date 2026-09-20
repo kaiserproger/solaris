@@ -43,10 +43,11 @@ fn build_component_bytes() -> Vec<u8> {
     component_bytes_from_workspace(&sdk, "solaris-hello-plugin", "solaris_hello_plugin.wasm")
 }
 
-/// Build one SDK-workspace guest and encode its real core module as a component.
+/// Build an SDK-workspace test guest and encode its real core module as a
+/// component.
 ///
-/// First-party component acceptance tests use this instead of hand-written wasm:
-/// the guest's source must compile against the same WIT contract as the host.
+/// Component integration tests use this instead of hand-written wasm: the test
+/// guest must compile against the same WIT contract as the host.
 #[must_use]
 pub fn component_bytes_from_workspace(
     workspace: &Path,

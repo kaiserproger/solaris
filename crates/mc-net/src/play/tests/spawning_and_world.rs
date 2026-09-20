@@ -2785,10 +2785,11 @@ async fn resident_scheduled_fluid_tick_stays_off_the_synchronous_journal_path() 
         simple_block(0, "minecraft:air"),
         BlockReport {
             id: mc_data::Identifier::parse("minecraft:water").unwrap(),
-            properties: prop_schema(&[("level", &["0", "1"])]),
+            properties: prop_schema(&[("level", &["0", "1", "8"])]),
             states: vec![
                 state(1, true, &[("level", "0")]),
                 state(2, false, &[("level", "1")]),
+                state(3, false, &[("level", "8")]),
             ],
         },
     ];
@@ -2879,7 +2880,7 @@ async fn resident_scheduled_fluid_tick_stays_off_the_synchronous_journal_path() 
     let chunk = snapshot.chunk(chunk_pos).unwrap();
     assert_eq!(
         chunk.get_block(4, target.y, 4),
-        Some(mc_world::BlockStateId(2))
+        Some(mc_world::BlockStateId(3))
     );
     assert!(
         chunk
@@ -2898,10 +2899,11 @@ async fn region_boundary_scheduled_fluid_tick_uses_exact_coordinator_fallback() 
         simple_block(0, "minecraft:air"),
         BlockReport {
             id: mc_data::Identifier::parse("minecraft:water").unwrap(),
-            properties: prop_schema(&[("level", &["0", "1"])]),
+            properties: prop_schema(&[("level", &["0", "1", "8"])]),
             states: vec![
                 state(1, true, &[("level", "0")]),
                 state(2, false, &[("level", "1")]),
+                state(3, false, &[("level", "8")]),
             ],
         },
     ];
@@ -2964,7 +2966,7 @@ async fn region_boundary_scheduled_fluid_tick_uses_exact_coordinator_fallback() 
     let mut storage = config.world.as_ref().unwrap().lock().await;
     assert_eq!(
         storage.get_cached_block(target),
-        Some(mc_world::BlockStateId(2))
+        Some(mc_world::BlockStateId(3))
     );
     assert!(
         storage
@@ -2982,10 +2984,11 @@ async fn stale_scheduled_fluid_plan_keeps_due_tick_without_edit() {
         simple_block(0, "minecraft:air"),
         BlockReport {
             id: mc_data::Identifier::parse("minecraft:water").unwrap(),
-            properties: prop_schema(&[("level", &["0", "1"])]),
+            properties: prop_schema(&[("level", &["0", "1", "8"])]),
             states: vec![
                 state(1, true, &[("level", "0")]),
                 state(2, false, &[("level", "1")]),
+                state(3, false, &[("level", "8")]),
             ],
         },
     ];
@@ -3054,7 +3057,7 @@ async fn stale_scheduled_fluid_plan_keeps_due_tick_without_edit() {
         plan.edits,
         vec![BlockEdit {
             pos: target,
-            new_state: mc_world::BlockStateId(2),
+            new_state: mc_world::BlockStateId(3),
         }]
     );
 

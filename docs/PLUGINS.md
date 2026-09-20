@@ -38,27 +38,9 @@ package roster, and a grant for every capability each package requests:
 [plugins]
 directory = "plugins"
 strict = true
-expected = [
-  "solaris-permissions",
-  "solaris-essentials",
-  "solaris-economy",
-  "solaris-towns",
-  "solaris-audit",
-]
+expected = ["my-plugin"]
 
-[plugins.grants.solaris-permissions]
-capabilities = ["storage"]
-
-[plugins.grants.solaris-essentials]
-capabilities = ["storage", "player_teleport", "player_queries"]
-
-[plugins.grants.solaris-economy]
-capabilities = ["storage"]
-
-[plugins.grants.solaris-towns]
-capabilities = ["storage", "zones", "player_queries"]
-
-[plugins.grants.solaris-audit]
+[plugins.grants.my-plugin]
 capabilities = ["storage"]
 ```
 
@@ -70,11 +52,10 @@ duplicate ids or command roots, and a deployed set that differs from
 `expected`. Use permissive discovery only for local iteration where skipping an
 ordinary broken package is intentional.
 
-The first-party standard packages above are Rust guest artifacts in
-`sdk/rust/packages/`. Their sources, manifests, and package-specific
-configuration are owned there. A deployment copies only each selected
-package's `plugin.toml`, `plugin.wasm`, and optional `config.toml` into its
-plugin root.
+Product packages are owned and built in their own repositories. A deployment
+copies each selected package's `plugin.toml`, `plugin.wasm`, and optional
+`config.toml` into its plugin root; the core and SDK do not carry product
+sources or manifests.
 
 Validate the exact deployment before serving:
 
@@ -89,7 +70,7 @@ plugin storage, bind a listener, apply commands, or start timers. A successful
 component check prints the checked package ids:
 
 ```text
-component plugins checked: solaris-audit, solaris-economy, solaris-essentials, solaris-permissions, solaris-towns
+component plugins checked: my-plugin
 ```
 
 Treat any check failure as a refused deployment, not a partial success. Inspect
@@ -130,28 +111,24 @@ for player installation.
 
 ## Build, encode, and deploy a Rust guest
 
-Rust guests belong in the out-of-tree `sdk/rust/` workspace. Build a guest as a
-`wasm32-unknown-unknown` module, then encode that module as a component before
-placing it in a package. For the Essentials package, for example:
+The SDK is an API dependency, not a home for product plugins. A guest's source,
+manifest, configuration, and deployed artifact belong to that plugin's own
+repository. Build its `wasm32-unknown-unknown` module, then encode that module
+as a component before placing it in its package:
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo build --manifest-path sdk/rust/Cargo.toml \
-  -p solaris-essentials-plugin --target wasm32-unknown-unknown --release
+cargo build --manifest-path path/to/plugin/Cargo.toml \
+  --target wasm32-unknown-unknown --release
 cargo run --manifest-path crates/mc-plugin-host/Cargo.toml \
   --example plugin-component -- \
-  sdk/rust/target/wasm32-unknown-unknown/release/solaris_essentials_plugin.wasm \
-  plugins/solaris-essentials/plugin.wasm
-cp sdk/rust/packages/solaris-essentials/plugin.toml plugins/solaris-essentials/
-cp sdk/rust/packages/solaris-essentials/config.toml plugins/solaris-essentials/
+  path/to/plugin.wasm plugins/my-plugin/plugin.wasm
 ```
 
 `plugin-component` validates while encoding; a module that lacks the component
-types cannot become a deployable artifact. For a separately authored package,
-use the same sequence with that package's workspace manifest, package name,
-artifact name, manifest, and optional configuration. Build artifacts are
-independently versioned and deployed; the core server source tree is not the
-guest build workspace.
+types cannot become a deployable artifact. The plugin repository owns
+`plugin.toml` and optional `config.toml`; the core repository neither ships nor
+compiles first-party product plugins.
 
 Authors implement `solaris_plugin_sdk::Plugin` (or bindings for the same WIT
 world) and use the WIT and SDK definitions as the API reference. Do not copy

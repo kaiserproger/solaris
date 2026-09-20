@@ -199,7 +199,10 @@ async fn dense_entity_movement_backlog_coalesces_without_disconnect() {
                 ..
             } if *position == Vec3::new(64.0, 64.0, index as f64)
         ));
-        assert_eq!(movement.velocity, Vec3::new(64.0, 0.0, 0.0));
+        // Ticks 3+ carry `send_velocity: false`, so they never supersede the
+        // last explicitly sent velocity (tick 2): coalescing must keep it
+        // instead of rewriting the queued impulse with the latest snapshot.
+        assert_eq!(movement.velocity, Vec3::new(2.0, 0.0, 0.0));
         assert_eq!(movement.rotation.yaw, 64.0);
         assert_eq!(movement.rotation.head_yaw, 64.0);
     }

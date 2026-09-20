@@ -73,7 +73,7 @@ fn safe_spawn_position(
             let Some(z) = spawn.block_z.checked_add(dz) else {
                 continue;
             };
-            let Some(y) = safe_spawn_y(config, &snapshot, x, z) else {
+            let Some(y) = safe_spawn_y(&config.blocks, &config.block_facts, &snapshot, x, z) else {
                 continue;
             };
             best = Some((distance_squared, x, y, z));
@@ -84,7 +84,8 @@ fn safe_spawn_position(
 }
 
 fn safe_spawn_y(
-    config: &ServerConfig,
+    blocks: &mc_world::BlockRegistry,
+    block_facts: &mc_data::block_facts::BlockFactsTable,
     snapshot: &mc_world::WorldReadSnapshot,
     x: i32,
     z: i32,
@@ -96,27 +97,77 @@ fn safe_spawn_y(
     let chunk = snapshot.chunk(chunk_pos)?;
     let local_x = x.rem_euclid(16) as u8;
     let local_z = z.rem_euclid(16) as u8;
+    safe_spawn_y_in_chunk(blocks, block_facts, &chunk, local_x, local_z)
+}
+
+fn safe_spawn_y_in_chunk(
+    blocks: &mc_world::BlockRegistry,
+    block_facts: &mc_data::block_facts::BlockFactsTable,
+    chunk: &Chunk,
+    local_x: u8,
+    local_z: u8,
+) -> Option<i32> {
     let top = chunk.highest_opaque_y(local_x, local_z)?;
     let spawn_y = top.checked_add(2)?;
 
     let support = chunk.get_block(local_x, top, local_z)?;
-    if !safe_spawn_support(config, support) {
+    if !safe_spawn_support(blocks, block_facts, support) {
         return None;
     }
     for y in [top.checked_add(1)?, spawn_y, spawn_y.checked_add(1)?] {
         let state = chunk.get_block(local_x, y, local_z)?;
-        if !clear_spawn_body_cell(config, state) {
+        if !clear_spawn_body_cell(blocks, block_facts, state) {
             return None;
         }
     }
     Some(spawn_y)
 }
 
-fn safe_spawn_support(config: &ServerConfig, state_id: mc_world::BlockStateId) -> bool {
-    if config.block_facts.fluid(state_id.0).is_some() {
+/// Re-validate one stored spawn column against the live world with the same
+/// support and body-cell rules the login path applies. `None` means the chunk
+/// is not resident or the column offers no valid surface, so the caller must
+/// fall back to another spawn.
+///
+/// A resident chunk whose opaque heightmap was never built is rebuilt from
+/// the light table first, mirroring the adaptive login fallback.
+pub(super) fn validated_respawn_y(
+    blocks: &mc_world::BlockRegistry,
+    block_facts: &mc_data::block_facts::BlockFactsTable,
+    block_light: Option<&mc_data::block_light::BlockLightTable>,
+    world_read: &mc_world::WorldReadView,
+    x: i32,
+    z: i32,
+) -> Option<i32> {
+    let chunk_pos = ChunkPos {
+        x: x.div_euclid(16),
+        z: z.div_euclid(16),
+    };
+    let snapshot = world_read.snapshot_chunks(&[chunk_pos]);
+    let chunk = snapshot.chunk(chunk_pos)?;
+    let local_x = x.rem_euclid(16) as u8;
+    let local_z = z.rem_euclid(16) as u8;
+    let mut rebuilt;
+    let chunk = if chunk.highest_opaque_y(local_x, local_z).is_none() {
+        rebuilt = chunk.as_ref().clone();
+        if let Some(table) = block_light {
+            rebuilt.rebuild_highest_opaque(table);
+        }
+        &rebuilt
+    } else {
+        chunk.as_ref()
+    };
+    safe_spawn_y_in_chunk(blocks, block_facts, chunk, local_x, local_z)
+}
+
+fn safe_spawn_support(
+    blocks: &mc_world::BlockRegistry,
+    block_facts: &mc_data::block_facts::BlockFactsTable,
+    state_id: mc_world::BlockStateId,
+) -> bool {
+    if block_facts.fluid(state_id.0).is_some() {
         return false;
     }
-    let Some(state) = config.blocks.by_id(state_id) else {
+    let Some(state) = blocks.by_id(state_id) else {
         return false;
     };
     let path = state.block.id.path();
@@ -126,11 +177,15 @@ fn safe_spawn_support(config: &ServerConfig, state_id: mc_world::BlockStateId) -
     !passable_block_name(state.block.id.as_str())
 }
 
-fn clear_spawn_body_cell(config: &ServerConfig, state_id: mc_world::BlockStateId) -> bool {
-    if config.block_facts.fluid(state_id.0).is_some() {
+fn clear_spawn_body_cell(
+    blocks: &mc_world::BlockRegistry,
+    block_facts: &mc_data::block_facts::BlockFactsTable,
+    state_id: mc_world::BlockStateId,
+) -> bool {
+    if block_facts.fluid(state_id.0).is_some() {
         return false;
     }
-    let Some(state) = config.blocks.by_id(state_id) else {
+    let Some(state) = blocks.by_id(state_id) else {
         return false;
     };
     if hazardous_spawn_block(state.block.id.path()) {

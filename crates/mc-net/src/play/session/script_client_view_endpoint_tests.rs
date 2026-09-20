@@ -11,6 +11,7 @@ fn hello_component_bytes() -> Vec<u8> {
             .canonicalize()
             .expect("repository root");
         let sdk = root.join("sdk/rust");
+        let _guest_build = crate::test_support::guest_build_lock();
         let status = Command::new(env!("CARGO"))
             .args([
                 "build",

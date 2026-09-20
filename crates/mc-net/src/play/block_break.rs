@@ -586,6 +586,35 @@ pub(super) fn plan_break_block_edits(
             });
         }
     }
+
+    if state.block.id.path().ends_with("_bed") {
+        let facing_step =
+            super::block_state_property(state, "facing").and_then(super::beds::horizontal_step);
+        // The head sits one step along the foot's facing, so the sibling of a
+        // head is one step back along it — vanilla `BedBlock.playerWillDestroy`
+        // removes the other half of the pair.
+        let other_offset = match (super::block_state_property(state, "part"), facing_step) {
+            (Some("foot"), Some((dx, dz))) => Some((dx, dz)),
+            (Some("head"), Some((dx, dz))) => Some((-dx, -dz)),
+            _ => None,
+        };
+        if let Some((dx, dz)) = other_offset {
+            let other_pos = mc_world::BlockPos {
+                x: pos.x + dx,
+                z: pos.z + dz,
+                ..pos
+            };
+            if let Some(other_state_id) = storage.get_cached_block(other_pos)
+                && let Some(other_state) = blocks.by_id(other_state_id)
+                && other_state.block.id == state.block.id
+            {
+                edits.push(BlockEdit {
+                    pos: other_pos,
+                    new_state: air,
+                });
+            }
+        }
+    }
     if let Some(edit) = super::block_placement::chest::reset_partner(
         blocks,
         |position| storage.get_cached_block(position),
