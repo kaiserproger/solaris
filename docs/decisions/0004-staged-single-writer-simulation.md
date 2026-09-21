@@ -43,18 +43,20 @@ the existing staged source fence and atomic publication boundary.
 Receipt-bearing server-owned block-edit batches cover settlement structure
 portions and resident harvesting, mining, cutting, and planting. They reuse
 `ApplyBlockEdits`' regional lane rather than a domain-specific command or saga:
-the submitter captures exact mutation-token preconditions, calculates canonical
-loot for breaks, and prepares the storage batch (including material consumption
-or resident cargo and progress) before submitting the finite block portion with
-its encoded receipt. The regional worker checks those *supplied*
-preconditions, rechecks the captured zone fence and consumes the current
-`before-build` approval when applicable. It conditionally applies/stamps the
-blocks, appends the chunk after-images and encoded receipt as one world-journal
-decision, then publishes. Only the acknowledged decision permits storage
-projection and `mark_inventory_projected`; reopening projects that same receipt
-before new settlement or resident work. Ordinary server-owned edits without a
-receipt retain the canonical staged path, including campfire eviction and
-reactivity.
+the submitter captures exact mutation-token preconditions and resolves the
+bounded `before-build` question before enqueuing the finite block portion. It
+prepares the storage batch (including material consumption or resident cargo and
+progress) and encodes its receipt before submission; that preparation has no
+durable effect until the regional decision is acknowledged. A cancellation is
+delivered with the submitted approval and the regional worker refuses it before
+block mutation or world-journal reservation. The worker checks the supplied
+preconditions and rechecks the captured zone fence before it conditionally
+applies/stamps the blocks, appends the chunk after-images and encoded receipt as
+one world-journal decision, then publishes. Only the acknowledged decision
+permits storage projection and `mark_inventory_projected`; reopening projects
+that same receipt before new settlement or resident work. Ordinary server-owned
+edits without a receipt retain the canonical staged path, including campfire
+eviction and reactivity.
 
 Structure footprint change detection is content-scoped, not journal-scoped: a stage
 fence compares a digest of the block states strictly inside the reserved footprint and

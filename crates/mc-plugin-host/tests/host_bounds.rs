@@ -25,6 +25,8 @@
 //! What this file proves is the bound itself: it decides admission, at byte
 //! magnitude, over the whole answer rather than per string.
 
+use std::convert::Infallible;
+
 use mc_plugin_host::bindings::exports::solaris::plugin::events::{
     Event, EventContext, PlayerJoined,
 };
@@ -35,6 +37,8 @@ use mc_plugin_host::{
     CommandBatch, CompiledPlugin, HostError, HostServices, LogLevel, PluginInstance, PluginLimits,
     PluginStartup, engine, linker,
 };
+use wasm_encoder::reencode::{Error as ReencodeError, Reencode};
+use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 mod fixture;
 
@@ -76,11 +80,14 @@ fn limits(hostcall_bytes: usize, guest_memory_bytes: usize) -> PluginLimits {
 /// startup phase in a store of its own that is dropped here, then `init` in the
 /// store this answers with. The probe in `mode = "configure-isolation"` is what a
 /// test uses to tell the two apart from the guest side.
-fn guest(limits: PluginLimits, config: &str) -> PluginInstance<Services> {
-    let bytes = fixture::component_bytes();
+fn guest_with_component(
+    bytes: &[u8],
+    limits: PluginLimits,
+    config: &str,
+) -> PluginInstance<Services> {
     let engine = engine(&limits).expect("engine");
     let compiled =
-        CompiledPlugin::compile(&engine, &bytes, &limits, "0.7.0").expect("the fixture compiles");
+        CompiledPlugin::compile(&engine, bytes, &limits, "0.7.0").expect("the fixture compiles");
     let linker = linker::<Services>(&engine).expect("linker");
     let _ = PluginStartup::instantiate(
         &linker,
@@ -106,6 +113,10 @@ fn guest(limits: PluginLimits, config: &str) -> PluginInstance<Services> {
         .init(config, init_context())
         .expect("the fixture's init is harmless");
     plugin
+}
+
+fn guest(limits: PluginLimits, config: &str) -> PluginInstance<Services> {
+    guest_with_component(&fixture::component_bytes(), limits, config)
 }
 
 /// One arm of a startup case: the startup contribution is the answer under test.
@@ -180,6 +191,218 @@ fn assert_refused_by_the_transfer_budget(answer: Result<(), HostError>) {
     }
 }
 
+const ON_EVENTS: &str = "solaris:plugin/events@0.7.0#on-events";
+const COMMAND_STRIDE: i32 = 120;
+const SEND_MESSAGE_TEXT_OFFSET: i32 = 24;
+const SEND_MESSAGE_TEXT_LENGTH_OFFSET: i32 = 28;
+
+/// Retarget only the event export of the SDK-built guest after its canonical
+/// lowering has materialised the answer. The replacement keeps the first wide
+/// string's `(ptr, len)` pair, then makes every later `send-message` point at
+/// those same bytes. Its one-byte-shorter lengths make the rewrite observable
+/// after host lifting without changing the claimed total enough to evade the
+/// transfer budget.
+struct AliasWideOutput {
+    signature: u32,
+    original: u32,
+    replacement: u32,
+}
+
+impl Reencode for AliasWideOutput {
+    type Error = Infallible;
+
+    fn parse_function_section(
+        &mut self,
+        functions: &mut wasm_encoder::FunctionSection,
+        section: wasmparser::FunctionSectionReader<'_>,
+    ) -> Result<(), ReencodeError<Self::Error>> {
+        wasm_encoder::reencode::utils::parse_function_section(self, functions, section)?;
+        functions.function(self.signature);
+        Ok(())
+    }
+
+    fn parse_export_section(
+        &mut self,
+        exports: &mut wasm_encoder::ExportSection,
+        section: wasmparser::ExportSectionReader<'_>,
+    ) -> Result<(), ReencodeError<Self::Error>> {
+        for export in section {
+            let export = export?;
+            let index = if export.name == ON_EVENTS {
+                self.replacement
+            } else {
+                export.index
+            };
+            exports.export(export.name, self.export_kind(export.kind)?, index);
+        }
+        Ok(())
+    }
+
+    fn parse_code_section(
+        &mut self,
+        code: &mut wasm_encoder::CodeSection,
+        section: wasmparser::CodeSectionReader<'_>,
+    ) -> Result<(), ReencodeError<Self::Error>> {
+        for body in section {
+            code.raw(body?.as_bytes());
+        }
+
+        let memory = MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        };
+        let byte_memory = MemArg { align: 0, ..memory };
+        // Parameters 0..=4 are the real event export's canonical ABI. Locals
+        // hold its result area, list pointer/length, first text pair, and index.
+        let mut alias = Function::new([(6, ValType::I32)]);
+        for parameter in 0..=4 {
+            alias.instruction(&Instruction::LocalGet(parameter));
+        }
+        alias.instruction(&Instruction::Call(self.original));
+        alias.instruction(&Instruction::LocalSet(5));
+
+        // A nonzero result discriminant is the guest's plugin error, which
+        // carries no command list to rewrite.
+        alias.instruction(&Instruction::LocalGet(5));
+        alias.instruction(&Instruction::I32Load8U(byte_memory));
+        alias.instruction(&Instruction::I32Eqz);
+        alias.instruction(&Instruction::If(BlockType::Empty));
+        alias.instruction(&Instruction::LocalGet(5));
+        alias.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            ..memory
+        }));
+        alias.instruction(&Instruction::LocalSet(6));
+        alias.instruction(&Instruction::LocalGet(5));
+        alias.instruction(&Instruction::I32Load(MemArg {
+            offset: 8,
+            ..memory
+        }));
+        alias.instruction(&Instruction::LocalSet(7));
+        alias.instruction(&Instruction::LocalGet(7));
+        alias.instruction(&Instruction::I32Const(1));
+        alias.instruction(&Instruction::I32GtU);
+        alias.instruction(&Instruction::If(BlockType::Empty));
+        alias.instruction(&Instruction::LocalGet(6));
+        alias.instruction(&Instruction::I32Const(SEND_MESSAGE_TEXT_OFFSET));
+        alias.instruction(&Instruction::I32Add);
+        alias.instruction(&Instruction::I32Load(memory));
+        alias.instruction(&Instruction::LocalSet(8));
+        alias.instruction(&Instruction::LocalGet(6));
+        alias.instruction(&Instruction::I32Const(SEND_MESSAGE_TEXT_LENGTH_OFFSET));
+        alias.instruction(&Instruction::I32Add);
+        alias.instruction(&Instruction::I32Load(memory));
+        alias.instruction(&Instruction::LocalSet(9));
+        alias.instruction(&Instruction::LocalGet(8));
+        alias.instruction(&Instruction::I32Const(i32::from(b'x')));
+        alias.instruction(&Instruction::I32Store8(byte_memory));
+        alias.instruction(&Instruction::I32Const(1));
+        alias.instruction(&Instruction::LocalSet(10));
+        alias.instruction(&Instruction::Block(BlockType::Empty));
+        alias.instruction(&Instruction::Loop(BlockType::Empty));
+        alias.instruction(&Instruction::LocalGet(10));
+        alias.instruction(&Instruction::LocalGet(7));
+        alias.instruction(&Instruction::I32GeU);
+        alias.instruction(&Instruction::BrIf(1));
+        alias.instruction(&Instruction::LocalGet(6));
+        alias.instruction(&Instruction::LocalGet(10));
+        alias.instruction(&Instruction::I32Const(COMMAND_STRIDE));
+        alias.instruction(&Instruction::I32Mul);
+        alias.instruction(&Instruction::I32Add);
+        alias.instruction(&Instruction::I32Const(SEND_MESSAGE_TEXT_OFFSET));
+        alias.instruction(&Instruction::I32Add);
+        alias.instruction(&Instruction::LocalGet(8));
+        alias.instruction(&Instruction::I32Store(memory));
+        alias.instruction(&Instruction::LocalGet(6));
+        alias.instruction(&Instruction::LocalGet(10));
+        alias.instruction(&Instruction::I32Const(COMMAND_STRIDE));
+        alias.instruction(&Instruction::I32Mul);
+        alias.instruction(&Instruction::I32Add);
+        alias.instruction(&Instruction::I32Const(SEND_MESSAGE_TEXT_LENGTH_OFFSET));
+        alias.instruction(&Instruction::I32Add);
+        alias.instruction(&Instruction::LocalGet(9));
+        alias.instruction(&Instruction::LocalGet(10));
+        alias.instruction(&Instruction::I32Sub);
+        alias.instruction(&Instruction::I32Store(memory));
+        alias.instruction(&Instruction::LocalGet(10));
+        alias.instruction(&Instruction::I32Const(1));
+        alias.instruction(&Instruction::I32Add);
+        alias.instruction(&Instruction::LocalSet(10));
+        alias.instruction(&Instruction::Br(0));
+        alias.instruction(&Instruction::End);
+        alias.instruction(&Instruction::End);
+        alias.instruction(&Instruction::End);
+        alias.instruction(&Instruction::End);
+        alias.instruction(&Instruction::LocalGet(5));
+        alias.instruction(&Instruction::End);
+        code.function(&alias);
+        Ok(())
+    }
+}
+
+fn component_with_aliased_wide_output() -> Vec<u8> {
+    let _ = fixture::component_bytes();
+    let bytes = std::fs::read(
+        fixture::repo_root()
+            .join("sdk/rust/target/wasm32-unknown-unknown/release/solaris_hello_plugin.wasm"),
+    )
+    .expect("the SDK-built core module exists");
+    let mut imports = 0;
+    let mut functions = Vec::new();
+    let mut event_export = None;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        match payload.expect("the SDK-built core module parses") {
+            wasmparser::Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    if matches!(
+                        import.expect("core import").ty,
+                        wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
+                    ) {
+                        imports += 1;
+                    }
+                }
+            }
+            wasmparser::Payload::FunctionSection(section) => {
+                functions.extend(
+                    section
+                        .into_iter()
+                        .map(|function| function.expect("core function type")),
+                );
+            }
+            wasmparser::Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export.expect("core export");
+                    if export.name == ON_EVENTS {
+                        event_export = Some(export.index);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let original = event_export.expect("SDK guest exports on-events");
+    let mut rewrite = AliasWideOutput {
+        signature: functions[usize::try_from(original - imports).expect("defined event export")],
+        original,
+        replacement: imports + u32::try_from(functions.len()).expect("function count"),
+    };
+    let mut module = wasm_encoder::Module::new();
+    rewrite
+        .parse_core_module(&mut module, wasmparser::Parser::new(0), &bytes)
+        .expect("the SDK-built core module reencodes");
+    wit_component::ComponentEncoder::default()
+        .module(&module.finish())
+        .expect("the rewritten core module carries component metadata")
+        .validate(true)
+        .encode()
+        .expect("the rewritten core module encodes as a component")
+}
+
+fn run_aliased_join(limits: PluginLimits, config: &str) -> Result<CommandBatch, HostError> {
+    let component = component_with_aliased_wide_output();
+    guest_with_component(&component, limits, config).on_events(event_context(), &[join_event()])
+}
 #[test]
 fn one_answer_past_the_transfer_bound_is_never_copied() {
     const CLAIM: usize = 12 * 1024 * 1024;
@@ -357,4 +580,58 @@ fn a_trapped_callback_publishes_no_batch() {
         plugin.retired_because().is_some(),
         "the instance is retired, so no later call can produce that batch"
     );
+}
+
+#[test]
+fn repeated_output_pointers_cannot_reduce_the_transfer_charge() {
+    const EACH: usize = 2 * 1024 * 1024;
+    const COUNT: usize = 6;
+    let config = format!("mode = \"wide\"\nsize = {EACH}\ncount = {COUNT}\n");
+    const GUEST_MEMORY: usize = 64 * 1024 * 1024;
+
+    let bound = PluginLimits::default().hostcall_bytes;
+    assert!(
+        EACH < bound && EACH * COUNT > bound,
+        "the aliased answer must exceed the shipped transfer budget"
+    );
+    assert_refused_by_the_transfer_budget(
+        run_aliased_join(limits(bound, GUEST_MEMORY), &config).map(drop),
+    );
+
+    let admitted = run_aliased_join(
+        PluginLimits {
+            hostcall_bytes: EACH * COUNT * 2,
+            text_bytes: EACH,
+            commands_per_call: COUNT,
+            ..limits(bound, GUEST_MEMORY)
+        },
+        &config,
+    )
+    .expect("the same aliased answer is lifted when its declared bytes fit");
+    assert_eq!(
+        admitted.len(),
+        COUNT,
+        "all aliased commands reached the host"
+    );
+    for (index, command) in admitted.into_commands().into_iter().enumerate() {
+        let mc_plugin_host::bindings::solaris::plugin::commands::Command::SendMessage(message) =
+            command
+        else {
+            panic!("the aliased command must remain a send-message");
+        };
+        assert_eq!(
+            message.text.len(),
+            EACH - index,
+            "the alias made command {index} declare a distinct length"
+        );
+        assert_eq!(
+            message.text.as_bytes().first(),
+            Some(&b'x'),
+            "the component rewrote command {index} to the first string's pointer"
+        );
+        assert!(
+            message.text.bytes().skip(1).all(|byte| byte == b'y'),
+            "the alias preserves the first string's remaining bytes"
+        );
+    }
 }

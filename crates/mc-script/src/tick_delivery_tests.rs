@@ -24,6 +24,24 @@ fn latest_server_tick_is_coalesced_behind_a_full_event_queue() {
 }
 
 #[test]
+fn event_queue_depth_tracks_admission_and_drain() {
+    let (boundary, mut endpoint) = script_boundary_pair(nonzero(2), nonzero(1));
+    assert_eq!(boundary.event_queue_depth(), 0);
+
+    boundary
+        .try_enqueue_event(ScriptEvent::server_started())
+        .expect("first event enters");
+    assert_eq!(boundary.event_queue_depth(), 1);
+    boundary
+        .try_enqueue_event(ScriptEvent::server_stopping("test"))
+        .expect("second event enters");
+    assert_eq!(boundary.event_queue_depth(), 2);
+
+    assert!(endpoint.recv_event_blocking().is_some());
+    assert_eq!(boundary.event_queue_depth(), 1);
+}
+
+#[test]
 fn newly_sendable_tick_merges_an_older_coalesced_tick_without_reordering() {
     let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
     let buffered = ScriptEvent::server_started();

@@ -120,6 +120,111 @@ class ReceiptContractTests(unittest.TestCase):
             "test.log",
         )
 
+    def test_standard_pack_profile_checks_explicit_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = profiles.ProfileContext(Path(tmp))
+            plugins_root = Path(tmp) / "plugins"
+            for package_id, _ in profiles.STANDARD_PACK:
+                package = plugins_root / package_id
+                package.mkdir(parents=True)
+                for name in ("plugin.toml", "plugin.wasm", "config.toml"):
+                    (package / name).write_text(name)
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"SOLARIS_DEFAULT_PLUGINS_ROOT": str(plugins_root)},
+                ),
+                mock.patch.object(
+                    profiles, "_backend_env", return_value={"validation": "run"}
+                ),
+                mock.patch.object(
+                    profiles, "_build_mc_server", return_value={"server": "built"}
+                ),
+                mock.patch.object(profiles, "_run_command", return_value={}) as run,
+            ):
+                profiles.run_standard_pack(ctx)
+            source_call = mock.call(
+                [
+                    sys.executable,
+                    str(plugins_root / "tools" / "build_standard_pack.py"),
+                    "--check",
+                    "--core-root",
+                    str(profiles.REPO_ROOT),
+                ],
+                ctx,
+                "standard-pack-source.log",
+                cwd=plugins_root,
+                env={"validation": "run"},
+            )
+            behavior_call = mock.call(
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "mc-test-harness",
+                    "--test",
+                    "plugin_standard_pack",
+                    "--",
+                    "--ignored",
+                ],
+                ctx,
+                "standard-pack-behavior.log",
+                env={"validation": "run"},
+            )
+            live_workload_call = mock.call(
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "mc-test-harness",
+                    "--test",
+                    "load_scenarios",
+                    "p7_first_party_components_run_on_live_server_tick_workload",
+                    "--",
+                    "--ignored",
+                    "--nocapture",
+                ],
+                ctx,
+                "standard-pack-live-workload.log",
+                env={"validation": "run"},
+            )
+            config = ctx.artifact_dir / "standard-pack.toml"
+            startup_call = mock.call(
+                [
+                    str(profiles.REPO_ROOT / "target" / "debug" / "mc-server"),
+                    "--check",
+                    "--config",
+                    str(config),
+                ],
+                ctx,
+                "standard-pack-startup.log",
+            )
+            self.assertEqual(
+                run.call_args_list,
+                [source_call, behavior_call, live_workload_call, startup_call],
+            )
+            self.assertEqual(
+                (
+                    ctx.artifact_dir
+                    / "standard-pack"
+                    / "plugins"
+                    / "solaris-audit"
+                    / "plugin.wasm"
+                ).read_text(),
+                "plugin.wasm",
+            )
+            rendered = config.read_text()
+            self.assertIn(
+                'expected = ["solaris-permissions", "solaris-essentials", '
+                '"solaris-economy", "solaris-towns", "solaris-audit"]',
+                rendered,
+            )
+            self.assertIn(
+                '[plugins.grants.solaris-towns]\n'
+                'capabilities = ["storage", "zones", "player_queries"]',
+                rendered,
+            )
+
 class ReadinessCleanupTests(unittest.TestCase):
     def test_wait_port_observes_real_server_startup(self) -> None:
         port = runtime.reserve_port()

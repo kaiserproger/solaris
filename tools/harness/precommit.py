@@ -197,7 +197,6 @@ operators = ["{PLAYER}"]
 allow_local_dev_operators = false
 [plugins]
 directory = "{(run_dir / 'plugins').relative_to(runtime.REPO_ROOT).as_posix()}"
-runtime = "wasm"
 strict = true
 expected = ["hook-a", "hook-b"]
 {registrations}

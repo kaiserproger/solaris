@@ -4666,6 +4666,7 @@ struct ScriptEventAdmission {
     closed: AtomicBool,
     sender: StdMutex<Option<mpsc::Sender<ScriptHostInput>>>,
     weak_sender: mpsc::WeakSender<ScriptHostInput>,
+    event_capacity: usize,
     coalesced_server_tick: Arc<StdMutex<CoalescedServerTick>>,
 }
 
@@ -4907,6 +4908,22 @@ impl ScriptBoundary {
             plugin_id: plugin_id.to_owned(),
             generation: registration.generation,
         })))
+    }
+
+    /// Number of event inputs currently waiting at the host boundary.
+    ///
+    /// This is diagnostic state only: producers still use the same nonblocking
+    /// admission and full queues continue to refuse new work.
+    #[must_use]
+    pub fn event_queue_depth(&self) -> usize {
+        self.event_admission
+            .sender()
+            .map(|sender| {
+                self.event_admission
+                    .event_capacity
+                    .saturating_sub(sender.capacity())
+            })
+            .unwrap_or(0)
     }
 
     /// Return a sorted snapshot of currently active plugin command roots.
@@ -5792,6 +5809,7 @@ pub fn script_boundary_pair(
                 closed: AtomicBool::new(false),
                 sender: StdMutex::new(Some(event_tx)),
                 weak_sender: weak_event_tx,
+                event_capacity,
                 coalesced_server_tick: Arc::clone(&coalesced_server_tick),
             }),
             command_rx: Arc::new(Mutex::new(command_rx)),

@@ -21,12 +21,12 @@
 //! can schedule, fire and cancel, and the loop drives those here, under the same
 //! discipline every other callback takes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mc_script::precommit::{
     DamageContext, DamageTarget, HookActor, HookDecision, HookFailure, HookFailurePolicy, Request,
@@ -87,13 +87,74 @@ impl Default for HostQueues {
 /// next tick, whatever it is doing.
 pub const EPOCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
+const CALLBACK_LATENCY_SAMPLE_CAPACITY: usize = 1_200;
+
+/// Percentiles from the bounded most-recent callback sample window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallbackLatencyPercentiles {
+    pub samples: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+}
+
+#[derive(Debug)]
+struct CallbackLatencyWindow {
+    samples: VecDeque<u64>,
+}
+
+impl Default for CallbackLatencyWindow {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(CALLBACK_LATENCY_SAMPLE_CAPACITY),
+        }
+    }
+}
+
+impl CallbackLatencyWindow {
+    fn record(&mut self, elapsed: Duration) {
+        if self.samples.len() == CALLBACK_LATENCY_SAMPLE_CAPACITY {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(
+            elapsed
+                .as_micros()
+                .min(u128::from(u64::MAX))
+                .try_into()
+                .expect("bounded microseconds fit u64"),
+        );
+    }
+
+    fn snapshot(&self) -> CallbackLatencyPercentiles {
+        let mut samples = self.samples.iter().copied().collect::<Vec<_>>();
+        samples.sort_unstable();
+        let Some(&max_us) = samples.last() else {
+            return CallbackLatencyPercentiles::default();
+        };
+        let percentile = |percent: usize| {
+            let rank = (percent * samples.len()).div_ceil(100);
+            samples[rank.saturating_sub(1)]
+        };
+        CallbackLatencyPercentiles {
+            samples: samples.len() as u64,
+            p50_us: percentile(50),
+            p95_us: percentile(95),
+            p99_us: percentile(99),
+            max_us,
+        }
+    }
+}
+
 /// Operator diagnostics of one hosted instance.
 #[derive(Debug, Default)]
 pub struct InstanceDiagnostics {
+    /// Every guest `on-events` callback attempted by the runtime store.
     pub calls: u64,
     pub events_delivered: u64,
     pub commands_submitted: u64,
     pub commands_refused: u64,
+    pub callback_latency: CallbackLatencyPercentiles,
 }
 
 /// Services a hosted guest gets: `tracing` under the plugin's own target, and the
@@ -129,6 +190,7 @@ struct Hosted<S: HostServices + 'static> {
     admission: HostCommandAdmission,
     instance: PluginInstance<S>,
     diagnostics: InstanceDiagnostics,
+    callback_latency: CallbackLatencyWindow,
     limits: PluginLimits,
     /// The timers this package owns, and the simulation tick it last observed.
     ///
@@ -142,6 +204,13 @@ struct Hosted<S: HostServices + 'static> {
     /// Set once a callback failed: the instance keeps its place for the final
     /// report, but it is never called again and it holds no routes.
     retired: bool,
+}
+
+impl<S: HostServices + 'static> Hosted<S> {
+    fn record_callback(&mut self, started: Instant) {
+        self.diagnostics.calls += 1;
+        self.callback_latency.record(started.elapsed());
+    }
 }
 
 /// Why a host could not start.
@@ -587,6 +656,7 @@ where
             admission,
             instance,
             diagnostics,
+            callback_latency: CallbackLatencyWindow::default(),
             limits,
             timers,
             observed_tick: 0,
@@ -760,15 +830,7 @@ where
                     deliver(hosted, &mut endpoint, sessions.as_ref(), context, &events);
                 }
             }
-            for hosted in &mut hosted {
-                if let Err(error) = hosted.instance.shutdown() {
-                    tracing::warn!(plugin = %hosted.id, %error, "shutdown failed");
-                }
-            }
-            hosted
-                .into_iter()
-                .map(|hosted| (hosted.id, hosted.diagnostics))
-                .collect()
+            shutdown_hosts(hosted)
         })
         .map_err(|error| HostStartError::Engine(error.to_string()))?;
 
@@ -914,6 +976,7 @@ where
             admission,
             instance,
             diagnostics: InstanceDiagnostics::default(),
+            callback_latency: CallbackLatencyWindow::default(),
             limits,
             timers,
             observed_tick: active.current_tick,
@@ -945,6 +1008,7 @@ fn shutdown_hosts<S: HostServices + 'static>(
         if let Err(error) = candidate.instance.shutdown() {
             tracing::warn!(plugin = %candidate.id, %error, "shutdown failed");
         }
+        candidate.diagnostics.callback_latency = candidate.callback_latency.snapshot();
     }
     hosted
         .into_iter()
@@ -985,7 +1049,10 @@ fn deliver<S: HostServices + 'static>(
     context: EventContext,
     events: &[Event],
 ) {
-    let batch = match hosted.instance.on_events(context, events) {
+    let started = Instant::now();
+    let result = hosted.instance.on_events(context, events);
+    hosted.record_callback(started);
+    let batch = match result {
         Ok(batch) => batch,
         Err(error) => {
             // The guest answered with a `plugin-error`: that is a first-class
@@ -1058,10 +1125,12 @@ fn notify_batch_rejected<S: HostServices + 'static>(
     endpoint: &mut ScriptHostEndpoint,
     context: EventContext,
 ) {
-    let batch = match hosted
+    let started = Instant::now();
+    let result = hosted
         .instance
-        .on_events(context, &[Event::CommandBatchRejected])
-    {
+        .on_events(context, &[Event::CommandBatchRejected]);
+    hosted.record_callback(started);
+    let batch = match result {
         Ok(batch) => batch,
         Err(error) => {
             if hosted.instance.retired_because().is_some() {
@@ -1144,7 +1213,10 @@ fn deliver_timers<S: HostServices + 'static>(
             first_sequence: 0,
             count: 1,
         };
-        let answer = match hosted.instance.on_events_within_delivery(context, &events) {
+        let started = Instant::now();
+        let result = hosted.instance.on_events_within_delivery(context, &events);
+        hosted.record_callback(started);
+        let answer = match result {
             Ok(answer) => answer,
             Err(error) => {
                 // A `plugin-error` is a first-class answer, not misbehaviour: the
@@ -1919,5 +1991,24 @@ mod tests {
         assert_eq!(invoked.name, "perm");
         assert_eq!(invoked.arguments, ["set", "admin"]);
         assert_eq!(invoked.raw_arguments, "set admin");
+    }
+
+    #[test]
+    fn callback_latency_window_reports_bounded_nearest_rank_percentiles() {
+        let mut window = CallbackLatencyWindow::default();
+        for micros in 0..=CALLBACK_LATENCY_SAMPLE_CAPACITY {
+            window.record(Duration::from_micros(micros as u64));
+        }
+
+        assert_eq!(
+            window.snapshot(),
+            CallbackLatencyPercentiles {
+                samples: CALLBACK_LATENCY_SAMPLE_CAPACITY as u64,
+                p50_us: 600,
+                p95_us: 1_140,
+                p99_us: 1_188,
+                max_us: 1_200,
+            }
+        );
     }
 }

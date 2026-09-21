@@ -55,8 +55,9 @@ pub use discovery::{
     DeploymentConfig, DiscoveredDeployment, DiscoveryError, DiscoveryMode, discover,
 };
 pub use host::{
-    HostQueues, HostStartError, InstanceDiagnostics, PluginHost, PluginReloadContractField,
-    PluginReloadError, PluginReloadReport, start_deployment, start_deployment_with,
+    CallbackLatencyPercentiles, HostQueues, HostStartError, InstanceDiagnostics, PluginHost,
+    PluginReloadContractField, PluginReloadError, PluginReloadReport, start_deployment,
+    start_deployment_with,
 };
 pub use instance::{PluginInstance, PluginStartup};
 pub use limits::{PluginLimits, TRUNCATION_MARKER};

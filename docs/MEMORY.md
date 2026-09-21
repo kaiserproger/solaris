@@ -166,20 +166,193 @@ strict admission—not campaign readiness. CP-014 remains blocked.
   pending.
 - CP-087 remains a conditional handoff; CP-088, CP-089, CP-090, CP-091,
   CP-092, CP-093, CP-094, CP-095, CP-096 remain pending.
-**P0 component-host revalidation (2026-09-20).** The real SDK-built component
+**P0 component-host revalidation (2026-09-21).** The real SDK-built component
 passes the host safety matrix: raw core-module/ABI refusal before guest code,
 pre-compilation artifact cap, fuel/epoch/memory/stack limits, bounded
-guest-to-host lifting for oversized, cumulative and nested outputs, unpublished
-trap and canonical cleanup behavior, and independent-instance isolation. The
-refreshed baseline drives a strict one-package deployment through its real
-bounded queues and records Linux x86_64 hardware/workload/RSS/latency/tick/
-queue/counter data at
-`.analysis/codex-logs/p0-revalidation-20260920/receipt.txt`: 13 focused tests
-passed. Rust 1.94 resolves Wasmtime 36.0.15 and WIT tooling 0.259. The same host
-cross-compiled for `aarch64-unknown-linux-gnu` against an isolated Ubuntu
-sysroot; the new native Arm CI job will execute the test matrix and retain its
-baseline output after a committed revision. That native execution has not been
-claimed from this workstation.
+guest-to-host lifting for oversized, cumulative, nested and now directly
+aliased outputs, unpublished trap and canonical cleanup behavior, and
+independent-instance isolation. The hostile alias fixture retargets a real
+SDK-built component result after canonical lowering; five result records reuse
+the first string pointer, have distinct declared lengths, and lift the modified
+shared first byte. The strict one-package deployment baseline records Linux
+x86_64 hardware/workload/RSS/latency/tick/queue/counter data. Receipt:
+`.analysis/codex-logs/p0-revalidation-20260921/receipt.txt`; 14 focused tests,
+formatter and code-health passed. Rust 1.94 resolves Wasmtime 36.0.15 and WIT
+tooling 0.259. Native Linux AArch64 execution has not run from this workstation:
+it lacks both `aarch64-linux-gnu-gcc` and a compatible sysroot. The configured
+native Arm CI job is not claimed as execution evidence.
+The current target check confirms the recorded blocker rather than merely assuming
+it: `CARGO_BUILD_JOBS=2 cargo check --target aarch64-unknown-linux-gnu -p
+mc-plugin-host` exits 101 in Wasmtime's build script, before Rust checking,
+because `cc-rs` must compile `src/runtime/vm/helpers.c` and
+`aarch64-linux-gnu-gcc` is absent. The installed Rust target alone is
+insufficient; this is not a linker-only gap. Receipt:
+`.analysis/codex-logs/p0-aarch64-target-check-20260921/receipt.txt`.
+
+**P0 Arm CI handoff prepared (2026-09-21).** The owner authorized publishing
+the exact current branch, including base `b454200b`; this prevents a default
+checkout of stale `origin/main` from being misattributed to P0. The
+`wasm-host-arm` job now runs only the bounded P0 matrix:
+`host_bounds`, `cleanup_isolation`, `component_roundtrip`, `contract_refusal`,
+and `host_baseline`. The exact command passed locally with 16 tests across five
+suites in 54.07 seconds; independent review found the Cargo selectors, wasm32
+guest prerequisite, and P0 coverage valid. The former full package CI command
+timed out after 480.09 seconds while starting `timer_operations`; its
+non-attributable preflight remains in the receipt below. Native Arm execution
+is still pending the published-commit CI run. Receipt:
+`.analysis/codex-logs/p0-aarch64-target-check-20260921/receipt.txt`.
+
+**P5 precommit revalidation (2026-09-21).** Six real-component host hook cases,
+15 bounded ticket/roster/deadline cases, and 27 native build/damage precommit
+cases passed. The cross-region receipt test now reflects the actual
+preparation/submission boundary: a cancelled `before-build` approval reaches the
+regional worker but is refused before block mutation or world-journal
+reservation; its prepared storage is never projected. ADR 0004 records that
+boundary. Formatter and code-health passed again at
+`.analysis/validation/20260921T015413-{fmt-du9288he,code-health-wjjcq4_u}/`.
+Receipt: `.analysis/codex-logs/p5-precommit-revalidation-20260921/receipt.txt`.
+
+**P6 reload/shutdown revalidation (2026-09-21).** The prior L2 workspace-test
+blocker was an unrelated `set -u` defect in real-client prepare: the optional
+`SCENARIO_SERVER_PORT` override was never initialized. Its
+`${SCENARIO_SERVER_PORT:-}` initialization preserves an explicitly exported
+port and otherwise leaves the source `network.port` intact. All 49
+manifest-preparation tests passed after the correction; the failed workspace
+test stage had already passed on rerun. The prior formatter, strict workspace
+Clippy and code-health stages remain green. Receipt:
+`.analysis/codex-logs/p6-revalidation-20260921/receipt.txt`.
+
+**P7 package-source recovery and Basic Economy Wasm port (2026-09-21).** The
+five API 0.7 standard-pack sources were recovered from core revision
+`7f68cc2a`; boundary revision `b454200b` removed those paths from core so the
+sibling owns first-party content. The explicit sibling build script regenerates
+and byte-verifies the strict five-package deployment plus the `basic-economy`
+client fixture; the strict five still stage as the only expected production
+pack. The standard-pack profile passed its source check, ignored component
+behavior target, strict startup, and five-package configuration:
+`.analysis/validation/20260921T121331-standard-pack-7q_6e3_v/result.json`.
+
+Following the owner's port decision, `../solaris-default-plugins/basic-economy`
+is now an API 0.7 component with `entry = "plugin.wasm"` and independently
+reproducible Rust source at `sources/basic-economy/`. It preserves the
+`basic-economy` ID, `shop:economy:<uuid>` v2 ledger, configured zone/menu
+entry, one-dirt/two-apple primary purchase, secondary refund, and the
+inventory-storage/CAS authority path. Independent review found that an early
+departure could retain pending state and that a rejected multi-command callback
+could roll back only its final correlation. The component now cleans each exact
+departed session (including pending reads, transactions, menus, notices, and
+rejection state) and rolls back every correlation in a rejected output batch.
+Four component unit tests, including both regressions, and the final
+six-component `tools/build_standard_pack.py --write` plus `--check` passed; the
+deployed Basic Economy component SHA-256 is
+`45a3e70fa5c1a1fad9d3d9105a3e30c6da142d2b43e0711bb723e2d128e45d3d`.
+
+The final real-client core profile passed:
+`.analysis/validation/20260921T133734-core-client-a7okwwgp/result.json`.
+Its server-only flow mined and picked up natural dirt, purchased two apples
+with the ledger at one, then refunded to one dirt, zero apples, and ledger
+ownership zero. The final inventory profile passed:
+`.analysis/validation/20260921T134225-inventory-omn1dveo/result.json`; it
+preserved the purchase result into the existing cursor/held-item/crafting
+probe. The inventory-only branch intentionally leaves the bought apples
+available to that pre-existing probe; refund remains asserted by `core-client`.
+`harness-check` passed at
+`.analysis/validation/20260921T122939-harness-check-ud9nbnj3/result.json`.
+The latest root `fmt` and `code-health` passes are
+`.analysis/validation/20260921T134726-fmt-ueordzad/result.json` and
+`.analysis/validation/20260921T134736-code-health-rtmmc29e/result.json`.
+
+The historical API 0.6 and `main.lua` component-rejection failures remain
+recorded in the P7 receipt; they are not passing evidence. The host now reports
+bounded per-component callback counts and p50/p95/p99/max latency at generation
+stop. The strict five-component behavior test asserts that its actual
+normal/event-storm economy run produces ordered metrics, and the final
+core-client record observed Basic Economy at 13 callbacks with p50 185 us and
+p95/p99/max 276 us:
+`.analysis/validation/20260921T133734-core-client-a7okwwgp/server-only/server.log`.
+The final inventory record observed eight callbacks with p50 172 us and
+p95/p99/max 245 us:
+`.analysis/validation/20260921T134225-inventory-omn1dveo/server-only/server.log`.
+
+The canonical strict-pack profile binds the five actual components to a real
+`mc-net` server under the debug profile, seed 0, zero connected clients, and a
+fixed 100-tick post-normal phase. Independent review found and corrected two
+gate defects: the telemetry snapshot now must reach `source_tick >= target`,
+and a continuously fed queue is sampled rather than asserted instantly empty.
+The corrected
+`.analysis/validation/20260921T180218-standard-pack-djhdo778/result.json`
+recorded tick p50/p95/p99/max 746/1045/1482/1619 us, Economy callback
+p50/p95/p99/max 171/263/284/344 us over 165 callbacks, storm queue peak 62,
+sampled pre-shutdown depth zero, 67/5 user/system CPU ticks, VmHWM
+181204→211744 KiB, and zero host refusals. The strict-pack Xvfb gate passed:
+`.analysis/validation/20260921T141704-standard-pack-qvsi6yy9/result.json`;
+all five components reached Play and `/money` returned `Balance: 100 coins.`
+
+P7 is accepted. The zero, normal, flood, infinite, slow-storage, event-storm,
+and reload scenarios execute in strict component tests; the canonical live
+workload adds actual-server tick/latency/queue/CPU/RSS evidence. The owner
+explicitly waived the plan's unrecoverable historical Luau comparison after
+confirming that the retained P0 baseline is current Wasm-only and recovering
+the old runner would cross the 453-file `d4d65062`→`v0.0.7` transition. Receipt:
+`.analysis/codex-logs/p7-first-party-source-audit-20260921/receipt.txt`.
+
+```yaml
+base_tree: b454200b8249ec307b831838b6b2ddf295db0a4d
+diff_hash: 8a27f57ff0fcdbd281049397cecef57cc752558fb6683968a6255fa09fbfd005
+diff_hash_recipe: >
+  SHA-256 of `git diff --binary b454200b8249ec307b831838b6b2ddf295db0a4d`,
+  snapshot immediately before this record update.
+changed_files:
+  - crates/mc-net/src/play/ingress/player_control.rs
+  - crates/mc-net/src/play/simulation/tests/precommit_tests.rs
+  - crates/mc-plugin-host/src/limits.rs
+  - crates/mc-plugin-host/src/host.rs
+  - crates/mc-plugin-host/src/lib.rs
+  - crates/mc-plugin-host/tests/host_bounds.rs
+  - crates/mc-script/src/lib.rs
+  - crates/mc-script/src/tick_delivery_tests.rs
+  - crates/mc-server/src/startup/components.rs
+  - crates/mc-test-harness/tests/load_scenarios.rs
+  - docs/AGENT_TOOLING.md
+  - docs/MEMORY.md
+  - docs/decisions/0004-staged-single-writer-simulation.md
+  - tools/harness/backends/regression.sh
+  - tools/harness/compatibility.py
+  - tools/harness/precommit.py
+  - tools/harness/profiles.py
+  - tools/harness/test_harness.py
+sibling_checkpoint:
+  base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+  tracked_diff_hash: f313f6fc2295873e598eddb00d27daaabae58d8a8dd541ee701f8d2676efd754
+  basic_economy_component_sha256: 45a3e70fa5c1a1fad9d3d9105a3e30c6da142d2b43e0711bb723e2d128e45d3d
+validation:
+  - cargo test --manifest-path ../solaris-default-plugins/sources/basic-economy/Cargo.toml: passed (4 tests)
+  - ../solaris-default-plugins/tools/build_standard_pack.py --write/--check: passed
+  - cargo test -p mc-plugin-host callback_latency_window_reports_bounded_nearest_rank_percentiles: passed
+  - cargo test -p mc-plugin-host: failed (480-second timeout; do not treat as package-wide pass)
+  - .analysis/validation/20260921T133208-standard-pack-e1l_zsad/result.json: passed
+  - .analysis/validation/20260921T133734-core-client-a7okwwgp/result.json: passed
+  - .analysis/validation/20260921T134225-inventory-omn1dveo/result.json: passed
+  - .analysis/validation/20260921T134726-fmt-ueordzad/result.json: passed
+  - .analysis/validation/20260921T134736-code-health-rtmmc29e/result.json: passed
+  - .analysis/validation/20260921T180218-standard-pack-djhdo778/result.json: passed
+  - .analysis/validation/20260921T141704-standard-pack-qvsi6yy9/result.json: passed (strict pack Xvfb `/money`)
+  - .analysis/validation/20260921T142707-harness-check-kky8e73o/result.json: passed
+  - .analysis/validation/20260921T180822-fmt-fv2tg8hu/result.json: passed
+  - .analysis/validation/20260921T180822-code-health-2uehntbf/result.json: passed
+status: P7 accepted under the owner's explicit waiver of the unrecoverable legacy-Luau comparison; strict source, behavior, live-server workload, and real-client evidence passed.
+next: P8 remains blocked only by P0's unavailable native Linux AArch64 execution receipt.
+```
+
+**P8 production-cutover audit (2026-09-21).** The core production source and
+lockfile have no Luau runtime, legacy entrypoint or Lua dependency reference,
+and the standalone `mc-server` build passed without a sibling checkout or guest
+compiler. The explicit standard-pack profile proves the sibling only participates
+in its integration gate. P7 is accepted; P8 remains unaccepted only because P0
+still lacks native Linux AArch64 execution evidence. CP-001 onward is no longer
+source-blocked, but P8 cannot be treated as a verified prerequisite.
+Receipt: `.analysis/codex-logs/p8-cutover-audit-20260921/receipt.txt`.
+
 
 **Blocker.** The canonical profile list has no settlement scenario, and
 `docs/real-client-regression/manifests/` declares none. The client MCP credential

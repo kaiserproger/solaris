@@ -231,6 +231,11 @@ pub(crate) fn report_component_stop(counters: Vec<(String, mc_plugin_host::Insta
             events_delivered = diagnostics.events_delivered,
             commands_submitted = diagnostics.commands_submitted,
             commands_refused = diagnostics.commands_refused,
+            callback_samples = diagnostics.callback_latency.samples,
+            callback_p50_us = diagnostics.callback_latency.p50_us,
+            callback_p95_us = diagnostics.callback_latency.p95_us,
+            callback_p99_us = diagnostics.callback_latency.p99_us,
+            callback_max_us = diagnostics.callback_latency.max_us,
             "component plugin stopped"
         );
     }

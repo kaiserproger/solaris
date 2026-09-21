@@ -27,7 +27,7 @@ The repository validation entrypoint is `python3 -m tools.harness`, run from the
 repository root. Profiles reuse the existing Cargo, Gradle and scenario engines;
 they do not lower the acceptance bar or turn preparation into gameplay evidence.
 Never invoke `tools/harness/backends/` directly: those engines are private, and
-only a profile run leaves a canonical receipt. There are 23 profiles; `list`
+only a profile run leaves a canonical receipt. There are 24 profiles; `list`
 is authoritative if this table drifts:
 
 ```sh
@@ -137,6 +137,7 @@ own result either way.
 | `correctness` | Rust L2: formatter, strict workspace Clippy, code-health, workspace/all-target tests. `python3 -m tools.harness run correctness` |
 | `fmt`, `clippy`, `code-health`, `test` | The individual Rust gates; CI uses the same profiles. `test` accepts trailing Cargo test selectors after `--`, for example `python3 -m tools.harness run test -- -p mc-net --lib player_attack`; its no-argument form remains the full workspace/all-target gate. |
 | `harness-check` | Fail-closed receipt/process lifecycle regressions plus private shell-engine syntax (`bash -n` over every backend). `python3 -m tools.harness run harness-check` |
+| `standard-pack` | Explicit first-party sibling integration: rebuilds and byte-verifies six source components—the strict five-package deployment plus the `basic-economy` client fixture—runs the ignored behavior target and a fixed-seed, 100-tick live-server workload against the strict five (runtime tick and component callback percentiles, queue depth, CPU/RSS, host refusals), stages only that expected set with its declared grants, then verifies real `mc-server --check` startup. Requires `../solaris-default-plugins`, local vanilla sidecars, and the guest build target; `SOLARIS_DEFAULT_PLUGINS_ROOT` overrides that sibling for every component stage. Add `--real-client` to launch the strict pack under Xvfb and assert a real `/money` response. `python3 -m tools.harness run standard-pack` |
 | `build` | Debug server build (`cargo build --bin mc-server`); `--release` explicitly selects the locked release workspace build (`cargo build --locked --release --workspace`). `python3 -m tools.harness run build --release` |
 | `java` | Gradle bridge/agent/Loader module tests (`:bridge-core`, `:java-agent`, `:loader-core`, `:loader-fabric`, `:loader-neoforge`, `:loader-forge`). Requires a Minecraft client jar via `SOLARIS_CLIENT_JAR` or the Loader's documented local path. CI downloads the version declared in Loader `gradle.properties` and verifies Mojang's SHA-1 before testing. `python3 -m tools.harness run java` |
 | `fixture-check` | Reproducible Loader fixture verification (`tools/build-loader-live-gate-fixture.sh --check`); requires `ffmpeg` with `libvorbis`, plus ZIP and coreutils commands. CI installs the audio encoder explicitly. |

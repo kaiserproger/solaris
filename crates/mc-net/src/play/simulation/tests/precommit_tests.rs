@@ -495,6 +495,7 @@ async fn cancelled_journaled_structure_portion_keeps_blocks_and_receipt_uncommit
     .await;
     cancel_next_build(&mut endpoint);
     assert_request_enqueued(request.as_mut(), &handle).await;
+    assert!(owner.wait_for_command().await);
     assert_eq!(
         owner
             .process_commands_with_world_views(
@@ -511,7 +512,7 @@ async fn cancelled_journaled_structure_portion_keeps_blocks_and_receipt_uncommit
             )
             .await
             .processed,
-        1
+        0
     );
 
     assert!(matches!(
@@ -524,8 +525,10 @@ async fn cancelled_journaled_structure_portion_keeps_blocks_and_receipt_uncommit
     );
     let journal = registry.world_chunk_journal().unwrap();
     let pending = journal.pending_decisions_for_test();
-    assert_eq!(pending.len(), 1, "the refusal closes its reserved id");
-    assert_eq!(pending[0].inventory_batch().unwrap(), None);
+    assert!(
+        pending.is_empty(),
+        "a precommit cancellation creates no receipt-bearing journal decision"
+    );
     assert!(
         journal.decode_pending(&pending).unwrap().is_empty(),
         "a refused portion records neither after-image nor receipt"

@@ -8,10 +8,15 @@
 //! cargo test -p mc-test-harness --test load_scenarios -- --ignored --nocapture
 //! ```
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mc_plugin_host::{
+    DeploymentConfig, DiscoveryMode, HostQueues, PlayerSessions, PluginHost, PluginLimits,
+    discover, start_deployment,
+};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetContent,
@@ -25,6 +30,7 @@ use mc_protocol::packets::play::{
     ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
     pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
+use mc_script::{PlayerCommandAdmission, ScriptBoundary, ScriptPlayerContext, ScriptPlayerId};
 use mc_test_harness::client::Client;
 use mc_test_harness::replay::{
     ReplayConcurrentAction, ReplayConcurrentFixture, ReplayConcurrentGroup, ReplayScenarioManifest,
@@ -1062,12 +1068,24 @@ enum TransactionReplayPersistenceProbe {
 }
 
 async fn shutdown_load_server(server: LoadServer, context: &str) {
+    let _ = shutdown_load_server_with_plugin_diagnostics(server, context).await;
+}
+
+async fn shutdown_load_server_with_plugin_diagnostics(
+    mut server: LoadServer,
+    context: &str,
+) -> Vec<(String, mc_plugin_host::InstanceDiagnostics)> {
     server.shutdown.request();
     let serve_result = tokio::time::timeout(Duration::from_secs(5), server.serve_task)
         .await
         .unwrap_or_else(|_| panic!("{context} server shutdown timed out"))
         .unwrap_or_else(|error| panic!("{context} server task failed: {error}"));
     serve_result.unwrap_or_else(|error| panic!("{context} server failed: {error}"));
+    server
+        .component_host
+        .take()
+        .map(PluginHost::stop)
+        .unwrap_or_default()
 }
 
 async fn apply_transaction_restart_observations(
@@ -4356,6 +4374,272 @@ fn entity_scale_tick_profile_json(value: mc_net::RuntimeTickPercentiles) -> serd
     })
 }
 
+const P7_STANDARD_PACK: [(&str, &[&str]); 5] = [
+    ("solaris-permissions", &["storage"]),
+    (
+        "solaris-essentials",
+        &["storage", "player_teleport", "player_queries"],
+    ),
+    ("solaris-economy", &["storage"]),
+    ("solaris-towns", &["storage", "zones", "player_queries"]),
+    ("solaris-audit", &["storage"]),
+];
+const P7_PLAYER: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const P7_SESSION: u64 = 7;
+
+struct P7Sessions;
+
+impl PlayerSessions for P7Sessions {
+    fn session_of(&self, player: &str) -> Option<u64> {
+        (player == P7_PLAYER).then_some(P7_SESSION)
+    }
+}
+
+fn p7_plugins_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("SOLARIS_DEFAULT_PLUGINS_ROOT") {
+        return PathBuf::from(root);
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("test crate lives under the core repository crates directory")
+        .parent()
+        .expect("core repository has the first-party sibling")
+        .join("solaris-default-plugins")
+}
+
+fn p7_staged_standard_pack() -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("stage standard-pack components");
+    for (id, _) in P7_STANDARD_PACK {
+        let source = p7_plugins_root().join(id);
+        let target = root.path().join(id);
+        std::fs::create_dir(&target).expect("create staged package directory");
+        for name in ["plugin.toml", "plugin.wasm", "config.toml"] {
+            std::fs::copy(source.join(name), target.join(name))
+                .unwrap_or_else(|error| panic!("stage {id}/{name}: {error}"));
+        }
+    }
+    root
+}
+
+fn p7_standard_pack_packages(
+    root: &Path,
+    limits: &PluginLimits,
+) -> Vec<mc_plugin_host::LoadedPackage> {
+    let deployment = DeploymentConfig {
+        root: root.to_path_buf(),
+        mode: DiscoveryMode::Strict,
+        expected: P7_STANDARD_PACK
+            .into_iter()
+            .map(|(id, _)| id.to_owned())
+            .collect(),
+        grants: P7_STANDARD_PACK
+            .into_iter()
+            .map(|(id, capabilities)| {
+                (
+                    id.to_owned(),
+                    capabilities
+                        .iter()
+                        .map(|capability| (*capability).to_owned())
+                        .collect(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
+        require_grants: true,
+        precommit_hooks: Vec::new(),
+    };
+    discover(&deployment, limits)
+        .expect("discover strict first-party component pack")
+        .into_packages()
+}
+
+fn p7_player_context() -> ScriptPlayerContext {
+    ScriptPlayerContext::try_new(P7_PLAYER, "P7Metric", false, 32.0, 64.0, -16.0)
+        .expect("bounded first-party workload player context")
+}
+
+fn p7_enqueue_money(boundary: &ScriptBoundary) {
+    assert_eq!(
+        boundary.try_enqueue_player_command_with_context(
+            ScriptPlayerId::new(P7_SESSION),
+            p7_player_context(),
+            "money",
+        ),
+        Ok(PlayerCommandAdmission::Enqueued),
+        "the actual component command is admitted to the live server boundary"
+    );
+}
+
+fn p7_peak_rss_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("Linux reports process RSS");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .expect("Linux process status includes VmHWM")
+}
+
+fn p7_process_cpu_ticks() -> (u64, u64) {
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("Linux reports process CPU time");
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .expect("Linux process stat includes process name terminator");
+    let values = fields.split_whitespace().collect::<Vec<_>>();
+    (
+        values[11].parse().expect("Linux process user CPU ticks"),
+        values[12].parse().expect("Linux process system CPU ticks"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local data/vanilla and the explicit first-party sibling integration gate"]
+async fn p7_first_party_components_run_on_live_server_tick_workload() {
+    const NORMAL_CALLS: usize = 100;
+    const STORM_CALLS: usize = 64;
+    const MEASURE_TICKS: u64 = 100;
+
+    let staged = p7_staged_standard_pack();
+    let limits = PluginLimits::default();
+    let host = start_deployment(
+        p7_standard_pack_packages(staged.path(), &limits),
+        limits,
+        HostQueues::default(),
+        Arc::new(P7Sessions),
+    )
+    .expect("strict first-party component host starts");
+    let boundary = host.boundary().clone();
+    let server =
+        start_load_server_with_component_host(LoadServerOptions::default(), Some(host)).await;
+    let mut ticks = server.runtime_telemetry.subscribe_simulation_ticks();
+    let peak_before_kib = p7_peak_rss_kib();
+    let (cpu_user_before, cpu_system_before) = p7_process_cpu_ticks();
+    let normal_started = Instant::now();
+    for _ in 0..NORMAL_CALLS {
+        let submitted_at_tick = *ticks.borrow_and_update();
+        p7_enqueue_money(&boundary);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the tick-separated normal command did not observe the next live server tick"
+            );
+            tokio::time::timeout(remaining, ticks.changed())
+                .await
+                .expect("normal command tick wait timed out")
+                .expect("normal command tick sender remains active");
+            if *ticks.borrow_and_update() > submitted_at_tick {
+                break;
+            }
+        }
+    }
+    let normal_elapsed = normal_started.elapsed();
+    let start_tick = *ticks.borrow_and_update();
+    let mut storm_peak_depth = boundary.event_queue_depth();
+    for _ in 0..STORM_CALLS {
+        p7_enqueue_money(&boundary);
+        storm_peak_depth = storm_peak_depth.max(boundary.event_queue_depth());
+    }
+
+    let target_tick = start_tick.saturating_add(MEASURE_TICKS);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let tick_profile = loop {
+        if let Some(profile) = server.runtime_telemetry.snapshot().tick_percentiles
+            && profile.source_tick >= target_tick
+            && *ticks.borrow_and_update() >= target_tick
+        {
+            break profile;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "live first-party workload did not publish tick telemetry by tick {target_tick}"
+        );
+        tokio::time::timeout(remaining, ticks.changed())
+            .await
+            .expect("live first-party workload tick wait timed out")
+            .expect("live first-party workload tick sender remains active");
+    };
+    let peak_after_kib = p7_peak_rss_kib();
+    let (cpu_user_after, cpu_system_after) = p7_process_cpu_ticks();
+    let queue_depth_at_sample = boundary.event_queue_depth();
+    let diagnostics =
+        shutdown_load_server_with_plugin_diagnostics(server, "P7 first-party live workload").await;
+    let economy = diagnostics
+        .iter()
+        .find(|(id, _)| id == "solaris-economy")
+        .map(|(_, diagnostics)| diagnostics)
+        .expect("the strict component workload hosts solaris-economy");
+
+    assert!(
+        tick_profile.tick.samples > 0,
+        "the live server published runtime tick samples"
+    );
+    assert!(
+        tick_profile.tick.p50_us <= tick_profile.tick.p95_us
+            && tick_profile.tick.p95_us <= tick_profile.tick.p99_us
+            && tick_profile.tick.p99_us <= tick_profile.tick.max_us,
+        "runtime tick percentiles remain ordered: {:?}",
+        tick_profile.tick
+    );
+    assert!(
+        economy.events_delivered >= (NORMAL_CALLS + STORM_CALLS) as u64,
+        "every normal and storm command reaches the live economy component: {economy:?}"
+    );
+    assert_eq!(
+        economy.commands_refused, 0,
+        "the comparable live normal/storm workload is not refused by the host"
+    );
+    assert!(
+        economy.callback_latency.samples > 0
+            && economy.callback_latency.p50_us <= economy.callback_latency.p95_us
+            && economy.callback_latency.p95_us <= economy.callback_latency.p99_us
+            && economy.callback_latency.p99_us <= economy.callback_latency.max_us,
+        "live component callback percentiles remain ordered: {:?}",
+        economy.callback_latency
+    );
+
+    eprintln!("--- P7 first-party live server workload ---");
+    eprintln!(
+        "environment: {} {} | logical CPUs {} | build: cargo test debug | seed: 0 | clients: 0 synthetic script command source | duration: {MEASURE_TICKS} simulation ticks",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(0),
+    );
+    eprintln!(
+        "workload: strict five-package pack; {NORMAL_CALLS} tick-separated /money commands in {:.3} ms, then {STORM_CALLS} queued /money commands",
+        normal_elapsed.as_secs_f64() * 1e3,
+    );
+    eprintln!(
+        "runtime ticks: samples {} | p50 {} us | p95 {} us | p99 {} us | max {} us | source tick {}",
+        tick_profile.tick.samples,
+        tick_profile.tick.p50_us,
+        tick_profile.tick.p95_us,
+        tick_profile.tick.p99_us,
+        tick_profile.tick.max_us,
+        tick_profile.source_tick,
+    );
+    eprintln!(
+        "economy callback latency: samples {} | p50 {} us | p95 {} us | p99 {} us | max {} us",
+        economy.callback_latency.samples,
+        economy.callback_latency.p50_us,
+        economy.callback_latency.p95_us,
+        economy.callback_latency.p99_us,
+        economy.callback_latency.max_us,
+    );
+    eprintln!(
+        "event queue depth: storm peak {storm_peak_depth} | sampled before graceful shutdown {queue_depth_at_sample} | CPU delta user {} ticks system {} ticks | peak RSS {} KiB -> {} KiB | host refusals {}",
+        cpu_user_after.saturating_sub(cpu_user_before),
+        cpu_system_after.saturating_sub(cpu_system_before),
+        peak_before_kib,
+        peak_after_kib,
+        economy.commands_refused,
+    );
+}
+
 struct LoadServer {
     addr: std::net::SocketAddr,
     blocks: Arc<mc_world::BlockRegistry>,
@@ -4377,6 +4661,7 @@ struct LoadServer {
     chunk_io_threads: usize,
     chunk_worker_threads: usize,
     world_dir: Option<tempfile::TempDir>,
+    component_host: Option<PluginHost>,
 }
 
 impl LoadServer {
@@ -4420,6 +4705,13 @@ async fn start_load_server() -> LoadServer {
 }
 
 async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServer {
+    start_load_server_with_component_host(options, None).await
+}
+
+async fn start_load_server_with_component_host(
+    options: LoadServerOptions,
+    component_host: Option<PluginHost>,
+) -> LoadServer {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -4566,7 +4858,12 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let shutdown = cfg.shutdown.clone();
-    let bound = mc_net::bind(cfg).await.expect("bind");
+    let bound = match component_host.as_ref() {
+        Some(host) => mc_net::bind_with_scripts(cfg, host.boundary().clone())
+            .await
+            .expect("bind scripted load server"),
+        None => mc_net::bind(cfg).await.expect("bind"),
+    };
     let addr = bound.local_addr().expect("local addr");
     let chunk_pipeline_metrics = bound.chunk_pipeline_metrics();
     let outbound_pressure = bound.outbound_pressure_handle();
@@ -4603,6 +4900,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
         chunk_worker_threads: options.chunk_worker_threads,
         world_dir,
+        component_host,
     }
 }
 

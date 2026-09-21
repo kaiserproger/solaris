@@ -63,6 +63,9 @@ where
             let pick = ServerboundSetCarriedItem::decode(&mut body)?;
             if (0..=8).contains(&pick.slot) {
                 let slot = pick.slot as u8;
+                let selection_changed = interaction
+                    .as_deref()
+                    .is_some_and(|state| state.selected_hotbar_slot() != slot);
                 simulation
                     .commit_selected_hotbar_slot(slot)
                     .await
@@ -72,7 +75,7 @@ where
                             operation: "committing hotbar selection",
                         }
                     })?;
-                if let Some(state) = interaction.as_deref_mut() {
+                if selection_changed && let Some(state) = interaction.as_deref_mut() {
                     state.pending_break = None;
                     state.pending_use = None;
                     clear_shield_use(state);

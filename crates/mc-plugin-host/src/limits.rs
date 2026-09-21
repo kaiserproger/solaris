@@ -95,10 +95,12 @@ impl Default for PluginLimits {
             // against the ported packages (P7) may lower it; nothing may raise it
             // back toward the default.
             hostcall_bytes: 8 * 1024 * 1024,
-            // Four default packages can coexist with their replacements:
-            // 2 generations × 4 packages × 4 memories × 64 MiB = 2 GiB.
-            // P7 replaces this provisional static bound with measured packages.
-            reload_candidate_memory_bytes: 2 * 1024 * 1024 * 1024,
+            // A strict standard-pack reload was refused at the previous 2 GiB
+            // limit because its declared maximum was 2 × 5 × 4 × 64 MiB = 2.5
+            // GiB. This admission capacity is reserved, not allocated; a sixth
+            // package still fails closed. It remains provisional until P7
+            // measures the real package workloads and calibrates the budget.
+            reload_candidate_memory_bytes: 2 * 5 * 4 * 64 * 1024 * 1024,
             guest_memory_bytes: 64 * 1024 * 1024,
             table_elements: 100_000,
             instances: 4,
