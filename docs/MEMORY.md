@@ -189,17 +189,17 @@ because `cc-rs` must compile `src/runtime/vm/helpers.c` and
 insufficient; this is not a linker-only gap. Receipt:
 `.analysis/codex-logs/p0-aarch64-target-check-20260921/receipt.txt`.
 
-**P0 Arm CI handoff prepared (2026-09-21).** The owner authorized publishing
-the exact current branch, including base `b454200b`; this prevents a default
-checkout of stale `origin/main` from being misattributed to P0. The
-`wasm-host-arm` job now runs only the bounded P0 matrix:
-`host_bounds`, `cleanup_isolation`, `component_roundtrip`, `contract_refusal`,
-and `host_baseline`. The exact command passed locally with 16 tests across five
-suites in 54.07 seconds; independent review found the Cargo selectors, wasm32
-guest prerequisite, and P0 coverage valid. The former full package CI command
-timed out after 480.09 seconds while starting `timer_operations`; its
-non-attributable preflight remains in the receipt below. Native Arm execution
-is still pending the published-commit CI run. Receipt:
+**P0 Arm CI handoff retry (2026-09-21).** Owner-authorized run
+[`35667411935`](https://github.com/kaiserproger/solaris/actions/runs/35667411935)
+executed the bounded 16-test command on native `ubuntu-24.04-arm` at
+`b0f381e`. It failed only when the guest fixture built: despite the
+toolchain action's `targets` input, the active workspace override lacked
+`wasm32-unknown-unknown` and Rust reported `E0463` for `std`. The job now runs
+the same explicit `rustup target add wasm32-unknown-unknown` step proven by the
+ordinary CI test job; no production code or test assertion changed. The bounded
+command still passes locally in 54.07 seconds and independent review passed.
+The former full package command's 480.09-second timeout remains irrelevant to
+this P0 matrix. Native Arm acceptance awaits the retry receipt:
 `.analysis/codex-logs/p0-aarch64-target-check-20260921/receipt.txt`.
 
 **P5 precommit revalidation (2026-09-21).** Six real-component host hook cases,
