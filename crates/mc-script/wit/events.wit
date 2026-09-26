@@ -499,6 +499,25 @@ interface events {
         outcome: client-view-outcome,
     }
 
+    /// One accepted selection context or the owner's refusal for an exact
+    /// session, view revision and action. A context id alone grants no world
+    /// mutation; the owner consumes it at most once on a later view action.
+    record selection-context {
+        id: string,
+        expires-at-tick: u64,
+    }
+
+    variant client-selection-outcome {
+        started(selection-context),
+        refused(view-failure),
+    }
+
+    record client-selection-started {
+        request: string,
+        session: session-id,
+        outcome: client-selection-outcome,
+    }
+
     /// Why a Loader-owned custom-block item grant did not commit.
     ///
     /// The server's own closed vocabulary, carried through unchanged. A reason
@@ -588,6 +607,8 @@ interface events {
         loader-view-action(loader-view-action),
         /// The outcome of one `open-client-view` this plugin issued.
         client-view-opened(client-view-opened),
+        /// The outcome of one `begin-client-selection` this plugin issued.
+        client-selection-started(client-selection-started),
         /// The result of one `grant-loader-block-item` this plugin issued.
         loader-item-grant-result(loader-item-grant-result),
     }

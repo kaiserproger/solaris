@@ -51,6 +51,7 @@ pub(super) struct NativeResidentWorkResume {
 const RESIDENT_MELEE_REACH: f64 = 3.0;
 /// Attack reach of one resident bow shot, in blocks.
 const RESIDENT_BOW_REACH: f64 = 16.0;
+const RESIDENT_ATTACK_COOLDOWN_TICKS: u64 = 20;
 /// Deterministic resident-fishing output. This is a bounded worker abstraction,
 /// not a claim to simulate vanilla fishing loot or timing.
 const RESIDENT_FISHING_CATCH: &str = "minecraft:cod";
@@ -88,8 +89,10 @@ impl ItemLedger {
 struct PlannedAttack {
     target_ref: String,
     uuid: uuid::Uuid,
+    shooter: EntitySnapshot,
     expected: EntitySnapshot,
     amount: f32,
+    ranged: bool,
 }
 
 /// One member's resolved execution plan inside an accepted batch.
@@ -100,8 +103,10 @@ struct MemberPlan {
     goal: Option<GoalState>,
     targets: Vec<ScriptOrderTarget>,
     attacks: Vec<PlannedAttack>,
+    active_target_ref: Option<String>,
     /// Approved guard post this member occupies, for a garrison order.
     garrison: Option<DurableGarrisonSlot>,
+    observed_health: Option<f32>,
 }
 
 impl super::InventoryRuntime {
@@ -183,6 +188,22 @@ impl super::InventoryRuntime {
                 self.demobilize_resident(storage, plugin_id, request, handle, *expected_revision)
                     .await
             }
+            ScriptResidentOrderOperation::Capture {
+                handle,
+                custodian,
+                expected_revision,
+                ..
+            } => {
+                self.capture_resident(
+                    storage,
+                    plugin_id,
+                    request,
+                    handle,
+                    custodian,
+                    *expected_revision,
+                )
+                .await
+            }
             // The closed operation union is non-exhaustive to plugins.
             _ => Ok(rejected(ScriptOperationFailure::InvalidRequest)),
         }
@@ -190,7 +211,10 @@ impl super::InventoryRuntime {
 
     /// Replay every committed group admission whose members still owe an engine
     /// goal push. Called once when the storage actor starts.
-    pub(crate) async fn recover_resident_orders(&self, storage: &mut PluginStorage) {
+    pub(crate) async fn recover_resident_orders(
+        &self,
+        storage: &mut PluginStorage,
+    ) -> Result<(), PluginStorageMutationError> {
         let pending = storage.resident_orders().pending_admissions();
         for (admission_id, members) in pending {
             let mut goals = Vec::new();
@@ -213,10 +237,115 @@ impl super::InventoryRuntime {
                 admission_id,
                 members,
             };
-            if storage.append_resident_order_change(change).is_err() {
-                return;
-            }
+            storage.append_resident_order_change(change)?;
         }
+        self.advance_active_morale(storage).await
+    }
+    /// Continue accepted attacks when a pushed simulation tick finds an active
+    /// guard ready. The guest never polls or submits a damage command. A target
+    /// reference is trusted here only if it was authenticated at admission;
+    /// current owner, live actors, policy, weapon, reach and LOS are rechecked.
+    pub(crate) async fn continue_active_resident_combat(
+        &self,
+        storage: &mut PluginStorage,
+        tick: u64,
+    ) -> Result<(), PluginStorageMutationError> {
+        self.advance_active_morale(storage).await?;
+        let ready = storage
+            .resident_orders()
+            .active_attack_records(tick, RESIDENT_ATTACK_COOLDOWN_TICKS);
+        for mut record in ready {
+            if !storage
+                .residents()
+                .record(&record.handle)
+                .is_some_and(|resident| {
+                    resident.plugin_id == record.plugin_id
+                        && resident.entity_uuid == record.entity_uuid
+                })
+            {
+                continue;
+            }
+            let Some(order) = record.order.as_ref() else {
+                continue;
+            };
+            let ScriptResidentOrder::Attack { targets, policy } = &order.order else {
+                continue;
+            };
+            let Some(target) = order
+                .active_target_ref
+                .as_ref()
+                .and_then(|approved| targets.iter().find(|target| &target.target_ref == approved))
+            else {
+                continue;
+            };
+            let Some(reference) = storage
+                .resident_orders()
+                .reference(&record.plugin_id, &target.target_ref)
+            else {
+                continue;
+            };
+            let Ok(uuid) = uuid::Uuid::parse_str(&reference.entity_uuid) else {
+                continue;
+            };
+            let Some(snapshot) = self
+                .sessions()
+                .resident_entity_snapshots(&[uuid])
+                .await
+                .into_iter()
+                .next()
+                .flatten()
+            else {
+                continue;
+            };
+            let references = BTreeMap::from([(uuid, &snapshot)]);
+            let (attacks, _) = self
+                .plan_member_attacks(
+                    storage,
+                    &record.plugin_id,
+                    &record,
+                    std::slice::from_ref(target),
+                    policy,
+                    &references,
+                    &self.sessions().resident_live_player_uuids(),
+                    storage.revision.saturating_add(1),
+                    tick,
+                    true,
+                )
+                .await;
+            let Some(attack) = attacks.into_iter().next() else {
+                continue;
+            };
+            let applied = if attack.ranged {
+                self.sessions()
+                    .launch_resident_arrow(&attack.shooter, &attack.expected)
+            } else {
+                self.sessions()
+                    .commit_resident_damage(
+                        &record.plugin_id,
+                        vec![ResidentAttack {
+                            uuid: attack.uuid,
+                            amount: attack.amount,
+                            expected: attack.expected,
+                        }],
+                    )
+                    .await
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .is_some_and(|hit| hit.damage > 0.0)
+            };
+            if !applied {
+                continue;
+            }
+            if attack.ranged && gear_take(&mut record, RESIDENT_ARROW, 1) != 1 {
+                return Err(PluginStorageMutationError::QuotaExceeded);
+            }
+            record.last_attack_tick = Some(tick);
+            storage.append_resident_order_change(DurableResidentOrderChange::CombatProgress {
+                record: Box::new(record),
+            })?;
+        }
+        Ok(())
     }
 
     /// Resume the same durable assignments whose bounded work regions received
@@ -357,6 +486,7 @@ impl super::InventoryRuntime {
                 &mut staged_edits,
             )
             .await;
+        let world_input_wait = source_missing_input_wait(&next, work, reason);
         let state = match reason {
             Some(_) => ScriptWorkState::Paused,
             None if done >= planned => ScriptWorkState::Committed,
@@ -390,6 +520,7 @@ impl super::InventoryRuntime {
                     done,
                     state,
                     reason,
+                    world_input_wait,
                 }));
                 let payload = payload(assignment(done, state, reason, ledger));
                 if staged_edits.is_empty() {
@@ -457,6 +588,7 @@ impl super::InventoryRuntime {
                     done,
                     state,
                     reason,
+                    world_input_wait,
                 }));
                 let commit = self
                     .commit_resident_warehouse_move(
@@ -481,6 +613,7 @@ impl super::InventoryRuntime {
                         done,
                         state: ScriptWorkState::Paused,
                         reason: Some(ScriptWorkPauseReason::NoStorage),
+                        world_input_wait: false,
                     }));
                     self.commit_resident_order(
                         storage,
@@ -527,6 +660,7 @@ impl super::InventoryRuntime {
             cancelled.state = ScriptWorkState::Cancelled;
             cancelled.reason = None;
             cancelled.revision = 0;
+            cancelled.world_input_wait = false;
             next.work = Some(Box::new(cancelled));
         }
         let payload = ScriptOperationPayload::ResidentOrder {
@@ -600,6 +734,9 @@ impl super::InventoryRuntime {
                         return (done, Some(ScriptWorkPauseReason::Unloaded));
                     };
                     if !is_harvestable_crop(&block.path) {
+                        continue;
+                    }
+                    if !world.crop_is_mature(block.state) {
                         continue;
                     }
                     if staged_edits.first().is_some_and(|first| {
@@ -755,6 +892,17 @@ impl super::InventoryRuntime {
                         Ok(false) => continue,
                         Err(reason) => return (done, Some(reason)),
                     }
+                    // Do not let a work receipt teleport a logger into its
+                    // target. A real, bounded route must reach a standable
+                    // neighbour of this trunk cell.
+                    match self
+                        .tree_cell_reachable(world, &area.dimension, record, cell)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return (done, Some(ScriptWorkPauseReason::BlockedRoute)),
+                        Err(reason) => return (done, Some(reason)),
+                    }
                     if staged_edits.first().is_some_and(|first| {
                         !same_resident_work_region(
                             [
@@ -824,6 +972,18 @@ impl super::InventoryRuntime {
                     if !is_ore_path(&block.path) {
                         continue;
                     }
+                    // A mine order names a bounded area, not permission to
+                    // extract unseen ore through solid terrain.
+                    match self
+                        .mine_cell_reachable(world, &area.dimension, record, cell)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return (done, Some(ScriptWorkPauseReason::BlockedRoute));
+                        }
+                        Err(reason) => return (done, Some(reason)),
+                    }
                     if staged_edits.first().is_some_and(|first| {
                         !same_resident_work_region(
                             [
@@ -873,27 +1033,44 @@ impl super::InventoryRuntime {
                 if !gear_has(record, &tool) {
                     return (already_done, Some(ScriptWorkPauseReason::MissingTool));
                 }
+                let Some(from) = self.resident_work_cell(record).await else {
+                    return (already_done, Some(ScriptWorkPauseReason::BlockedRoute));
+                };
                 let mut columns = std::collections::BTreeSet::new();
+                let mut has_water = false;
                 for cell in work_cells(area) {
                     let Some(block) = world.block(&area.dimension, cell) else {
                         return (already_done, Some(ScriptWorkPauseReason::Unloaded));
                     };
-                    if block.path == "water" {
-                        columns.insert((cell[0], cell[2]));
+                    if block.path != "water" {
+                        continue;
+                    }
+                    has_water = true;
+                    let column = (cell[0], cell[2]);
+                    if columns.contains(&column) {
+                        continue;
+                    }
+                    match self.fishing_cell_reachable(world, &area.dimension, from, cell) {
+                        Ok(true) => {
+                            columns.insert(column);
+                        }
+                        Ok(false) => {}
+                        Err(reason) => return (already_done, Some(reason)),
                     }
                 }
-                if columns.is_empty() {
+                if !has_water {
                     return (already_done, Some(ScriptWorkPauseReason::MissingInput));
                 }
-                // One deterministic catch per real water column. This proves
-                // the physical source and inventory owner without representing
-                // vanilla loot-table rolls or fishing timing.
+                if columns.is_empty() {
+                    return (already_done, Some(ScriptWorkPauseReason::BlockedRoute));
+                }
+                // One deterministic catch per physically reachable water column.
+                // This is a bounded worker abstraction, not vanilla fishing loot
+                // or timing simulation.
                 let catchable = u64::try_from(columns.len()).unwrap_or(0).min(remaining);
                 let catch_id = resource_item(RESIDENT_FISHING_CATCH);
                 let mut caught = 0_u64;
                 for _ in 0..catchable {
-                    // The deterministic catch only counts when the worker can
-                    // hold it.
                     let drops = [ResidentDrop {
                         item_id: catch_id.clone(),
                         count: 1,
@@ -956,14 +1133,29 @@ impl super::InventoryRuntime {
                 if animals.is_empty() {
                     return (already_done, Some(ScriptWorkPauseReason::MissingInput));
                 }
+                let Some(from) = self.resident_work_cell(record).await else {
+                    return (already_done, Some(ScriptWorkPauseReason::BlockedRoute));
+                };
+                let mut reachable = 0_u64;
+                for animal in animals {
+                    match self.animal_cell_reachable(world, &area.dimension, from, animal.position)
+                    {
+                        Ok(true) => reachable += 1,
+                        Ok(false) => {}
+                        Err(reason) => return (already_done, Some(reason)),
+                    }
+                }
+                if reachable == 0 {
+                    return (already_done, Some(ScriptWorkPauseReason::BlockedRoute));
+                }
                 let mut done = already_done;
-                for _ in animals {
+                for _ in 0..reachable {
                     if done - already_done >= remaining || !gear_has(record, &feed_item) {
                         break;
                     }
-                    // Tending consumes resident-owned feed only for animals
-                    // currently visible to the simulation; it does not mint
-                    // livestock goods.
+                    // Tending consumes resident-owned feed only for a live,
+                    // mature, compatible animal the resident can reach; it
+                    // never fabricates livestock goods.
                     wear_gear_count(record, &feed_item, 1, ledger);
                     done += 1;
                 }
@@ -1009,6 +1201,19 @@ impl super::InventoryRuntime {
                 count,
                 station,
             } => {
+                let recipes = mc_data::recipes::solaris_required_recipes();
+                let Some(recipe) = recipes
+                    .iter()
+                    .find(|candidate| candidate.id.as_str() == recipe)
+                else {
+                    return (already_done, Some(ScriptWorkPauseReason::Unsupported));
+                };
+                let Some(required_station) = resident_recipe_station(recipe) else {
+                    // Furnace-backed recipes consume fuel and preserve burn progress
+                    // in the live furnace. A worker craft cannot replace that state
+                    // machine with a free instantaneous conversion.
+                    return (already_done, Some(ScriptWorkPauseReason::Unsupported));
+                };
                 if world.foreign_zone_overlaps(
                     plugin_id,
                     &station.dimension,
@@ -1020,7 +1225,9 @@ impl super::InventoryRuntime {
                 let Some(block) = world.block(&station.dimension, bounds_min(station)) else {
                     return (already_done, Some(ScriptWorkPauseReason::Unloaded));
                 };
-                if block.path != "crafting_table" {
+                if block.path != required_station
+                    || (required_station == "campfire" && !block.is_lit_campfire)
+                {
                     return (already_done, Some(ScriptWorkPauseReason::MissingStation));
                 }
                 self.craft_resident_items(record, recipe, *count, remaining, ledger)
@@ -1185,24 +1392,17 @@ impl super::InventoryRuntime {
         (moved, None)
     }
 
-    /// Craft a real recipe from the resident's own canonical slots. Inputs are
-    /// consumed only for crafts that complete; a missing ingredient stops the
-    /// job with `missing_input` and reports only the committed crafts.
+    /// Craft one registry recipe from the resident's canonical slots. Inputs,
+    /// output, and recipe remainders become one resident-record after-image, so
+    /// a missing input or recipient capacity commits no partial craft.
     fn craft_resident_items(
         &self,
         record: &mut DurableResidentOrderRecord,
-        recipe_id: &str,
+        recipe: &mc_data::recipes::Recipe,
         count: u32,
         limit: u64,
         ledger: &mut ItemLedger,
     ) -> (u64, Option<ScriptWorkPauseReason>) {
-        let recipes = mc_data::recipes::solaris_required_recipes();
-        let Some(recipe) = recipes
-            .iter()
-            .find(|recipe| recipe.id.as_str() == recipe_id)
-        else {
-            return (0, Some(ScriptWorkPauseReason::Unsupported));
-        };
         let Some(ingredients) = recipe_ingredients(recipe) else {
             return (0, Some(ScriptWorkPauseReason::Unsupported));
         };
@@ -1210,7 +1410,10 @@ impl super::InventoryRuntime {
             return (0, Some(ScriptWorkPauseReason::Unsupported));
         }
         let tags = mc_data::tags::solaris_required_item_tags(self.items());
-        let Some(result) = recipe.result.to_stack(self.items()) else {
+        if self.item_facts().custom(&recipe.result.item).is_some() {
+            return (0, Some(ScriptWorkPauseReason::Unsupported));
+        }
+        let Some(result) = recipe.result.to_stack(self.items(), self.item_facts()) else {
             return (0, Some(ScriptWorkPauseReason::Unsupported));
         };
         let Some(result_name) = self.items().name_of(result.item_id) else {
@@ -1219,10 +1422,13 @@ impl super::InventoryRuntime {
         let result_name = result_name.as_str().to_owned();
         let mut done = 0_u64;
         while done < u64::from(count) && done < limit {
+            // Work on a complete after-image. Component-bearing inputs must be
+            // restored exactly as read when output or remainder capacity fails.
+            let mut crafted = record.clone();
             let mut taken: Vec<String> = Vec::new();
             let mut satisfied = true;
             for ingredient in &ingredients {
-                match take_ingredient(record, self.items(), &tags, ingredient, ledger) {
+                match take_ingredient(&mut crafted, self.items(), &tags, ingredient) {
                     Some(item_id) => taken.push(item_id),
                     None => {
                         satisfied = false;
@@ -1231,29 +1437,28 @@ impl super::InventoryRuntime {
                 }
             }
             if !satisfied {
-                // Put back the ingredients of the incomplete craft; nothing was
-                // committed for it.
-                for item_id in taken {
-                    let max_stack = self.drop_max_stack(&item_id);
-                    put_resident_item(record, &item_id, 1, max_stack);
-                    ledger.add(&item_id, 1);
-                }
                 break;
             }
-            let max_stack = self.drop_max_stack(&result_name);
-            let produced = u64::try_from(result.count).unwrap_or(0);
-            if !put_resident_item(record, &result_name, produced, max_stack) {
-                // The inputs were tentatively taken for this craft, but its
-                // output cannot fit. Restore them so only completed crafts
-                // consume canonical resident inventory.
-                for item_id in taken {
-                    let max_stack = self.drop_max_stack(&item_id);
-                    put_resident_item(record, &item_id, 1, max_stack);
-                    ledger.add(&item_id, 1);
-                }
+            let mut outputs = vec![(
+                result_name.clone(),
+                u64::try_from(result.count).unwrap_or(0),
+            )];
+            outputs.extend(taken.iter().filter_map(|item_id| {
+                crafting_remainder(self.item_facts(), item_id).map(|remainder| (remainder, 1))
+            }));
+            let outputs_fit = outputs.iter().all(|(item_id, amount)| {
+                put_resident_item(&mut crafted, item_id, *amount, self.drop_max_stack(item_id))
+            });
+            if !outputs_fit {
                 return (done, Some(ScriptWorkPauseReason::NoStorage));
             }
-            ledger.add(&result_name, i64::from(result.count));
+            *record = crafted;
+            for item_id in taken {
+                ledger.add(&item_id, -1);
+            }
+            for (item_id, amount) in outputs {
+                ledger.add(&item_id, i64::try_from(amount).unwrap_or(i64::MAX));
+            }
             done += 1;
         }
         if done == 0 {
@@ -1342,6 +1547,19 @@ impl super::InventoryRuntime {
         else {
             return Ok(resident_order_batch_refusal(handles));
         };
+        if matches!(order, ScriptResidentOrder::Attack { .. })
+            && records.values().any(|record| {
+                record.morale.as_ref().is_some_and(|morale| {
+                    matches!(
+                        morale.phase,
+                        super::resident_morale::MoralePhase::Routing
+                            | super::resident_morale::MoralePhase::Surrendered
+                    )
+                })
+            })
+        {
+            return Ok(resident_order_batch_refusal(handles));
+        }
         let Some(Some(mut admission)) = self
             .prepare_resident_order_batch(storage, request, &records)
             .await
@@ -1356,37 +1574,57 @@ impl super::InventoryRuntime {
             .next_transaction_id()
             .map_err(|_| PluginStorageMutationError::RevisionOverflow)?;
         let mut next_records = records.clone();
+        let attack_tick = self.sessions().simulation_tick();
         let (mut plans, refs) = self
-            .plan_member_orders(storage, plugin_id, &mut next_records, order, transaction_id)
+            .plan_member_orders(
+                storage,
+                plugin_id,
+                &mut next_records,
+                order,
+                transaction_id,
+                attack_tick,
+            )
             .await;
-        // Real combat resolves before the durable commit, so the receipt carries
-        // only damage the engine actually committed.
+        // A melee receipt records only committed damage. A bow shot launches
+        // one world projectile; impact damage belongs to the arrow kernel.
         let attacks = plans
             .iter()
             .flat_map(|plan| plan.attacks.iter())
+            .filter(|attack| !attack.ranged)
             .map(|attack| ResidentAttack {
                 uuid: attack.uuid,
                 amount: attack.amount,
                 expected: attack.expected.clone(),
             })
             .collect::<Vec<_>>();
-        let hits = self
+        let mut hits = self
             .sessions()
             .commit_resident_damage(plugin_id, attacks)
-            .await;
+            .await
+            .into_iter();
         let mut combat = Vec::new();
-        let mut hit_index = 0_usize;
         for plan in &mut plans {
-            let plan_attacks = std::mem::take(&mut plan.attacks);
-            for attack in plan_attacks {
-                let hit = hits.get(hit_index).and_then(Option::as_ref);
-                hit_index += 1;
-                let Some(hit) = hit else {
+            for attack in std::mem::take(&mut plan.attacks) {
+                if attack.ranged {
+                    if self
+                        .sessions()
+                        .launch_resident_arrow(&attack.shooter, &attack.expected)
+                        && let Some(record) = next_records.get_mut(&plan.handle)
+                    {
+                        record.last_attack_tick = Some(attack_tick);
+                        let _ = gear_take(record, RESIDENT_ARROW, 1);
+                    }
+                    continue;
+                }
+                let Some(hit) = hits.next().flatten() else {
                     continue;
                 };
                 let damage_milli = (hit.damage * 1000.0).round().max(0.0) as u64;
                 if damage_milli == 0 {
                     continue;
+                }
+                if let Some(record) = next_records.get_mut(&plan.handle) {
+                    record.last_attack_tick = Some(attack_tick);
                 }
                 let event_id = (transaction_id << 6) | (combat.len() as u64 & 63);
                 let Ok(event) = ok_combat_event(
@@ -1490,6 +1728,7 @@ impl super::InventoryRuntime {
             };
             let mut next = record.clone();
             next.order = None;
+            next.morale = None;
             changes.push(DurableResidentOrderChange::Record {
                 record: Box::new(next),
             });
@@ -1555,16 +1794,38 @@ impl super::InventoryRuntime {
         if record.revision != expected_revision {
             return Ok(rejected(ScriptOperationFailure::StaleRevision));
         }
-        // Returning gear needs a writable warehouse endpoint. Core has no
-        // warehouse resolver, so the resident keeps its handle, housing and
-        // every item on its canonical slots and stays demobilising.
+        let records = BTreeMap::from([(handle.to_owned(), record.clone())]);
+        let Some(Some(mut admission)) = self
+            .prepare_resident_order_batch(storage, request, &records)
+            .await
+        else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if !commit_resident_order_batch(self.sessions(), &records, &mut admission).await {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        }
+        let admission_id = admission.admission_id();
+        // The first decision stops service without touching items. The guest
+        // returns issued gear through fenced owned-inventory transfers before
+        // asking for the second, civilian decision; personal items stay put.
+        let complete = record.assignment == DurableAssignment::Demobilizing;
         let mut next = record.clone();
-        next.assignment = DurableAssignment::Demobilizing;
+        next.assignment = if complete {
+            DurableAssignment::Civilian
+        } else {
+            DurableAssignment::Demobilizing
+        };
         next.order = None;
+        next.work = None;
+        next.morale = None;
         let resident = ScriptDemobilizeResult::new(
             handle.to_owned(),
-            ScriptDemobilizeState::Demobilizing,
-            Some(ScriptWorkPauseReason::NoStorage),
+            if complete {
+                ScriptDemobilizeState::Civilian
+            } else {
+                ScriptDemobilizeState::Demobilizing
+            },
+            (!complete).then_some(ScriptWorkPauseReason::NoStorage),
             Vec::new(),
             0,
         );
@@ -1578,13 +1839,181 @@ impl super::InventoryRuntime {
             plugin_id,
             request,
             payload,
-            vec![DurableResidentOrderChange::Record {
-                record: Box::new(next),
-            }],
+            vec![
+                DurableResidentOrderChange::Record {
+                    record: Box::new(next),
+                },
+                DurableResidentOrderChange::Admission {
+                    admission: Box::new(durable_admission(
+                        admission_id,
+                        plugin_id,
+                        request
+                            .operation_id()
+                            .expect("demobilization decision identity"),
+                        request_fingerprint(request),
+                        &records,
+                        &[],
+                    )),
+                },
+            ],
         )?;
+        if let Ok(uuid) = uuid::Uuid::parse_str(&record.entity_uuid) {
+            self.sessions()
+                .apply_resident_goals(vec![ResidentGoal {
+                    uuid,
+                    goal: GoalState::Idle,
+                }])
+                .await;
+        }
+        self.acknowledge_resident_admission(storage, admission_id, vec![handle.to_owned()]);
         Ok(self
             .resident_order_receipt_outcome(storage, plugin_id, request)
             .expect("committed demobilisation remains installed"))
+    }
+
+    async fn capture_resident(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+        handle: &str,
+        custodian: &str,
+        expected_revision: u64,
+    ) -> Result<ScriptOperationOutcome, PluginStorageMutationError> {
+        use super::resident_morale::MoralePhase;
+
+        let Some(record) = resident_order_record(storage, plugin_id, handle) else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if record.order_revision() != expected_revision {
+            return Ok(rejected(ScriptOperationFailure::StaleRevision));
+        }
+        let Some(guard) = resident_order_record(storage, plugin_id, custodian) else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if record.assignment != DurableAssignment::Military
+            || record.morale.as_ref().map(|morale| morale.phase) != Some(MoralePhase::Routing)
+            || !record
+                .order
+                .as_ref()
+                .is_some_and(|order| matches!(order.order, ScriptResidentOrder::Attack { .. }))
+            || guard.assignment != DurableAssignment::Military
+            || guard.morale.as_ref().is_some_and(|morale| {
+                matches!(
+                    morale.phase,
+                    MoralePhase::Routing | MoralePhase::Surrendered
+                )
+            })
+        {
+            return Ok(rejected(ScriptOperationFailure::InvalidRequest));
+        }
+        let Ok(victim_uuid) = uuid::Uuid::parse_str(&record.entity_uuid) else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        let Ok(guard_uuid) = uuid::Uuid::parse_str(&guard.entity_uuid) else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        let snapshots = self
+            .sessions()
+            .resident_entity_snapshots(&[victim_uuid, guard_uuid])
+            .await;
+        let Some((Some(victim), Some(guard_snapshot))) = snapshots
+            .first()
+            .zip(snapshots.get(1))
+            .map(|(victim, guard)| (victim.as_ref(), guard.as_ref()))
+        else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if !super::residents::resident_entity_is_current(victim)
+            || !super::residents::resident_entity_is_current(guard_snapshot)
+            || victim.health <= 0.0
+            || guard_snapshot.health <= 0.0
+        {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        }
+        let close = |victim: &EntitySnapshot, guard: &EntitySnapshot| {
+            let dx = victim.position.x - guard.position.x;
+            let dy = victim.position.y - guard.position.y;
+            let dz = victim.position.z - guard.position.z;
+            dx * dx + dy * dy + dz * dz <= 9.0
+        };
+        if !close(victim, guard_snapshot) {
+            return Ok(rejected(ScriptOperationFailure::InvalidRequest));
+        }
+        let records = BTreeMap::from([(handle.to_owned(), record.clone())]);
+        let Some(Some(mut admission)) = self
+            .prepare_resident_order_batch(storage, request, &records)
+            .await
+        else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if !commit_resident_order_batch(self.sessions(), &records, &mut admission).await {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        }
+        let now = self
+            .sessions()
+            .resident_entity_snapshots(&[victim_uuid, guard_uuid])
+            .await;
+        if !matches!(now.as_slice(), [Some(victim_now), Some(guard_now)]
+            if super::residents::resident_entity_is_current(victim_now)
+                && super::residents::resident_entity_is_current(guard_now)
+                && victim_now.health > 0.0
+                && guard_now.health > 0.0
+                && close(victim_now, guard_now))
+        {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        }
+        let admission_id = admission.admission_id();
+        let mut next = record.clone();
+        next.assignment = DurableAssignment::Prisoner;
+        next.custodian = Some(custodian.to_owned());
+        next.order = None;
+        next.work = None;
+        if let Some(morale) = &mut next.morale {
+            morale.phase = MoralePhase::Surrendered;
+            morale.goal_applied = false;
+        }
+        self.commit_resident_order(
+            storage,
+            plugin_id,
+            request,
+            ScriptOperationPayload::ResidentOrder {
+                result: Box::new(ScriptResidentOrderResult::Captured {
+                    handle: handle.to_owned(),
+                    custodian: custodian.to_owned(),
+                    revision: 0,
+                }),
+            },
+            vec![
+                DurableResidentOrderChange::Record {
+                    record: Box::new(next),
+                },
+                DurableResidentOrderChange::Admission {
+                    admission: Box::new(durable_admission(
+                        admission_id,
+                        plugin_id,
+                        request.operation_id().expect("capture decision identity"),
+                        request_fingerprint(request),
+                        &records,
+                        &[],
+                    )),
+                },
+            ],
+        )?;
+        if self
+            .sessions()
+            .apply_resident_goals(vec![ResidentGoal {
+                uuid: victim_uuid,
+                goal: GoalState::Idle,
+            }])
+            .await
+            == 1
+        {
+            self.acknowledge_resident_admission(storage, admission_id, vec![handle.to_owned()]);
+        }
+        Ok(self
+            .resident_order_receipt_outcome(storage, plugin_id, request)
+            .expect("committed physical capture remains installed"))
     }
 
     // ------------------------------------------------------------ planning
@@ -1627,6 +2056,7 @@ impl super::InventoryRuntime {
         next_records: &mut BTreeMap<String, DurableResidentOrderRecord>,
         order: &ScriptResidentOrder,
         transaction_id: u64,
+        attack_tick: u64,
     ) -> (Vec<MemberPlan>, Vec<DurableTargetRef>) {
         let member_uuids = next_records
             .values()
@@ -1674,6 +2104,19 @@ impl super::InventoryRuntime {
             _ => (BTreeMap::new(), BTreeMap::new()),
         };
         let mut plans = Vec::new();
+        // Every distinct anchor is placed once per batch, not once per member.
+        // Patrol members may have different route indices; cache each anchor.
+        let mut formations = Vec::new();
+        let mut formation_slot_at = |anchor: Vec3, index: usize| {
+            let cached = formations
+                .iter()
+                .position(|(position, _)| *position == anchor)
+                .unwrap_or_else(|| {
+                    formations.push((anchor, self.formation_slots_at(order, anchor, count)));
+                    formations.len() - 1
+                });
+            formations[cached].1.as_ref()?.get(index).copied()
+        };
         let mut refs = Vec::new();
         for (index, handle) in handles.iter().enumerate() {
             let Some(record) = next_records.get(handle).cloned() else {
@@ -1686,7 +2129,16 @@ impl super::InventoryRuntime {
                 goal: None,
                 targets: Vec::new(),
                 attacks: Vec::new(),
+                active_target_ref: None,
                 garrison: None,
+                observed_health: member_uuids
+                    .iter()
+                    .position(|uuid| *uuid == uuid_of(&record))
+                    .and_then(|index| {
+                        member_snapshots[index]
+                            .as_ref()
+                            .map(|snapshot| snapshot.health)
+                    }),
             };
             match order {
                 ScriptResidentOrder::Follow { target_player, .. } => {
@@ -1699,8 +2151,7 @@ impl super::InventoryRuntime {
                             target: entity,
                             speed: 1.0,
                         });
-                        plan.slot = self
-                            .formation_slot_at(order, position, index, count)
+                        plan.slot = formation_slot_at(position, index)
                             .map(|(slot, _)| slot)
                             .or_else(|| Some(u16::try_from(index).unwrap_or(u16::MAX)));
                     } else {
@@ -1713,9 +2164,7 @@ impl super::InventoryRuntime {
                 } => {
                     plan.goal = Some(GoalState::Idle);
                     let anchor = order_anchor(order).unwrap_or(Vec3::ZERO);
-                    plan.slot = self
-                        .formation_slot_at(order, anchor, index, count)
-                        .map(|(slot, _)| slot);
+                    plan.slot = formation_slot_at(anchor, index).map(|(slot, _)| slot);
                     let (targets, minted) = self.perceived_targets(
                         storage,
                         &record,
@@ -1805,9 +2254,7 @@ impl super::InventoryRuntime {
                 }
                 ScriptResidentOrder::Move { .. } => {
                     let anchor = order_anchor(order).unwrap_or(Vec3::ZERO);
-                    if let Some((slot, position)) =
-                        self.formation_slot_at(order, anchor, index, count)
-                    {
+                    if let Some((slot, position)) = formation_slot_at(anchor, index) {
                         // The member must actually be able to walk there: a
                         // closed passage reports `blocked_route` and pushes no
                         // goal instead of teleporting.
@@ -1839,9 +2286,7 @@ impl super::InventoryRuntime {
                         .get(route_index)
                         .map(block_position)
                         .unwrap_or(Vec3::ZERO);
-                    if let Some((slot, position)) =
-                        self.formation_slot_at(order, anchor, index, count)
-                    {
+                    if let Some((slot, position)) = formation_slot_at(anchor, index) {
                         plan.slot = Some(slot);
                         plan.goal = Some(GoalState::FollowPosition {
                             target: position,
@@ -1863,17 +2308,65 @@ impl super::InventoryRuntime {
                 }
                 ScriptResidentOrder::Retreat { .. } => {
                     let anchor = order_anchor(order).unwrap_or(Vec3::ZERO);
-                    if let Some((slot, position)) =
-                        self.formation_slot_at(order, anchor, index, count)
-                    {
+                    if let Some((slot, position)) = formation_slot_at(anchor, index) {
                         plan.slot = Some(slot);
                         plan.goal = Some(GoalState::FollowPosition {
                             target: position,
                             speed: 1.2,
                         });
+                    } else {
+                        // An unplaceable rally must still stop the interrupted
+                        // chase: the member keeps its honest `blocked_route`
+                        // report and stops instead of leaving the old attack
+                        // goal installed.
+                        plan.goal = Some(GoalState::Idle);
                     }
                 }
                 ScriptResidentOrder::Attack { targets, policy } => {
+                    let rally = policy.rally.expect("accepted attack has a rally point");
+                    let Some(world) = self.resident_world() else {
+                        plans.push(plan);
+                        continue;
+                    };
+                    let reachable = member_positions.get(&uuid_of(&record)).is_some_and(|from| {
+                        goal_for_position(rally, world).is_some()
+                            && !self.route_blocked(
+                                RESIDENT_WORLD_DIMENSION,
+                                *from,
+                                block_position(&rally),
+                            )
+                    });
+                    if !reachable {
+                        plans.push(plan);
+                        continue;
+                    }
+                    if let Some(officer) = &policy.officer {
+                        let available = storage
+                            .resident_orders()
+                            .record(officer)
+                            .filter(|officer_record| {
+                                officer_record.plugin_id == plugin_id
+                                    && officer_record.assignment == DurableAssignment::Military
+                            })
+                            .and_then(|officer_record| {
+                                uuid::Uuid::parse_str(&officer_record.entity_uuid).ok()
+                            });
+                        let Some(officer_uuid) = available else {
+                            plans.push(plan);
+                            continue;
+                        };
+                        if !self
+                            .sessions()
+                            .resident_entity_snapshots(&[officer_uuid])
+                            .await
+                            .into_iter()
+                            .flatten()
+                            .any(|officer| officer.lifecycle == mc_entity::EntityLifecycle::Alive)
+                        {
+                            plans.push(plan);
+                            continue;
+                        }
+                    }
                     let (perceived, minted) = self.perceived_targets(
                         storage,
                         &record,
@@ -1890,27 +2383,52 @@ impl super::InventoryRuntime {
                         .plan_member_attacks(
                             storage,
                             plugin_id,
-                            next_records.get_mut(handle),
                             &record,
                             targets,
                             policy,
                             &references,
                             &live_players,
                             transaction_id,
+                            attack_tick,
+                            false,
                         )
                         .await;
                     plan.attacks = attacks;
                     refs.extend(refreshed);
-                    if let Some(attack) = plan.attacks.first() {
-                        plan.goal = Some(GoalState::FollowTarget {
-                            target: mc_entity::EntityId(attack.expected.id.0),
-                            speed: 1.1,
+                    // Cooldown suppresses damage, not a valid chase toward
+                    // the member's still-permitted, server-issued target.
+                    let chase = plan
+                        .attacks
+                        .first()
+                        .map(|attack| (attack.expected.id, attack.target_ref.clone()))
+                        .or_else(|| {
+                            plan.targets.iter().find_map(|candidate| {
+                                let requested = targets.iter().find(|requested| {
+                                    requested.target_ref == candidate.target_ref
+                                })?;
+                                let reference = storage
+                                    .resident_orders()
+                                    .reference(plugin_id, &candidate.target_ref)?;
+                                if reference.expires_revision < storage.revision
+                                    || reference.expires_revision != requested.expires_revision
+                                    || reference.policy_revision != requested.policy_revision
+                                    || reference.policy_revision != policy.revision
+                                    || reference.category != candidate.category.as_str()
+                                {
+                                    return None;
+                                }
+                                let uuid = uuid::Uuid::parse_str(&reference.entity_uuid).ok()?;
+                                let target = references.get(&uuid)?;
+                                (target.lifecycle == mc_entity::EntityLifecycle::Alive)
+                                    .then(|| (target.id, candidate.target_ref.clone()))
+                            })
                         });
-                        plan.slot = Some(u16::try_from(index).unwrap_or(u16::MAX));
-                    } else {
-                        plan.goal = Some(GoalState::Idle);
-                        plan.slot = Some(u16::try_from(index).unwrap_or(u16::MAX));
-                    }
+                    plan.active_target_ref =
+                        chase.as_ref().map(|(_, target_ref)| target_ref.clone());
+                    plan.goal = Some(chase.map_or(GoalState::Idle, |(target, _)| {
+                        GoalState::FollowTarget { target, speed: 1.1 }
+                    }));
+                    plan.slot = Some(u16::try_from(index).unwrap_or(u16::MAX));
                 }
                 // The closed order union is non-exhaustive to plugins.
                 _ => {
@@ -1977,15 +2495,13 @@ impl super::InventoryRuntime {
         Some(position)
     }
 
-    /// Distinct standable formation slot for one member, when the order builds
-    /// one around `anchor`.
-    fn formation_slot_at(
+    /// Place one formation at an anchor and retain its indexed member slots.
+    fn formation_slots_at(
         &self,
         order: &ScriptResidentOrder,
         anchor: Vec3,
-        index: usize,
         count: usize,
-    ) -> Option<(u16, Vec3)> {
+    ) -> Option<Vec<(u16, Vec3)>> {
         let world = self.resident_world()?;
         let (formation, heading) = order_formation(order)?;
         match place_formation(
@@ -1996,14 +2512,17 @@ impl super::InventoryRuntime {
             order_dimension(order),
             world,
         ) {
-            Some(FormationPlacement::Placed(placements)) => {
-                placements.get(index).map(|placement| {
-                    (
-                        u16::try_from(placement.slot).unwrap_or(u16::MAX),
-                        placement.position,
-                    )
-                })
-            }
+            Some(FormationPlacement::Placed(placements)) => Some(
+                placements
+                    .into_iter()
+                    .map(|placement| {
+                        (
+                            u16::try_from(placement.slot).unwrap_or(u16::MAX),
+                            placement.position,
+                        )
+                    })
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -2061,6 +2580,7 @@ impl super::InventoryRuntime {
                 continue;
             }
             let target_ref = target_ref_for(&candidate.uuid);
+            let expires_revision = transaction_id.saturating_add(TARGET_REF_TTL_REVISIONS);
             refs.push(DurableTargetRef {
                 plugin_id: plugin_id.to_owned(),
                 target_ref: target_ref.clone(),
@@ -2068,10 +2588,12 @@ impl super::InventoryRuntime {
                 category: candidate.category.as_str().to_owned(),
                 policy_revision: policy.revision,
                 revision: 0,
-                expires_revision: transaction_id.saturating_add(TARGET_REF_TTL_REVISIONS),
+                expires_revision,
             });
             targets.push(ScriptOrderTarget::new(
                 target_ref,
+                policy.revision,
+                expires_revision,
                 candidate.category,
                 mc_script::ScriptBlockPosition::new(
                     candidate.position.x.floor() as i32,
@@ -2092,20 +2614,24 @@ impl super::InventoryRuntime {
         &self,
         storage: &PluginStorage,
         plugin_id: &str,
-        next_record: Option<&mut DurableResidentOrderRecord>,
         record: &DurableResidentOrderRecord,
         targets: &[ScriptOrderTargetRef],
         policy: &ScriptEngagementPolicy,
         references: &BTreeMap<uuid::Uuid, &EntitySnapshot>,
         live_players: &std::collections::BTreeSet<uuid::Uuid>,
         transaction_id: u64,
+        attack_tick: u64,
+        accepted_order: bool,
     ) -> (Vec<PlannedAttack>, Vec<DurableTargetRef>) {
         let Some(world) = self.resident_world() else {
             return (Vec::new(), Vec::new());
         };
-        let Some(next_record) = next_record else {
+        if record
+            .last_attack_tick
+            .is_some_and(|last| attack_tick.saturating_sub(last) < RESIDENT_ATTACK_COOLDOWN_TICKS)
+        {
             return (Vec::new(), Vec::new());
-        };
+        }
         let Some(policy) = target_policy(policy, f64::from(mc_script::MAX_ENGAGEMENT_RADIUS))
         else {
             return (Vec::new(), Vec::new());
@@ -2121,21 +2647,23 @@ impl super::InventoryRuntime {
         } else {
             RESIDENT_MELEE_REACH
         };
-        if ranged && !gear_has(next_record, RESIDENT_ARROW) {
+        if ranged && !gear_has(record, RESIDENT_ARROW) {
             // No ammo: the archer engages nothing and consumes nothing.
             return (Vec::new(), Vec::new());
         }
-        let Some(attacker_position) = self
+        let Some(attacker) = self
             .sessions()
             .resident_entity_snapshots(&[uuid_of(record)])
             .await
             .into_iter()
             .next()
             .flatten()
-            .map(|snapshot| snapshot.position)
         else {
             return (Vec::new(), Vec::new());
         };
+        if attacker.lifecycle != mc_entity::EntityLifecycle::Alive {
+            return (Vec::new(), Vec::new());
+        }
         let mut attacks = Vec::new();
         let mut minted = Vec::new();
         for target in targets {
@@ -2146,7 +2674,12 @@ impl super::InventoryRuntime {
                 // A reference this core never issued is rejected.
                 continue;
             };
-            if reference.expires_revision < storage.revision {
+            if (!accepted_order
+                && (reference.expires_revision < storage.revision
+                    || reference.expires_revision != target.expires_revision))
+                || reference.policy_revision != target.policy_revision
+                || reference.policy_revision != policy.revision()
+            {
                 continue;
             }
             let Ok(uuid) = uuid::Uuid::parse_str(&reference.entity_uuid) else {
@@ -2158,6 +2691,11 @@ impl super::InventoryRuntime {
             let Some(category) = resident_category(&snapshot.type_name) else {
                 continue;
             };
+            if snapshot.lifecycle != mc_entity::EntityLifecycle::Alive
+                || reference.category != category.as_str()
+            {
+                continue;
+            }
             if category == ScriptHostileCategory::Player && !live_players.contains(&uuid) {
                 continue;
             }
@@ -2175,14 +2713,14 @@ impl super::InventoryRuntime {
             {
                 continue;
             }
-            let distance = distance(&attacker_position, &snapshot.position);
+            let distance = distance(&attacker.position, &snapshot.position);
             if distance > reach {
                 continue;
             }
             let eye = Vec3::new(
-                attacker_position.x,
-                attacker_position.y + 1.5,
-                attacker_position.z,
+                attacker.position.x,
+                attacker.position.y + 1.5,
+                attacker.position.z,
             );
             let target_eye = Vec3::new(
                 snapshot.position.x,
@@ -2195,10 +2733,6 @@ impl super::InventoryRuntime {
                 .unwrap_or(false)
             {
                 continue;
-            }
-            let mut item_ledger = ItemLedger::default();
-            if ranged {
-                wear_gear_count(next_record, RESIDENT_ARROW, 1, &mut item_ledger);
             }
             let item_id = weapon
                 .as_deref()
@@ -2213,19 +2747,23 @@ impl super::InventoryRuntime {
                 target_ref: reference.target_ref.clone(),
                 uuid,
                 expected: (*snapshot).clone(),
+                shooter: attacker.clone(),
                 amount,
+                ranged,
             });
-            minted.push(DurableTargetRef {
-                plugin_id: plugin_id.to_owned(),
-                target_ref: target.target_ref.clone(),
-                entity_uuid: uuid.to_string(),
-                category: category.as_str().to_owned(),
-                policy_revision: policy.revision(),
-                revision: 0,
-                expires_revision: transaction_id.saturating_add(TARGET_REF_TTL_REVISIONS),
-            });
+            if !accepted_order {
+                minted.push(DurableTargetRef {
+                    plugin_id: plugin_id.to_owned(),
+                    target_ref: target.target_ref.clone(),
+                    entity_uuid: uuid.to_string(),
+                    category: category.as_str().to_owned(),
+                    policy_revision: policy.revision(),
+                    revision: 0,
+                    expires_revision: transaction_id.saturating_add(TARGET_REF_TTL_REVISIONS),
+                });
+            }
+            break; // one native attack per member inside its cooldown
         }
-        attacks.sort_unstable_by(|left, right| left.target_ref.cmp(&right.target_ref));
         (attacks, minted)
     }
 
@@ -2241,9 +2779,12 @@ impl super::InventoryRuntime {
         self.sessions().apply_resident_goals(goals).await;
     }
 
-    /// Resolve the engine goal of one durable order, used by admission replay.
+    /// Resolve the engine goal of one durable order or cancellation, used by
+    /// admission replay.
     fn resident_order_goal(&self, record: &DurableResidentOrderRecord) -> Option<GoalState> {
-        let order = record.order.as_ref()?;
+        let Some(order) = record.order.as_ref() else {
+            return Some(GoalState::Idle);
+        };
         match &order.order {
             ScriptResidentOrder::Hold { .. } => Some(GoalState::Idle),
             ScriptResidentOrder::Garrison { .. } => {
@@ -2260,10 +2801,32 @@ impl super::InventoryRuntime {
                 })
             }
             ScriptResidentOrder::Move { .. } | ScriptResidentOrder::Retreat { .. } => {
+                if let Some([x, y, z]) = order.formation_destination {
+                    return Some(GoalState::FollowPosition {
+                        target: Vec3::new(f64::from_bits(x), f64::from_bits(y), f64::from_bits(z)),
+                        speed: if matches!(order.order, ScriptResidentOrder::Retreat { .. }) {
+                            1.2
+                        } else {
+                            1.0
+                        },
+                    });
+                }
                 let world = self.resident_world()?;
-                goal_for_order(&order.order, world)
+                let goal = goal_for_order(&order.order, world);
+                if goal.is_none() && matches!(order.order, ScriptResidentOrder::Retreat { .. }) {
+                    // A replay of an unplaceable rally stops the interrupted
+                    // chase the same way the accepted order did.
+                    return Some(GoalState::Idle);
+                }
+                goal
             }
             ScriptResidentOrder::Patrol { waypoints, .. } => {
+                if let Some([x, y, z]) = order.formation_destination {
+                    return Some(GoalState::FollowPosition {
+                        target: Vec3::new(f64::from_bits(x), f64::from_bits(y), f64::from_bits(z)),
+                        speed: 1.0,
+                    });
+                }
                 let waypoint = waypoints.get(usize::from(order.route_index))?;
                 let world = self.resident_world()?;
                 goal_for_position(*waypoint, world)
@@ -2287,9 +2850,173 @@ impl super::InventoryRuntime {
         self.sessions().set_resident_held_item(uuid, held).await;
     }
 
+    /// Whether the live resident can walk to a standable neighbour of one
+    /// bounded tree cell. Missing snapshots or an unavailable route fail closed
+    /// instead of granting remote block work.
+    async fn tree_cell_reachable(
+        &self,
+        world: &dyn ResidentWorld,
+        dimension: &str,
+        record: &DurableResidentOrderRecord,
+        tree_cell: [i32; 3],
+    ) -> Result<bool, ScriptWorkPauseReason> {
+        let Some(from) = self
+            .sessions()
+            .resident_entity_snapshots(&[uuid_of(record)])
+            .await
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|snapshot| {
+                [
+                    snapshot.position.x.floor() as i32,
+                    snapshot.position.y.floor() as i32,
+                    snapshot.position.z.floor() as i32,
+                ]
+            })
+        else {
+            return Ok(false);
+        };
+        let mut root = tree_cell;
+        for _ in 0..16 {
+            let below = [root[0], root[1] - 1, root[2]];
+            let block = world
+                .block(dimension, below)
+                .ok_or(ScriptWorkPauseReason::Unloaded)?;
+            if !is_log_path(&block.path) {
+                break;
+            }
+            root = below;
+        }
+        for [dx, dz] in [[-1, 0], [1, 0], [0, -1], [0, 1]] {
+            match world.route_open(dimension, from, [root[0] + dx, root[1], root[2] + dz]) {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => return Err(ScriptWorkPauseReason::Unloaded),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the live resident can walk to a bounded mining stance beside or
+    /// directly atop one ore cell. All candidate routes must be visible in the
+    /// loaded world; an absent snapshot or route never grants remote extraction.
+    async fn mine_cell_reachable(
+        &self,
+        world: &dyn ResidentWorld,
+        dimension: &str,
+        record: &DurableResidentOrderRecord,
+        ore_cell: [i32; 3],
+    ) -> Result<bool, ScriptWorkPauseReason> {
+        let Some(from) = self
+            .sessions()
+            .resident_entity_snapshots(&[uuid_of(record)])
+            .await
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|snapshot| {
+                [
+                    snapshot.position.x.floor() as i32,
+                    snapshot.position.y.floor() as i32,
+                    snapshot.position.z.floor() as i32,
+                ]
+            })
+        else {
+            return Ok(false);
+        };
+        for target in [
+            [ore_cell[0] - 1, ore_cell[1], ore_cell[2]],
+            [ore_cell[0] + 1, ore_cell[1], ore_cell[2]],
+            [ore_cell[0], ore_cell[1], ore_cell[2] - 1],
+            [ore_cell[0], ore_cell[1], ore_cell[2] + 1],
+            [ore_cell[0], ore_cell[1] + 1, ore_cell[2]],
+        ] {
+            match world.route_open(dimension, from, target) {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => return Err(ScriptWorkPauseReason::Unloaded),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Current standable work cell of a live resident. A missing actor snapshot
+    /// is never permission to complete a remote resource job.
+    async fn resident_work_cell(&self, record: &DurableResidentOrderRecord) -> Option<[i32; 3]> {
+        self.sessions()
+            .resident_entity_snapshots(&[uuid_of(record)])
+            .await
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|snapshot| {
+                [
+                    snapshot.position.x.floor() as i32,
+                    snapshot.position.y.floor() as i32,
+                    snapshot.position.z.floor() as i32,
+                ]
+            })
+    }
+
+    /// A fisher stands on shore one block above an adjacent water source.
+    fn fishing_cell_reachable(
+        &self,
+        world: &dyn ResidentWorld,
+        dimension: &str,
+        from: [i32; 3],
+        water_cell: [i32; 3],
+    ) -> Result<bool, ScriptWorkPauseReason> {
+        let mut saw_unloaded = false;
+        for [dx, dz] in [[-1, 0], [1, 0], [0, -1], [0, 1]] {
+            match world.route_open(
+                dimension,
+                from,
+                [water_cell[0] + dx, water_cell[1] + 1, water_cell[2] + dz],
+            ) {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => saw_unloaded = true,
+            }
+        }
+        if saw_unloaded {
+            Err(ScriptWorkPauseReason::Unloaded)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// A tender stands beside, not inside, the live animal it feeds.
+    fn animal_cell_reachable(
+        &self,
+        world: &dyn ResidentWorld,
+        dimension: &str,
+        from: [i32; 3],
+        animal_position: Vec3,
+    ) -> Result<bool, ScriptWorkPauseReason> {
+        let cell = [
+            animal_position.x.floor() as i32,
+            animal_position.y.floor() as i32,
+            animal_position.z.floor() as i32,
+        ];
+        let mut saw_unloaded = false;
+        for [dx, dz] in [[-1, 0], [1, 0], [0, -1], [0, 1]] {
+            match world.route_open(dimension, from, [cell[0] + dx, cell[1], cell[2] + dz]) {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => saw_unloaded = true,
+            }
+        }
+        if saw_unloaded {
+            Err(ScriptWorkPauseReason::Unloaded)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Whether a member cannot walk between two positions: an absent world
     /// adapter, an unsimulated dimension, a blocked route or unloaded terrain.
-    fn route_blocked(&self, dimension: &str, from: Vec3, to: Vec3) -> bool {
+    pub(super) fn route_blocked(&self, dimension: &str, from: Vec3, to: Vec3) -> bool {
         let Some(world) = self.resident_world() else {
             return true;
         };
@@ -2576,7 +3303,7 @@ async fn observe_resident_members(
         observations.insert(
             handle.clone(),
             GroupMemberObservation {
-                alive: snapshot.lifecycle == mc_entity::EntityLifecycle::Alive,
+                alive: super::residents::resident_entity_is_current(snapshot),
                 loaded: true,
                 region,
                 order_revision: record.order_revision(),
@@ -2605,12 +3332,19 @@ pub(super) fn resident_order_record(
     handle: &str,
 ) -> Option<DurableResidentOrderRecord> {
     let resident = storage.residents().record(handle)?;
-    if resident.plugin_id != plugin_id {
+    if resident.plugin_id != plugin_id
+        || resident.disposition != super::residents::ResidentDisposition::Alive
+    {
         return None;
     }
     let entity_uuid = resident.entity_uuid.clone();
     match storage.resident_orders().record(handle) {
-        Some(record) if record.entity_uuid == entity_uuid => Some(record.clone()),
+        Some(record)
+            if record.entity_uuid == entity_uuid
+                && record.assignment != DurableAssignment::Prisoner =>
+        {
+            Some(record.clone())
+        }
         Some(_) => None,
         None => Some(DurableResidentOrderRecord::empty(
             handle.to_owned(),
@@ -2646,7 +3380,36 @@ fn member_order_record(
         order: order.clone(),
         route_index,
         garrison: plan.garrison.clone(),
+        active_target_ref: plan.active_target_ref.clone(),
+        formation_destination: if matches!(
+            order,
+            ScriptResidentOrder::Move { .. }
+                | ScriptResidentOrder::Patrol { .. }
+                | ScriptResidentOrder::Retreat { .. }
+        ) {
+            match plan.goal {
+                Some(GoalState::FollowPosition { target, .. }) => {
+                    Some([target.x.to_bits(), target.y.to_bits(), target.z.to_bits()])
+                }
+                _ => None,
+            }
+        } else {
+            None
+        },
     }));
+    next.morale = match order {
+        ScriptResidentOrder::Attack { policy, .. } if plan.slot.is_some() => {
+            plan.observed_health.map(|health| {
+                super::resident_morale::OperationalMorale::new(
+                    health,
+                    policy.rally.expect("accepted attack has a rally point"),
+                    policy.officer.clone(),
+                )
+            })
+        }
+        ScriptResidentOrder::Attack { .. } => None,
+        _ => None,
+    };
     next.assignment = DurableAssignment::Military;
     next
 }
@@ -2941,7 +3704,6 @@ fn take_ingredient(
     items: &ItemRegistry,
     tags: &mc_data::tags::TagsData,
     ingredient: &mc_data::recipes::Ingredient,
-    ledger: &mut ItemLedger,
 ) -> Option<String> {
     let candidates = record
         .equipment
@@ -2961,7 +3723,6 @@ fn take_ingredient(
         if mc_data::recipes::ingredient_accepts_item(items, tags, item, ingredient) {
             let taken = gear_take(record, &item_id, 1);
             if taken == 1 {
-                ledger.add(&item_id, -1);
                 return Some(item_id);
             }
         }
@@ -2983,12 +3744,45 @@ fn recipe_ingredients(
             }
             Some(ingredients)
         }
+        mc_data::recipes::RecipeKind::Smelting(cooking)
+        | mc_data::recipes::RecipeKind::Blasting(cooking)
+        | mc_data::recipes::RecipeKind::Smoking(cooking)
+        | mc_data::recipes::RecipeKind::CampfireCooking(cooking) => {
+            Some(vec![cooking.ingredient.clone()])
+        }
+        mc_data::recipes::RecipeKind::Stonecutting(stonecutting) => {
+            Some(vec![stonecutting.ingredient.clone()])
+        }
+    }
+}
+
+/// The direct worker craft path owns only stateless stations. Furnace, smoker
+/// and blast-furnace recipes remain with their live fuel and burn-progress
+/// state machines instead of minting an instantaneous no-fuel result here.
+fn resident_recipe_station(recipe: &mc_data::recipes::Recipe) -> Option<&'static str> {
+    match &recipe.kind {
+        mc_data::recipes::RecipeKind::Shaped(_) | mc_data::recipes::RecipeKind::Shapeless(_) => {
+            Some("crafting_table")
+        }
+        mc_data::recipes::RecipeKind::CampfireCooking(_) => Some("campfire"),
+        mc_data::recipes::RecipeKind::Stonecutting(_) => Some("stonecutter"),
         mc_data::recipes::RecipeKind::Smelting(_)
         | mc_data::recipes::RecipeKind::Blasting(_)
-        | mc_data::recipes::RecipeKind::Smoking(_)
-        | mc_data::recipes::RecipeKind::CampfireCooking(_)
-        | mc_data::recipes::RecipeKind::Stonecutting(_) => None,
+        | mc_data::recipes::RecipeKind::Smoking(_) => None,
     }
+}
+
+/// The server's item component gives the canonical container item back after
+/// crafting consumes an item such as a milk bucket.
+fn crafting_remainder(
+    item_facts: &mc_data::item_components::ItemFactsTable,
+    item_id: &str,
+) -> Option<String> {
+    let item = Identifier::parse(item_id.to_owned()).ok()?;
+    item_facts
+        .get(&item)
+        .and_then(|facts| facts.use_remainder.as_ref())
+        .map(|remainder| remainder.as_str().to_owned())
 }
 
 fn structure_hash(structure_id: &str) -> u64 {
@@ -3153,6 +3947,27 @@ fn is_ground_path(path: &str) -> bool {
 
 fn is_ore_path(path: &str) -> bool {
     path.ends_with("_ore") || path == "ancient_debris"
+}
+
+fn source_missing_input_wait(
+    record: &DurableResidentOrderRecord,
+    work: &ScriptResidentWorkOrder,
+    reason: Option<ScriptWorkPauseReason>,
+) -> bool {
+    if reason != Some(ScriptWorkPauseReason::MissingInput) {
+        return false;
+    }
+    match work {
+        ScriptResidentWorkOrder::Harvest { .. }
+        | ScriptResidentWorkOrder::CutTree { .. }
+        | ScriptResidentWorkOrder::Mine { .. }
+        | ScriptResidentWorkOrder::Fish { .. } => true,
+        ScriptResidentWorkOrder::Replant { seed, .. } => gear_has(record, &resource_item(seed)),
+        ScriptResidentWorkOrder::TendLivestock { feed, .. } => {
+            gear_has(record, &resource_item(feed))
+        }
+        _ => false,
+    }
 }
 
 fn work_failure_reason(failure: ScriptOperationFailure) -> ScriptWorkPauseReason {

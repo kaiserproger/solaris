@@ -74,6 +74,7 @@ async fn play_loop_drains_bounded_outbound_pressure_without_shedding() {
             pose,
             respawn,
             CommandPermissions::from_op(false),
+            "127.0.0.1:40000".parse().unwrap(),
             SurvivalState::FULL,
             XpState::default(),
             GameMode::Survival,

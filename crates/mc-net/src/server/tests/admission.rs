@@ -62,39 +62,23 @@ fn console_operator_grant_applies_without_restart() {
     let config = CommandPermissionConfig::new(Vec::<String>::new(), false);
     let control = access_control_handle(&config);
     let peer = "192.168.1.20:40000".parse().unwrap();
-    let denied = play::commands::CommandPermissions::from_op(false);
 
     // A fresh login and an online session both start without authority.
     assert!(!config.permissions_for(&profile, peer).is_op());
-    assert!(
-        !config
-            .live_permissions_for("Builder", &uuid, denied)
-            .is_op()
-    );
+    assert!(!config.live_permissions_for("Builder", &uuid, peer).is_op());
 
     assert_eq!(control.set_operator(" Builder ", true), ["builder"]);
 
     // The next login resolves through the live set, and an online session
     // picks it up on its next command.
     assert!(config.permissions_for(&profile, peer).is_op());
-    assert!(
-        config
-            .live_permissions_for("builder", &uuid, denied)
-            .is_op()
-    );
-    assert!(
-        config
-            .live_permissions_for("Builder", &uuid, denied)
-            .is_op()
-    );
+    assert!(config.live_permissions_for("builder", &uuid, peer).is_op());
+    assert!(config.live_permissions_for("Builder", &uuid, peer).is_op());
 
     control.set_operator("builder", false);
     assert!(!config.permissions_for(&profile, peer).is_op());
-    assert!(
-        !config
-            .live_permissions_for("Builder", &uuid, denied)
-            .is_op()
-    );
+    // A session that logged in while listed must lose that authority too.
+    assert!(!config.live_permissions_for("Builder", &uuid, peer).is_op());
 }
 
 #[test]
@@ -113,15 +97,9 @@ fn console_operator_grant_retires_loopback_dev_fallback() {
     // Configuring any operator retires the empty-list fallback, matching
     // what a fresh login decides.
     assert!(!config.permissions_for(&dev, peer).is_op());
-    assert!(
-        !config
-            .live_permissions_for(
-                "Dev",
-                &uuid,
-                play::commands::CommandPermissions::from_op(true)
-            )
-            .is_op()
-    );
+    assert!(!config.live_permissions_for("Dev", &uuid, peer).is_op());
+    control.set_operator("Builder", false);
+    assert!(config.live_permissions_for("Dev", &uuid, peer).is_op());
 }
 
 #[test]

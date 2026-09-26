@@ -1143,10 +1143,7 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(in crate::play) fn published_entity_health_for_test(
-        &self,
-        entity_id: EntityId,
-    ) -> Option<f32> {
+    pub(crate) fn published_entity_health_for_test(&self, entity_id: EntityId) -> Option<f32> {
         self.lock_inner("read test published entity health")
             .published_entity_snapshots
             .get(&entity_id)

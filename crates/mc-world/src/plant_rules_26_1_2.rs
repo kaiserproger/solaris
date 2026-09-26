@@ -52,8 +52,19 @@ pub fn is_ground_support_plant(path: &str) -> bool {
     }
     matches!(
         path,
+        // crops lose their soil when the supporting block is destroyed
+        "wheat"
+            | "carrots"
+            | "potatoes"
+            | "beetroots"
+            | "nether_wart"
+            | "melon_stem"
+            | "pumpkin_stem"
+            | "attached_melon_stem"
+            | "attached_pumpkin_stem"
+            | "sweet_berry_bush"
         // small flowers
-        "poppy"
+        | "poppy"
             | "dandelion"
             | "golden_dandelion"
             | "blue_orchid"

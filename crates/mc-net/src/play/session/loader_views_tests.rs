@@ -141,6 +141,67 @@ fn present_is_a_cas_replacement_and_close_refuses_further_delivery() {
 }
 
 #[test]
+fn non_selection_actions_deliver_once_per_sequence_across_model_replacements() {
+    let mut registry = LoaderViewRegistry::new();
+    let opened = registry.open(OWNER, &open_request(None)).unwrap();
+    let first = action(&opened.instance_id, 1, None);
+    assert!(
+        registry
+            .handle_action(PLAYER, &first, true, 0)
+            .unwrap()
+            .deliver
+    );
+    assert!(
+        !registry
+            .handle_action(PLAYER, &first, true, 0)
+            .unwrap()
+            .deliver
+    );
+    let mut next = first.clone();
+    next.action_sequence = 2;
+    assert!(
+        registry
+            .handle_action(PLAYER, &next, true, 0)
+            .unwrap()
+            .deliver
+    );
+    assert!(
+        !registry
+            .handle_action(PLAYER, &first, true, 0)
+            .unwrap()
+            .deliver
+    );
+    registry
+        .present(OWNER, &present_request(&opened.instance_id, 1, None), 0)
+        .unwrap();
+    assert_eq!(
+        registry.handle_action(PLAYER, &next, true, 0),
+        Err(LoaderViewError::StaleRevision)
+    );
+    let mut refreshed = first.clone();
+    refreshed.view_revision = 2;
+    assert!(
+        registry
+            .handle_action(PLAYER, &refreshed, true, 0)
+            .unwrap()
+            .deliver
+    );
+    assert!(
+        !registry
+            .handle_action(PLAYER, &refreshed, true, 0)
+            .unwrap()
+            .deliver
+    );
+    refreshed.action_sequence = 2;
+    assert!(
+        registry
+            .handle_action(PLAYER, &refreshed, true, 0)
+            .unwrap()
+            .deliver
+    );
+}
+
+#[test]
 fn substituted_fields_and_disabled_actions_are_refused() {
     let mut registry = LoaderViewRegistry::new();
     let opened = registry.open(OWNER, &open_request(None)).unwrap();

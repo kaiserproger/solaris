@@ -447,6 +447,34 @@ fn fluid_block_report(id: &str, state_id: u32) -> BlockReport {
         }],
     }
 }
+fn chest_block_report() -> BlockReport {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "facing".to_owned(),
+        vec!["north".to_owned(), "south".to_owned()],
+    );
+    properties.insert(
+        "type".to_owned(),
+        vec!["single".to_owned(), "left".to_owned(), "right".to_owned()],
+    );
+    let state = |id: u32, default: bool, facing: &str, kind: &str| BlockStateReport {
+        id,
+        default,
+        properties: BTreeMap::from([
+            ("facing".to_owned(), facing.to_owned()),
+            ("type".to_owned(), kind.to_owned()),
+        ]),
+    };
+    BlockReport {
+        id: Identifier::parse("minecraft:chest").unwrap(),
+        properties,
+        states: vec![
+            state(7, true, "north", "single"),
+            state(8, false, "north", "left"),
+            state(9, false, "north", "right"),
+        ],
+    }
+}
 
 fn test_block_reports() -> Vec<BlockReport> {
     vec![
@@ -457,6 +485,7 @@ fn test_block_reports() -> Vec<BlockReport> {
         block_report("minecraft:campfire", 4),
         block_report("minecraft:tnt", 5),
         block_report("minecraft:dirt", 6),
+        chest_block_report(),
     ]
 }
 
@@ -687,6 +716,7 @@ async fn regional_block_edit_is_durable_before_response_publication() {
             hook_approval: None,
             zone_fence: None,
             plugin_receipt: None,
+            material_debit: None,
         })
         .unwrap();
 
@@ -786,6 +816,7 @@ async fn journaled_block_edit_does_not_capture_following_non_journaled_mutation(
             hook_approval: None,
             zone_fence: None,
             plugin_receipt: None,
+            material_debit: None,
         })
         .unwrap();
     let bytes = vec![10, 0, 0, 0];
@@ -902,6 +933,7 @@ async fn journal_failure_after_ram_acceptance_stops_further_world_mutations() {
             hook_approval: None,
             zone_fence: None,
             plugin_receipt: None,
+            material_debit: None,
         })
         .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1081,6 +1113,7 @@ async fn stale_block_edit_does_not_notify_dirty_flush() {
             hook_approval: None,
             zone_fence: None,
             plugin_receipt: None,
+            material_debit: None,
         })
         .unwrap();
 
@@ -1129,6 +1162,7 @@ fn server_owned_block_edits_never_take_a_session_fast_lane() {
         hook_approval: None,
         zone_fence: None,
         plugin_receipt: None,
+        material_debit: None,
     };
     let server_owned_batch = SimulationCommand::ApplyBlockEdits {
         actor_session: None,
@@ -1139,6 +1173,7 @@ fn server_owned_block_edits_never_take_a_session_fast_lane() {
         hook_approval: None,
         zone_fence: None,
         plugin_receipt: None,
+        material_debit: None,
     };
 
     assert!(
@@ -1211,6 +1246,7 @@ async fn regional_block_edits_in_distinct_lanes_overlap() {
                     hook_approval: None,
                     zone_fence: None,
                     plugin_receipt: None,
+                    material_debit: None,
                 })
                 .unwrap()
         })
@@ -1339,6 +1375,7 @@ async fn regional_block_edits_in_one_lane_preserve_sequence() {
         hook_approval: None,
         zone_fence: None,
         plugin_receipt: None,
+        material_debit: None,
     };
     let first = handle.enqueue(command()).unwrap();
     let stale = handle.enqueue(command()).unwrap();
@@ -1416,6 +1453,7 @@ async fn mixed_world_run_preserves_regional_waves_around_coordinator_barrier() {
         hook_approval: None,
         zone_fence: None,
         plugin_receipt: None,
+        material_debit: None,
     };
     let first = handle.enqueue(command(positions[0], tokens[0])).unwrap();
     let second = handle.enqueue(command(positions[1], tokens[1])).unwrap();
@@ -4283,6 +4321,7 @@ fn block_edit_routes_only_when_every_world_position_has_one_region_owner() {
         hook_approval: None,
         zone_fence: None,
         plugin_receipt: None,
+        material_debit: None,
     };
 
     assert_eq!(
@@ -8782,6 +8821,7 @@ async fn queued_conditional_block_edits_commit_only_first_matching_token() {
         hook_approval: None,
         zone_fence: None,
         plugin_receipt: None,
+        material_debit: None,
     };
     let first = handle.enqueue(command()).unwrap();
     let stale = handle.enqueue(command()).unwrap();
@@ -8830,6 +8870,7 @@ async fn queued_conditional_block_edit_rejects_busy_world_without_mutation() {
             hook_approval: None,
             zone_fence: None,
             plugin_receipt: None,
+            material_debit: None,
         })
         .unwrap();
     let guard = world.try_lock().expect("test owns world lock");
@@ -8962,6 +9003,7 @@ async fn queued_unconditional_block_edits_apply_in_owner_sequence_order() {
             hook_approval: None,
             zone_fence: None,
             plugin_receipt: None,
+            material_debit: None,
         })
         .unwrap();
     let restore = handle
@@ -8977,6 +9019,7 @@ async fn queued_unconditional_block_edits_apply_in_owner_sequence_order() {
             hook_approval: None,
             zone_fence: None,
             plugin_receipt: None,
+            material_debit: None,
         })
         .unwrap();
 
@@ -9029,6 +9072,7 @@ async fn chest_commit_rejects_actor_without_open_view() {
     let mut request = Box::pin(session_handle.commit_chest(
         pos,
         vec![pos],
+        vec![world.lock().await.block_mutation_token(pos).unwrap()],
         1,
         vec![initial.clone()],
         vec![updated],
@@ -9089,6 +9133,7 @@ async fn chest_commit_resyncs_when_a_warehouse_reservation_floor_would_be_consum
     let mut request = Box::pin(session_handle.commit_chest(
         position,
         vec![position],
+        vec![world.lock().await.block_mutation_token(position).unwrap()],
         1,
         vec![initial.clone()],
         vec![updated],
@@ -9158,6 +9203,7 @@ async fn regional_chest_commit_resyncs_when_a_warehouse_floor_would_be_consumed(
     let mut request = Box::pin(session_handle.commit_chest(
         position,
         vec![position],
+        vec![read_view.block_mutation_token(position).unwrap()],
         1,
         vec![initial.clone()],
         vec![updated],
@@ -9229,6 +9275,7 @@ fn server_owned_chest_commit_preserves_the_warehouse_reservation_floor() {
                 ChestTransactionRequest {
                     primary_position: position,
                     positions: &[position],
+                    expected_tokens: None,
                     expected_state_id: registry.chest_state_id(position),
                     expected: &[initial.clone()],
                     updated: &[updated],
@@ -9239,6 +9286,44 @@ fn server_owned_chest_commit_preserves_the_warehouse_reservation_floor() {
         ServerOwnedChestCommit::StaleContainer
     ));
     assert_eq!(storage.chest_block_entity(position).unwrap(), Some(initial));
+}
+
+#[test]
+fn construction_debit_releases_only_its_warehouse_reservation_floor() {
+    let position = BlockPos { x: 7, y: 64, z: 7 };
+    let mut expected = mc_world::ChestBlockEntity::default();
+    expected.slots[0] = mc_world::FurnaceSlot {
+        item_id: 42,
+        count: 2,
+        damage: None,
+        enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
+        stew_effects: Vec::new(),
+    };
+    let mut updated = expected.clone();
+    updated.slots[0].count = 1;
+    let registry = SessionRegistry::new();
+    registry.install_warehouse_reservation_floors(Arc::new(arc_swap::ArcSwap::from_pointee(
+        HashMap::from([(position, BTreeMap::from([(42_u32, 2_u64)]))]),
+    )));
+    assert!(
+        registry
+            .warehouse_reservation_stock_survives_after_consuming(position, &expected, &updated,),
+        "the receipt derives and releases its own material debit before checking other floors"
+    );
+    assert!(
+        !registry
+            .warehouse_reservation_stock_survives_after_consuming(position, &updated, &updated,),
+        "an unchanged image cannot release a still-reserved material floor"
+    );
+    let mut increased = expected.clone();
+    increased.slots[0].count = 3;
+    assert!(
+        !SessionRegistry::new()
+            .warehouse_reservation_stock_survives_after_consuming(position, &expected, &increased,),
+        "a construction receipt may not introduce warehouse stock without a floor installed"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -9262,10 +9347,50 @@ async fn structure_portion_journals_block_after_image_with_its_receipt() {
         )
         .unwrap();
     let position = BlockPos { x: 1, y: 64, z: 1 };
+    let primary_chest_position = BlockPos { x: 2, y: 64, z: 1 };
+    let chest_position = BlockPos { x: 3, y: 64, z: 1 };
+    storage
+        .set_block_at(primary_chest_position, BlockStateId(8))
+        .unwrap();
+    storage
+        .set_block_at(chest_position, BlockStateId(9))
+        .unwrap();
+    let mut expected_chest = mc_world::ChestBlockEntity::default();
+    expected_chest.slots[0] = mc_world::FurnaceSlot {
+        item_id: 42,
+        count: 2,
+        damage: None,
+        enchantments: Vec::new(),
+        custom_name: None,
+        item_model: None,
+        stew_effects: Vec::new(),
+    };
+    let mut updated_chest = expected_chest.clone();
+    updated_chest.slots[0].count = 1;
+    storage
+        .set_chest_block_entity(
+            primary_chest_position,
+            mc_world::ChestBlockEntity::default(),
+        )
+        .unwrap();
+    storage
+        .set_chest_block_entity(chest_position, expected_chest.clone())
+        .unwrap();
+    let mut expected_container = vec![ItemStack::EMPTY; 27];
+    expected_container[0] = ItemStack::new(42, 2);
+    let mut updated_container = expected_container.clone();
+    updated_container[0] = ItemStack::new(42, 1);
     let read_view = storage.read_view();
     let mutation_view = storage.mutation_view();
     let world = Arc::new(tokio::sync::Mutex::new(storage));
     let registry = SessionRegistry::new();
+    let (viewer, mut outbound) =
+        register_test_session_with_outbound(&registry, "StructureWarehouseViewer");
+    assert_eq!(
+        registry.register_chest_viewer(viewer, primary_chest_position),
+        1
+    );
+    assert_eq!(registry.register_chest_viewer(viewer, chest_position), 1);
     let (journal, pending) = crate::play::world_journal::WorldChunkJournal::open_for_test(
         temp.path(),
         Arc::clone(&blocks),
@@ -9289,11 +9414,16 @@ async fn structure_portion_journals_block_after_image_with_its_receipt() {
     let receipt = batch.encode_world_decision().unwrap();
     let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
     let (handle, mut owner) = simulation_channel_with_capacity(1);
-    let mut result = Box::pin(handle.commit_server_owned_block_edits(
+    let mut result = Box::pin(handle.commit_server_owned_structure_portion(
         "settlement",
         vec![BlockEdit::new(position, BlockStateId(1))],
         None,
         receipt,
+        WarehouseStructureMaterialDebit {
+            position: chest_position,
+            expected_container,
+            updated_container,
+        },
     ));
     // Receipt-bearing portions capture exact block tokens before their
     // authoritative write, then enqueue the decided mutation.
@@ -9335,11 +9465,57 @@ async fn structure_portion_journals_block_after_image_with_its_receipt() {
             .processed,
         1
     );
+    // The material participant captures its container fence separately from
+    // the structure block preconditions before it can enter the durable run.
+    assert_request_enqueued(result.as_mut(), &handle).await;
+    assert_eq!(
+        owner
+            .process_commands_with_world_views(
+                &registry,
+                Some(&world),
+                SimulationWorldAccess {
+                    read: Some(&read_view),
+                    mutation: Some(&mutation_view),
+                    cpu: Some(&resources),
+                    light: None,
+                },
+                None,
+                1,
+            )
+            .await
+            .processed,
+        1
+    );
     assert_eq!(result.await.unwrap(), Some(1));
     assert_eq!(
         world.lock().await.get_cached_block(position),
         Some(BlockStateId(1))
     );
+    assert_eq!(
+        world
+            .lock()
+            .await
+            .chest_block_entity(chest_position)
+            .unwrap(),
+        Some(updated_chest)
+    );
+    match outbound
+        .try_recv()
+        .expect("double chest viewer receives the debit")
+    {
+        OutboundCommand::ChestSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, primary_chest_position);
+            assert_eq!(state_id, 2);
+            assert_eq!(slots.len(), 54);
+            assert_eq!(slots[0], ItemStack::EMPTY);
+            assert_eq!(slots[27], ItemStack::new(42, 1));
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
     let journal = registry.world_chunk_journal().unwrap();
     let mut recovered = 0;
     journal
@@ -9412,6 +9588,7 @@ async fn queued_chest_commit_matches_direct_state_and_viewer_version() {
     let mut request = Box::pin(session_handle.commit_chest(
         queued_pos,
         vec![queued_pos],
+        vec![world.lock().await.block_mutation_token(queued_pos).unwrap()],
         1,
         vec![initial.clone()],
         vec![updated.clone()],
@@ -9478,6 +9655,7 @@ async fn resident_chest_commit_completes_while_global_world_writer_is_held() {
     let mut request = Box::pin(session_handle.commit_chest(
         position,
         vec![position],
+        vec![read_view.block_mutation_token(position).unwrap()],
         1,
         vec![initial],
         vec![updated.clone()],
@@ -9523,6 +9701,143 @@ async fn resident_chest_commit_completes_while_global_world_writer_is_held() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn resident_chest_commit_rejects_replaced_block_with_identical_contents() {
+    let (mut storage, position, opening_token) = test_block_storage();
+    let mut original = mc_world::ChestBlockEntity::default();
+    original.slots[0] = mc_world::FurnaceSlot {
+        item_id: 42,
+        count: 2,
+        ..Default::default()
+    };
+    storage
+        .set_chest_block_entity(position, original.clone())
+        .unwrap();
+    let read_view = storage.read_view();
+    let mutation_view = storage.mutation_view();
+    storage.set_block_at(position, BlockStateId(0)).unwrap();
+    storage.set_block_at(position, BlockStateId(1)).unwrap();
+    storage
+        .set_chest_block_entity(position, original.clone())
+        .unwrap();
+    assert_ne!(storage.block_mutation_token(position), Some(opening_token));
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let sessions = SessionRegistry::new();
+    let actor = register_test_session(&sessions, "ReplacedChestActor");
+    assert_eq!(sessions.register_chest_viewer(actor, position), 1);
+    let mut player = empty_container_player_plan();
+    player.updated_carried_item = ItemStack::new(42, 1);
+    register_test_player_state(&sessions, actor, player.expected_inventory.clone());
+    let mut updated = original.clone();
+    updated.slots[0].count = 1;
+    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+    let (handle, mut owner) = simulation_channel_with_capacity(1);
+    let response = handle
+        .enqueue(SimulationCommand::CommitChest {
+            primary_position: position,
+            positions: vec![position],
+            expected_tokens: Some(vec![opening_token]),
+            expected_state_id: 1,
+            actor_session: Some(actor),
+            expected: vec![original.clone()],
+            updated: vec![updated],
+            player: Some(Box::new(player)),
+            plugin_receipt: None,
+            treatment: None,
+        })
+        .unwrap();
+    assert_eq!(
+        owner
+            .process_commands_with_world_views(
+                &sessions,
+                Some(&world),
+                SimulationWorldAccess {
+                    read: Some(&read_view),
+                    mutation: Some(&mutation_view),
+                    cpu: Some(&resources),
+                    light: None,
+                },
+                None,
+                1,
+            )
+            .await
+            .processed,
+        1
+    );
+    assert!(
+        matches!(
+            response.await.unwrap().unwrap(),
+            SimulationResponse::ChestCommit(Ok(outcome))
+                if matches!(*outcome, SharedContainerCommit::Rejected { .. })
+        ),
+        "an old chest window must not commit against a replacement with matching slots"
+    );
+    assert_eq!(
+        world.lock().await.chest_block_entity(position).unwrap(),
+        Some(original)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn coordinator_chest_commit_rejects_replaced_block_with_identical_contents() {
+    let (mut storage, position, opening_token) = test_block_storage();
+    let mut original = mc_world::ChestBlockEntity::default();
+    original.slots[0] = mc_world::FurnaceSlot {
+        item_id: 42,
+        count: 2,
+        ..Default::default()
+    };
+    storage
+        .set_chest_block_entity(position, original.clone())
+        .unwrap();
+    storage.set_block_at(position, BlockStateId(0)).unwrap();
+    storage.set_block_at(position, BlockStateId(1)).unwrap();
+    storage
+        .set_chest_block_entity(position, original.clone())
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let sessions = SessionRegistry::new();
+    let actor = register_test_session(&sessions, "CoordinatorReplacedChestActor");
+    assert_eq!(sessions.register_chest_viewer(actor, position), 1);
+    let mut player = empty_container_player_plan();
+    player.updated_carried_item = ItemStack::new(42, 1);
+    register_test_player_state(&sessions, actor, player.expected_inventory.clone());
+    let mut updated = original.clone();
+    updated.slots[0].count = 1;
+    let (handle, mut owner) = simulation_channel_with_capacity(1);
+    let response = handle
+        .enqueue(SimulationCommand::CommitChest {
+            primary_position: position,
+            positions: vec![position],
+            expected_tokens: Some(vec![opening_token]),
+            expected_state_id: 1,
+            actor_session: Some(actor),
+            expected: vec![original.clone()],
+            updated: vec![updated],
+            player: Some(Box::new(player)),
+            plugin_receipt: None,
+            treatment: None,
+        })
+        .unwrap();
+    assert_eq!(
+        owner
+            .process_tick_with_world(&sessions, Some(&world), None, 1)
+            .processed,
+        1
+    );
+    assert!(matches!(
+        response.await.unwrap().unwrap(),
+        SimulationResponse::ChestCommit(Ok(outcome))
+            if matches!(*outcome, SharedContainerCommit::Rejected { .. })
+    ));
+    assert_eq!(
+        world.lock().await.chest_block_entity(position).unwrap(),
+        Some(original)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn resident_stale_chest_commit_returns_current_authoritative_state() {
     let mut initial = mc_world::ChestBlockEntity::default();
     initial.slots[0] = mc_world::FurnaceSlot {
@@ -9556,24 +9871,28 @@ async fn resident_stale_chest_commit_returns_current_authoritative_state() {
         .enqueue(SimulationCommand::CommitChest {
             primary_position: position,
             positions: vec![position],
+            expected_tokens: Some(vec![read_view.block_mutation_token(position).unwrap()]),
             expected_state_id: 1,
             actor_session: Some(actor),
             expected: vec![initial.clone()],
             updated: vec![first_update.clone()],
             player: Some(Box::new(player.clone())),
             plugin_receipt: None,
+            treatment: None,
         })
         .unwrap();
     let stale = handle
         .enqueue(SimulationCommand::CommitChest {
             primary_position: position,
             positions: vec![position],
+            expected_tokens: Some(vec![read_view.block_mutation_token(position).unwrap()]),
             expected_state_id: 1,
             actor_session: Some(actor),
             expected: vec![initial],
             updated: vec![stale_update],
             player: Some(Box::new(player)),
             plugin_receipt: None,
+            treatment: None,
         })
         .unwrap();
 
@@ -9674,12 +9993,14 @@ async fn chest_commits_in_distinct_regions_overlap() {
                 .enqueue(SimulationCommand::CommitChest {
                     primary_position: position,
                     positions: vec![position],
+                    expected_tokens: Some(vec![read_view.block_mutation_token(position).unwrap()]),
                     expected_state_id: 1,
                     actor_session: Some(actor),
                     expected: vec![initial.clone()],
                     updated: vec![updated.clone()],
                     player: Some(Box::new(empty_container_player_plan())),
                     plugin_receipt: None,
+                    treatment: None,
                 })
                 .unwrap()
         })
@@ -9795,24 +10116,28 @@ async fn queued_chest_commit_moves_container_player_cursor_and_drop_once() {
         .enqueue(SimulationCommand::CommitChest {
             primary_position: pos,
             positions: vec![pos],
+            expected_tokens: Some(vec![world.lock().await.block_mutation_token(pos).unwrap()]),
             expected_state_id: 1,
             actor_session: Some(actor),
             expected: vec![initial.clone()],
             updated: vec![first_update.clone()],
             player: Some(Box::new(player.clone())),
             plugin_receipt: None,
+            treatment: None,
         })
         .unwrap();
     let stale = handle
         .enqueue(SimulationCommand::CommitChest {
             primary_position: pos,
             positions: vec![pos],
+            expected_tokens: Some(vec![world.lock().await.block_mutation_token(pos).unwrap()]),
             expected_state_id: 1,
             actor_session: Some(actor),
             expected: vec![initial],
             updated: vec![stale_update],
             player: Some(Box::new(player)),
             plugin_receipt: None,
+            treatment: None,
         })
         .unwrap();
 
@@ -11317,6 +11642,7 @@ async fn server_owned_warehouse_deposit_appends_before_publishing_and_recovers_b
             updated_carried_item: carried_item,
         }),
         receipt,
+        treatment: None,
     };
 
     let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
@@ -11577,6 +11903,7 @@ async fn server_owned_warehouse_deposit_refuses_stale_fences_without_mutating() 
             updated_carried_item: ItemStack::EMPTY,
         }),
         receipt: receipt(&registry),
+        treatment: None,
     };
     let live_state_id = registry.chest_state_id(position);
     let stale_state_id = request(
@@ -11643,5 +11970,336 @@ async fn server_owned_warehouse_deposit_refuses_stale_fences_without_mutating() 
             decision.inventory_batch().unwrap().is_none(),
             "a refused deposit journals no receipt"
         );
+    }
+}
+
+/// Medicine spends a real chest stack and durably advances native health before
+/// either participant can be observed. A restart must not apply the heal twice.
+#[tokio::test(flavor = "current_thread")]
+async fn warehouse_treatment_commits_native_health_before_publication_and_replays_once() {
+    treatment_recovery_case(false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn warehouse_treatment_recovers_after_regional_commit_fails_after_world_debit() {
+    treatment_recovery_case(true, false).await;
+}
+
+/// The native health WAL can be compacted after the patient dies while the
+/// world debit remains pending; its linked acknowledgement still replays.
+#[tokio::test(flavor = "current_thread")]
+async fn warehouse_treatment_survives_patient_death_and_entity_checkpoint() {
+    treatment_recovery_case(false, true).await;
+}
+
+struct RefuseMedicalRegionalCommit(crate::play::persistence::FileRegionalDecisionJournal);
+
+impl mc_entity::RegionalDecisionJournal for RefuseMedicalRegionalCommit {
+    fn record_commit(
+        &mut self,
+        decision: &mc_entity::RegionalCommitDecision,
+    ) -> Result<(), mc_entity::RegionalDecisionJournalError> {
+        if decision
+            .upserts()
+            .iter()
+            .any(|snapshot| snapshot.retained.treatment_decision_id != 0)
+        {
+            return Err(mc_entity::RegionalDecisionJournalError::SAFE);
+        }
+        mc_entity::RegionalDecisionJournal::record_commit(&mut self.0, decision)
+    }
+
+    fn clear_commit(
+        &mut self,
+        phase: mc_entity::RegionPhase,
+    ) -> Result<(), mc_entity::RegionalDecisionJournalError> {
+        mc_entity::RegionalDecisionJournal::clear_commit(&mut self.0, phase)
+    }
+}
+
+async fn treatment_recovery_case(fail_native_commit: bool, remove_after_commit: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("region")).unwrap();
+    let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let item_id = items
+        .id_of(&Identifier::parse("minecraft:bread").unwrap())
+        .unwrap();
+    let mut storage = WorldStorage::open(temp.path(), Arc::clone(&blocks))
+        .unwrap()
+        .with_item_registry(Arc::clone(&items));
+    let chunk = ChunkPos { x: 0, z: 0 };
+    storage
+        .insert_generated_chunk(
+            chunk,
+            Chunk::empty(
+                chunk,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let position = BlockPos { x: 1, y: 64, z: 1 };
+    storage.set_block_at(position, BlockStateId(1)).unwrap();
+    let mut chest = ChestBlockEntity::default();
+    chest.slots[0] = mc_world::FurnaceSlot {
+        count: 2,
+        item_id,
+        ..mc_world::FurnaceSlot::EMPTY
+    };
+    assert!(
+        storage
+            .set_chest_block_entity(position, chest.clone())
+            .unwrap()
+    );
+    let read_view = storage.read_view();
+    let mutation_view = storage.mutation_view();
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let writer = crate::play::world_journal::JournalWriter::open(temp.path()).unwrap();
+    let (entity_journal, pending) = crate::play::persistence::FileRegionalDecisionJournal::open(
+        temp.path(),
+        Arc::clone(&writer),
+    )
+    .unwrap();
+    assert!(pending.is_empty());
+    let entity_journal: Box<dyn mc_entity::RegionalDecisionJournal> = if fail_native_commit {
+        Box::new(RefuseMedicalRegionalCommit(entity_journal))
+    } else {
+        Box::new(entity_journal)
+    };
+    let registry = Arc::new(SessionRegistry::new_with_entity_owner_journal(
+        1,
+        entity_journal,
+    ));
+    let uuid = uuid::Uuid::from_u128(0xabc47);
+    let spawned = registry.spawn_resident_entity_for_test(uuid, Vec3::new(2.0, 64.0, 2.0));
+    let mut wounded = spawned.clone();
+    wounded.health = 10.0;
+    assert!(
+        registry
+            .replay_resident_treatment(spawned, wounded.clone())
+            .unwrap()
+    );
+    let accepted = SessionRegistry::plan_resident_treatment(&wounded, 1, 3_000).unwrap();
+    assert_eq!(accepted.health, 13.0);
+
+    let (journal, pending) = crate::play::world_journal::WorldChunkJournal::open(
+        temp.path(),
+        Arc::clone(&blocks),
+        Arc::clone(&items),
+        Arc::clone(&writer),
+    )
+    .unwrap();
+    assert!(pending.is_empty());
+    registry.install_world_chunk_journal(journal);
+    let (observer, mut observer_outbound) =
+        register_test_session_with_outbound(&registry, "MedicalObserver");
+    assert_eq!(registry.register_chest_viewer(observer, position), 1);
+    let batch: crate::script::storage::PreparedStorageBatch =
+        serde_json::from_value(serde_json::json!({
+            "transaction_id": 1,
+            "plugin_id": "settlement",
+            "mutations": [{
+                "kind": "compare_and_swap",
+                "key": "medicine-charge",
+                "expected_version": null,
+                "value": "1"
+            }],
+            "treatment": {
+                "entity_uuid": uuid.to_string(),
+                "expected_health_bits": wounded.health.to_bits(),
+                "next_health_bits": accepted.health.to_bits()
+            }
+        }))
+        .unwrap();
+    let mut updated = chest.clone();
+    updated.slots[0].count = 1;
+    let request = WarehouseTransferRequest {
+        position,
+        expected_state_id: registry.chest_state_id(position),
+        expected_container: chest
+            .slots
+            .iter()
+            .map(crate::play::owned_inventory::container_slot_to_item)
+            .collect(),
+        updated_container: updated
+            .slots
+            .iter()
+            .map(crate::play::owned_inventory::container_slot_to_item)
+            .collect(),
+        player: None,
+        receipt: batch.encode_world_inventory().unwrap(),
+        treatment: Some(Arc::new(Mutex::new(Some(
+            crate::play::owned_inventory::PlannedResidentTreatment {
+                expected: wounded.clone(),
+                accepted,
+                operation_revision: 1,
+                heal_milli: 3_000,
+                mutation: None,
+            },
+        )))),
+    };
+    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+    let (handle, mut owner) = simulation_channel_with_capacity(1);
+    let (result, report) = tokio::join!(
+        handle.commit_warehouse_transfer(request),
+        owner.process_commands_with_world_views(
+            &registry,
+            Some(&world),
+            SimulationWorldAccess {
+                read: Some(&read_view),
+                mutation: Some(&mutation_view),
+                cpu: Some(&resources),
+                light: None,
+            },
+            None,
+            1,
+        )
+    );
+    assert_eq!(report.processed, 1);
+    let live_journal = registry.world_chunk_journal().unwrap();
+    let decision_id = live_journal.pending_decisions_for_test()[0].id();
+    if fail_native_commit {
+        assert!(
+            result.is_err(),
+            "regional WAL refusal cannot acknowledge treatment"
+        );
+    } else {
+        assert_eq!(
+            result.unwrap(),
+            WarehouseTransferOutcome::Committed { decision_id }
+        );
+    }
+    assert_eq!(
+        read_view
+            .snapshot_chunks(&[chunk])
+            .chunk(chunk)
+            .unwrap()
+            .chests[&position]
+            .slots[0]
+            .count,
+        1
+    );
+    if !fail_native_commit {
+        assert_eq!(
+            registry.resident_entity_snapshots(&[uuid]).await[0]
+                .as_ref()
+                .unwrap()
+                .health,
+            13.0
+        );
+    }
+    assert_eq!(
+        observer_outbound.try_recv().is_ok(),
+        !fail_native_commit,
+        "never publish a debit whose native health commit failed"
+    );
+    assert_eq!(live_journal.pending_treatments().unwrap().len(), 1);
+    assert_eq!(
+        live_journal.pending_treatments().unwrap()[0].3,
+        !fail_native_commit,
+        "WAM1 follows only a synced native regional commit"
+    );
+    if remove_after_commit {
+        assert!(registry.remove_resident_entity_for_test(wounded.id));
+        let (checkpoint, phases) = registry.persisted_entity_save_snapshot();
+        assert!(checkpoint.records.is_empty());
+        crate::play::persistence::save_persisted_entity_records(temp.path(), &items, &checkpoint)
+            .unwrap();
+        registry.clear_recovered_entity_commits(&phases).unwrap();
+    }
+    assert_eq!(live_journal.watermark(), None);
+    drop(live_journal);
+    drop(registry);
+    drop(owner);
+    drop(handle);
+    drop(world);
+    drop(read_view);
+    drop(mutation_view);
+    drop(observer_outbound);
+    drop(writer);
+
+    // Reopen both independent WALs, then restore native entities before
+    // projecting the world decision as the server does at startup.
+    let writer = crate::play::world_journal::JournalWriter::open(temp.path()).unwrap();
+    let (regional_journal, entity_decisions) =
+        crate::play::persistence::FileRegionalDecisionJournal::open(
+            temp.path(),
+            Arc::clone(&writer),
+        )
+        .unwrap();
+    let checkpoint = if remove_after_commit {
+        assert!(
+            entity_decisions.is_empty(),
+            "entity WAL was compacted after save"
+        );
+        crate::play::persistence::load_persisted_entities(
+            temp.path(),
+            &items,
+            &mc_data::entity_types::solaris_required_entity_types(),
+        )
+        .unwrap()
+    } else {
+        crate::play::persistence::PersistedEntityCheckpoint::new(
+            0,
+            Vec::<crate::play::persistence::PersistedEntityRecord>::new(),
+        )
+    };
+    let checkpoint =
+        crate::play::persistence::replay_regional_commit_decisions(checkpoint, &entity_decisions)
+            .unwrap();
+    assert_eq!(checkpoint.records.len(), usize::from(!remove_after_commit));
+    if !remove_after_commit {
+        assert_eq!(
+            checkpoint.records[0].snapshot.health,
+            if fail_native_commit { 10.0 } else { 13.0 },
+            "reopened regional WAL contains only native commits acknowledged before the cut"
+        );
+    }
+    let registry = Arc::new(SessionRegistry::new_with_entity_owner_journal(
+        1,
+        Box::new(regional_journal),
+    ));
+    assert_eq!(
+        registry.restore_persisted_entities(checkpoint),
+        usize::from(!remove_after_commit)
+    );
+    let (reopened, pending) = crate::play::world_journal::WorldChunkJournal::open(
+        temp.path(),
+        Arc::clone(&blocks),
+        Arc::clone(&items),
+        Arc::clone(&writer),
+    )
+    .unwrap();
+    let images = reopened.decode_pending(&pending).unwrap();
+    assert_eq!(images[0].chests[&position].slots[0].count, 1);
+    registry.install_world_chunk_journal(reopened);
+    let runtime = crate::script::storage::world_inventory::InventoryRuntime::new(
+        Some(temp.path()),
+        &crate::server::ShutdownHandle::default(),
+        Arc::clone(&registry),
+        Arc::clone(&items),
+        Arc::new(mc_data::item_components::solaris_required_item_facts()),
+    );
+    let ledger_root = tempfile::tempdir().unwrap();
+    let mut ledger = crate::script::storage::PluginStorage::open(ledger_root.path()).unwrap();
+    runtime.recover(&mut ledger).unwrap();
+    assert_eq!(registry.world_chunk_journal().unwrap().watermark(), None);
+    runtime.recover_pending_treatments().await.unwrap();
+    assert_eq!(
+        registry.world_chunk_journal().unwrap().watermark(),
+        Some(decision_id)
+    );
+    if remove_after_commit {
+        assert!(registry.resident_entity_snapshots(&[uuid]).await[0].is_none());
+    } else {
+        let restored = registry.resident_entity_snapshots(&[uuid]).await[0]
+            .clone()
+            .unwrap();
+        assert_eq!(
+            restored.health, 13.0,
+            "the regional marker prevents double healing"
+        );
+        assert_eq!(restored.retained.treatment_decision_id, 1);
     }
 }

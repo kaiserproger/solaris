@@ -214,6 +214,50 @@ impl LoaderManifest {
         })
     }
 
+    /// Refuse startup if a canonical server item is not represented by an
+    /// authorized, verified artifact from the same package.
+    pub fn validate_custom_items(
+        &self,
+        definitions: &[mc_data::item_components::CustomItemDefinition],
+    ) -> Result<(), LoaderHandshakeError> {
+        for definition in definitions {
+            let mut found = false;
+            for bundle in &self.bundles {
+                if bundle.owner != definition.id.namespace()
+                    || !bundle.content.contains(&LoaderContentKind::Items)
+                    || !bundle
+                        .permissions
+                        .contains(&LoaderPermission::RegisterItems)
+                {
+                    continue;
+                }
+                let Some(bytes) = &bundle.artifact_bytes else {
+                    continue;
+                };
+                let Some(path) = &bundle.source_path else {
+                    continue;
+                };
+                let index =
+                    read_index_from_artifact_bytes(bytes, path, bundle.size_bytes, &bundle.sha256)?;
+                if index.items.iter().any(|item| {
+                    item.id == definition.id.as_str()
+                        && item.base_item == definition.carrier.as_str()
+                        && item.name == definition.name
+                }) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(LoaderHandshakeError::ArtifactIndex(format!(
+                    "custom item {} needs a matching Loader item and register_items permission from its owner",
+                    definition.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bundles.is_empty()
@@ -651,6 +695,8 @@ struct LoaderArtifactIndex {
     screens: Vec<LoaderArtifactScreen>,
     #[serde(default)]
     blocks: Vec<LoaderArtifactBlock>,
+    #[serde(default)]
+    items: Vec<LoaderArtifactItem>,
 }
 
 /// The routing identity of one declared screen. The Loader owns the rest of the
@@ -670,6 +716,13 @@ struct LoaderArtifactBlock {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct LoaderArtifactItem {
+    id: String,
+    base_item: String,
+    name: String,
+}
+
 #[derive(Debug)]
 struct VerifiedLoaderBlock {
     id: String,
@@ -681,6 +734,7 @@ fn read_declared_index(
 ) -> Result<Option<LoaderArtifactIndex>, LoaderHandshakeError> {
     let declared = |content| bundle.content().contains(&content);
     if !declared(mc_script::ClientContentKind::Blocks)
+        && !declared(mc_script::ClientContentKind::Items)
         && !declared(mc_script::ClientContentKind::Views)
     {
         return Ok(None);
@@ -1550,6 +1604,60 @@ mod tests {
         ));
         assert!(matches!(
             read_index_from_artifact_bytes(&bytes, &path, size, &"0".repeat(64)),
+            Err(LoaderHandshakeError::ArtifactIndex(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_item_requires_matching_verified_artifact_and_registration_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("items.bundle");
+        let mut archive = zip::ZipWriter::new(File::create(&path).unwrap());
+        archive
+            .start_file(
+                LOADER_ARTIFACT_INDEX_PATH,
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(
+                br#"{"schema":2,"items":[{"id":"example:ruby","base_item":"minecraft:paper","name":"Ruby"}]}"#,
+            )
+            .unwrap();
+        archive.finish().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut manifest = manifest();
+        manifest.bundles[0].source_path = Some(path);
+        manifest.bundles[0].size_bytes = bytes.len() as u64;
+        manifest.bundles[0].sha256 = format!("{:x}", Sha256::digest(&bytes));
+        manifest.bundles[0].artifact_bytes = Some(Arc::from(bytes));
+        let definition = mc_data::item_components::CustomItemDefinition {
+            id: Identifier::parse("example:ruby").unwrap(),
+            carrier: Identifier::parse("minecraft:paper").unwrap(),
+            name: "Ruby".to_owned(),
+            crafting_ingredient: None,
+            facts: mc_data::item_components::ItemFacts {
+                max_stack_size: Some(16),
+                ..Default::default()
+            },
+        };
+        manifest
+            .validate_custom_items(std::slice::from_ref(&definition))
+            .unwrap();
+        manifest.bundles[0]
+            .permissions
+            .retain(|permission| *permission != LoaderPermission::RegisterItems);
+        assert!(matches!(
+            manifest.validate_custom_items(std::slice::from_ref(&definition)),
+            Err(LoaderHandshakeError::ArtifactIndex(_))
+        ));
+        manifest.bundles[0]
+            .permissions
+            .push(LoaderPermission::RegisterItems);
+        let mut wrong = definition.clone();
+        wrong.name = "Another item".to_owned();
+        assert!(matches!(
+            manifest.validate_custom_items(std::slice::from_ref(&wrong)),
             Err(LoaderHandshakeError::ArtifactIndex(_))
         ));
     }

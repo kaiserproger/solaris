@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use mc_data::block_light::BlockLightTable;
+
 use super::{
-    BlockPos, ChestBlockEntity, ResidentBlockEditBatchResult, ResidentBlockEntityChange,
-    ResidentBlockPrecondition, ResidentChunkTransaction, ResidentCrossRegionStagedChunk,
-    WorldMutationView, chunk_pos_of, region_of,
+    BlockPos, ChestBlockEntity, ResidentBlockEdit, ResidentBlockEditBatchResult,
+    ResidentBlockEntityChange, ResidentBlockPrecondition, ResidentChunkTransaction,
+    ResidentCrossRegionScheduledBlockTickPrepareResult, ResidentCrossRegionStagedChunk,
+    ResidentScheduledBlockTickPlan, WorldMutationView, chunk_pos_of, region_of,
 };
 
 impl WorldMutationView {
@@ -104,6 +107,47 @@ impl WorldMutationView {
             #[cfg(test)]
             publish_hook: None,
         })
+    }
+}
+
+impl WorldMutationView {
+    /// Stages structure blocks and one physical material-container debit through
+    /// the shared cross-region transaction path. The durable caller writes its
+    /// chunk images before either after-image is published.
+    pub fn prepare_structure_chest_inventory_transaction(
+        &self,
+        edits: &[ResidentBlockEdit],
+        preconditions: &[ResidentBlockPrecondition],
+        chest: &ResidentBlockEntityChange<ChestBlockEntity>,
+        chest_precondition: &ResidentBlockPrecondition,
+        revision: u64,
+        light_table: Option<&BlockLightTable>,
+    ) -> Result<ResidentChunkTransaction, ResidentBlockEditBatchResult> {
+        if revision == 0 || revision > i64::MAX as u64 {
+            return Err(ResidentBlockEditBatchResult::Stale);
+        }
+        let plan = ResidentScheduledBlockTickPlan {
+            consumed_ticks: &[],
+            edits,
+            preconditions,
+            light_table,
+            leaf_trigger_tick: None,
+        };
+        match self.prepare_cross_region_scheduled_block_tick_transaction_with_chest(
+            Some(revision),
+            &plan,
+            Some((chest, chest_precondition)),
+        ) {
+            ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(transaction) => {
+                Ok(transaction)
+            }
+            ResidentCrossRegionScheduledBlockTickPrepareResult::Missing => {
+                Err(ResidentBlockEditBatchResult::Missing)
+            }
+            ResidentCrossRegionScheduledBlockTickPrepareResult::Stale => {
+                Err(ResidentBlockEditBatchResult::Stale)
+            }
+        }
     }
 }
 

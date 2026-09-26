@@ -1194,6 +1194,17 @@ impl EntityOwnerAccess {
         removed
     }
 
+    pub(super) fn try_replace_snapshot_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<bool, mc_entity::RegionOwnerLaneError> {
+        let id = expected.id;
+        let applied = self.try_call(|handle| handle.replace_snapshot_if_current(expected, next));
+        self.invalidate(id);
+        applied
+    }
+
     pub(super) fn replace_snapshot_if_current(
         &mut self,
         expected: EntitySnapshot,

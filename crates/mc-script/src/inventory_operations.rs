@@ -303,7 +303,6 @@ impl ScriptOwnedInventoryOperation {
                 expected_revisions,
                 ..
             } => {
-                validate_player(*actor_id)?;
                 if transfers.is_empty()
                     || transfers.len() > MAX_OWNED_INVENTORY_TRANSFERS
                     || expected_revisions.len() > MAX_OWNED_INVENTORY_TRANSFERS * 2
@@ -330,6 +329,28 @@ impl ScriptOwnedInventoryOperation {
                         .ok_or(ScriptDtoError::InvalidBounds)?;
                     endpoints.insert(&transfer.source);
                     endpoints.insert(&transfer.destination);
+                }
+                if *actor_id == 0 {
+                    let warehouse = endpoints.iter().any(|endpoint| {
+                        matches!(endpoint, ScriptInventoryEndpoint::Warehouse { .. })
+                    });
+                    let resident = endpoints.iter().any(|endpoint| {
+                        matches!(
+                            endpoint,
+                            ScriptInventoryEndpoint::ResidentEquipment { .. }
+                                | ScriptInventoryEndpoint::ResidentCarry { .. }
+                        )
+                    });
+                    if !warehouse
+                        || !resident
+                        || endpoints.iter().any(|endpoint| {
+                            matches!(endpoint, ScriptInventoryEndpoint::PlayerInventory { .. })
+                        })
+                    {
+                        return Err(ScriptDtoError::InvalidBounds);
+                    }
+                } else {
+                    validate_player(*actor_id)?;
                 }
                 if endpoints.len() != expected_revisions.len() {
                     return Err(ScriptDtoError::InvalidBounds);

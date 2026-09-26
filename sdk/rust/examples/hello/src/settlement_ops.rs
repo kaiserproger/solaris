@@ -448,11 +448,13 @@ impl Fixture {
                 prepare_structure(
                     "settle-prepare",
                     operation_id,
+                    &site.id,
                     &self.blueprint,
                     anchor(site.origin),
                     ROTATION,
                     token,
                     expected,
+                    None,
                 )
             }
             Step::Status => match self.structure.as_ref() {

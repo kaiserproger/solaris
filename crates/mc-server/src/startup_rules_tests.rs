@@ -13,6 +13,7 @@ fn open_world(path: &Path, rules: Option<&str>) -> anyhow::Result<WorldSource> {
         "vanilla",
         mc_world::WorldSpawn::default(),
         rules,
+        None,
     )
 }
 
@@ -42,6 +43,39 @@ fn startup_rules_cannot_be_added_to_an_existing_unconfigured_world() {
     open_world(world.path(), None).unwrap();
     let original = std::fs::read(world_contract_path(world.path())).unwrap();
     assert!(open_world(world.path(), Some("added")).is_err());
+    assert_eq!(
+        std::fs::read(world_contract_path(world.path())).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn custom_item_catalog_must_match_across_world_restarts() {
+    let world = tempfile::tempdir().unwrap();
+    let open = |identity| {
+        ensure_world_contract_with_spawn(
+            world.path(),
+            mc_world::OVERWORLD_GEOMETRY,
+            712_816,
+            "tellus_like",
+            "vanilla",
+            "vanilla",
+            mc_world::WorldSpawn::default(),
+            None,
+            identity,
+        )
+    };
+    assert_eq!(
+        open(Some("component-items:original")).unwrap(),
+        WorldSource::SolarisGenerated
+    );
+    let original = std::fs::read(world_contract_path(world.path())).unwrap();
+    assert_eq!(
+        open(Some("component-items:original")).unwrap(),
+        WorldSource::SolarisGenerated
+    );
+    assert!(open(Some("component-items:changed")).is_err());
+    assert!(open(None).is_err());
     assert_eq!(
         std::fs::read(world_contract_path(world.path())).unwrap(),
         original

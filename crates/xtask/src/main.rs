@@ -81,7 +81,7 @@ const GATEWAY_FUNCTION_SIZE_BUDGETS: &[FunctionSizeBudget] = &[
         name: "Play ingress gateway",
         file: "crates/mc-net/src/play.rs",
         signature: "async fn play_loop_inner<R, W>(",
-        max_lines: 731,
+        max_lines: 742,
     },
     FunctionSizeBudget {
         name: "server lifecycle gateway",

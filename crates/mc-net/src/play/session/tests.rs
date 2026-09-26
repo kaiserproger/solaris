@@ -10405,7 +10405,8 @@ fn registration<'a>(
         pose: PlayerPose::new(0.5, 64.0, 0.5),
         game_mode: mc_domain::GameMode::Survival,
         max_sessions,
-        script_operator: false,
+        script_permissions: crate::server::CommandPermissionConfig::default(),
+        peer: "127.0.0.1:40000".parse().unwrap(),
         dimension: "minecraft:overworld",
         loader_session: None,
     }
@@ -10459,7 +10460,8 @@ async fn profile_properties_reach_observer_player_info_wire_packet() {
             pose: PlayerPose::new(1.5, 64.0, 0.5),
             game_mode: mc_domain::GameMode::Survival,
             max_sessions: usize::MAX,
-            script_operator: false,
+            script_permissions: crate::server::CommandPermissionConfig::default(),
+            peer: "127.0.0.1:40000".parse().unwrap(),
             dimension: "minecraft:overworld",
             loader_session: None,
         })

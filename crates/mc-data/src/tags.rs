@@ -1215,7 +1215,7 @@ impl TagsData {
         self.registries
             .get(&registry)
             .and_then(|tags| tags.get(&tag))
-            .is_some_and(|entries| entries.binary_search(&raw_id).is_ok())
+            .is_some_and(|entries| entries.contains(&raw_id))
     }
 
     /// Number of `(registry, tag)` pairs the packet will emit.
@@ -1890,6 +1890,13 @@ mod tests {
                 .get(&Identifier::parse("minecraft:planks").unwrap())
                 .unwrap()
                 .contains(&38)
+        );
+        let egg_id = items
+            .id_of(&Identifier::parse("minecraft:egg").unwrap())
+            .expect("egg is in the required item registry");
+        assert!(
+            tags.contains_raw_id("minecraft:item", "minecraft:eggs", egg_id as i32),
+            "recipe tag membership must not depend on source ordering"
         );
     }
 

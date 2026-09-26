@@ -42,6 +42,7 @@
 //! One action is outstanding at a time, and nothing here waits: each step is the
 //! answer to the request the previous one staged.
 
+use solaris_plugin_sdk::commands;
 use solaris_plugin_sdk::events::{
     CommandInvoked, Event, OperationAnswered, OperationOutcome, OperationPayload,
 };
@@ -52,7 +53,7 @@ use solaris_plugin_sdk::inventories::{
 };
 use solaris_plugin_sdk::operation_types::OperationFailure;
 use solaris_plugin_sdk::{
-    log, message_player, query_owned_inventory, reserve_inventory_items, transfer_owned_items,
+    log, message_session, query_owned_inventory, reserve_inventory_items, transfer_owned_items,
     Command, Config, Failure, LogLevel,
 };
 
@@ -71,6 +72,8 @@ const UNEXPECTED: &str = "P3_INV_UNEXPECTED";
 
 /// The marker prefix every concluded step is reported under.
 const MARKER: &str = "P3_INV";
+const LEFT: &str = "P3_INV_LEFT";
+const LATE_MOVE: &str = "P3_INV_MOVE_ANSWERED";
 
 /// The hotbar slot the world's own durable player file puts the tool in, and the
 /// free hotbar slot a transfer stows it in.
@@ -109,6 +112,8 @@ const FOREIGN_FENCE: &str = "inv-foreign-fence";
 const FOREIGN_REQUEST: &str = "inv-foreign";
 const FOREIGN_OPERATION: &str = "inv-op-foreign";
 const REPLAY_REQUEST: &str = "inv-replay";
+const STATUS_REQUEST: &str = "inv-status";
+const EXPIRED_REQUEST: &str = "inv-expired";
 const CONFLICT_REQUEST: &str = "inv-conflict";
 
 /// One owned-inventory action a player can ask the fixture for.
@@ -134,6 +139,10 @@ enum Action {
     Reserve,
     /// Submit the last committed transfer's record again.
     Replay,
+    /// Read the durable outcome without resubmitting the transfer.
+    Status,
+    /// Read the old session's inventory after the same identity reconnects.
+    Expired,
     /// Submit that record under the same durable id with different content.
     Conflict,
 }
@@ -151,6 +160,8 @@ impl Action {
             "absent-carry" => Self::AbsentCarry,
             "absent-warehouse" => Self::AbsentWarehouse,
             "reserve" => Self::Reserve,
+            "expired" => Self::Expired,
+            "status" => Self::Status,
             "replay" => Self::Replay,
             "conflict" => Self::Conflict,
             _ => return None,
@@ -170,6 +181,8 @@ impl Action {
             Self::AbsentWarehouse => "absent-warehouse",
             Self::Reserve => "reserve",
             Self::Replay => "replay",
+            Self::Expired => "expired",
+            Self::Status => "status",
             Self::Conflict => "conflict",
         }
     }
@@ -184,6 +197,23 @@ impl Action {
             Self::Foreign => Some(FOREIGN_FENCE),
             Self::Reserve => Some(RESERVE_FENCE),
             _ => None,
+        }
+    }
+
+    fn answer_request(self) -> &'static str {
+        match self {
+            Self::Query | Self::AbsentResident | Self::AbsentCarry | Self::AbsentWarehouse => {
+                QUERY_REQUEST
+            }
+            Self::Expired => EXPIRED_REQUEST,
+            Self::Move => MOVE_REQUEST,
+            Self::Restore => RESTORE_REQUEST,
+            Self::Stale => STALE_REQUEST,
+            Self::Foreign => FOREIGN_REQUEST,
+            Self::Reserve => RESERVE_REQUEST,
+            Self::Replay => REPLAY_REQUEST,
+            Self::Status => STATUS_REQUEST,
+            Self::Conflict => CONFLICT_REQUEST,
         }
     }
 }
@@ -232,8 +262,6 @@ struct TransferRecord {
 pub struct Fixture {
     /// The session of the connection the action in flight runs on.
     session: u64,
-    /// The player the marker goes to, from the command that began the action.
-    reporter: String,
     /// The action in flight, if any.
     action: Option<Action>,
     /// What the fixture is waiting for.
@@ -261,7 +289,6 @@ impl Fixture {
         }
         Ok(Self {
             session: 0,
-            reporter: String::new(),
             action: None,
             step: Step::Idle,
             fence: None,
@@ -288,10 +315,14 @@ impl Fixture {
             commands.extend(self.answer(event)?);
         }
         for event in events {
-            if let Event::CommandInvoked(invoked) = event {
-                if invoked.name == ROOT {
+            match event {
+                Event::CommandInvoked(invoked) if invoked.name == ROOT => {
                     commands.extend(self.begin(invoked)?);
                 }
+                Event::PlayerLeft(left) if left.session == self.session => {
+                    log(LogLevel::Debug, &format!("{LEFT} {}", left.session));
+                }
+                _ => {}
             }
         }
         Ok(commands)
@@ -313,7 +344,6 @@ impl Fixture {
             )));
         };
         self.session = invoked.session;
-        self.reporter = invoked.player.clone();
         self.action = Some(action);
         self.fence = None;
         // A fence read is the first step of every mutation action, and the final
@@ -350,6 +380,15 @@ impl Fixture {
                 InventoryEndpoint::Warehouse(ABSENT_WAREHOUSE.to_owned()),
                 None,
             ),
+            Action::Expired => {
+                let Some(record) = &self.last_transfer else {
+                    return Err(self.unexpected("no old session to query"));
+                };
+                if record.actor_id == self.session {
+                    return Err(self.unexpected("the connection did not change session"));
+                }
+                query_owned_inventory(EXPIRED_REQUEST, player_endpoint(record.actor_id), None)
+            }
             Action::Move => {
                 let fence = self.read_fence()?;
                 let record = transfer_record(
@@ -442,6 +481,15 @@ impl Fixture {
                     record.expected_revisions.clone(),
                 )
             }
+            Action::Status => {
+                let Some(record) = &self.last_transfer else {
+                    return Err(self.unexpected("no committed transfer to query"));
+                };
+                Command::OperationStatus(commands::OperationStatus {
+                    request: STATUS_REQUEST.to_owned(),
+                    operation_id: record.operation_id.clone(),
+                })
+            }
             Action::Conflict => {
                 let Some(record) = &self.last_transfer else {
                     return Err(self.unexpected("no transfer was committed to reuse"));
@@ -516,6 +564,9 @@ impl Fixture {
         action: Action,
         answered: &OperationAnswered,
     ) -> Result<Vec<Command>, Failure> {
+        if answered.request != action.answer_request() {
+            return Err(self.unexpected("the operation answered a different request"));
+        }
         match action {
             Action::Query => {
                 if answered.operation_id.is_some() {
@@ -543,11 +594,15 @@ impl Fixture {
             Action::Move | Action::Restore => {
                 let revision = self.expect_transfer(action, answered)?;
                 self.record_revision(revision);
+                if action == Action::Move {
+                    log(LogLevel::Debug, LATE_MOVE);
+                }
                 Ok(vec![self.report(&format!(
                     "{} committed revision={revision}",
                     action.name()
                 ))])
             }
+            Action::Expired => self.expect_refusal(action, answered, OperationFailure::NotFound),
             Action::Stale => self.expect_refusal(action, answered, OperationFailure::StaleRevision),
             Action::Foreign => self.expect_refusal(action, answered, OperationFailure::Forbidden),
             Action::Conflict => {
@@ -567,6 +622,18 @@ impl Fixture {
                 Ok(vec![self.report(&format!(
                     "replay committed revision={revision} replayed=true"
                 ))])
+            }
+            Action::Status => {
+                let revision = self.expect_transfer(Action::Status, answered)?;
+                let Some(record) = &self.last_transfer else {
+                    return Err(self.unexpected("a status concluded without a recorded transfer"));
+                };
+                if revision != record.revision {
+                    return Err(self.unexpected("status returned a different committed revision"));
+                }
+                Ok(vec![
+                    self.report(&format!("status committed revision={revision}"))
+                ])
             }
             Action::Reserve => {
                 let reservation = self.reservation(answered)?;
@@ -630,7 +697,7 @@ impl Fixture {
         let expected_operation = match action {
             Action::Move => MOVE_OPERATION,
             Action::Restore => RESTORE_OPERATION,
-            Action::Replay => self
+            Action::Replay | Action::Status => self
                 .last_transfer
                 .as_ref()
                 .map_or(REPLAY_REQUEST, |record| record.operation_id.as_str()),
@@ -649,7 +716,17 @@ impl Fixture {
         else {
             return Err(self.unexpected("a transfer answered a payload that is not a fence list"));
         };
-        let endpoint = player_endpoint(self.session);
+        // A replay answers the committed old session, never the connection that
+        // happened to request this receipt after reconnecting.
+        let actor_id = if matches!(action, Action::Replay | Action::Status) {
+            self.last_transfer
+                .as_ref()
+                .ok_or_else(|| self.unexpected("a replay lost its recorded actor"))?
+                .actor_id
+        } else {
+            self.session
+        };
+        let endpoint = player_endpoint(actor_id);
         let Some(entry) = inventories
             .iter()
             .find(|expected| same_endpoint(&expected.endpoint, &endpoint))
@@ -730,9 +807,10 @@ impl Fixture {
         ))])
     }
 
-    /// One marker line to the player who asked.
+    /// One marker to the exact session that asked. A committed late answer must
+    /// never be retargeted to a replacement connection of the same identity.
     fn report(&self, body: &str) -> Command {
-        message_player(&self.reporter, format!("{MARKER} {body}"))
+        message_session(self.session, format!("{MARKER} {body}"))
     }
 
     /// Log one step this fixture could not conclude, and fail the callback with it

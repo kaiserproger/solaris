@@ -158,20 +158,37 @@ impl CommandPermissionConfig {
 
     /// Re-resolve operator authority for an already connected player.
     ///
-    /// The login-time loopback developer fallback stays in force only while no
-    /// operator is configured, matching what a fresh login would decide.
+    /// The loopback developer fallback uses the actual connection peer,
+    /// not the login-time operator bit, which may have since been revoked.
     #[must_use]
     pub(crate) fn live_permissions_for(
         &self,
         name: &str,
         uuid: &str,
-        login_resolved: play::commands::CommandPermissions,
+        peer: SocketAddr,
+    ) -> play::commands::CommandPermissions {
+        self.live_permissions_for_normalized(
+            &name.to_ascii_lowercase(),
+            &uuid.to_ascii_lowercase(),
+            peer,
+        )
+    }
+
+    /// The caller holds normalized identifiers derived from the verified profile.
+    /// Movement observations can reuse them without allocating on every packet.
+    pub(crate) fn live_permissions_for_normalized(
+        &self,
+        name: &str,
+        uuid: &str,
+        peer: SocketAddr,
     ) -> play::commands::CommandPermissions {
         let operators = self.operators.load();
-        let listed = operators.contains(&name.to_ascii_lowercase())
-            || operators.contains(&uuid.to_ascii_lowercase());
+        let listed = operators.contains(name) || operators.contains(uuid);
         play::commands::CommandPermissions::from_op(
-            listed || (login_resolved.is_op() && operators.is_empty()),
+            listed
+                || (operators.is_empty()
+                    && self.allow_local_dev_operators
+                    && is_loopback_peer(peer)),
         )
     }
 
@@ -2871,18 +2888,6 @@ async fn bind_internal(
     } else {
         None
     };
-    let script_storage =
-        scripts
-            .as_ref()
-            .zip(inventory_storage)
-            .map(|(scripts, (storage, inventory))| {
-                PluginStorageHandle::start(
-                    storage,
-                    inventory,
-                    scripts.clone(),
-                    config.shutdown.clone(),
-                )
-            });
     play::configure_session_arrow_kill_rewards(&sessions, &config);
     play::configure_session_player_combat(&sessions, &config);
     play::prepare_spawn_chunk(&config, chunk_pipeline_resources.clone())
@@ -2991,6 +2996,21 @@ async fn bind_internal(
     } else {
         ConnectionWorld::default()
     };
+    if let Some((_, inventory)) = inventory_storage.as_ref() {
+        inventory.recover_pending_treatments().await?;
+    }
+    let script_storage =
+        scripts
+            .as_ref()
+            .zip(inventory_storage)
+            .map(|(scripts, (storage, inventory))| {
+                PluginStorageHandle::start(
+                    storage,
+                    inventory,
+                    scripts.clone(),
+                    config.shutdown.clone(),
+                )
+            });
     if let Some(world_read) = connection_world.read.as_ref() {
         simulation_owner.configure_player_movement_authority(
             world_read.clone(),

@@ -11,14 +11,20 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MAX_SCRIPT_WORLD_TIME, ScriptDtoError, check_contract_resource_id, validate_bounded_nonempty,
-    validate_generation_id, validate_spawn_site_token,
+    MAX_SCRIPT_BLOCK_COORDINATE, MAX_SCRIPT_WORLD_TIME, ScriptDtoError, check_contract_resource_id,
+    validate_bounded_nonempty, validate_generation_id, validate_spawn_site_token,
 };
 
 /// Maximum sites returned by one `list_sites` or `query_site` page.
 pub const MAX_SETTLEMENT_SITE_PAGE: usize = 64;
-/// Maximum buildings placed into one settlement site.
+/// Maximum buildings listed by one authored settlement site.
 pub const MAX_SETTLEMENT_PLACEMENTS: usize = 128;
+/// Maximum buildings listed by one generated vanilla village site.
+///
+/// This is a host-side payload budget, not a claim about the generator's largest
+/// possible village. It stays separate from the authored catalog-site bound so
+/// an ordinary generated village does not weaken that contract.
+pub const MAX_VANILLA_VILLAGE_BUILDINGS: usize = 512;
 /// Maximum points of interest attached to one settlement site.
 pub const MAX_SETTLEMENT_POIS: usize = 128;
 /// Maximum inhabitants generated for one settlement site.
@@ -297,6 +303,279 @@ impl ScriptSettlementPoi {
     }
 }
 
+/// One typed interaction point a player proposes for a building certificate.
+///
+/// The vocabulary is the server's own functional check surface, not a new
+/// domain taxonomy: entrances (reachable access), POIs (home/work/meeting/
+/// guard roles with bounded capacity, reusing `ScriptSitePoiKind`), workstations
+/// (craft and production capability with bounded workplaces), and storage
+/// (container endpoints). The server checks each point against the live world
+/// at recognition time; the DTO only bounds and names them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum ScriptBuildingInteractionPoint {
+    Entrance {
+        at: [i32; 3],
+    },
+    Poi {
+        poi_kind: ScriptSitePoiKind,
+        at: [i32; 3],
+        capacity: u16,
+    },
+    Workstation {
+        at: [i32; 3],
+        capability: String,
+        workplaces: u16,
+    },
+    Storage {
+        at: [i32; 3],
+    },
+}
+
+impl ScriptBuildingInteractionPoint {
+    #[must_use]
+    pub fn at(&self) -> [i32; 3] {
+        match self {
+            Self::Entrance { at }
+            | Self::Poi { at, .. }
+            | Self::Workstation { at, .. }
+            | Self::Storage { at } => *at,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ScriptDtoError> {
+        validate_warehouse_position(self.at())?;
+        match self {
+            Self::Poi { capacity, .. } if *capacity == 0 => {
+                return Err(ScriptDtoError::InvalidBounds);
+            }
+            Self::Workstation {
+                capability,
+                workplaces,
+                ..
+            } => {
+                validate_building_station_capability(capability)?;
+                if *workplaces == 0 {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn cmp_interaction_points(
+    left: &ScriptBuildingInteractionPoint,
+    right: &ScriptBuildingInteractionPoint,
+) -> std::cmp::Ordering {
+    fn rank(point: &ScriptBuildingInteractionPoint) -> u8 {
+        match point {
+            ScriptBuildingInteractionPoint::Entrance { .. } => 0,
+            ScriptBuildingInteractionPoint::Poi { .. } => 1,
+            ScriptBuildingInteractionPoint::Workstation { .. } => 2,
+            ScriptBuildingInteractionPoint::Storage { .. } => 3,
+        }
+    }
+    rank(left)
+        .cmp(&rank(right))
+        .then_with(|| match (left, right) {
+            (
+                ScriptBuildingInteractionPoint::Poi {
+                    poi_kind: left_kind,
+                    capacity: left_capacity,
+                    at: left_at,
+                },
+                ScriptBuildingInteractionPoint::Poi {
+                    poi_kind: right_kind,
+                    capacity: right_capacity,
+                    at: right_at,
+                },
+            ) => left_kind
+                .as_str()
+                .cmp(right_kind.as_str())
+                .then_with(|| left_capacity.cmp(right_capacity))
+                .then_with(|| left_at.cmp(right_at)),
+            (
+                ScriptBuildingInteractionPoint::Workstation {
+                    capability: left_capability,
+                    workplaces: left_workplaces,
+                    at: left_at,
+                },
+                ScriptBuildingInteractionPoint::Workstation {
+                    capability: right_capability,
+                    workplaces: right_workplaces,
+                    at: right_at,
+                },
+            ) => left_capability
+                .cmp(right_capability)
+                .then_with(|| left_workplaces.cmp(right_workplaces))
+                .then_with(|| left_at.cmp(right_at)),
+            _ => left.at().cmp(&right.at()),
+        })
+}
+
+fn validate_interaction_points(
+    points: &[ScriptBuildingInteractionPoint],
+) -> Result<(), ScriptDtoError> {
+    if points.is_empty() || points.len() > MAX_SETTLEMENT_POIS {
+        return Err(ScriptDtoError::InvalidBounds);
+    }
+    let mut positions = BTreeSet::new();
+    for point in points {
+        point.validate()?;
+        if !positions.insert(point.at()) {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+    }
+    Ok(())
+}
+
+fn building_point_in_footprint(footprint: &ScriptSurveyBounds, at: [i32; 3]) -> bool {
+    (footprint.min[0]..=footprint.max[0]).contains(&at[0])
+        && (footprint.min[1]..=footprint.max[1]).contains(&at[1])
+        && (footprint.min[2]..=footprint.max[2]).contains(&at[2])
+}
+
+fn validate_points_in_footprint(
+    footprint: &ScriptSurveyBounds,
+    points: &[ScriptBuildingInteractionPoint],
+) -> Result<(), ScriptDtoError> {
+    if points
+        .iter()
+        .any(|point| !building_point_in_footprint(footprint, point.at()))
+    {
+        return Err(ScriptDtoError::InvalidBounds);
+    }
+    Ok(())
+}
+
+fn validate_building_purpose(value: &str) -> Result<(), ScriptDtoError> {
+    validate_bounded_nonempty("building purpose", value, MAX_BLUEPRINT_ID_BYTES)?;
+    check_contract_resource_id(value)
+}
+
+fn validate_building_station_capability(value: &str) -> Result<(), ScriptDtoError> {
+    validate_bounded_nonempty("building station capability", value, MAX_BLUEPRINT_ID_BYTES)?;
+    check_contract_resource_id(value)
+}
+
+fn validate_building_certificate_id(value: &str) -> Result<(), ScriptDtoError> {
+    validate_bounded_nonempty("building certificate id", value, MAX_STRUCTURE_ID_BYTES)
+}
+
+/// One bounded request to recognize a player-built volume as a functional building.
+///
+/// `purpose` is a content-defined id (a contract resource id, 1..64 bytes),
+/// never a closed core taxonomy: compound and content-defined purposes from
+/// the building catalog stay in content, while core only checks the typed
+/// interaction points. The footprint reuses the existing survey bounds; the
+/// point list reuses the settled POI budget (`MAX_SETTLEMENT_POIS`), so no new
+/// domain limit is introduced here. `survey_token` is the fence, as in
+/// `BindManualWarehouse`: the caller's own live token, checked for ownership
+/// and freshness at recognition time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ScriptBuildingCertificateRequest {
+    pub footprint: ScriptSurveyBounds,
+    pub purpose: String,
+    pub interaction_points: Vec<ScriptBuildingInteractionPoint>,
+    pub survey_token: String,
+    pub expected_world_revision: u64,
+}
+
+impl ScriptBuildingCertificateRequest {
+    #[must_use]
+    pub fn new(
+        footprint: ScriptSurveyBounds,
+        purpose: String,
+        interaction_points: Vec<ScriptBuildingInteractionPoint>,
+        survey_token: String,
+        expected_world_revision: u64,
+    ) -> Self {
+        Self {
+            footprint,
+            purpose,
+            interaction_points,
+            survey_token,
+            expected_world_revision,
+        }
+    }
+
+    /// Order the points so equal requests compare equal on the wire.
+    pub fn canonicalize(&mut self) {
+        self.interaction_points
+            .sort_unstable_by(cmp_interaction_points);
+    }
+
+    pub fn validate(&self) -> Result<(), ScriptDtoError> {
+        self.footprint.validate()?;
+        validate_building_purpose(&self.purpose)?;
+        validate_bounded_nonempty("survey token", &self.survey_token, MAX_SURVEY_TOKEN_BYTES)?;
+        validate_interaction_points(&self.interaction_points)?;
+        validate_points_in_footprint(&self.footprint, &self.interaction_points)?;
+        validate_revision(self.expected_world_revision)
+    }
+}
+
+/// One bounded recognition of a player-built volume as a functional building.
+///
+/// Mirrors the request the server accepted, plus the opaque certificate
+/// handle, the world revision it was recognized against, and the
+/// certificate's own revision. Capacity, workplaces, and capabilities are
+/// derived at runtime through the same native path as blueprinted
+/// construction, never stored as a second authority here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ScriptBuildingCertificate {
+    pub certificate_id: String,
+    pub footprint: ScriptSurveyBounds,
+    pub purpose: String,
+    pub interaction_points: Vec<ScriptBuildingInteractionPoint>,
+    pub world_revision: u64,
+    pub revision: u64,
+}
+
+impl ScriptBuildingCertificate {
+    #[must_use]
+    pub fn new(
+        certificate_id: String,
+        footprint: ScriptSurveyBounds,
+        purpose: String,
+        interaction_points: Vec<ScriptBuildingInteractionPoint>,
+        world_revision: u64,
+        revision: u64,
+    ) -> Self {
+        Self {
+            certificate_id,
+            footprint,
+            purpose,
+            interaction_points,
+            world_revision,
+            revision,
+        }
+    }
+
+    /// Order the points so equal certificates compare equal on the wire.
+    pub fn canonicalize(&mut self) {
+        self.interaction_points
+            .sort_unstable_by(cmp_interaction_points);
+    }
+
+    pub fn validate(&self) -> Result<(), ScriptDtoError> {
+        validate_building_certificate_id(&self.certificate_id)?;
+        self.footprint.validate()?;
+        validate_building_purpose(&self.purpose)?;
+        validate_interaction_points(&self.interaction_points)?;
+        validate_points_in_footprint(&self.footprint, &self.interaction_points)?;
+        validate_revision(self.world_revision)?;
+        validate_revision(self.revision)
+    }
+}
+
 /// One fully described settlement site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -369,7 +648,11 @@ impl ScriptSettlementSite {
         validate_site_id(&self.site_id)?;
         validate_revision(self.revision)?;
         validate_site_footprint(self.footprint_size)?;
-        if self.buildings.len() > MAX_SETTLEMENT_PLACEMENTS
+        let building_limit = match self.provenance {
+            ScriptSiteProvenance::Authored => MAX_SETTLEMENT_PLACEMENTS,
+            ScriptSiteProvenance::VanillaVillage => MAX_VANILLA_VILLAGE_BUILDINGS,
+        };
+        if self.buildings.len() > building_limit
             || self.pois.len() > MAX_SETTLEMENT_POIS
             || self.inhabitant_generation_ids.len() > MAX_SETTLEMENT_RESIDENTS
         {
@@ -497,6 +780,7 @@ pub struct ScriptSurveySnapshot {
     pub dimension: String,
     pub bounds: ScriptSurveyBounds,
     pub revision: u64,
+    pub world_revision: u64,
     pub chunk_availability: ScriptChunkAvailability,
     pub survey_token: String,
     pub usable_plots: u32,
@@ -514,6 +798,7 @@ impl ScriptSurveySnapshot {
         dimension: String,
         bounds: ScriptSurveyBounds,
         revision: u64,
+        world_revision: u64,
         chunk_availability: ScriptChunkAvailability,
         survey_token: String,
         usable_plots: u32,
@@ -527,6 +812,7 @@ impl ScriptSurveySnapshot {
             dimension,
             bounds,
             revision,
+            world_revision,
             chunk_availability,
             survey_token,
             usable_plots,
@@ -542,6 +828,7 @@ impl ScriptSurveySnapshot {
         check_contract_resource_id(&self.dimension)?;
         self.bounds.validate()?;
         validate_revision(self.revision)?;
+        validate_revision(self.world_revision)?;
         validate_bounded_nonempty("survey token", &self.survey_token, MAX_SURVEY_TOKEN_BYTES)?;
         // Every column the survey read is either a usable plot or water, so the
         // aggregates partition the surveyed tile. The snapshot stays bounded: it
@@ -818,6 +1105,9 @@ pub enum ScriptWarehouseSource {
         site_id: String,
         container_id: u32,
     },
+    Manual {
+        position: [i32; 3],
+    },
 }
 
 impl ScriptWarehouseSource {
@@ -825,17 +1115,20 @@ impl ScriptWarehouseSource {
         match self {
             Self::Authored { structure_id, .. } => validate_structure_id(structure_id),
             Self::VanillaVillage { site_id, .. } => validate_site_id(site_id),
+            Self::Manual { position } => validate_warehouse_position(*position),
         }
     }
 }
 
-/// One core-issued warehouse binding for an authored structure container or a
-/// materialized generator-authenticated village container.
+/// One core-issued warehouse binding for an authored structure container, a
+/// materialized generator-authenticated village container, or a player-built
+/// manual container.
 ///
 /// `handle` is opaque to the plugin: the plugin never parses it and never
 /// chooses a container by coordinates. The source ordinal is resolved by core;
 /// a village binding retains its exact source position durably outside this
-/// public snapshot so the ordinal is never reinterpreted after the bind.
+/// public snapshot so the ordinal is never reinterpreted after the bind, and a
+/// manual binding names its exact surveyed position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedWarehouseBinding")]
 #[non_exhaustive]
@@ -963,11 +1256,13 @@ pub enum ScriptSettlementOperation {
     },
     PrepareStructure {
         operation_id: String,
+        site_id: String,
         blueprint_id: String,
         anchor: [i32; 3],
         rotation: u16,
         survey_token: String,
         expected_site_revision: u64,
+        expected_blueprint_hash: Option<String>,
     },
     AdvanceStructure {
         operation_id: String,
@@ -992,6 +1287,10 @@ pub enum ScriptSettlementOperation {
         structure_id: String,
         expected_revision: u64,
     },
+    /// Read one durable structure or building certificate the caller owns.
+    ///
+    /// A structure id answers its `structure` snapshot; a certificate id
+    /// answers its immutable `building` snapshot.
     Status {
         structure_id: String,
     },
@@ -1004,6 +1303,15 @@ pub enum ScriptSettlementOperation {
         operation_id: String,
         site_id: String,
         container_id: u32,
+    },
+    BindManualWarehouse {
+        operation_id: String,
+        survey_token: String,
+        position: [i32; 3],
+    },
+    RecognizeBuilding {
+        operation_id: String,
+        request: Box<ScriptBuildingCertificateRequest>,
     },
 }
 
@@ -1021,7 +1329,9 @@ impl ScriptSettlementOperation {
             | Self::ResumeStructure { operation_id, .. }
             | Self::CancelStructure { operation_id, .. }
             | Self::BindWarehouse { operation_id, .. }
-            | Self::BindVillageWarehouse { operation_id, .. } => Some(operation_id),
+            | Self::BindVillageWarehouse { operation_id, .. }
+            | Self::BindManualWarehouse { operation_id, .. }
+            | Self::RecognizeBuilding { operation_id, .. } => Some(operation_id),
             Self::ListSites { .. }
             | Self::QuerySite { .. }
             | Self::Survey { .. }
@@ -1029,10 +1339,13 @@ impl ScriptSettlementOperation {
         }
     }
 
-    /// No operation variant carries an unordered collection: site snapshots are
-    /// canonicalised by [`ScriptSettlementSite::canonicalize`] and pages by
-    /// [`ScriptSettlementSitePage::canonicalize`].
-    pub fn canonicalize(&mut self) {}
+    /// Recognition points are an unordered set: sort them so admission,
+    /// fingerprinting, and durable replay all see the normalized request.
+    pub fn canonicalize(&mut self) {
+        if let Self::RecognizeBuilding { request, .. } = self {
+            request.canonicalize();
+        }
+    }
 
     pub fn validate(&self) -> Result<(), ScriptDtoError> {
         if let Some(operation_id) = self.operation_id() {
@@ -1076,16 +1389,22 @@ impl ScriptSettlementOperation {
                 bounds.validate()?;
             }
             Self::PrepareStructure {
+                site_id,
                 blueprint_id,
                 rotation,
                 survey_token,
                 expected_site_revision,
+                expected_blueprint_hash,
                 ..
             } => {
+                validate_site_id(site_id)?;
                 validate_blueprint_id(blueprint_id)?;
                 validate_rotation(*rotation)?;
                 validate_bounded_nonempty("survey token", survey_token, MAX_SURVEY_TOKEN_BYTES)?;
                 validate_revision(*expected_site_revision)?;
+                if let Some(hash) = expected_blueprint_hash {
+                    validate_hex_hash("expected blueprint hash", hash)?;
+                }
             }
             Self::AdvanceStructure {
                 structure_id,
@@ -1122,6 +1441,15 @@ impl ScriptSettlementOperation {
             Self::Status { structure_id } => validate_structure_id(structure_id)?,
             Self::BindWarehouse { structure_id, .. } => validate_structure_id(structure_id)?,
             Self::BindVillageWarehouse { site_id, .. } => validate_site_id(site_id)?,
+            Self::BindManualWarehouse {
+                survey_token,
+                position,
+                ..
+            } => {
+                validate_bounded_nonempty("survey token", survey_token, MAX_SURVEY_TOKEN_BYTES)?;
+                validate_warehouse_position(*position)?;
+            }
+            Self::RecognizeBuilding { request, .. } => request.validate()?,
         }
         Ok(())
     }
@@ -1153,6 +1481,9 @@ pub enum ScriptSettlementResult {
     Warehouse {
         binding: Box<ScriptWarehouseBinding>,
     },
+    Building {
+        certificate: Box<ScriptBuildingCertificate>,
+    },
 }
 
 impl ScriptSettlementResult {
@@ -1165,6 +1496,7 @@ impl ScriptSettlementResult {
             Self::Structure { structure } => structure.validate(),
             Self::Receipt { receipt } => receipt.validate(),
             Self::Warehouse { binding } => binding.validate(),
+            Self::Building { certificate } => certificate.validate(),
         }
     }
 }
@@ -1273,6 +1605,16 @@ fn validate_blueprint_id(value: &str) -> Result<(), ScriptDtoError> {
 
 fn validate_structure_id(value: &str) -> Result<(), ScriptDtoError> {
     validate_bounded_nonempty("structure id", value, MAX_STRUCTURE_ID_BYTES)
+}
+
+fn validate_warehouse_position(position: [i32; 3]) -> Result<(), ScriptDtoError> {
+    if position
+        .iter()
+        .any(|coordinate| coordinate.unsigned_abs() > MAX_SCRIPT_BLOCK_COORDINATE as u32)
+    {
+        return Err(ScriptDtoError::InvalidBounds);
+    }
+    Ok(())
 }
 
 fn validate_stage(value: &str) -> Result<(), ScriptDtoError> {

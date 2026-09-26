@@ -205,6 +205,10 @@ pub struct ScriptEngagementPolicy {
     /// Opaque alliance ids (owned resident handles, allied player uuids).
     pub allies: Vec<String>,
     pub permitted: Vec<ScriptHostileCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub officer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rally: Option<ScriptBlockPosition>,
 }
 
 impl ScriptEngagementPolicy {
@@ -214,6 +218,8 @@ impl ScriptEngagementPolicy {
             revision,
             allies,
             permitted,
+            officer: None,
+            rally: None,
         }
     }
 
@@ -243,6 +249,16 @@ impl ScriptEngagementPolicy {
             }
             previous = Some(ally.as_str());
         }
+        if let Some(officer) = &self.officer
+            && !self.allies.iter().any(|ally| ally == officer)
+        {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "order officer",
+            });
+        }
+        if let Some(rally) = self.rally {
+            rally.validate()?;
+        }
         let mut previous = None;
         for category in &self.permitted {
             if previous.is_some_and(|value: &str| value >= category.as_str()) {
@@ -262,7 +278,9 @@ impl ScriptEngagementPolicy {
 #[non_exhaustive]
 pub struct ScriptOrderTargetRef {
     pub target_ref: String,
+    #[serde(default)]
     pub policy_revision: u64,
+    #[serde(default)]
     pub expires_revision: u64,
 }
 
@@ -333,7 +351,8 @@ pub enum ScriptResidentWorkOrder {
     Craft {
         recipe: String,
         count: u32,
-        /// One loaded crafting-table cell the native engine verifies.
+        /// One loaded station cell whose capability matches the chosen recipe.
+        /// Furnace-backed recipes remain in their own fuel/burn state machine.
         station: ScriptWorkArea,
     },
     Construct {
@@ -541,7 +560,8 @@ impl ScriptResidentOrder {
                 validate_engagement_radius(*engagement_radius)
             }
             Self::Attack { targets, policy } => {
-                if targets.is_empty() || targets.len() > MAX_ORDER_TARGETS {
+                if targets.is_empty() || targets.len() > MAX_ORDER_TARGETS || policy.rally.is_none()
+                {
                     return Err(ScriptDtoError::InvalidBounds);
                 }
                 let mut previous = None;
@@ -612,6 +632,12 @@ pub enum ScriptResidentOrderOperation {
         handle: String,
         expected_revision: u64,
     },
+    Capture {
+        operation_id: String,
+        handle: String,
+        custodian: String,
+        expected_revision: u64,
+    },
 }
 
 impl ScriptResidentOrderOperation {
@@ -621,7 +647,8 @@ impl ScriptResidentOrderOperation {
             | Self::CancelWork { operation_id, .. }
             | Self::IssueOrder { operation_id, .. }
             | Self::CancelOrder { operation_id, .. }
-            | Self::Demobilize { operation_id, .. } => Some(operation_id),
+            | Self::Demobilize { operation_id, .. }
+            | Self::Capture { operation_id, .. } => Some(operation_id),
         }
     }
 
@@ -702,6 +729,19 @@ impl ScriptResidentOrderOperation {
             } => {
                 crate::validate_resident_handle(handle)?;
                 if *expected_revision > MAX_SCRIPT_WORLD_TIME {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                Ok(())
+            }
+            Self::Capture {
+                handle,
+                custodian,
+                expected_revision,
+                ..
+            } => {
+                crate::validate_resident_handle(handle)?;
+                crate::validate_resident_handle(custodian)?;
+                if handle == custodian || *expected_revision > MAX_SCRIPT_WORLD_TIME {
                     return Err(ScriptDtoError::InvalidBounds);
                 }
                 Ok(())
@@ -929,6 +969,10 @@ impl ScriptOrderMemberState {
 #[non_exhaustive]
 pub struct ScriptOrderTarget {
     pub target_ref: String,
+    #[serde(default)]
+    pub policy_revision: u64,
+    #[serde(default)]
+    pub expires_revision: u64,
     pub category: ScriptHostileCategory,
     pub position: ScriptBlockPosition,
 }
@@ -937,11 +981,15 @@ impl ScriptOrderTarget {
     #[must_use]
     pub fn new(
         target_ref: String,
+        policy_revision: u64,
+        expires_revision: u64,
         category: ScriptHostileCategory,
         position: ScriptBlockPosition,
     ) -> Self {
         Self {
             target_ref,
+            policy_revision,
+            expires_revision,
             category,
             position,
         }
@@ -949,6 +997,11 @@ impl ScriptOrderTarget {
 
     pub fn validate(&self) -> Result<(), ScriptDtoError> {
         validate_bounded_nonempty("target ref", &self.target_ref, MAX_TARGET_REF_BYTES)?;
+        if self.policy_revision > MAX_SCRIPT_WORLD_TIME
+            || self.expires_revision > MAX_SCRIPT_WORLD_TIME
+        {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
         self.position.validate()
     }
 }
@@ -1092,6 +1145,11 @@ pub enum ScriptResidentOrderResult {
     Demobilized {
         resident: Box<ScriptDemobilizeResult>,
     },
+    Captured {
+        handle: String,
+        custodian: String,
+        revision: u64,
+    },
 }
 
 impl ScriptResidentOrderResult {
@@ -1122,6 +1180,18 @@ impl ScriptResidentOrderResult {
             }
             Self::OrderCancelled { members, .. } => validate_order_member_outcomes(members),
             Self::Demobilized { resident } => resident.validate(),
+            Self::Captured {
+                handle,
+                custodian,
+                revision,
+            } => {
+                crate::validate_resident_handle(handle)?;
+                crate::validate_resident_handle(custodian)?;
+                if handle == custodian || *revision > MAX_SCRIPT_WORLD_TIME {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                Ok(())
+            }
         }
     }
 }

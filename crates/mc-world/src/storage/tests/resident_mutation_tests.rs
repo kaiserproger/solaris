@@ -736,7 +736,7 @@ fn resident_double_chest_commit_preflights_before_any_write() {
     stale[1].slots[0].count = 99;
 
     assert!(matches!(
-        mutation.commit_chests_conditionally(&positions, &stale, &updated),
+        mutation.commit_chests_conditionally(&positions, None, &stale, &updated),
         crate::ResidentChestCommitResult::Rejected(authoritative)
             if authoritative == initial
     ));
@@ -748,7 +748,7 @@ fn resident_double_chest_commit_preflights_before_any_write() {
     }
 
     assert_eq!(
-        mutation.commit_chests_conditionally(&positions, &initial, &updated),
+        mutation.commit_chests_conditionally(&positions, None, &initial, &updated),
         crate::ResidentChestCommitResult::Applied
     );
     for (&position, chest) in positions.iter().zip(&updated) {

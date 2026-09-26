@@ -2032,6 +2032,7 @@ dependencies = [
 name = "mc-plugin-host"
 version = "0.0.8"
 dependencies = [
+ "mc-data",
  "mc-script",
  "serde",
  "sha2",
@@ -2136,6 +2137,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wit-component 0.259.0",
+ "zip",
 ]
 
 [[package]]

@@ -27,13 +27,13 @@ use crate::bindings::solaris::plugin::residents as wire;
 use mc_script::{
     ScriptBlockPosition, ScriptCombatEvent, ScriptDemobilizeResult, ScriptDemobilizeState,
     ScriptDtoError, ScriptEngagementPolicy, ScriptFormation, ScriptFormationKind,
-    ScriptHostileCategory, ScriptInventoryEndpoint, ScriptItemChange, ScriptOrderMemberOutcome,
-    ScriptOrderMemberState, ScriptOrderTarget, ScriptOrderTargetRef, ScriptResidentItemSummary,
-    ScriptResidentKind, ScriptResidentLifecycle, ScriptResidentLoadedState,
-    ScriptResidentOperation, ScriptResidentOrder, ScriptResidentOrderOperation,
-    ScriptResidentOrderResult, ScriptResidentProfile, ScriptResidentResult, ScriptResidentSnapshot,
-    ScriptResidentWorkOrder, ScriptWorkArea, ScriptWorkAssignment, ScriptWorkPauseReason,
-    ScriptWorkState,
+    ScriptHostileCategory, ScriptInventoryEndpoint, ScriptInventoryMaterial, ScriptItemChange,
+    ScriptOrderMemberOutcome, ScriptOrderMemberState, ScriptOrderTarget, ScriptOrderTargetRef,
+    ScriptResidentItemSummary, ScriptResidentKind, ScriptResidentLifecycle,
+    ScriptResidentLoadedState, ScriptResidentOperation, ScriptResidentOrder,
+    ScriptResidentOrderOperation, ScriptResidentOrderResult, ScriptResidentProfile,
+    ScriptResidentResult, ScriptResidentSnapshot, ScriptResidentWorkOrder, ScriptWorkArea,
+    ScriptWorkAssignment, ScriptWorkPauseReason, ScriptWorkState,
 };
 
 /// One resident call, as the server's own DTO.
@@ -63,6 +63,21 @@ pub(crate) fn decode(
             work_poi: pois.work_poi,
             meeting_poi: pois.meeting_poi,
             expected_revision: pois.expected_revision,
+        },
+        wire::ResidentOperation::Query(query) => ScriptResidentOperation::Query {
+            handles: query.handles,
+            cursor: query.cursor,
+        },
+        wire::ResidentOperation::Treat(treat) => ScriptResidentOperation::Treat {
+            operation_id: treat.operation_id,
+            handle: treat.handle,
+            expected_revision: treat.expected_revision,
+            source: endpoint(treat.source),
+            material: ScriptInventoryMaterial::new(
+                treat.material.resource_id,
+                treat.material.quantity,
+            ),
+            heal_milli: treat.heal_milli,
         },
     })
 }
@@ -116,22 +131,30 @@ pub(crate) fn decode_order(
                 expected_revision: demobilize.expected_revision,
             }
         }
+        wire::ResidentOrderOperation::Capture(capture) => ScriptResidentOrderOperation::Capture {
+            operation_id: capture.operation_id,
+            handle: capture.handle,
+            custodian: capture.custodian,
+            expected_revision: capture.expected_revision,
+        },
     })
 }
 
-/// One resident result, as the contract names it, or nothing when the contract
-/// cannot express the server's own variant.
-///
-/// The server's resident result union also carries the page a handle query
-/// answers. This contract admits no query - the current consumer reads its
-/// residents back through the settlement site and the owned-inventory snapshot -
-/// so that variant has no contract member to become, and an answer carrying one
-/// is dropped here rather than renamed into a snapshot it is not.
+/// One resident result, as the contract names it. The page is the core's
+/// owner-scoped, bounded query response; it must not be renamed into a single
+/// resident snapshot or silently dropped when the caller reads lifecycle.
 pub(crate) fn encode_result(value: &ScriptResidentResult) -> Option<wire::ResidentResult> {
     Some(match value {
         ScriptResidentResult::Snapshot { resident } => {
             wire::ResidentResult::Snapshot(snapshot(resident)?)
         }
+        ScriptResidentResult::Page { residents, cursor } => {
+            wire::ResidentResult::Page(wire::ResidentPage {
+                residents: residents.iter().map(snapshot).collect::<Option<Vec<_>>>()?,
+                cursor: cursor.clone(),
+            })
+        }
+        ScriptResidentResult::Treated { handle } => wire::ResidentResult::Treated(handle.clone()),
         _ => return None,
     })
 }
@@ -180,6 +203,15 @@ pub(crate) fn encode_order_result(
         ScriptResidentOrderResult::Demobilized { resident } => {
             wire::ResidentOrderResult::Demobilized(demobilize_result(resident)?)
         }
+        ScriptResidentOrderResult::Captured {
+            handle,
+            custodian,
+            revision,
+        } => wire::ResidentOrderResult::Captured(wire::CaptureResult {
+            handle: handle.clone(),
+            custodian: custodian.clone(),
+            revision: *revision,
+        }),
         _ => return None,
     })
 }
@@ -212,6 +244,19 @@ pub(crate) fn max_text_bytes(value: &wire::ResidentOperation) -> usize {
             }
             longest
         }
+        wire::ResidentOperation::Query(query) => query
+            .handles
+            .iter()
+            .map(String::len)
+            .chain(query.cursor.as_ref().map(String::len))
+            .max()
+            .unwrap_or(0),
+        wire::ResidentOperation::Treat(treat) => treat
+            .operation_id
+            .len()
+            .max(treat.handle.len())
+            .max(endpoint_text_bytes(&treat.source))
+            .max(treat.material.resource_id.len()),
     }
 }
 
@@ -238,6 +283,11 @@ pub(crate) fn max_order_text_bytes(value: &wire::ResidentOrderOperation) -> usiz
         wire::ResidentOrderOperation::Demobilize(demobilize) => {
             demobilize.operation_id.len().max(demobilize.handle.len())
         }
+        wire::ResidentOrderOperation::Capture(capture) => capture
+            .operation_id
+            .len()
+            .max(capture.handle.len())
+            .max(capture.custodian.len()),
     }
 }
 
@@ -408,16 +458,21 @@ fn order(value: wire::Order) -> ScriptResidentOrder {
                     )
                 })
                 .collect(),
-            policy: ScriptEngagementPolicy::new(
-                attack.policy.revision,
-                attack.policy.allies,
-                attack
-                    .policy
-                    .permitted
-                    .into_iter()
-                    .map(hostile_category)
-                    .collect(),
-            ),
+            policy: {
+                let mut policy = ScriptEngagementPolicy::new(
+                    attack.policy.revision,
+                    attack.policy.allies,
+                    attack
+                        .policy
+                        .permitted
+                        .into_iter()
+                        .map(hostile_category)
+                        .collect(),
+                );
+                policy.officer = attack.policy.officer;
+                policy.rally = Some(position(attack.policy.rally));
+                policy
+            },
         },
         wire::Order::Retreat(retreat) => ScriptResidentOrder::Retreat {
             anchor: position(retreat.anchor),
@@ -616,6 +671,8 @@ fn member_state(value: ScriptOrderMemberState) -> Option<wire::OrderMemberState>
 fn order_target(value: &ScriptOrderTarget) -> Option<wire::OrderTarget> {
     Some(wire::OrderTarget {
         target_ref: value.target_ref.clone(),
+        policy_revision: value.policy_revision,
+        expires_revision: value.expires_revision,
         category: contract_hostile_category(value.category)?,
         position: wire::BlockPosition {
             x: value.position.x,

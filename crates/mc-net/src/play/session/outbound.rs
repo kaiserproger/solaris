@@ -933,6 +933,13 @@ pub(in crate::play) mod publication_probe {
             });
         });
     }
+    /// A refused run emits no container publication; release its armed journal
+    /// rather than retaining the world lease on the owner thread.
+    pub(in crate::play) fn disarm() {
+        ARMED.with(|armed| {
+            armed.borrow_mut().take();
+        });
+    }
 
     /// Observe one outbound command as it is enqueued for publication. The
     /// `ChestSlots` command of the armed container is the publication the rule

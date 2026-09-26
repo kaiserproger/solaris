@@ -18,7 +18,7 @@
 //! already answered this plugin with - a plugin never derives one, and a handle
 //! that belongs to another plugin is refused rather than resolved.
 
-use crate::{domain_operations, residents, Command};
+use crate::{domain_operations, inventories, residents, Command};
 
 /// Adopt the live villager one entity uuid names.
 ///
@@ -114,6 +114,45 @@ pub fn set_resident_pois(
             work_poi: work_poi.map(str::to_owned),
             meeting_poi: meeting_poi.map(str::to_owned),
             expected_revision,
+        }),
+    )
+}
+
+/// Ask core to spend real warehouse supplies and heal one wounded resident.
+#[must_use]
+pub fn treat_resident(
+    request: &str,
+    operation_id: &str,
+    handle: &str,
+    expected_revision: u64,
+    source: inventories::InventoryEndpoint,
+    material: inventories::InventoryMaterial,
+    heal_milli: u32,
+) -> Command {
+    operation(
+        request,
+        residents::ResidentOperation::Treat(residents::ResidentTreat {
+            operation_id: operation_id.to_owned(),
+            handle: handle.to_owned(),
+            expected_revision,
+            source,
+            material,
+            heal_milli,
+        }),
+    )
+}
+
+/// Read the server's current owner-scoped resident snapshots. An explicit
+/// handle that is absent or foreign is refused; this read observes death
+/// before answering, so role policy cannot equip a tombstoned resident.
+/// An empty list requests one bounded page instead.
+#[must_use]
+pub fn query_residents(request: &str, handles: &[String], cursor: Option<&str>) -> Command {
+    operation(
+        request,
+        residents::ResidentOperation::Query(residents::ResidentQuery {
+            handles: handles.to_vec(),
+            cursor: cursor.map(str::to_owned),
         }),
     )
 }
@@ -237,14 +276,15 @@ pub fn cancel_resident_order(
     )
 }
 
-/// Turn one serving resident back into a civilian.
+/// Move a serving resident through `demobilizing → civilian`.
 ///
-/// The server returns the serving gear to the resident's own containers and keeps
-/// the handle and the housing, so a demobilised resident is still this plugin's
-/// resident. A resident that cannot hand its gear anywhere stays `demobilizing`
-/// with a typed reason and every item on its canonical slots rather than losing a
-/// stack: the answer says which of the two happened and reports only item changes
-/// the server really committed.
+/// The first fenced call cancels any active goals and work without moving
+/// items. A caller may use a separate fenced [`crate::transfer_owned_items`]
+/// call according to its own item policy; the second fenced call records the
+/// civilian assignment. Both decisions retain the same resident handle and
+/// housing. A resident equipped before their first military order may still
+/// have a civilian order assignment. `expected_revision` is the resident
+/// order/gear fence, not the independently versioned resident-identity snapshot.
 #[must_use]
 pub fn demobilize_resident(
     request: &str,
@@ -257,6 +297,27 @@ pub fn demobilize_resident(
         residents::ResidentOrderOperation::Demobilize(residents::Demobilize {
             operation_id: operation_id.to_owned(),
             handle: handle.to_owned(),
+            expected_revision,
+        }),
+    )
+}
+
+/// A serving guard must physically reach a living routing combatant. The
+/// accepted capture interrupts combat without changing resident or gear identity.
+#[must_use]
+pub fn capture_resident(
+    request: &str,
+    operation_id: &str,
+    handle: &str,
+    custodian: &str,
+    expected_revision: u64,
+) -> Command {
+    order(
+        request,
+        residents::ResidentOrderOperation::Capture(residents::Capture {
+            operation_id: operation_id.to_owned(),
+            handle: handle.to_owned(),
+            custodian: custodian.to_owned(),
             expected_revision,
         }),
     )

@@ -42,9 +42,10 @@ pub use resident_ops::*;
 pub use settlement_ops::*;
 
 pub use client_presentation::{
-    ClientCommand, CloseClientView, GrantLoaderBlockItem, OpenClientView, PlayClientSound,
-    PresentClientView, StopClientSound, ViewAction, ViewField, ViewFieldValue, ViewFormation,
-    ViewMarker, ViewModel, ViewResourceEntry, ViewRow, ViewTab,
+    BeginClientSelection, CancelClientSelection, ClientCommand, CloseClientView,
+    GrantLoaderBlockItem, OpenClientView, PlayClientSound, PresentClientView, StopClientSound,
+    ViewAction, ViewField, ViewFieldValue, ViewFormation, ViewMarker, ViewModel, ViewResourceEntry,
+    ViewRow, ViewTab,
 };
 pub use commands::{
     CancelTimer, Command, DisconnectPlayer, InventoryMenu, InventoryMenuSlot,
@@ -52,10 +53,11 @@ pub use commands::{
     ScheduleTimer, SendMessage, StorageCas, StorageGet, StorageMutation,
 };
 pub use events::{
-    ClientViewOpened, ClientViewOutcome, Event, EventContext, InventoryClick, InventoryMenuClicked,
-    InventoryStorageOutcome, InventoryStorageTransactionAnswered, LoaderItemGrantFailure,
-    LoaderItemGrantOutcome, LoaderItemGrantResult, LoaderViewAction, LoaderViewRequest,
-    PlayerZoneTransition, TimerFired, ViewFailure, ViewOpened, ViewRequestKind,
+    ClientSelectionOutcome, ClientSelectionStarted, ClientViewOpened, ClientViewOutcome, Event,
+    EventContext, InventoryClick, InventoryMenuClicked, InventoryStorageOutcome,
+    InventoryStorageTransactionAnswered, LoaderItemGrantFailure, LoaderItemGrantOutcome,
+    LoaderItemGrantResult, LoaderViewAction, LoaderViewRequest, PlayerZoneTransition,
+    SelectionContext, TimerFired, ViewFailure, ViewOpened, ViewRequestKind,
 };
 pub use lifecycle::{InitContext, StartupContribution};
 pub use precommit::{

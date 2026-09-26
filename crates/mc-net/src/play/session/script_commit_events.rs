@@ -36,10 +36,14 @@ pub(super) fn push_player_death_event_locked(
             return;
         }
     };
+    let uuid = session.uuid.to_string();
     let context = match ScriptPlayerContext::try_new(
-        session.uuid.to_string(),
+        &uuid,
         &session.name,
-        session.script_operator,
+        session
+            .script_permissions
+            .live_permissions_for(&session.name, &uuid, session.peer)
+            .is_op(),
         position.x,
         position.y,
         position.z,
@@ -118,10 +122,14 @@ pub(super) fn push_player_entity_killed_event_locked(
         );
         return;
     };
+    let uuid = session.uuid.to_string();
     let context = match ScriptPlayerContext::try_new(
-        session.uuid.to_string(),
+        &uuid,
         &session.name,
-        session.script_operator,
+        session
+            .script_permissions
+            .live_permissions_for(&session.name, &uuid, session.peer)
+            .is_op(),
         player_pose.x,
         player_pose.y,
         player_pose.z,

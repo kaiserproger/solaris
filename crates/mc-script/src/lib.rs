@@ -73,9 +73,9 @@ pub use resident_operations::{
     ScriptResidentKind, ScriptResidentLifecycle, ScriptResidentLoadedState,
     ScriptResidentOperation, ScriptResidentPois, ScriptResidentProfile, ScriptResidentResult,
     ScriptResidentSnapshot, resident_entity_uuid, resident_generation_id,
-    resident_handle_for_entity, resident_handle_for_generation, resident_spawn_site_token,
-    validate_entity_uuid, validate_generation_id, validate_resident_handle, validate_resident_poi,
-    validate_spawn_site_token,
+    resident_generation_id_for_poi, resident_handle_for_entity, resident_handle_for_generation,
+    resident_spawn_site_token, validate_entity_uuid, validate_generation_id,
+    validate_resident_handle, validate_resident_poi, validate_spawn_site_token,
 };
 
 mod resident_order_operations;
@@ -99,13 +99,15 @@ pub use settlement_operations::{
     MAX_SETTLEMENT_POIS, MAX_SETTLEMENT_RESIDENTS, MAX_SETTLEMENT_SITE_AXIS,
     MAX_SETTLEMENT_SITE_PAGE, MAX_SITE_ID_BYTES, MAX_STRUCTURE_ACTIVE_PER_PLUGIN,
     MAX_STRUCTURE_ID_BYTES, MAX_STRUCTURE_RESOURCE_TYPES, MAX_STRUCTURE_STAGES,
-    MAX_SURVEY_BOUNDS_AXIS, MAX_SURVEY_TAGS, MAX_SURVEY_TOKEN_BYTES, MAX_WORLD_COMMIT_PORTION,
-    ScriptChunkAvailability, ScriptResidentSiteReservation, ScriptSettlementBuilding,
-    ScriptSettlementOperation, ScriptSettlementPoi, ScriptSettlementResult, ScriptSettlementSite,
-    ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteProvenance,
-    ScriptSiteVariant, ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
-    ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose,
-    ScriptSurveySnapshot, ScriptWarehouseBinding, ScriptWarehouseSource, warehouse_handle,
+    MAX_SURVEY_BOUNDS_AXIS, MAX_SURVEY_TAGS, MAX_SURVEY_TOKEN_BYTES, MAX_VANILLA_VILLAGE_BUILDINGS,
+    MAX_WORLD_COMMIT_PORTION, ScriptBuildingCertificate, ScriptBuildingCertificateRequest,
+    ScriptBuildingInteractionPoint, ScriptChunkAvailability, ScriptResidentSiteReservation,
+    ScriptSettlementBuilding, ScriptSettlementOperation, ScriptSettlementPoi,
+    ScriptSettlementResult, ScriptSettlementSite, ScriptSettlementSitePage, ScriptSitePoiKind,
+    ScriptSitePoiState, ScriptSiteProvenance, ScriptSiteVariant, ScriptStructureMaterial,
+    ScriptStructureReceipt, ScriptStructureSnapshot, ScriptStructureStagePlan,
+    ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose, ScriptSurveySnapshot,
+    ScriptWarehouseBinding, ScriptWarehouseSource, warehouse_handle,
 };
 
 mod plugin_metadata;
@@ -1723,15 +1725,26 @@ impl ScriptProtocolPhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptEvent {
     target_plugin_id: Option<String>,
+    /// Registration that issued an asynchronous request, if this is its result.
+    /// The response must not be reattributed to a replacement with the same id.
+    origin_generation: Option<u64>,
     kind: ScriptEventKind,
 }
 
 impl ScriptEvent {
+    /// Keep the registration that issued a request even when its owner replies
+    /// after a deployment reload. Unsolicited events use admission-time routing.
+    fn with_origin_generation(mut self, generation: Option<u64>) -> Self {
+        self.origin_generation = generation;
+        self
+    }
+
     /// Build a server-started event snapshot.
     pub fn server_started() -> Self {
         Self {
             target_plugin_id: None,
             kind: ScriptEventKind::ServerStarted,
+            origin_generation: None,
         }
     }
 
@@ -1749,6 +1762,7 @@ impl ScriptEvent {
             kind: ScriptEventKind::ServerStopping {
                 reason: reason.to_owned(),
             },
+            origin_generation: None,
         }
     }
 
@@ -1767,6 +1781,7 @@ impl ScriptEvent {
                 username: context.username().to_owned(),
                 context,
             },
+            origin_generation: None,
         }
     }
 
@@ -1785,6 +1800,7 @@ impl ScriptEvent {
                 player_id,
                 reason: reason.to_owned(),
             },
+            origin_generation: None,
         }
     }
 
@@ -1811,6 +1827,7 @@ impl ScriptEvent {
                 message: message.to_owned(),
                 context,
             },
+            origin_generation: None,
         }
     }
 
@@ -1839,6 +1856,7 @@ impl ScriptEvent {
                 z,
                 game_mode,
             },
+            origin_generation: None,
         })
     }
 
@@ -1867,6 +1885,7 @@ impl ScriptEvent {
                 z,
                 game_mode,
             },
+            origin_generation: None,
         })
     }
 
@@ -1898,6 +1917,7 @@ impl ScriptEvent {
                 source,
                 game_mode,
             },
+            origin_generation: None,
         })
     }
 
@@ -1927,6 +1947,7 @@ impl ScriptEvent {
                 source,
                 game_mode,
             },
+            origin_generation: None,
         })
     }
 
@@ -1952,6 +1973,7 @@ impl ScriptEvent {
                 source,
                 game_mode,
             },
+            origin_generation: None,
         })
     }
 
@@ -1980,6 +2002,7 @@ impl ScriptEvent {
                 secondary_action,
                 game_mode,
             },
+            origin_generation: None,
         })
     }
 
@@ -1999,6 +2022,7 @@ impl ScriptEvent {
                 dimension: validate_contract_resource_id(dimension.as_ref())?,
                 game_mode,
             },
+            origin_generation: None,
         })
     }
 
@@ -2029,6 +2053,7 @@ impl ScriptEvent {
                 arguments: arguments.to_owned(),
                 context,
             },
+            origin_generation: None,
         })
     }
 
@@ -2037,6 +2062,7 @@ impl ScriptEvent {
         Self {
             target_plugin_id: None,
             kind: ScriptEventKind::ServerTick { tick },
+            origin_generation: None,
         }
     }
 
@@ -2064,6 +2090,7 @@ impl ScriptEvent {
                 version,
                 failure: None,
             },
+            origin_generation: None,
         })
     }
 
@@ -2088,6 +2115,7 @@ impl ScriptEvent {
                 version,
                 failure: None,
             },
+            origin_generation: None,
         })
     }
 
@@ -2112,6 +2140,7 @@ impl ScriptEvent {
                 version,
                 failure: None,
             },
+            origin_generation: None,
         })
     }
 
@@ -2136,6 +2165,7 @@ impl ScriptEvent {
                 slot,
                 click,
             },
+            origin_generation: None,
         })
     }
 
@@ -2151,6 +2181,7 @@ impl ScriptEvent {
                 request_id: transaction.id().to_owned(),
                 committed,
             },
+            origin_generation: None,
         })
     }
 
@@ -2167,6 +2198,7 @@ impl ScriptEvent {
                 operation_id: operation_id.map(validate_script_id).transpose()?,
                 outcome,
             },
+            origin_generation: None,
         };
         event.validate()?;
         Ok(event)
@@ -2185,6 +2217,7 @@ impl ScriptEvent {
                 player_id: transaction.player_id(),
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2202,6 +2235,7 @@ impl ScriptEvent {
                 context,
                 zone_id: zone.id().to_owned(),
             },
+            origin_generation: None,
         })
     }
 
@@ -2219,6 +2253,7 @@ impl ScriptEvent {
                 context,
                 zone_id: zone.id().to_owned(),
             },
+            origin_generation: None,
         })
     }
 
@@ -2233,6 +2268,7 @@ impl ScriptEvent {
                 zone_id: validate_script_id(zone_id.as_ref())?.to_owned(),
                 accepted,
             },
+            origin_generation: None,
         })
     }
 
@@ -2250,6 +2286,7 @@ impl ScriptEvent {
                 position: request.position(),
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2266,6 +2303,7 @@ impl ScriptEvent {
                 world_time: request.world_time(),
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2293,6 +2331,7 @@ impl ScriptEvent {
                 applied,
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2312,6 +2351,7 @@ impl ScriptEvent {
                 z: request.z(),
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2330,6 +2370,7 @@ impl ScriptEvent {
                 count: request.count(),
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2351,6 +2392,7 @@ impl ScriptEvent {
                 position,
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2381,6 +2423,7 @@ impl ScriptEvent {
                 killed,
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2407,6 +2450,7 @@ impl ScriptEvent {
                 players,
                 truncated,
             },
+            origin_generation: None,
         })
     }
 
@@ -2422,6 +2466,7 @@ impl ScriptEvent {
                 player_id,
                 request_kind,
             },
+            origin_generation: None,
         })
     }
 
@@ -2464,6 +2509,7 @@ impl ScriptEvent {
                 fields,
                 selection_token,
             },
+            origin_generation: None,
         })
     }
 
@@ -2485,6 +2531,7 @@ impl ScriptEvent {
                 revision,
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2506,6 +2553,7 @@ impl ScriptEvent {
                 expires_at_tick,
                 failure,
             },
+            origin_generation: None,
         })
     }
 
@@ -2522,6 +2570,7 @@ impl ScriptEvent {
                 player_id,
                 brand: brand.to_owned(),
             },
+            origin_generation: None,
         })
     }
 
@@ -2551,6 +2600,7 @@ impl ScriptEvent {
                 channel,
                 payload,
             },
+            origin_generation: None,
         })
     }
 
@@ -3499,6 +3549,7 @@ impl Drop for HostAdmissionCancellation {
 struct HostAdmissionRecord {
     plugin_id: Arc<str>,
     request: Weak<ScriptCommand>,
+    generation: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -3512,6 +3563,7 @@ impl HostAdmissionLedger {
         self: &Arc<Self>,
         plugin_id: Arc<str>,
         batch: CommandBatch,
+        generation: Option<u64>,
     ) -> Result<Vec<ScriptCommand>, CommandBatch> {
         let mut pending = match self.pending.lock() {
             Ok(pending) => pending,
@@ -3545,6 +3597,7 @@ impl HostAdmissionLedger {
                 HostAdmissionRecord {
                     plugin_id: Arc::clone(&plugin_id),
                     request: Arc::downgrade(&request),
+                    generation,
                 },
             );
             attached.push(ScriptCommand::HostAttached {
@@ -3582,6 +3635,7 @@ impl HostAdmissionLedger {
         &self,
         provenance: ScriptCommandProvenance,
         request: Arc<ScriptCommand>,
+        current_generation: Option<u64>,
     ) -> Result<AdmittedScriptCommand, ScriptCommandAcceptanceError> {
         let mut pending = match self.pending.lock() {
             Ok(pending) => pending,
@@ -3601,6 +3655,7 @@ impl HostAdmissionLedger {
         Ok(AdmittedScriptCommand {
             plugin_id: record.plugin_id,
             request,
+            generation: record.generation.or(current_generation),
         })
     }
 }
@@ -3614,6 +3669,7 @@ impl HostAdmissionLedger {
 pub struct AdmittedScriptCommand {
     plugin_id: Arc<str>,
     request: Arc<ScriptCommand>,
+    generation: Option<u64>,
 }
 
 impl AdmittedScriptCommand {
@@ -3806,6 +3862,7 @@ impl AdmittedScriptCommand {
             value.map(str::to_owned),
             version,
         )
+        .map(|event| event.with_origin_generation(self.generation))
     }
 
     pub fn plugin_storage_cas_result(
@@ -3819,6 +3876,7 @@ impl AdmittedScriptCommand {
             });
         };
         ScriptEvent::plugin_storage_cas_result(&self.plugin_id, request, applied, version)
+            .map(|event| event.with_origin_generation(self.generation))
     }
 
     pub fn plugin_storage_delete_result(
@@ -3832,6 +3890,7 @@ impl AdmittedScriptCommand {
             });
         };
         ScriptEvent::plugin_storage_delete_result(&self.plugin_id, request, deleted, version)
+            .map(|event| event.with_origin_generation(self.generation))
     }
 
     pub fn plugin_storage_failure_result(
@@ -3876,6 +3935,7 @@ impl AdmittedScriptCommand {
         Ok(ScriptEvent {
             target_plugin_id: Some(target_plugin_id),
             kind,
+            origin_generation: self.generation,
         })
     }
 
@@ -3890,6 +3950,7 @@ impl AdmittedScriptCommand {
             });
         };
         ScriptEvent::inventory_storage_transaction_result(&self.plugin_id, transaction, committed)
+            .map(|event| event.with_origin_generation(self.generation))
     }
 
     pub fn operation_result(
@@ -3907,6 +3968,7 @@ impl AdmittedScriptCommand {
             request.operation_id(),
             outcome,
         )
+        .map(|event| event.with_origin_generation(self.generation))
     }
 
     pub fn player_inventory_transaction_result(
@@ -4163,7 +4225,8 @@ impl ScriptCommand {
                     }
                     ScriptResidentOrderOperation::IssueOrder { .. }
                     | ScriptResidentOrderOperation::CancelOrder { .. }
-                    | ScriptResidentOrderOperation::Demobilize { .. } => {
+                    | ScriptResidentOrderOperation::Demobilize { .. }
+                    | ScriptResidentOrderOperation::Capture { .. } => {
                         RequiredCommandCapability::ResidentOrders
                     }
                 },
@@ -4182,7 +4245,9 @@ impl ScriptCommand {
                     | ScriptSettlementOperation::CancelStructure { .. }
                     | ScriptSettlementOperation::Status { .. }
                     | ScriptSettlementOperation::BindWarehouse { .. }
-                    | ScriptSettlementOperation::BindVillageWarehouse { .. } => {
+                    | ScriptSettlementOperation::BindVillageWarehouse { .. }
+                    | ScriptSettlementOperation::BindManualWarehouse { .. }
+                    | ScriptSettlementOperation::RecognizeBuilding { .. } => {
                         RequiredCommandCapability::StructureOperations
                     }
                 },
@@ -4713,11 +4778,13 @@ impl ScriptBoundary {
 
     fn admit_event(&self, event: ScriptEvent) -> ScriptHostEvent {
         let target_generation = match event.target_plugin_id() {
-            Some(plugin_id) => EventTargetGeneration::Targeted(
-                self.plugin_routes
-                    .registration(plugin_id)
-                    .map(|registration| registration.generation),
-            ),
+            Some(plugin_id) => {
+                EventTargetGeneration::Targeted(event.origin_generation.or_else(|| {
+                    self.plugin_routes
+                        .registration(plugin_id)
+                        .map(|registration| registration.generation)
+                }))
+            }
             None => EventTargetGeneration::Untargeted,
         };
         ScriptHostEvent {
@@ -5028,7 +5095,12 @@ impl ScriptBoundary {
         else {
             return Err(ScriptCommandAcceptanceError::NotHostAttached);
         };
-        self.host_admissions.accept(provenance, request)
+        let current_generation = self
+            .plugin_routes
+            .registration(&provenance.plugin_id)
+            .map(|registration| registration.generation);
+        self.host_admissions
+            .accept(provenance, request, current_generation)
     }
 }
 
@@ -5254,10 +5326,13 @@ impl ScriptHostEndpoint {
                 return Err(ScriptBatchSubmissionError::Closed(batch));
             }
         };
-        let attached = match self
-            .host_admissions
-            .issue(Arc::clone(&admission.plugin_id), batch)
-        {
+        let attached = match self.host_admissions.issue(
+            Arc::clone(&admission.plugin_id),
+            batch,
+            self.plugin_routes
+                .registration(&admission.plugin_id)
+                .map(|registration| registration.generation),
+        ) {
             Ok(attached) => attached,
             Err(batch) => {
                 return Err(ScriptBatchSubmissionError::Rejected {
@@ -5354,15 +5429,40 @@ impl ScriptHostEndpoint {
         for (admission, batch) in batches {
             let issued = self
                 .host_admissions
-                .issue(Arc::clone(&admission.plugin_id), batch)
+                .issue(Arc::clone(&admission.plugin_id), batch, None)
                 .map_err(|_| ScriptReloadCommitError::Rejected {
                     error: CommandBatchError::AdmissionUnavailable,
                 })?;
             attached.extend(issued);
         }
+        // Keep candidate tickets under the same ledger lock while the route
+        // generation changes. The server may not accept their queued commands
+        // until after another reload; accepting then must not reattribute them.
+        let mut pending =
+            self.host_admissions
+                .pending
+                .lock()
+                .map_err(|_| ScriptReloadCommitError::Rejected {
+                    error: CommandBatchError::AdmissionUnavailable,
+                })?;
         self.plugin_routes
             .replace_all(manifests)
             .map_err(|error| ScriptReloadCommitError::Ownership { error })?;
+        for command in &attached {
+            let ScriptCommand::HostAttached { provenance, .. } = command else {
+                unreachable!("candidate batch was host-attached before the route switch");
+            };
+            pending
+                .get_mut(&provenance.nonce)
+                .expect("unpublished candidate admission remains reserved")
+                .generation = Some(
+                self.plugin_routes
+                    .registration(&provenance.plugin_id)
+                    .expect("committed candidate has a live route")
+                    .generation,
+            );
+        }
+        drop(pending);
         swap();
         for (permit, command) in permits.zip(attached) {
             permit.send(command);

@@ -10,8 +10,8 @@ use super::{
     dispatch_and_clear_setup_packets, handle_block_item_placement,
     insert_hopper_stack_into_campfire, pack_block_pos, play_loop_slow_client_test_config,
     prop_schema, register_interaction_player, register_loaded_button_session,
-    run_scheduled_block_ticks, scheduled_hopper_transfer, simple_block, simulation_channel, state,
-    test_use_item_on,
+    run_scheduled_block_ticks, scheduled_hopper_transfer, scheduled_hopper_transfer_with_admission,
+    simple_block, simulation_channel, state, test_use_item_on,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -174,6 +174,28 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
     drop(storage);
     let (_simulation, owner) = simulation_channel();
     let world_writer = world.lock().await;
+    let reservation = sessions
+        .lock_warehouse_reservation_admission(source_pos)
+        .await;
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(5),
+        owner.run_scheduled_block_ticks_with_budget(
+            &config,
+            &sessions,
+            SimulationWorldAccess {
+                read: Some(&world_read),
+                mutation: Some(&world_mutation),
+                ..SimulationWorldAccess::default()
+            },
+            20,
+            1,
+        ),
+    )
+    .await
+    .expect("reservation admission defers hopper tick");
+    assert_eq!(blocked.applied, 0);
+    assert!(source_rx.try_recv().is_err());
+    drop(reservation);
     let report = tokio::time::timeout(
         Duration::from_secs(5),
         owner.run_scheduled_block_ticks_with_budget(
@@ -273,6 +295,138 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
     assert_eq!(source.slots[0].count, 1);
     assert_eq!(hopper.slots[0].item_id, 42);
     assert_eq!(hopper.slots[0].count, 1);
+}
+
+#[test]
+fn scheduled_hopper_respects_reserved_chest_stock_and_moves_only_surplus() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:apple").unwrap(),
+        protocol_id: 42,
+    }]);
+    let chunk_pos = ChunkPos { x: 0, z: 0 };
+    let source_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            chunk_pos,
+            Chunk::empty(
+                chunk_pos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(source_pos, BlockStateId(1)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    let mut chest = mc_world::ChestBlockEntity::default();
+    chest.slots[0] = mc_world::FurnaceSlot {
+        count: 2,
+        item_id: 42,
+        ..Default::default()
+    };
+    storage.set_chest_block_entity(source_pos, chest).unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+
+    let floors = Arc::new(arc_swap::ArcSwap::from_pointee(
+        std::collections::HashMap::from([(
+            source_pos,
+            std::collections::BTreeMap::from([(42, 2)]),
+        )]),
+    ));
+    let sessions = SessionRegistry::new();
+    sessions.install_warehouse_reservation_floors(Arc::clone(&floors));
+    let tags = TagsData::default();
+    let recipes = Vec::new();
+    let context = HopperTransferContext {
+        blocks: blocks.as_ref(),
+        items: &items,
+        tags: &tags,
+        recipes: &recipes,
+        sessions: &sessions,
+    };
+    let blocked = scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2))
+        .expect("hopper tick");
+    assert!(!blocked.moved);
+    assert_eq!(
+        storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .unwrap()
+            .slots[0]
+            .count,
+        2
+    );
+    assert!(
+        storage
+            .hopper_block_entity(hopper_pos)
+            .unwrap()
+            .unwrap()
+            .slots
+            .iter()
+            .all(mc_world::FurnaceSlot::is_empty)
+    );
+
+    floors.store(Arc::new(std::collections::HashMap::from([(
+        source_pos,
+        std::collections::BTreeMap::from([(42, 1)]),
+    )])));
+    let admission = sessions
+        .try_lock_warehouse_reservation_admission(source_pos)
+        .expect("reserve chest region");
+    let deferred = scheduled_hopper_transfer_with_admission(
+        &context,
+        &mut storage,
+        hopper_pos,
+        BlockStateId(2),
+    )
+    .expect("hopper tick while reservation is pending");
+    assert!(!deferred.moved);
+    assert_eq!(
+        storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .unwrap()
+            .slots[0]
+            .count,
+        2
+    );
+    drop(admission);
+    let moved = scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2))
+        .expect("hopper tick with surplus");
+    assert!(moved.moved);
+    assert_eq!(
+        storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .unwrap()
+            .slots[0]
+            .count,
+        1
+    );
+    assert_eq!(
+        storage
+            .hopper_block_entity(hopper_pos)
+            .unwrap()
+            .unwrap()
+            .slots[0]
+            .count,
+        1
+    );
 }
 
 #[tokio::test]

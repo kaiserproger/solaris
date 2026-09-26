@@ -319,6 +319,43 @@ fn canonical_stack(stack: ItemStack) -> ItemStack {
     mc_data::inventory_semantics_26_1_2::canonical_stack(stack)
 }
 
+/// Pack compatible item drops without exceeding the owner transaction's entity budget.
+/// Refuse the whole click rather than consuming items without a matching world drop.
+pub(super) fn pack_drop_stacks(
+    item_facts: &ItemFactsTable,
+    items: &ItemRegistry,
+    dropped: Vec<ItemStack>,
+    max_drops: usize,
+) -> Option<Vec<ItemStack>> {
+    let mut stacks: Vec<ItemStack> = Vec::new();
+    for mut stack in dropped {
+        let max_stack = item_max_stack(item_facts, items, &stack).max(1);
+        for existing in &mut stacks {
+            if can_stack(existing, &stack) && existing.count < max_stack {
+                let moved = (max_stack - existing.count).min(stack.count);
+                existing.count += moved;
+                stack.count -= moved;
+                if stack.count == 0 {
+                    break;
+                }
+            }
+        }
+        while stack.count > max_stack {
+            let mut split = stack.clone();
+            split.count = max_stack;
+            stacks.push(split);
+            stack.count -= max_stack;
+        }
+        if stack.count > 0 {
+            stacks.push(stack);
+        }
+        if stacks.len() > max_drops {
+            return None;
+        }
+    }
+    Some(stacks)
+}
+
 pub(crate) fn can_stack(left: &ItemStack, right: &ItemStack) -> bool {
     mc_data::inventory_semantics_26_1_2::can_stack(left, right)
 }
@@ -424,7 +461,7 @@ pub(crate) fn can_place_in_player_slot(
         return true;
     }
     match slot {
-        5..=8 => equippable_slot_for_item(item_facts, items, stack.item_id) == Some(slot),
+        5..=8 => equippable_slot_for_item(item_facts, items, stack) == Some(slot),
         _ => true,
     }
 }
@@ -432,9 +469,9 @@ pub(crate) fn can_place_in_player_slot(
 pub(crate) fn equippable_slot_for_item(
     item_facts: &ItemFactsTable,
     items: &ItemRegistry,
-    item_id: u32,
+    stack: &ItemStack,
 ) -> Option<usize> {
-    mc_data::item_semantics_26_1_2::equippable_player_slot(item_facts, items, item_id)
+    mc_data::item_semantics_26_1_2::equippable_player_slot(item_facts, items, stack)
 }
 
 pub(crate) fn armor_entry_for_item(

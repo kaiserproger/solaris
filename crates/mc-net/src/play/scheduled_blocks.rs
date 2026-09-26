@@ -437,6 +437,56 @@ pub(super) fn plan_resident_hopper_transfer(
     Some(ResidentPlannedHopperTransfer { plan, result })
 }
 
+pub(super) fn scheduled_hopper_transfer_with_admission(
+    context: &HopperTransferContext<'_>,
+    storage: &mut WorldStorage,
+    pos: mc_world::BlockPos,
+    state_id: BlockStateId,
+) -> Option<HopperTickResult> {
+    let state = context.blocks.by_id(state_id)?;
+    if state.block.id.path() != "hopper" {
+        return None;
+    }
+    let facing = block_state_property(state, "facing")?;
+    let source_pos = mc_world::BlockPos {
+        y: pos.y + 1,
+        ..pos
+    };
+    let target_pos = hopper_facing_target(pos, facing)?;
+    // The coordinator fallback writes storage directly; the resident planner
+    // instead acquires admission at its owner commit.
+    let mut regions = HashSet::new();
+    let mut _admissions = Vec::new();
+    for position in cached_storage_chest_like_positions(context.blocks, storage, source_pos)
+        .into_iter()
+        .flatten()
+        .chain(
+            cached_storage_chest_like_positions(context.blocks, storage, target_pos)
+                .into_iter()
+                .flatten(),
+        )
+    {
+        let region = RegionKey::from_chunk(
+            position.x.div_euclid(SECTION_DIM as i32),
+            position.z.div_euclid(SECTION_DIM as i32),
+        );
+        if !regions.insert(region) {
+            continue;
+        }
+        let Some(guard) = context
+            .sessions
+            .try_lock_warehouse_reservation_admission(position)
+        else {
+            return Some(HopperTickResult {
+                updates: Vec::new(),
+                moved: false,
+            });
+        };
+        _admissions.push(guard);
+    }
+    scheduled_hopper_transfer(context, storage, pos, state_id)
+}
+
 pub(super) fn scheduled_hopper_transfer(
     context: &HopperTransferContext<'_>,
     storage: &mut WorldStorage,
@@ -627,6 +677,12 @@ fn suck_items_into_hopper(
         };
 
         decrement_furnace_slot(&mut source.chests[source_chest].slots[source_slot]);
+        if !context
+            .sessions
+            .warehouse_reservation_stock_survives(&source_positions, &source.chests)
+        {
+            return false;
+        }
         insert_one_into_furnace_slot(&mut hopper.slots[hopper_slot], moving);
 
         if !store_hopper_chest_view(storage, &source_positions, &source) {

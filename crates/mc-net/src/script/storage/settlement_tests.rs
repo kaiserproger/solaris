@@ -15,8 +15,9 @@ use mc_data::blocks::{BlockReport, BlockStateReport};
 use mc_data::item_components::solaris_required_item_facts;
 use mc_data::items::solaris_required_items;
 use mc_script::{
-    ScriptChunkAvailability, ScriptInventoryEndpoint, ScriptInventoryExpectedRevision,
-    ScriptInventoryFence, ScriptInventoryMaterial, ScriptInventoryReservationQuantity,
+    ScriptBuildingCertificateRequest, ScriptBuildingInteractionPoint, ScriptChunkAvailability,
+    ScriptInventoryEndpoint, ScriptInventoryExpectedRevision, ScriptInventoryFence,
+    ScriptInventoryMaterial, ScriptInventoryReservationQuantity,
     ScriptInventoryReservationSnapshot, ScriptInventoryResourcePlan, ScriptInventoryWorkPortion,
     ScriptOperation, ScriptOperationFailure, ScriptOperationOutcome, ScriptOperationPayload,
     ScriptOperationRequest, ScriptOwnedInventoryOperation, ScriptOwnedInventoryResult,
@@ -27,7 +28,7 @@ use mc_script::{
     ScriptWarehouseBinding, ScriptWarehouseSource, resident_generation_id,
 };
 use mc_world::BlockRegistry;
-use mc_worldgen::{BlueprintCatalog, SettlementSelector};
+use mc_worldgen::{BlueprintCatalog, SITE_CELL_BLOCKS, SettlementSelector};
 
 use crate::play::SessionRegistry;
 use crate::play::owned_inventory::{
@@ -40,8 +41,9 @@ use super::PreparedStorageBatch;
 use super::ScriptStoragePrepareOutcome;
 use super::StorageFaultPoint;
 use super::settlement::{
-    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
-    VillageInhabitantReading, VillagePoiReading, VillageReading, journal_test_plugin_decision,
+    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement,
+    StructureMaterialDebit, SurveyReading, VillageBounds, VillageInhabitantReading,
+    VillagePoiReading, VillageReading, journal_test_plugin_decision,
 };
 use super::world_inventory::InventoryRuntime;
 
@@ -70,6 +72,12 @@ struct FakeWorld {
     opaque_y: Mutex<Option<i32>>,
     applied: Mutex<BTreeMap<String, Vec<[i32; 3]>>>,
     containers: Mutex<BTreeMap<[i32; 3], Vec<ItemStack>>>,
+    /// Explicit resident-work block paths beyond the fixture's default open air.
+    resident_blocks: Mutex<BTreeMap<[i32; 3], String>>,
+    /// Positions refusing a standing body.
+    unstandable: Mutex<Vec<[i32; 3]>>,
+    /// Closed walks between two cells.
+    blocked_routes: Mutex<Vec<([i32; 3], [i32; 3])>>,
     /// The server-owned deposits this fake's world half accepted, so a test can
     /// assert the plan the composite committed.
     warehouse_requests: Mutex<Vec<WarehouseTransferRequest>>,
@@ -90,6 +98,9 @@ impl FakeWorld {
             opaque_y: Mutex::new(Some(i32::MIN)),
             applied: Mutex::new(BTreeMap::new()),
             containers: Mutex::new(BTreeMap::new()),
+            resident_blocks: Mutex::new(BTreeMap::new()),
+            unstandable: Mutex::new(Vec::new()),
+            blocked_routes: Mutex::new(Vec::new()),
             warehouse_requests: Mutex::new(Vec::new()),
             warehouse: None,
         }
@@ -140,6 +151,34 @@ impl FakeWorld {
         self.containers.lock().unwrap().insert(position, items);
     }
 
+    /// Set one loaded cell the resident-work adapter reads, by canonical path.
+    fn set_resident_block(&self, position: [i32; 3], path: &str) {
+        self.resident_blocks
+            .lock()
+            .unwrap()
+            .insert(position, path.to_owned());
+    }
+
+    /// Make one cell refuse a standing body.
+    fn set_unstandable(&self, position: [i32; 3]) {
+        self.unstandable.lock().unwrap().push(position);
+    }
+
+    /// Clear every standing refusal.
+    fn clear_unstandable(&self) {
+        self.unstandable.lock().unwrap().clear();
+    }
+
+    /// Close one bounded walk between two cells.
+    fn set_blocked_route(&self, from: [i32; 3], to: [i32; 3]) {
+        self.blocked_routes.lock().unwrap().push((from, to));
+    }
+
+    /// Clear every closed walk.
+    fn clear_blocked_routes(&self) {
+        self.blocked_routes.lock().unwrap().clear();
+    }
+
     /// The last server-owned deposit this world half accepted.
     fn last_warehouse_request(&self) -> WarehouseTransferRequest {
         self.warehouse_requests
@@ -179,21 +218,21 @@ impl SettlementWorld for FakeWorld {
         })
     }
 
-    /// A fake world holds no generated village of its own: the settlement tests
-    /// exercise the authored lane, and a generated site is supplied by
-    /// [`FakeVillageGround`]. What it does hold is the marker record of the
-    /// inhabitant the generated village placed, which is what the descriptor
-    /// reports.
+    /// The fixture's generated village exposes one materialized bed, whose
+    /// block position remains distinct from a resident's standable body cell.
     fn village_pois(
         &self,
-        _bounds: ScriptSurveyBounds,
+        _bounds: VillageBounds,
     ) -> Result<VillageReading<VillagePoiReading>, ScriptOperationFailure> {
-        Ok(VillageReading::Loaded(Vec::new()))
+        Ok(VillageReading::Loaded(vec![VillagePoiReading {
+            at: [50, 64, 82],
+            kind: ScriptSitePoiKind::Home,
+        }]))
     }
 
     fn village_inhabitants(
         &self,
-        _bounds: ScriptSurveyBounds,
+        _bounds: VillageBounds,
     ) -> Result<VillageReading<VillageInhabitantReading>, ScriptOperationFailure> {
         Ok(VillageReading::Loaded(vec![VillageInhabitantReading {
             claim: VILLAGE_INHABITANT_CLAIM.to_owned(),
@@ -251,7 +290,7 @@ impl SettlementWorld for FakeWorld {
 
     fn village_containers(
         &self,
-        bounds: ScriptSurveyBounds,
+        bounds: VillageBounds,
     ) -> Result<VillageReading<[i32; 3]>, ScriptOperationFailure> {
         if *self.availability.lock().unwrap() != ScriptChunkAvailability::Loaded {
             return Ok(VillageReading::Unloaded);
@@ -295,12 +334,20 @@ impl SettlementWorld for FakeWorld {
         _plugin_id: &'a str,
         structure_id: &'a str,
         blocks: &'a [StructureBlockPlacement],
+        material_debit: &'a StructureMaterialDebit,
         receipt: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>> {
         Box::pin(async move {
             let Some(sessions) = self.warehouse.as_ref() else {
                 return Err(ScriptOperationFailure::RuntimeUnavailable);
             };
+            let position = material_debit.position;
+            if !matches!(
+                self.container_reading(position)?,
+                ContainerReading::Loaded(items) if items == material_debit.expected
+            ) {
+                return Err(ScriptOperationFailure::StaleRevision);
+            }
             let decision_id = journal_test_plugin_decision(sessions, receipt)?;
             self.applied
                 .lock()
@@ -308,6 +355,7 @@ impl SettlementWorld for FakeWorld {
                 .entry(structure_id.to_owned())
                 .or_default()
                 .extend(blocks.iter().map(|block| block.pos));
+            self.set_container(position, material_debit.updated.clone());
             // A portion is a durable world commit, so it advances the world's
             // revision exactly like the live adapter's journal decision does.
             self.mark_change();
@@ -316,6 +364,102 @@ impl SettlementWorld for FakeWorld {
     }
 }
 
+impl crate::play::resident_work::ResidentWorld for FakeWorld {
+    fn dimension_loaded(&self, dimension: &str) -> bool {
+        dimension == "minecraft:overworld"
+    }
+
+    fn block(
+        &self,
+        _dimension: &str,
+        pos: [i32; 3],
+    ) -> Option<crate::play::resident_work::ResidentBlock> {
+        if *self.availability.lock().unwrap() != ScriptChunkAvailability::Loaded {
+            return None;
+        }
+        Some(crate::play::resident_work::ResidentBlock {
+            state: 0,
+            path: self
+                .resident_blocks
+                .lock()
+                .unwrap()
+                .get(&pos)
+                .cloned()
+                .unwrap_or_else(|| "air".to_owned()),
+            is_lit_campfire: false,
+        })
+    }
+
+    fn standable(&self, _dimension: &str, pos: [i32; 3]) -> Option<bool> {
+        if *self.availability.lock().unwrap() != ScriptChunkAvailability::Loaded {
+            return None;
+        }
+        Some(!self.unstandable.lock().unwrap().contains(&pos))
+    }
+
+    fn route_open(&self, _dimension: &str, from: [i32; 3], to: [i32; 3]) -> Option<bool> {
+        if *self.availability.lock().unwrap() != ScriptChunkAvailability::Loaded {
+            return None;
+        }
+        Some(!self.blocked_routes.lock().unwrap().contains(&(from, to)))
+    }
+
+    fn line_of_sight(
+        &self,
+        _dimension: &str,
+        _from: mc_entity::Vec3,
+        _to: mc_entity::Vec3,
+    ) -> Option<bool> {
+        Some(true)
+    }
+
+    fn foreign_zone_overlaps(
+        &self,
+        _plugin_id: &str,
+        _dimension: &str,
+        _min: [i32; 3],
+        _max: [i32; 3],
+    ) -> bool {
+        false
+    }
+
+    fn state_for(&self, _block_path: &str) -> Option<u32> {
+        Some(0)
+    }
+
+    fn crop_is_mature(&self, _state: u32) -> bool {
+        true
+    }
+
+    fn preview_break(
+        &self,
+        _dimension: &str,
+        _pos: [i32; 3],
+        _expected_state: u32,
+        _tool: Option<&str>,
+    ) -> Result<crate::play::resident_work::ResidentWorldEdit, ScriptOperationFailure> {
+        Err(ScriptOperationFailure::RuntimeUnavailable)
+    }
+
+    fn preview_place(
+        &self,
+        _dimension: &str,
+        _pos: [i32; 3],
+        _state: u32,
+    ) -> Result<crate::play::resident_work::ResidentWorldEdit, ScriptOperationFailure> {
+        Err(ScriptOperationFailure::RuntimeUnavailable)
+    }
+
+    fn commit_world_edits<'a>(
+        &'a self,
+        _plugin_id: &'a str,
+        _dimension: &'a str,
+        _edits: &'a [crate::play::resident_work::ResidentWorldEdit],
+        _receipt: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>> {
+        Box::pin(async { Err(ScriptOperationFailure::RuntimeUnavailable) })
+    }
+}
 /// A stub block registry holding the two palette blocks the catalog authoring
 /// uses, mirroring the worldgen settlement tests.
 fn stub_registry() -> BlockRegistry {
@@ -337,7 +481,16 @@ fn stub_registry() -> BlockRegistry {
             properties: BTreeMap::new(),
         }],
     };
-    BlockRegistry::from_report(&[stone, planks]).unwrap()
+    let chest = BlockReport {
+        id: Identifier::parse("minecraft:chest").unwrap(),
+        properties: BTreeMap::new(),
+        states: vec![BlockStateReport {
+            id: 2,
+            default: true,
+            properties: BTreeMap::new(),
+        }],
+    };
+    BlockRegistry::from_report(&[stone, planks, chest]).unwrap()
 }
 
 /// One authored stage: its name and its `(local position, palette index)` cells.
@@ -475,7 +628,9 @@ fn runtime_at_with(
         )));
     }
     if adapter {
-        runtime = runtime.with_settlement_world(world as Arc<dyn SettlementWorld>);
+        runtime = runtime
+            .with_settlement_world(world.clone() as Arc<dyn SettlementWorld>)
+            .with_resident_world(world as Arc<dyn crate::play::resident_work::ResidentWorld>);
     }
     runtime
 }
@@ -637,6 +792,17 @@ fn survey_request(dimension: &str, bounds: ScriptSurveyBounds) -> ScriptOperatio
     })
 }
 
+fn site_id_for(anchor: [i32; 3]) -> String {
+    let cell = [
+        anchor[0].div_euclid(SITE_CELL_BLOCKS),
+        anchor[2].div_euclid(SITE_CELL_BLOCKS),
+    ];
+    SettlementSelector::new(SEED, PROFILE_REVISION)
+        .candidate(cell)
+        .map(|candidate| candidate.site_id)
+        .unwrap_or_else(|| "site_missing".to_owned())
+}
+
 fn prepare_request(
     operation_id: &str,
     blueprint_id: &str,
@@ -646,11 +812,13 @@ fn prepare_request(
 ) -> ScriptOperationRequest {
     settlement(ScriptSettlementOperation::PrepareStructure {
         operation_id: operation_id.to_owned(),
+        site_id: site_id_for(anchor),
         blueprint_id: blueprint_id.to_owned(),
         anchor,
         rotation: 0,
         survey_token: survey_token.to_owned(),
         expected_site_revision,
+        expected_blueprint_hash: None,
     })
 }
 
@@ -696,6 +864,18 @@ fn bind_village_warehouse_request(
     })
 }
 
+fn bind_manual_warehouse_request(
+    operation_id: &str,
+    survey_token: &str,
+    position: [i32; 3],
+) -> ScriptOperationRequest {
+    settlement(ScriptSettlementOperation::BindManualWarehouse {
+        operation_id: operation_id.to_owned(),
+        survey_token: survey_token.to_owned(),
+        position,
+    })
+}
+
 fn warehouse_query_request(handle: &str, expected_revision: Option<u64>) -> ScriptOperationRequest {
     ScriptOperationRequest::try_new(
         "request",
@@ -731,6 +911,24 @@ fn warehouse_reserve_request(
         },
     )
     .expect("a warehouse reservation is a valid request")
+}
+
+fn release_reservation_request(
+    operation_id: &str,
+    reservation_ref: &str,
+    expected_revision: u64,
+) -> ScriptOperationRequest {
+    ScriptOperationRequest::try_new(
+        "release-warehouse",
+        ScriptOperation::Inventory {
+            operation: ScriptOwnedInventoryOperation::Release {
+                operation_id: operation_id.to_owned(),
+                reservation_ref: reservation_ref.to_owned(),
+                expected_revision,
+            },
+        },
+    )
+    .expect("a warehouse reservation release is a valid request")
 }
 
 fn pause_request(
@@ -862,6 +1060,16 @@ fn owned_snapshot_of(outcome: &ScriptOperationOutcome) -> mc_script::ScriptOwned
     }
 }
 
+fn reservation_of(outcome: &ScriptOperationOutcome) -> ScriptInventoryReservationSnapshot {
+    match outcome.payload() {
+        ScriptOperationPayload::OwnedInventory { result } => match &**result {
+            ScriptOwnedInventoryResult::Reservation { reservation } => reservation.clone(),
+            other => panic!("expected an inventory reservation, got {other:?}"),
+        },
+        other => panic!("expected an owned inventory payload, got {other:?}"),
+    }
+}
+
 fn assert_invariant(quantities: &[ScriptInventoryReservationQuantity]) {
     for quantity in quantities {
         assert_eq!(
@@ -919,20 +1127,212 @@ fn plan_of(structure: &ScriptStructureSnapshot) -> ScriptInventoryResourcePlan {
     )
 }
 
-/// Commit one durable reservation receipt for `plan`, exactly the projection the
-/// C1 reserve operation installs, without needing a live player session.
-fn reserve_plan(
+/// Reserve a construction plan against a real bound warehouse image.
+async fn reserve_bound_warehouse_plan(
+    fixture: &Fixture,
     storage: &mut PluginStorage,
     reference: &str,
     plan: &ScriptInventoryResourcePlan,
 ) -> ScriptInventoryReservationSnapshot {
-    let quantities = resource_plan_totals(plan)
-        .unwrap()
+    let survey = fixture
+        .execute(
+            storage,
+            OWNER,
+            &survey_request(
+                "minecraft:overworld",
+                ScriptSurveyBounds::new([0, 0, 0], [7, 3, 7]).expect("fixed survey bounds"),
+            ),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "warehouse survey: {survey:?}");
+    let mut warehouse_anchor = fixture.anchor();
+    warehouse_anchor[0] += 5;
+    let prepared = fixture
+        .execute(
+            storage,
+            OWNER,
+            &prepare_request(
+                &format!("prepare-materials-{reference}"),
+                WAREHOUSE,
+                warehouse_anchor,
+                &survey_of(&survey).survey_token,
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(prepared.failure(), None, "warehouse prepare: {prepared:?}");
+    let warehouse = structure_of(&prepared);
+    let position = [
+        warehouse_anchor[0] + 1,
+        warehouse_anchor[1] + 1,
+        warehouse_anchor[2] + 1,
+    ];
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    for (slot, (resource, quantity)) in resource_plan_totals(plan)
+        .expect("finite material plan")
         .into_iter()
-        .map(|(resource, quantity)| {
-            ScriptInventoryReservationQuantity::new(resource, quantity, 0, 0, quantity)
-        })
-        .collect();
+        .enumerate()
+    {
+        let item = solaris_required_items()
+            .id_of(&Identifier::parse(&resource).expect("catalog resource id"))
+            .expect("catalog resource has a concrete item");
+        chest[slot] = ItemStack::new(item, i32::try_from(quantity).expect("test stack fits"));
+    }
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .execute(
+            storage,
+            OWNER,
+            &bind_warehouse_request(
+                &format!("bind-materials-{reference}"),
+                &warehouse.structure_id,
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(bind.failure(), None, "bind: {bind:?}");
+    let binding = warehouse_of(&bind);
+    let snapshot = fixture
+        .execute_inventory(
+            storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle, Some(binding.revision)),
+        )
+        .await;
+    assert_eq!(snapshot.failure(), None, "warehouse snapshot: {snapshot:?}");
+    let reserve = fixture
+        .execute_inventory(
+            storage,
+            OWNER,
+            &warehouse_reserve_request(
+                &format!("reserve-materials-{reference}"),
+                &binding.handle,
+                plan.clone(),
+                owned_snapshot_of(&snapshot).fence,
+            ),
+        )
+        .await;
+    assert_eq!(reserve.failure(), None, "reserve: {reserve:?}");
+    reservation_of(&reserve)
+}
+
+struct LiveWarehouseReservation<'a> {
+    anchor: [i32; 3],
+    survey_token: &'a str,
+    expected_site_revision: u64,
+    reference: &'a str,
+    plan: &'a ScriptInventoryResourcePlan,
+}
+
+/// Bind and reserve a physical warehouse beside an already prepared live
+/// structure. The test world owns the real block entity, so construction takes
+/// the same material-debit branch as production.
+async fn reserve_live_warehouse_plan(
+    runtime: &InventoryRuntime,
+    storage: &mut PluginStorage,
+    world: &crate::server::WorldHandle,
+    reservation: LiveWarehouseReservation<'_>,
+) -> ScriptInventoryReservationSnapshot {
+    let LiveWarehouseReservation {
+        anchor,
+        survey_token,
+        expected_site_revision,
+        reference,
+        plan,
+    } = reservation;
+    let warehouse_anchor = [anchor[0] + 5, anchor[1], anchor[2]];
+    let prepared = runtime
+        .execute_settlement_operation(
+            storage,
+            OWNER,
+            &prepare_request(
+                &format!("prepare-materials-{reference}"),
+                WAREHOUSE,
+                warehouse_anchor,
+                survey_token,
+                expected_site_revision,
+            ),
+        )
+        .await
+        .expect("live warehouse preparation reaches the durable boundary");
+    assert_eq!(prepared.failure(), None, "warehouse prepare: {prepared:?}");
+    let warehouse = structure_of(&prepared);
+    let position = mc_world::BlockPos {
+        x: warehouse_anchor[0] + 1,
+        y: warehouse_anchor[1] + 1,
+        z: warehouse_anchor[2] + 1,
+    };
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    for (slot, (resource, quantity)) in resource_plan_totals(plan)
+        .expect("finite material plan")
+        .into_iter()
+        .enumerate()
+    {
+        let item = solaris_required_items()
+            .id_of(&Identifier::parse(&resource).expect("catalog resource id"))
+            .expect("catalog resource has a concrete item");
+        chest[slot] = ItemStack::new(item, i32::try_from(quantity).expect("test stack fits"));
+    }
+    let chest_image = crate::play::owned_inventory::container_chest_image(&chest)
+        .expect("canonical test chest has exactly 27 slots");
+    {
+        let mut world = world.lock().await;
+        world
+            .set_block_at(position, mc_world::BlockStateId(2))
+            .expect("material warehouse chunk is loaded");
+        world
+            .set_chest_block_entity(position, chest_image)
+            .expect("material warehouse chest is valid");
+    }
+    let binding = runtime
+        .execute_settlement_operation(
+            storage,
+            OWNER,
+            &bind_warehouse_request(
+                &format!("bind-materials-{reference}"),
+                &warehouse.structure_id,
+                0,
+            ),
+        )
+        .await
+        .expect("live warehouse bind reaches the durable boundary");
+    assert_eq!(binding.failure(), None, "warehouse bind: {binding:?}");
+    let binding = warehouse_of(&binding);
+    let snapshot = runtime
+        .execute_owned_inventory(
+            storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle, Some(binding.revision)),
+        )
+        .await
+        .expect("live warehouse query reaches the durable boundary");
+    assert_eq!(snapshot.failure(), None, "warehouse snapshot: {snapshot:?}");
+    let reserved = runtime
+        .execute_owned_inventory(
+            storage,
+            OWNER,
+            &warehouse_reserve_request(
+                &format!("reserve-materials-{reference}"),
+                &binding.handle,
+                plan.clone(),
+                owned_snapshot_of(&snapshot).fence,
+            ),
+        )
+        .await
+        .expect("live warehouse reservation reaches the durable boundary");
+    assert_eq!(reserved.failure(), None, "warehouse reserve: {reserved:?}");
+    reservation_of(&reserved)
+}
+
+/// Install a reservation projection whose durable quantity image is explicit.
+/// This fixture path models a once-valid reservation whose material remainder
+/// was reduced before the construction portion reaches its commit boundary.
+fn reserve_plan_with_quantities(
+    storage: &mut PluginStorage,
+    reference: &str,
+    plan: &ScriptInventoryResourcePlan,
+    quantities: Vec<ScriptInventoryReservationQuantity>,
+) -> ScriptInventoryReservationSnapshot {
     let reservation = ScriptInventoryReservationSnapshot::new(
         reference.to_owned(),
         ScriptInventoryEndpoint::PlayerInventory { player_id: PLAYER },
@@ -1047,6 +1447,24 @@ fn generated_village() -> mc_world::GeneratedVillageSite {
             },
         ],
     }
+}
+
+/// A generated village is read through its site authority, not the smaller
+/// public survey tile, while malformed generator data still fails closed.
+#[test]
+fn generated_village_bounds_allow_the_settlement_extent_only() {
+    let mut village = generated_village();
+    village.max.x = village.min.x + 255;
+    let bounds =
+        super::settlement::village_bounds(&village).expect("256-block generated village bound");
+    assert_eq!(bounds.min[0], village.min.x);
+    assert_eq!(bounds.max[0], village.max.x);
+
+    village.max.x += 1;
+    assert!(matches!(
+        super::settlement::village_bounds(&village),
+        Err(ScriptOperationFailure::RuntimeUnavailable)
+    ));
 }
 
 /// The claim one generated village placement carries.
@@ -1236,6 +1654,60 @@ async fn a_generated_village_is_listed_and_queried_by_its_own_id() {
         )
         .await;
     assert_eq!(absent.failure(), Some(ScriptOperationFailure::NotFound));
+}
+
+#[tokio::test]
+async fn generated_village_home_reserves_its_materialized_bed() {
+    let fixture = fixture_with_generated_village();
+    let mut storage = fixture.storage();
+    let site_id = crate::script::storage::village_site_id(
+        WORLD_IDENTITY,
+        "minecraft:overworld",
+        generated_village().start_chunk,
+    );
+    let site = site_of(
+        &fixture
+            .execute(
+                &mut storage,
+                OWNER,
+                &settlement(ScriptSettlementOperation::QuerySite {
+                    site_id: site_id.clone(),
+                    cursor: None,
+                    limit: 64,
+                }),
+            )
+            .await,
+    );
+    let home = first_home(&site);
+    let reserved = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &reserve_poi_request("reserve-village-home", &site_id, &home, site.revision),
+        )
+        .await;
+    assert_eq!(reserved.failure(), None, "reserve: {reserved:?}");
+    let reservation = resident_site_of(&reserved);
+    assert_eq!(reservation.site_id, site_id);
+    assert_eq!(reservation.poi_id, home);
+
+    let current = site_of(
+        &fixture
+            .execute(
+                &mut storage,
+                OWNER,
+                &settlement(ScriptSettlementOperation::QuerySite {
+                    site_id,
+                    cursor: None,
+                    limit: 64,
+                }),
+            )
+            .await,
+    );
+    assert_eq!(
+        poi_state_of(&current, &reservation.poi_id),
+        ScriptSitePoiState::Reserved
+    );
 }
 
 #[tokio::test]
@@ -1488,6 +1960,71 @@ async fn list_and_query_sites_are_deterministic() {
     );
 }
 
+/// A page cursor traverses live cells, not a frozen roster. If a generated
+/// village becomes visible in a cell already visited, continuing must not
+/// repeat that cell; a fresh walk sees the newly discovered site.
+#[tokio::test]
+async fn list_sites_cursor_stays_bounded_when_the_roster_gains_a_village() {
+    let fixture = Fixture::build(true, true);
+    let mut storage = fixture.storage();
+    let first = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &settlement(ScriptSettlementOperation::ListSites {
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await;
+    let (before, next) = page_of(&first);
+    let next = next.expect("the first page names its next cell");
+    let village_id = crate::script::storage::village_site_id(
+        WORLD_IDENTITY,
+        "minecraft:overworld",
+        generated_village().start_chunk,
+    );
+    assert!(!before.iter().any(|site| site.site_id == village_id));
+
+    let discovered = runtime_with_generated_village(Arc::clone(&fixture.world));
+    let fresh = discovered
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &settlement(ScriptSettlementOperation::ListSites {
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await
+        .unwrap();
+    let (fresh, _) = page_of(&fresh);
+    assert!(
+        fresh.iter().any(|site| site.site_id == village_id),
+        "a fresh page discovers the new village in the already traversed cell"
+    );
+
+    let continued = discovered
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &settlement(ScriptSettlementOperation::ListSites {
+                cursor: Some(next.clone()),
+                limit: 64,
+            }),
+        )
+        .await
+        .unwrap();
+    let (continued, later) = page_of(&continued);
+    assert_ne!(later.as_deref(), Some(next.as_str()), "cursor must advance");
+    assert!(
+        continued.iter().all(|site| {
+            site.site_id != village_id && !before.iter().any(|old| old.site_id == site.site_id)
+        }),
+        "continuation cannot repeat an already traversed cell after roster change"
+    );
+}
+
 #[tokio::test]
 async fn query_site_pages_points_of_interest_and_rejects_a_bad_cursor() {
     let fixture = Fixture::new();
@@ -1601,7 +2138,7 @@ async fn prepare_builds_nothing_and_cancel_preserves_built_blocks() {
         .await
         .0;
     let plan = plan_of(&structure);
-    let reserved = reserve_plan(&mut storage, "res-cottage", &plan);
+    let reserved = reserve_bound_warehouse_plan(&fixture, &mut storage, "res-cottage", &plan).await;
     assert_eq!(reserved.remaining_total(), 5);
     assert_invariant(&reserved.quantities);
 
@@ -1613,7 +2150,7 @@ async fn prepare_builds_nothing_and_cancel_preserves_built_blocks() {
                 "advance-partial",
                 &structure.structure_id,
                 &structure.stages[0].stage,
-                "res-cottage",
+                &reserved.reservation_ref,
                 structure.revision,
                 2,
             ),
@@ -1661,7 +2198,7 @@ async fn prepare_builds_nothing_and_cancel_preserves_built_blocks() {
     );
 
     let (_, projection) = storage
-        .settlement_reservation(OWNER, "res-cottage")
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
         .expect("the reservation stays projected");
     assert!(projection.released);
     assert_eq!(projection.remaining_total(), 0);
@@ -1679,7 +2216,7 @@ async fn pause_resume_requires_the_accepted_footprint_and_releases_only_unspent_
         .await
         .0;
     let plan = plan_of(&structure);
-    reserve_plan(&mut storage, "res-resume", &plan);
+    let reserved = reserve_bound_warehouse_plan(&fixture, &mut storage, "res-resume", &plan).await;
 
     let outcome = fixture
         .execute(
@@ -1715,7 +2252,7 @@ async fn pause_resume_requires_the_accepted_footprint_and_releases_only_unspent_
                 "advance-resume",
                 &structure.structure_id,
                 &structure.stages[0].stage,
-                "res-resume",
+                &reserved.reservation_ref,
                 prepared.revision,
                 2,
             ),
@@ -1774,7 +2311,7 @@ async fn pause_resume_requires_the_accepted_footprint_and_releases_only_unspent_
     assert_eq!(cancelled.state, ScriptStructureState::Cancelled);
     assert_eq!(fixture.world.built_blocks(&structure.structure_id), 2);
     let (_, reservation) = storage
-        .settlement_reservation(OWNER, "res-resume")
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
         .expect("cancelled structure leaves a durable reservation projection");
     assert_eq!(reservation.quantity("minecraft:stone").consumed, 2);
     assert_eq!(reservation.quantity("minecraft:stone").returned, 1);
@@ -1795,6 +2332,90 @@ async fn pause_resume_requires_the_accepted_footprint_and_releases_only_unspent_
     assert_eq!(repeated.failure(), Some(ScriptOperationFailure::Blocked));
 }
 
+#[tokio::test]
+async fn paused_construction_reopens_then_resumes_or_cancels_once() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let structure = prepared_cottage(&fixture, &mut storage, "prepare-pause-reopen")
+        .await
+        .0;
+    let plan = plan_of(&structure);
+    let reserved =
+        reserve_bound_warehouse_plan(&fixture, &mut storage, "res-pause-reopen", &plan).await;
+    let advanced = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-pause-reopen",
+                &structure.structure_id,
+                &structure.stages[0].stage,
+                &reserved.reservation_ref,
+                structure.revision,
+                2,
+            ),
+        )
+        .await;
+    let receipt = receipt_of(&advanced);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &pause_request("pause-reopen", &structure.structure_id, receipt.revision),
+        )
+        .await;
+    let paused = structure_of(&paused);
+    drop(storage);
+
+    let (runtime, _) = fixture.reopened();
+    let mut storage = fixture.storage();
+    let status = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &status_request(&structure.structure_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        structure_of(&status),
+        paused,
+        "pause survives storage reopen"
+    );
+    let resumed = runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &resume_request("resume-reopen", &structure.structure_id, paused.revision),
+        )
+        .await
+        .unwrap();
+    let running = structure_of(&resumed);
+    assert_eq!(running.state, ScriptStructureState::Running);
+    assert_eq!(
+        running.completed_work_units, 2,
+        "resume creates no new portion"
+    );
+    let cancel = cancel_request("cancel-reopen", &structure.structure_id, running.revision);
+    let cancelled = runtime
+        .execute_settlement_operation(&mut storage, OWNER, &cancel)
+        .await
+        .unwrap();
+    let cancelled = structure_of(&cancelled);
+    assert_eq!(cancelled.state, ScriptStructureState::Cancelled);
+    let (_, reservation) = storage
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
+        .expect("cancelled reservation survives reopen");
+    assert_eq!(reservation.quantity("minecraft:stone").consumed, 2);
+    assert_eq!(reservation.quantity("minecraft:stone").returned, 1);
+    assert_eq!(reservation.quantity("minecraft:oak_planks").returned, 2);
+    assert_invariant(&reservation.quantities);
+    let replay = runtime
+        .execute_settlement_operation(&mut storage, OWNER, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(structure_of(&replay), cancelled);
+}
 #[tokio::test]
 async fn prepare_plans_a_body_only_blueprint_as_one_stage() {
     let fixture = Fixture::new();
@@ -1837,12 +2458,12 @@ async fn advance_replays_after_reopen_without_a_second_portion() {
         .await
         .0;
     let plan = plan_of(&structure);
-    reserve_plan(&mut storage, "res-replay", &plan);
+    let reserved = reserve_bound_warehouse_plan(&fixture, &mut storage, "res-replay", &plan).await;
     let advance = advance_request(
         "advance-foundation",
         &structure.structure_id,
         &structure.stages[0].stage,
-        "res-replay",
+        &reserved.reservation_ref,
         structure.revision,
         512,
     );
@@ -1853,7 +2474,7 @@ async fn advance_replays_after_reopen_without_a_second_portion() {
     assert_eq!(fixture.world.built_blocks(&structure.structure_id), 3);
 
     let (_, projected) = storage
-        .settlement_reservation(OWNER, "res-replay")
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
         .expect("the reservation stays projected");
     assert_eq!(projected.receipt_watermark, 1);
     assert_eq!(
@@ -1870,7 +2491,7 @@ async fn advance_replays_after_reopen_without_a_second_portion() {
     let (runtime, world) = fixture.reopened();
     let mut storage = fixture.storage();
     let (_, rebuilt) = storage
-        .settlement_reservation(OWNER, "res-replay")
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
         .expect("the projection survives a reopen");
     assert_eq!(rebuilt, projected, "the reopened projection is identical");
 
@@ -1905,7 +2526,7 @@ async fn advance_replays_after_reopen_without_a_second_portion() {
         "advance-foundation",
         &structure.structure_id,
         &structure.stages[1].stage,
-        "res-replay",
+        &reserved.reservation_ref,
         structure.revision,
         512,
     );
@@ -1927,12 +2548,12 @@ async fn structure_portion_recovers_its_receipt_after_storage_append_fails() {
         .await
         .0;
     let plan = plan_of(&structure);
-    reserve_plan(&mut storage, "res-recover", &plan);
+    let reserved = reserve_bound_warehouse_plan(&fixture, &mut storage, "res-recover", &plan).await;
     let advance = advance_request(
         "advance-recover",
         &structure.structure_id,
         &structure.stages[0].stage,
-        "res-recover",
+        &reserved.reservation_ref,
         structure.revision,
         512,
     );
@@ -1987,11 +2608,70 @@ async fn structure_portion_recovers_its_receipt_after_storage_append_fails() {
         "replaying a recovered receipt submits no second world portion"
     );
     let (_, reservation) = storage
-        .settlement_reservation(OWNER, "res-recover")
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
         .expect("the reservation projection recovered with the receipt");
     assert_eq!(reservation.quantity("minecraft:stone").consumed, 3);
     assert_invariant(&reservation.quantities);
 }
+
+#[tokio::test]
+async fn structure_portion_refuses_missing_reserved_material_without_building() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let structure = prepared_cottage(&fixture, &mut storage, "prepare-underfunded")
+        .await
+        .0;
+    let plan = plan_of(&structure);
+    let mut quantities = resource_plan_totals(&plan)
+        .unwrap()
+        .into_iter()
+        .map(|(resource, quantity)| {
+            ScriptInventoryReservationQuantity::new(resource, quantity, 0, 0, quantity)
+        })
+        .collect::<Vec<_>>();
+    let stone = quantities
+        .iter_mut()
+        .find(|quantity| quantity.resource_id == "minecraft:stone")
+        .expect("cottage foundation needs stone");
+    stone.returned = 1;
+    stone.remaining -= 1;
+    let reserved = reserve_plan_with_quantities(&mut storage, "res-underfunded", &plan, quantities);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &advance_request(
+                "advance-underfunded",
+                &structure.structure_id,
+                &structure.stages[0].stage,
+                "res-underfunded",
+                structure.revision,
+                structure.stages[0].work_units,
+            ),
+        )
+        .await;
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::InsufficientItems),
+        "a portion cannot turn a missing reserved material into blocks"
+    );
+    assert_eq!(fixture.world.built_total(), 0);
+    let status = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &status_request(&structure.structure_id),
+        )
+        .await;
+    assert_eq!(structure_of(&status), structure);
+    let (_, projection) = storage
+        .settlement_reservation(OWNER, "res-underfunded")
+        .expect("the refused portion leaves its reservation untouched");
+    assert_eq!(projection, reserved);
+    assert_invariant(&projection.quantities);
+}
+
 #[tokio::test]
 async fn competing_structure_portions_admit_only_one_revision() {
     let fixture = Fixture::new();
@@ -2000,12 +2680,13 @@ async fn competing_structure_portions_admit_only_one_revision() {
         .await
         .0;
     let plan = plan_of(&structure);
-    reserve_plan(&mut storage, "res-competing", &plan);
+    let reserved =
+        reserve_bound_warehouse_plan(&fixture, &mut storage, "res-competing", &plan).await;
     let first = advance_request(
         "advance-competing-a",
         &structure.structure_id,
         &structure.stages[0].stage,
-        "res-competing",
+        &reserved.reservation_ref,
         structure.revision,
         1,
     );
@@ -2013,7 +2694,7 @@ async fn competing_structure_portions_admit_only_one_revision() {
         "advance-competing-b",
         &structure.structure_id,
         &structure.stages[0].stage,
-        "res-competing",
+        &reserved.reservation_ref,
         structure.revision,
         1,
     );
@@ -2032,7 +2713,7 @@ async fn competing_structure_portions_admit_only_one_revision() {
     assert_eq!(current.completed_work_units, 1);
     assert_eq!(fixture.world.built_blocks(&structure.structure_id), 1);
     let (_, reservation) = storage
-        .settlement_reservation(OWNER, "res-competing")
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
         .expect("the accepted portion stays projected");
     assert_eq!(reservation.quantity("minecraft:stone").consumed, 1);
     assert_invariant(&reservation.quantities);
@@ -2046,7 +2727,7 @@ async fn advance_pauses_when_the_reserved_site_changed() {
         .await
         .0;
     let plan = plan_of(&structure);
-    let reserved = reserve_plan(&mut storage, "res-paused", &plan);
+    let reserved = reserve_bound_warehouse_plan(&fixture, &mut storage, "res-paused", &plan).await;
 
     fixture.world.mark_change();
     let outcome = fixture
@@ -2057,7 +2738,7 @@ async fn advance_pauses_when_the_reserved_site_changed() {
                 "advance-changed",
                 &structure.structure_id,
                 &structure.stages[0].stage,
-                "res-paused",
+                &reserved.reservation_ref,
                 structure.revision,
                 512,
             ),
@@ -2071,7 +2752,7 @@ async fn advance_pauses_when_the_reserved_site_changed() {
     assert_eq!(fixture.world.built_total(), 0, "a pause builds nothing");
 
     let (_, projection) = storage
-        .settlement_reservation(OWNER, "res-paused")
+        .settlement_reservation(OWNER, &reserved.reservation_ref)
         .expect("the reservation stays projected");
     assert_eq!(
         projection.quantities, reserved.quantities,
@@ -2111,7 +2792,7 @@ async fn advance_absorbs_its_own_durable_commits_but_a_foreign_edit_still_pauses
         .await
         .0;
     let plan = plan_of(&structure);
-    reserve_plan(&mut storage, "res-own", &plan);
+    let reserved = reserve_bound_warehouse_plan(&fixture, &mut storage, "res-own", &plan).await;
 
     // First portion: two of the foundation's three cells. Applying it is a
     // durable world commit of this structure's own work, which advances the
@@ -2124,7 +2805,7 @@ async fn advance_absorbs_its_own_durable_commits_but_a_foreign_edit_still_pauses
                 "advance-own-1",
                 &structure.structure_id,
                 &structure.stages[0].stage,
-                "res-own",
+                &reserved.reservation_ref,
                 structure.revision,
                 2,
             ),
@@ -2145,7 +2826,7 @@ async fn advance_absorbs_its_own_durable_commits_but_a_foreign_edit_still_pauses
                 "advance-own-2",
                 &structure.structure_id,
                 &structure.stages[0].stage,
-                "res-own",
+                &reserved.reservation_ref,
                 revision,
                 2,
             ),
@@ -2180,7 +2861,7 @@ async fn advance_absorbs_its_own_durable_commits_but_a_foreign_edit_still_pauses
                 "advance-own-3",
                 &structure.structure_id,
                 &next_stage.stage,
-                "res-own",
+                &reserved.reservation_ref,
                 revision,
                 2,
             ),
@@ -2195,6 +2876,62 @@ async fn advance_absorbs_its_own_durable_commits_but_a_foreign_edit_still_pauses
         3,
         "the paused advance built nothing"
     );
+}
+
+#[tokio::test]
+async fn prepare_refuses_a_changed_preview_blueprint_without_reserving_the_site() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let bounds = ScriptSurveyBounds::new([0, 0, 0], [7, 3, 7]).unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", bounds),
+        )
+        .await;
+    let token = survey_of(&survey).survey_token;
+    let prepare = |operation_id: &str, hash: String| {
+        settlement(ScriptSettlementOperation::PrepareStructure {
+            operation_id: operation_id.to_owned(),
+            site_id: site_id_for(fixture.anchor()),
+            blueprint_id: COTTAGE.to_owned(),
+            anchor: fixture.anchor(),
+            rotation: 0,
+            survey_token: token.clone(),
+            expected_site_revision: 0,
+            expected_blueprint_hash: Some(hash),
+        })
+    };
+    let changed = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &prepare("preview-stale", "0".repeat(64)),
+        )
+        .await;
+    assert_eq!(
+        changed.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+    assert!(storage.settlements().active_structures(OWNER).is_empty());
+
+    let hash = fixture
+        .catalog
+        .get(COTTAGE)
+        .unwrap()
+        .content_hash()
+        .to_owned();
+    let matching = fixture
+        .execute(&mut storage, OWNER, &prepare("preview-matching", hash))
+        .await;
+    assert_eq!(matching.failure(), None, "matching preview: {matching:?}");
+    match settlement_payload(&matching) {
+        ScriptSettlementResult::Structure { structure } => {
+            assert_eq!(structure.blueprint_id, COTTAGE);
+        }
+        other => panic!("expected planned structure, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2403,7 +3140,7 @@ async fn advance_rejects_a_reservation_with_a_mismatched_plan() {
             1,
         )],
     )]);
-    reserve_plan(&mut storage, "res-other", &other);
+    let reserved = reserve_bound_warehouse_plan(&fixture, &mut storage, "res-other", &other).await;
 
     let outcome = fixture
         .execute(
@@ -2413,7 +3150,7 @@ async fn advance_rejects_a_reservation_with_a_mismatched_plan() {
                 "advance-mismatched",
                 &structure.structure_id,
                 &structure.stages[0].stage,
-                "res-other",
+                &reserved.reservation_ref,
                 structure.revision,
                 512,
             ),
@@ -2449,7 +3186,7 @@ async fn advance_rejects_a_reservation_with_a_mismatched_plan() {
                 "advance-unknown-stage",
                 &structure.structure_id,
                 "cellar",
-                "res-other",
+                &reserved.reservation_ref,
                 structure.revision,
                 512,
             ),
@@ -2972,7 +3709,7 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
         WorldStorage::open(world_root.path(), Arc::clone(&blocks)).unwrap(),
     ));
 
-    let (structure, reservation) = {
+    let (structure, reservation, reservation_ref) = {
         {
             let mut world = handle.lock().await;
             for position in covering_chunks(
@@ -3072,12 +3809,23 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
             )
             .await
             .unwrap();
-        assert_eq!(outcome.failure(), None, "prepare: {outcome:?}");
         let prepared = structure_of(&outcome);
         assert_eq!(prepared.state, ScriptStructureState::Prepared);
 
         let plan = plan_of(&prepared);
-        let reserved = reserve_plan(&mut storage, "res-live", &plan);
+        let reserved = reserve_live_warehouse_plan(
+            &runtime,
+            &mut storage,
+            &handle,
+            LiveWarehouseReservation {
+                anchor,
+                survey_token: &survey.survey_token,
+                expected_site_revision: 0,
+                reference: "res-live",
+                plan: &plan,
+            },
+        )
+        .await;
         assert_eq!(reserved.remaining_total(), 5);
 
         // Advance both authored stages; every portion commits through the live
@@ -3092,7 +3840,7 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
                         &format!("advance-{}-live", stage.stage),
                         &prepared.structure_id,
                         &stage.stage,
-                        "res-live",
+                        &reserved.reservation_ref,
                         revision,
                         stage.work_units,
                     ),
@@ -3143,7 +3891,7 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
 
         // The receipt arithmetic stays inside the reservation.
         let (_, projection) = storage
-            .settlement_reservation(OWNER, "res-live")
+            .settlement_reservation(OWNER, &reserved.reservation_ref)
             .expect("the reservation stays projected");
         assert_eq!(projection.quantity("minecraft:stone").consumed, 3);
         assert_eq!(projection.quantity("minecraft:oak_planks").consumed, 2);
@@ -3164,7 +3912,7 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
         assert_eq!(committed.consumed.len(), 2);
         assert_eq!(committed.current_stage_index, committed.stages.len() as u32);
         assert_eq!(committed.completed_work_units, 0);
-        (prepared, projection)
+        (prepared, projection, reserved.reservation_ref.clone())
     };
 
     // Re-open the world from disk: a committed stage is durable.
@@ -3187,7 +3935,7 @@ async fn live_world_stage_commit_is_durable_across_a_world_reopen() {
     // replay without re-materializing a second portion.
     let storage = PluginStorage::open(plugin_root.path()).unwrap();
     let (_, projection) = storage
-        .settlement_reservation(OWNER, "res-live")
+        .settlement_reservation(OWNER, &reservation_ref)
         .expect("the reservation replay rebuilds the projection");
     assert_eq!(projection.quantity("minecraft:oak_planks").consumed, 2);
     assert_eq!(projection.remaining_total(), 0);
@@ -3338,7 +4086,19 @@ async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_positio
     assert_eq!(outcome.failure(), None, "prepare: {outcome:?}");
     let prepared = structure_of(&outcome);
     let plan = plan_of(&prepared);
-    reserve_plan(&mut storage, "res-scope", &plan);
+    let reserved = reserve_live_warehouse_plan(
+        &runtime,
+        &mut storage,
+        &handle,
+        LiveWarehouseReservation {
+            anchor,
+            survey_token: &survey.survey_token,
+            expected_site_revision: 0,
+            reference: "res-scope",
+            plan: &plan,
+        },
+    )
+    .await;
 
     // The first portion of the foundation. It commits its staged blocks, and the
     // structure re-reads the footprint it just built into.
@@ -3351,7 +4111,7 @@ async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_positio
                 "advance-scope-1",
                 &prepared.structure_id,
                 &first.stage,
-                "res-scope",
+                &reserved.reservation_ref,
                 prepared.revision,
                 2,
             ),
@@ -3376,7 +4136,7 @@ async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_positio
                 "advance-scope-2",
                 &prepared.structure_id,
                 &first.stage,
-                "res-scope",
+                &reserved.reservation_ref,
                 revision,
                 2,
             ),
@@ -3405,7 +4165,7 @@ async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_positio
                 "advance-scope-3",
                 &prepared.structure_id,
                 &next.stage,
-                "res-scope",
+                &reserved.reservation_ref,
                 revision,
                 first_half_of_next_stage,
             ),
@@ -3446,7 +4206,7 @@ async fn live_fence_scopes_to_the_footprint_and_not_to_the_chunk_durable_positio
                 "advance-scope-4",
                 &prepared.structure_id,
                 &next.stage,
-                "res-scope",
+                &reserved.reservation_ref,
                 revision,
                 first_half_of_next_stage,
             ),
@@ -3807,6 +4567,91 @@ async fn warehouse_reservations_hold_live_stock_across_restart_and_reject_overpr
     );
 }
 
+/// (CP-004) A released warehouse reservation removes its physical floor once:
+/// player container commits may use the returned stock, while a replay cannot
+/// return it twice.
+#[tokio::test]
+async fn releasing_a_warehouse_reservation_returns_its_stock_floor_once() {
+    let fixture = Fixture::with_journal();
+    let mut storage = fixture.storage();
+    let structure = prepared_warehouse(&fixture, &mut storage, "prepare-release-wh").await;
+    let position = container_position(&fixture, 1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(BIRCH_LOG, 3);
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-release-wh", &structure.structure_id, 0),
+        )
+        .await;
+    assert_eq!(bind.failure(), None, "bind: {bind:?}");
+    let binding = warehouse_of(&bind);
+    let snapshot = fixture
+        .execute_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle, Some(binding.revision)),
+        )
+        .await;
+    let expected = owned_snapshot_of(&snapshot).fence;
+    let plan = ScriptInventoryResourcePlan::new(vec![ScriptInventoryWorkPortion::new(
+        1,
+        vec![ScriptInventoryMaterial::new(
+            "minecraft:birch_log".to_owned(),
+            3,
+        )],
+    )]);
+    let reserved = fixture
+        .execute_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_reserve_request("reserve-release-wh", &binding.handle, plan, expected),
+        )
+        .await;
+    assert_eq!(reserved.failure(), None, "reserve: {reserved:?}");
+    let reservation = reservation_of(&reserved);
+    let mut after = mc_world::ChestBlockEntity::default();
+    after.slots[0].item_id = BIRCH_LOG;
+    after.slots[0].count = 2;
+    let position = mc_world::BlockPos {
+        x: position[0],
+        y: position[1],
+        z: position[2],
+    };
+    assert!(
+        !fixture
+            .sessions
+            .as_ref()
+            .expect("journal fixture has sessions")
+            .warehouse_reservation_stock_survives(&[position], &[after.clone()]),
+        "the player cannot consume a reserved log"
+    );
+
+    let release = release_reservation_request(
+        "release-reserve-wh",
+        &reservation.reservation_ref,
+        reserved.revision().expect("reservation revision"),
+    );
+    let released = fixture
+        .execute_inventory(&mut storage, OWNER, &release)
+        .await;
+    assert_eq!(released.failure(), None, "release: {released:?}");
+    assert!(reservation_of(&released).released);
+    assert!(
+        fixture
+            .sessions
+            .as_ref()
+            .expect("journal fixture has sessions")
+            .warehouse_reservation_stock_survives(&[position], &[after]),
+        "the released stock is available to the next accepted player commit"
+    );
+    let replay = fixture
+        .execute_inventory(&mut storage, OWNER, &release)
+        .await;
+    assert_eq!(replay, released, "release replays one stored outcome");
+}
 #[tokio::test]
 async fn warehouse_bind_refuses_foreign_unknown_inactive_and_unloaded() {
     let fixture = Fixture::new();
@@ -3879,6 +4724,641 @@ async fn warehouse_bind_refuses_foreign_unknown_inactive_and_unloaded() {
         )
         .await;
     assert_eq!(inactive.failure(), Some(ScriptOperationFailure::Blocked));
+}
+
+#[tokio::test]
+async fn manual_warehouse_binds_surveyed_container_and_reuses_handle() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let bounds = ScriptSurveyBounds::new([0, 60, 0], [7, 67, 7]).unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", bounds),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "survey: {survey:?}");
+    let token = survey_of(&survey).survey_token;
+    let position = [3, 64, 3];
+    fixture
+        .world
+        .set_container(position, vec![ItemStack::new(BIRCH_LOG, 4)]);
+
+    let bind = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual", &token, position),
+        )
+        .await;
+    assert_eq!(bind.failure(), None, "bind: {bind:?}");
+    let binding = warehouse_of(&bind);
+    assert!(matches!(
+        &binding.source,
+        ScriptWarehouseSource::Manual { position: bound } if *bound == position
+    ));
+    assert_eq!(
+        binding.handle,
+        format!(
+            "warehouse:{OWNER}:manual:{}:{}:{}",
+            position[0], position[1], position[2]
+        )
+    );
+
+    let read = fixture
+        .runtime
+        .execute_owned_inventory(
+            &mut storage,
+            OWNER,
+            &warehouse_query_request(&binding.handle, Some(binding.revision)),
+        )
+        .await
+        .expect("manual warehouse query reaches the durable boundary");
+    assert_eq!(read.failure(), None, "read: {read:?}");
+
+    let repeat = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-again", &token, position),
+        )
+        .await;
+    assert_eq!(repeat.failure(), None, "repeat: {repeat:?}");
+    assert_eq!(warehouse_of(&repeat), binding, "repeat bind is idempotent");
+
+    let foreign = fixture
+        .execute(
+            &mut storage,
+            FOREIGN,
+            &bind_manual_warehouse_request("bind-manual-foreign", &token, position),
+        )
+        .await;
+    assert_eq!(foreign.failure(), Some(ScriptOperationFailure::Forbidden));
+}
+
+#[tokio::test]
+async fn manual_warehouse_refuses_stale_token_outside_claimed_missing_and_cross_kind() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let bounds = ScriptSurveyBounds::new([0, 60, 0], [7, 67, 7]).unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", bounds),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "survey: {survey:?}");
+    let token = survey_of(&survey).survey_token;
+    let position = [3, 64, 3];
+    fixture
+        .world
+        .set_container(position, vec![ItemStack::new(BIRCH_LOG, 4)]);
+
+    let foreign_token = fixture
+        .execute(
+            &mut storage,
+            FOREIGN,
+            &bind_manual_warehouse_request("bind-manual-foreign-token", &token, position),
+        )
+        .await;
+    assert_eq!(
+        foreign_token.failure(),
+        Some(ScriptOperationFailure::Forbidden)
+    );
+
+    let outside = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-outside", &token, [100, 64, 100]),
+        )
+        .await;
+    assert_eq!(
+        outside.failure(),
+        Some(ScriptOperationFailure::InvalidRequest)
+    );
+
+    fixture.world.set_claimed(true);
+    let claimed = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-claimed", &token, position),
+        )
+        .await;
+    assert_eq!(claimed.failure(), Some(ScriptOperationFailure::Forbidden));
+    fixture.world.set_claimed(false);
+
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Unloaded);
+    let unloaded = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-unloaded", &token, position),
+        )
+        .await;
+    assert_eq!(unloaded.failure(), Some(ScriptOperationFailure::Unloaded));
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Loaded);
+
+    fixture.world.clear_container(position);
+    let missing = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-missing", &token, position),
+        )
+        .await;
+    assert_eq!(missing.failure(), Some(ScriptOperationFailure::NotFound));
+    fixture
+        .world
+        .set_container(position, vec![ItemStack::new(BIRCH_LOG, 4)]);
+
+    fixture.world.mark_change();
+    let stale = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-stale", &token, position),
+        )
+        .await;
+    assert_eq!(stale.failure(), Some(ScriptOperationFailure::StaleRevision));
+    // Stale token plus unloaded target must still answer `Unloaded`: the
+    // availability fence runs before the freshness fence.
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Unloaded);
+    let stale_unloaded = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-stale-unloaded", &token, position),
+        )
+        .await;
+    assert_eq!(
+        stale_unloaded.failure(),
+        Some(ScriptOperationFailure::Unloaded)
+    );
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Loaded);
+
+    let nether = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:the_nether", bounds),
+        )
+        .await;
+    assert_eq!(nether.failure(), None, "nether survey: {nether:?}");
+    let nether_token = survey_of(&nether).survey_token;
+    fixture
+        .world
+        .set_container(position, vec![ItemStack::new(BIRCH_LOG, 4)]);
+    let dimension = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-nether", &nether_token, position),
+        )
+        .await;
+    assert_eq!(
+        dimension.failure(),
+        Some(ScriptOperationFailure::RuntimeUnavailable)
+    );
+}
+
+#[tokio::test]
+async fn manual_bind_refuses_position_held_by_authored_binding() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let structure = prepared_warehouse(&fixture, &mut storage, "prepare-wh-manual").await;
+    let position = container_position(&fixture, 1);
+    fixture
+        .world
+        .set_container(position, vec![ItemStack::new(BIRCH_LOG, 1)]);
+    let authored = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-authored-first", &structure.structure_id, 0),
+        )
+        .await;
+    assert_eq!(authored.failure(), None, "authored bind: {authored:?}");
+
+    let bounds = ScriptSurveyBounds::new(
+        [position[0] - 3, position[1] - 3, position[2] - 3],
+        [position[0] + 3, position[1] + 3, position[2] + 3],
+    )
+    .unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", bounds),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "survey: {survey:?}");
+    let token = survey_of(&survey).survey_token;
+    let manual = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &bind_manual_warehouse_request("bind-manual-cross", &token, position),
+        )
+        .await;
+    assert_eq!(manual.failure(), None, "cross-kind bind: {manual:?}");
+    assert_eq!(
+        warehouse_of(&manual),
+        warehouse_of(&authored),
+        "one physical container keeps one handle across kinds"
+    );
+}
+
+fn recognize_request(
+    operation_id: &str,
+    footprint: ScriptSurveyBounds,
+    survey_token: &str,
+    expected_world_revision: u64,
+) -> ScriptOperationRequest {
+    settlement(ScriptSettlementOperation::RecognizeBuilding {
+        operation_id: operation_id.to_owned(),
+        request: Box::new(ScriptBuildingCertificateRequest::new(
+            footprint,
+            "solaris:smithy".to_owned(),
+            vec![
+                ScriptBuildingInteractionPoint::Entrance { at: [1, 61, 1] },
+                ScriptBuildingInteractionPoint::Workstation {
+                    at: [3, 61, 3],
+                    capability: "minecraft:crafting_table".to_owned(),
+                    workplaces: 1,
+                },
+                ScriptBuildingInteractionPoint::Storage { at: [4, 61, 4] },
+            ],
+            survey_token.to_owned(),
+            expected_world_revision,
+        )),
+    })
+}
+
+fn certificate_of(outcome: &ScriptOperationOutcome) -> mc_script::ScriptBuildingCertificate {
+    match settlement_payload(outcome) {
+        ScriptSettlementResult::Building { certificate } => certificate.as_ref().clone(),
+        other => panic!("expected a building certificate, got {other:?}"),
+    }
+}
+
+/// A valid player-built volume recognizes through the live world reads and
+/// re-recognition of the same normalized footprint is idempotent.
+#[tokio::test]
+async fn recognize_building_validates_live_points_and_reuses_certificate() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let footprint = ScriptSurveyBounds::new([0, 60, 0], [7, 67, 7]).unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", footprint),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "survey: {survey:?}");
+    let snapshot = survey_of(&survey);
+    fixture
+        .world
+        .set_container([4, 61, 4], vec![ItemStack::new(BIRCH_LOG, 4)]);
+    fixture
+        .world
+        .set_resident_block([3, 61, 3], "crafting_table");
+
+    let recognized = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-1",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(recognized.failure(), None, "recognize: {recognized:?}");
+    let certificate = certificate_of(&recognized);
+    assert_eq!(certificate.footprint, footprint);
+    assert_eq!(certificate.world_revision, snapshot.world_revision);
+
+    let repeat = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-2",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(repeat.failure(), None, "repeat: {repeat:?}");
+    assert_eq!(
+        certificate_of(&repeat),
+        certificate,
+        "repeat recognition is idempotent"
+    );
+
+    let foreign = fixture
+        .execute(
+            &mut storage,
+            FOREIGN,
+            &recognize_request(
+                "recognize-foreign",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(foreign.failure(), Some(ScriptOperationFailure::Forbidden));
+}
+/// A certificate footprint strictly inside a larger survey still recognizes:
+/// the staleness fence compares the surveyed token bounds, not the smaller
+/// footprint digest.
+#[tokio::test]
+async fn recognize_building_accepts_a_sub_footprint_of_a_larger_survey() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let surveyed = ScriptSurveyBounds::new([0, 60, 0], [15, 67, 15]).unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", surveyed),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "survey: {survey:?}");
+    let snapshot = survey_of(&survey);
+    fixture
+        .world
+        .set_container([4, 61, 4], vec![ItemStack::new(BIRCH_LOG, 4)]);
+    fixture
+        .world
+        .set_resident_block([3, 61, 3], "crafting_table");
+    let footprint = ScriptSurveyBounds::new([0, 60, 0], [7, 67, 7]).unwrap();
+    let recognized = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-sub-footprint",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(recognized.failure(), None, "recognize: {recognized:?}");
+    assert_eq!(certificate_of(&recognized).footprint, footprint);
+}
+/// `Status` answers the durable ledger the id names: a structure snapshot for
+/// built workplaces, the immutable certificate for recognized ones. Foreign
+/// ids stay forbidden and unknown ids stay not-found, exactly as for
+/// structures.
+#[tokio::test]
+async fn status_answers_structure_and_certificate_through_one_query() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let footprint = ScriptSurveyBounds::new([0, 60, 0], [7, 67, 7]).unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", footprint),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "survey: {survey:?}");
+    let snapshot = survey_of(&survey);
+    fixture
+        .world
+        .set_container([4, 61, 4], vec![ItemStack::new(BIRCH_LOG, 4)]);
+    fixture
+        .world
+        .set_resident_block([3, 61, 3], "crafting_table");
+    let recognized = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-status",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(recognized.failure(), None, "recognize: {recognized:?}");
+    let certificate = certificate_of(&recognized);
+
+    let status = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &status_request(&certificate.certificate_id),
+        )
+        .await;
+    assert_eq!(status.failure(), None, "certificate status: {status:?}");
+    assert_eq!(certificate_of(&status), certificate);
+
+    let foreign = fixture
+        .execute(
+            &mut storage,
+            FOREIGN,
+            &status_request(&certificate.certificate_id),
+        )
+        .await;
+    assert_eq!(foreign.failure(), Some(ScriptOperationFailure::Forbidden));
+
+    let unknown = fixture
+        .execute(&mut storage, OWNER, &status_request("forged-certificate"))
+        .await;
+    assert_eq!(unknown.failure(), Some(ScriptOperationFailure::NotFound));
+}
+
+/// Recognition refuses a missing station, a missing container, a stale fence,
+/// an unloaded footprint, and a namespaced capability alias.
+#[tokio::test]
+async fn recognize_building_refuses_invalid_live_points() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let footprint = ScriptSurveyBounds::new([0, 60, 0], [7, 67, 7]).unwrap();
+    let survey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", footprint),
+        )
+        .await;
+    assert_eq!(survey.failure(), None, "survey: {survey:?}");
+    let snapshot = survey_of(&survey);
+
+    let missing_station = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-missing-station",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        missing_station.failure(),
+        Some(ScriptOperationFailure::Blocked)
+    );
+    fixture
+        .world
+        .set_resident_block([3, 61, 3], "crafting_table");
+
+    let missing_container = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-missing-container",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        missing_container.failure(),
+        Some(ScriptOperationFailure::NotFound)
+    );
+    fixture
+        .world
+        .set_container([4, 61, 4], vec![ItemStack::new(BIRCH_LOG, 4)]);
+
+    fixture.world.set_unstandable([1, 61, 1]);
+    let blocked_entrance = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-blocked-entrance",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        blocked_entrance.failure(),
+        Some(ScriptOperationFailure::Blocked)
+    );
+
+    fixture.world.mark_change();
+    let stale = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-stale",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(stale.failure(), Some(ScriptOperationFailure::StaleRevision));
+
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Unloaded);
+    // Unloaded footprint wins over the stale fence: the token is stale, but
+    // the POI read fails first and the caller retries on load.
+    let stale_unloaded = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-stale-unloaded",
+                footprint,
+                &snapshot.survey_token,
+                snapshot.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        stale_unloaded.failure(),
+        Some(ScriptOperationFailure::Unloaded)
+    );
+    fixture
+        .world
+        .set_availability(ScriptChunkAvailability::Loaded);
+    // The earlier mark_change staled the original token; re-survey so the
+    // remaining pins test their own check, not the fence.
+    let resurvey = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &survey_request("minecraft:overworld", footprint),
+        )
+        .await;
+    assert_eq!(resurvey.failure(), None, "resurvey: {resurvey:?}");
+    let fresh = survey_of(&resurvey);
+    // A closed walk blocks recognition even though every cell is loaded and
+    // standable: close all four neighbour walks into the station. The earlier
+    // entrance refusal is cleared so this pin reaches the route fence.
+    fixture.world.clear_unstandable();
+    for neighbour in [[4, 61, 3], [2, 61, 3], [3, 61, 4], [3, 61, 2]] {
+        fixture.world.set_blocked_route([1, 61, 1], neighbour);
+    }
+    let blocked_route = fixture
+        .execute(
+            &mut storage,
+            OWNER,
+            &recognize_request(
+                "recognize-blocked-route",
+                footprint,
+                &fresh.survey_token,
+                fresh.world_revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        blocked_route.failure(),
+        Some(ScriptOperationFailure::Blocked)
+    );
+    // The route pin must not leak into the alias check.
+    fixture.world.clear_blocked_routes();
+    let aliased = settlement(ScriptSettlementOperation::RecognizeBuilding {
+        operation_id: "recognize-alias".to_owned(),
+        request: Box::new(ScriptBuildingCertificateRequest::new(
+            footprint,
+            "solaris:smithy".to_owned(),
+            vec![
+                ScriptBuildingInteractionPoint::Entrance { at: [1, 61, 1] },
+                ScriptBuildingInteractionPoint::Workstation {
+                    at: [3, 61, 3],
+                    capability: "solaris:crafting_table".to_owned(),
+                    workplaces: 1,
+                },
+                ScriptBuildingInteractionPoint::Storage { at: [4, 61, 4] },
+            ],
+            fresh.survey_token.clone(),
+            fresh.world_revision,
+        )),
+    });
+    let aliased = fixture.execute(&mut storage, OWNER, &aliased).await;
+    assert_eq!(aliased.failure(), Some(ScriptOperationFailure::Blocked));
 }
 
 #[tokio::test]
@@ -4064,7 +5544,8 @@ async fn warehouse_survives_structure_completion_and_binds_after_it() {
     assert_eq!(bind.failure(), None, "bind during construction: {bind:?}");
     let binding = warehouse_of(&bind);
     let plan = plan_of(&structure);
-    let reserved = reserve_plan(&mut storage, "res-wh-complete", &plan);
+    let reserved =
+        reserve_bound_warehouse_plan(&fixture, &mut storage, "res-wh-complete", &plan).await;
     assert_invariant(&reserved.quantities);
     let advance = fixture
         .execute(
@@ -4074,7 +5555,7 @@ async fn warehouse_survives_structure_completion_and_binds_after_it() {
                 "advance-wh-complete",
                 &structure.structure_id,
                 &structure.stages[0].stage,
-                "res-wh-complete",
+                &reserved.reservation_ref,
                 structure.revision,
                 structure.stages[0].work_units,
             ),

@@ -66,7 +66,11 @@ async fn crafted_stew_keeps_flower_effect_through_wire_save_drop_and_consumption
         packet.encode(&mut wire).unwrap();
         let decoded = ClientboundContainerSetSlot::decode(&mut wire.as_slice()).unwrap();
         assert_eq!(decoded.item_stack, manual);
-        let book = crate::play::recipes::initial_recipe_book(std::slice::from_ref(recipe), &items);
+        let book = crate::play::recipes::initial_recipe_book(
+            std::slice::from_ref(recipe),
+            &items,
+            &state.item_facts,
+        );
         let mut book_wire = Vec::new();
         book.encode(&mut book_wire).unwrap();
         let decoded_book =

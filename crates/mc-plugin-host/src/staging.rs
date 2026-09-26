@@ -211,6 +211,13 @@ fn client_presentation_text_bytes(request: &ClientCommand) -> usize {
             .len()
             .max(view_model_text_bytes(&present.model)),
         ClientCommand::CloseClientView(close) => close.view_instance_id.len(),
+        ClientCommand::BeginClientSelection(begin) => begin
+            .request
+            .len()
+            .max(begin.view_instance_id.len())
+            .max(begin.action_id.len())
+            .max(begin.dimension.len()),
+        ClientCommand::CancelClientSelection(cancel) => cancel.selection_context_id.len(),
         ClientCommand::PlayClientSound(play) => play.sound_id.len(),
         ClientCommand::StopClientSound(stop) => stop.sound_id.len(),
         ClientCommand::GrantLoaderBlockItem(grant) => grant.request.len().max(grant.block.len()),

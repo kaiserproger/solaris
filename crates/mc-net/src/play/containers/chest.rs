@@ -1,7 +1,7 @@
 use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
-use mc_world::{BlockPos, ChestBlockEntity};
+use mc_world::{BlockMutationToken, BlockPos, ChestBlockEntity};
 
 use super::furnace::{furnace_slot_to_stack, stack_to_furnace_slot};
 use super::quickcraft::{
@@ -22,6 +22,7 @@ pub(in crate::play) const PLAYER_CONTAINER_STORAGE_SLOTS: usize = 36;
 pub(in crate::play) struct ChestWindow {
     pub(in crate::play) container_id: i32,
     pub(in crate::play) positions: Vec<BlockPos>,
+    pub(in crate::play) block_tokens: Vec<BlockMutationToken>,
     pub(in crate::play) state_id: i32,
     pub(in crate::play) quickcraft: QuickCraftState,
 }
@@ -35,6 +36,7 @@ impl ChestWindow {
         Self {
             container_id,
             positions,
+            block_tokens: Vec::new(),
             state_id: 1,
             quickcraft: QuickCraftState::default(),
         }

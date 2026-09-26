@@ -25,9 +25,9 @@ pub(in crate::play) fn held_attack_speed(
     items: &ItemRegistry,
     held: &ItemStack,
 ) -> f32 {
-    let modifier = held_item_id(held)
-        .and_then(|item_id| items.name_of(item_id))
-        .and_then(|item| item_facts.get(item))
+    let modifier = (!held.is_empty())
+        .then(|| item_facts.facts_for_stack(held, items))
+        .flatten()
         .and_then(|facts| facts.attack_speed_modifier)
         .unwrap_or(0.0);
     (PLAYER_BASE_ATTACK_SPEED + modifier).max(0.0)
@@ -38,11 +38,7 @@ pub(in crate::play) fn held_attack_damage(
     items: &ItemRegistry,
     held: &ItemStack,
 ) -> f32 {
-    let base = attack_damage_for_item(
-        item_facts,
-        items,
-        (!held.is_empty()).then_some(held.item_id),
-    );
+    let base = attack_damage_for_held(item_facts, items, held);
     base + sharpness_damage_bonus(held)
 }
 
@@ -61,7 +57,7 @@ pub(in crate::play) fn held_attack_damage_at_tick(
     let strength = ((elapsed_ticks + 0.5) * held_attack_speed(item_facts, items, held)
         / ATTACK_RECHARGE_TICKS_PER_SECOND)
         .clamp(0.0, 1.0);
-    let base_damage = attack_damage_for_item(item_facts, items, held_item_id(held));
+    let base_damage = attack_damage_for_held(item_facts, items, held);
     let enchantment_damage = full_damage - base_damage;
     base_damage * (0.2 + strength * strength * 0.8) + enchantment_damage * strength
 }
@@ -84,6 +80,22 @@ pub(in crate::play) fn begin_player_attack_attempt(
         last_tick,
         current_tick,
     ))
+}
+
+fn attack_damage_for_held(
+    item_facts: &ItemFactsTable,
+    items: &ItemRegistry,
+    held: &ItemStack,
+) -> f32 {
+    if let Some(model) = held.item_model.as_deref()
+        && item_facts.custom(model).is_some()
+    {
+        return item_facts
+            .custom_for_stack(held, items)
+            .and_then(|item| item.facts.attack_damage_modifier)
+            .map_or(1.0, |modifier| (1.0 + modifier).max(0.0));
+    }
+    attack_damage_for_item(item_facts, items, held_item_id(held))
 }
 
 pub(in crate::play) fn attack_damage_for_item(
@@ -136,26 +148,37 @@ pub(in crate::play) fn damage_held_weapon_stack(
     item_facts: &ItemFactsTable,
     held: &mut ItemStack,
 ) -> Option<ItemStack> {
-    let (max_damage, damage_per_attack) = {
-        if held.is_empty() {
+    if held.is_empty() {
+        return None;
+    }
+    let (max_damage, damage_per_attack) = if let Some(custom) = held
+        .item_model
+        .as_deref()
+        .and_then(|model| item_facts.custom(model))
+    {
+        if items.id_of(&custom.carrier) != Some(held.item_id) || !custom.facts.weapon {
             return None;
         }
+        (
+            i32::try_from(custom.facts.max_damage?).ok()?,
+            custom.facts.weapon_damage_per_attack.unwrap_or(1).max(1),
+        )
+    } else {
         let item = items.name_of(held.item_id)?;
         let facts = item_facts.get(item);
-        let is_weapon = facts.is_some_and(|facts| facts.weapon);
-        let is_tool = is_durability_tool_path(item.path());
-        if !is_weapon && !is_tool {
+        if !facts.is_some_and(|facts| facts.weapon) && !is_durability_tool_path(item.path()) {
             return None;
         }
-        let max_damage = facts
-            .and_then(|facts| facts.max_damage)
-            .and_then(|value| i32::try_from(value).ok())
-            .or_else(|| max_tool_damage_for_path(item.path()))?;
-        let damage_per_attack = facts
-            .and_then(|facts| facts.weapon_damage_per_attack)
-            .unwrap_or(1)
-            .max(1);
-        (max_damage, damage_per_attack)
+        (
+            facts
+                .and_then(|facts| facts.max_damage)
+                .and_then(|value| i32::try_from(value).ok())
+                .or_else(|| max_tool_damage_for_path(item.path()))?,
+            facts
+                .and_then(|facts| facts.weapon_damage_per_attack)
+                .unwrap_or(1)
+                .max(1),
+        )
     };
 
     let damage_per_attack = i32::try_from(damage_per_attack).unwrap_or(i32::MAX);

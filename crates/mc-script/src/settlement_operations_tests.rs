@@ -1,11 +1,12 @@
 use crate::{
-    ScriptChunkAvailability, ScriptDtoError, ScriptResidentSiteReservation,
-    ScriptSettlementBuilding, ScriptSettlementOperation, ScriptSettlementPoi,
-    ScriptSettlementResult, ScriptSettlementSite, ScriptSettlementSitePage, ScriptSitePoiKind,
-    ScriptSitePoiState, ScriptSiteProvenance, ScriptSiteVariant, ScriptStructureMaterial,
-    ScriptStructureReceipt, ScriptStructureSnapshot, ScriptStructureStagePlan,
-    ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose, ScriptSurveySnapshot,
-    ScriptWarehouseBinding, ScriptWarehouseSource, warehouse_handle,
+    MAX_SETTLEMENT_PLACEMENTS, MAX_VANILLA_VILLAGE_BUILDINGS, ScriptBuildingCertificate,
+    ScriptBuildingCertificateRequest, ScriptBuildingInteractionPoint, ScriptChunkAvailability,
+    ScriptDtoError, ScriptResidentSiteReservation, ScriptSettlementBuilding,
+    ScriptSettlementOperation, ScriptSettlementPoi, ScriptSettlementResult, ScriptSettlementSite,
+    ScriptSettlementSitePage, ScriptSitePoiKind, ScriptSitePoiState, ScriptSiteProvenance,
+    ScriptSiteVariant, ScriptStructureMaterial, ScriptStructureReceipt, ScriptStructureSnapshot,
+    ScriptStructureStagePlan, ScriptStructureState, ScriptSurveyBounds, ScriptSurveyPurpose,
+    ScriptSurveySnapshot, ScriptWarehouseBinding, ScriptWarehouseSource, warehouse_handle,
 };
 
 const GENERATION_ID_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -136,6 +137,7 @@ fn survey_snapshot_is_bounded_by_aggregate_counts() {
     let full = ScriptSurveySnapshot::new(
         "minecraft:overworld".to_owned(),
         bounds,
+        1,
         1,
         ScriptChunkAvailability::Loaded,
         "survey-1".to_owned(),
@@ -282,11 +284,13 @@ fn operation_id_is_exposed_only_for_idempotent_mutations() {
     assert_eq!(
         ScriptSettlementOperation::PrepareStructure {
             operation_id: "prepare-1".to_owned(),
+            site_id: "site-1".to_owned(),
             blueprint_id: "settlement:house".to_owned(),
             anchor: [0, 64, 0],
             rotation: 0,
             survey_token: "survey-1".to_owned(),
             expected_site_revision: 1,
+            expected_blueprint_hash: None,
         }
         .operation_id(),
         Some("prepare-1")
@@ -415,6 +419,7 @@ fn serde_round_trips_one_full_site_and_one_full_structure() {
         dimension: "minecraft:overworld".to_owned(),
         bounds: ScriptSurveyBounds::new([0, 0, 0], [1, 1, 1]).expect("valid bounds"),
         revision: 2,
+        world_revision: 2,
         chunk_availability: ScriptChunkAvailability::Loaded,
         survey_token: "survey-1".to_owned(),
         usable_plots: 2,
@@ -560,8 +565,47 @@ fn warehouse_binding_and_handle_are_bounded_and_owner_scoped() {
     };
     assert_eq!(village.operation_id(), Some("bind-village-1"));
     assert!(village.validate().is_ok());
-}
 
+    let manual = ScriptWarehouseBinding::new(
+        "warehouse:settlement:manual:1:2:3".to_owned(),
+        ScriptWarehouseSource::Manual {
+            position: [1, 2, 3],
+        },
+        5,
+    );
+    assert!(manual.validate().is_ok());
+    let far = ScriptWarehouseBinding::new(
+        "warehouse:settlement:manual:far".to_owned(),
+        ScriptWarehouseSource::Manual {
+            position: [30_000_001, 0, 0],
+        },
+        5,
+    );
+    assert!(matches!(far.validate(), Err(ScriptDtoError::InvalidBounds)));
+
+    let bind_manual = ScriptSettlementOperation::BindManualWarehouse {
+        operation_id: "bind-manual-1".to_owned(),
+        survey_token: "t".repeat(64),
+        position: [1, 2, 3],
+    };
+    assert_eq!(bind_manual.operation_id(), Some("bind-manual-1"));
+    assert!(bind_manual.validate().is_ok());
+    let encoded = serde_json::to_string(&bind_manual).expect("manual bind serializes");
+    assert_eq!(
+        serde_json::from_str::<ScriptSettlementOperation>(&encoded)
+            .expect("manual bind deserializes"),
+        bind_manual
+    );
+    let outside = ScriptSettlementOperation::BindManualWarehouse {
+        operation_id: "bind-manual-2".to_owned(),
+        survey_token: "t".repeat(64),
+        position: [30_000_001, 0, 0],
+    };
+    assert!(matches!(
+        outside.validate(),
+        Err(ScriptDtoError::InvalidBounds)
+    ));
+}
 #[test]
 fn serde_rejects_unknown_keys() {
     let operation = serde_json::json!({
@@ -602,4 +646,157 @@ fn site_territory_footprint_is_accepted_above_the_blueprint_bound() {
         house.validate(),
         Err(ScriptDtoError::InvalidBounds)
     ));
+}
+
+/// Vanilla villages describe all placed templates, so their independently bounded
+/// descriptor capacity must not weaken the authored catalog-site contract.
+#[test]
+fn vanilla_village_buildings_use_a_separate_descriptor_bound() {
+    let mut village = site("site-village");
+    village.provenance = ScriptSiteProvenance::VanillaVillage;
+    village.inhabitant_generation_ids.clear();
+    village.buildings =
+        vec![building("minecraft:village_house"); MAX_SETTLEMENT_PLACEMENTS.saturating_add(1)];
+    assert!(village.validate().is_ok());
+
+    village.buildings =
+        vec![building("minecraft:village_house"); MAX_VANILLA_VILLAGE_BUILDINGS.saturating_add(1)];
+    assert!(matches!(
+        village.validate(),
+        Err(ScriptDtoError::InvalidBounds)
+    ));
+
+    village.provenance = ScriptSiteProvenance::Authored;
+    assert!(matches!(
+        village.validate(),
+        Err(ScriptDtoError::InvalidBounds)
+    ));
+}
+
+fn certificate_footprint() -> ScriptSurveyBounds {
+    ScriptSurveyBounds::new([0, 60, 0], [15, 67, 15]).expect("valid footprint")
+}
+
+fn certificate_points() -> Vec<ScriptBuildingInteractionPoint> {
+    vec![
+        ScriptBuildingInteractionPoint::Entrance { at: [1, 61, 1] },
+        ScriptBuildingInteractionPoint::Poi {
+            poi_kind: ScriptSitePoiKind::Home,
+            at: [2, 61, 2],
+            capacity: 2,
+        },
+        ScriptBuildingInteractionPoint::Workstation {
+            at: [3, 61, 3],
+            capability: "solaris:smithy".to_owned(),
+            workplaces: 2,
+        },
+        ScriptBuildingInteractionPoint::Storage { at: [4, 61, 4] },
+    ]
+}
+
+fn certificate_request() -> ScriptBuildingCertificateRequest {
+    ScriptBuildingCertificateRequest::new(
+        certificate_footprint(),
+        "solaris:smithy".to_owned(),
+        certificate_points(),
+        "t".repeat(64),
+        7,
+    )
+}
+
+/// The certificate request carries the §4.3 fields, round-trips, and refuses
+/// malformed fences: bad purpose, missing/foreign survey token, points outside
+/// the footprint, duplicates, empty lists, and zero capacity/workplaces.
+#[test]
+fn building_certificate_request_bounds_and_round_trip() {
+    let mut request = certificate_request();
+    request.canonicalize();
+    assert!(request.validate().is_ok());
+    let encoded = serde_json::to_string(&request).expect("request serializes");
+    assert_eq!(
+        serde_json::from_str::<ScriptBuildingCertificateRequest>(&encoded)
+            .expect("request deserializes"),
+        request
+    );
+
+    let mut bad_purpose = certificate_request();
+    bad_purpose.purpose = "not a resource id".to_owned();
+    assert!(bad_purpose.validate().is_err());
+
+    let mut no_token = certificate_request();
+    no_token.survey_token.clear();
+    assert!(no_token.validate().is_err());
+
+    let mut outside = certificate_request();
+    outside
+        .interaction_points
+        .push(ScriptBuildingInteractionPoint::Entrance { at: [100, 64, 100] });
+    assert!(outside.validate().is_err());
+
+    let mut duplicate = certificate_request();
+    duplicate
+        .interaction_points
+        .push(ScriptBuildingInteractionPoint::Entrance { at: [1, 61, 1] });
+    assert!(duplicate.validate().is_err());
+
+    let mut empty = certificate_request();
+    empty.interaction_points.clear();
+    assert!(empty.validate().is_err());
+
+    let mut zero_capacity = certificate_request();
+    zero_capacity.interaction_points = vec![ScriptBuildingInteractionPoint::Poi {
+        poi_kind: ScriptSitePoiKind::Home,
+        at: [1, 61, 1],
+        capacity: 0,
+    }];
+    assert!(zero_capacity.validate().is_err());
+
+    let mut zero_workplaces = certificate_request();
+    zero_workplaces.interaction_points = vec![ScriptBuildingInteractionPoint::Workstation {
+        at: [1, 61, 1],
+        capability: "solaris:smithy".to_owned(),
+        workplaces: 0,
+    }];
+    assert!(zero_workplaces.validate().is_err());
+
+    let mut bad_capability = certificate_request();
+    bad_capability.interaction_points = vec![ScriptBuildingInteractionPoint::Workstation {
+        at: [1, 61, 1],
+        capability: "not a capability".to_owned(),
+        workplaces: 1,
+    }];
+    assert!(bad_capability.validate().is_err());
+}
+
+/// The certificate mirrors the accepted request with its own opaque handle and
+/// revisions, round-trips, and refuses a missing handle or moved points.
+#[test]
+fn building_certificate_bounds_and_round_trip() {
+    let request = certificate_request();
+    let mut certificate = ScriptBuildingCertificate::new(
+        "certificate-1".to_owned(),
+        request.footprint,
+        request.purpose.clone(),
+        request.interaction_points.clone(),
+        7,
+        3,
+    );
+    certificate.canonicalize();
+    assert!(certificate.validate().is_ok());
+    let encoded = serde_json::to_string(&certificate).expect("certificate serializes");
+    assert_eq!(
+        serde_json::from_str::<ScriptBuildingCertificate>(&encoded)
+            .expect("certificate deserializes"),
+        certificate
+    );
+
+    let mut no_handle = certificate.clone();
+    no_handle.certificate_id.clear();
+    assert!(no_handle.validate().is_err());
+
+    let mut outside = certificate.clone();
+    outside
+        .interaction_points
+        .push(ScriptBuildingInteractionPoint::Storage { at: [100, 64, 100] });
+    assert!(outside.validate().is_err());
 }

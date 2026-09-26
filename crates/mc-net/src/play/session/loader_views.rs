@@ -275,7 +275,7 @@ impl LoaderViewRegistry {
         // A replacement invalidates every prior action binding and context.
         self.selections
             .retain(|_, context| context.instance_id != instance.instance_id);
-        let mut replacement = build_instance(
+        let replacement = build_instance(
             instance.instance_id.clone(),
             revision,
             instance.player_id,
@@ -284,7 +284,6 @@ impl LoaderViewRegistry {
             &instance.title,
             model,
         );
-        replacement.last_action_sequence = instance.last_action_sequence;
         self.views.insert(instance.instance_id.clone(), replacement);
         for mut context in armed {
             context.revision = revision;
@@ -479,9 +478,16 @@ impl LoaderViewRegistry {
         }
         let instance_id = instance.instance_id.clone();
         let requires_selection = instance.requires_selection(&action.action_id);
+        let last_sequence = instance.last_action_sequence;
         let Some(token) = action.selection_token.as_deref() else {
             if requires_selection {
                 return Err(LoaderViewError::SelectionRequired);
+            }
+            if action.action_sequence <= last_sequence {
+                return Ok(ActionOutcome {
+                    deliver: false,
+                    admission: None,
+                });
             }
             self.record_sequence(&instance_id, action.action_sequence);
             return Ok(ActionOutcome {
@@ -505,6 +511,12 @@ impl LoaderViewRegistry {
             return Ok(ActionOutcome {
                 deliver: false,
                 admission: context.admission.clone(),
+            });
+        }
+        if action.action_sequence <= last_sequence {
+            return Ok(ActionOutcome {
+                deliver: false,
+                admission: None,
             });
         }
         if now_tick > context.expires_at_tick {

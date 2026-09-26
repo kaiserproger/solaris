@@ -413,7 +413,8 @@ pub(super) struct SessionRegistration<'a> {
     pub(super) pose: PlayerPose,
     pub(super) game_mode: GameMode,
     pub(super) max_sessions: usize,
-    pub(super) script_operator: bool,
+    pub(super) script_permissions: crate::server::CommandPermissionConfig,
+    pub(super) peer: std::net::SocketAddr,
     pub(super) dimension: &'a str,
     pub(super) loader_session: Option<crate::LoaderSession>,
 }
@@ -438,7 +439,8 @@ struct PlaySession {
     ordered_dispatch: Arc<OrderedDispatchState>,
     script_inventory_transaction_gate:
         Arc<script_inventory_transaction_endpoint::ScriptInventoryTransactionGate>,
-    script_operator: bool,
+    script_permissions: crate::server::CommandPermissionConfig,
+    peer: std::net::SocketAddr,
     dimension: String,
     loader_session: Option<crate::LoaderSession>,
     last_broadcast_world_time: Option<(u64, bool)>,
@@ -1337,6 +1339,56 @@ impl SessionRegistry {
             }
             required.iter().all(|(item_id, quantity)| {
                 available.get(item_id).copied().unwrap_or(0) >= *quantity
+            })
+        })
+    }
+
+    /// Check the material after-image while deriving the released amount from
+    /// the exact physical before/after images. A debit may never introduce or
+    /// increase stock, nor release more than the floor currently reserves.
+    pub(crate) fn warehouse_reservation_stock_survives_after_consuming(
+        &self,
+        position: mc_world::BlockPos,
+        expected: &mc_world::ChestBlockEntity,
+        updated: &mc_world::ChestBlockEntity,
+    ) -> bool {
+        let totals = |chest: &mc_world::ChestBlockEntity| {
+            let mut totals = BTreeMap::new();
+            for slot in &chest.slots {
+                let count = u64::try_from(slot.count).ok()?;
+                *totals.entry(slot.item_id).or_insert(0_u64) += count;
+            }
+            Some(totals)
+        };
+        let (Some(expected), Some(updated)) = (totals(expected), totals(updated)) else {
+            return false;
+        };
+        if updated.iter().any(|(item_id, quantity)| {
+            *quantity > expected.get(item_id).copied().unwrap_or_default()
+        }) {
+            return false;
+        }
+        let floors = lock_authoritative_mutex(
+            &self.warehouse_reservation_floors,
+            "play.warehouse_reservation_floors",
+        )
+        .clone();
+        let Some(floors) = floors else {
+            return true;
+        };
+        let floors = floors.load();
+        let Some(required) = floors.get(&position) else {
+            return true;
+        };
+        required.iter().all(|(item_id, quantity)| {
+            let released = expected
+                .get(item_id)
+                .copied()
+                .unwrap_or_default()
+                .checked_sub(updated.get(item_id).copied().unwrap_or_default());
+            let remaining_floor = released.and_then(|released| quantity.checked_sub(released));
+            remaining_floor.is_some_and(|remaining_floor| {
+                updated.get(item_id).copied().unwrap_or_default() >= remaining_floor
             })
         })
     }
@@ -2634,6 +2686,9 @@ fn remove_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk:
     }
 }
 
+#[cfg(test)]
+#[path = "session/resident_damage_tests.rs"]
+mod resident_damage_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

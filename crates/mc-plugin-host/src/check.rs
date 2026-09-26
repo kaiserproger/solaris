@@ -10,6 +10,7 @@
 
 use std::path::Path;
 
+use mc_data::item_components::CustomItemDefinition;
 use mc_script::{COMPONENT_PLUGIN_API_VERSION, ClientBundle, GameplayRules, script_boundary_pair};
 use std::num::NonZeroUsize;
 
@@ -44,6 +45,8 @@ pub struct CheckedPackage {
     /// contribution the startup contract refuses fails the check instead of being
     /// reported.
     pub plan: Option<GameplayRules>,
+    /// Checked canonical item identities from the component's configure phase.
+    pub items: Vec<CustomItemDefinition>,
     /// How many commands the package's `init` staged and the boundary admitted.
     ///
     /// A check has no session registry, so a command that addresses a player by
@@ -212,7 +215,7 @@ fn check_package(
     // handed to the caller as though something would accept it.
     let plan = contribution
         .as_ref()
-        .map(convert_startup_contribution)
+        .map(|value| convert_startup_contribution(&id, value))
         .transpose()
         .map_err(|refusal| refuse(refusal.to_string()))?;
 
@@ -286,7 +289,8 @@ fn check_package(
     Ok(CheckedPackage {
         id,
         api: compiled.api_version().to_owned(),
-        plan,
+        plan: plan.as_ref().and_then(|content| content.rules().cloned()),
+        items: plan.map_or_else(Vec::new, |content| content.items().to_vec()),
         admitted_commands,
         unverifiable_player_commands: admitted_commands == 0 && commands_needed_a_session,
     })

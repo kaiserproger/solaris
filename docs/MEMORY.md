@@ -25,6 +25,1554 @@
 | [`docs/memory/log-08-audit-closeout-and-inhabitants.md`](memory/log-08-audit-closeout-and-inhabitants.md) | 4202–4400 | Закрытие аудита ядра и жители деревень из маркеров частей (закрытый чекпоинт 09-15). |
 
 
+## CP-048 birth record layer, child service gate, roster evidence (2026-09-26)
+
+**Status.** `draft`; durable birth record layer only. Runtime birth (native reserve/spawn execution, housing/food pause gates, migration transitions) remains unwired: the initiation triggers and precondition thresholds are an open runtime gap, not an owner decision. Only relocation waits on an owner decision (identity model + ADR). No commit authorized.
+
+**Current result.** The sibling package records one birth as an immutable plan with reserved identity in the opening CAS: stable decision id first for replay, then per-settlement sequence for the child alias and the `-reserve`/`-spawn` ids (gaps on refusal, never reuse), script-id alphabet validation on all three ids before any mutation, capacity and household-parent checks at record time, all-or-nothing mutation, single sequence reservation (projection advances nothing further), scoped open-birth slot holds in `validate_intent`/`add_member`/roster writer, household-scoped parents, vacant-holder death handling with retire-on-refusal, refused-decision replay, generic-path commit blocked, and 64-byte id bounds. `commit_birth` projects the child once (roster alias, handle, household ref, age origin) and replays idempotently. Hire admits a child to service only at `tick - age_origin >= ADULT_AGE_TICKS` (18 calendar years per SPECIFICATION) with the callback tick threaded from `EventContext`; no-origin residents stay adopted adults. `assert_birth_evidence` pins the package-side roster/household/intent projection; core reserve/spawn/release `Occupied` occupancy stays asserted by the native storage suites.
+
+**Review.** One independent read-only reviewer returned `pass` (confidence 0.86), no findings, after the birth-scope corrections. Fixing findings does not trigger a second reviewer.
+
+**Checks.** Sibling `cargo test`: 82 passed, 0 failed; `cargo clippy --all-targets`: 0 errors; `rustfmt --check` on touched sibling files: 0 diffs. Core `cargo test -p mc-net --lib script::storage::`: 157 passed; `cargo test -p mc-script settlement`: 13 passed. Graphical acceptance `not run` (owner-deferred until after CP-096). No wire, sidecar, or schema change beyond the additive sibling registry fields.
+
+**Blocked.** Only relocation waits on an owner decision (identity model + ADR per sibling IMPLEMENTATION_SPEC §5.5; unauthorized `MoveResidentHome` slice removed from core DTO/WIT/host/SDK/dispatch). Adult migration, birth runtime, housing/food pauses, and guardian-death recovery reissue wait on the open runtime gap: initiation triggers + precondition thresholds.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 087a81e714d963cf386d44970fc271a4104a1b5a9b6b78d5c11316c6ec1cd586  # sha256 of `git diff HEAD` over the core relocation-removal files (DTO, WIT, host, SDK, settlement.rs, residents.rs, tests, lib.rs)
+changed_files:
+  - crates/mc-net/src/script/storage/{settlement.rs,residents.rs,resident_settlement_tests.rs}
+  - crates/mc-script/src/{settlement_operations.rs,lib.rs}
+  - crates/mc-script/wit/settlements.wit
+  - crates/mc-plugin-host/src/domain_settlements.rs
+  - sdk/rust/solaris-plugin-sdk/src/settlement_ops.rs
+  - ../solaris-default-plugins/sources/solaris-settlements/src/{demography.rs,demography_tests.rs,hire_runtime.rs,hire_tests.rs,lib.rs}
+validation:
+  - sibling cargo test: 82 passed, 0 failed
+  - sibling cargo clippy --all-targets: 0 errors
+  - sibling rustfmt --check touched files: 0 diffs
+  - core cargo test -p mc-net --lib script::storage:: : 157 passed
+  - core cargo test -p mc-script settlement: 13 passed
+status: CP-048 birth record layer complete with review; only relocation blocked on owner decision, birth/migration/pauses/guardian-death runtime on open trigger gap; no commit authorized
+next: Pause on insufficient housing and food (record-time capacity holds exist; native gates need triggers); then guardian-death runtime reissue, then CP-049
+```
+
+## CP-047 combat recovery, treatment and demobilization closed headlessly (2026-09-25)
+
+**Status.** `draft`; the CP-047 headless native and first-party-component scope is
+complete, including the corrections from one independent read-only review. The
+owner deferred graphical Minecraft acceptance until after CP-096, so this is not
+client-accepted and not `stabilization`. Core keeps generic resident order,
+inventory, world and entity authority; first-party settlement policy and its
+integration tests live in `../solaris-default-plugins`.
+
+**Current result.** Operational morale is a durable field on each serving
+resident's order record (`script/storage/resident_morale.rs`); observed native
+ally/officer losses, the physical flank and real arrival move it through
+`Steady -> Shaken -> Wavering -> Routing -> Rallied`, and routing replaces the
+interrupted chase with a native walk goal at the rally without moving the guard
+itself. `/settlement retreat` issues one bounded revision-fenced native
+`Retreat` that stops the old chase without teleporting; when the rally cell
+cannot be placed the member now receives `Idle` while keeping its
+`blocked_route` report (the durable-replay projection returns the same `Idle`,
+source-qualified, no separate replay test). Demobilization retains native gear
+provenance, refuses missing live residents and mints no second gear owner for a
+dead one. `/settlement treat` spends one real warehouse bread for up to three
+native health points as one WIF plus a linked world-journal acknowledgement
+before publication, and startup projects an unprojected debit only with that
+acknowledgement; a lower health revision still fails closed. Capture keeps the
+victim's handle, UUID and gear and admits no second army membership, and
+startup recovery reads the settlement registry once and now continues past a
+refused dismissal to the remaining intents and to capture recovery. Resident
+melee damage still commits one off-thread regional batch and then publishes
+health, hurt/death and kill rewards through the same session path as every other
+damage source; the publication reconciles the live snapshot, so motion, goals
+and ticking timers no longer drop the committed health, while a newer hit or a
+paid heal keeps ownership of the published value.
+
+**Review.** One read-only reviewer (`Cp047Review-2`) returned `changes` with
+three findings - the dropped health publication, the starved guest startup
+recovery and the blocked-retreat chase - all confirmed in live code, corrected
+and covered by RED/GREEN focused tests. Fixing findings does not trigger a
+second reviewer. Raw evidence:
+`.analysis/codex-logs/cp047-review-findings/receipt.md`,
+`.analysis/codex-logs/cp047-resident-damage-publication/receipt.md`.
+
+**Checks.** `cargo test -p mc-net --lib` on the final tree: 2377 passed, 0
+failed, 8 ignored. Final gates, all on the corrected tree:
+
+| Gate | CP-047 |
+| --- | --- |
+| Cargo baseline | `run correctness` passed: `.analysis/validation/20260925T053848-correctness-ho0j9n8o/result.json` (fmt, code-health and strict clippy exit 0; `cargo test --workspace --all-targets` exit 0 in 1621.6 s = 90 suites, 5165 passed, 0 failed, 192 ignored). |
+| Integration | `settlement-cargo` passed: `.analysis/validation/20260925T060652-settlement-cargo-o8o4ljqj/result.json` (component hash match on the rebuilt guest, 7/7 component integration, 1/1 wasm readiness, 27/27 resident settlement, 75/75 resident order, 70/70 settlement, 2/2 warehouse deposit). |
+| Focused tests | New moved-victim publication regressions and the blocked-rally retreat regression; each fails on the reverted tree. Guest starvation regression RED/GREEN recorded in the receipt. |
+| Vanilla oracle | `not run` - no packet id/layout, registry id or vanilla data changed. |
+| Client/manual gate | `deferred_by_owner`: graphical two-client medicine/retreat/rally/demobilization acceptance after CP-096; not run here. |
+| Performance | `not run` - no performance claim; one bounded snapshot reconciliation per committed damage. |
+| Concurrency | No new worker, lane or lock order: one regional batch off-thread, then one bounded pass under the existing session guard. |
+| Data/protocol facts | `not run` - no wire, sidecar or schema change. |
+| Persistence/storage | Treatment WIF + acknowledgement, capture intent replay, refused-dismissal recovery continuation and morale `goal_applied` across reopen covered; storage formats unchanged. |
+| Dependencies | None added; `Cargo.lock` unchanged by this checkpoint. |
+| Known gaps | Graphical acceptance deferred by owner; world-goal journal replay asserted through `goal_applied` plus reopen, not a separate replay test; the demobilisation kill test uses a configured loot table, not a vanilla capture; the guest fix re-authorized the component hash without re-running graphical Loader acceptance. |
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+validated_tree:
+  head: 87af4502a79864392798bcb52634e6d2d68ce9d4
+  tracked_diff_sha256: bcd122e28fdd928c8eedaf6ebd135710fbc7f08e5b64be44db0f47dcedee01a0  # sha256 of `git diff HEAD` (tracked modifications only)
+  tree_manifest_sha256: 642f02b2e1287f6122963973d1c7b3403332f38761c565432392550af8c164ef  # sha256 over sorted `<sha256>  <path>` lines for all 156 dirty paths, tracked and untracked, target/ excluded
+  untracked_inputs: 5 paths, including this checkpoint's crates/mc-net/src/play/session/resident_damage_tests.rs and crates/mc-net/src/script/storage/resident_morale.rs (the other three belong to earlier checkpoints of the same route)
+  guest_src_manifest_sha256: 036e107538297b133a3f118f031a3b43874fcfebd6ab677d50d32edf76da3e18  # 14 sources/solaris-settlements/src/*.rs
+  deployed_component_sha256: a32bb32bf0aa87a2226ff1364fc27f39d53a50d7b746dfefb00ce4dc428c7d74
+  note: CP-047 has no commit boundary (HEAD predates the whole uncommitted route; the guest Rust sources are untracked in the sibling), so per-slice attribution is not mechanically recoverable and the fingerprints cover the whole validated tree. This MEMORY.md edit is docs-only after the gates.
+changed_files:  # CP-047's own edits per its receipts and work record, not a mechanical boundary
+  - crates/mc-net/src/script/storage/{resident_morale.rs (new),resident_orders.rs,resident_order_execution.rs,resident_order_tests.rs,resident_settlement_tests.rs}
+  - crates/mc-net/src/play/session/{resident_orders.rs,resident_damage_tests.rs (new),entity_combat.rs,session.rs}
+  - crates/mc-net/src/play/{world_journal.rs,world_inventory_journal.rs,world_inventory_journal_tests.rs,simulation.rs,simulation/regional_mutation.rs,simulation/tests.rs}
+  - crates/mc-script/src/resident_order_operations.rs
+  - crates/mc-script/wit/residents.wit
+  - docs/decisions/0009-regional-plugin-boundary.md
+  - docs/MEMORY.md
+  - ../solaris-default-plugins/sources/solaris-settlements/src/{combat.rs,capture_runtime.rs,capture_tests.rs,demob_runtime.rs,demob_tests.rs,lib.rs}
+  - ../solaris-default-plugins/solaris-settlements/plugin.wasm
+validation:
+  - python3 -m tools.harness run correctness: 20260925T053848-correctness-ho0j9n8o passed; workspace tests 90 suites, 5165 passed, 0 failed, 192 ignored
+  - python3 -m tools.harness run settlement-cargo: 20260925T060652-settlement-cargo-o8o4ljqj passed; component hash match; 7/1/27/75/70/2 passed
+status: CP-047 headless scope complete with review corrections; graphical acceptance deferred by owner; no commit authorized
+next: Begin CP-048 - keep resident identities across population growth and housing changes; reconcile the package's demographic rules with the resident model first, then add only the transitions the contract requires.
+```
+
+## CP-014 R1 code path — headless canonical village chain passed (2026-09-23)
+
+**Status.** `draft`. The CP-014 headless R1 path is proven; CP-014 remains
+open because graphical R0/R1 acceptance is `deferred_by_owner`. This is not
+`stabilization`, `release-ready`, or evidence of two real clients.
+
+**Current path.** The shipped `solaris-settlements` Rust component carries the
+selected `site_id` through WIT/SDK/host/core. A generated, materialized vanilla
+village supplies an actual resident home and a bound physical village chest.
+Generated-home reservations use stable POI identity and reject an occupied
+home. The canonical TCP scenario creates/adopts/populates the village, equips
+its resident, harvests a mature carrot crop, deposits food, withdraws one
+physical `oak_wood`, crafts four planks at a physical crafting table, and
+deposits them. It checks the real chest *before* funding the unchanged
+revision-1 `watch_post` blueprint with legal item stacks; it then commits one
+structure portion and observes a changed world block. After world/host/server
+restart it verifies saved food and the committed block, reads the exact core
+structure status, rebinds the existing warehouse, and assigns fresh native
+work to the same resident. No virtual material grant or mock host is used.
+
+**Evidence and limits.**
+- `settlement-cargo` including component-byte/source equality, real TCP/Wasm
+  scenario, native inventory/build/work regressions:
+  `.analysis/validation/20260923T003934-settlement-cargo-yom12edb/result.json`
+  — `passed`.
+- L2 stages on final source: `fmt` passed in
+  `.analysis/validation/20260923T004141-correctness-srnrky0z/result.json`;
+  an unused test variable caused Clippy failure, corrected without production
+  change. Reran only failed Clippy:
+  `.analysis/validation/20260923T004203-clippy-cwvjlss4/result.json` —
+  `passed`; remaining `code-health` and workspace/all-target tests:
+  `.analysis/validation/20260923T004210-code-health-q7h76lt1/result.json`
+  and `.analysis/validation/20260923T004216-test-98cyl3o_/result.json`
+  — both `passed`. The earlier complete `correctness` receipt
+  `.analysis/validation/20260923T000523-correctness-egd2omz8/result.json`
+  passed before the final stronger restart assertion.
+- Independent read-only `CP014R1Review` found that the original restarted
+  `settlement info` asserted only guest registry membership. The final scenario
+  now also checks authoritative structure progress, persisted changed block,
+  and a fresh core worker assignment; no second review was run after the fix.
+- Shipped sibling component SHA-256:
+  `e51d45440d543f9265163d36054130b65357afa3c6e774743d164d6b4c59ecba`.
+  Real graphical client R0/R1, two observers, and graphical rejoin:
+  `deferred_by_owner`, **not run**. Vanilla oracle/performance not run for
+  this scenario. The headless client is a direct Minecraft TCP client, not a
+  graphical real-client acceptance.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+tracked_source_diff_sha256_excluding_memory: 97dbfe7d4b109fdf4128e93b80b8338a148f5c921d151dc867e93e0c4a9d63db
+untracked_canonical_test_sha256: 6949f8a16bdc06a622ed54b54d2c6462691e3cc2fe753cb6fb265aeb6468d15f
+changed_files:
+  - crates/mc-net/src/script/storage/resident_settlement_tests.rs
+  - crates/mc-net/src/script/storage/settlement.rs
+  - crates/mc-net/src/script/storage/settlement_tests.rs
+  - crates/mc-plugin-host/src/domain_settlements.rs
+  - crates/mc-script/src/lib.rs
+  - crates/mc-script/src/resident_operations.rs
+  - crates/mc-script/src/resident_operations_tests.rs
+  - crates/mc-script/src/settlement_operations.rs
+  - crates/mc-script/src/settlement_operations_tests.rs
+  - crates/mc-script/wit/settlements.wit
+  - crates/mc-test-harness/tests/settlement_wasm_readiness.rs
+  - sdk/rust/examples/hello/src/settlement_ops.rs
+  - sdk/rust/solaris-plugin-sdk/src/settlement_ops.rs
+  - tools/harness/profiles.py
+  - ../solaris-default-plugins/sources/solaris-settlements/src/lib.rs
+  - ../solaris-default-plugins/solaris-settlements/plugin.wasm
+  - ../solaris-default-plugins/SETTLEMENT_OVERHAUL_CONTRACT.md
+validation:
+  - settlement-cargo: 20260923T003934-settlement-cargo-yom12edb passed
+  - fmt: 20260923T004141-correctness-srnrky0z passed
+  - clippy: 20260923T004203-clippy-cwvjlss4 passed
+  - code-health: 20260923T004210-code-health-q7h76lt1 passed
+  - test: 20260923T004216-test-98cyl3o_ passed
+  - graphical-R0-R1: deferred_by_owner
+next: Owner deferred graphical/final acceptance until after CP-096; continue source implementation in checkpoint order while retaining unverified gates.
+```
+
+## Deferred client acceptance, CP-015 source-only placement correction (2026-09-23)
+
+The owner explicitly requested that the blocked implementation queue be
+unblocked, graphical validation skipped, and overall acceptance performed only
+after CP-096. All CP-014…096 TODOs are unblocked; CP-014 and CP-015 remain
+pending **acceptance**, not passed. `draft` remains the product label.
+
+In the Loader Java agent, `findUnobstructedPlaceablePair` no longer requires a
+clicked dirt-like block: a full-collision, non-menu solid support can now be
+chosen for an unobstructed crafting-table/stonecutter placement. The other
+placement selectors retain their dirt-support constraint, including the
+two-client dirt-drop scenario. The crafting-table blockage diagnostic now
+describes unobstructed placement, not dry terrain. This is a code-path
+correction, **not** a reproduction or real-client resolution of the historical
+no-debug survival failure; the exact failure still needs the deferred graphical
+scenario. No terrain/worldgen change was made.
+
+Focused sibling `:java-agent:compileJava` passed twice and
+`:java-agent:test --tests dev.solaris.agent.javaagent.PlayableRealClientLoopScenarioTest`
+passed after the final correction. Independent read-only review found that
+interactive supports could consume the place action; the final selector
+excludes menu supports and non-full collision blocks. No second review was run.
+Graphical survival and multi-client acceptance: `deferred_by_owner`, not run.
+Sibling base `0972926e4431ee597cb4903abc43e96872acd732`; scoped two-file
+working diff SHA-256 `fd2d18937193e914319d88e7742c040462548d25e06927d0d1e3412039144fcb`
+includes pre-existing unrelated edits in `MinecraftScenarioClient.java`;
+preserve them.
+
+## CP-018 inventory/crafting source correction, client acceptance deferred (2026-09-23)
+
+Window-0 and crafting-table clicks previously consumed overflow crafting
+remainders and only logged that they were "dropping" them. The owner commit now
+receives those remainder stacks as world-drop plans; if item entities or the
+bounded drop budget are unavailable, the candidate is rejected without
+consuming ingredients. Compatible drops are packed within item stack limits
+before the existing 14-entity owner admission fence. The recipe-book
+direct-craft path now generates the same bucket remainders rather than silently
+consuming them. No new container authority or session mirror was added.
+
+The packet-level Window-0 regression exercised 16 shift-click crafts with
+full inventory: the player retained the final empty bucket and the owner
+persisted a single 15-bucket world drop. The recipe-book unit regression
+exercised a full inventory and observed its overflow bucket. Both focused
+`cargo test -p mc-net ... --lib` commands passed; `cargo fmt --all -- --check`
+passed and `code-health` passed at
+`.analysis/validation/20260923T032201-code-health-3id2vmbj/result.json`.
+Independent read-only review found the pre-packing 14-drop admission error;
+packing and bounded rejection address it. No second review was run.
+Pre-fix source evidence: `.analysis/codex-logs/crafting-remainder-overflow/repro.txt`.
+The graphical `inventory` profile and complete CP-018 acceptance remain
+`deferred_by_owner` until after CP-096; the product label remains `draft`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 4bdcf1bb8f6236e4be2595bfc1fb8670fb60544cb1e26814a69ea29a49ba8ecc
+changed_files:
+  - crates/mc-net/src/play.rs
+  - crates/mc-net/src/play/recipes.rs
+  - crates/mc-net/src/play/inventory.rs
+  - crates/mc-net/src/play/containers.rs
+  - crates/mc-net/src/play/containers/crafting.rs
+  - crates/mc-net/src/play/command_execution.rs
+  - crates/mc-net/src/play/session/creative_slot.rs
+  - crates/mc-net/src/play/tests/inventory_settlement.rs
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net full_inventory_crafting_preserves_overflow_bucket_as_world_drop --lib: passed
+  - cargo test -p mc-net recipe_book_craft_preserves_bucket_remainder_when_inventory_is_full --lib: passed
+  - cargo fmt --all -- --check: passed
+  - code-health: 20260923T032201-code-health-3id2vmbj passed
+  - graphical-inventory: deferred_by_owner
+next: Continue non-graphical CP-018 source audit, then CP-019 container observer audit; defer acceptance to the owner after CP-096.
+```
+
+
+## CP-023 hopper reservation source correction, client acceptance deferred (2026-09-23)
+
+A hopper could pull reserved warehouse stock from a chest: its staged source
+after-image was never checked against the CP-004 reservation floor. A focused
+regression failed before the fix with two reserved items being moved, then
+passed with the floor preserved and only unreserved surplus movable.
+`scheduled_hopper_transfer` now checks the source after-image. The resident
+owner commit rechecks the floor while holding the existing per-region
+reservation admission gate; it includes both physical chest halves and the
+canonical viewer position. An occupied gate leaves the resident tick unclaimed.
+The coordinator fallback, which writes storage directly, also holds admission
+while transferring; a busy gate produces no transfer and schedules a later tick.
+No second planner or inventory authority was added.
+
+The 16 focused `scheduled_hopper_` tests passed, including durable journal,
+double-chest transfers, a held reservation admission gate and a direct
+fallback-path regression that failed before the fallback guard. `fmt` passed
+at `.analysis/validation/20260923T042617-fmt-jiliool5/result.json`;
+`code-health` passed at
+`.analysis/validation/20260923T042609-code-health-chcx4x1x/result.json`.
+Independent read-only review found both the initial same-region double-lock
+error and the fallback bypass; both were corrected and the failed hopper suite
+was rerun after the relevant fixes. The graphical machine/container scenario,
+bounded tick workload, unload/restart and complete CP-023 acceptance remain
+`deferred_by_owner` until after CP-096; product maturity remains `draft`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 5d3837f90d2cc2683ca152a9c2388504d8aecb16bacdf76983c1ee6a0543df31
+changed_files:
+  - crates/mc-net/src/play.rs
+  - crates/mc-net/src/play/scheduled_blocks.rs
+  - crates/mc-net/src/play/tests/scheduled_hoppers.rs
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net scheduled_hopper_ --lib: 16 passed
+  - fmt: 20260923T042617-fmt-jiliool5 passed
+  - code-health: 20260923T042609-code-health-chcx4x1x passed
+  - graphical-machines: deferred_by_owner
+next: Reproduce CP-019 stale chest window after same-position block replacement before changing container authority.
+```
+
+## CP-019 chest opening fence correction, client acceptance deferred (2026-09-23)
+
+An old chest menu could spend items from a new block at the same position when
+the replacement had identical slots and a matching shared menu state id. The
+pre-fix regional test failed as a committed stale click; exact reproduction is
+in `.analysis/codex-logs/chest-window-aba/repro.txt`. The open menu now retains
+each physical half's existing `BlockMutationToken`. Both resident CAS and the
+coordinator fallback compare these tokens with contents under their respective
+world locks. Replacing a half or unloading/reloading a chunk rejects the old
+menu. The connection closes that menu, unregisters chest viewers, and sends
+window-0 inventory/cursor resynchronization. The server-owned warehouse
+receipt has no menu opening token and keeps its existing transaction path.
+
+Regional and fallback ABA tests passed (2); chest scope passed (39), including
+the packet-level close and inventory resync; mc-world chest tests passed (9).
+Production `cargo check -p mc-net` passed. `fmt` passed at
+`.analysis/validation/20260923T051613-fmt-wmlnlpe4/result.json`;
+`code-health` passed at
+`.analysis/validation/20260923T051617-code-health-alg7ti__/result.json`;
+`git diff --check` and `codegraph sync .` passed. Independent read-only
+`ChestABAReview` found the missing inventory resync and a resident test using
+the coordinator fallback; both were fixed and the affected checks rerun.
+Graphical two-viewer/double-chest/reconnect and save/reopen acceptance is
+`deferred_by_owner` until after CP-096, not passed; maturity remains `draft`.
+No commit was authorized.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 60f91239f6d07224ff7a69ef413816a8ab409f722653f5b8119e9cd493af9585
+changed_files:
+  - crates/mc-net/src/play.rs
+  - crates/mc-net/src/play/containers/chest.rs
+  - crates/mc-net/src/play/session/transactions.rs
+  - crates/mc-net/src/play/simulation.rs
+  - crates/mc-net/src/play/simulation/regional_mutation.rs
+  - crates/mc-net/src/play/simulation/tests.rs
+  - crates/mc-net/src/play/tests/chest.rs
+  - crates/mc-world/src/resident.rs
+  - crates/mc-world/src/resident/inventory_tests.rs
+  - crates/mc-world/src/storage/tests/resident_mutation_tests.rs
+  - docs/decisions/0004-staged-single-writer-simulation.md
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net chest --lib: 39 passed
+  - cargo test -p mc-world chest --lib: 9 passed
+  - cargo check -p mc-net: passed
+  - fmt: 20260923T051613-fmt-wmlnlpe4 passed
+  - code-health: 20260923T051617-code-health-alg7ti__ passed
+  - graphical-two-viewer: deferred_by_owner
+next: Audit CP-020 lethal damage, drops, XP and respawn authority without graphical acceptance.
+```
+
+## CP-020 combat/death source audit, client acceptance deferred (2026-09-23)
+
+Existing owner paths keep attack/target inventory and health fences together;
+lethal survival commit clears ordinary inventory/cursor and XP while spawning
+the corresponding item and XP entities, then publishes death to observers.
+The connection applies the committed damage publication without using socket
+success as the commit gate. This is a bounded source audit, not an assertion
+that the entire CP-020 scenario has passed.
+
+Focused tests on this tree: `cargo test -p mc-net player_combat --lib` (24
+passed), `cargo test -p mc-net respawn --lib` (11 passed),
+`cargo test -p mc-net player_damage --lib` (16 passed), and
+`cargo test -p mc-net player_death_inventory_xp_policy_is_atomic_and_idempotent
+--lib` (1 passed). These include Keep/Cancel/Replace and lethal drop policy;
+they do not substitute for two real attackers, disconnected victim, full
+pickup inventory, death/rejoin, or real-client respawn. Those scenarios remain
+`deferred_by_owner` until after CP-096. No CP-020 source edit or commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+changed_files:
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net player_combat --lib: 24 passed
+  - cargo test -p mc-net respawn --lib: 11 passed
+  - cargo test -p mc-net player_damage --lib: 16 passed
+  - cargo test -p mc-net player_death_inventory_xp_policy_is_atomic_and_idempotent --lib: 1 passed
+  - graphical-combat-death: deferred_by_owner
+next: Audit CP-021 crop growth, animal feeding and saved-state reuse without graphical acceptance.
+```
+
+## CP-021 crop support and trample source correction, client acceptance deferred (2026-09-23)
+
+Breaking farmland previously left wheat suspended: the shared support-cascade
+classifier omitted ordinary crops. Falling onto farmland likewise replaced
+only the soil, leaving a mature crop over dirt and no physical item. Both
+pre-fix failures and their commands are recorded in
+`.analysis/codex-logs/crop-support/repro.txt`.
+
+The shared plant support rule now includes ordinary crops and stems for break
+cascades and water washing. Farmland trampling snapshots both block tokens:
+nonempty crop loot commits soil, crop, and physical drops together through the
+existing regional block-drop owner; a legitimate zero-seed stem roll uses the
+existing conditional two-block edit path. Seeded melon/pumpkin stem fallback
+uses the local 26.1.2 loot-table rule of three age-weighted seed trials; it
+replaces the old unsupported generic stem-block item fallback. The
+independent read-only `CropSupportReview` identified the zero-yield stem
+regression; it was fixed and the affected test rerun.
+
+On this tree, `cargo test -p mc-net plants --lib` passed 84, `random_tick`
+passed 37, `breeding` passed 11, `animal_feed` passed 1, and the animal
+age/save-barrier test passed 1. `cargo test -p mc-world plant --lib` passed 7.
+`fmt` passed at
+`.analysis/validation/20260923T062536-fmt-_8hscj7v/result.json`,
+`code-health` passed at
+`.analysis/validation/20260923T062542-code-health-czbvbr4n/result.json`;
+`git diff --check` and `codegraph sync .` passed. No real farm/animal
+graphical scenario, observer client, unload/rejoin lifecycle, or NPC job
+end-to-end gate was run; these remain `deferred_by_owner` until after CP-096.
+Maturity stays `draft`; no commit was authorized.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: e601eecea69c005cde06f18bde9ee3c94a9c63c4aef9985fb44309049e24cd62
+changed_files:
+  - crates/mc-world/src/plant_rules_26_1_2.rs
+  - crates/mc-net/src/play.rs
+  - crates/mc-net/src/play/survival.rs
+  - crates/mc-net/src/play/tests/plants.rs
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net plants --lib: 84 passed
+  - cargo test -p mc-net random_tick --lib: 37 passed
+  - cargo test -p mc-net breeding --lib: 11 passed
+  - cargo test -p mc-net animal_feed --lib: 1 passed
+  - cargo test -p mc-net animal_age_countdown_waits_for_entity_save_barrier --lib: 1 passed
+  - cargo test -p mc-world plant --lib: 7 passed
+  - fmt: 20260923T062536-fmt-_8hscj7v passed
+  - code-health: 20260923T062542-code-health-czbvbr4n passed
+  - graphical-farm-animals: deferred_by_owner
+next: Audit CP-022 bucket/fluid/falling-block/light source behavior without graphical acceptance.
+```
+
+## CP-022 fluid/falling/light source audit, client acceptance deferred (2026-09-23)
+
+The current conditional bucket owner commits block and held-item effects
+together; scheduled fluid ticks use the shared simulation tick, water/lava
+mixing is planned from loaded snapshots, falling-block start/landing retain
+block preconditions, and block edits route light invalidation through the
+resident mutation result. No CP-022 code change was warranted by the focused
+source audit. This does not claim the full bucket/fall/light scenario passed.
+
+On the unchanged source tree, `cargo test -p mc-net fluid_runtime --lib`
+passed 18, `falling_blocks` passed 7, `bucket` passed 24, and
+`cargo test -p mc-world light --lib` passed 42 with 2 ignored. These
+do not cover a real two-client chunk-edge fall, save/restart mid-flight,
+or the observed lighting topology against 26.1.2 vanilla. Graphical
+acceptance remains `deferred_by_owner` until after CP-096; maturity `draft`.
+No commit was authorized.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: e601eecea69c005cde06f18bde9ee3c94a9c63c4aef9985fb44309049e24cd62
+changed_files:
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net fluid_runtime --lib: 18 passed
+  - cargo test -p mc-net falling_blocks --lib: 7 passed
+  - cargo test -p mc-net bucket --lib: 24 passed
+  - cargo test -p mc-world light --lib: 42 passed, 2 ignored
+  - graphical-fluid-fall-light: deferred_by_owner
+next: Audit CP-023 furnace/hopper item conservation and observer paths without graphical acceptance.
+```
+
+## CP-023 machine transfer follow-up, client acceptance deferred (2026-09-23)
+
+The earlier CP-023 reservation correction at this cursor remains the source
+change: hopper withdrawal checks the physical warehouse reservation floor
+under the existing region admission gate, including coordinator fallback.
+This pass found no further source discrepancy in the normal furnace/hopper
+chain. `cargo test -p mc-net scheduled_hopper_ --lib` passed 16 on the
+current tree, including hopper→furnace input/fuel, furnace output→chest,
+double-chest transfer, held reservation gate, cross-region atomic commit,
+and failure preservation. `cargo test -p mc-net furnace --lib` passed 35.
+The earlier fmt/code-health receipts remain applicable to the unchanged
+Rust source since CP-021. This is a source/focused-test result, not a
+bounded tick measurement or graphical proof; concurrent player clicks,
+unload/restart, observers and actual machine-chain capacity are
+`deferred_by_owner` until after CP-096. Maturity remains `draft`; no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: e601eecea69c005cde06f18bde9ee3c94a9c63c4aef9985fb44309049e24cd62
+changed_files:
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net scheduled_hopper_ --lib: 16 passed
+  - cargo test -p mc-net furnace --lib: 35 passed
+  - graphical-machine-chain: deferred_by_owner
+next: Audit CP-024 terrain generation and vanilla village site behavior without graphical acceptance.
+```
+
+## CP-024 terrain/village source audit, client acceptance deferred (2026-09-23)
+
+Generation and adoption were checked separately. `cargo test -p mc-worldgen
+village --lib` passed 77 with 2 ignored old prototype tests. A live-cache
+village test actually generated 13 entity-bearing pieces and placed 8
+villagers (seed 4242); a desert village assembled 87 pieces at chunk
+`(0,111)`. The multi-seed Tellus biome/feature fingerprint test passed
+one corpus run. The separate chunk inhabitant-marker round-trip and
+settlement claim/villager-job entity-storage round-trip each passed one.
+No terrain rewrite or CP-024 source change was warranted by these checks.
+
+These receipts do not prove a generated village survives a full fresh
+generate→unload→reopen→plugin-adoption scenario, every ACC-02 village
+family, accessible entrances/resources, unknown saved contents, or owner
+terrain ACCEPT. All remain pending; graphical/owner acceptance is
+`deferred_by_owner` until after CP-096. Maturity stays `draft`; no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: e601eecea69c005cde06f18bde9ee3c94a9c63c4aef9985fb44309049e24cd62
+changed_files:
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-worldgen village --lib: 77 passed, 2 ignored
+  - cargo test -p mc-worldgen live_village_populates_its_pieces_villagers --lib -- --nocapture: 1 passed, 8 villagers
+  - cargo test -p mc-worldgen desert_village_assembles_deterministically --lib -- --nocapture: 1 passed, 87 pieces
+  - cargo test -p mc-worldgen tellus_multi_seed_biome_and_feature_fingerprints_are_distinct_and_bounded --lib: 1 passed
+  - cargo test -p mc-world settlement_inhabitant_markers_round_trip_through_chunk_extras --lib: 1 passed
+  - cargo test -p mc-net settlement_claim_and_villager_job_round_trip_through_entity_storage --lib: 1 passed
+  - graphical-world-village: deferred_by_owner
+next: Audit CP-025 chunk/entity visibility during movement and generation fences without graphical acceptance.
+```
+
+## CP-025 moving view source audit, client acceptance deferred (2026-09-23)
+
+The chunk stream rejects obsolete generation results, releases their
+prepared claims, checks prepared revisions before and after socket writes,
+and requeues a result invalidated during writing. Visibility is marked
+loaded only after the chunk frame is written; entity spawn commands follow
+that transition. `cargo test -p mc-net chunk_stream --lib` passed 80;
+focused spawn-before-movement and one-chunk crossing tests each passed one.
+No CP-025 source change was warranted by these focused checks.
+
+They do not prove a complete view window/light/entity picture while two
+real clients cross regions at different read rates or respawn far away.
+Owner-deferred graphical acceptance remains `deferred_by_owner` until
+after CP-096; maturity `draft`, no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: e601eecea69c005cde06f18bde9ee3c94a9c63c4aef9985fb44309049e24cd62
+changed_files:
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net chunk_stream --lib: 80 passed
+  - cargo test -p mc-net planned_spawn_orders_concurrent_entity_movement_before_channel_delivery --lib: 1 passed
+  - cargo test -p mc-net one_chunk_crossing_does_not_suppress_other_entity_movement --lib: 1 passed
+  - graphical-two-client-movement: deferred_by_owner
+next: Audit CP-026 normal save/reopen and unsupported-data behavior without graphical acceptance.
+```
+
+## CP-026 normal persistence source audit, client acceptance deferred (2026-09-23)
+
+`cargo test -p mc-world dirty_flush --lib` passed 44 with 2 ignored;
+its scoped reopen cases include edited chunks and unknown root extras.
+`cargo test -p mc-world anvil --lib` passed 52 with 8 ignored.
+`cargo test -p mc-net persistence --lib` passed 93 with 1 ignored,
+and `world_journal` passed 31. These exercise internal Anvil/NBT,
+player/component and entity storage, and journal replay on this tree.
+An embedded server save/stop/rejoin restored inventory and edited block;
+the wire sign flush/reopen and natural entity identity restart each passed.
+The in-flight campfire restart initially failed on a held journal lease:
+the test kept its `SaveHandle` (and its `ServerConfig` world) alive after
+the first serve task joined. Dropping that handle before binding the
+second server fixed the exact repro; receipt
+`.analysis/codex-logs/cp026-campfire-restart/repro.txt`. The same test
+then passed and observed cooking resume after reopen.
+An independent read-only review of the handle-release correction returned
+`pass` with no findings; it ran no validation.
+
+The opt-in real vanilla-world chunk fixture
+`.analysis/test-world/region/r.0.0.mca` is absent (the 26.1.2 blocks
+report is present); ignored real-world round-trips were not run.
+These separate runtime scenarios are not a joined server save/stop/start
+with a chest, sign, furnace, component item and entity all in one world.
+The graphical rejoin remains `deferred_by_owner` until after CP-096.
+Unsupported-data coverage is limited to the named focused cases, not
+generic vanilla-world compatibility. Maturity `draft`; no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 4874a7668c9cd112b55afeea5a583503a7da0952b727b60f30e1a2fea460ac03
+changed_files:
+  - crates/mc-test-harness/tests/block_edit/campfire.rs
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-world dirty_flush --lib: 44 passed, 2 ignored
+  - cargo test -p mc-world anvil --lib: 52 passed, 8 ignored
+  - cargo test -p mc-net persistence --lib: 93 passed, 1 ignored
+  - cargo test -p mc-net world_journal --lib: 31 passed
+  - embedded_save_restart_rejoin_preserves_inventory_and_edited_block: 1 passed
+  - survival_sign_text_survives_flush_and_reopen --ignored: 1 passed
+  - natural_entities_keep_identity_across_save_restart_rejoin: 1 passed
+  - survival_campfire_in_flight_state_resumes_after_reopen --ignored: failed pre-fix (journal lease), 1 passed post-fix
+  - real-vanilla-chunk-fixture: absent
+  - graphical-save-rejoin: deferred_by_owner
+next: Audit CP-027 login/relogin/session authority without graphical acceptance.
+```
+
+## CP-027 live session and operator authority source correction, client acceptance deferred (2026-09-23)
+
+Login/session source review found that duplicate UUID or case-insensitive
+name admission is rejected until unregister. Online mode uses encrypted
+challenge plus verified Mojang profile; offline UUID is deterministic but
+is **not** authentication. Public hosting rejects the loopback developer
+operator fallback. The old `live_permissions_for` retained a login-time
+operator bit whenever the live operator set became empty, so revoking the
+last explicitly listed operator left a connected remote player's admin
+permissions intact. A red regression and exact command are recorded in
+`.analysis/codex-logs/cp027-revoked-operator/repro.txt`. Live commands now
+resolve against the verified profile, actual socket peer, and shared operator
+set. Configuration-to-Play recomputes the grant after the handshake.
+
+Plugin player snapshots also copied the old operator bit at registration;
+the pre-fix red reproduction is in
+`.analysis/codex-logs/cp027-revoked-operator/plugin-repro.txt`.
+Play sessions now retain the peer and a clone of the shared
+`CommandPermissionConfig`; script queries, committed-event snapshots, zone
+observations, gameplay event contexts and zone build checks all resolve
+against its current operator set. Container script context and the
+`ServerboundChangeGameMode` ingress also recheck the current role rather
+than their initial grant. The frequently called zone, container and
+gameplay paths normalize the verified name once and reuse the canonical
+UUID without per-packet lowercase allocations. Console mutations do not
+rewrite a second role cache. The revised query and committed-block-event
+regressions pass after revocation. An exact uncompressed
+`ClientboundCommands` frame is decoded after role revocation and its root
+has no operator children. ADR 0006 records this authority boundary.
+The Play ingress size tripwire rose from 731 to 742 for actual
+peer-threading and live-role routing lines; `code-health` passes.
+
+Focused evidence: `mc-net login` 13, `session_auth` 14,
+`admission` 21, `stale_session` 15, `script_player_query_endpoint` 4,
+`script_gameplay_events` 14, `script_client_view` 4, committed death 1,
+duplicate-session rejection 1, role-revoke command-tree wire 1,
+revoked-operator focused 2; `mc-script revoked` 1;
+`mc-server --test login` 12. Canonical fmt passed at
+`.analysis/validation/20260923T073338-fmt-d1ma5auh/result.json`;
+code-health passed at
+`.analysis/validation/20260923T073400-code-health-p11pq_4x/result.json`.
+The independent read-only reviewer returned `pass` for the original
+session/command delta but found retained login-time authority in the
+zone/gameplay and player-control paths; those findings were corrected
+and the focused gates rerun. No second review was run.
+Full real-client expired/replaced-session and stale-callback scenarios
+remain `deferred_by_owner` until after CP-096. Focused tests do not
+establish them; maturity `draft`, no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 9a39022198dcd78b8bd041c166b61d8a1bbb38182d83d55ebc29ce0a98375b11
+changed_files:
+  - crates/mc-net/src/server.rs
+  - crates/mc-net/src/connection_driver.rs
+  - crates/mc-net/src/play.rs
+  - crates/mc-net/src/play/ingress/chat_commands.rs
+  - crates/mc-net/src/play/session.rs
+  - crates/mc-net/src/play/session/session_lifecycle.rs
+  - crates/mc-net/src/play/session/script_commit_events.rs
+  - crates/mc-net/src/play/session/script_player_query_endpoint.rs
+  - crates/mc-net/src/play/session/script_player_query_endpoint_tests.rs
+  - crates/mc-net/src/play/tests/admin_commands.rs
+  - crates/mc-net/src/play/tests/tab_list.rs
+  - crates/mc-net/src/play/tests/outbound_delivery.rs
+  - crates/mc-net/src/play/tests/direct_response_write_stall.rs
+  - crates/mc-net/src/play/tests/outbound_channel_close.rs
+  - crates/mc-net/src/play/tests/outbound_pressure_draining.rs
+  - crates/mc-net/src/play/tests/outbound_write_stall.rs
+  - crates/mc-net/src/server/tests/admission.rs
+  - crates/mc-net/src/server/operator_control.rs
+  - crates/mc-net/src/play/session/script_client_sound_endpoint_tests.rs
+  - crates/mc-net/src/play/session/script_loader_item_endpoint_tests.rs
+  - crates/mc-net/src/play/session/tests.rs
+  - crates/mc-net/src/play/use_item_on_adapter_tests.rs
+  - crates/mc-net/src/play/script_gameplay_events.rs
+  - crates/mc-net/src/play/script_gameplay_events_tests.rs
+  - crates/mc-net/tests/enchanting_recipe_settlement.rs
+  - crates/mc-net/tests/inventory_settlement.rs
+  - crates/xtask/src/main.rs
+  - docs/decisions/0006-mc-net-module-boundaries.md
+  - docs/MEMORY.md
+validation:
+  - revoked operator pre-fix red, post-fix admission 21 passed
+  - plugin player context pre-fix red, post-fix query 4 passed
+  - revoked operator command tree wire: 1 passed
+  - committed block event rechecks revoked operator context: 1 passed
+  - mc-net script_gameplay_events: 14 passed
+  - mc-net revoked_operator: 2 passed
+  - mc-server login: 12 passed
+  - fmt: 20260923T073338-fmt-d1ma5auh passed
+  - code-health: 20260923T073400-code-health-p11pq_4x passed
+  - graphical-session-authority: deferred_by_owner
+next: Audit CP-028 concurrent two-player actions without claiming graphical acceptance.
+```
+
+## CP-028 two-player contention source audit, client acceptance deferred (2026-09-23)
+
+The sidecar-backed deterministic multiplayer transaction replay passed twice
+with seed 8102 and checked eight same-target placement races plus a shared
+chest pickup with a conserved two-item total. The two-subscriber stale
+survival break test passed against peer replacement. Focused owner tests
+passed for one claimant/exact item stack, pickup credit after requester
+delivery loss, stale chest click resync, and stale crafting grid rebuild.
+No CP-028 source correction followed these checks.
+
+These tests are supplemental, not two real graphical clients racing on the
+same block/drop/menu. They do not cover every last-stack, concurrent worker
+move, or disconnected winning-client acknowledgement in the exact plan
+scenario. Server decision plus both-client evidence is
+`deferred_by_owner` until after CP-096. Maturity `draft`; no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 9a39022198dcd78b8bd041c166b61d8a1bbb38182d83d55ebc29ce0a98375b11
+changed_files:
+  - docs/MEMORY.md
+validation:
+  - checked_multiplayer_transaction_replay_is_deterministic_and_conservative --ignored: 1 passed
+  - stale_survival_break_cannot_break_peer_replacement --ignored: 1 passed
+  - concurrent_item_pickup_has_one_claimant_and_exact_stack: 1 passed
+  - item_pickup_credit_survives_requester_loss_after_owner_apply: 1 passed
+  - stale_chest_click_after_peer_mutation_resyncs_without_mutating_storage: 1 passed
+  - stale_crafting_click_rebuilds_grid_from_owner_projection: 1 passed
+  - graphical-two-client-contention: deferred_by_owner
+next: Record CP-029 acceptance deferral, then verify CP-030 WIT consumer route.
+```
+
+## CP-029 scoped survival acceptance deferred by owner (2026-09-23)
+
+This VERIFY checkpoint requires the full 20-minute no-debug vanilla-survival
+loop, save/rejoin, a second real player, varied seeds and a bounded
+adversarial pass. Owner deferred all graphical acceptance until after
+CP-096. No `playable` or `regression` graphical profile was run for this
+checkpoint; source-focused checks from CP-015–028 do not replace client or
+vanilla evidence, close an existing owner failure or establish a percentage
+of accepted gameplay. Coverage remains `draft` and CP-029 remains blocked.
+No new source correction, readiness ledger or commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 9a39022198dcd78b8bd041c166b61d8a1bbb38182d83d55ebc29ce0a98375b11
+changed_files:
+  - docs/MEMORY.md
+validation:
+  - full-20-minute-graphical-survival: deferred_by_owner
+  - two-client-varied-seed-acceptance: deferred_by_owner
+  - adversarial-graphical-pass: deferred_by_owner
+next: Verify CP-030 WIT consumer gameplay kernel while retaining CP-029 acceptance block.
+```
+
+## CP-030 shared inventory kernel across client and real WIT guest (2026-09-23)
+
+The existing owned-inventory operation is the selected ordinary mechanic.
+Its Rust guest uses the SDK's `transfer_owned_items` and `query_owned_inventory`
+through `inventories.wit`, the single host `domain_inventories::decode`,
+`to_script_batch`, the attested `ScriptBoundary` and storage operation route
+to the native session inventory owner. A direct unattested privileged
+`ScriptCommand::Operation` is rejected by `ScriptRouter`.
+No planner, DTO converter, action bus or gameplay authority was added.
+
+The real-component TCP scenario now also swaps a component-bearing tool from
+hotbar slot 36 to 37 and back via ordinary `ServerboundContainerClick` packets.
+On the identical starting inventory, the real Rust guest then reads its
+fresh owner fence through WIT and transfers the same tool to slot 37. The
+authoritative player inventory frames show identical slot/component outcomes
+and conserve unrelated emeralds. The same component scenario checks durable
+replay without reapplication, conflicting operation id, stale revision,
+foreign-player refusal, missing owner, and saved tool components. Its separate
+grant test refuses an ungranted inventory command by capability name.
+Both tests passed. The existing native `before-build` cases also passed for
+a cancelled programmatic owner edit and changed protected-zone snapshot; the
+selected inventory transfer has **no** `before-build` hook. Source inspection
+shows `request_build_hook` returns before queue/await with no registered hook;
+this was not a new runtime zero-subscriber benchmark.
+
+This is a headless real server, real component and real TCP client, not
+graphical vanilla-client acceptance. CP-029 remains owner-deferred; it is not
+substituted here. Maturity `draft`, no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 252b851988effe9688be88f05087f3f2965a9fffd17820f68b602cc19d65e4b0
+changed_files:
+  - crates/mc-test-harness/tests/wasm_owned_inventory.rs
+  - docs/MEMORY.md
+validation:
+  - mc-test-harness --test wasm_owned_inventory: 2 passed
+  - mc-net changed_zone_snapshot_refuses_kept_placement_without_mutation: 1 passed
+  - mc-net cancelled_server_owned_edit_cannot_bypass_before_build: 1 passed
+  - fmt: 20260923T080147-fmt-zokojtsa passed
+  - code-health: 20260923T080147-code-health-wq26p0wb passed
+  - graphical-same-mechanic-client: deferred_by_owner
+next: Verify CP-031 request result lifecycle on the selected owned-inventory WIT operation.
+```
+
+## CP-031 owned-inventory request outcome after reconnect (2026-09-23)
+
+The selected real Rust guest issues owned-inventory requests through the
+existing bounded host/boundary queue and receives correlated answers in a
+later delivery phase. Its new `status` command explicitly declares and is
+granted `storage_batches`, as the existing operation-status contract requires;
+`inventory_transfers` remains independently granted. After the original
+player leaves and the same identity rejoins with a new session, the guest
+queries the stored transfer's operation id without resubmitting its payload.
+The result names the old actor and original committed revision, while the new
+session's component-bearing tool remains unchanged. A subsequent fresh
+request id replays the same durable transfer without another item move.
+
+This scenario initially reproduced a **guest fixture** bug: replay compared
+the old-session receipt to the current session and reported an unexpected
+answer. The fixture now checks the recorded transfer actor for replay and
+status and checks every answer's request id. Pre-fix command/output and
+post-fix receipt: `.analysis/codex-logs/cp031-replay-session/repro.txt`.
+No second request runtime, callback retry, or server commit policy was added.
+
+A separate real-component TCP reproduction now holds the **committed** move
+answer at the guest host log boundary, replaces the old connection with the
+same stable player identity, then releases callback output. Before the fix,
+the old request's chat report reached the new session because the guest sent
+to stable identity and the host re-resolved it at admission. The guest now
+targets the invoking **session** for every action report; the new client sees
+the committed tool in slot 37 and can query the durable receipt, but receives
+no old move report. Exact failing/passing repro:
+`.analysis/codex-logs/cp031-late-callback/repro.txt`. This closes the
+read-only reviewer's late-disconnect coverage finding without inventing
+callback durability.
+
+The pre-existing owner crash test passed after process termination before
+callback delivery at its three commit boundaries: the recovered durable
+receipt and item effect remain exactly once. Existing required outbox tests
+passed overflow, receiver drop with backlog, closed enqueue, and capacity
+release; host tests passed bounded full-command refusal without retiring the
+guest, refused delivery without committing a timer, targeted result routing,
+and compatible generation replacement. These are inherited
+boundary/generation checks, **not** a forced same-transfer in-flight reload
+or a durable in-memory callback guarantee. Graphical client acceptance
+remains deferred by the owner until after CP-096. Maturity `draft`, no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 8a14053608b3e6350fca8a95414c7716fe2973bbb25b57ae3937747f96c27a20
+changed_files:
+  - sdk/rust/examples/hello/src/inventory_ops.rs
+  - crates/mc-test-harness/tests/wasm_owned_inventory.rs
+  - docs/MEMORY.md
+validation:
+  - mc-test-harness --test wasm_owned_inventory: 3 passed
+  - mc-net owned_transfer_recovers_exactly_once_across_a_process_crash: 1 passed
+  - mc-script commit_events::tests: 5 passed
+  - mc-plugin-host host_runtime full-command queue and targeted result: 2 passed
+  - mc-plugin-host timer_operations refused delivery: 1 passed
+  - mc-plugin-host host_deployment compatible reload: 1 passed
+  - sdk/rust cargo fmt --check: passed
+  - fmt: 20260923T082954-fmt-3uhmtztw passed
+  - code-health: 20260923T082957-code-health-1fninoab passed
+  - graphical-owned-inventory-client: deferred_by_owner
+next: Verify CP-032 stable handles, stale identity, bounded WIT observations.
+```
+
+## CP-032 stable WIT inventory handles and bounded observations (2026-09-23)
+
+The real owned-inventory component now reads the **old numeric player
+session** after the same identity has rejoined: the owner returns typed
+`not-found`, while `operation-status` can still return the old committed
+receipt and the new session retains the component-bearing tool. The same
+check passes when the old move's callback was deliberately held until after
+the reconnect. This separates stable player identity, exact session, and
+object revision; the existing native resident suite confirms durable
+owner-scoped handles keep their UUID after storage/session reopen, report
+`alive-unloaded` without a live pose, and refuse foreign, unknown and stale
+revisions. The host's compatible-generation reload test and Loader's pending
+HUD-open disconnect test cover generation/session isolation. No ECS or
+network entity id was added to WIT inventory endpoints.
+
+Settlement `list-sites` already pages by a bounded live cell cursor. A new
+regression adds a generated village after the first page: continuation
+advances without repeating old sites; a fresh walk discovers the new
+village. It does **not** promise snapshot-isolated pages or revisit a cell
+already passed. The selected owned-inventory query instead returns one
+bounded canonical endpoint image (at most 54 slots), not a cursor.
+
+Host lift accounting remains the existing `PluginLimits::hostcall_bytes`
+(8 MiB per callback): Wasmtime charges declared list strides and string
+lengths before copying, including repeated/aliased guest pointers; the six
+`host_bounds` cases passed. `domain_inventories::decode` moves lifted strings
+into the native DTO and rebuilds bounded record vectors, with DTO validation
+before an owner sees them (16 transfers, at most 32 expected endpoints,
+4,096 moved items). This identifies one bounded guest-to-host lift and
+additional bounded native record allocations; it is **not** a measurement of
+all downstream host allocations. Owned-inventory input has no floating
+fields; the existing WIT player teleport test rejects NaN, Infinity and
+oversized values. A wrapped 64-bit session counter or artificial ECS-id
+recycling was not forced: the selected WIT endpoint does not expose ECS ids.
+Graphical acceptance remains deferred until after CP-096. Maturity `draft`,
+no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: efc4f7698016538ec9c60e5aae7d0a43e2b20831eedb58254f03fa5b5b1a43ae
+changed_files:
+  - sdk/rust/examples/hello/src/inventory_ops.rs
+  - crates/mc-test-harness/tests/wasm_owned_inventory.rs
+  - crates/mc-net/src/script/storage/settlement_tests.rs
+  - docs/MEMORY.md
+validation:
+  - mc-test-harness --test wasm_owned_inventory: 3 passed
+  - mc-net script::storage::resident_tests: 8 passed
+  - mc-net list_sites_cursor_stays_bounded_when_the_roster_gains_a_village: 1 passed
+  - mc-net list_and_query_sites_are_deterministic: 1 passed
+  - mc-plugin-host --test host_bounds: 6 passed
+  - mc-plugin-host player_operations nonfinite-bound refusal: 1 passed
+  - mc-plugin-host loader_operations pending disconnect: 1 passed
+  - mc-script inventory_operations_tests: 1 passed
+  - sdk/rust cargo fmt --check: passed
+  - fmt: 20260923T084143-fmt-4lr9m1__ passed
+  - code-health: 20260923T084148-code-health-zozqi_46 passed
+  - graphical-client-handle-acceptance: deferred_by_owner
+next: Verify CP-033 induced work and fairness limits for the selected WIT consumer.
+```
+
+## CP-033 induced-work and healthy-player limits (2026-09-23)
+
+The selected owned-inventory WIT operation remains one fenced endpoint read or
+bounded transfer, not a scan. Existing P0/P2/P3 limits separately constrain
+guest fuel (50 million/call), epoch deadline (four ticks), guest linear memory
+(64 MiB per memory), aggregate guest-to-host lift (8 MiB/callback), native
+inventory DTOs (16 transfers/32 fences/4,096 moved items), event admission
+(default 1,024; configurable), and the command queue (default 256). Previously
+passed focused real-component cases cover an infinite guest rejected at
+startup, a guest blocked inside a host import terminated by the epoch deadline,
+oversized/aliased lift rejection, and full-command-queue refusal without
+dropping the live instance. These are different budgets; no fuel increase or
+new host-worker pool was needed.
+
+The real TCP/component test now runs two distinct packages and two connected
+players. After the inventory owner commits a component-bearing tool move,
+its callback reply is held; the other player sends 32 `/hello` commands
+to the other component, below the TCP ingress's weighted-work burst limit.
+Releasing the owner then answers the healthy player's stale endpoint and durable
+status without retargeting the old reply; the tool remains moved exactly once.
+An actual reply reaches the flood player, not just a socket write.
+The healthy stale-endpoint reply
+took 4.377 ms in the focused run; this is one observation, not an SLO.
+The TCP ingress's weighted-work allowance is 1,024 and each command costs 24; the
+initial 64-command probe correctly disconnected the flooder after three
+violations, so the smaller simultaneous-load scenario uses 32. The separate
+five-package headless workload admitted 11/64 commands, refused 53, and
+observed event depth at most eight with an eight-event bound. Another
+source-built five-package run answered 100 sequential `/money` requests
+(p50 83.337 µs, p95 109.637 µs, p99 137.168 µs), drained 64 queued
+requests in 3.415 ms, had zero economy command refusals, and observed
+168,824 KiB process peak RSS. These measurements cover a finite workload,
+not a global host-memory ceiling or graphical client latency.
+
+The canonical `standard-pack` profile **failed** its sibling source check:
+six existing, untracked `plugin.wasm` files differ from fresh source builds.
+The ignored source-built staging root was used only for the two focused
+headless integration tests. No sibling artifact was overwritten; the
+canonical profile remains failed and must not be described as green.
+Graphical client acceptance remains owner-deferred until after CP-096.
+Maturity `draft`, no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: c7db0f757fc677f3548a2f5414fbb1173f42f550c3ee7eede3b23cd4848384ab
+changed_files:
+  - crates/mc-test-harness/tests/wasm_owned_inventory.rs
+  - docs/MEMORY.md
+validation:
+  - mc-test-harness --test wasm_owned_inventory: 3 passed
+  - source-built standard-pack bounded flood: 1 passed, 53/64 refused, peak event depth 8
+  - source-built standard-pack command workload: 1 passed, 164/164 workload replies
+  - standard-pack: 20260923T084315-standard-pack-x0445y9s failed (source/artifact mismatch)
+  - fmt: 20260923T085635-fmt-0pyveqe0 passed
+  - code-health: 20260923T085635-code-health-878yjrux passed
+  - codegraph sync: up to date
+  - graphical acceptance: deferred_by_owner
+next: Assess CP-034 conditional package expansion; preserve the untracked sibling artifacts.
+```
+
+## CP-035 plugin reload generation fence (2026-09-23)
+
+The selected owned-inventory and plugin-storage requests now carry the issuing
+registration generation from host command admission through owner completion.
+Previously an old accepted request finishing after same-ID reload was stamped
+with the replacement's *current* generation at result enqueue and could answer
+the replacement Store. The pre-fix regression failed; the typed storage and
+owned-inventory result regressions now pass. Candidate init commands also bind
+their reserved tickets to the newly committed generation before publication:
+otherwise a second reload before server acceptance could deliver the first
+candidate's result to the second Store. That regression failed before the fix
+and passes after it. Both failures and exact commands are in
+`.analysis/codex-logs/cp035-late-result/repro.txt`.
+
+The actual Wasm host regression reloads the same package after an admitted
+storage read; the replacement reuses its request ID, but receives only its own
+value. Existing deployment tests cover refused candidates preserving old
+routes, restart-only contract refusal, combined guest-memory budget, and timer
+restart. The source fix does not alter WIT, persisted receipts, or durable owner
+effects; an accepted operation remains queryable by durable ID if its callback
+is discarded. This is an issuing-command result fence, not a promise about
+unsolicited events or startup replay lacking an admitted request. Graphical
+acceptance remains deferred by owner until after CP-096. CP-034 remains
+conditional/blocked: no concrete expanding first-party package currently
+requires a modular SDK refactor; the selected inventory WIT consumer uses the
+existing Rust SDK. The pre-existing sibling `standard-pack` source/artifact
+mismatch remains failed. Maturity `draft`; no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: f228a76a5b9843e8464f336b6724948b43631cdb99b347e16504d403cf0c88db
+changed_files:
+  - crates/mc-script/src/lib.rs
+  - crates/mc-script/src/host_control_tests.rs
+  - crates/mc-plugin-host/tests/host_runtime.rs
+  - docs/decisions/0009-regional-plugin-boundary.md
+  - docs/MEMORY.md
+validation:
+  - mc-script: 161 passed
+  - mc-plugin-host --test host_deployment: 9 passed
+  - mc-plugin-host --test host_runtime late_storage_reply_does_not_answer_the_replacement_guest: 1 passed
+  - mc-test-harness --test wasm_owned_inventory: 3 passed
+  - fmt: 20260923T102143-fmt-56qhwpkj passed
+  - code-health: 20260923T102143-code-health-zob7x8vk passed
+  - codegraph sync: up to date
+  - graphical acceptance: deferred_by_owner
+  - standard-pack: 20260923T084315-standard-pack-x0445y9s failed (unchanged sibling artifacts)
+next: Select one real first-party CP-036 durable service consumer, then close its restart and CAS recovery path.
+```
+
+## CP-036 durable first-party payment (2026-09-23)
+
+The source-built `solaris-economy` Rust component now uses the existing
+`StorageBatchCas` and durable `OperationStatus` for `/pay`. One owner operation
+CASes the existing `ledger-v1` value, including debit, credit, and bounded
+token record; the operation ID derives from sender UUID and transfer token.
+The guest checks the receipt before issuing a payment and reloads the ledger
+after an unconfirmed result. No second ledger, WIT extension, post-commit
+business CAS, or arbitrary retention TTL was introduced. Old `ledger-v1`
+values still decode; pre-migration tokens have only their old bounded ledger
+window, not retroactive receipts. The new `storage_batches` grant and required
+feature are declared by the sibling package.
+
+The **same real-server/TCP regression** failed against the old source-built
+guest: after a 7-coin payment, a 1-coin payment evicted the first token; a
+same-package reload then paid another 7 instead of refusing the replay.
+It passes with the rebuilt guest. Two players observed exact balances
+100/100 -> 92/108; duplicate and different-payload reuse after reload and
+world/server restart left those balances unchanged. The separate typed
+component test loads a pre-existing version-4 ledger with a legacy token,
+simulates a lost callback after the named batch, and observes one payment and
+no second batch on reinitialization. This last test injects the ledger image,
+not an interrupted live owner commit. Existing native owner tests cover
+same-ID/different-payload conflict, durable status after compaction/restart,
+DurabilityUnknown recovery, and bounded scan/cursor. This payment has **no
+post-commit CAS**, so a post-commit business CAS-conflict scenario does not
+exist. Commands, old/new component hashes, and assertions are recorded at
+`.analysis/codex-logs/cp036-economy/repro.txt`.
+
+The sibling's existing untracked `plugin.wasm` was preserved; focused tests
+use an ignored source-built staging directory. Canonical `standard-pack`
+remains **failed** on the prior six untracked source/artifact mismatches.
+Strict Wasm Clippy passed for the sibling source. A focused root strict
+Clippy attempt found one CP-035 helper naming warning (fixed with LSP);
+the rerun still fails on three existing `mc-net` argument-count/type-complexity
+warnings. It is **not** a Clippy pass; resolve at the mandatory L2 phase gate.
+Graphical acceptance remains deferred by owner until after CP-096. Maturity
+`draft`; no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+diff_hash: c67f72dac0fa99bdfaed23bfa6a272c3d300a4f392e8944309e288db45c26ea6
+changed_files:
+  - crates/mc-script/src/lib.rs
+  - crates/mc-test-harness/tests/plugin_standard_pack.rs
+  - crates/mc-test-harness/tests/wasm_economy_payment.rs
+  - ../solaris-default-plugins/sources/solaris-economy/src/lib.rs
+  - ../solaris-default-plugins/solaris-economy/plugin.toml
+  - ../solaris-default-plugins/solaris-economy/README.md
+  - docs/MEMORY.md
+validation:
+  - real TCP/world payment old component: 1 failed (second 7-coin debit after token eviction/reload)
+  - real TCP/world payment rebuilt component: 1 passed (exact balances; reload; restart)
+  - typed guest legacy-ledger/lost-callback: 1 passed
+  - mc-net script::storage::operations_tests: 3 passed
+  - guest wasm32 release clippy -D warnings: passed
+  - root focused clippy -D warnings: failed (three unrelated mc-net warnings)
+  - fmt: 20260923T114852-fmt-ji73auk_ passed
+  - code-health: 20260923T114852-code-health-jiwtxjp3 passed
+  - codegraph sync: up to date
+  - standard-pack: 20260923T084315-standard-pack-x0445y9s failed (unchanged sibling artifacts)
+  - graphical acceptance: deferred_by_owner
+next: Wire one real canonical custom-item definition through native lifecycle and Loader presentation; keep graphical acceptance deferred until after CP-096.
+```
+
+## CP-037 canonical custom item lifecycle (2026-09-23)
+
+The guest `configure` contribution now defines bounded owner items; startup
+requires an exact verified Loader item declaration and `register_items`.
+Native `ItemFactsTable` resolves canonical `item_model` identities on vanilla
+carrier stacks. Recipe ingredients/results, stack limits, equipment,
+player attack damage and wear use those registered facts. The source-built
+Ruby/Sapphire Loader fixture declares craftable paper-carried Ruby material
+and a Ruby-carried blade; the byte-for-byte fixture rebuild check passed.
+World startup records a deterministic item catalog identity and refuses
+changed/removed definitions on reopen. ADR-0010 records this owner boundary.
+
+Two real Loader-handshake TCP clients crafted the material and blade; the
+second observed its canonical dropped entity model, walked into pickup range,
+and received that same model. After graceful shutdown and restart of the same
+world, its initial inventory still contained the blade. Native focused tests
+cover split/merge, equipment, damage/wear, chest transfer versus vanilla
+carrier, chest NBT flush/reopen, malformed item contribution, missing Loader
+permission/artifact mismatch, and changed-world catalog refusal. Raw outputs
+and exact commands are in `.analysis/codex-logs/cp037-custom-item/repro.txt`.
+The hardcoded-port TCP smoke was removed after proof. **Graphical client
+acceptance remains deferred by owner until after CP-096**; this is not a
+Fabric/NeoForge/Forge graphical pass. Maturity `draft`; no commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: a3a8c9bc486fa9d9a38ac91bb9a7fb550465a3c84ec945567275852185a13d48
+diff_scope: CP037 source paths against base, including earlier uncommitted checkpoints; untracked files listed separately
+changed_files:
+  - crates/mc-data/src/{item_components.rs,item_semantics_26_1_2.rs,recipes.rs}
+  - crates/mc-data/tests/custom_item_recipe.rs
+  - crates/mc-net/src/{loader.rs,play/containers/chest/component_tests.rs,play/containers/crafting.rs,play/combat/player_actions.rs,play/inventory.rs,play/recipes.rs,play/tests/held_sharpness_damage.rs,script/storage/resident_order_execution.rs}
+  - crates/mc-plugin-host/{Cargo.toml,src/check.rs,src/lib.rs,src/startup.rs,tests/startup_contribution.rs}
+  - crates/mc-script/wit/lifecycle.wit
+  - crates/mc-server/{Cargo.toml,src/main.rs,src/startup/check.rs,src/startup/components.rs,src/startup_rules_tests.rs,src/startup_validation.rs}
+  - sdk/rust/examples/hello/src/lib.rs
+  - examples/loader-live-gate/plugins/{ruby-live,sapphire-live}
+  - tools/build-loader-live-gate-fixture.sh
+  - docs/decisions/0010-solaris-loader-contract.md
+  - docs/MEMORY.md
+validation:
+  - real TCP craft/drop/peer pickup/restart: passed; see receipt
+  - mc-data custom recipe: 1 passed
+  - mc-net weapon, recipe book, chest and Loader artifact: 4 passed
+  - mc-plugin-host item-only contribution: 1 passed
+  - mc-server world contract: 1 passed
+  - mc-world chest world flush/reopen: 1 passed
+  - loader fixture deterministic --check: passed
+  - fmt: 20260923T135257-fmt-us4tor76 passed
+  - code-health: 20260923T135302-code-health-fimmwzo8 passed
+  - codegraph sync: up to date
+  - graphical acceptance: deferred_by_owner
+next: Verify CP038 server-only and rejected Loader handshakes plus three-adapter shared-core schema/activation without graphical acceptance until after CP096.
+```
+
+## CP-038 Loader adapter verification (non-graphical, 2026-09-23)
+
+Server wire **3**, archive schema **2**, exact owner permissions and bundle
+hashes remain unchanged. The existing shipped-archive Java test had a false
+manifest: it requested `sounds`/`play_sounds` although neither fixture declares
+sounds. It failed when the changed Ruby archive forced a fresh run. The
+corrected test now activates the exact Ruby/Sapphire archives, including
+`ruby-live:blade`, through the shared core on Fabric, NeoForge and Forge with
+the same block/item/asset identities. Gradle tracks both external fixture ZIPs
+as test inputs so a changed archive cannot hide behind `UP-TO-DATE`.
+Missing assets now fail explicitly as well as corrupted asset bytes. The
+sibling README distinguishes pre-freeze native carrier registration (installing
+an adapter needs restart) from per-connection verified pack activation.
+
+Four Java suites executed, not just Gradle cache hits. Shared tests covered
+consent denial/permission changes, bad transfer hashes and staging cleanup,
+unknown/old schema, exact assets, connection generation cleanup and adapter
+transport ACKs. Rust configuration refusal and disconnect reason tests passed;
+an embedded vanilla TCP client entered Play on a server with no Loader
+manifest. Full graphical `loader-live` for each platform **remains blocked by
+owner deferral until after CP-096**. Shared-core activation and Java adapter
+unit tests are not a real client run; CP-038 is not accepted. Exact receipts:
+`.analysis/codex-logs/cp038-loader-verify/repro.txt`. No commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_base_tree: 0972926e4431ee597cb4903abc43e96872acd732
+sibling_diff_hash: 1d31fe1f2a66ceae7dca0ca258e69914c4fcbefc1ca4725ad160ea1ef3a5ee03
+changed_files:
+  - ../solaris-loader/loader-core/build.gradle.kts
+  - ../solaris-loader/loader-core/src/test/java/dev/solaris/loader/LoaderLiveGateFixtureTest.java
+  - ../solaris-loader/loader-core/src/test/java/dev/solaris/loader/LoaderContentArchiveTest.java
+  - ../solaris-loader/README.md
+  - docs/MEMORY.md
+validation:
+  - four Java test suites with --rerun-tasks: 21 executed; passed
+  - updated Java missing-asset case: passed
+  - mc-net configuration Loader ACK tests: 3 passed
+  - mc-net explicit refusal/reason tests: 2 passed
+  - vanilla embedded TCP Play without Loader: 1 passed
+  - graphical three-platform loader-live: deferred_by_owner
+next: Implement CP039 bounded actionable views and non-graphical owner tests; retain graphical CP038/039 acceptance for after CP096.
+```
+
+## CP-039/040 actionable settlement view and input (headless, 2026-09-23)
+
+The first-party settlements Wasm package now serves a bounded schema-2
+overview with paged residents, buildings and warehouse stock, exact-session
+player identity, and fresh registry authority checks on funding. Role
+revocation, disconnect and delayed view-open acknowledgments close or refuse
+the former view; an explicit key/chat request reopens it. The shipped client
+archive declares four namespace-qualified actions; the source-built Wasm and
+archive are verified together by a strict-deployment integration test.
+The server suppresses duplicate or regressed view-action sequences within a
+revision and resets that counter on each new revision. The shared Loader input
+does not dispatch a HUD press when the same physical key edge is bound to
+vanilla attack/use; release remains routed for held-state cleanup. The
+26.1.2 KeyEvent/mapping API was checked against the actual client bytecode.
+
+Exact commands, counts and artifact hashes:
+`.analysis/codex-logs/cp039-settlement-view/repro.txt`.
+First-party view tests passed 4/4, shipped Wasm integration passed 2/2,
+native view-owner tests passed 6/6; the final archive was parsed by all three
+Java adapters, and all three adapter test tasks passed. Root `fmt` and
+`code-health` profiles passed; CodeGraph synced. Independent read-only review
+findings were fixed and rechecked. **Neither checkpoint has graphical
+acceptance**: the owner deferred real-client checks until after CP-096.
+Both checkpoints remain blocked for that gate. No commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_plugin_base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+sibling_loader_base_tree: 0972926e4431ee597cb4903abc43e96872acd732
+diff_hash: d78f057a3b3d419a78dfeaa94e50468a5f273b91fa5f07b439d90be74215fb9d
+sibling_plugin_manifest_diff_hash: fe14e150b1a01625b05d1776a90050d3cce56affec994e699a7db97e784057d5
+sibling_loader_view_diff_hash: e2a0584e51a6159b01c73d22760ed1660881b1c109187677ffded56f6b821358
+changed_files:
+  - ../solaris-default-plugins/sources/solaris-settlements/src/{lib.rs,view.rs,view_tests.rs}
+  - ../solaris-default-plugins/solaris-settlements/{plugin.toml,plugin.wasm,client-src/solaris-client.json,client/settlements.zip}
+  - ../solaris-default-plugins/tools/build_settlements_client.py
+  - ../solaris-loader/loader-platform-common/src/main/java/dev/solaris/loader/minecraft/{LoaderMinecraftInput.java,LoaderViewScreen.java,LoaderHud.java}
+  - crates/mc-net/src/play/session/{loader_views.rs,loader_views_tests.rs}
+  - crates/mc-test-harness/tests/settlement_component_haul.rs
+  - docs/{AGENT_TOOLING.md,decisions/0010-solaris-loader-contract.md,MEMORY.md}
+validation:
+  - first-party view tests: 4 passed
+  - shipped Wasm strict deployment integration: 2 passed
+  - native view owner tests: 6 passed
+  - final archive LoaderCore three-platform parser: passed
+  - all three Loader adapter Java test tasks: passed
+  - fmt: 20260923T145548-fmt-o35kvh1n passed
+  - code-health: 20260923T145548-code-health-u04d6ofo passed
+  - graphical CP039/040: deferred_by_owner
+next: Bind CP041 preview/selection to an authorized committed structure operation; queue graphical acceptance after CP096.
+```
+
+## CP-041/042 preview-bound construction and bounded sound (headless, 2026-09-23)
+
+The shipped settlements component now begins a server-owned selection from
+its view, presents one of four authored palisade-gate quarter turns, and
+forwards the exact preview anchor, rotation, live player/view continuation and
+catalog SHA-256 through the existing survey/site/operation pipeline. A changed
+catalog refuses preparation before a durable structure reservation; chat
+projection without a preview remains available. Server ownership still checks
+surveyed/loaded footprint, revision and foreign claims. The shared Loader
+refuses undeclared preview references, renders bounded schematic layers, and
+retains select/cancel controls for markers that do not declare a schematic.
+The first-party construction sound is an original 0.17-second verified Vorbis
+clip emitted only for a committed portion with actual placed blocks. Client
+preflight checks the full decoded clip; playback permits eight distinct starts
+per game tick, at most one instance per sound, and origin-scoped disconnect
+cleanup. No guest GPU/native execution or generalized particle renderer.
+
+The independent read-only reviewer found a late-disconnect reservation leak,
+missing no-preview marker controls, and a preview hash mistakenly applied to
+plain chat. All three were corrected without a second review. Exact commands,
+failures and artifact hashes:
+`.analysis/codex-logs/cp041-042-preview-effects/repro.txt`.
+**Graphical placement and effect acceptance remains deferred by owner until
+after CP-096**; neither CP-041 nor CP-042 is accepted. No commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_loader_base_tree: 0972926e4431ee597cb4903abc43e96872acd732
+sibling_plugin_base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+diff_hash: 028aaff183f821cabf5fbf5fe7a93b9d5203f291cfdeed335615e7bd7978861c
+sibling_loader_diff_hash: 628c5109684a187268fc1f960990a254b3da9a0940a8fc42a6a0e038a2d3cd7b
+diff_scope: selected tracked core/Loader boundary files only; excludes untracked package sources and this cursor
+changed_files:
+  - crates/mc-script/wit/{client-presentation,events,settlements}.wit
+  - crates/mc-script/src/settlement_operations.rs
+  - crates/mc-plugin-host/src/{adapter,client_presentation,domain_settlements,staging}.rs
+  - crates/mc-net/src/script/storage/{settlement,settlement_tests}.rs
+  - crates/mc-test-harness/{Cargo.toml,tests/settlement_component_haul.rs}
+  - sdk/rust/solaris-plugin-sdk/src/{lib,settlement_ops}.rs
+  - sdk/rust/examples/hello/src/settlement_ops.rs
+  - ../solaris-loader/loader-core/src/{main/java/dev/solaris/loader/LoaderContentArchive.java,test/java/dev/solaris/loader/LoaderScreenIndexTest.java}
+  - ../solaris-loader/loader-platform-common/src/main/java/dev/solaris/loader/minecraft/{LoaderViewScreen,LoaderMinecraftView,LoaderHud,LoaderMinecraftSound}.java
+  - ../solaris-default-plugins/{tools/build_settlements_client.py,solaris-settlements/plugin.toml,solaris-settlements/plugin.wasm,solaris-settlements/client-src/,solaris-settlements/client/settlements.zip,sources/solaris-settlements/src/}
+  - docs/{MEMORY.md,decisions/0010-solaris-loader-contract.md}
+validation:
+  - native stale preview hash: 1 passed
+  - first-party guest tests: 49 passed
+  - shipped Wasm actual host plus quarter-turn catalog: 3 passed
+  - three Loader archive activations: passed
+  - Fabric client audio decoder, malformed, oversized: passed
+  - all three adapter Java compiles: passed
+  - guest and preview archive byte-for-byte build checks: passed
+  - fmt: 20260923T153708-fmt-uxz6acmp passed
+  - code-health: 20260923T153708-code-health-9ijacxxn passed
+  - graphical CP041/042: deferred_by_owner
+next: Verify CP043 two independent WIT/SDK consumers through headless install, lifecycle, storage and reload; retain graphical acceptance after CP096.
+```
+
+## CP-043 dual independent component acceptance (headless, 2026-09-23)
+
+The independent server-only `solaris-audit` Rust component and Loader-backed
+`solaris-settlements` Rust component now install together in strict discovery
+with distinct grants and one validated Loader bundle. The shipped guests check,
+start, consume separate owner-scoped startup storage reads, process a synthetic
+committed-block event and emit an admitted Audit CAS request, reload together,
+reconstruct the saved Audit record after restart, answer operator status, and
+leave Settlements active when Audit is disabled. The host integration supplies
+the successful Audit CAS and saved payload from test memory; it does **not**
+prove a real block commit, disk/world persistence, Loader execution, or a
+graphical client. Core journal reopening and stale-generation replies have
+separate focused owner tests. Core `mc-server` checked without compiling siblings.
+
+The CP-041/042 WIT expansion changed the component ABI even for server-only
+guests, so all six first-party standard-pack components were rebuilt and
+byte-checked against their Rust sources. WIT declarations still route selection
+and sound through the already bounded view/Loader owners, and preparation
+through the existing native catalog/region/budget gates; this checkpoint
+introduced no package-id branch or new native work class. Exact commands,
+identities and limitations: `.analysis/codex-logs/cp043-dual-consumer/repro.txt`.
+The earlier three-platform Java archive/decoder/compile evidence remains
+unchanged; none was repeated. **Real graphical acceptance remains deferred by
+owner until after CP-096**; CP-043 is not accepted. No commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_plugin_base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+diff_hash: c148756d7eca0ce4f461e685479237499af4fb44ce3fb4b4f5db19b8016d1035
+diff_scope: untracked integration test against /dev/null; sibling component byte identities in receipt
+changed_files:
+  - crates/mc-test-harness/tests/settlement_component_haul.rs
+  - crates/mc-data/src/{item_components.rs,item_semantics_26_1_2.rs,recipes.rs}; crates/mc-script/src/host_control_tests.rs
+  - crates/mc-net/src/play/{combat/player_actions.rs,ingress/chat_commands.rs,simulation.rs,recipes.rs,use_item_on_adapter_tests.rs,tests/enchanting_recipe_settlement.rs,tests/inventory_settlement.rs}; crates/mc-test-harness/tests/wasm_owned_inventory.rs (strict-Clippy and repair regression fixes)
+  - ../solaris-default-plugins/{solaris-permissions,solaris-essentials,solaris-economy,solaris-towns,solaris-audit,basic-economy}/plugin.wasm
+  - docs/MEMORY.md
+validation:
+  - dual shipped component check/start/action/reload/restart/disable: 1 passed
+  - audit saved value recovery and status: 1 passed in same integration
+  - first-party standard pack artifact rebuild/check: 6 byte-identical
+  - core standalone mc-server check: passed
+  - core durable storage restart tests: 2 passed
+  - old-generation storage reply isolation: 1 passed
+  - enchanted tool repair focused regression: 1 passed after clearing inherited enchantments
+  - fmt: 20260923T164446-fmt-e28o8mab passed
+  - strict workspace Clippy: 20260923T170659-clippy-db6m8szk passed
+  - code-health: 20260923T170753-code-health-7gdu8_em passed
+  - full workspace test (bounded 6G scope, one Cargo compiler): 20260923T163804-test-5mjwj48q passed after repair regression fix
+  - independent read-only review: pass; no critical defect, synthetic evidence caveat above
+  - graphical CP043: deferred_by_owner
+next: Implement CP044 real resident hiring and equipment via native owner and durable guest intent; keep graphical acceptance queued after CP096.
+```
+
+## CP-044 real resident hiring and paid equipment (headless, 2026-09-23)
+
+`solaris-settlements` now hires an existing core-owned villager under four role
+policies (militia, infantry, spearman, archer), with exact real warehouse stock
+and an emerald signing wage delivered to resident carry. The guest stores an
+owner-scoped CAS hiring intent before the native no-player equipment transfer,
+then finalizes role/employer under a second CAS. The same operation id replays
+after reload without a second debit; repeat hiring and competing employers are
+refused. The native world-journal decision includes physical container image,
+resident gear and receipt while preserving UUID and previous work/assignment.
+The guest rereads the gear revision after the storage actor resumes paused work
+and before publishing the roster fence. Admission consults the live entity owner
+and tombstones an observed conversion/death before any stock debit; replay of
+an already committed receipt precedes that admission.
+
+Focused native ledger/journal and shipped-component host integration passed;
+the latter supplies synthetic storage, resident, inventory and transfer
+callbacks, not a real chunk save or graphical client. The native world fixture
+models the physical container and reopens core storage; it does not prove a
+persisted disk chunk. Full reproduction, independent review findings/fixes,
+commands and artifact identities are at
+`.analysis/codex-logs/cp044-hiring/repro.txt`. **Owner-deferred graphical
+Minecraft acceptance remains queued until after CP-096**; CP-044 is not
+accepted. No commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_plugin_base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+diff_hash: 1ff8298098cdf6802180296f9c4c55e5e827e7a01577dbf59201ba0c13eabac4
+sibling_diff_hash: b57d2d929611d12a004fd3e60ef2d393b0cc9c29f1f71bbad619a41f379ad2c8
+diff_scope: CP044 tracked paths in changed_files except docs/MEMORY.md; full bytes of both untracked core files; sibling README diff plus full source and component bytes
+changed_files:
+  - crates/mc-net/src/script/storage/{residents.rs,resident_orders.rs,resident_settlement_tests.rs,world_inventory.rs,world_inventory/warehouse_resident.rs}
+  - crates/mc-script/src/{inventory_operations.rs,resident_operations.rs}; crates/mc-script/wit/{inventories.wit,residents.wit}
+  - crates/mc-plugin-host/src/domain_residents.rs
+  - sdk/rust/solaris-plugin-sdk/src/{lib.rs,inventory_ops.rs,resident_ops.rs}
+  - crates/mc-test-harness/tests/settlement_component_haul.rs (untracked CP043/CP044 shared fixture)
+  - docs/decisions/0009-regional-plugin-boundary.md; docs/MEMORY.md
+  - ../solaris-default-plugins/sources/solaris-settlements/src/{lib.rs,hire.rs,hire_runtime.rs,hire_tests.rs,view.rs,view_tests.rs}
+  - ../solaris-default-plugins/solaris-settlements/{README.md,plugin.wasm}
+validation:
+  - native focused pre-fix work-revision reproduction failed as expected; fixed test 1 passed, then conversion and post-conversion replay test 1 passed
+  - native resident scope before reviewer changes: 96 passed
+  - guest package before reviewer changes: 53 passed; post-resume finalization focused test 1 passed
+  - shipped Wasm host integration before reviewer changes: 4 passed; post-resume current-revision flow focused 1 passed
+  - mc-script and mc-plugin-host suites before reviewer changes: 301 passed
+  - settlements component rebuilt and byte-checked SHA256 729cc6c9dc58d3224bb181dcaa49e6fccb505e0600b4b81ac13fa2a73b64cc45
+  - six other first-party standard components rebuilt and byte-checked; hashes in receipt
+  - fmt: 20260923T180341-fmt-uz9k0ha7 passed after applying rustfmt
+  - code-health: 20260923T180341-code-health-0u6sbjox passed
+  - codegraph sync: up to date
+  - independent read-only review: two findings corrected with focused regressions; no second review
+  - graphical CP044: deferred_by_owner
+next: Implement CP045 native melee/ranged orders, cooldown and ammo against real target kernels; defer graphical two-client acceptance until after CP096.
+```
+
+## CP-045 native resident melee and physical ranged combat (headless, 2026-09-23)
+
+The first-party Rust/Wasm settlement guest now accepts `defend` from the
+settlement owner/steward for a hired resident. It issues one Hold order, takes
+one server-issued hostile reference and its policy/expiry fences, then issues
+an Attack order with a durable operation counter; it sends no tick damage.
+Native owner admission rechecks identity, allowed category, ally policy,
+equipment, reach, line of sight and persisted 20-tick cooldown. Melee uses
+the entity damage owner. A bow spends one canonical arrow on actual launch;
+the server creates one target-restricted world arrow and the ordinary arrow
+kernel resolves impact and client-visible health/hurt/despawn later. An
+accepted attack is indexed in the storage ledger and continues on pushed
+simulation ticks after moving into reach, without changing the guest order
+fence. Cancellation, death/invalid refs and empty ammunition stop combat.
+Old target-bearing durable receipts decode with inert zero metadata rather
+than preventing the world from opening.
+
+Two session outbound observers each received one projectile spawn and one
+impact publication in a headless injected-physics fixture; this is not two
+graphical Minecraft clients or end-to-end world collision. Native tests cover
+bow/ally/LOS/ammo, melee/chase/cooldown, changed weapon, departed target,
+reopen/cancel and crowded bystanders. The shipped component host test uses
+synthetic owner responses to exercise the real Wasm command/metadata flow.
+The projectile spawn and order/ammo journal remain separate, so the narrow
+crash window is **not** a cross-journal atomicity proof; CP065 owns durable
+projectile outcomes. Full commands, failed pre-fix repros and fixes are in
+`.analysis/codex-logs/cp045-combat/repro.txt`. **Owner-deferred graphical
+two-client acceptance remains queued until after CP096**; CP045 is not
+client-accepted. No commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_plugin_base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+diff_hash: da82eebcf4ccd534c4b19f39ef7891978e6c13c8c2ac844d779f0ec8b803a25c
+sibling_diff_hash: bda893dbb74507159d46cb13cdf9564148bdde86a35ca829229dfe3959817e42
+diff_scope: CP045 tracked paths below except docs/MEMORY.md, plus full bytes of the untracked shared host test; sibling tracked README/manifest diffs plus full guest combat/lib sources and component bytes
+changed_files:
+  - crates/mc-net/src/script/storage.rs
+  - crates/mc-net/src/script/storage/{resident_order_execution.rs,resident_orders.rs,resident_order_tests.rs}
+  - crates/mc-net/src/play/session/{resident_orders.rs,projectiles.rs,projectiles_tests.rs}
+  - crates/mc-entity/src/projectile_26_1_2/arrow.rs
+  - crates/mc-script/{wit/residents.wit,src/resident_order_operations.rs,src/resident_order_operations_tests.rs}
+  - crates/mc-plugin-host/src/domain_residents.rs
+  - crates/mc-test-harness/tests/settlement_component_haul.rs (untracked shared fixture)
+  - docs/decisions/0009-regional-plugin-boundary.md; docs/MEMORY.md
+  - ../solaris-default-plugins/{README.md,solaris-settlements/README.md,solaris-settlements/plugin.toml,solaris-settlements/plugin.wasm}
+  - ../solaris-default-plugins/sources/solaris-settlements/src/{combat.rs,combat_tests.rs,lib.rs}
+validation:
+  - native pre-fix cooldown and chase reproductions failed as expected; fixed distant chase/reopen/cancel focused 1 passed after Applied-state correction; ranged continuation focused 1 passed
+  - mc-net resident order scope: 67 passed before final Applied-state assertion; final affected focused test 1 passed
+  - two-observer shared projectile kernel focused: 1 passed, injected physics only
+  - mc-script and mc-plugin-host suites: 302 passed; old target-bearing receipt migration focused 1 passed
+  - sibling settlements Rust guest: 54 passed before final byte rebuild
+  - shipped Wasm host integration: 4 of 5 passed with one missing fixture grant, then that one focused test passed after grant; guard flow included in initial 4
+  - settlements component rebuilt and byte-checked SHA256 100d95dbf266e03cedb64ec008e43b7789f3b4a050d5303c0713cf90e1afe54f
+  - six other standard components rebuilt and byte-checked, hashes in receipt
+  - fmt: 20260923T195517-fmt-uuz9vukz passed after rustfmt and Applied-state correction
+  - code-health: 20260923T194809-code-health-aptnzb1e passed before one fixture grant and Applied slot restoration; architecture scope unchanged
+  - codegraph sync: up to date
+  - independent read-only review: two priority-one findings fixed with focused regressions; later advisor finding on Applied state corrected; no second review
+  - graphical CP045: deferred_by_owner
+next: Implement CP046 group roster order, bounded slot planning, reformation and path/query evidence; defer graphical acceptance until after CP096.
+```
+
+## CP-046 bounded squad orders and reformation (headless, 2026-09-23)
+
+The first-party settlement Wasm guest now accepts `march` and `halt` for one
+explicit roster of one to 32 hired aliases with per-member order revisions.
+It re-reads owner/steward authority and issues one fenced native batch rather
+than per-member movement commands. Native group admission remains atomic; an
+unreachable passage or slot gives a per-member `blocked_route` outcome
+without teleportation. For each distinct anchor a batch computes its
+formation once, then checks routes only for eligible members. A later subset
+order replans just those handles; cancellation idles the named members.
+The selected list is retained in native admission/receipt and per-member
+durable orders, not a new named guest squad record. Accepted Move/Retreat/
+Patrol destinations survive pending-admission replay exactly: the pre-fix
+reproduction collapsed all members to a shared anchor. Cancellation also
+replays `Idle` for committed `order=None` members before acknowledging their
+pending admission; the pre-fix crash-window fixture left a stale movement goal.
+
+Headless query counts on real world storage: open 3-member squad 3 standable /
+3 route calls, reformed 2-member subset 2 / 2, closed passage 3 / 3,
+unplaceable slot 5 / 0; repeating the same operation id adds zero queries.
+Clearing the slot and issuing a newly fenced order resumes distinct movement.
+The shipped Wasm host test exercises command-to-native translation and
+cancellation using synthetic native outcomes; the native fixture separately
+executes actual group goals. Migration fencing and death-between-admission
+are covered headlessly; **owner-deferred graphical client acceptance remains
+queued until after CP096**, not green. Source, both pre-fix failures and exact
+gates are in `.analysis/codex-logs/cp046-squad/repro.txt`. No commit.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+sibling_plugin_base_tree: 92c51a37dee282e75b8fce709b8e720509f4f43f
+diff_hash: 04452a2bafccaf0ecdca15ee271bfc1d4be90dc8c4bbf71d1643e5e4dbab3147
+sibling_diff_hash: 1aeeecd2bb230fd4f961a4ed92b9633d63ff0186306887447a39e4e9b0ddbbad
+diff_scope: cumulative CP045+CP046 owned paths against base, excluding this MEMORY cursor; exact path set in receipt
+changed_files:
+  - crates/mc-net/src/script/storage/{resident_order_execution.rs,resident_orders.rs,resident_order_tests.rs}
+  - crates/mc-test-harness/tests/settlement_component_haul.rs (untracked shared fixture)
+  - docs/decisions/0009-regional-plugin-boundary.md; docs/MEMORY.md
+  - ../solaris-default-plugins/sources/solaris-settlements/src/{combat.rs,combat_tests.rs,lib.rs}
+  - ../solaris-default-plugins/solaris-settlements/{README.md,plugin.wasm}
+validation:
+  - native pre-fix pending Move and Cancel replay failed as expected; corrected resident-order scope 68 passed (artifact://2125)
+  - native group migration fence focused 1 passed; first-party guest 55 passed
+  - shipped Wasm group move/cancel host integration 1 passed after final byte rebuild
+  - shipped component byte-check SHA256 dc424c803b94e78d676773b4998621038b27c44503031a4baa3e2ce4bc32d404
+  - fmt: 20260923T212848-fmt-fj9xnmss passed
+  - code-health: 20260923T212852-code-health-7_f22u2c passed
+  - codegraph sync: up to date
+  - independent read-only review: pass on initial CP046 diff; late Cancel replay repair verified by regression and gates
+  - graphical CP046: deferred_by_owner
+next: Implement CP047 retreat, treatment and demobilization with native health/gear ownership; continue through CP096 before owner-deferred graphical acceptance.
+```
+
 ## v0.0.8 release candidate (2026-09-20)
 
 **Versioning.** `v0.0.7` is already published at `9e5e20e4`; the next release
@@ -189,18 +1737,659 @@ because `cc-rs` must compile `src/runtime/vm/helpers.c` and
 insufficient; this is not a linker-only gap. Receipt:
 `.analysis/codex-logs/p0-aarch64-target-check-20260921/receipt.txt`.
 
-**P0 Arm CI handoff retry (2026-09-21).** Owner-authorized run
-[`35667411935`](https://github.com/kaiserproger/solaris/actions/runs/35667411935)
-executed the bounded 16-test command on native `ubuntu-24.04-arm` at
-`b0f381e`. It failed only when the guest fixture built: despite the
-toolchain action's `targets` input, the active workspace override lacked
-`wasm32-unknown-unknown` and Rust reported `E0463` for `std`. The job now runs
-the same explicit `rustup target add wasm32-unknown-unknown` step proven by the
-ordinary CI test job; no production code or test assertion changed. The bounded
-command still passes locally in 54.07 seconds and independent review passed.
-The former full package command's 480.09-second timeout remains irrelevant to
-this P0 matrix. Native Arm acceptance awaits the retry receipt:
+**P0 accepted — native Linux AArch64 (2026-09-21).** GitHub Actions
+[run 35667641281](https://github.com/kaiserproger/solaris/actions/runs/35667641281),
+job 106556828374, executed commit
+`87af4502a79864392798bcb52634e6d2d68ce9d4` on `ubuntu-24.04-arm` with
+Rust 1.94.1 and the explicit wasm32 guest target. All 16 tests in
+`host_bounds`, `cleanup_isolation`, `component_roundtrip`,
+`contract_refusal`, and `host_baseline` passed. The Arm baseline recorded four
+logical CPUs, callback p50/p95/p99/max 15.575/16.215/30.071/47.374 us,
+component compilation 19,313.064 ms, and VmHWM 5,772→140,000 KiB. This
+closes P0's last target-compatibility gap; the earlier target-install failure
+and its setup-only fix remain in the receipt. Receipt:
 `.analysis/codex-logs/p0-aarch64-target-check-20260921/receipt.txt`.
+
+**P8 accepted — single Wasmtime production runtime (2026-09-22).** Current
+production source, Cargo graph, CI, SDK, examples, and active architecture
+contracts contain no Luau runtime/dependency or legacy package caller.
+`rules.lua` remains only as an intentionally invalid, no-Loader cutover fixture:
+the strict component still reaches Play, emits its greeting, and answers
+`/hello`, proving it is not executed as a fallback. P0's native AArch64
+component gate and P7's strict five-component server-only/Loader/storage/reload
+gates are accepted. Final-tree formatter, strict Clippy, code-health, and
+workspace/all-target tests passed; standalone `mc-server` built without a
+sibling repository or guest compiler. The only final source correction removes
+a redundant `PluginLimits::clone()` of a `Copy` value in the standard-pack test.
+Independent review `P8CutoverReview` passed with no findings. Receipt:
+`.analysis/codex-logs/p8-cutover-audit-20260921/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+diff_hash: 0801c54790bdb37a188bd0699a4d68425ede08b89b68ac57499eaf58e5992bca
+diff_hash_recipe: >
+  SHA-256 of git diff --binary base_tree --
+  crates/mc-test-harness/tests/plugin_standard_pack.rs; cursor/evidence
+  updates are deliberately excluded.
+changed_files:
+  - crates/mc-test-harness/tests/plugin_standard_pack.rs
+  - docs/MEMORY.md
+validation:
+  - fmt: 20260922T000431-fmt-zdfu8fdm passed
+  - clippy: 20260921T234139-clippy-3nw87l7z passed
+  - code-health: 20260921T234155-code-health-nc6xfimy passed
+  - test: 20260921T234210-test-1bzklpuy passed
+  - build: 20260921T234155-build-mn7ls_iy passed
+  - reviewer: P8CutoverReview passed
+next: CP-001 audit existing Rust/WASM cargo-delivery evidence.
+```
+
+**CP-001 accepted — cargo delivery through the shipped Settlements component
+(2026-09-22).** The dedicated `settlement-cargo` profile rebuilds and
+SHA-256-checks `solaris-settlements/plugin.wasm` from its Rust source, then
+strictly deploys the full package. Its actual Wasm handler receives production
+boundary commands, persists its guest-owned counter, accepts the correlated
+bound-warehouse result, and emits an admitted `AssignWork::Haul` from
+`ResidentCarry(resident-1)` to the returned bound warehouse for
+`minecraft:birch_log` at revision 3. The existing `worker_haul_*` core owner
+cases execute that directed request against a real chest and cover merge,
+full-destination refusal, restart/replay idempotence, and mixed cargo where a
+later stack fits. The tracked component artifact was stale before this gate;
+it was rebuilt from reviewed source and its final SHA-256 is
+`6411e420d35d9cea17613a9d8102478aeb2ce2c6331aef7d671a0bf55ba8742e`.
+Independent review `CP001CargoReview` passed with no findings. Receipt:
+`.analysis/codex-logs/cp001-settlement-cargo-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: e56ff322fdaef9352a2b57c3c3204f7ae3667b6e39e446ad3f35a468401fed81
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-test-harness/tests/settlement_component_haul.rs tools/harness/profiles.py;
+  cursor/evidence updates are deliberately excluded.
+sibling_untracked_content_sha256:
+  tools/build_standard_pack.py: 6027ace455668730503225ad664996743b84200891fb9cd91adc5ff282eb2084
+  solaris-settlements/plugin.wasm: 6411e420d35d9cea17613a9d8102478aeb2ce2c6331aef7d671a0bf55ba8742e
+changed_files:
+  - crates/mc-test-harness/tests/settlement_component_haul.rs
+  - tools/harness/profiles.py
+  - ../solaris-default-plugins/tools/build_standard_pack.py
+  - ../solaris-default-plugins/solaris-settlements/plugin.wasm
+  - docs/MEMORY.md
+  - docs/AGENT_TOOLING.md
+validation:
+  - settlement-cargo: 20260922T001746-settlement-cargo-d1fz8sa6 passed
+  - harness-check: 20260922T002334-harness-check-amjjpmhd passed
+  - fmt: 20260922T002401-fmt-ocm4w57r passed
+  - code-health: 20260922T002418-code-health-0prcg_mm passed
+  - reviewer: CP001CargoReview passed
+next: CP-002 reproduce current Wasm settlement readiness under controlled load.
+```
+
+**CP-002 accepted — current Wasm settlement readiness (2026-09-22).** The old
+Lua `settlement_pause_repro` target remains absent; the removal belongs to
+`b454200b` and is not misrepresented as a repaired historical flake. Its
+observable wire-client intent is now reproduced by
+`settlement_wasm_readiness`: actual shipped `solaris-settlements` Wasm is
+strictly deployed, real player commands create/adopt a core site, wait for
+world chunk delivery, survey, project a `solaris:watch_post`, provide its real
+palette materials, reserve them, and commit a structure portion. The same real
+player receives `Structure materials reserved.` and `Structure portion
+committed.` through the guest and existing owner boundary. Four owned CPU
+spinners leave the complete flow passing in 18.88 s with no swaps. Current
+host controls also passed 16 cases across `host_runtime` and
+`startup_lifecycle`, covering startup-budget, configure/check, queue-capacity,
+capability, and epoch-deadline refusals. No timeout, retry, fuel, epoch, or
+queue budget changed. Independent review `CP002ClosureReview` passed with no
+findings. Receipt:
+`.analysis/codex-logs/cp002-wasm-readiness-20260922/receipt.txt`.
+
+**CP-003 accepted — warehouse-to-worker issuance (2026-09-22).** The shipped
+`solaris-settlements` Wasm component emits a real admitted Warehouse →
+ResidentCarry/ResidentEquipment haul after its durable guest counter update;
+no player principal or second inventory authority participates. The existing
+owner commits the container after-image and resident record in one journal
+decision. The cargo profile proves named carry and equipment issue with damage,
+enchantment, custom-name, and item-model preservation across storage reopen;
+insufficient, full, foreign, unknown, stale, and replay outcomes; and an
+allowed generated village chest retaining its resolved physical source and one
+issued result after reopen. Existing owner-fence tests cover
+foreign/unknown/unloaded/stale container state and post-commit publication to
+every open viewer. Independent review found the original component-preservation
+evidence insufficient; the profile now carries a component-bearing, durable
+reopen assertion and passes in 22.5 s. Strict Clippy and the workspace/all-target
+test gate passed; no warning suppression was added. Receipt:
+`.analysis/codex-logs/cp003-warehouse-withdrawal-20260922/receipt.txt`.
+
+
+**CP-004 accepted — live warehouse material reservation (2026-09-22).**
+Warehouse reserve already fenced every owner-bound physical chest against its
+durable ledger. The remaining release transition now rebuilds that chest's live
+reservation floor only after its owned-inventory decision is durably committed.
+A released three-log reservation therefore makes the same two-log player
+after-image admissible; a replay returns the one stored release outcome and
+cannot return stock twice. The cargo profile also covers two reservations
+exhausting actual stock, overpromise refusal, partial player pickup, admission
+against a concurrent chest commit, source loss, and restart/unloaded recovery.
+There is no global reservation service or second inventory authority. Independent
+review `CP004ReservationReview` found no P0/P1/P2 defect; its caveat that the
+new focused test observes the physical admission predicate rather than moving an
+item is covered by the profile's existing real chest-commit/resync cases.
+Receipt: `.analysis/codex-logs/cp004-warehouse-reservation-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: ecb4443e88cb499233ca219a0207b9f59c62cd660d09115ee15a02ef0516e693
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/script/storage/world_inventory.rs
+  crates/mc-net/src/script/storage/settlement_tests.rs
+  tools/harness/profiles.py docs/AGENT_TOOLING.md;
+  cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/script/storage/world_inventory.rs
+  - crates/mc-net/src/script/storage/settlement_tests.rs
+  - tools/harness/profiles.py
+  - docs/AGENT_TOOLING.md
+  - docs/MEMORY.md
+validation:
+  - settlement-cargo: 20260922T014609-settlement-cargo-dspcgrjp passed
+  - harness-check: 20260922T014711-harness-check-l3cfexn4 passed
+  - fmt: 20260922T014728-fmt-wqjl0np5 passed
+  - code-health: 20260922T014716-code-health-4k567se1 passed
+  - clippy: 20260922T014735-clippy-l3hcaaav passed
+  - reviewer: CP004ReservationReview passed
+next: Complete CP-005 controlled villager material logistics.
+```
+
+**CP-005 accepted — one atomic building portion (2026-09-22).** The bounded
+existing portion transaction remains one server-owned block decision carrying
+the same prepared plugin batch for material consumption, structure progress,
+and receipt. An underfunded matching-plan reservation now proves refusal leaves
+all three unchanged. Independent review found a real ordering gap: a kept
+`before-build` ticket could be consumed before its portion waited for journal
+order. The ticket now survives that wait and is consumed only after the
+cross-region transaction revalidates source images, immediately before its
+receipt append and publish. A roster revoked while a predecessor holds the
+journal turn produces no blocks or recoverable receipt. Cancellation, changed
+footprint, competing builder, append-fault recovery, and reopen replay remain
+in the focused profile. The reviewer found no defect in the candidate test
+itself; its ordering finding was fixed without a second review, per the
+checkpoint review policy. Receipt:
+`.analysis/codex-logs/cp005-structure-portion-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 9a6f5cce8e5730201dedd2dc7508a0d583606ae2668f9acb2c99564332eb9574
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/play.rs crates/mc-net/src/play/simulation.rs
+  crates/mc-net/src/play/simulation/tests/precommit_tests.rs
+  crates/mc-net/src/play/tests/scheduled_buttons.rs
+  crates/mc-net/src/script/storage/settlement_tests.rs
+  tools/harness/profiles.py docs/AGENT_TOOLING.md;
+  cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/play.rs
+  - crates/mc-net/src/play/simulation.rs
+  - crates/mc-net/src/play/simulation/tests/precommit_tests.rs
+  - crates/mc-net/src/play/tests/scheduled_buttons.rs
+  - crates/mc-net/src/script/storage/settlement_tests.rs
+  - tools/harness/profiles.py
+  - docs/AGENT_TOOLING.md
+  - docs/MEMORY.md
+validation:
+  - settlement-cargo: 20260922T020950-settlement-cargo-bz7h7heb passed
+  - fmt: 20260922T021048-fmt-48aqtcg7 passed
+  - harness-check: 20260922T021059-harness-check-ffuybdna passed
+  - code-health: 20260922T021059-code-health-k41pjrr1 passed
+  - clippy: 20260922T021104-clippy-1w7i8yol passed
+  - reviewer: CP005TransactionReview finding fixed
+next: Complete CP-006 pause, cancel, and resume construction safely.
+```
+
+**CP-006 accepted — durable construction lifecycle (2026-09-22).** Pause,
+resume, and cancel use the existing authoritative structure revision and
+reservation projection: a partial portion stays consumed and its placed blocks
+are never removed; cancel returns only the remaining material and is
+idempotent. New storage-level reopen coverage pauses after two blocks, reads
+the identical paused status after a new runtime/storage open, resumes without a
+second portion, cancels using that reopened revision, and replays cancel without
+a new intent. Existing partial-cancel coverage directly asserts the two blocks
+stay in the world; CP-005 journal-fault recovery covers the portion/ledger
+boundary. Independent review `CP006LifecycleReview` passed with no P0/P1/P2
+finding and notes the new reopen test deliberately observes durable
+storage-state, while its fresh fake world cannot stand in for world-image
+recovery. Receipt:
+`.analysis/codex-logs/cp006-construction-lifecycle-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: bbe33fe302e06c41ad7ad114786beb62e5a9ec80fc417e3ee89ca084113b0eb6
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/script/storage/settlement_tests.rs
+  tools/harness/profiles.py docs/AGENT_TOOLING.md;
+  cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/script/storage/settlement_tests.rs
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - settlement-cargo: 20260922T021417-settlement-cargo-htnq9mzn passed
+  - fmt: 20260922T021525-fmt-560ad23k passed
+  - harness-check: 20260922T021534-harness-check-co_wuypr passed
+  - code-health: 20260922T021534-code-health-uue76ins passed
+  - clippy: 20260922T021540-clippy-nmz3k856 passed
+  - reviewer: CP006LifecycleReview passed
+next: Complete CP-007 durable mining cargo receipts.
+```
+
+
+**CP-007 accepted — durable mining cargo receipt (2026-09-22).** Mining already
+staged canonical break loot, cargo after-images, and the resident work watermark
+through the same world-journal decision. Added the missing mining-specific
+projection-fault regression: after the world accepts iron-ore removal, a forced
+plugin-storage write failure returns durability unknown; reopening projects the
+accepted receipt once. The existing full-cargo mine test proves capacity refusal
+leaves ore untouched with zero work. Replaying the original fault-injected
+operation reports one work unit and leaves exactly one raw iron in worker
+cargo—no dropped block, lost progress, or duplicate loot. Independent review
+`CP007MiningReceiptReview` passed with no findings. It is
+journal/plugin-storage recovery, not a power-loss or full
+world-process-restart claim. Receipt:
+`.analysis/codex-logs/cp007-mining-cargo-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: bf1065fab5b54cc75ef1b354b531dfb54e7edb3effc5d9be40565ae05a872768
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  tools/harness/profiles.py; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - focused test: mine_recovers_cargo_and_progress_after_storage_projection_fails passed
+  - settlement-cargo: 20260922T022009-settlement-cargo-upe1k752 passed
+  - fmt: 20260922T022106-fmt-eyzrx2hv passed
+  - code-health: 20260922T022111-code-health-u6u13y7p passed
+  - harness-check: 20260922T022113-harness-check-1uuj39af passed
+  - clippy: 20260922T022114-clippy-5ekg9zi7 passed
+  - reviewer: CP007MiningReceiptReview passed
+next: Complete CP-008 agricultural resource cycle.
+```
+
+**CP-008 accepted — real agricultural cycle (2026-09-22), corrected maturity
+fence.** Harvest now requires an authoritative registered mature crop state
+before it previews canonical break loot: age 7 for wheat/carrots/potatoes, age
+3 for beetroot/nether wart/sweet berries, age 2 for cocoa, and the produced
+fruit/cane blocks themselves. Unknown or unaged states fail closed. Coverage
+harvests and replants, attempts a second harvest while the replanted wheat is
+still age 0 (MissingInput with zero work and no loot), applies an external
+mature-world update, then completes the second harvest/replant cycle. Both
+harvest outputs remain worker-owned. The public matrix also runs missing-seed,
+missing-tool, stale-field, and full-cargo refusal cases. This is a real
+world-event fixture, not a claim that settlement timers produce crops.
+`CP008AgriculturalReview` and the correction review `CP008MaturityReview`
+passed with no findings. Receipts:
+`.analysis/codex-logs/cp008-agricultural-cycle-20260922/receipt.txt` and
+`.analysis/codex-logs/cp008-crop-maturity-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 2f363e1273363d20076a6b22e9e7031e44cfb12a893af478d043c330344d3d8c
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/play/resident_work.rs
+  crates/mc-net/src/script/storage/resident_order_execution.rs
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  crates/mc-net/src/script/storage/resident_settlement_tests.rs
+  tools/harness/profiles.py; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/play/resident_work.rs
+  - crates/mc-net/src/script/storage/resident_order_execution.rs
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - crates/mc-net/src/script/storage/resident_settlement_tests.rs
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - focused test: a_matured_replanted_crop_completes_a_second_cycle passed
+  - settlement-cargo: 20260922T024903-settlement-cargo-bp6x49x6 passed
+  - fmt: 20260922T025013-fmt-jk74fxbz passed
+  - code-health: 20260922T025018-code-health-r3776cqp passed
+  - harness-check: 20260922T025021-harness-check-e1fnr137 passed
+  - clippy: 20260922T025021-clippy-pjc5rxgz passed
+  - reviewer: CP008AgriculturalReview and CP008MaturityReview passed
+next: Complete CP-010 honest resident mining.
+```
+
+**CP-009 accepted — bounded real-tree logging (2026-09-22).** Tree selection
+remains a bounded rooted-trunk-plus-canopy check; grounded non-canopied house
+logs remain excluded. CutTree now fences each conditional break through a live
+resident's bounded path to a standable neighbour of the tree root. A missing
+snapshot, unavailable world route, or blocked route produces a typed refusal
+without a block change. The first review found that upper trunk cells were
+using their own elevation for the route and could be stranded after lower
+progress. The correction reuses the bounded rooted standing height, proven by
+a three-log tree. The matrix covers real tree cargo, house protection, blocked
+route, missing tool, full cargo, and exact resumption after a permission fence
+is removed. Receipt: `.analysis/codex-logs/cp009-real-trees-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 4d73e66dcedebd0df6fbbd416b2723c6416677e6768d60066eaa286017b7182d
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/script/storage/resident_order_execution.rs
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  tools/harness/profiles.py; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/script/storage/resident_order_execution.rs
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - focused tree tests: cut_tree_ and rooted tall trunk passed
+  - settlement-cargo: 20260922T024323-settlement-cargo-d09g2sl8 passed
+  - fmt: 20260922T024434-fmt-3jveizr_ passed
+  - code-health: 20260922T024438-code-health-ww0gav7l passed
+  - harness-check: 20260922T024441-harness-check-n6g07cn3 passed
+  - clippy: 20260922T024441-clippy-v_4tat9v passed
+  - reviewer: CP009RealTreeReview found and localized upper-trunk route defect;
+    fixed with rooted-route lookup and tall-tree regression; no second review by policy
+next: Complete CP-010 honest resident mining.
+```
+**CP-010 accepted — honest resident mining (2026-09-22).** Mine retains its
+bounded requested area, canonical break preview, tool/drop gate, capacity fence,
+protection check, and durable receipt. It now also requires a live resident
+snapshot with a bounded open route to an actual mining stance: a standable
+horizontal neighbour at ore level or the cell directly above it. Hidden ore no
+longer becomes cargo merely because it appears in the request area; missing
+snapshots and unavailable route data fail closed. The fixture's normal ore has
+a narrow physical stair; sealed ore remains untouched with `BlockedRoute`.
+The matrix proves accessible canonical loot/work, unsuitable tool, full cargo,
+protection, stale source, unloaded target, later tier gate, and receipt
+recovery. `CP010MiningReview` passed with no findings. Receipt:
+`.analysis/codex-logs/cp010-honest-mining-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: b1fad33e9974f8fc1ad1c2b2ab49f9cf7101e733ae71e68e54b2db1f0ec63d68
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/script/storage/resident_order_execution.rs
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  tools/harness/profiles.py; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/script/storage/resident_order_execution.rs
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - focused mining tests: mine_ and stale preview passed
+  - settlement-cargo: 20260922T025905-settlement-cargo-27ktzoiw passed
+  - fmt: 20260922T030050-fmt-m2c3kzgn passed
+  - code-health: 20260922T030054-code-health-4qf2ojiv passed
+  - harness-check: 20260922T030057-harness-check-m_jnd4j8 passed
+  - clippy: 20260922T030057-clippy-wz76jbyj passed
+  - reviewer: CP010MiningReview passed
+next: Complete CP-011 fishing and livestock resource contract.
+```
+
+**CP-011 accepted — fishing and livestock resource contract (2026-09-22).**
+Fish and tend now require a live resident plus a bounded route to the actual
+water shore or adjacent animal stance. A present source behind a closed route
+does not become remote cargo or consume feed. Fishing retains its deliberately
+deterministic one-cod-per-reachable-column worker contract: the target vanilla
+fish table is present locally and weighted, but the worker API does not
+evaluate that table or bobber timing, so this checkpoint does not claim vanilla
+fishing parity. Tending consumes feed only for a live mature compatible animal;
+it produces no virtual livestock items. Tests cover source removal, no storage,
+no route, no feed, maturity/compatibility, death, missing source, replay after
+storage reopen, and loaded boundary stances. The reviewer found that an
+unloaded first candidate incorrectly hid a reachable later candidate; the
+fix records unavailable candidates while trying the whole bounded set, with
+boundary regressions. No second review by policy. Receipt:
+`.analysis/codex-logs/cp011-resource-contract-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 6f7e3bb326090ea0f77ff8512a8c4497a1f3f360f78d214c2eb2e23b5ac89a1f
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/script/storage/resident_order_execution.rs
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  tools/harness/profiles.py; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/script/storage/resident_order_execution.rs
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - focused fish, tend, dead-source, and boundary-stance tests passed
+  - settlement-cargo: 20260922T031937-settlement-cargo-glc61_yz passed
+  - fmt: 20260922T032052-fmt-vuf1uq8r passed
+  - code-health: 20260922T032057-code-health-27u0i5vp passed
+  - harness-check: 20260922T032059-harness-check-dyz2op78 passed
+  - clippy: 20260922T032100-clippy-i_l83zj9 passed
+  - reviewer: CP011ResourceReview found stance-order defect; fixed with
+    boundary regressions; no second review by policy
+next: Complete CP-012 warehouse-backed production.
+```
+
+**CP-012 accepted — warehouse-backed workshop production (2026-09-22).**
+Workers now execute shared recipes only at their matching stateless station:
+crafting table, lit campfire, or stonecutter. Furnace, smoker, and blast-furnace
+recipes remain with their live fuel/burn state rather than becoming free
+instantaneous crafts. Each resident craft stages ingredient removal, output,
+and item-component remainders on one record after-image, then commits it with
+the durable receipt; no-capacity rejection preserves even a named/component
+input exactly. Shared tag membership no longer assumes protocol-id ordering, so
+valid tag-driven recipes such as cake consume inputs and return their container
+remainders. The warehouse flow remains explicit: bound-container withdrawal,
+resident craft, and return transfer; the integration test reopens storage
+before replaying the accepted craft receipt. `CP012WorkshopReview` found
+component-bearing rollback loss and unlit campfire cooking; both have focused
+regressions and are fixed. No second review by policy. Receipt:
+`.analysis/codex-logs/cp012-workshop-production-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 444e8192cc34c052fa034b3e4f66172c0c0238ed9d30c8435f84df4054c7f2ce
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-data/src/tags.rs
+  crates/mc-net/src/play/resident_work.rs
+  crates/mc-net/src/script/storage/resident_order_execution.rs
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  crates/mc-net/src/script/storage/resident_settlement_tests.rs
+  crates/mc-script/src/resident_order_operations.rs
+  crates/mc-script/wit/residents.wit
+  tools/harness/profiles.py; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-data/src/tags.rs
+  - crates/mc-net/src/play/resident_work.rs
+  - crates/mc-net/src/script/storage/resident_order_execution.rs
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - crates/mc-net/src/script/storage/resident_settlement_tests.rs
+  - crates/mc-script/src/resident_order_operations.rs
+  - crates/mc-script/wit/residents.wit
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - focused tag, craft, warehouse replay, campfire, and component-capacity tests passed
+  - settlement-cargo: 20260922T035355-settlement-cargo-hugvmxzi passed
+  - fmt: 20260922T035355-fmt-qpci7xkm passed
+  - code-health: 20260922T035400-code-health-4l7h3lhx passed
+  - harness-check: 20260922T035422-harness-check-dbq1794p passed
+  - clippy: 20260922T035422-clippy-q2_ineib passed
+  - reviewer: CP012WorkshopReview found component rollback and unlit campfire
+    defects; both fixed with regressions; no second review by policy
+next: Complete CP-013 event-driven paused-work resumption.
+```
+
+**CP-013 accepted — event-driven paused-work resumption (2026-09-22).**
+Paused work now keeps whether `missing_input` waits on a bounded world source
+or an addressed inventory transfer. A matching world region resumes only the
+former; tools, recipe inputs, seeds, feed, resident capacity, and warehouse
+capacity continue to wait for their real inventory event. The source wake
+persists across Store reopen and advances the same durable watermark once;
+completed work drops from the pause index. Existing native receipts already
+carry the real `work-assignment` state and typed reason, including actor-driven
+resumes. The active-owner gate remains before execution, and chunk/zone/
+warehouse lookups remain bounded indexes rather than a tick scan. Receipt:
+`.analysis/codex-logs/cp013-event-resumption-20260922/receipt.txt`.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 40dfaba4f8430868dbc25189717f715f8336638fdc9e69b71492ba614f9978a8
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD --
+  crates/mc-net/src/script/storage/resident_order_execution.rs
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  crates/mc-net/src/script/storage/resident_orders.rs
+  tools/harness/profiles.py; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-net/src/script/storage/resident_order_execution.rs
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - crates/mc-net/src/script/storage/resident_orders.rs
+  - tools/harness/profiles.py
+  - docs/MEMORY.md
+validation:
+  - focused world/inventory wake, Store-reload, owner-active, chunk, zone,
+    warehouse, and actor-receipt regressions passed
+  - settlement-cargo: 20260922T040652-settlement-cargo-4r1zt4oc passed
+  - fmt: 20260922T040840-fmt-3m02_fkl passed
+  - code-health: 20260922T040844-code-health-ochclu2a passed
+  - harness-check: 20260922T040847-harness-check-75z74c6g passed
+  - clippy: 20260922T040848-clippy-qust4u9p passed
+  - reviewer: CP013ResumptionReview found inventory-backed missing-input
+    world retries; causal classification and a no-receipt regression fixed it;
+    no second review by policy
+next: Complete CP-014 unified R1/R0 acceptance scenario.
+```
+
+**CP-014 recheck — draft remains blocked (2026-09-22).**
+The exact deployed Rust component now exposes a bound warehouse funding path,
+prints deterministic home coordinates, and persists the real initial work
+fence `0` rather than the distinct resident-ledger spawn revision. An accepted
+work response remains the source of the successor fence. The cancellation
+repair also clears `world_input_wait` before a cancelled durable record is
+reopened. None of those component and storage checks establishes the required
+R1 product chain.
+
+The real headless package route still reaches `create → site → adopt → survey
+→ project → fund → advance`; its CP-002 readiness test passes only with
+test-granted construction materials. Extending that route to populate a worker
+first refused `Unloaded`; after the exact home chunk was loaded, core correctly
+refused `Blocked`: the selected deterministic `site_*` layout has no physical
+standable home. A layout is not housing. The removed extension and exact chat
+evidence are recorded in
+`.analysis/codex-logs/cp014-worker-population-20260922/receipt.txt`.
+
+Static trace found a second R1 blocker: `advance_structure` records a portion's
+quantities as reservation consumption, but
+`commit_prepared_structure_portion` commits only block edits and its storage
+receipt. It has no physical player/warehouse container mutation, then lowers
+the warehouse reservation floor. A warehouse-funded structure therefore does
+not yet prove physical material consumption. `settlement-cargo` proves the
+individual cargo, reservation, structure, source-work, and resume mechanics,
+not their required physical end-to-end chain.
+
+The independent `CP14BlockerReview` found one component defect: the spawn
+snapshot revision had been advertised as the first work fence although a new
+resident's order record starts at `0`. The repair persists/displays `0` and
+adds regression coverage; no second reviewer is run by policy. The review
+also confirmed that keeping CP-014 draft is justified, not a CP-002 test setup
+artifact. Real-client R0/R1, two observers, rejoin, and recovery remain
+owner-deferred. No L2 was run because CP-014 is unaccepted.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 90a3a5305bf58cb5d9217a0bc9291d15ac5954a3e33b58779b3489aeb2aa467f
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary 87af4502a79864392798bcb52634e6d2d68ce9d4 --
+  crates/mc-net/src/script/storage/resident_order_execution.rs
+  crates/mc-net/src/script/storage/resident_order_tests.rs
+  sdk/rust/solaris-plugin-sdk/src/inventory_ops.rs
+component_hashes:
+  source: 26959b232f2450472de854c563191fbcd0e1578dace036d4f54fa7271be42a1a
+  wasm: d808dc53f24f99f7913c176631430a6c937c62a7ab9aa0bb0cf3e2a9d66c40a9
+  readme: 71f9182014ff017f05a564197fc0b6b011fa8ee0017135d3b113a4206dc1a842
+changed_files:
+  - crates/mc-net/src/script/storage/resident_order_execution.rs
+  - crates/mc-net/src/script/storage/resident_order_tests.rs
+  - sdk/rust/solaris-plugin-sdk/src/inventory_ops.rs
+  - ../solaris-default-plugins/sources/solaris-settlements/src/lib.rs
+  - ../solaris-default-plugins/solaris-settlements/plugin.wasm
+  - ../solaris-default-plugins/solaris-settlements/README.md
+  - docs/MEMORY.md
+validation:
+  - cargo test -p mc-net cancelling_a_world_input_wait_reopens_cleanly --lib passed
+  - sibling cargo test passed: 40
+  - sibling package source/deployed hash matched: d808dc53f24f99f7913c176631430a6c937c62a7ab9aa0bb0cf3e2a9d66c40a9
+  - cargo test -p mc-test-harness --test settlement_wasm_readiness passed
+  - settlement-cargo: 20260922T045003-settlement-cargo-2gas66in passed
+  - root fmt: 20260922T043939-fmt-iowbfu8z passed
+  - code-health: 20260922T044153-code-health-ra7fla7l passed
+  - harness-check: 20260922T044159-harness-check-agmhwt55 passed
+  - root clippy: 20260922T044207-clippy-niophqv4 passed
+  - component strict clippy is not green: seven pre-existing lint failures
+    (three too_many_arguments, three clone_on_copy/unnecessary_filter_map,
+    and one test field_reassign_with_default)
+  - reviewer: CP14BlockerReview found and the author fixed the initial work-fence mismatch
+next: Atomically debit the reserved physical endpoint in the same world decision as a structure portion.
+```
+
+**CP-014 material-debit repair — draft remains blocked (2026-09-22).**
+Every committed construction portion now debits only its bound physical
+warehouse chest. The planner produces exact 27-slot before/after images, and
+the resident cross-region transaction stages those images, structure blocks,
+and the plugin receipt under one durable world-journal decision. A failed
+persistence closure publishes neither image nor receipt; the owner rejects a
+stale chest image, a stock increase, or an admission already held by another
+warehouse transition. The reservation floor is derived from the canonical
+before/after item totals, not a second release authority.
+
+Post-commit publication resolves a valid double chest through the canonical
+world registry and publishes its combined 54-slot image under the sorted
+primary position. A debit from the secondary half therefore refreshes the
+active double-chest window rather than being silently ignored.
+
+```yaml
+base_tree: 87af4502a79864392798bcb52634e6d2d68ce9d4
+core_diff_hash: 23bb1522985745e2bdc8698d5ecd9ca4d2b77d84712643593610b7e3db85b720
+core_diff_hash_recipe: >
+  SHA-256 of git diff --binary HEAD -- the 12 source/test paths in
+  changed_files; cursor/evidence updates are deliberately excluded.
+changed_files:
+  - crates/mc-world/src/resident.rs
+  - crates/mc-world/src/resident/inventory.rs
+  - crates/mc-net/src/play.rs
+  - crates/mc-net/src/play/owned_inventory.rs
+  - crates/mc-net/src/play/session.rs
+  - crates/mc-net/src/play/simulation.rs
+  - crates/mc-net/src/script/storage.rs
+  - crates/mc-net/src/script/storage/resident_settlement_tests.rs
+  - crates/mc-net/src/script/storage/settlement.rs
+  - crates/mc-net/src/script/storage/settlement_tests.rs
+  - crates/mc-net/src/script/storage/world_inventory.rs
+  - crates/mc-net/src/settlement.rs
+validation:
+  - cargo test -p mc-world structure_and_material_chest_share_one_durable_cross_region_decision --lib passed
+  - cargo test -p mc-net structure_portion_journals_block_after_image_with_its_receipt --lib passed
+  - cargo test -p mc-net settlement_tests --lib: 59 passed
+  - cargo test -p mc-net construction_debit_releases_only_its_warehouse_reservation_floor --lib passed
+  - cargo test -p mc-net construct_work_consumes_the_reserved_portion_and_commits_the_stage --lib passed
+  - cargo check -p mc-net passed
+  - fmt: 20260922T131612-fmt-aw56cu2u passed
+  - code-health: 20260922T131619-code-health-k1nlvjwe passed
+  - reviewer: FinalMaterialDebitReview found double-chest publication; fixed with a regression, no second review by policy
+next: resolve the loaded-site physical-home blocker, then run the owner-authorized R1 real-client scenario; R0 acceptance remains deferred by owner.
+```
 
 **P5 precommit revalidation (2026-09-21).** Six real-component host hook cases,
 15 bounded ticket/roster/deadline cases, and 27 native build/damage precommit

@@ -9,7 +9,6 @@ profiles, nonzero commands, exceptions, and prepared-only runs never pass.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -21,13 +20,6 @@ from .runtime import AGENT_ROOT, REPO_ROOT, start_xvfb, stop_process
 
 BACKENDS = REPO_ROOT / "tools" / "harness" / "backends"
 DEFAULT_PLUGINS_ROOT = REPO_ROOT.parent / "solaris-default-plugins"
-STANDARD_PACK = (
-    ("solaris-permissions", ("storage",)),
-    ("solaris-essentials", ("storage", "player_teleport", "player_queries")),
-    ("solaris-economy", ("storage",)),
-    ("solaris-towns", ("storage", "zones", "player_queries")),
-    ("solaris-audit", ("storage",)),
-)
 
 
 
@@ -210,132 +202,34 @@ def run_fixture_check(ctx: ProfileContext) -> dict[str, Any]:
         "fixture-check.log",
     )
 
-def run_standard_pack(ctx: ProfileContext) -> dict[str, Any]:
-    """Rebuild the explicit sibling pack, then check its actual deployment."""
+def _run_first_party_gate(ctx: ProfileContext, profile: str) -> dict[str, Any]:
     plugins_root = Path(
         os.environ.get("SOLARIS_DEFAULT_PLUGINS_ROOT", str(DEFAULT_PLUGINS_ROOT))
     )
-    details = _run_command(
-        [
-            sys.executable,
-            str(plugins_root / "tools" / "build_standard_pack.py"),
-            "--check",
-            "--core-root",
-            str(REPO_ROOT),
-        ],
-        ctx,
-        "standard-pack-source.log",
-        cwd=plugins_root,
-        env=_backend_env(ctx),
+    argv = [
+        sys.executable,
+        str(plugins_root / "tools" / "run_integration.py"),
+        profile,
+        "--core-root",
+        str(REPO_ROOT),
+        "--artifact-dir",
+        str(ctx.artifact_dir),
+    ]
+    if profile == "standard-pack" and "--real-client" in ctx.extra_args:
+        argv.extend(["--real-client", "--timeout-seconds", str(
+            ctx.timeout_seconds or CORE_CLIENT_TIMEOUT_SECONDS
+        )])
+    return _run_command(
+        argv, ctx, f"{profile}.log", cwd=plugins_root, env=_backend_env(ctx)
     )
-    _merge_details(
-        details,
-        _run_command(
-            [
-                "cargo",
-                "test",
-                "-p",
-                "mc-test-harness",
-                "--test",
-                "plugin_standard_pack",
-                "--",
-                "--ignored",
-            ],
-            ctx,
-            "standard-pack-behavior.log",
-            env=_backend_env(ctx),
-        ),
-    )
-    _merge_details(
-        details,
-        _run_command(
-            [
-                "cargo",
-                "test",
-                "-p",
-                "mc-test-harness",
-                "--test",
-                "load_scenarios",
-                "p7_first_party_components_run_on_live_server_tick_workload",
-                "--",
-                "--ignored",
-                "--nocapture",
-            ],
-            ctx,
-            "standard-pack-live-workload.log",
-            env=_backend_env(ctx),
-        ),
-    )
-    deployment = ctx.artifact_dir / "standard-pack" / "plugins"
-    for package_id, _ in STANDARD_PACK:
-        source = plugins_root / package_id
-        target = deployment / package_id
-        target.mkdir(parents=True)
-        for name in ("plugin.toml", "plugin.wasm", "config.toml"):
-            artifact = source / name
-            if not artifact.is_file():
-                raise RuntimeError(f"standard-pack artifact is missing: {artifact}")
-            shutil.copyfile(artifact, target / name)
-    config = ctx.artifact_dir / "standard-pack.toml"
-    expected = ", ".join(f'"{package_id}"' for package_id, _ in STANDARD_PACK)
-    grant_rows = []
-    for package_id, capabilities in STANDARD_PACK:
-        capabilities_literal = ", ".join(f'"{capability}"' for capability in capabilities)
-        grant_rows.append(
-            f"[plugins.grants.{package_id}]\ncapabilities = [{capabilities_literal}]"
-        )
-    grants = "\n".join(grant_rows)
-    config.write_text(
-        "\n".join(
-            (
-                "[server]",
-                'name = "Standard Pack Check"',
-                'motd = "Standard Pack Check"',
-                "",
-                "[network]",
-                'bind_address = "127.0.0.1"',
-                "port = 25565",
-                "",
-                "[data]",
-                f'world_dir = "{ctx.artifact_dir / "standard-pack-world"}"',
-                "",
-                "[plugins]",
-                f'directory = "{deployment}"',
-                "strict = true",
-                f"expected = [{expected}]",
-                "",
-                grants,
-                "",
-            )
-        )
-    )
-    _merge_details(details, _build_mc_server(ctx))
-    _merge_details(
-        details,
-        _run_command(
-            [
-                str(REPO_ROOT / "target" / "debug" / "mc-server"),
-                "--check",
-                "--config",
-                str(config),
-            ],
-            ctx,
-            "standard-pack-startup.log",
-        ),
-    )
-    if "--real-client" in ctx.extra_args:
-        from . import compatibility
 
-        real_client = compatibility.run_standard_pack(
-            ctx.timeout_seconds or CORE_CLIENT_TIMEOUT_SECONDS,
-            ctx.artifact_dir,
-            plugins_root,
-            STANDARD_PACK,
-        )
-        details["real_client"] = real_client
-        if real_client.get("passed") is not True:
-            raise RuntimeError(f"standard-pack client scenario did not pass: {real_client}")
-    return details
+
+def run_standard_pack(ctx: ProfileContext) -> dict[str, Any]:
+    return _run_first_party_gate(ctx, "standard-pack")
+
+def run_settlement_cargo(ctx: ProfileContext) -> dict[str, Any]:
+    return _run_first_party_gate(ctx, "settlement-cargo")
+
 
 def run_installer(ctx: ProfileContext) -> dict[str, Any]:
     return _run_command(
@@ -636,6 +530,11 @@ PROFILES: dict[str, dict[str, Any]] = {
         "scope": "plugins",
         "description": "rebuild and byte-verify the explicit first-party standard-pack sibling",
         "run": run_standard_pack,
+    },
+    "settlement-cargo": {
+        "scope": "plugins",
+        "description": "rebuild the Settlements component and verify warehouse cargo plus vanilla-village construction",
+        "run": run_settlement_cargo,
     },
     "installer": {
         "scope": "release",

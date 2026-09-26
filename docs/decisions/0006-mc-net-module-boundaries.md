@@ -99,6 +99,13 @@ commands. An outbound queue or socket never decides whether gameplay committed.
   admitted payload commands use the existing reliable per-session outbound
   lane. Reserved Loader control channels require typed, permission-checked
   commands rather than raw payload capabilities.
+- The verified login profile and socket peer establish player identity and
+  loopback-only development eligibility. `CommandPermissionConfig` owns one
+  shared live operator set: chat commands recheck it at ingress, while script
+  player queries and committed-event contexts read it when creating a snapshot.
+  A Play session retains the peer and shared permission handle, not an operator
+  bit copied from login. Console role changes therefore cannot leave plugin
+  contexts with a stale grant after revocation.
 - `mc-script::commit_events` owns the required committed-event queue, bounded
   admission, delivery-failure notification, and drain accounting. `mc-net`
   translates authoritative player/entity commits into `ScriptEvent` snapshots

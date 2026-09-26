@@ -113,16 +113,15 @@ interface inventories {
 
     /// One move of items between owned endpoints, under one durable operation id.
     ///
-    /// The actor is the runtime player id whose own inventory participates, and a
-    /// transfer naming any other player's inventory is refused `forbidden`. The
-    /// request must name the actor's inventory, up to
-    /// `mc_script::MAX_OWNED_INVENTORY_TRANSFERS` (16) transfers and up to
-    /// `mc_script::MAX_OWNED_INVENTORY_TRANSFERS * 2` expected revisions - one per
-    /// distinct endpoint, sorted by endpoint, exactly the endpoints the transfers
-    /// name. `operation-id` is the durable name the server records the commit
-    /// under: repeating it with byte-identical content replays the recorded
-    /// outcome and applies nothing, and reusing it for different content is
-    /// refused with `operation-conflict`.
+    /// A player endpoint requires the exact participating runtime player id;
+    /// any other player's inventory is refused `forbidden`. `actor-id` is zero
+    /// only for a server-owned warehouse-to-resident move with no player endpoint:
+    /// the warehouse binding and resident handle must both belong to this plugin.
+    /// Up to `mc_script::MAX_OWNED_INVENTORY_TRANSFERS` (16) transfers and twice
+    /// that many expected revisions name exactly the participating endpoints,
+    /// sorted by endpoint. `operation-id` is the durable name the server records
+    /// under: repeating byte-identical content replays its outcome without
+    /// applying it again, and different content is `operation-conflict`.
     record inventory-transfer {
         /// 1..`mc_script::MAX_SCRIPT_ID_BYTES` (64) bytes of lowercase letters,
         /// digits, `_` and `-`.

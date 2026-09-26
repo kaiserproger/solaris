@@ -3,8 +3,8 @@ use crate::{
     ScriptOperationRequest, ScriptResidentKind, ScriptResidentLifecycle, ScriptResidentLoadedState,
     ScriptResidentOperation, ScriptResidentPois, ScriptResidentProfile, ScriptResidentResult,
     ScriptResidentSnapshot, resident_entity_uuid, resident_generation_id,
-    resident_handle_for_entity, resident_handle_for_generation, resident_spawn_site_token,
-    validate_generation_id,
+    resident_generation_id_for_poi, resident_handle_for_entity, resident_handle_for_generation,
+    resident_spawn_site_token, validate_generation_id,
 };
 
 const UUID: &str = "12345678-1234-5678-1234-567812345678";
@@ -84,6 +84,25 @@ fn generation_ids_and_handles_are_deterministic_and_domain_separated() {
             .map(|id| validate_generation_id(&id.to_uppercase())),
         Ok(Err(ScriptDtoError::InvalidId { .. }))
     ));
+}
+
+#[test]
+fn poi_generation_ids_are_stable_and_not_descriptor_slots() {
+    let first = resident_generation_id_for_poi("world-1", "village-7", "village_poi_3_64_5")
+        .expect("valid physical POI");
+    assert_eq!(
+        first,
+        resident_generation_id_for_poi("world-1", "village-7", "village_poi_3_64_5").unwrap()
+    );
+    assert_ne!(
+        first,
+        resident_generation_id_for_poi("world-1", "village-7", "village_poi_4_64_5").unwrap()
+    );
+    assert_ne!(
+        first,
+        resident_generation_id("world-1", "village-7", 0).unwrap()
+    );
+    validate_generation_id(&first).unwrap();
 }
 
 #[test]

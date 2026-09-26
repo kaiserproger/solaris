@@ -101,6 +101,17 @@ pub(crate) struct ResidentCrossRegionBlockEditPlan<'a> {
     pub scheduled_block_ticks: &'a [ScheduledBlockTick],
     pub light_table: Option<&'a BlockLightTable>,
     pub leaf_trigger_tick: Option<u64>,
+    /// An optional physical container after-image sharing this decision's
+    /// source fences, journal images and publication.
+    pub chest: Option<ResidentCrossRegionChestChange<'a>>,
+}
+
+/// The exact material-container after-image attached to one construction
+/// portion. The block and container sources are revalidated together.
+#[derive(Clone, Copy)]
+pub(crate) struct ResidentCrossRegionChestChange<'a> {
+    pub change: &'a ResidentBlockEntityChange<ChestBlockEntity>,
+    pub precondition: &'a ResidentBlockPrecondition,
 }
 
 /// Staged chunk changes with source-fenced, all-or-nothing publication.
@@ -688,6 +699,11 @@ impl ResidentChunkStore {
 }
 
 impl WorldMutationView {
+    #[must_use]
+    pub fn block_registry(&self) -> &BlockRegistry {
+        &self.resident.registry
+    }
+
     /// Apply accumulated active-player time to resident chunks.
     ///
     /// Callers batch ticks before entering this mutation boundary so ordinary
@@ -1426,6 +1442,7 @@ impl WorldMutationView {
     pub fn commit_chests_conditionally(
         &self,
         positions: &[BlockPos],
+        expected_tokens: Option<&[BlockMutationToken]>,
         expected: &[ChestBlockEntity],
         updated: &[ChestBlockEntity],
     ) -> ResidentChestCommitResult {
@@ -1435,6 +1452,7 @@ impl WorldMutationView {
         if positions.is_empty()
             || positions.len() != expected.len()
             || positions.len() != updated.len()
+            || expected_tokens.is_some_and(|tokens| tokens.len() != positions.len())
             || positions.iter().any(|position| !unique.insert(*position))
         {
             return ResidentChestCommitResult::Missing;
@@ -1468,7 +1486,20 @@ impl WorldMutationView {
                     .unwrap_or_default()
             })
             .collect::<Vec<_>>();
-        if authoritative != expected {
+        if authoritative != expected
+            || expected_tokens.is_some_and(|tokens| {
+                positions
+                    .iter()
+                    .zip(tokens)
+                    .any(|(position, expected_token)| {
+                        let chunk = &region.chunks[&chunk_pos_of(*position)];
+                        let local_x = position.x.rem_euclid(SECTION_DIM as i32) as u8;
+                        let local_z = position.z.rem_euclid(SECTION_DIM as i32) as u8;
+                        chunk.block_mutation_token(local_x, position.y, local_z)
+                            != Some(*expected_token)
+                    })
+            })
+        {
             return ResidentChestCommitResult::Rejected(authoritative);
         }
 
@@ -1689,6 +1720,25 @@ impl WorldMutationView {
         decision_id: Option<u64>,
         plan: &ResidentScheduledBlockTickPlan<'_>,
     ) -> ResidentCrossRegionScheduledBlockTickPrepareResult {
+        self.prepare_cross_region_scheduled_block_tick_transaction_with_chest(
+            decision_id,
+            plan,
+            None,
+        )
+    }
+
+    /// Prepare one scheduled block-tick decision with an optional physical
+    /// chest participant. Its ticks, light updates, and leaf trigger remain
+    /// identical to the caller's original plan.
+    pub fn prepare_cross_region_scheduled_block_tick_transaction_with_chest(
+        &self,
+        decision_id: Option<u64>,
+        plan: &ResidentScheduledBlockTickPlan<'_>,
+        chest: Option<(
+            &ResidentBlockEntityChange<ChestBlockEntity>,
+            &ResidentBlockPrecondition,
+        )>,
+    ) -> ResidentCrossRegionScheduledBlockTickPrepareResult {
         self.prepare_cross_region_block_edit_inner(
             decision_id,
             plan.consumed_ticks,
@@ -1698,6 +1748,10 @@ impl WorldMutationView {
                 scheduled_block_ticks: &[],
                 light_table: plan.light_table,
                 leaf_trigger_tick: plan.leaf_trigger_tick,
+                chest: chest.map(|(change, precondition)| ResidentCrossRegionChestChange {
+                    change,
+                    precondition,
+                }),
             },
         )
     }
@@ -1727,7 +1781,14 @@ impl WorldMutationView {
             scheduled_block_ticks,
             light_table,
             leaf_trigger_tick,
+            chest,
         } = plan;
+        if let Some(chest) = chest
+            && (chest.change.position != chest.precondition.pos
+                || edits.iter().any(|edit| edit.pos == chest.change.position))
+        {
+            return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
+        }
         let publication = self.resident.read_view.publication_state();
         let _mutation = publication.mutation();
         let mut required = HashSet::new();
@@ -1743,6 +1804,9 @@ impl WorldMutationView {
                 .iter()
                 .map(|tick| chunk_pos_of(tick.pos)),
         );
+        if let Some(chest) = chest {
+            required.insert(chunk_pos_of(chest.change.position));
+        }
         let mut positions = required.iter().copied().collect::<Vec<_>>();
         if leaf_trigger_tick.is_some() {
             for edit in edits {
@@ -1834,6 +1898,36 @@ impl WorldMutationView {
                 != Some(precondition.expected_state)
                 || staged.block_mutation_token(local_x, precondition.pos.y, local_z)
                     != Some(precondition.expected_token)
+            {
+                return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
+            }
+        }
+        if let Some(chest) = chest {
+            let Some(chunk) =
+                cross_region_staged_chunk(&chunks, chunk_pos_of(chest.change.position))
+            else {
+                return ResidentCrossRegionScheduledBlockTickPrepareResult::Missing;
+            };
+            let Some(staged) = chunk.staged.as_ref() else {
+                return ResidentCrossRegionScheduledBlockTickPrepareResult::Missing;
+            };
+            let local_x = chest.change.position.x.rem_euclid(SECTION_DIM as i32) as u8;
+            let local_z = chest.change.position.z.rem_euclid(SECTION_DIM as i32) as u8;
+            let chest_block = self
+                .resident
+                .registry
+                .by_id(chest.precondition.expected_state)
+                .is_some_and(|state| matches!(state.block.id.path(), "chest" | "barrel"));
+            let contents_match = staged.chests.get(&chest.change.position).map_or_else(
+                || chest.change.expected == ChestBlockEntity::default(),
+                |current| current == &chest.change.expected,
+            );
+            if staged.get_block(local_x, chest.change.position.y, local_z)
+                != Some(chest.precondition.expected_state)
+                || staged.block_mutation_token(local_x, chest.change.position.y, local_z)
+                    != Some(chest.precondition.expected_token)
+                || !chest_block
+                || !contents_match
             {
                 return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
             }
@@ -2004,6 +2098,27 @@ impl WorldMutationView {
                     }
                     touched.insert(chunk_position);
                 }
+            }
+        }
+        if let Some(chest) = chest {
+            let position = chunk_pos_of(chest.change.position);
+            let chunk = cross_region_staged_chunk_mut(&mut chunks, position)
+                .expect("preflighted material-container chunk");
+            let chunk = Arc::make_mut(
+                chunk
+                    .staged
+                    .as_mut()
+                    .expect("preflighted material-container chunk"),
+            );
+            if chunk.chests.get(&chest.change.position) != Some(&chest.change.updated) {
+                chunk
+                    .chests
+                    .insert(chest.change.position, chest.change.updated.clone());
+                chunk.mark_dirty();
+                if let Some(decision_id) = decision_id {
+                    chunk.set_world_journal_lsn(decision_id);
+                }
+                touched.insert(position);
             }
         }
 

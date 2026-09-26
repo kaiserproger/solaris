@@ -309,3 +309,206 @@ fn a_poisoned_admission_ledger_refuses_the_next_batch() {
         }
     ));
 }
+#[tokio::test]
+async fn result_of_command_accepted_before_reload_cannot_reach_replacement() {
+    let (boundary, mut endpoint) = script_boundary_pair(nonzero(2), nonzero(1));
+    let initial = ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+        .declare_plugin_storage()
+        .validate()
+        .unwrap();
+    endpoint.register_plugin_routes(&initial).unwrap();
+    let mut batch = CommandBatch::new(nonzero(1));
+    batch
+        .try_push_authorized(
+            ScriptCommand::PluginStorageGet {
+                request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+            },
+            &initial.to_command_capabilities(),
+        )
+        .unwrap();
+    endpoint
+        .try_submit_plugin_batch(&HostCommandAdmission::from_manifest(&initial), batch)
+        .unwrap();
+    let admitted = boundary
+        .accept_host_command(boundary.recv_command().await.unwrap())
+        .unwrap();
+
+    let replacement =
+        ScriptPluginManifest::new("shop", "Shop", "0.2.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+    endpoint
+        .commit_reload(std::slice::from_ref(&replacement), Vec::new(), || {})
+        .unwrap();
+    boundary
+        .try_enqueue_event(
+            admitted
+                .plugin_storage_get_result(Some("7"), Some(1))
+                .unwrap(),
+        )
+        .unwrap();
+    boundary
+        .try_enqueue_event(ScriptEvent::server_started())
+        .unwrap();
+    assert!(matches!(
+        endpoint.recv_event().await,
+        Some(event) if event.event_name() == "server.started"
+    ));
+    let mut batch = CommandBatch::new(nonzero(1));
+    batch
+        .try_push_authorized(
+            ScriptCommand::PluginStorageGet {
+                request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+            },
+            &replacement.to_command_capabilities(),
+        )
+        .unwrap();
+    endpoint
+        .try_submit_plugin_batch(&HostCommandAdmission::from_manifest(&replacement), batch)
+        .unwrap();
+    let admitted = boundary
+        .accept_host_command(boundary.recv_command().await.unwrap())
+        .unwrap();
+    boundary
+        .try_enqueue_event(
+            admitted
+                .plugin_storage_get_result(Some("9"), Some(2))
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        endpoint.recv_event().await,
+        Some(event) if matches!(
+            event.kind(),
+            ScriptEventKind::PluginStorageGetResult { value: Some(value), .. } if value == "9"
+        )
+    ));
+}
+
+#[tokio::test]
+async fn late_owned_inventory_query_result_cannot_answer_a_reloaded_store() {
+    let (boundary, mut endpoint) = script_boundary_pair(nonzero(2), nonzero(1));
+    let initial = ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+        .declare_inventory_transfers()
+        .validate()
+        .unwrap();
+    endpoint.register_plugin_routes(&initial).unwrap();
+    let issue = |endpoint: &ScriptHostEndpoint, manifest: &ValidatedScriptPluginManifest| {
+        let mut batch = CommandBatch::new(nonzero(1));
+        batch
+            .try_push_authorized(
+                ScriptCommand::Operation {
+                    request: ScriptOperationRequest::try_new(
+                        "read",
+                        ScriptOperation::Inventory {
+                            operation: ScriptOwnedInventoryOperation::Query {
+                                endpoint: ScriptInventoryEndpoint::PlayerInventory { player_id: 7 },
+                                expected_revision: None,
+                            },
+                        },
+                    )
+                    .unwrap(),
+                },
+                &manifest.to_command_capabilities(),
+            )
+            .unwrap();
+        endpoint
+            .try_submit_plugin_batch(&HostCommandAdmission::from_manifest(manifest), batch)
+            .unwrap();
+    };
+    issue(&endpoint, &initial);
+    let old = boundary
+        .accept_host_command(boundary.recv_command().await.unwrap())
+        .unwrap();
+
+    let replacement =
+        ScriptPluginManifest::new("shop", "Shop", "0.2.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_inventory_transfers()
+            .validate()
+            .unwrap();
+    endpoint
+        .commit_reload(std::slice::from_ref(&replacement), Vec::new(), || {})
+        .unwrap();
+    issue(&endpoint, &replacement);
+    let new = boundary
+        .accept_host_command(boundary.recv_command().await.unwrap())
+        .unwrap();
+
+    boundary
+        .try_enqueue_event(
+            old.operation_result(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::RuntimeUnavailable,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    boundary
+        .try_enqueue_event(
+            new.operation_result(ScriptOperationOutcome::rejected(
+                ScriptOperationFailure::NotFound,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        endpoint.recv_event().await,
+        Some(event) if matches!(
+            event.kind(),
+            ScriptEventKind::OperationResult { outcome, .. }
+                if outcome.failure() == Some(ScriptOperationFailure::NotFound)
+        )
+    ));
+}
+
+#[tokio::test]
+async fn staged_init_request_keeps_its_generation_across_a_second_reload() {
+    let (boundary, mut endpoint) = script_boundary_pair(nonzero(2), nonzero(1));
+    let candidate =
+        ScriptPluginManifest::new("shop", "Shop", "0.1.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+    let mut batch = CommandBatch::new(nonzero(1));
+    batch
+        .try_push_authorized(
+            ScriptCommand::PluginStorageGet {
+                request: ScriptPluginStorageGetRequest::try_new("init-read", "balance").unwrap(),
+            },
+            &candidate.to_command_capabilities(),
+        )
+        .unwrap();
+    endpoint
+        .commit_reload(
+            std::slice::from_ref(&candidate),
+            vec![(HostCommandAdmission::from_manifest(&candidate), batch)],
+            || {},
+        )
+        .unwrap();
+    let replacement =
+        ScriptPluginManifest::new("shop", "Shop", "0.2.0", COMPONENT_PLUGIN_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+    endpoint
+        .commit_reload(&[replacement], Vec::new(), || {})
+        .unwrap();
+
+    let admitted = boundary
+        .accept_host_command(boundary.recv_command().await.unwrap())
+        .unwrap();
+    boundary
+        .try_enqueue_event(
+            admitted
+                .plugin_storage_get_result(Some("old"), Some(1))
+                .unwrap(),
+        )
+        .unwrap();
+    boundary
+        .try_enqueue_event(ScriptEvent::server_started())
+        .unwrap();
+    assert!(matches!(
+        endpoint.recv_event().await,
+        Some(event) if event.event_name() == "server.started"
+    ));
+}

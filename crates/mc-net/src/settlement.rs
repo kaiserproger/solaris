@@ -33,12 +33,15 @@ use sha2::{Digest, Sha256};
 
 use crate::play::BlockEdit;
 use crate::play::SimulationHandle;
-use crate::play::owned_inventory::container_slot_to_item;
-use crate::play::owned_inventory::{WarehouseTransferOutcome, WarehouseTransferRequest};
+use crate::play::owned_inventory::{
+    WarehouseStructureMaterialDebit, WarehouseTransferOutcome, WarehouseTransferRequest,
+    container_slot_to_item,
+};
 use crate::script::PluginZoneAdapter;
 use crate::script::storage::{
-    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
-    VillageInhabitantReading, VillagePoiReading, VillageReading, village_poi_kind,
+    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement,
+    StructureMaterialDebit, SurveyReading, VillageBounds, VillageInhabitantReading,
+    VillagePoiReading, VillageReading, village_poi_kind,
 };
 
 /// Manifest feature that owns settlement site discovery.
@@ -462,15 +465,24 @@ impl LiveSettlementWorld {
         Some(digest)
     }
 
-    /// Chunk positions covering an inclusive block bounds rectangle.
+    /// Chunk positions covering an inclusive public survey rectangle.
     fn chunk_positions(bounds: ScriptSurveyBounds) -> Vec<ChunkPos> {
+        Self::chunk_positions_between(bounds.min, bounds.max)
+    }
+
+    /// Chunk positions covering an inclusive generated-village rectangle.
+    fn village_chunk_positions(bounds: VillageBounds) -> Vec<ChunkPos> {
+        Self::chunk_positions_between(bounds.min, bounds.max)
+    }
+
+    fn chunk_positions_between(min: [i32; 3], max: [i32; 3]) -> Vec<ChunkPos> {
         let first = ChunkPos {
-            x: bounds.min[0].div_euclid(CHUNK_AXIS),
-            z: bounds.min[2].div_euclid(CHUNK_AXIS),
+            x: min[0].div_euclid(CHUNK_AXIS),
+            z: min[2].div_euclid(CHUNK_AXIS),
         };
         let last = ChunkPos {
-            x: bounds.max[0].div_euclid(CHUNK_AXIS),
-            z: bounds.max[2].div_euclid(CHUNK_AXIS),
+            x: max[0].div_euclid(CHUNK_AXIS),
+            z: max[2].div_euclid(CHUNK_AXIS),
         };
         let mut positions = Vec::new();
         for x in first.x..=last.x {
@@ -504,11 +516,11 @@ impl LiveSettlementWorld {
     }
 }
 
-/// Whether one entity position lies inside a bounded reading region.
+/// Whether one entity position lies inside a generated-village region.
 ///
 /// The floor of each coordinate is the block the entity stands in, which is the
 /// same comparison the site's footprint uses.
-fn block_inside(bounds: ScriptSurveyBounds, position: [f64; 3]) -> bool {
+fn block_inside(bounds: VillageBounds, position: [f64; 3]) -> bool {
     let block = [
         position[0].floor() as i32,
         position[1].floor() as i32,
@@ -724,9 +736,9 @@ impl SettlementWorld for LiveSettlementWorld {
 
     fn village_containers(
         &self,
-        bounds: ScriptSurveyBounds,
+        bounds: VillageBounds,
     ) -> Result<VillageReading<[i32; 3]>, ScriptOperationFailure> {
-        let positions = Self::chunk_positions(bounds);
+        let positions = Self::village_chunk_positions(bounds);
         let snapshot = self.read.snapshot_chunks(&positions);
         if positions
             .iter()
@@ -766,6 +778,7 @@ impl SettlementWorld for LiveSettlementWorld {
                     WarehouseTransferOutcome::StalePlayer
                     | WarehouseTransferOutcome::StaleContainer,
                 ) => Err(ScriptOperationFailure::StaleRevision),
+                Ok(WarehouseTransferOutcome::StaleResident) => Err(ScriptOperationFailure::Blocked),
                 Ok(WarehouseTransferOutcome::MissingContainer) => {
                     Err(ScriptOperationFailure::NotFound)
                 }
@@ -782,6 +795,7 @@ impl SettlementWorld for LiveSettlementWorld {
         plugin_id: &'a str,
         _structure_id: &'a str,
         blocks: &'a [StructureBlockPlacement],
+        material_debit: &'a StructureMaterialDebit,
         receipt: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>> {
         Box::pin(async move {
@@ -812,9 +826,24 @@ impl SettlementWorld for LiveSettlementWorld {
                     )
                 })
                 .collect::<Vec<_>>();
+            let material_debit = WarehouseStructureMaterialDebit {
+                position: BlockPos {
+                    x: material_debit.position[0],
+                    y: material_debit.position[1],
+                    z: material_debit.position[2],
+                },
+                expected_container: material_debit.expected.clone(),
+                updated_container: material_debit.updated.clone(),
+            };
             match self
                 .simulation
-                .commit_server_owned_block_edits(plugin_id, edits, zone_fence, receipt)
+                .commit_server_owned_structure_portion(
+                    plugin_id,
+                    edits,
+                    zone_fence,
+                    receipt,
+                    material_debit,
+                )
                 .await
             {
                 Ok(Some(decision_id)) => Ok(decision_id),
@@ -828,9 +857,9 @@ impl SettlementWorld for LiveSettlementWorld {
     }
     fn village_pois(
         &self,
-        bounds: ScriptSurveyBounds,
+        bounds: VillageBounds,
     ) -> Result<VillageReading<VillagePoiReading>, ScriptOperationFailure> {
-        let positions = Self::chunk_positions(bounds);
+        let positions = Self::village_chunk_positions(bounds);
         let snapshot = self.read.snapshot_chunks(&positions);
         if positions
             .iter()
@@ -881,9 +910,9 @@ impl SettlementWorld for LiveSettlementWorld {
 
     fn village_inhabitants(
         &self,
-        bounds: ScriptSurveyBounds,
+        bounds: VillageBounds,
     ) -> Result<VillageReading<VillageInhabitantReading>, ScriptOperationFailure> {
-        let positions = Self::chunk_positions(bounds);
+        let positions = Self::village_chunk_positions(bounds);
         let snapshot = self.read.snapshot_chunks(&positions);
         if positions
             .iter()

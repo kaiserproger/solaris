@@ -653,7 +653,32 @@ pub(super) fn block_drop_stacks_with_tool_and_facts_from_seeded(
             })
             .collect();
     }
-
+    let seed = match block.block.id.as_str() {
+        "minecraft:melon_stem" | "minecraft:attached_melon_stem" => "minecraft:melon_seeds",
+        "minecraft:pumpkin_stem" | "minecraft:attached_pumpkin_stem" => "minecraft:pumpkin_seeds",
+        _ => "",
+    };
+    if !seed.is_empty() {
+        let age = if block.block.id.path().starts_with("attached_") {
+            7
+        } else {
+            block_state_property(block, "age")
+                .and_then(|age| age.parse::<u8>().ok())
+                .unwrap_or(0)
+                .min(7)
+        };
+        // Vanilla stem tables sample three seeds with p = (age + 1) / 15.
+        let count = (0..3)
+            .filter(|index| block_drop_roll(loot_seed, *index) % 15 < u64::from(age + 1))
+            .count() as u32;
+        if count == 0 {
+            return Vec::new();
+        }
+        return items
+            .id_of(&Identifier::parse(seed).expect("static identifier"))
+            .map(|item_id| split_drop_stack(items, item_facts, item_id, count))
+            .unwrap_or_default();
+    }
     items
         .id_of(&block.block.id)
         .map(|item_id| split_drop_stack(items, item_facts, item_id, 1))

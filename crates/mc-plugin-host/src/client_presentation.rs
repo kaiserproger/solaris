@@ -33,9 +33,9 @@ use mc_script::{
 };
 
 use crate::bindings::exports::solaris::plugin::events::{
-    ClientViewOpened, ClientViewOutcome, Event, LoaderItemGrantFailure, LoaderItemGrantOutcome,
-    LoaderItemGrantResult, LoaderViewAction, LoaderViewRequest, ViewFailure, ViewOpened,
-    ViewRequestKind,
+    ClientSelectionOutcome, ClientSelectionStarted, ClientViewOpened, ClientViewOutcome, Event,
+    LoaderItemGrantFailure, LoaderItemGrantOutcome, LoaderItemGrantResult, LoaderViewAction,
+    LoaderViewRequest, SelectionContext, ViewFailure, ViewOpened, ViewRequestKind,
 };
 use crate::bindings::solaris::plugin::client_presentation::{ViewField, ViewFieldValue};
 
@@ -89,6 +89,31 @@ pub(crate) fn map_event(kind: &ScriptEventKind) -> Option<Event> {
             session: session_of(*player_id),
             outcome: client_view_outcome(view_instance_id.as_deref(), *revision, *failure)?,
         })),
+        ScriptEventKind::ClientSelectionStarted {
+            request_id,
+            player_id,
+            selection_context_id,
+            expires_at_tick,
+            failure,
+        } => {
+            let outcome = match (selection_context_id, expires_at_tick, failure) {
+                (Some(id), Some(expires_at_tick), None) => {
+                    ClientSelectionOutcome::Started(SelectionContext {
+                        id: id.clone(),
+                        expires_at_tick: *expires_at_tick,
+                    })
+                }
+                (None, None, Some(failure)) => {
+                    ClientSelectionOutcome::Refused(view_failure(*failure)?)
+                }
+                _ => return None,
+            };
+            Some(Event::ClientSelectionStarted(ClientSelectionStarted {
+                request: request_id.clone(),
+                session: session_of(*player_id),
+                outcome,
+            }))
+        }
         // One grant the inventory authority decided. The block and the count are
         // echoed for correlation, and the reason a refusal carries is the
         // authority's own.

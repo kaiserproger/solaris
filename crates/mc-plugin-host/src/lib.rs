@@ -65,7 +65,7 @@ pub use package::{LoadedPackage, PackageError, PackageManifest, load_package};
 pub use staging::{CommandBatch, StagingError};
 pub use startup::{
     ContributionOutcome, ContributionRefusal, DeploymentContribution, FieldOverflow,
-    PackageContribution, convert_startup_contribution,
+    PackageContribution, ValidatedStartupContribution, convert_startup_contribution,
 };
 
 /// Why a plugin could not be compiled, instantiated or called.

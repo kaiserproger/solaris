@@ -94,6 +94,26 @@ The server assigns each opened view an instance id and revision; updates and
 actions must match the live instance and revision. Presentation travels over
 `solaris:view`. Each adapter captures the originating connection before
 queueing client-thread work and discards work for a superseded connection.
+Within one revision, the action sequence starts at one and must increase;
+duplicate or earlier sequences do not deliver a second plugin event. A CAS
+presentation starts a new revision and resets its sequence on both sides.
+The server checks session, owner, live revision, action and field policy before
+classifying a submission as a replay.
+
+The `world_marker` placement slice binds a same-bundle, size-bounded
+`world_previews` archive entry to a declared marker ID. Shared Loader activation
+rejects an undeclared preview reference; the platform-common screen draws only
+the verified preview's quarter-turn schematic and labels, not an editable world
+or a client-authored blueprint. A component begins a native selection context
+for its opened view, exact player and action; the native owner returns the
+selection token. The component may present that token with the corresponding
+marker rotation, but the server admits a later placement action only for its
+live view/revision, token, session, range and declared action. The first-party
+palisade-gate archive is generated from its authored blueprint, with all four
+rotations checked against the server catalog and staged block placements. Its
+prepare request supplies the expected catalog blueprint SHA-256; the storage
+owner refuses a changed catalog with `stale-revision` before reserving a
+structure. A rejected or superseded selection does not authorize placement.
 
 `loader-platform-common` owns one modal presenter and a multi-owner non-modal
 HUD registry. Adapters register native payload and HUD-layer hooks, not separate
@@ -114,10 +134,11 @@ notification, so stale disconnect work cannot clear a newer mount.
 
 The sound slice adds at most 64 owner-namespaced `sounds` definitions (`id`)
 under `play_sounds`. Each resolves only a same-bundle hash-verified mono
-`assets/<owner>/sounds/<path>.ogg` asset. Shared preflight probes the Vorbis
-header and initial decoded audio; the same pack generates `sounds.json` and
-rejects resource collisions before acknowledgement. No Java/native plugin code
-or frozen sound-event registry mutation is involved.
+`assets/<owner>/sounds/<path>.ogg` asset. Shared preflight consumes the
+entire mono Vorbis clip before acknowledgement, refusing over 256 KiB encoded,
+over two decoded seconds (192 KiB maximum) or a sample rate outside 8–48 kHz.
+The same pack generates `sounds.json` and rejects resource collisions. No
+Java/native plugin code or frozen sound-event registry mutation is involved.
 
 `play_client_sound` and `stop_client_sound` share one admitted command and
 `solaris:loader/sound` Play channel, with Loader protocol 3. Server ownership,
@@ -125,25 +146,32 @@ permission and live-session checks precede ordered publication; adapters capture
 the source connection before scheduling and reject stale work. Shared playback
 resolves only activated definitions, uses native one-shot sound instances,
 master volume, bounded pitch and optional fixed-position linear attenuation.
-Stop affects all instances of that same owner sound id on that player;
-activation/disconnect stops old Loader sounds. No loops, moving sources or
-playback completion callbacks are introduced.
+The client starts at most eight distinct owner sounds per game tick and one
+instance of each sound at a time; a repeat within that tick is ignored, while
+a later repeat replaces the prior instance. Explicit stop and origin-guarded
+disconnect clear the active sounds. No loops, moving sources or playback
+completion callbacks are introduced. The settlements component plays its
+verified short construction sound only after the server commits a portion
+with placed blocks; a refused or paused operation produces no sound.
 
 Input belongs to the same view/action contract, not a separate interaction
 payload. A schema-2 HUD may declare up to eight `input_bindings` using canonical
 native keyboard names and declared press/release actions. Admission requires
 `views`/`view_actions` content and `present_views`/`send_view_actions` permissions.
-Each reported edge carries its instance, revision and per-instance sequence;
-the native owner admits only actions enabled in the current model and routes
-them to that plugin's `loader.view_action` event on the original session.
+Each reported edge carries its instance, revision and revision-local sequence;
+the native owner admits only actions enabled in the current model, suppresses
+replayed edges and routes accepted ones to that plugin's `loader.view_action`
+event on the original session.
 
 Shared `KeyboardHandler.keyPress` HEAD/RETURN hooks observe gameplay input
 without cancelling vanilla handling. Autorepeat is not an edge; presses must
-retain gameplay focus before and after vanilla handling. Declared F2/F11 may
-report edges while vanilla still takes screenshots or toggles fullscreen.
-Screen changes, overlays
-and the primary window's focus callback release held bindings once; there is
-no per-tick focus polling. Shared state is connection-scoped, and disconnect
+retain gameplay focus before and after vanilla handling. A keyboard key
+remapped to vanilla attack or use keeps the vanilla action but suppresses the
+Loader press, so a single edge never issues two gameplay intents. Declared
+F2/F11 may report edges while vanilla still takes screenshots or toggles
+fullscreen. Screen changes, overlays and the primary window's focus callback
+release held bindings once; there is no per-tick focus polling.
+Shared state is connection-scoped, and disconnect
 or content remount drops it rather than replaying it into another session.
 Fixed bindings do not add rebinding UI, chords, mouse/gamepad or client guest
 execution.
@@ -172,6 +200,17 @@ mutate the frozen vanilla item registry. That local item declaration remains a
 presentation path; the block-specific server grant is defined below.
 Player-driven use of generic Loader item declarations remains outside the
 implemented boundary.
+
+Guest-backed custom items are a narrower server-authoritative path than generic
+Loader presentation. At configure, a component contributes bounded item facts
+and an optional one-ingredient recipe. The server requires the matching verified
+owner item declaration and `register_items` permission before binding; it
+refuses invalid definitions and a changed or removed catalog for an existing
+world. Each stack persists its owner identity in `minecraft:item_model`; the
+known vanilla base item is only a wire carrier. Native stack, recipe, equipment,
+combat and wear decisions use the registered owner facts rather than that
+carrier. This does not add dynamic entries to the vanilla item registry or
+authorize player use of unrelated presentation-only declarations.
 
 The block-presentation slice accepts up to eight owner-namespaced block
 declarations with bounded names and owner model ids. Activation requires

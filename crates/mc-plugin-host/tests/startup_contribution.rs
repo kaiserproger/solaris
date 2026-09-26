@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use fixture::component_bytes;
 use mc_plugin_host::bindings::exports::solaris::plugin::lifecycle::{
-    ClayRules, PlacementRules, SpawnEntry as ContributionEntry, SpawnGroup, SpawnRules,
-    StartupContribution, TreeRules,
+    ClayRules, ItemDefinition, PlacementRules, SpawnEntry as ContributionEntry, SpawnGroup,
+    SpawnRules, StartupContribution, TreeRules,
 };
 use mc_plugin_host::{
     ContributionOutcome, ContributionRefusal, DeploymentConfig, DiscoveryMode, FieldOverflow,
@@ -42,7 +42,57 @@ fn no_categories() -> StartupContribution {
         trees: None,
         clay: None,
         spawning: None,
+        items: None,
     }
+}
+
+#[test]
+fn item_only_contribution_preserves_identity_and_refuses_invalid_definitions() {
+    let mut item = ItemDefinition {
+        id: "ruby-live:ruby".to_owned(),
+        carrier: "minecraft:paper".to_owned(),
+        name: "Ruby".to_owned(),
+        max_stack_size: 16,
+        max_damage: None,
+        weapon: false,
+        attack_damage_modifier: None,
+        attack_speed_modifier: None,
+        equippable_slot: None,
+        crafting_ingredient: Some("minecraft:paper".to_owned()),
+    };
+    let contribution = |item: ItemDefinition| StartupContribution {
+        items: Some(vec![item]),
+        ..no_categories()
+    };
+    let validated = convert_startup_contribution("ruby-live", &contribution(item.clone())).unwrap();
+    assert!(validated.rules().is_none());
+    assert_eq!(validated.items()[0].id.as_str(), "ruby-live:ruby");
+    assert_eq!(
+        validated.items()[0]
+            .crafting_ingredient
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "minecraft:paper"
+    );
+
+    item.max_stack_size = 0;
+    assert!(matches!(
+        convert_startup_contribution("ruby-live", &contribution(item.clone())),
+        Err(ContributionRefusal::InvalidItem(_))
+    ));
+    item.max_stack_size = 16;
+    item.id = "someone-else:ruby".to_owned();
+    assert!(matches!(
+        convert_startup_contribution("ruby-live", &contribution(item.clone())),
+        Err(ContributionRefusal::InvalidItem(_))
+    ));
+    item.id = "ruby-live:ruby".to_owned();
+    item.crafting_ingredient = Some("ruby-live:missing".to_owned());
+    assert!(matches!(
+        convert_startup_contribution("ruby-live", &contribution(item)),
+        Err(ContributionRefusal::InvalidItem(_))
+    ));
 }
 
 /// A contribution whose only category is one tree declaration over one biome.
@@ -56,6 +106,7 @@ fn one_tree(spacing: u32) -> StartupContribution {
         }]),
         clay: None,
         spawning: None,
+        items: None,
     }
 }
 
@@ -104,9 +155,13 @@ fn component_rules_fingerprint_matches_its_independent_construction() {
                 },
             ],
         }]),
+        items: None,
     };
-    let from_component =
-        convert_startup_contribution(&plan).expect("a plan inside every bound is accepted");
+    let from_component = convert_startup_contribution("planner", &plan)
+        .expect("a plan inside every bound is accepted")
+        .rules()
+        .cloned()
+        .expect("rules");
     let independently_constructed = GameplayRules::new(
         vec![BiomeSpawns::new(
             "minecraft:plains",
@@ -176,6 +231,7 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
             max_water_depth: 6,
         }),
         spawning: None,
+        items: None,
     };
 
     // 272 truncated to a byte is 16, which is a legal water depth: this is the
@@ -183,7 +239,7 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
     // A runtime that narrowed instead of refusing would materialize a plan no
     // package declared, and the world fingerprint would record it as if it had.
     assert_eq!(
-        convert_startup_contribution(&clay_and_placement(3, 272))
+        convert_startup_contribution("planner", &clay_and_placement(3, 272))
             .expect_err("272 does not fit the contract's u8, even though its low byte does"),
         ContributionRefusal::Overflow(FieldOverflow {
             field: "placement-rules.water-depth",
@@ -192,7 +248,7 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
         })
     );
     assert_eq!(
-        convert_startup_contribution(&clay_and_placement(300, 4))
+        convert_startup_contribution("planner", &clay_and_placement(300, 4))
             .expect_err("300 does not fit the contract's u8"),
         ContributionRefusal::Overflow(FieldOverflow {
             field: "clay-rules.radius-min",
@@ -200,8 +256,11 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
             max: u64::from(u8::MAX),
         })
     );
-    let accepted =
-        convert_startup_contribution(&clay_and_placement(3, 4)).expect("3 fits the contract's u8");
+    let accepted = convert_startup_contribution("planner", &clay_and_placement(3, 4))
+        .expect("3 fits the contract's u8")
+        .rules()
+        .cloned()
+        .expect("rules");
     assert_eq!(
         accepted.clay.expect("clay is declared").radius_min,
         3,
@@ -209,7 +268,7 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
     );
 
     assert_eq!(
-        convert_startup_contribution(&clay_and_placement(3, 300))
+        convert_startup_contribution("planner", &clay_and_placement(3, 300))
             .expect_err("a water depth of 300 does not fit the contract's u8"),
         ContributionRefusal::Overflow(FieldOverflow {
             field: "placement-rules.water-depth",
@@ -222,7 +281,7 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
     // A runtime that narrowed instead of refusing would materialize a plan no
     // package declared, and the world fingerprint would record it as if it had.
     assert_eq!(
-        convert_startup_contribution(&clay_and_placement(3, 272))
+        convert_startup_contribution("planner", &clay_and_placement(3, 272))
             .expect_err("272 does not fit the contract's u8, even though its low byte does"),
         ContributionRefusal::Overflow(FieldOverflow {
             field: "placement-rules.water-depth",
@@ -231,8 +290,11 @@ fn a_value_wider_than_its_contract_field_is_refused_rather_than_truncated() {
         })
     );
 
-    let widest = convert_startup_contribution(&one_tree(u32::MAX))
-        .expect("a u32 spacing is always inside the contract's u64");
+    let widest = convert_startup_contribution("planner", &one_tree(u32::MAX))
+        .expect("a u32 spacing is always inside the contract's u64")
+        .rules()
+        .cloned()
+        .expect("rules");
     assert_eq!(
         widest.trees[0].spacing,
         u64::from(u32::MAX),
@@ -257,10 +319,12 @@ fn a_contribution_that_breaks_an_enforced_bound_is_refused_with_the_check_that_r
         ),
         clay: None,
         spawning: None,
+        items: None,
     };
-    convert_startup_contribution(&declarations(64)).expect("64 tree declarations are the bound");
+    convert_startup_contribution("planner", &declarations(64))
+        .expect("64 tree declarations are the bound");
     assert_eq!(
-        convert_startup_contribution(&declarations(65))
+        convert_startup_contribution("planner", &declarations(65))
             .expect_err("65 declarations exceed the bound"),
         ContributionRefusal::Invalid(GameplayRulesError::TooManyDeclarations)
     );
@@ -281,16 +345,17 @@ fn a_contribution_that_breaks_an_enforced_bound_is_refused_with_the_check_that_r
                 }],
             }],
         }]),
+        items: None,
     };
-    convert_startup_contribution(&spawn_group("creature", 1, 4))
+    convert_startup_contribution("planner", &spawn_group("creature", 1, 4))
         .expect("a supported group is accepted");
     assert_eq!(
-        convert_startup_contribution(&spawn_group("boss", 1, 4))
+        convert_startup_contribution("planner", &spawn_group("boss", 1, 4))
             .expect_err("boss is not a spawn group"),
         ContributionRefusal::Invalid(GameplayRulesError::UnsupportedSpawnGroup)
     );
     assert_eq!(
-        convert_startup_contribution(&spawn_group("creature", 4, 1))
+        convert_startup_contribution("planner", &spawn_group("creature", 4, 1))
             .expect_err("min may not exceed max"),
         ContributionRefusal::Invalid(GameplayRulesError::InvalidSpawnEntry)
     );
@@ -321,10 +386,11 @@ fn a_contribution_that_breaks_an_enforced_bound_is_refused_with_the_check_that_r
                 },
             ],
         }]),
+        items: None,
         ..no_categories()
     };
     assert_eq!(
-        convert_startup_contribution(&duplicated)
+        convert_startup_contribution("planner", &duplicated)
             .expect_err("a group name declared twice is refused"),
         ContributionRefusal::DuplicateSpawnGroup {
             biome: "minecraft:plains".to_owned(),
@@ -338,7 +404,7 @@ fn an_empty_contribution_is_refused() {
     // WIT's own comment on `startup-contribution`: "the host rejects a
     // contribution that sets none".
     assert_eq!(
-        convert_startup_contribution(&no_categories())
+        convert_startup_contribution("planner", &no_categories())
             .expect_err("a plan with no category is refused"),
         ContributionRefusal::Invalid(GameplayRulesError::NoCategory)
     );
@@ -346,10 +412,13 @@ fn an_empty_contribution_is_refused() {
     // it by the same check: `option<list<..>>` says whether the package set the
     // category, not whether the category ended up empty.
     assert_eq!(
-        convert_startup_contribution(&StartupContribution {
-            trees: Some(Vec::new()),
-            ..no_categories()
-        })
+        convert_startup_contribution(
+            "planner",
+            &StartupContribution {
+                trees: Some(Vec::new()),
+                ..no_categories()
+            }
+        )
         .expect_err("an empty category list is still an empty plan"),
         ContributionRefusal::Invalid(GameplayRulesError::NoCategory)
     );

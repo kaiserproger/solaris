@@ -38,12 +38,14 @@ use crate::play::resident_work::{ResidentBlock, ResidentWorld, ResidentWorldEdit
 use super::PluginStorage;
 use super::ScriptStoragePrepareOutcome;
 use super::settlement::{
-    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
-    VillageInhabitantReading, VillagePoiReading, VillageReading,
+    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement,
+    StructureMaterialDebit, SurveyReading, VillageBounds, VillageInhabitantReading,
+    VillagePoiReading, VillageReading,
 };
 use super::world_inventory::InventoryRuntime;
 
 const OWNER: &str = "settlement";
+const FOREIGN: &str = "foreign-settlement";
 const WORLD_IDENTITY: &str = "resident-settlement-world";
 const SEED: i64 = 7;
 const PROFILE_REVISION: u64 = 3;
@@ -102,6 +104,7 @@ impl TestWorld {
             ResidentBlock {
                 state: 0,
                 path: path.to_owned(),
+                is_lit_campfire: path == "campfire",
             },
         );
     }
@@ -194,7 +197,7 @@ impl SettlementWorld for TestWorld {
 
     fn village_containers(
         &self,
-        bounds: ScriptSurveyBounds,
+        bounds: VillageBounds,
     ) -> Result<VillageReading<[i32; 3]>, ScriptOperationFailure> {
         let mut containers = self
             .containers
@@ -237,12 +240,17 @@ impl SettlementWorld for TestWorld {
         _plugin_id: &'a str,
         structure_id: &'a str,
         blocks: &'a [StructureBlockPlacement],
+        material_debit: &'a StructureMaterialDebit,
         receipt: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, ScriptOperationFailure>> + Send + 'a>> {
         Box::pin(async move {
             let Some(sessions) = self.sessions.as_ref() else {
                 return Err(ScriptOperationFailure::RuntimeUnavailable);
             };
+            let position = material_debit.position;
+            if self.container(position) != material_debit.expected {
+                return Err(ScriptOperationFailure::StaleRevision);
+            }
             let decision_id = super::settlement::journal_test_plugin_decision(sessions, receipt)?;
             self.applied
                 .lock()
@@ -250,22 +258,26 @@ impl SettlementWorld for TestWorld {
                 .entry(structure_id.to_owned())
                 .or_default()
                 .extend(blocks.iter().map(|block| block.pos));
+            self.set_container(position, material_debit.updated.clone());
             Ok(decision_id)
         })
     }
 
-    /// A fake world holds no generated village: these tests exercise the
-    /// authored lane, and a village site answers through its own fixtures.
+    /// Generated-village tests expose one materialized bed block. Its usable
+    /// resident body cell is directly above this floor position.
     fn village_pois(
         &self,
-        _bounds: ScriptSurveyBounds,
+        _bounds: VillageBounds,
     ) -> Result<VillageReading<VillagePoiReading>, ScriptOperationFailure> {
-        Ok(VillageReading::Loaded(Vec::new()))
+        Ok(VillageReading::Loaded(vec![VillagePoiReading {
+            at: [50, 64, 82],
+            kind: ScriptSitePoiKind::Home,
+        }]))
     }
 
     fn village_inhabitants(
         &self,
-        _bounds: ScriptSurveyBounds,
+        _bounds: VillageBounds,
     ) -> Result<VillageReading<VillageInhabitantReading>, ScriptOperationFailure> {
         Ok(VillageReading::Loaded(Vec::new()))
     }
@@ -286,6 +298,7 @@ impl ResidentWorld for TestWorld {
                 .unwrap_or_else(|| ResidentBlock {
                     state: 0,
                     path: "air".to_owned(),
+                    is_lit_campfire: false,
                 }),
         )
     }
@@ -314,6 +327,10 @@ impl ResidentWorld for TestWorld {
 
     fn state_for(&self, _block_path: &str) -> Option<u32> {
         Some(0)
+    }
+
+    fn crop_is_mature(&self, _state: u32) -> bool {
+        true
     }
 
     fn preview_break(
@@ -468,6 +485,48 @@ impl mc_world::ChunkGenerator for FlatGround {
     }
 }
 
+/// The one generated village a CP-003 source fixture exposes.
+fn generated_village() -> mc_world::GeneratedVillageSite {
+    mc_world::GeneratedVillageSite {
+        start_chunk: (3, 5),
+        min: mc_world::BlockPos {
+            x: 48,
+            y: 64,
+            z: 80,
+        },
+        max: mc_world::BlockPos {
+            x: 79,
+            y: 72,
+            z: 111,
+        },
+        pieces: vec![mc_world::GeneratedVillagePiece {
+            template: Some("minecraft:village/plains/houses/plains_small_house_1".to_owned()),
+            position: mc_world::BlockPos {
+                x: 48,
+                y: 64,
+                z: 80,
+            },
+            rotation: 1,
+        }],
+    }
+}
+
+/// The runtime's generator-facing enumeration for one materialized village.
+struct VillageGround;
+
+impl crate::script::storage::VillageSiteGround for VillageGround {
+    fn village_sites_in_region(
+        &self,
+        min_chunk: (i32, i32),
+        max_chunk: (i32, i32),
+    ) -> Vec<mc_world::GeneratedVillageSite> {
+        let village = generated_village();
+        let contained = (min_chunk.0..=max_chunk.0).contains(&village.start_chunk.0)
+            && (min_chunk.1..=max_chunk.1).contains(&village.start_chunk.1);
+        contained.then_some(village).into_iter().collect()
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -488,6 +547,40 @@ impl Fixture {
             START_CELL,
             Arc::new(FlatGround),
             None,
+        )))
+        .with_settlement_world(Arc::clone(&world) as Arc<dyn SettlementWorld>)
+        .with_resident_world(Arc::clone(&world) as Arc<dyn ResidentWorld>);
+        Self {
+            root,
+            runtime,
+            world,
+            catalog,
+            selector: SettlementSelector::new(SEED, PROFILE_REVISION),
+            sessions,
+        }
+    }
+
+    /// Build the regular durable resident fixture with one generated village
+    /// source available through the same settlement runtime as production.
+    fn with_generated_village() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(catalog());
+        let sessions = Arc::new(SessionRegistry::new());
+        let world =
+            Arc::new(TestWorld::default().journal_warehouse_transfers(Arc::clone(&sessions)));
+        let runtime = InventoryRuntime::player_only_for_test(
+            root.path(),
+            Arc::clone(&sessions),
+            Arc::new(solaris_required_items()),
+            Arc::new(solaris_required_item_facts()),
+        )
+        .with_settlement_runtime(Arc::new(SettlementRuntime::new(
+            SettlementSelector::new(SEED, PROFILE_REVISION),
+            Arc::clone(&catalog),
+            WORLD_IDENTITY,
+            START_CELL,
+            Arc::new(FlatGround),
+            Some(Arc::new(VillageGround)),
         )))
         .with_settlement_world(Arc::clone(&world) as Arc<dyn SettlementWorld>)
         .with_resident_world(Arc::clone(&world) as Arc<dyn ResidentWorld>);
@@ -684,11 +777,13 @@ impl Fixture {
             ScriptOperation::Settlement {
                 operation: mc_script::ScriptSettlementOperation::PrepareStructure {
                     operation_id: operation_id.to_owned(),
+                    site_id: self.candidate().site_id,
                     blueprint_id: blueprint_id.to_owned(),
                     anchor,
                     rotation: 0,
                     survey_token: token,
                     expected_site_revision: 0,
+                    expected_blueprint_hash: None,
                 },
             },
         )
@@ -802,6 +897,24 @@ fn bind_warehouse_request(
         },
     )
     .expect("valid bind request")
+}
+
+fn bind_village_warehouse_request(
+    operation_id: &str,
+    site_id: &str,
+    container_id: u32,
+) -> ScriptOperationRequest {
+    ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Settlement {
+            operation: mc_script::ScriptSettlementOperation::BindVillageWarehouse {
+                operation_id: operation_id.to_owned(),
+                site_id: site_id.to_owned(),
+                container_id,
+            },
+        },
+    )
+    .expect("valid village bind request")
 }
 
 fn warehouse_query_request(handle: &str) -> ScriptOperationRequest {
@@ -970,6 +1083,38 @@ fn reserve_plan(
     reference: &str,
     plan: &ScriptInventoryResourcePlan,
 ) -> ScriptInventoryReservationSnapshot {
+    reserve_plan_for(
+        storage,
+        reference,
+        plan,
+        ScriptInventoryEndpoint::PlayerInventory { player_id: PLAYER },
+    )
+}
+
+/// The physical construction path reserves a bound warehouse rather than a
+/// player mirror, so its later stage portion can debit the same container.
+fn reserve_warehouse_plan(
+    storage: &mut PluginStorage,
+    reference: &str,
+    plan: &ScriptInventoryResourcePlan,
+    handle: &str,
+) -> ScriptInventoryReservationSnapshot {
+    reserve_plan_for(
+        storage,
+        reference,
+        plan,
+        ScriptInventoryEndpoint::Warehouse {
+            handle: handle.to_owned(),
+        },
+    )
+}
+
+fn reserve_plan_for(
+    storage: &mut PluginStorage,
+    reference: &str,
+    plan: &ScriptInventoryResourcePlan,
+    endpoint: ScriptInventoryEndpoint,
+) -> ScriptInventoryReservationSnapshot {
     let quantities = resource_plan_totals(plan)
         .unwrap()
         .into_iter()
@@ -979,7 +1124,7 @@ fn reserve_plan(
         .collect();
     let reservation = ScriptInventoryReservationSnapshot::new(
         reference.to_owned(),
-        ScriptInventoryEndpoint::PlayerInventory { player_id: PLAYER },
+        endpoint.clone(),
         resource_plan_hash(plan),
         quantities,
         None,
@@ -991,7 +1136,7 @@ fn reserve_plan(
         ScriptOperation::Inventory {
             operation: mc_script::ScriptOwnedInventoryOperation::Reserve {
                 operation_id: format!("reserve-{reference}"),
-                endpoint: ScriptInventoryEndpoint::PlayerInventory { player_id: PLAYER },
+                endpoint,
                 resource_plan: plan.clone(),
                 expected_revision: mc_script::ScriptInventoryFence::try_new(0, "0".repeat(64))
                     .unwrap(),
@@ -1063,6 +1208,37 @@ async fn query_site(fixture: &Fixture, storage: &mut PluginStorage) -> ScriptSet
         ScriptOperationPayload::Settlement { result } => match &**result {
             ScriptSettlementResult::Site { site } => site.as_ref().clone(),
             other => panic!("expected one site, got {other:?}"),
+        },
+        other => panic!("expected a settlement payload, got {other:?}"),
+    }
+}
+
+async fn query_generated_site(
+    fixture: &Fixture,
+    storage: &mut PluginStorage,
+) -> ScriptSettlementSite {
+    let site_id = crate::script::storage::village_site_id(
+        WORLD_IDENTITY,
+        "minecraft:overworld",
+        generated_village().start_chunk,
+    );
+    let outcome = fixture
+        .runtime
+        .execute_settlement_operation(
+            storage,
+            OWNER,
+            &settlement_request(ScriptSettlementOperation::QuerySite {
+                site_id,
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await
+        .expect("generated village query reaches the durable boundary");
+    match outcome.payload() {
+        ScriptOperationPayload::Settlement { result } => match &**result {
+            ScriptSettlementResult::Site { site } => site.as_ref().clone(),
+            other => panic!("expected generated village site, got {other:?}"),
         },
         other => panic!("expected a settlement payload, got {other:?}"),
     }
@@ -1220,7 +1396,11 @@ async fn garrison_occupies_free_posts_without_double_booking() {
             std::slice::from_ref(&recovered),
         )
         .unwrap();
-    fixture.runtime.recover_resident_orders(&mut storage).await;
+    fixture
+        .runtime
+        .recover_resident_orders(&mut storage)
+        .await
+        .unwrap();
     assert_eq!(
         fixture.goal(first_uuid).await,
         GoalState::FollowPosition {
@@ -1294,7 +1474,7 @@ async fn garrison_occupies_free_posts_without_double_booking() {
 /// units. A repeated portion neither double-consumes nor commits blocks twice.
 #[tokio::test]
 async fn construct_work_consumes_the_reserved_portion_and_commits_the_stage() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_generated_village();
     let mut storage = fixture.storage();
     let (handle, _uuid) = fixture
         .resident(&mut storage, 1, Vec3::new(0.5, 64.0, 0.5))
@@ -1304,7 +1484,50 @@ async fn construct_work_consumes_the_reserved_portion_and_commits_the_stage() {
         .await;
     let stage = structure.stages[0].clone();
     let plan = plan_of(&structure);
-    reserve_plan(&mut storage, "res-construct", &plan);
+    let village = generated_village();
+    let site_id = crate::script::storage::village_site_id(
+        WORLD_IDENTITY,
+        "minecraft:overworld",
+        village.start_chunk,
+    );
+    let position = [64, 66, 96];
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    for (slot, (resource, quantity)) in resource_plan_totals(&plan)
+        .expect("finite construction plan")
+        .into_iter()
+        .enumerate()
+    {
+        let item = solaris_required_items()
+            .id_of(&Identifier::parse(&resource).expect("catalog resource id"))
+            .expect("catalog resource has a concrete item");
+        chest[slot] = ItemStack::new(item, i32::try_from(quantity).expect("test stack fits"));
+    }
+    let mut expected_after = chest.clone();
+    for material in &stage.materials {
+        let item = solaris_required_items()
+            .id_of(&Identifier::parse(&material.resource).expect("catalog resource id"))
+            .expect("catalog resource has a concrete item");
+        let slot = expected_after
+            .iter_mut()
+            .find(|stack| stack.item_id == item)
+            .expect("staged material was loaded into the warehouse");
+        slot.count -= i32::try_from(material.quantity).expect("stage quantity fits");
+        if slot.count == 0 {
+            *slot = ItemStack::EMPTY;
+        }
+    }
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_village_warehouse_request("bind-materials", &site_id, 0),
+        )
+        .await
+        .expect("village warehouse bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    reserve_warehouse_plan(&mut storage, "res-construct", &plan, &binding.handle);
 
     let work = ScriptResidentWorkOrder::Construct {
         structure_id: structure.structure_id.clone(),
@@ -1331,6 +1554,11 @@ async fn construct_work_consumes_the_reserved_portion_and_commits_the_stage() {
         fixture.world.built_blocks(&structure.structure_id),
         usize::try_from(stage.work_units).unwrap(),
         "the world portion really committed"
+    );
+    assert_eq!(
+        fixture.world.container(position),
+        expected_after,
+        "the accepted structure receipt removes its exact staged materials from the bound warehouse"
     );
 
     // The receipt's consumed vector is coupled to the C1 reservation.
@@ -2022,7 +2250,7 @@ async fn worker_withdraws_the_named_item_from_the_bound_warehouse() {
     let mut chest = vec![ItemStack::EMPTY; 27];
     chest[0] = ItemStack::new(log, 10);
     chest[1] = ItemStack::new(axe, 5);
-    fixture.world.set_container(position, chest);
+    fixture.world.set_container(position, chest.clone());
     let bind = fixture
         .runtime
         .execute_settlement_operation(
@@ -2034,6 +2262,13 @@ async fn worker_withdraws_the_named_item_from_the_bound_warehouse() {
         .expect("bind reaches the durable boundary");
     assert_eq!(bind.failure(), None, "bind: {bind:?}");
     let binding = warehouse_of(&bind);
+    let issued_axe = ItemStack::new(axe, 5)
+        .with_damage(17)
+        .with_enchantment(Identifier::parse("minecraft:efficiency").unwrap(), 3)
+        .with_custom_name("Surveyor's axe")
+        .with_item_model(Identifier::parse("minecraft:iron_axe").unwrap());
+    chest[1] = issued_axe;
+    fixture.world.set_container(position, chest);
     let revision = seed_carry(&mut storage, &handle, uuid, &[]);
 
     let outcome = fixture
@@ -2078,6 +2313,25 @@ async fn worker_withdraws_the_named_item_from_the_bound_warehouse() {
         vec![("minecraft:iron_axe".to_owned(), 1); 2],
         "the worker holds the item it was issued, and only it - one slot per axe, \
          because a tool does not stack"
+    );
+    let carried = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("withdrawal keeps the resident record")
+        .carry
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(
+        carried.iter().all(|stack| {
+            stack.damage == Some(17)
+                && stack.enchantments.len() == 1
+                && stack.enchantments[0].id == "minecraft:efficiency"
+                && stack.enchantments[0].level == 3
+                && stack.custom_name.as_deref() == Some("Surveyor's axe")
+                && stack.item_model.as_deref() == Some("minecraft:iron_axe")
+        }),
+        "every issued tool preserves its item components"
     );
 
     let container = fixture.world.container(position);
@@ -2127,6 +2381,28 @@ async fn worker_withdraws_the_named_item_from_the_bound_warehouse() {
         .expect("the remaining axes are still in the container");
     assert_eq!(slot.resource_id, "minecraft:iron_axe");
     assert_eq!(slot.count, 3);
+    drop(storage);
+    let reopened = fixture.storage();
+    let carried = reopened
+        .resident_orders()
+        .record(&handle)
+        .expect("reopen preserves the issued resident record")
+        .carry
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(carried.len(), 2);
+    assert!(
+        carried.iter().all(|stack| {
+            stack.damage == Some(17)
+                && stack.enchantments.len() == 1
+                && stack.enchantments[0].id == "minecraft:efficiency"
+                && stack.enchantments[0].level == 3
+                && stack.custom_name.as_deref() == Some("Surveyor's axe")
+                && stack.item_model.as_deref() == Some("minecraft:iron_axe")
+        }),
+        "storage reopen preserves every issued item component"
+    );
 }
 
 /// (CP-003) The same withdrawal can land in the worker's own equipment: the
@@ -2198,6 +2474,228 @@ async fn worker_withdraws_into_its_own_equipment() {
     );
     assert!(carry_of(&storage, &handle).is_empty());
     assert_eq!(fixture.world.container(position)[0].count, 3);
+}
+
+/// A fenced resident-equipment/warehouse round trip preserves unrelated carry
+/// and a repeated operation ID cannot transfer the same stack twice.
+#[tokio::test]
+async fn warehouse_resident_transfer_replays_without_touching_unrelated_carry() {
+    use mc_script::{
+        ScriptInventoryExpectedRevision, ScriptOwnedInventoryOperation, ScriptOwnedItemTransfer,
+    };
+
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-return-warehouse", WAREHOUSE)
+        .await;
+    let sword = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:iron_sword").unwrap())
+        .expect("sword registered");
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(sword, 1).with_damage(7);
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-return-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("warehouse binds");
+    let warehouse = ScriptInventoryEndpoint::Warehouse {
+        handle: warehouse_of(&bind).handle,
+    };
+    let equipment = ScriptInventoryEndpoint::ResidentEquipment {
+        handle: handle.clone(),
+    };
+    seed_carry(&mut storage, &handle, uuid, &[("minecraft:emerald", 1)]);
+    let mut enlisted = storage.resident_orders().record(&handle).unwrap().clone();
+    enlisted.assignment = super::resident_orders::DurableAssignment::Military;
+    storage
+        .append_resident_order_change(super::resident_orders::DurableResidentOrderChange::Record {
+            record: Box::new(enlisted),
+        })
+        .expect("same resident enlisted");
+    let demob = |operation_id: &str, revision| {
+        ScriptOperationRequest::try_new(
+            "request",
+            ScriptOperation::ResidentOrder {
+                operation: ScriptResidentOrderOperation::Demobilize {
+                    operation_id: operation_id.to_owned(),
+                    handle: handle.clone(),
+                    expected_revision: revision,
+                },
+            },
+        )
+        .expect("fenced demobilization")
+    };
+    let query = |endpoint: ScriptInventoryEndpoint| {
+        ScriptOperationRequest::try_new(
+            "request",
+            ScriptOperation::Inventory {
+                operation: ScriptOwnedInventoryOperation::Query {
+                    endpoint,
+                    expected_revision: None,
+                },
+            },
+        )
+        .expect("inventory query")
+    };
+    let warehouse_before = owned_snapshot_of(
+        &fixture
+            .runtime
+            .execute_owned_inventory(&mut storage, OWNER, &query(warehouse.clone()))
+            .await
+            .expect("warehouse snapshot"),
+    );
+    let equipment_before = owned_snapshot_of(
+        &fixture
+            .runtime
+            .execute_owned_inventory(&mut storage, OWNER, &query(equipment.clone()))
+            .await
+            .expect("equipment snapshot"),
+    );
+    let issue = ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Inventory {
+            operation: ScriptOwnedInventoryOperation::Transfer {
+                operation_id: "warehouse-to-resident-equipment".to_owned(),
+                actor_id: 0,
+                transfers: vec![ScriptOwnedItemTransfer::new(
+                    warehouse.clone(),
+                    0,
+                    equipment.clone(),
+                    0,
+                    1,
+                )],
+                expected_revisions: vec![
+                    ScriptInventoryExpectedRevision::new(warehouse.clone(), warehouse_before.fence),
+                    ScriptInventoryExpectedRevision::new(equipment.clone(), equipment_before.fence),
+                ],
+            },
+        },
+    )
+    .expect("warehouse to equipment transfer request");
+    let issued = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &issue)
+        .await
+        .expect("physical warehouse transfer");
+    assert_eq!(issued.failure(), None, "{issued:?}");
+    assert!(fixture.world.container(position)[0].is_empty());
+    assert_eq!(
+        equipment_of(&storage, &handle),
+        vec![("minecraft:iron_sword".to_owned(), 1)]
+    );
+    let first_revision = storage.resident_orders().record(&handle).unwrap().revision;
+    let first_demob = fixture
+        .execute(&mut storage, &demob("demob-return-gear", first_revision))
+        .await;
+    assert_eq!(first_demob.failure(), None, "{first_demob:?}");
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .unwrap()
+            .assignment,
+        super::resident_orders::DurableAssignment::Demobilizing
+    );
+    assert_eq!(
+        equipment_of(&storage, &handle),
+        vec![("minecraft:iron_sword".to_owned(), 1)],
+        "demobilization alone does not move resident equipment"
+    );
+
+    let warehouse_after_issue = owned_snapshot_of(
+        &fixture
+            .runtime
+            .execute_owned_inventory(&mut storage, OWNER, &query(warehouse.clone()))
+            .await
+            .expect("warehouse snapshot after issue"),
+    );
+    let equipment_after_issue = owned_snapshot_of(
+        &fixture
+            .runtime
+            .execute_owned_inventory(&mut storage, OWNER, &query(equipment.clone()))
+            .await
+            .expect("equipment snapshot after issue"),
+    );
+    let returning = ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Inventory {
+            operation: ScriptOwnedInventoryOperation::Transfer {
+                operation_id: "resident-equipment-to-warehouse".to_owned(),
+                actor_id: 0,
+                transfers: vec![ScriptOwnedItemTransfer::new(
+                    equipment.clone(),
+                    0,
+                    warehouse.clone(),
+                    0,
+                    1,
+                )],
+                expected_revisions: vec![
+                    ScriptInventoryExpectedRevision::new(equipment, equipment_after_issue.fence),
+                    ScriptInventoryExpectedRevision::new(warehouse, warehouse_after_issue.fence),
+                ],
+            },
+        },
+    )
+    .expect("equipment to warehouse transfer request");
+    let returned = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &returning)
+        .await
+        .expect("gear return");
+    assert_eq!(returned.failure(), None, "{returned:?}");
+    let repeated = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &returning)
+        .await
+        .expect("repeated return");
+    assert_eq!(repeated, returned);
+    assert_eq!(
+        fixture.world.container(position)[0],
+        ItemStack::new(sword, 1).with_damage(7)
+    );
+    assert!(equipment_of(&storage, &handle).is_empty());
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:emerald".to_owned(), 1)]
+    );
+    let finalize_revision = storage.resident_orders().record(&handle).unwrap().revision;
+    let finalized = fixture
+        .execute(&mut storage, &demob("demob-finish", finalize_revision))
+        .await;
+    assert_eq!(finalized.failure(), None, "{finalized:?}");
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .unwrap()
+            .assignment,
+        super::resident_orders::DurableAssignment::Civilian,
+        "only the explicitly transferred equipment moved; unrelated carry remains"
+    );
+    let reopened = fixture.storage();
+    assert!(equipment_of(&reopened, &handle).is_empty());
+    assert_eq!(
+        carry_of(&reopened, &handle),
+        vec![("minecraft:emerald".to_owned(), 1)]
+    );
+    assert_eq!(
+        reopened
+            .resident_orders()
+            .record(&handle)
+            .unwrap()
+            .assignment,
+        super::resident_orders::DurableAssignment::Civilian
+    );
 }
 
 /// (CP-003) An item the container does not hold stops the job with
@@ -2445,6 +2943,346 @@ async fn a_withdrawal_through_an_unknown_handle_pauses_with_no_storage() {
     assert_eq!(work.done, 0);
     assert_eq!(work.state, ScriptWorkState::Paused);
 }
+/// (CP-003) A foreign plugin cannot turn another plugin's opaque warehouse
+/// handle into worker inventory. The refusal preserves the real container and
+/// spends no resident/container move.
+#[tokio::test]
+async fn a_foreign_plugin_cannot_withdraw_from_another_plugins_warehouse() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident_for(&mut storage, FOREIGN, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let axe = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:iron_axe").unwrap())
+        .expect("an iron axe is a required item");
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(axe, 5);
+    fixture.world.set_container(position, chest.clone());
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let revision = seed_carry_for(&mut storage, FOREIGN, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute_for(
+            &mut storage,
+            FOREIGN,
+            &work_request(
+                "withdraw-foreign",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle,
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_axe".to_owned()),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(assignment.work_units_done, 0);
+    assert_eq!(fixture.world.container(position), chest);
+    assert!(carry_of(&storage, &handle).is_empty());
+    assert!(fixture.world.deposits().is_empty());
+}
+
+/// (CP-003) A stale resident revision cannot consume an otherwise valid
+/// warehouse binding. The work request is rejected before any container plan
+/// or durable move exists.
+#[tokio::test]
+async fn a_stale_withdrawal_revision_leaves_the_warehouse_untouched() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-warehouse", WAREHOUSE)
+        .await;
+    let axe = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:iron_axe").unwrap())
+        .expect("an iron axe is a required item");
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(axe, 5);
+    fixture.world.set_container(position, chest.clone());
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("bind reaches the durable boundary");
+    let binding = warehouse_of(&bind);
+    let current_revision = seed_carry(&mut storage, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "withdraw-stale",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle,
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_axe".to_owned()),
+                },
+                1,
+                current_revision - 1,
+            ),
+        )
+        .await;
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+    assert_eq!(fixture.world.container(position), chest);
+    assert!(carry_of(&storage, &handle).is_empty());
+    assert!(fixture.world.deposits().is_empty());
+}
+
+/// (CP-003) A worker may draw from the allowed resolved village container
+/// source. The exact physical chest is preserved over storage reopen; no
+/// second binding or synthetic source participates.
+#[tokio::test]
+async fn worker_withdraws_from_the_bound_village_warehouse_once() {
+    let fixture = Fixture::with_generated_village();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let village = generated_village();
+    let site_id = crate::script::storage::village_site_id(
+        WORLD_IDENTITY,
+        "minecraft:overworld",
+        village.start_chunk,
+    );
+    let position = [64, 66, 96];
+    let axe = solaris_required_items()
+        .id_of(&Identifier::parse("minecraft:iron_axe").unwrap())
+        .expect("an iron axe is a required item");
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(axe, 5);
+    fixture.world.set_container(position, chest);
+    let bind = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_village_warehouse_request("bind-village", &site_id, 0),
+        )
+        .await
+        .expect("village bind reaches the durable boundary");
+    assert_eq!(bind.failure(), None, "bind: {bind:?}");
+    let binding = warehouse_of(&bind);
+    assert!(matches!(
+        binding.source,
+        mc_script::ScriptWarehouseSource::VanillaVillage { .. }
+    ));
+    let revision = seed_carry(&mut storage, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "withdraw-village",
+                &handle,
+                ScriptResidentWorkOrder::Haul {
+                    source: ScriptInventoryEndpoint::Warehouse {
+                        handle: binding.handle.clone(),
+                    },
+                    destination: ScriptInventoryEndpoint::ResidentCarry {
+                        handle: handle.clone(),
+                    },
+                    item: Some("minecraft:iron_axe".to_owned()),
+                },
+                2,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.reason, None, "{assignment:?}");
+    assert_eq!(assignment.work_units_done, 2);
+    assert_eq!(fixture.world.container(position)[0].count, 3);
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:iron_axe".to_owned(), 1); 2]
+    );
+
+    drop(storage);
+    let mut reopened = fixture.storage();
+    let read = fixture
+        .runtime
+        .execute_owned_inventory(
+            &mut reopened,
+            OWNER,
+            &warehouse_query_request(&binding.handle),
+        )
+        .await
+        .expect("the reopened village warehouse resolves through its source");
+    assert_eq!(read.failure(), None, "reopened read: {read:?}");
+    assert_eq!(
+        owned_snapshot_of(&read).slots[0]
+            .item
+            .as_ref()
+            .map(|item| item.count),
+        Some(3)
+    );
+    assert_eq!(
+        carry_of(&reopened, &handle),
+        vec![("minecraft:iron_axe".to_owned(), 1); 2],
+        "reopen retains the single issued resident carry"
+    );
+}
+
+/// (CP-014) A generated village home reserves the body cell over its physical
+/// bed block, then the ordinary spawn path can consume that durable token.
+#[tokio::test]
+async fn generated_village_home_spawns_above_its_materialized_bed() {
+    let fixture = Fixture::with_generated_village();
+    let mut storage = fixture.storage();
+    let village = generated_village();
+    let site_id = crate::script::storage::village_site_id(
+        WORLD_IDENTITY,
+        "minecraft:overworld",
+        village.start_chunk,
+    );
+    let outcome = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &settlement_request(ScriptSettlementOperation::QuerySite {
+                site_id,
+                cursor: None,
+                limit: 64,
+            }),
+        )
+        .await
+        .expect("village query reaches the durable boundary");
+    let site = match outcome.payload() {
+        ScriptOperationPayload::Settlement { result } => match &**result {
+            ScriptSettlementResult::Site { site } => site.as_ref().clone(),
+            other => panic!("expected one village site, got {other:?}"),
+        },
+        other => panic!("expected a settlement payload, got {other:?}"),
+    };
+    let home = first_home(&site);
+    let reservation = reserve_home(&fixture, &mut storage, &site, &home).await;
+    assert_eq!(reservation.failure(), None, "reserve: {reservation:?}");
+    let token = resident_token(&reservation);
+    assert_eq!(
+        storage
+            .residents()
+            .site(&token)
+            .and_then(|site| site.position()),
+        Some(Vec3::new(50.5, 65.0, 82.5))
+    );
+
+    let spawn = ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::Resident {
+            operation: ScriptResidentOperation::Spawn {
+                operation_id: "spawn-village-home".to_owned(),
+                spawn_site_token: token,
+                profile: ScriptResidentProfile::new(ScriptResidentKind::Villager),
+            },
+        },
+    )
+    .expect("valid spawn request");
+    let outcome = fixture
+        .runtime
+        .execute_resident_operation(&mut storage, OWNER, &spawn)
+        .await
+        .expect("spawn reaches the durable boundary");
+    assert_eq!(outcome.failure(), None, "spawn: {outcome:?}");
+}
+
+/// A home held by an existing resident is occupied even when it has no
+/// reservation ledger entry (for example, a resident claimed before the site
+/// was adopted). The generated descriptor is rebuilt from that resident state.
+#[tokio::test]
+async fn generated_village_rejects_a_resident_owned_home_without_a_new_reservation() {
+    let fixture = Fixture::with_generated_village();
+    let mut storage = fixture.storage();
+    let site = query_generated_site(&fixture, &mut storage).await;
+    let home = first_home(&site);
+    let (handle, _) = fixture
+        .resident(&mut storage, 17, Vec3::new(0.5, 64.0, 0.5))
+        .await;
+    let resident_revision = storage
+        .residents()
+        .record(&handle)
+        .expect("materialized resident record")
+        .revision;
+    let set_pois = ScriptOperationRequest::try_new(
+        "assign-village-home",
+        ScriptOperation::Resident {
+            operation: ScriptResidentOperation::SetPois {
+                operation_id: "assign-village-home".to_owned(),
+                handle,
+                home_poi: Some(home.clone()),
+                work_poi: None,
+                meeting_poi: None,
+                expected_revision: resident_revision,
+            },
+        },
+    )
+    .expect("valid resident POI assignment");
+    let assigned = fixture
+        .runtime
+        .execute_resident_operation(&mut storage, OWNER, &set_pois)
+        .await
+        .expect("POI assignment reaches the durable boundary");
+    assert_eq!(assigned.failure(), None, "assign home: {assigned:?}");
+
+    let occupied = query_generated_site(&fixture, &mut storage).await;
+    assert_eq!(poi_state(&occupied, &home), ScriptSitePoiState::Occupied);
+    let reserve = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &settlement_request(ScriptSettlementOperation::ReserveResidentSite {
+                operation_id: "reserve-owned-village-home".to_owned(),
+                site_id: occupied.site_id.clone(),
+                poi_id: home,
+                expected_site_revision: occupied.revision,
+            }),
+        )
+        .await
+        .expect("reservation reaches the durable boundary");
+    assert_eq!(reserve.failure(), Some(ScriptOperationFailure::Blocked));
+    assert!(
+        storage.settlements().site(&occupied.site_id).is_none(),
+        "a refused occupied-home reservation must not mint site state"
+    );
+}
 
 /// (CP-003, REC-02 shape) Replaying the same withdrawal takes the item once:
 /// the stored receipt answers, and neither the container nor the record moves
@@ -2600,11 +3438,13 @@ async fn workshop_returns_warehouse_inputs_as_one_real_recipe_output() {
             .collect::<BTreeMap<_, _>>(),
         BTreeMap::from([("minecraft:oak_log", -1), ("minecraft:oak_planks", 4)]),
     );
+    drop(storage);
+    let mut storage = fixture.storage();
     let replay = fixture.execute(&mut storage, &craft_request).await;
     assert_eq!(
         work_of(&replay),
         crafted,
-        "the accepted craft receipt replays without rolling new output"
+        "the accepted craft receipt survives restart and replays without rolling new output"
     );
 
     let returned = fixture
@@ -2648,5 +3488,653 @@ async fn workshop_returns_warehouse_inputs_as_one_real_recipe_output() {
             .sum::<i32>(),
         4,
         "the output returns to the bound warehouse"
+    );
+}
+
+/// Hiring must spend the actual kit and wage in one decision, without a
+/// connected player or overwriting the resident's previous work assignment.
+#[tokio::test]
+async fn warehouse_hire_gear_and_payment_share_one_replayable_decision() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 52, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    seed_carry(&mut storage, &handle, uuid, &[]);
+    let mut before = storage.resident_orders().record(&handle).unwrap().clone();
+    before.work = Some(Box::new(super::resident_orders::DurableResidentWork {
+        revision: before.revision,
+        work: ScriptResidentWorkOrder::Haul {
+            source: ScriptInventoryEndpoint::ResidentCarry {
+                handle: handle.clone(),
+            },
+            destination: ScriptInventoryEndpoint::ResidentEquipment {
+                handle: handle.clone(),
+            },
+            item: None,
+        },
+        planned: 4,
+        done: 0,
+        state: ScriptWorkState::Paused,
+        reason: None,
+        world_input_wait: false,
+    }));
+    storage
+        .append_resident_order_change(super::resident_orders::DurableResidentOrderChange::Record {
+            record: Box::new(before.clone()),
+        })
+        .unwrap();
+    let before = storage.resident_orders().record(&handle).unwrap().clone();
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-hire-warehouse", WAREHOUSE)
+        .await;
+    let items = solaris_required_items();
+    let item_id = |resource| {
+        items
+            .id_of(&Identifier::parse(resource).unwrap())
+            .unwrap_or_else(|| panic!("{resource} must be in the canonical item registry"))
+    };
+    let position = fixture.container_position(1);
+    let mut chest = vec![ItemStack::EMPTY; 27];
+    chest[0] = ItemStack::new(item_id("minecraft:iron_sword"), 1);
+    chest[1] = ItemStack::new(item_id("minecraft:leather_chestplate"), 1);
+    chest[2] = ItemStack::new(item_id("minecraft:emerald"), 1);
+    fixture.world.set_container(position, chest.clone());
+    let binding = warehouse_of(
+        &fixture
+            .runtime
+            .execute_settlement_operation(
+                &mut storage,
+                OWNER,
+                &bind_warehouse_request("bind-hire", &structure.structure_id, 0),
+            )
+            .await
+            .unwrap(),
+    );
+    let warehouse = ScriptInventoryEndpoint::Warehouse {
+        handle: binding.handle.clone(),
+    };
+    let equipment = ScriptInventoryEndpoint::ResidentEquipment {
+        handle: handle.clone(),
+    };
+    let carry = ScriptInventoryEndpoint::ResidentCarry {
+        handle: handle.clone(),
+    };
+    let mut fences = Vec::new();
+    for endpoint in [&warehouse, &equipment, &carry] {
+        let request = ScriptOperationRequest::try_new(
+            "query-hire",
+            ScriptOperation::Inventory {
+                operation: mc_script::ScriptOwnedInventoryOperation::Query {
+                    endpoint: endpoint.clone(),
+                    expected_revision: None,
+                },
+            },
+        )
+        .unwrap();
+        let snapshot = fixture
+            .runtime
+            .execute_owned_inventory(&mut storage, OWNER, &request)
+            .await
+            .unwrap();
+        let snapshot = owned_snapshot_of(&snapshot);
+        fences.push(mc_script::ScriptInventoryExpectedRevision::new(
+            endpoint.clone(),
+            snapshot.fence,
+        ));
+    }
+    let moves = vec![
+        mc_script::ScriptOwnedItemTransfer::new(warehouse.clone(), 0, equipment.clone(), 0, 1),
+        mc_script::ScriptOwnedItemTransfer::new(warehouse.clone(), 1, equipment.clone(), 3, 1),
+        mc_script::ScriptOwnedItemTransfer::new(warehouse.clone(), 2, carry.clone(), 0, 1),
+    ];
+    let transfer = ScriptOperationRequest::try_new(
+        "hire-request",
+        ScriptOperation::Inventory {
+            operation: mc_script::ScriptOwnedInventoryOperation::Transfer {
+                operation_id: "hire-kit".to_owned(),
+                actor_id: 0,
+                transfers: moves.clone(),
+                expected_revisions: fences.clone(),
+            },
+        },
+    )
+    .unwrap();
+    // A missing signing wage cannot consume just the two gear pieces.
+    let mut unpaid = chest.clone();
+    unpaid[2] = ItemStack::EMPTY;
+    fixture.world.set_container(position, unpaid.clone());
+    let refused = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &transfer)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+    assert_eq!(fixture.world.container(position), unpaid);
+    assert_eq!(storage.resident_orders().record(&handle), Some(&before));
+    assert!(fixture.world.deposits().is_empty());
+
+    fixture.world.set_container(position, chest.clone());
+    // Conversion after the guest's lifecycle read but before admission must
+    // tombstone the bound UUID, not debit stock to a non-villager.
+    let (converted_handle, converted_uuid) = fixture
+        .resident(&mut storage, 53, Vec3::new(3.5, 64.0, 5.5))
+        .await;
+    let converted_equipment = ScriptInventoryEndpoint::ResidentEquipment {
+        handle: converted_handle.clone(),
+    };
+    let converted_carry = ScriptInventoryEndpoint::ResidentCarry {
+        handle: converted_handle.clone(),
+    };
+    let mut converted_fences = Vec::new();
+    for endpoint in [&converted_equipment, &converted_carry] {
+        let request = ScriptOperationRequest::try_new(
+            "query-converted-hire",
+            ScriptOperation::Inventory {
+                operation: mc_script::ScriptOwnedInventoryOperation::Query {
+                    endpoint: endpoint.clone(),
+                    expected_revision: None,
+                },
+            },
+        )
+        .unwrap();
+        let outcome = fixture
+            .runtime
+            .execute_owned_inventory(&mut storage, OWNER, &request)
+            .await
+            .unwrap();
+        converted_fences.push(mc_script::ScriptInventoryExpectedRevision::new(
+            endpoint.clone(),
+            owned_snapshot_of(&outcome).fence,
+        ));
+    }
+    let converted_transfer = ScriptOperationRequest::try_new(
+        "hire-converted-request",
+        ScriptOperation::Inventory {
+            operation: mc_script::ScriptOwnedInventoryOperation::Transfer {
+                operation_id: "hire-converted".to_owned(),
+                actor_id: 0,
+                transfers: moves
+                    .iter()
+                    .map(|move_item| {
+                        let destination = if move_item.destination == equipment {
+                            converted_equipment.clone()
+                        } else {
+                            converted_carry.clone()
+                        };
+                        mc_script::ScriptOwnedItemTransfer::new(
+                            warehouse.clone(),
+                            move_item.source_slot,
+                            destination,
+                            move_item.destination_slot,
+                            move_item.count,
+                        )
+                    })
+                    .collect(),
+                expected_revisions: std::iter::once(fences[0].clone())
+                    .chain(converted_fences)
+                    .collect(),
+            },
+        },
+    )
+    .unwrap();
+    let converted_id = fixture
+        .sessions
+        .resident_entity_snapshots(&[converted_uuid])
+        .await[0]
+        .as_ref()
+        .unwrap()
+        .id;
+    assert!(
+        fixture
+            .sessions
+            .convert_resident_entity_for_test(converted_id)
+    );
+    let refused = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &converted_transfer)
+        .await
+        .unwrap();
+    assert_eq!(refused.failure(), Some(ScriptOperationFailure::NotFound));
+    assert_eq!(
+        storage
+            .residents()
+            .record(&converted_handle)
+            .unwrap()
+            .disposition,
+        super::residents::ResidentDisposition::Dead
+    );
+    assert_eq!(fixture.world.container(position), chest);
+    assert!(fixture.world.deposits().is_empty());
+    let committed = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &transfer)
+        .await
+        .unwrap();
+    assert_eq!(committed.failure(), None, "{committed:?}");
+    assert_eq!(fixture.world.deposits().len(), 1);
+    assert!(fixture.world.deposits()[0].player.is_none());
+    assert_eq!(
+        fixture.world.container(position),
+        vec![ItemStack::EMPTY; 27]
+    );
+    assert_eq!(
+        equipment_of(&storage, &handle),
+        vec![
+            ("minecraft:iron_sword".to_owned(), 1),
+            ("minecraft:leather_chestplate".to_owned(), 1)
+        ]
+    );
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:emerald".to_owned(), 1)]
+    );
+    let after = storage.resident_orders().record(&handle).unwrap();
+    assert_eq!(after.entity_uuid, before.entity_uuid);
+    assert_eq!(after.assignment, before.assignment);
+    assert_eq!(after.work, before.work);
+    // The same already-committed decision replays even if its resident has
+    // since converted; a later lifecycle cannot undo paid gear.
+    let original_id = fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+        .as_ref()
+        .unwrap()
+        .id;
+    assert!(
+        fixture
+            .sessions
+            .convert_resident_entity_for_test(original_id)
+    );
+    let replayed = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &transfer)
+        .await
+        .unwrap();
+    assert_eq!(replayed, committed);
+    assert_eq!(fixture.world.deposits().len(), 1);
+    drop(storage);
+    let storage = fixture.storage();
+    assert_eq!(
+        storage.resident_orders().record(&handle).unwrap().work,
+        before.work
+    );
+    assert_eq!(
+        carry_of(&storage, &handle),
+        vec![("minecraft:emerald".to_owned(), 1)]
+    );
+    assert!(storage.operation_receipt(OWNER, "hire-kit").is_some());
+}
+
+#[tokio::test]
+async fn owned_resident_transfer_refuses_absent_entity_without_touching_gear() {
+    use mc_script::{
+        ScriptInventoryExpectedRevision, ScriptOwnedInventoryOperation, ScriptOwnedItemTransfer,
+    };
+
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 54, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    seed_gear(
+        &mut storage,
+        OWNER,
+        &handle,
+        uuid,
+        &[("minecraft:iron_sword", 1)],
+        |record| &mut record.equipment,
+    );
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-absent-gear-warehouse", WAREHOUSE)
+        .await;
+    let position = fixture.container_position(1);
+    fixture
+        .world
+        .set_container(position, vec![ItemStack::EMPTY; 27]);
+    let bound = fixture
+        .runtime
+        .execute_settlement_operation(
+            &mut storage,
+            OWNER,
+            &bind_warehouse_request("bind-absent-gear-warehouse", &structure.structure_id, 0),
+        )
+        .await
+        .expect("warehouse binds");
+    let warehouse = ScriptInventoryEndpoint::Warehouse {
+        handle: warehouse_of(&bound).handle,
+    };
+    let equipment = ScriptInventoryEndpoint::ResidentEquipment {
+        handle: handle.clone(),
+    };
+    let destination = warehouse.clone();
+    let query = |endpoint: ScriptInventoryEndpoint| {
+        ScriptOperationRequest::try_new(
+            "query-gear",
+            ScriptOperation::Inventory {
+                operation: ScriptOwnedInventoryOperation::Query {
+                    endpoint,
+                    expected_revision: None,
+                },
+            },
+        )
+        .unwrap()
+    };
+    let mut fences = Vec::new();
+    for endpoint in [&equipment, &warehouse] {
+        let outcome = fixture
+            .runtime
+            .execute_owned_inventory(&mut storage, OWNER, &query(endpoint.clone()))
+            .await
+            .unwrap();
+        fences.push(ScriptInventoryExpectedRevision::new(
+            endpoint.clone(),
+            owned_snapshot_of(&outcome).fence,
+        ));
+    }
+    let transfer = ScriptOperationRequest::try_new(
+        "move-absent-gear",
+        ScriptOperation::Inventory {
+            operation: ScriptOwnedInventoryOperation::Transfer {
+                operation_id: "move-absent-gear".to_owned(),
+                actor_id: 0,
+                transfers: vec![ScriptOwnedItemTransfer::new(
+                    equipment,
+                    0,
+                    destination,
+                    0,
+                    1,
+                )],
+                expected_revisions: fences,
+            },
+        },
+    )
+    .unwrap();
+    let entity = fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+        .as_ref()
+        .unwrap()
+        .id;
+    assert!(fixture.sessions.remove_resident_entity_for_test(entity));
+    let refused = fixture
+        .runtime
+        .execute_owned_inventory(&mut storage, OWNER, &transfer)
+        .await
+        .unwrap();
+    assert_eq!(refused.failure(), Some(ScriptOperationFailure::Unloaded));
+    assert_eq!(
+        equipment_of(&storage, &handle),
+        vec![("minecraft:iron_sword".to_owned(), 1)]
+    );
+    assert_eq!(
+        fixture.world.container(position),
+        vec![ItemStack::EMPTY; 27]
+    );
+    assert!(
+        storage
+            .operation_receipt(OWNER, "move-absent-gear")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn resident_treatment_without_real_warehouse_medicine_leaves_health_and_receipt_unchanged() {
+    let fixture = Fixture::new();
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let live = fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+        .clone()
+        .unwrap();
+    let mut wounded = live.clone();
+    wounded.health = 10.0;
+    assert!(
+        fixture
+            .sessions
+            .replay_resident_treatment(live, wounded.clone())
+            .unwrap()
+    );
+    let structure = fixture
+        .prepared_structure(&mut storage, "prepare-medicine-warehouse", WAREHOUSE)
+        .await;
+    let position = fixture.container_position(1);
+    let empty = vec![ItemStack::EMPTY; 27];
+    fixture.world.set_container(position, empty.clone());
+    let binding = warehouse_of(
+        &fixture
+            .runtime
+            .execute_settlement_operation(
+                &mut storage,
+                OWNER,
+                &bind_warehouse_request("bind-medicine-warehouse", &structure.structure_id, 0),
+            )
+            .await
+            .unwrap(),
+    );
+    let revision = storage.revision;
+    let request = ScriptOperationRequest::try_new(
+        "treat-request",
+        ScriptOperation::Resident {
+            operation: ScriptResidentOperation::Treat {
+                operation_id: "treat-empty".to_owned(),
+                handle,
+                expected_revision: storage
+                    .residents()
+                    .record_by_entity(&uuid.to_string())
+                    .unwrap()
+                    .revision,
+                source: ScriptInventoryEndpoint::Warehouse {
+                    handle: binding.handle,
+                },
+                material: ScriptInventoryMaterial::new("minecraft:bread".to_owned(), 1),
+                heal_milli: 3_000,
+            },
+        },
+    )
+    .unwrap();
+    let refused = fixture
+        .runtime
+        .execute_resident_operation(&mut storage, OWNER, &request)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.failure(),
+        Some(ScriptOperationFailure::InsufficientItems)
+    );
+    assert_eq!(fixture.world.container(position), empty);
+    assert!(fixture.world.deposits.lock().unwrap().is_empty());
+    assert_eq!(storage.revision, revision);
+    assert!(storage.operation_receipt(OWNER, "treat-empty").is_none());
+    assert_eq!(
+        fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+            .as_ref()
+            .unwrap()
+            .health,
+        10.0
+    );
+}
+
+/// Exercise the public resident operation against a real owner turn and chest,
+/// rather than letting the deterministic settlement adapter accept a debit.
+#[tokio::test(flavor = "current_thread")]
+async fn resident_treatment_debits_real_warehouse_and_heals_once() {
+    use mc_world::{BlockPos, Chunk, ChunkPos, WorldStorage};
+
+    let fixture = Fixture::new();
+    let mut ledger = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut ledger, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let resident = fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+        .clone()
+        .unwrap();
+    let mut wounded = resident.clone();
+    wounded.health = 10.0;
+    assert!(
+        fixture
+            .sessions
+            .replay_resident_treatment(resident, wounded)
+            .unwrap()
+    );
+    let structure = fixture
+        .prepared_structure(&mut ledger, "prepare-paid-medicine", WAREHOUSE)
+        .await;
+    let coordinates = fixture.container_position(1);
+    fixture
+        .world
+        .set_container(coordinates, vec![ItemStack::EMPTY; 27]);
+    let binding = warehouse_of(
+        &fixture
+            .runtime
+            .execute_settlement_operation(
+                &mut ledger,
+                OWNER,
+                &bind_warehouse_request("bind-paid-medicine", &structure.structure_id, 0),
+            )
+            .await
+            .unwrap(),
+    );
+
+    let blocks = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
+    );
+    let items = Arc::new(solaris_required_items());
+    let bread = items
+        .id_of(&Identifier::parse("minecraft:bread").unwrap())
+        .unwrap();
+    std::fs::create_dir_all(fixture.root.path().join("region")).unwrap();
+    let mut storage = WorldStorage::open(fixture.root.path(), Arc::clone(&blocks))
+        .unwrap()
+        .with_item_registry(Arc::clone(&items));
+    let position = BlockPos {
+        x: coordinates[0],
+        y: coordinates[1],
+        z: coordinates[2],
+    };
+    let chunk = ChunkPos {
+        x: position.x.div_euclid(16),
+        z: position.z.div_euclid(16),
+    };
+    storage
+        .insert_generated_chunk(
+            chunk,
+            Chunk::empty(
+                chunk,
+                blocks
+                    .block(&Identifier::parse("minecraft:air").unwrap())
+                    .unwrap()
+                    .default,
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage
+        .set_block_at(
+            position,
+            blocks
+                .block(&Identifier::parse("minecraft:chest").unwrap())
+                .unwrap()
+                .default,
+        )
+        .unwrap();
+    let mut inventory = vec![ItemStack::EMPTY; 27];
+    inventory[0] = ItemStack::new(bread, 2);
+    assert!(
+        storage
+            .set_chest_block_entity(
+                position,
+                crate::play::owned_inventory::container_chest_image(&inventory).unwrap(),
+            )
+            .unwrap()
+    );
+    let read = storage.read_view();
+    let mutation = storage.mutation_view();
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let (simulation, mut owner) = crate::play::simulation_channel();
+    let runtime = InventoryRuntime::new(
+        Some(fixture.root.path()),
+        &crate::server::ShutdownHandle::default(),
+        Arc::clone(&fixture.sessions),
+        items,
+        Arc::new(solaris_required_item_facts()),
+    )
+    .with_settlement_runtime(Arc::new(SettlementRuntime::new(
+        SettlementSelector::new(SEED, PROFILE_REVISION),
+        Arc::clone(&fixture.catalog),
+        WORLD_IDENTITY,
+        START_CELL,
+        Arc::new(FlatGround),
+        None,
+    )))
+    .with_settlement_world(Arc::new(crate::settlement::LiveSettlementWorld::new(
+        read.clone(),
+        blocks,
+        Arc::new(mc_data::tags::TagsData::default()),
+        None,
+        simulation,
+    )));
+    let request = ScriptOperationRequest::try_new(
+        "treat-request",
+        ScriptOperation::Resident {
+            operation: ScriptResidentOperation::Treat {
+                operation_id: "treat-paid".to_owned(),
+                handle,
+                expected_revision: ledger
+                    .residents()
+                    .record_by_entity(&uuid.to_string())
+                    .unwrap()
+                    .revision,
+                source: ScriptInventoryEndpoint::Warehouse {
+                    handle: binding.handle,
+                },
+                material: ScriptInventoryMaterial::new("minecraft:bread".to_owned(), 1),
+                heal_milli: 3_000,
+            },
+        },
+    )
+    .unwrap();
+    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+    let (outcome, report) = tokio::join!(
+        runtime.execute_resident_operation(&mut ledger, OWNER, &request),
+        async {
+            assert!(owner.wait_for_command().await);
+            owner
+                .process_commands_with_world_views(
+                    &fixture.sessions,
+                    Some(&world),
+                    crate::play::SimulationWorldAccess {
+                        read: Some(&read),
+                        mutation: Some(&mutation),
+                        cpu: Some(&resources),
+                        light: None,
+                    },
+                    None,
+                    1,
+                )
+                .await
+        }
+    );
+    assert_eq!(report.processed, 1);
+    let outcome = outcome.unwrap();
+    assert_eq!(outcome.failure(), None, "paid treatment: {outcome:?}");
+    assert_eq!(
+        read.snapshot_chunks(&[chunk]).chunk(chunk).unwrap().chests[&position].slots[0].count,
+        1
+    );
+    assert_eq!(
+        fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+            .as_ref()
+            .unwrap()
+            .health,
+        13.0
+    );
+    assert_eq!(
+        runtime
+            .execute_resident_operation(&mut ledger, OWNER, &request)
+            .await
+            .unwrap(),
+        outcome,
+        "replaying the operation cannot spend or heal a second time"
     );
 }

@@ -128,13 +128,16 @@ interface settlements {
     ///
     /// Bounds: `site-id` is 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes;
     /// `revision` is at most `mc_script::MAX_SCRIPT_WORLD_TIME`; `buildings` holds
-    /// at most `mc_script::MAX_SETTLEMENT_PLACEMENTS` (128) entries, `pois` at most
-    /// `mc_script::MAX_SETTLEMENT_POIS` (128) with pairwise distinct ids, and
-    /// `inhabitant-generation-ids` at most `mc_script::MAX_SETTLEMENT_RESIDENTS`
-    /// (80) with no repeat; the footprint axes are 1..`MAX_SETTLEMENT_SITE_AXIS`
-    /// (256) each. The buildings, points of interest and inhabitants arrive in the
-    /// site's own canonical order - sorted by blueprint id and origin, by point-of-
-    /// interest id, and by identity - so equal sites compare equal on the wire.
+    /// at most `mc_script::MAX_SETTLEMENT_PLACEMENTS` (128) entries for an
+    /// authored site, or the host-side
+    /// `mc_script::MAX_VANILLA_VILLAGE_BUILDINGS` (512) payload budget for a
+    /// vanilla village; `pois` holds at most `mc_script::MAX_SETTLEMENT_POIS`
+    /// (128) with pairwise distinct ids; `inhabitant-generation-ids` holds at most
+    /// `mc_script::MAX_SETTLEMENT_RESIDENTS` (80) with no repeat; and each
+    /// footprint axis is 1..`MAX_SETTLEMENT_SITE_AXIS` (256). The buildings,
+    /// points of interest and inhabitants arrive in the site's own canonical order
+    /// - sorted by blueprint id and origin, by point-of-interest id, and by
+    /// identity - so equal sites compare equal on the wire.
     record settlement-site {
         site-id: string,
         provenance: site-provenance,
@@ -183,10 +186,13 @@ interface settlements {
     /// 1..`mc_script::MAX_SURVEY_TOKEN_BYTES` (64) bytes - `usable-plots` plus
     /// `water-columns` never exceeds the number of surveyed columns, and each tag
     /// list holds at most `mc_script::MAX_SURVEY_TAGS` (32) nonempty entries.
+    /// `world-revision` is the terrain revision the token fences: a later call
+    /// names its token plus this value, never the storage `revision`.
     record survey-snapshot {
         dimension: string,
         bounds: survey-bounds,
         revision: u64,
+        world-revision: u64,
         chunk-availability: chunk-availability,
         survey-token: string,
         usable-plots: u32,
@@ -300,10 +306,12 @@ interface settlements {
     /// The opaque handle never carries a plugin-selected coordinate. An authored
     /// source names a frozen blueprint seed ordinal; a village source names the
     /// generator-authenticated site and its canonical materialized ordinal. Core
-    /// resolves the latter to one immutable position before it binds.
+    /// resolves the latter to one immutable position before it binds. A manual
+    /// source names the exact surveyed container position the bind fenced.
     variant warehouse-source {
         authored(authored-warehouse-source),
         vanilla-village(village-warehouse-source),
+        manual(manual-warehouse-source),
     }
 
     /// One authored container selected by its blueprint seed ordinal.
@@ -325,6 +333,81 @@ interface settlements {
         container-id: u32,
     }
 
+    /// One player-built container selected by its exact surveyed position.
+    ///
+    /// The position is the durable identity: core fences it with the caller's
+    /// own live survey token and re-checks foreign zones before the commit.
+    record manual-warehouse-source {
+        position: block-position,
+    }
+
+    /// One typed interaction point of a player-built volume.
+    ///
+    /// The DTO-only vocabulary of the server's functional check surface:
+    /// entrances (reachable access), POIs (home/work/meeting/guard roles with
+    /// bounded capacity), workstations (craft and production capability with
+    /// bounded workplaces), and storage (container endpoints). No runtime
+    /// operation names these records yet; the server checks each point against
+    /// the live world at recognition time.
+    variant building-interaction-point {
+        entrance(building-entrance),
+        poi(building-poi),
+        workstation(building-workstation),
+        storage(building-storage),
+    }
+
+    /// One reachable access point inside the footprint.
+    record building-entrance {
+        at: block-position,
+    }
+
+    /// One home/work/meeting/guard point with bounded capacity.
+    record building-poi {
+        /// One of home, work, meeting or guard, as `site-poi-kind` names it.
+        poi-kind: site-poi-kind,
+        at: block-position,
+        capacity: u16,
+    }
+
+    /// One craft and production capability with bounded workplaces.
+    record building-workstation {
+        at: block-position,
+        /// A contract resource id naming the station capability.
+        capability: string,
+        workplaces: u16,
+    }
+
+    /// One container endpoint inside the footprint.
+    record building-storage {
+        at: block-position,
+    }
+
+    /// One bounded request to recognize a player-built volume.
+    ///
+    /// `purpose` is a content-defined contract resource id, never a closed
+    /// core taxonomy. The footprint reuses `survey-bounds`; the point list
+    /// reuses the settled POI budget (128). `survey-token` is the fence, as in
+    /// `bind-manual-warehouse`.
+    record building-certificate-request {
+        footprint: survey-bounds,
+        purpose: string,
+        interaction-points: list<building-interaction-point>,
+        survey-token: string,
+        expected-world-revision: u64,
+    }
+
+    /// One bounded recognition of a player-built volume.
+    ///
+    /// Mirrors the accepted request, plus the opaque certificate id, the world
+    /// revision it was recognized against, and the certificate's own revision.
+    record building-certificate {
+        certificate-id: string,
+        footprint: survey-bounds,
+        purpose: string,
+        interaction-points: list<building-interaction-point>,
+        world-revision: u64,
+        revision: u64,
+    }
     /// One core-issued opaque warehouse binding.
     record warehouse-binding {
         /// 1..`mc_script::MAX_WAREHOUSE_HANDLE_BYTES` (128) bytes.
@@ -391,7 +474,6 @@ interface settlements {
         /// 1..`mc_script::MAX_RESIDENT_SPAWN_TOKEN_BYTES` (64) bytes.
         spawn-site-token: string,
     }
-
     /// One bounded terrain survey of one region.
     ///
     /// A query in the sense that it decides no durable structure: it mints the
@@ -405,19 +487,23 @@ interface settlements {
         purpose: survey-purpose,
     }
 
-    /// One plan of one structure against one authored blueprint.
+    /// One plan of one authored blueprint at one settlement site.
     ///
-    /// The anchor is the structure's own base row. The owner refuses a placement
-    /// whose footprint blocks are not all loaded (`unloaded`, never a shortened
-    /// plan) or whose terrain rises above that row (`blocked`), so a structure is
-    /// never planned where it would overwrite what is already there. The survey
-    /// token must be the caller's own and unexpired: an expired token, one whose
-    /// region changed since it was read, or one whose site revision moved is
-    /// refused `stale-revision`; a foreign token is `forbidden` and one the owner
-    /// does not hold is `not-found`.
+    /// The site must be the caller's current, generator-authenticated or
+    /// catalog-authored site. The anchor is the structure's own base row. The
+    /// owner refuses a placement whose footprint blocks are not all loaded
+    /// (`unloaded`, never a shortened plan) or whose terrain rises above that row
+    /// (`blocked`), so a structure is never planned where it would overwrite what
+    /// is already there. The survey token must be the caller's own and unexpired:
+    /// an expired token, one whose region changed since it was read, or one whose
+    /// site revision moved is refused `stale-revision`; a foreign token is
+    /// `forbidden` and one the owner does not hold is `not-found`.
     record prepare-structure {
         /// The durable operation id, 1..64 bytes.
         operation-id: string,
+        /// 1..`mc_script::MAX_SITE_ID_BYTES` (64) bytes. It names the adopted
+        /// generated village or the authored site that this structure belongs to.
+        site-id: string,
         /// 1..`mc_script::MAX_BLUEPRINT_ID_BYTES` (64) bytes and a contract
         /// resource id; a blueprint the deployment's catalog does not hold is
         /// `not-found`.
@@ -428,6 +514,9 @@ interface settlements {
         /// 1..`mc_script::MAX_SURVEY_TOKEN_BYTES` (64) bytes.
         survey-token: string,
         expected-site-revision: u64,
+        /// Optional SHA-256 of the catalog blueprint used for a client preview.
+        /// A changed catalog refuses the plan with `stale-revision`.
+        expected-blueprint-hash: option<string>,
     }
 
     /// One bounded work portion of one stage of a structure.
@@ -497,13 +586,16 @@ interface settlements {
         expected-revision: u64,
     }
 
-    /// One read of one durable structure.
+    /// One read of one durable structure or building certificate.
     ///
-    /// A query: it carries no durable operation id and changes nothing. An id the
-    /// owner does not hold is `not-found`, and one another plugin owns is
-    /// `forbidden` rather than an empty snapshot.
+    /// A structure id answers its snapshot; a certificate id answers its
+    /// immutable `building-certificate`. A query: it carries no durable
+    /// operation id and changes nothing. An id the owner does not hold is
+    /// `not-found`, and one another plugin owns is `forbidden` rather than an
+    /// empty snapshot.
     record structure-status {
-        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes.
+        /// 1..`mc_script::MAX_STRUCTURE_ID_BYTES` (64) bytes; a certificate id
+        /// carries the same bound.
         structure-id: string,
     }
 
@@ -540,8 +632,27 @@ interface settlements {
         container-id: u32,
     }
 
+    /// Bind one player-built container at its exact surveyed position.
+    ///
+    /// `survey-token` is the fence: the caller's own live token whose bounds
+    /// contain `position`, minted before the bind and unchanged since. A
+    /// position outside those bounds is `invalid-request`, a foreign zone
+    /// claimed after the survey is `forbidden`, an unloaded chunk is
+    /// `unloaded`, and a loaded position with no container is `not-found`.
+    record bind-manual-warehouse {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        /// 1..`mc_script::MAX_SURVEY_TOKEN_BYTES` (64) bytes.
+        survey-token: string,
+        position: block-position,
+    }
 
     /// One settlement call inside the durable operation envelope.
+    ///
+    /// `recognize-building` names the bounded certificate request inline: the
+    /// footprint, the content-defined purpose, the typed interaction points,
+    /// the survey-token fence and the expected world revision. The answer is
+    /// the `building` certificate.
     variant settlement-operation {
         list-sites(list-sites),
         query-site(query-site),
@@ -556,8 +667,18 @@ interface settlements {
         structure-status(structure-status),
         bind-warehouse(bind-warehouse),
         bind-village-warehouse(bind-village-warehouse),
+        bind-manual-warehouse(bind-manual-warehouse),
+        recognize-building(recognize-building),
     }
-
+    /// One bounded request to recognize a player-built volume.
+    ///
+    /// The request record is `building-certificate-request` above; the
+    /// operation only adds the durable operation id every mutation carries.
+    record recognize-building {
+        /// The durable operation id, 1..64 bytes.
+        operation-id: string,
+        request: building-certificate-request,
+    }
     /// The typed answer to one settlement call.
     ///
     /// The variants are the server's own result, one for one: a site page, one
@@ -573,5 +694,6 @@ interface settlements {
         structure(structure-snapshot),
         receipt(structure-receipt),
         warehouse(warehouse-binding),
+        building(building-certificate),
     }
 }

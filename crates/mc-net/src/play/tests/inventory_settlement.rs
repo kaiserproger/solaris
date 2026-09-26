@@ -12,17 +12,16 @@ use crate::play::tests::{
     spawn_test_simulation_owner,
 };
 use crate::play::{
-    ActiveContainer, CommandPermissions, ContainerClickContext, ContainerInput, CraftedItem,
-    CraftingTableWindow, EnchantingTableWindow, EntityItemStack, GameMode, Identifier,
-    ItemRegistry, ItemStack, LoggedInProfile, PlayerInventory, PlayerPersistedState, PlayerPose,
-    RegisteredSessionCleanup, ScriptCraftingSource, ScriptEvent, ScriptEventSink,
-    ScriptGameplayEventPublisher, ScriptPlayerId, ServerboundContainerClick, SessionRegistry,
-    SurvivalState, Vec3, XpState, crafted_item_from_inventory_delta,
-    crafting_table_input_projection, handle_container_click, handle_crafting_container_click,
-    handle_enchanting_container_click, load_player_state, refresh_crafting_result,
-    refresh_inventory_crafting_result, settle_disconnected_cursor, settle_disconnected_inventory,
-    settle_recovered_player_inventory, simulation_channel, store_active_container,
-    store_inventory_crafting_inputs,
+    ActiveContainer, ContainerClickContext, ContainerInput, CraftedItem, CraftingTableWindow,
+    EnchantingTableWindow, EntityItemStack, GameMode, Identifier, ItemRegistry, ItemStack,
+    LoggedInProfile, PlayerInventory, PlayerPersistedState, PlayerPose, RegisteredSessionCleanup,
+    ScriptCraftingSource, ScriptEvent, ScriptEventSink, ScriptGameplayEventPublisher,
+    ScriptPlayerId, ServerboundContainerClick, SessionRegistry, SurvivalState, Vec3, XpState,
+    crafted_item_from_inventory_delta, crafting_table_input_projection, handle_container_click,
+    handle_crafting_container_click, handle_enchanting_container_click, load_player_state,
+    refresh_crafting_result, refresh_inventory_crafting_result, settle_disconnected_cursor,
+    settle_disconnected_inventory, settle_recovered_player_inventory, simulation_channel,
+    store_active_container, store_inventory_crafting_inputs,
 };
 
 #[tokio::test]
@@ -721,7 +720,8 @@ async fn stale_crafting_click_rebuilds_grid_from_owner_projection() {
         ScriptPlayerId::new(session_id),
         profile.uuid.to_string(),
         &profile.name,
-        CommandPermissions::from_op(false),
+        crate::server::CommandPermissionConfig::default(),
+        "192.168.1.20:40000".parse().unwrap(),
         "minecraft:overworld",
     );
 
@@ -846,7 +846,8 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
         ScriptPlayerId::new(session_id),
         profile.uuid.to_string(),
         &profile.name,
-        CommandPermissions::from_op(false),
+        crate::server::CommandPermissionConfig::default(),
+        "192.168.1.20:40000".parse().unwrap(),
         "minecraft:overworld",
     );
     let carried = mc_protocol::packets::play::HashedStack::Actual {
@@ -1012,7 +1013,8 @@ async fn inventory_result_paths_publish_only_after_owner_commit() {
         ScriptPlayerId::new(session_id),
         profile.uuid.to_string(),
         &profile.name,
-        CommandPermissions::from_op(false),
+        crate::server::CommandPermissionConfig::default(),
+        "192.168.1.20:40000".parse().unwrap(),
         "minecraft:overworld",
     );
     let xp = XpState::default();
@@ -1148,4 +1150,112 @@ async fn inventory_result_paths_publish_only_after_owner_commit() {
 
     let _ = stop.send(());
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn full_inventory_crafting_preserves_overflow_bucket_as_world_drop() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapelessRecipe,
+    };
+
+    let milk = Identifier::parse("minecraft:milk_bucket").unwrap();
+    let bucket = Identifier::parse("minecraft:bucket").unwrap();
+    let output = Identifier::parse("minecraft:test_output").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: milk.clone(),
+            protocol_id: 1,
+        },
+        ItemReport {
+            id: bucket,
+            protocol_id: 2,
+        },
+        ItemReport {
+            id: output.clone(),
+            protocol_id: 3,
+        },
+    ]));
+    let mut state = interaction_state_for_items(items);
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
+    state.recipes.push(Recipe {
+        id: Identifier::parse("minecraft:test_bucket_recipe").unwrap(),
+        kind: RecipeKind::Shapeless(ShapelessRecipe {
+            ingredients: vec![Ingredient {
+                alternatives: vec![IngredientAlternative::Item(milk)],
+            }],
+        }),
+        result: RecipeResult {
+            item: output,
+            count: 1,
+            stew_effects: Vec::new(),
+        },
+    });
+    state.inventory.slots[1] = ItemStack::new(1, 16);
+    for slot in 9..=44 {
+        state.inventory.slots[slot] = ItemStack::new(3, 64);
+    }
+    state.inventory.slots[10] = ItemStack::new(3, 48);
+    refresh_inventory_crafting_result(&mut state);
+    assert_eq!(state.inventory.slots[0], ItemStack::new(3, 1));
+
+    let pose = PlayerPose::new(4.5, 65.0, 6.5);
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("OverflowBucket"),
+        name: "OverflowBucket".to_owned(),
+    };
+    let (tx, _rx) = mpsc::channel(8);
+    let (session_id, _) = state
+        .sessions
+        .register(&profile, (0, 0), 0, HashSet::new(), tx, pose);
+    let mut saved = PlayerPersistedState::new_default(pose);
+    saved.inventory = state.inventory.clone();
+    let saved = Arc::new(Mutex::new(saved));
+    state
+        .sessions
+        .register_player_persistence(session_id, Arc::clone(&saved));
+    state.session_id = session_id;
+    let (simulation, stop, task) = spawn_test_simulation_owner(Arc::clone(&state.sessions));
+    state.simulation = simulation.for_session(session_id);
+
+    let mut writer = Vec::new();
+    handle_container_click(
+        &mut state,
+        &mut writer,
+        ContainerClickContext {
+            game_mode: GameMode::Survival,
+            survival_state: SurvivalState::FULL,
+            xp_state: &XpState::default(),
+            player_pose: pose,
+            script_events: None,
+            scripts: None,
+            script_player_id: ScriptPlayerId::new(session_id),
+            script_context: no_script_player_context(session_id),
+        },
+        ServerboundContainerClick {
+            container_id: 0,
+            state_id: 1,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::QuickMove,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::empty(),
+        },
+    )
+    .await
+    .unwrap();
+    let _ = stop.send(());
+    task.await.unwrap();
+
+    assert_eq!(
+        saved.lock().unwrap().inventory.slots[1],
+        ItemStack::new(2, 1)
+    );
+    assert_eq!(state.inventory.slots[10], ItemStack::new(3, 64));
+    assert!(state.carried_item.is_empty());
+    let drops = state.sessions.persisted_entity_records();
+    assert_eq!(drops.len(), 1);
+    assert_eq!(
+        drops[0].snapshot.item_stack,
+        Some(EntityItemStack::new(2, 15))
+    );
 }

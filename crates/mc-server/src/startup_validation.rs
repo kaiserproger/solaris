@@ -32,6 +32,8 @@ pub(crate) struct PersistedWorldContract {
     #[serde(default = "vanilla_profile")]
     pub(crate) settlement_profile: String,
     pub(crate) gameplay_rules: Option<String>,
+    #[serde(default)]
+    pub(crate) custom_items: Option<String>,
     pub(crate) min_y: i32,
     pub(crate) height: i32,
     #[serde(default)]
@@ -276,6 +278,7 @@ pub(crate) fn ensure_world_contract(
         settlement_profile,
         mc_world::WorldSpawn::default(),
         None,
+        None,
     )
 }
 
@@ -305,6 +308,7 @@ pub(crate) fn ensure_world_contract_with_spawn(
     settlement_profile: &str,
     spawn: mc_world::WorldSpawn,
     gameplay_rules: Option<&str>,
+    custom_items: Option<&str>,
 ) -> Result<WorldSource> {
     let path = world_contract_path(world_dir);
     match std::fs::read(&path) {
@@ -322,6 +326,12 @@ pub(crate) fn ensure_world_contract_with_spawn(
             if persisted.gameplay_rules.as_deref() != gameplay_rules {
                 bail!(
                     "startup gameplay rules changed in {}; use a fresh world_dir",
+                    path.display()
+                );
+            }
+            if persisted.custom_items.as_deref() != custom_items {
+                bail!(
+                    "startup custom item definitions changed in {}; use a fresh world_dir",
                     path.display()
                 );
             }
@@ -378,6 +388,7 @@ pub(crate) fn ensure_world_contract_with_spawn(
                 if ore_profile != "vanilla"
                     || settlement_profile != "vanilla"
                     || gameplay_rules.is_some()
+                    || custom_items.is_some()
                 {
                     bail!(
                         "worldgen profiles ore={ore_profile} settlement={settlement_profile} cannot be applied to an unversioned Anvil import; use a fresh world_dir"
@@ -394,6 +405,7 @@ pub(crate) fn ensure_world_contract_with_spawn(
                 settlement_profile,
                 spawn,
                 gameplay_rules,
+                custom_items,
             )?;
             Ok(WorldSource::SolarisGenerated)
         }
@@ -446,6 +458,7 @@ fn write_world_contract(
     settlement_profile: &str,
     spawn: mc_world::WorldSpawn,
     gameplay_rules: Option<&str>,
+    custom_items: Option<&str>,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -460,6 +473,7 @@ fn write_world_contract(
         ore_profile: ore_profile.to_owned(),
         settlement_profile: settlement_profile.to_owned(),
         gameplay_rules: gameplay_rules.map(str::to_owned),
+        custom_items: custom_items.map(str::to_owned),
         min_y: geometry.min_y(),
         height: geometry.height(),
         spawn_block_x: spawn.block_x,

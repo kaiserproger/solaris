@@ -168,6 +168,10 @@ impl<'de> Deserialize<'de> for PiercingLedger {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ArrowState {
     pub projectile: ProjectileState,
+    /// Script-issued arrows may only damage their server-approved target.
+    /// Ordinary player/mob arrows remain unrestricted.
+    #[serde(default)]
+    pub restricted_target: Option<EntityIdentity>,
     pub in_ground: bool,
     pub no_physics: bool,
     pub no_gravity: bool,
@@ -187,6 +191,7 @@ impl ArrowState {
     pub const fn new(projectile: ProjectileState, pickup: PickupMode, pierce_level: i8) -> Self {
         Self {
             projectile,
+            restricted_target: None,
             in_ground: false,
             no_physics: false,
             no_gravity: false,

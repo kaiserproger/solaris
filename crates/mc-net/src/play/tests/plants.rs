@@ -1,4 +1,6 @@
-use super::super::simulation::{SurvivalBlockBreakPlan, SurvivalBreakHeldItem};
+use super::super::simulation::{
+    SimulationWorldAccess, SurvivalBlockBreakPlan, SurvivalBreakHeldItem,
+};
 use super::super::survival::BlockMutationSnapshot;
 use super::{
     BlockChangedAck, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition, BlockReport,
@@ -14,8 +16,8 @@ use super::{
     plan_break_edit_preconditions, plan_flint_fire, plan_hoe_tilling, plan_loaded_bonemeal_growth,
     plan_loaded_plant_harvest, plan_place_block_edits, plan_survival_break_drops,
     player_pose_collides_with_solid, prop_schema, random_tick_edit, random_tick_edit_seeded,
-    register_ticketed_button_session, simple_block, simulation_channel, state, sweet_berry_harvest,
-    test_use_item_on, unpack_block_pos,
+    register_survival_test_player, register_ticketed_button_session, simple_block,
+    simulation_channel, state, sweet_berry_harvest, test_use_item_on, unpack_block_pos,
 };
 use mc_protocol::Packet;
 use std::sync::Arc;
@@ -368,22 +370,6 @@ fn carrot_slice_preserves_wheat_crop_drop_behavior() {
         ),
         vec![ItemStack::new(51, 1)]
     );
-}
-
-#[test]
-fn carrot_slice_unsupported_crop_state_uses_generic_fallback() {
-    let blocks = crop_test_registry();
-    let items = carrot_slice_drop_items();
-    let pumpkin_stem = test_crop_state_with_age(&blocks, "minecraft:pumpkin_stem", 1);
-
-    let drops = block_drop_stacks_from(
-        &mc_data::loot::LootTables::default(),
-        &items,
-        &blocks,
-        pumpkin_stem,
-    );
-
-    assert_eq!(drops, vec![ItemStack::new(53, 1)]);
 }
 
 #[test]
@@ -970,6 +956,40 @@ fn flowers_and_grass_pop_when_support_breaks() {
             new_state: BlockStateId(0),
         }],
         "a non-plant neighbour must not pop"
+    );
+}
+
+#[test]
+fn breaking_farmland_removes_supported_wheat_crop() {
+    let registry = Arc::new(crop_test_registry());
+    let mut world = ground_plant_world(&registry);
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let crop = mc_world::BlockPos { y: 65, ..support };
+    let farmland = BlockStateId(3);
+    let wheat = BlockStateId(11);
+    world.set_block_at(support, farmland).unwrap();
+    world.set_block_at(crop, wheat).unwrap();
+
+    assert_eq!(
+        plan_break_block_edits(
+            registry.as_ref(),
+            &world,
+            support,
+            farmland,
+            BlockStateId(0),
+            BlockStateId(0),
+        ),
+        vec![
+            BlockEdit {
+                pos: support,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: crop,
+                new_state: BlockStateId(0),
+            },
+        ],
+        "removing farmland must not leave its wheat crop floating"
     );
 }
 
@@ -3452,6 +3472,143 @@ async fn farmland_trample_does_not_overwrite_a_newer_block_state() {
 
     let storage = world.lock().await;
     assert_eq!(storage.get_cached_block(pos), Some(BlockStateId(3)));
+}
+
+#[tokio::test]
+async fn farmland_trample_removes_crop_and_preserves_its_drop() {
+    for crop_state in [BlockStateId(18), BlockStateId(54)] {
+        let blocks = Arc::new(crop_test_registry());
+        let items = Arc::new(ItemRegistry::from_report(&[
+            ItemReport {
+                id: Identifier::parse("minecraft:wheat").unwrap(),
+                protocol_id: 50,
+            },
+            ItemReport {
+                id: Identifier::parse("minecraft:wheat_seeds").unwrap(),
+                protocol_id: 51,
+            },
+            ItemReport {
+                id: Identifier::parse("minecraft:melon_seeds").unwrap(),
+                protocol_id: 52,
+            },
+        ]));
+        let storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+        let world_read = storage.read_view();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let mut state = interaction_state_for_items(items);
+        state.blocks = blocks;
+        state.world = Arc::clone(&world);
+        state.world_read = world_read;
+        let (session_id, _) = register_survival_test_player(
+            &mut state,
+            "CropTramplePlayer",
+            super::SurvivalState::FULL,
+            &super::XpState::default(),
+        );
+        let (simulation, mut owner) = simulation_channel();
+        state.simulation = simulation.for_session(session_id);
+        let sessions = Arc::clone(&state.sessions);
+        let owner_world = Arc::clone(&world);
+        let read = state.world_read.clone();
+        let mutation = world.lock().await.mutation_view();
+        let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let owner_task = tokio::spawn(async move {
+            tokio::select! {
+                ready = owner.wait_for_command() => assert!(ready),
+                _ = stop_rx => return 0,
+            }
+            owner
+                .process_commands_with_world_views(
+                    &sessions,
+                    Some(&owner_world),
+                    SimulationWorldAccess {
+                        read: Some(&read),
+                        mutation: Some(&mutation),
+                        cpu: Some(&resources),
+                        light: None,
+                    },
+                    None,
+                    1,
+                )
+                .await
+                .processed
+        });
+        let pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+        let crop = mc_world::BlockPos { y: 65, ..pos };
+        {
+            let mut storage = world.lock().await;
+            let chunk = ChunkPos { x: 0, z: 0 };
+            storage
+                .insert_generated_chunk(
+                    chunk,
+                    Chunk::empty(
+                        chunk,
+                        BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+            storage.set_block_at(pos, BlockStateId(3)).unwrap();
+            storage.set_block_at(crop, crop_state).unwrap();
+        }
+        let old_pose = PlayerPose::new(1.5, 66.0, 1.5);
+        let new_pose = PlayerPose {
+            y: 65.0,
+            flags: MovePlayerFlags::new(true, false),
+            ..old_pose
+        };
+        maybe_trample_farmland(&mut state, &mut Vec::new(), old_pose, new_pose)
+            .await
+            .unwrap();
+        let _ = stop_tx.send(());
+        let processed = owner_task.await.unwrap();
+        if crop_state == BlockStateId(18) {
+            assert_eq!(processed, 1);
+        }
+        let storage = world.lock().await;
+        assert_eq!(storage.get_cached_block(pos), Some(BlockStateId(1)));
+        assert_eq!(storage.get_cached_block(crop), Some(BlockStateId(0)));
+        if crop_state == BlockStateId(18) {
+            assert!(
+                state
+                    .sessions
+                    .persisted_entity_records()
+                    .iter()
+                    .any(|record| record.snapshot.item_stack.is_some()),
+                "trampled wheat must become a physical item rather than disappear"
+            );
+        }
+    }
+}
+
+#[test]
+fn stem_break_can_drop_seeds_without_guaranteeing_a_drop() {
+    let blocks = crop_test_registry();
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:melon_seeds").unwrap(),
+        protocol_id: 52,
+    }]);
+    let facts = mc_data::item_components::ItemFactsTable::default();
+    let loot = mc_data::loot::LootTables::default();
+    let counts = (0..128)
+        .map(|seed| {
+            super::super::survival::block_drop_stacks_with_tool_and_facts_from_seeded(
+                &loot,
+                &items,
+                &facts,
+                &blocks,
+                BlockStateId(54),
+                None,
+                seed,
+            )
+            .iter()
+            .map(|stack| stack.count)
+            .sum::<i32>()
+        })
+        .collect::<Vec<_>>();
+    assert!(counts.contains(&0));
+    assert!(counts.iter().any(|count| (1..=3).contains(count)));
 }
 
 #[tokio::test]

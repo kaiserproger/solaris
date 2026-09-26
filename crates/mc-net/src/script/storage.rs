@@ -28,6 +28,7 @@ mod operations;
 #[cfg(test)]
 mod operations_tests;
 mod owned_inventory;
+mod resident_morale;
 mod resident_order_execution;
 #[cfg(test)]
 mod resident_order_tests;
@@ -52,8 +53,9 @@ use resident_orders::{
 };
 use residents::{DurableResidentChange, ResidentLedger, decode_resident_change};
 pub(crate) use settlement::{
-    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement, SurveyReading,
-    VillageInhabitantReading, VillagePoiReading, VillageReading,
+    ContainerReading, SettlementRuntime, SettlementWorld, StructureBlockPlacement,
+    StructureMaterialDebit, SurveyReading, VillageBounds, VillageInhabitantReading,
+    VillagePoiReading, VillageReading,
 };
 use settlement::{DurableSettlementChange, SettlementLedger, decode_settlement_change};
 pub(crate) use settlement_village_sites::{
@@ -189,6 +191,8 @@ pub(crate) struct PreparedStorageBatch {
     settlement: Vec<DurableSettlementChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     order: Vec<DurableResidentOrderChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    treatment: Option<world_inventory::DurableTreatmentIntent>,
 }
 
 impl DurableMutationResult {
@@ -574,6 +578,7 @@ impl PluginStorage {
             resident: Vec::new(),
             settlement: Vec::new(),
             order: Vec::new(),
+            treatment: None,
         };
         if !self.batch_preconditions_match(&batch) {
             return Ok(ScriptStoragePrepareOutcome::Rejected);
@@ -639,6 +644,7 @@ impl PluginStorage {
                 resident: Vec::new(),
                 settlement: Vec::new(),
                 order: Vec::new(),
+                treatment: None,
             },
         ))
     }
@@ -1987,7 +1993,13 @@ async fn run_storage_actor(
     }
     // A committed group admission whose owners still owe an engine goal push is
     // applied once here, before any new command is admitted.
-    inventory.recover_resident_orders(&mut storage).await;
+    if let Err(error) = inventory.recover_resident_orders(&mut storage).await {
+        tracing::error!(%error, "resident order recovery failed");
+        stopped.mark_failed();
+        fail_queued_storage_commands(&mut commands, &events).await;
+        return;
+    }
+    let mut combat_ticks = inventory.sessions().subscribe_simulation_ticks();
     loop {
         let command = tokio::select! {
             () = shutdown.notified() => return,
@@ -2004,6 +2016,22 @@ async fn run_storage_actor(
                     &mut commands,
                     wake,
                 ).await {
+                    return;
+                }
+                continue;
+            }
+            tick = combat_ticks.changed() => {
+                if tick.is_err() {
+                    return;
+                }
+                let tick = *combat_ticks.borrow_and_update();
+                if let Err(error) = inventory
+                    .continue_active_resident_combat(&mut storage, tick)
+                    .await
+                {
+                    warn!(?error, "native resident combat progress could not be persisted");
+                    stopped.mark_failed();
+                    fail_queued_storage_commands(&mut commands, &events).await;
                     return;
                 }
                 continue;

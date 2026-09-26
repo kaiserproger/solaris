@@ -70,6 +70,7 @@ pub(in crate::play) struct ChestTransaction {
 pub(in crate::play) struct ChestTransactionRequest<'a> {
     pub(in crate::play) primary_position: mc_world::BlockPos,
     pub(in crate::play) positions: &'a [mc_world::BlockPos],
+    pub(in crate::play) expected_tokens: Option<&'a [mc_world::BlockMutationToken]>,
     pub(in crate::play) expected_state_id: i32,
     pub(in crate::play) expected: &'a [mc_world::ChestBlockEntity],
     pub(in crate::play) updated: &'a [mc_world::ChestBlockEntity],
@@ -153,8 +154,12 @@ fn commit_container_half(
             state_id: current_state_id,
         };
     }
-    match mutation.commit_chests_conditionally(request.positions, request.expected, request.updated)
-    {
+    match mutation.commit_chests_conditionally(
+        request.positions,
+        request.expected_tokens,
+        request.expected,
+        request.updated,
+    ) {
         mc_world::ResidentChestCommitResult::Applied => {}
         mc_world::ResidentChestCommitResult::Rejected(_) => {
             return ContainerCommitHalf::Stale {
@@ -329,6 +334,9 @@ impl ChestTransaction {
             // commit, and the validator refuses one before it gets here.
             return Err(SimulationRequestError::InvalidCommand);
         };
+        if request.expected_tokens.is_none() {
+            return Err(SimulationRequestError::InvalidCommand);
+        }
         let state_id_increment = chest_state_id_increment(&request);
         let container_wait_started = Instant::now();
         let container_guard = lock_authoritative_mutex(&self.containers, "play.container_registry");

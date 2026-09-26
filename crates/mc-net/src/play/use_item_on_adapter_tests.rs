@@ -23,9 +23,7 @@ use crate::login::LoggedInProfile;
 use crate::play::item_blocks::ItemToBlockTable;
 use crate::play::persistence::PlayerPersistedState;
 use crate::play::tests::{insert_fluid_test_chunk, interaction_state_for_blocks};
-use crate::play::{
-    CommandPermissions, OutboundCommand, SessionRegistration, SimulationOwner, simulation_channel,
-};
+use crate::play::{OutboundCommand, SessionRegistration, SimulationOwner, simulation_channel};
 use crate::server::ScriptEventSink;
 
 const SLAB_ITEM_ID: u32 = 42;
@@ -109,7 +107,8 @@ async fn placement_harness_with(
             pose,
             game_mode: mc_domain::GameMode::Survival,
             max_sessions: usize::MAX,
-            script_operator: false,
+            script_permissions: crate::server::CommandPermissionConfig::default(),
+            peer: "127.0.0.1:40000".parse().unwrap(),
             dimension: "minecraft:overworld",
             loader_session,
         })
@@ -536,7 +535,8 @@ async fn stale_stair_shape_dependency_rejects_without_inventory_debit_or_script_
         ScriptPlayerId::new(9),
         "123e4567-e89b-12d3-a456-426614174000",
         "PlacementAdapter",
-        CommandPermissions::from_op(true),
+        crate::server::CommandPermissionConfig::new(["PlacementAdapter"], false),
+        "192.168.1.20:40000".parse().unwrap(),
         "minecraft:overworld",
     );
     let mut request = Box::pin(handle_block_item_placement(

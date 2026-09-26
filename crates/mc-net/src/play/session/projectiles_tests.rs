@@ -1,4 +1,8 @@
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
 
 use mc_script::precommit::{
     DamageTarget, HookActor, HookContext, HookDecision, HookFailurePolicy, HookKind,
@@ -12,13 +16,145 @@ use mc_entity::{Rotation, Vec3};
 use crate::play::simulation::simulation_channel_with_capacity;
 use crate::play::{ArrowPhysicsFact, EntityPhysicsStep, HurtingProjectilePhysicsFact};
 
-use super::SessionRegistry;
 use super::entity_lifecycle::spawn_command_entity_locked;
+use super::outbound::dispatch_visibility_commands;
 use super::projectiles::{
     HurtingProjectileMotionProfile, initial_hurting_projectile_state,
     initial_hurting_projectile_state_with_motion, initial_throwable_projectile_state,
     projectile_identity, spawn_arrow_locked, spawn_throwable_projectile_locked,
 };
+use super::{OutboundCommand, PlayerPose, SessionRegistry, SimulationAuthority};
+
+#[test]
+fn resident_arrow_is_visible_once_to_each_observer_and_hits_once() {
+    let registry = SessionRegistry::new();
+    registry.configure_arrow_kill_rewards(
+        None,
+        None,
+        Some(77),
+        Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        Arc::new(mc_data::loot::LootTables::default()),
+    );
+    let mut observers = Vec::new();
+    for name in ["GuardObserverAlice", "GuardObserverBob"] {
+        let (tx, rx) = mpsc::channel(64);
+        let (id, initial) = registry.register(
+            &crate::login::LoggedInProfile {
+                uuid: crate::login::offline_uuid(name),
+                name: name.to_owned(),
+            },
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        dispatch_visibility_commands(initial);
+        dispatch_visibility_commands(registry.mark_loaded(id, (0, 0)));
+        observers.push(rx);
+    }
+    for (name, position) in [
+        ("minecraft:villager", Vec3::new(4.5, 64.0, 4.5)),
+        ("minecraft:cow", Vec3::new(6.5, 64.0, 4.5)),
+    ] {
+        dispatch_visibility_commands(registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            2,
+            name.to_owned(),
+            position,
+        ));
+    }
+    let mut entities = registry
+        .lock_entities("read resident archer and target")
+        .snapshots()
+        .collect::<Vec<_>>();
+    entities.sort_unstable_by_key(|snapshot| snapshot.id);
+    let (attacker, target) = (&entities[0], &entities[1]);
+    let before = target.health;
+    for receiver in &mut observers {
+        while receiver.try_recv().is_ok() {}
+    }
+    assert!(registry.launch_resident_arrow(attacker, target));
+    let arrows = registry.resident_arrows_for_test(attacker.position);
+    let [arrow] = arrows.as_slice() else {
+        panic!("one resident arrow is tracked");
+    };
+    for receiver in &mut observers {
+        let commands = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        let spawned = commands
+            .iter()
+            .filter(|command| {
+                matches!(command, OutboundCommand::SpawnEntity(entity) if entity.id == arrow.id)
+            })
+            .count();
+        assert_eq!(
+            spawned, 1,
+            "each client receives one arrow spawn: {commands:?}"
+        );
+    }
+
+    registry.apply_entity_physics_with_arrow_facts_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow.id,
+            position: Vec3::new(
+                arrow.position.x + arrow.velocity.x,
+                arrow.position.y + arrow.velocity.y,
+                arrow.position.z + arrow.velocity.z,
+            ),
+            velocity: arrow.velocity,
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+        &[ArrowPhysicsFact {
+            arrow_id: arrow.id,
+            block_hit: None,
+            embedded_in_block: false,
+            current_block_state: mc_world::BlockStateId(0),
+            should_fall: false,
+            fall_velocity_scale: Vec3::new(0.1, 0.1, 0.1),
+            in_water: false,
+            in_water_or_rain: false,
+        }],
+    );
+    assert!(
+        registry
+            .server_entity_snapshot(target.id)
+            .expect("target remains alive")
+            .health
+            .is_some_and(|health| health < before)
+    );
+    for receiver in &mut observers {
+        let mut hurt = 0;
+        let mut health = 0;
+        let mut despawn = 0;
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                OutboundCommand::EntityHurt { entity_id } if entity_id == target.id.0 => hurt += 1,
+                OutboundCommand::UpdateEntityHealth(snapshot) if snapshot.id == target.id => {
+                    health += 1
+                }
+                OutboundCommand::DespawnEntity(snapshot) if snapshot.id == arrow.id => despawn += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            (hurt, health, despawn),
+            (1, 1, 1),
+            "one shared projectile outcome per client"
+        );
+    }
+    assert!(
+        !registry.launch_resident_arrow(attacker, target),
+        "a changed target snapshot cannot launch a second projectile"
+    );
+    assert!(
+        registry
+            .resident_arrows_for_test(attacker.position)
+            .is_empty()
+    );
+}
 
 #[test]
 fn snowball_uses_throwable_item_gravity_and_survives_a_miss_tick() {

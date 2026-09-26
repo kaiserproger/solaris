@@ -30,11 +30,13 @@ const MAX_ROUTE_STEPS: i32 = 128;
 /// Longest line-of-sight ray a resident may test, in blocks.
 const MAX_SIGHT_STEPS: i32 = 96;
 
-/// One block read: raw state plus the canonical block path.
+/// One block read: raw state, canonical path and the activity fact direct work
+/// needs from the same live block state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResidentBlock {
     pub state: u32,
     pub path: String,
+    pub is_lit_campfire: bool,
 }
 
 /// One canonical drop of a committed block break.
@@ -80,6 +82,9 @@ pub(crate) trait ResidentWorld: Send + Sync {
     ) -> bool;
     /// Canonical block state id for one block path, when it is registered.
     fn state_for(&self, block_path: &str) -> Option<u32>;
+    /// Whether this registered crop state is mature enough for resident harvest.
+    /// A crop identity alone never authorizes a canonical break-loot preview.
+    fn crop_is_mature(&self, state: u32) -> bool;
     /// Canonical loot and source image of one conditional break, computed
     /// **without** touching the world. The returned precondition is the exact
     /// image the later durable decision must consume.
@@ -267,6 +272,7 @@ impl ResidentWorld for LiveResidentWorld {
             .map(|(state, path)| ResidentBlock {
                 state: state.0,
                 path,
+                is_lit_campfire: super::campfire::is_lit_campfire_block(&self.blocks, state),
             })
     }
 
@@ -330,6 +336,28 @@ impl ResidentWorld for LiveResidentWorld {
         // The canonical state of a block path is its registered default, which is
         // the state a fresh placement uses.
         self.blocks.block(&name).map(|block| block.default.0)
+    }
+
+    fn crop_is_mature(&self, state: u32) -> bool {
+        let Some(state) = self.blocks.by_id(BlockStateId(state)) else {
+            return false;
+        };
+        let age = state
+            .properties
+            .iter()
+            .find(|(key, _)| key == "age")
+            .map(|(_, value)| value.as_str());
+        match state.block.id.path() {
+            "wheat" | "carrots" | "potatoes" => age == Some("7"),
+            "beetroots" | "nether_wart" | "sweet_berry_bush" => age == Some("3"),
+            "cocoa" => age == Some("2"),
+            // These blocks are the produced fruit/cane itself, not a
+            // grow-stage state. Their existence is the world-side maturity
+            // signal; stem and height selection remain outside this bounded
+            // worker operation.
+            "pumpkin" | "melon" | "sugar_cane" => true,
+            _ => false,
+        }
     }
 
     fn preview_break(

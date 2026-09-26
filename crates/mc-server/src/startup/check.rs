@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 pub(crate) fn check_config(path: &Path) -> Result<()> {
     let mut cfg = load_config(path)?;
@@ -477,6 +478,7 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
 /// records describe the one deployment the server will run.
 pub(crate) struct DeploymentRecords<'a> {
     pub(crate) rules: Option<&'a mc_script::GameplayRules>,
+    pub(crate) items: &'a [mc_data::item_components::CustomItemDefinition],
     pub(crate) ore_profile: Option<mc_script::PluginWorldgenOreProfile>,
     pub(crate) settlement_plan: Option<&'a mc_script::PluginSettlementPlan>,
     pub(crate) client_bundles: &'a [mc_script::ClientBundle],
@@ -488,12 +490,14 @@ impl<'a> DeploymentRecords<'a> {
         match component {
             Some(component) => Self {
                 rules: component.rules.as_ref(),
+                items: &component.items,
                 ore_profile: component.ore_profile,
                 settlement_plan: component.settlement_plan.as_ref(),
                 client_bundles: &component.client_bundles,
             },
             None => Self {
                 rules: None,
+                items: &[],
                 ore_profile: None,
                 settlement_plan: None,
                 client_bundles: &[],
@@ -522,6 +526,32 @@ impl<'a> DeploymentRecords<'a> {
                 .map(mc_script::PluginSettlementPlan::contract_name)
                 .unwrap_or_else(|| configured_settlement.name().to_owned()),
             gameplay_rules: self.rules.map(mc_script::GameplayRules::contract_name),
+            custom_items: (!self.items.is_empty()).then(|| {
+                let mut entries = self
+                    .items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.id.as_str(),
+                            item.carrier.as_str(),
+                            item.name.as_str(),
+                            item.crafting_ingredient
+                                .as_ref()
+                                .map(mc_data::Identifier::as_str),
+                            item.facts.max_stack_size,
+                            item.facts.max_damage,
+                            item.facts.weapon,
+                            item.facts.attack_damage_modifier.map(f32::to_bits),
+                            item.facts.attack_speed_modifier.map(f32::to_bits),
+                            item.facts.equippable_slot.as_deref(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|item| item.0);
+                let bytes =
+                    serde_json::to_vec(&entries).expect("validated item identity serializes");
+                format!("component-items:{:x}", Sha256::digest(bytes))
+            }),
         }
     }
 
@@ -549,9 +579,10 @@ impl<'a> DeploymentRecords<'a> {
     }
 }
 
-/// The three identities one world records, as `world.json` keeps them.
+/// Startup identities recorded by each world contract.
 pub(crate) struct WorldContractIdentities {
     pub(crate) ore_profile: String,
     pub(crate) settlement_profile: String,
     pub(crate) gameplay_rules: Option<String>,
+    pub(crate) custom_items: Option<String>,
 }

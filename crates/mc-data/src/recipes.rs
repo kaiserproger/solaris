@@ -124,6 +124,27 @@ pub fn ingredient_accepts_item(
 }
 
 #[must_use]
+pub fn ingredient_accepts_stack(
+    items: &crate::items::ItemRegistry,
+    item_facts: &crate::item_components::ItemFactsTable,
+    tags: &crate::tags::TagsData,
+    stack: &crate::ItemStack,
+    ingredient: &Ingredient,
+) -> bool {
+    if let Some(custom) = stack
+        .item_model
+        .as_deref()
+        .and_then(|id| item_facts.custom(id))
+    {
+        return item_facts.custom_for_stack(stack, items).is_some()
+            && ingredient.alternatives.iter().any(
+                |alternative| matches!(alternative, IngredientAlternative::Item(id) if id == &custom.id),
+            );
+    }
+    ingredient_accepts_item(items, tags, stack.item_id, ingredient)
+}
+
+#[must_use]
 pub fn stonecutting_recipe_accepts_input(
     recipe: &Recipe,
     items: &crate::items::ItemRegistry,
@@ -197,6 +218,7 @@ pub fn furnace_fuel_ticks(
 #[must_use]
 pub fn shaped_recipe_matches(
     items: &crate::items::ItemRegistry,
+    item_facts: &crate::item_components::ItemFactsTable,
     tags: &crate::tags::TagsData,
     input: &[crate::ItemStack; 9],
     shaped: &ShapedRecipe,
@@ -230,11 +252,8 @@ pub fn shaped_recipe_matches(
                     match ingredient {
                         Some(ingredient)
                             if !stack.is_empty()
-                                && ingredient_accepts_item(
-                                    items,
-                                    tags,
-                                    stack.item_id,
-                                    ingredient,
+                                && ingredient_accepts_stack(
+                                    items, item_facts, tags, stack, ingredient,
                                 ) => {}
                         None if stack.is_empty() => {}
                         _ => continue 'left,
@@ -250,6 +269,7 @@ pub fn shaped_recipe_matches(
 #[must_use]
 pub fn shapeless_recipe_matches(
     items: &crate::items::ItemRegistry,
+    item_facts: &crate::item_components::ItemFactsTable,
     tags: &crate::tags::TagsData,
     input: &[crate::ItemStack; 9],
     shapeless: &ShapelessRecipe,
@@ -265,7 +285,7 @@ pub fn shapeless_recipe_matches(
             .iter()
             .enumerate()
             .find(|(idx, ingredient)| {
-                !used[*idx] && ingredient_accepts_item(items, tags, stack.item_id, ingredient)
+                !used[*idx] && ingredient_accepts_stack(items, item_facts, tags, stack, ingredient)
             })
         else {
             return false;
@@ -278,13 +298,16 @@ pub fn shapeless_recipe_matches(
 #[must_use]
 pub fn crafting_recipe_matches(
     items: &crate::items::ItemRegistry,
+    item_facts: &crate::item_components::ItemFactsTable,
     tags: &crate::tags::TagsData,
     input: &[crate::ItemStack; 9],
     recipe: &Recipe,
 ) -> bool {
     match &recipe.kind {
-        RecipeKind::Shaped(shaped) => shaped_recipe_matches(items, tags, input, shaped),
-        RecipeKind::Shapeless(shapeless) => shapeless_recipe_matches(items, tags, input, shapeless),
+        RecipeKind::Shaped(shaped) => shaped_recipe_matches(items, item_facts, tags, input, shaped),
+        RecipeKind::Shapeless(shapeless) => {
+            shapeless_recipe_matches(items, item_facts, tags, input, shapeless)
+        }
         RecipeKind::Smelting(_)
         | RecipeKind::Blasting(_)
         | RecipeKind::Smoking(_)
@@ -304,6 +327,7 @@ pub fn repair_item_crafting_result(
     let second = occupied.next()?;
     if occupied.next().is_some()
         || first.item_id != second.item_id
+        || first.item_model != second.item_model
         || first.count != 1
         || second.count != 1
     {
@@ -311,15 +335,17 @@ pub fn repair_item_crafting_result(
     }
     let first_damage = first.damage?;
     let second_damage = second.damage?;
-    let item = items.name_of(first.item_id)?;
-    let max_damage = i32::try_from(item_facts.get(item)?.max_damage?).ok()?;
+    let max_damage = i32::try_from(item_facts.facts_for_stack(first, items)?.max_damage?).ok()?;
     if max_damage <= 0 {
         return None;
     }
     let remaining = max_damage.saturating_sub(first_damage)
         + max_damage.saturating_sub(second_damage)
         + max_damage / 20;
-    Some(crate::ItemStack::new(first.item_id, 1).with_damage((max_damage - remaining).max(0)))
+    let mut repaired = first.clone();
+    repaired.enchantments.clear();
+    repaired.damage = Some((max_damage - remaining).max(0));
+    Some(repaired)
 }
 
 #[must_use]
@@ -335,8 +361,8 @@ pub fn crafting_result_from_input(
     }
     recipes
         .iter()
-        .find(|recipe| crafting_recipe_matches(items, tags, input, recipe))
-        .and_then(|recipe| recipe.result.to_stack(items))
+        .find(|recipe| crafting_recipe_matches(items, item_facts, tags, input, recipe))
+        .and_then(|recipe| recipe.result.to_stack(items, item_facts))
         .unwrap_or(crate::ItemStack::EMPTY)
 }
 
@@ -400,9 +426,21 @@ pub struct RecipeResult {
 
 impl RecipeResult {
     #[must_use]
-    pub fn to_stack(&self, items: &crate::items::ItemRegistry) -> Option<crate::ItemStack> {
-        let item_id = items.id_of(&self.item)?;
+    pub fn to_stack(
+        &self,
+        items: &crate::items::ItemRegistry,
+        item_facts: &crate::item_components::ItemFactsTable,
+    ) -> Option<crate::ItemStack> {
         let count = i32::try_from(self.count).ok().filter(|count| *count > 0)?;
+        if let Some(custom) = item_facts.custom(&self.item) {
+            let item_id = items.id_of(&custom.carrier)?;
+            return Some(
+                crate::ItemStack::new(item_id, count)
+                    .with_item_model(custom.id.clone())
+                    .with_custom_name(&custom.name),
+            );
+        }
+        let item_id = items.id_of(&self.item)?;
         let mut stack = crate::ItemStack::new(item_id, count);
         stack.stew_effects = self.stew_effects.clone();
         Some(stack)

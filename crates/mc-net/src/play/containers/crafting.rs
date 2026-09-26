@@ -188,7 +188,10 @@ fn can_place_in_crafting_menu_slot(
     }
 }
 
-fn crafting_remainder_for_item(items: &ItemRegistry, item_id: u32) -> Option<ItemStack> {
+pub(in crate::play) fn crafting_remainder_for_item(
+    items: &ItemRegistry,
+    item_id: u32,
+) -> Option<ItemStack> {
     let name = items.name_of(item_id)?;
     let bucket = Identifier::parse("minecraft:bucket").expect("static identifier");
     if name.path().ends_with("_bucket") || name.as_str() == "minecraft:milk_bucket" {
@@ -792,8 +795,7 @@ impl PlayerInventory {
         let original = self.slots[slot].clone();
         let max_stack = item_max_stack(item_facts, items, &original);
         if !(5..=8).contains(&slot)
-            && let Some(equipment_slot) =
-                equippable_slot_for_item(item_facts, items, original.item_id)
+            && let Some(equipment_slot) = equippable_slot_for_item(item_facts, items, &original)
             && self.slots[equipment_slot].is_empty()
         {
             let mut equipped = original.clone();

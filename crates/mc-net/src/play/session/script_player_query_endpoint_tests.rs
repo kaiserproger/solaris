@@ -1,11 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::SessionRegistry;
 use super::outbound::OutboundCommand;
+use super::{SessionRegistration, SessionRegistry};
 use crate::login::LoggedInProfile;
-use crate::play::PlayerPose;
+use crate::play::{GameMode, PlayerPose};
 
 fn profile(name: &str) -> LoggedInProfile {
     LoggedInProfile {
@@ -52,6 +53,39 @@ fn online_player_snapshot_is_sorted_bounded_and_excludes_closed_sessions() {
     assert_eq!(players[0].context().username(), "Alice");
     assert_eq!(players[0].dimension(), "minecraft:overworld");
     assert!(truncated);
+}
+
+#[test]
+fn plugin_player_context_tracks_live_operator_revocation() {
+    let config = crate::server::CommandPermissionConfig::new(["Builder"], false);
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel::<OutboundCommand>(1);
+    let builder = profile("Builder");
+    registry
+        .try_register(SessionRegistration {
+            profile: &builder,
+            properties: &[],
+            center: (0, 0),
+            view_distance: 2,
+            desired: HashSet::new(),
+            tx,
+            pose: PlayerPose::new(1.0, 64.0, 2.0),
+            game_mode: GameMode::Survival,
+            max_sessions: 8,
+            script_permissions: config.clone(),
+            peer: "192.168.1.20:40000".parse().unwrap(),
+            dimension: "minecraft:overworld",
+            loader_session: None,
+        })
+        .unwrap();
+
+    let (players, _) = registry.script_online_players(1).unwrap();
+    assert!(players[0].context().operator());
+    config
+        .operator_identities()
+        .store(Arc::new(BTreeSet::new()));
+    let (players, _) = registry.script_online_players(1).unwrap();
+    assert!(!players[0].context().operator());
 }
 
 #[test]

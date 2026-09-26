@@ -117,6 +117,7 @@ pub(super) enum DurableAssignment {
     Civilian,
     Military,
     Demobilizing,
+    Prisoner,
 }
 
 /// One occupied approved guard post of a garrison order.
@@ -144,6 +145,13 @@ pub(super) struct DurableResidentOrder {
     /// Occupied guard post of a garrison order, when one was assigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) garrison: Option<DurableGarrisonSlot>,
+    /// Reference authenticated at admission for native follow-up attacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) active_target_ref: Option<String>,
+    /// Exact accepted formation destination, stored as IEEE-754 bits so replay
+    /// restores the same goal without another terrain query or slot reassignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) formation_destination: Option<[u64; 3]>,
 }
 
 /// One durable work assignment.
@@ -158,9 +166,15 @@ pub(super) struct DurableResidentWork {
     pub(super) state: ScriptWorkState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<mc_script::ScriptWorkPauseReason>,
+    /// `missing_input` is waiting on a source in this work area's world region,
+    /// not a resident or warehouse inventory transfer.
+    #[serde(default)]
+    pub(super) world_input_wait: bool,
 }
 
 /// One durable per-handle order, work, gear and assignment record.
+use super::resident_morale::{MoralePhase, OperationalMorale};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableResidentOrderRecord {
@@ -169,6 +183,8 @@ pub(super) struct DurableResidentOrderRecord {
     pub(super) entity_uuid: String,
     pub(super) assignment: DurableAssignment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) custodian: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) order: Option<Box<DurableResidentOrder>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) work: Option<Box<DurableResidentWork>>,
@@ -176,6 +192,12 @@ pub(super) struct DurableResidentOrderRecord {
     pub(super) equipment: Vec<Option<DurableResidentStack>>,
     /// Canonical carry slots.
     pub(super) carry: Vec<Option<DurableResidentStack>>,
+    /// Simulation tick of the most recent committed native hit; reissued
+    /// orders cannot bypass the weapon cooldown with a new operation id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) last_attack_tick: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) morale: Option<OperationalMorale>,
     pub(super) revision: u64,
 }
 
@@ -192,10 +214,13 @@ impl DurableResidentOrderRecord {
             plugin_id,
             entity_uuid,
             assignment,
+            custodian: None,
             order: None,
             work: None,
             equipment: vec![None; usize::from(MAX_RESIDENT_EQUIPMENT_SLOTS)],
             carry: vec![None; usize::from(MAX_RESIDENT_CARRY_SLOTS)],
+            last_attack_tick: None,
+            morale: None,
             revision: 0,
         }
     }
@@ -215,11 +240,32 @@ impl DurableResidentOrderRecord {
             || self.carry.len() != usize::from(MAX_RESIDENT_CARRY_SLOTS)
             || self.revision == 0
             || self.revision > MAX_SCRIPT_WORLD_TIME
+            || self
+                .last_attack_tick
+                .is_some_and(|tick| tick > MAX_SCRIPT_WORLD_TIME)
         {
             return Err(PluginStorageStartError::Malformed("resident order record"));
         }
+        if (self.assignment == DurableAssignment::Prisoner) != self.custodian.is_some()
+            || self.custodian.as_ref().is_some_and(|custodian| {
+                custodian == &self.handle
+                    || validate_resident_order_field(custodian, "custodian").is_err()
+            })
+            || (self.assignment == DurableAssignment::Prisoner
+                && (self.order.is_some() || self.work.is_some()))
+        {
+            return Err(PluginStorageStartError::Malformed("resident custody"));
+        }
         for stack in self.equipment.iter().chain(&self.carry).flatten() {
             stack.validate()?;
+        }
+        if let Some(morale) = &self.morale
+            && (!f32::from_bits(morale.observed_health_bits).is_finite()
+                || morale.rally.validate().is_err()
+                || morale.witnessed_losses.len() > mc_script::MAX_ORDER_AFFILIATIONS
+                || morale.observed_allies.len() > mc_script::MAX_ORDER_AFFILIATIONS)
+        {
+            return Err(PluginStorageStartError::Malformed("resident morale"));
         }
         if let Some(order) = &self.order
             && (order.revision == 0
@@ -228,6 +274,18 @@ impl DurableResidentOrderRecord {
                 || order.order.validate().is_err())
         {
             return Err(PluginStorageStartError::Malformed("resident order"));
+        }
+        if let Some((order, active)) = self.order.as_ref().and_then(|order| {
+            order
+                .active_target_ref
+                .as_ref()
+                .map(|active| (order, active))
+        }) && (active.is_empty()
+            || active.len() > mc_script::MAX_TARGET_REF_BYTES
+            || !matches!(&order.order, ScriptResidentOrder::Attack { targets, .. }
+                    if targets.iter().any(|target| target.target_ref == *active)))
+        {
+            return Err(PluginStorageStartError::Malformed("resident combat target"));
         }
         if let Some(garrison) = self
             .order
@@ -245,7 +303,10 @@ impl DurableResidentOrderRecord {
                 || work.revision > self.revision
                 || work.planned == 0
                 || work.done > work.planned
-                || work.work.validate().is_err())
+                || work.work.validate().is_err()
+                || (work.world_input_wait
+                    && (work.state != ScriptWorkState::Paused
+                        || work.reason != Some(ScriptWorkPauseReason::MissingInput))))
         {
             return Err(PluginStorageStartError::Malformed("resident work"));
         }
@@ -375,6 +436,11 @@ pub(super) enum DurableResidentOrderChange {
     Record {
         record: Box<DurableResidentOrderRecord>,
     },
+    /// A native combat tick advances gear/cooldown without changing the
+    /// accepted order or work fences visible to guest callers.
+    CombatProgress {
+        record: Box<DurableResidentOrderRecord>,
+    },
     Admission {
         admission: Box<DurableAdmission>,
     },
@@ -394,7 +460,7 @@ pub(super) enum DurableResidentOrderChange {
 impl DurableResidentOrderChange {
     pub(super) const fn revision(&self) -> u64 {
         match self {
-            Self::Record { record } => record.revision,
+            Self::Record { record } | Self::CombatProgress { record } => record.revision,
             Self::Admission { admission } => admission.admission_id,
             Self::AdmissionApplied { revision, .. } | Self::TargetRef { revision, .. } => *revision,
         }
@@ -413,6 +479,7 @@ impl DurableResidentOrderChange {
                     work.revision = revision;
                 }
             }
+            Self::CombatProgress { record } => record.revision = revision,
             Self::Admission { admission } => {
                 admission.admission_id = revision;
                 admission.order_revision = revision;
@@ -432,7 +499,7 @@ impl DurableResidentOrderChange {
 
     pub(super) fn validate(&self) -> Result<(), PluginStorageStartError> {
         match self {
-            Self::Record { record } => record.validate(),
+            Self::Record { record } | Self::CombatProgress { record } => record.validate(),
             Self::Admission { admission } => admission.validate(),
             Self::AdmissionApplied {
                 revision,
@@ -472,6 +539,10 @@ pub(super) struct ResidentOrderLedger {
     /// Paused world work by active 8×8-chunk region. This is an event index,
     /// never a settlement-wide scheduler scan.
     paused_by_region: BTreeMap<(String, i32, i32), BTreeSet<String>>,
+    /// Accepted attacks only; no scan of passive resident/work records on ticks.
+    active_attacks: BTreeSet<String>,
+    /// Active combat morale only; no full population scan on simulation ticks.
+    active_morale: BTreeSet<String>,
     /// Paused haul assignments blocked on an exact warehouse destination.
     paused_haul_by_warehouse: BTreeMap<ScriptInventoryEndpoint, BTreeSet<String>>,
     admissions: BTreeMap<u64, DurableAdmission>,
@@ -481,6 +552,30 @@ pub(super) struct ResidentOrderLedger {
 impl ResidentOrderLedger {
     pub(super) fn record(&self, handle: &str) -> Option<&DurableResidentOrderRecord> {
         self.records.get(handle)
+    }
+
+    pub(super) fn active_attack_records(
+        &self,
+        tick: u64,
+        cooldown: u64,
+    ) -> Vec<DurableResidentOrderRecord> {
+        self.active_attacks
+            .iter()
+            .filter_map(|handle| self.records.get(handle))
+            .filter(|record| {
+                record
+                    .last_attack_tick
+                    .is_none_or(|last| tick.saturating_sub(last) >= cooldown)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn active_morale_records(&self) -> Vec<DurableResidentOrderRecord> {
+        self.active_morale
+            .iter()
+            .filter_map(|handle| self.records.get(handle).cloned())
+            .collect()
     }
 
     pub(super) fn reference(&self, plugin_id: &str, target_ref: &str) -> Option<&DurableTargetRef> {
@@ -513,8 +608,8 @@ impl ResidentOrderLedger {
     }
 
     /// Paused assignments whose bounded world target overlaps one changed
-    /// chunk. The index makes a world wake proportional to active work in that
-    /// region, not to all residents or containers.
+    /// chunk. Source-backed missing-input waits retain their exact cause;
+    /// inventory-backed waits remain indexed by their addressed transfer endpoints.
     pub(super) fn paused_records_for_chunks(
         &self,
         dimension: &str,
@@ -537,15 +632,16 @@ impl ResidentOrderLedger {
             .filter(|record| {
                 record.work.as_ref().is_some_and(|work| {
                     work.state == ScriptWorkState::Paused
-                        && matches!(
-                            work.reason,
+                        && match work.reason {
                             Some(
                                 ScriptWorkPauseReason::Unloaded
-                                    | ScriptWorkPauseReason::MissingStation
-                                    | ScriptWorkPauseReason::Protected
-                                    | ScriptWorkPauseReason::BlockedRoute
-                            )
-                        )
+                                | ScriptWorkPauseReason::MissingStation
+                                | ScriptWorkPauseReason::Protected
+                                | ScriptWorkPauseReason::BlockedRoute,
+                            ) => true,
+                            Some(ScriptWorkPauseReason::MissingInput) => work.world_input_wait,
+                            _ => false,
+                        }
                 })
             })
             .cloned()
@@ -606,14 +702,14 @@ impl ResidentOrderLedger {
             .filter(|record| {
                 record.work.as_ref().is_some_and(|work| {
                     work.state == ScriptWorkState::Paused
-                        && matches!(
-                            work.reason,
+                        && match work.reason {
                             Some(
                                 ScriptWorkPauseReason::MissingTool
-                                    | ScriptWorkPauseReason::MissingInput
-                                    | ScriptWorkPauseReason::NoStorage
-                            )
-                        )
+                                | ScriptWorkPauseReason::NoStorage,
+                            ) => true,
+                            Some(ScriptWorkPauseReason::MissingInput) => !work.world_input_wait,
+                            _ => false,
+                        }
                 })
             })
             .cloned()
@@ -667,7 +763,8 @@ impl ResidentOrderLedger {
         change: &DurableResidentOrderChange,
     ) -> Result<(), PluginStorageStartError> {
         match change {
-            DurableResidentOrderChange::Record { record } => {
+            DurableResidentOrderChange::Record { record }
+            | DurableResidentOrderChange::CombatProgress { record } => {
                 if let Some(existing) = self.records.get(&record.handle)
                     && existing.revision >= record.revision
                 {
@@ -677,9 +774,33 @@ impl ResidentOrderLedger {
                 }
                 if let Some(existing) = self.records.get(&record.handle).cloned() {
                     self.unindex_paused_work(&existing);
+                    self.active_attacks.remove(&existing.handle);
+                    self.active_morale.remove(&existing.handle);
                 }
                 let record = (**record).clone();
                 self.index_paused_work(&record);
+                if record.morale.as_ref().is_some_and(|morale| {
+                    !matches!(
+                        morale.phase,
+                        MoralePhase::Rallied | MoralePhase::Surrendered
+                    ) || !morale.goal_applied
+                }) {
+                    self.active_morale.insert(record.handle.clone());
+                }
+                if record.order.as_ref().is_some_and(|order| {
+                    matches!(order.order, ScriptResidentOrder::Attack { .. })
+                        && order.active_target_ref.is_some()
+                        && record.morale.as_ref().is_none_or(|morale| {
+                            !matches!(
+                                morale.phase,
+                                MoralePhase::Routing
+                                    | MoralePhase::Rallied
+                                    | MoralePhase::Surrendered
+                            )
+                        })
+                }) {
+                    self.active_attacks.insert(record.handle.clone());
+                }
                 self.records.insert(record.handle.clone(), record);
             }
             DurableResidentOrderChange::Admission { admission } => {
@@ -944,6 +1065,9 @@ impl PluginStorage {
                 mc_script::ScriptResidentOrderResult::Demobilized { resident } => {
                     resident.revision = transaction_id;
                 }
+                mc_script::ScriptResidentOrderResult::Captured { revision, .. } => {
+                    *revision = transaction_id;
+                }
                 // The closed result union is non-exhaustive to plugins; the
                 // durable revision is written for every variant this core owns.
                 _ => {}
@@ -976,6 +1100,7 @@ impl PluginStorage {
                 resident: Vec::new(),
                 settlement: Vec::new(),
                 order: changes,
+                treatment: None,
             },
         ))
     }
@@ -1000,7 +1125,12 @@ impl PluginStorage {
         let outcome = mc_script::ScriptOperationOutcome::committed(transaction_id, payload)
             .map_err(|error| PluginStorageMutationError::Io(std::io::Error::other(error)))?;
         for change in &mut changes {
-            change.set_revision(transaction_id);
+            let DurableResidentOrderChange::Record { record } = change else {
+                unreachable!("a gear batch changes resident gear records only");
+            };
+            // A gear-only decision changes the inventory fence, not an
+            // existing work or squad-order fence or the job it represents.
+            record.revision = transaction_id;
         }
         let receipt = super::operations::DurableOperationReceipt {
             plugin_id: plugin_id.to_owned(),
@@ -1026,6 +1156,7 @@ impl PluginStorage {
                 resident: Vec::new(),
                 settlement: Vec::new(),
                 order: changes,
+                treatment: None,
             },
         ))
     }

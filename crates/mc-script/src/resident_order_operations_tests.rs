@@ -172,11 +172,21 @@ fn patrol_and_attack_orders_are_bounded_and_closed() {
     assert!(too_many.is_err());
     let empty_attack = issue(ScriptResidentOrder::Attack {
         targets: Vec::new(),
-        policy: ScriptEngagementPolicy::new(1, Vec::new(), vec![ScriptHostileCategory::Hostile]),
+        policy: {
+            let mut policy =
+                ScriptEngagementPolicy::new(1, Vec::new(), vec![ScriptHostileCategory::Hostile]);
+            policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+            policy
+        },
     });
     assert!(empty_attack.is_err());
     // Player targets are only hostile when the policy explicitly permits them.
-    let policy = ScriptEngagementPolicy::new(1, Vec::new(), vec![ScriptHostileCategory::Hostile]);
+    let policy = {
+        let mut policy =
+            ScriptEngagementPolicy::new(1, Vec::new(), vec![ScriptHostileCategory::Hostile]);
+        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+        policy
+    };
     let request = issue(ScriptResidentOrder::Attack {
         targets: vec![ScriptOrderTargetRef::new("t1".to_owned(), 1, 64)],
         policy,
@@ -286,6 +296,49 @@ fn order_results_carry_member_reasons_and_committed_combat() {
         Some(crate::ScriptOperationFailure::Forbidden)
     );
     assert!(outcome.validate().is_ok());
+}
+
+#[test]
+fn pre_upgrade_target_bearing_order_receipt_remains_readable() {
+    let outcome = ScriptOperationOutcome::committed(
+        12,
+        ScriptOperationPayload::ResidentOrder {
+            result: Box::new(ScriptResidentOrderResult::Order {
+                order_revision: 12,
+                members: vec![crate::ScriptOrderMemberOutcome::new(
+                    "a".repeat(32),
+                    crate::ScriptOrderMemberState::Applied,
+                    Some(0),
+                    vec![crate::ScriptOrderTarget::new(
+                        "issued-target".to_owned(),
+                        0,
+                        44,
+                        ScriptHostileCategory::Hostile,
+                        ScriptBlockPosition::new(3, 64, 5),
+                    )],
+                )],
+                combat: Vec::new(),
+            }),
+        },
+    )
+    .expect("old committed result");
+    let mut old = serde_json::to_value(outcome).expect("serializes");
+    let target = old["payload"]["result"]["members"][0]["targets"][0]
+        .as_object_mut()
+        .expect("serialized target");
+    target.remove("policy_revision");
+    target.remove("expires_revision");
+    let restored: ScriptOperationOutcome =
+        serde_json::from_value(old).expect("old durable receipt decodes");
+    restored.validate().expect("old receipt stays valid");
+    let ScriptOperationPayload::ResidentOrder { result } = restored.payload() else {
+        panic!("order receipt");
+    };
+    let ScriptResidentOrderResult::Order { members, .. } = &**result else {
+        panic!("order result");
+    };
+    assert_eq!(members[0].targets[0].policy_revision, 0);
+    assert_eq!(members[0].targets[0].expires_revision, 0);
 }
 
 #[test]

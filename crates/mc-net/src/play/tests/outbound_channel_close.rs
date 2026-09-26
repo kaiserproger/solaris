@@ -60,6 +60,7 @@ async fn play_loop_exits_when_outbound_channel_closes() {
             pose,
             respawn,
             CommandPermissions::from_op(false),
+            "127.0.0.1:40000".parse().unwrap(),
             SurvivalState::FULL,
             XpState::default(),
             GameMode::Survival,

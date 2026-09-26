@@ -143,6 +143,29 @@ interface client-presentation {
         view-instance-id: string,
     }
 
+    /// Arm one single-use world selection for an action on this exact view
+    /// revision. The host returns a context id only after the manifest's
+    /// world-selection grant and the live owner accept it. A later view
+    /// replacement invalidates that context.
+    record begin-client-selection {
+        request: string,
+        session: session-id,
+        view-instance-id: string,
+        view-revision: u64,
+        action-id: string,
+        dimension: string,
+        range-limit: u32,
+        ttl-ticks: u64,
+        formation: option<view-formation>,
+        radius: option<f64>,
+    }
+
+    /// Explicitly retire one context belonging to this live session.
+    record cancel-client-selection {
+        session: session-id,
+        selection-context-id: string,
+    }
+
     /// One sound this plugin owns, played on one live session's client.
     ///
     /// The sound id must be namespaced to this plugin and the Loader manifest
@@ -204,6 +227,8 @@ interface client-presentation {
         open-client-view(open-client-view),
         present-client-view(present-client-view),
         close-client-view(close-client-view),
+        begin-client-selection(begin-client-selection),
+        cancel-client-selection(cancel-client-selection),
         play-client-sound(play-client-sound),
         stop-client-sound(stop-client-sound),
         grant-loader-block-item(grant-loader-block-item),

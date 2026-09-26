@@ -157,6 +157,7 @@ fn chest_inventory_unknown_commit_fail_stops_native_world_mutations() {
     let native = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         mutation.commit_chests_conditionally(
             &[position],
+            None,
             &[fixture.changes[0].expected.clone()],
             &[ChestBlockEntity::default()],
         )
@@ -210,4 +211,83 @@ fn chest_inventory_accepts_lazy_empty_chests_but_not_removed_containers() {
         ),
         Err(ResidentBlockEditBatchResult::Stale)
     ));
+}
+
+#[test]
+fn structure_and_material_chest_share_one_durable_cross_region_decision() {
+    let mut fixture = fixture();
+    let build_position = BlockPos { x: 129, y: 2, z: 3 };
+    let build_precondition = ResidentBlockPrecondition {
+        pos: build_position,
+        expected_state: BlockStateId(0),
+        expected_token: fixture.world.block_mutation_token(build_position).unwrap(),
+    };
+    let build = ResidentBlockEdit {
+        pos: build_position,
+        new_state: BlockStateId(1),
+        preserve_light: false,
+    };
+    let mut debit = fixture.changes[0].clone();
+    debit.updated.slots[0].count = 2;
+    let mutation = fixture.world.mutation_view();
+
+    let rejected = mutation
+        .prepare_structure_chest_inventory_transaction(
+            std::slice::from_ref(&build),
+            std::slice::from_ref(&build_precondition),
+            &debit,
+            &fixture.preconditions[0],
+            7,
+            None,
+        )
+        .unwrap_or_else(|_| panic!("valid structure material transaction"));
+    assert!(matches!(
+        rejected.commit_durably_classified(|_| Err("not written"), |_| false),
+        ResidentCrossRegionScheduledBlockTickCommitResult::DurabilityFailed(_)
+    ));
+    assert_eq!(
+        fixture.world.get_cached_block(build_position),
+        Some(BlockStateId(0)),
+        "a failed receipt cannot place structure blocks"
+    );
+    assert_eq!(
+        fixture.world.chest_block_entity(debit.position).unwrap(),
+        Some(debit.expected.clone()),
+        "a failed receipt cannot debit materials"
+    );
+
+    let transaction = mutation
+        .prepare_structure_chest_inventory_transaction(
+            std::slice::from_ref(&build),
+            std::slice::from_ref(&build_precondition),
+            &debit,
+            &fixture.preconditions[0],
+            8,
+            None,
+        )
+        .unwrap_or_else(|_| panic!("retry after failed receipt keeps both sources reusable"));
+    let mut journal_chunks = 0;
+    assert!(matches!(
+        transaction.commit_durably_classified(
+            |snapshots| {
+                journal_chunks = snapshots.len();
+                Ok::<_, ()>(())
+            },
+            |_| false,
+        ),
+        ResidentCrossRegionScheduledBlockTickCommitResult::Applied(_)
+    ));
+    assert_eq!(
+        journal_chunks, 2,
+        "one receipt includes both the structure and material-container chunks"
+    );
+    assert_eq!(
+        fixture.world.get_cached_block(build_position),
+        Some(BlockStateId(1))
+    );
+    assert_eq!(
+        fixture.world.chest_block_entity(debit.position).unwrap(),
+        Some(debit.updated),
+        "the durable decision applies the exact planned material debit"
+    );
 }

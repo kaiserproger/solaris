@@ -31,8 +31,8 @@ pub(in crate::play) use chest::{
 };
 pub(in crate::play) use crafting::{
     CRAFTING_MENU_TYPE_ID, CraftingTableWindow, crafting_menu_title_nbt,
-    crafting_table_input_from_projection, crafting_table_input_projection, crafting_wire_items,
-    refresh_crafting_result,
+    crafting_remainder_for_item, crafting_table_input_from_projection,
+    crafting_table_input_projection, crafting_wire_items, refresh_crafting_result,
 };
 #[cfg(test)]
 pub(in crate::play) use crafting::{

@@ -76,6 +76,7 @@ async fn play_loop_closes_session_when_direct_response_write_stalls() {
             pose,
             respawn,
             CommandPermissions::from_op(false),
+            "127.0.0.1:40000".parse().unwrap(),
             SurvivalState::FULL,
             XpState::default(),
             GameMode::Survival,

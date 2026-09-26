@@ -64,6 +64,22 @@ interface lifecycle {
         groups: list<spawn-group>,
     }
 
+    /// Canonical server identity and the vanilla packet carrier for one item.
+    /// The carrier is presentation only: gameplay uses the declaration below.
+    record item-definition {
+        id: string,
+        carrier: string,
+        name: string,
+        max-stack-size: u32,
+        max-damage: option<u32>,
+        weapon: bool,
+        attack-damage-modifier: option<f32>,
+        attack-speed-modifier: option<f32>,
+        equippable-slot: option<string>,
+        /// An optional one-input shapeless recipe (vanilla or owned item id).
+        crafting-ingredient: option<string>,
+    }
+
     /// The normalized startup contribution. Only the categories the package sets
     /// are present; the host rejects a contribution that sets none.
     record startup-contribution {
@@ -73,6 +89,9 @@ interface lifecycle {
         clay: option<clay-rules>,
         /// At most 64 biomes.
         spawning: option<list<spawn-rules>>,
+        /// At most 16 identities owned by this plugin. The host checks that
+        /// their matching Loader bundle declared `register_items` before use.
+        items: option<list<item-definition>>,
     }
 
     /// Values the host fixes for the instance, independent of the package.

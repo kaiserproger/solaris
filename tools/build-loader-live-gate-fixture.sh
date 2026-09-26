@@ -94,6 +94,16 @@ build_owner() {
     require_asset "$source_root/$block_path"
     require_asset "$plugin_root/plugin.toml.in"
 
+    local extra_asset_args=()
+    if [[ "$owner" == "ruby-live" ]]; then
+        local blade_path="assets/$owner/items/blade.json"
+        require_asset "$source_root/$blade_path"
+        extra_asset_args=(
+            -e "s/@BLADE_SHA256@/$(sha256 "$source_root/$blade_path")/g"
+            -e "s/@BLADE_SIZE@/$(stat -c %s "$source_root/$blade_path")/g"
+        )
+    fi
+
     mkdir -p "$stage_root"
     cp -R "$source_root/assets" "$stage_root/assets"
 
@@ -102,6 +112,7 @@ build_owner() {
         -e "s/@ITEM_SIZE@/$(stat -c %s "$source_root/$item_path")/g" \
         -e "s/@BLOCK_SHA256@/$(sha256 "$source_root/$block_path")/g" \
         -e "s/@BLOCK_SIZE@/$(stat -c %s "$source_root/$block_path")/g" \
+        "${extra_asset_args[@]}" \
         "$source_root/solaris-client.json.in" > "$stage_root/solaris-client.json"
 
     find "$stage_root" -type f -exec chmod 0644 {} +

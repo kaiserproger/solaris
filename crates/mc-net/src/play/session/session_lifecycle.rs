@@ -52,7 +52,8 @@ impl SessionRegistry {
             pose,
             game_mode: GameMode::Survival,
             max_sessions: usize::MAX,
-            script_operator: false,
+            script_permissions: crate::server::CommandPermissionConfig::default(),
+            peer: "127.0.0.1:40000".parse().unwrap(),
             dimension: "minecraft:overworld",
             loader_session: None,
         })
@@ -137,7 +138,8 @@ impl SessionRegistry {
                     super::script_inventory_transaction_endpoint::ScriptInventoryTransactionGate::new(
                     ),
                 ),
-                script_operator: registration.script_operator,
+                script_permissions: registration.script_permissions,
+                peer: registration.peer,
                 dimension: registration.dimension.to_owned(),
                 loader_session: registration.loader_session,
                 last_broadcast_world_time: None,

@@ -23,6 +23,7 @@ async fn initial_play_sync_sends_recipe_update_once_before_recipe_book_packets()
         &profile,
         &[],
         CommandPermissions { op: false },
+        "127.0.0.1:40000".parse().unwrap(),
         &config,
         crate::server::ConnectionWorld::default(),
         sessions,

@@ -1,10 +1,10 @@
 use super::{
-    BlockRegistry, BlockStateId, Chunk, ChunkPipelineResources, ChunkPos, Identifier,
-    LoggedInProfile, PlayerPose, ResidentBlockCommit, ScheduledBlockTick, ServerConfig,
-    SessionRegistry, SimulationWorldAccess, button_and_door_test_registry, button_test_registry,
-    commit_cross_region_scheduled_block_tick, commit_resident_block_edits, in_memory_button_world,
-    play_loop_slow_client_test_config, register_loaded_button_session,
-    register_ticketed_button_session, simulation_channel,
+    BlockRegistry, BlockStateId, Chunk, ChunkPipelineResources, ChunkPos,
+    CrossRegionScheduledBlockTickContext, Identifier, LoggedInProfile, PlayerPose,
+    ResidentBlockCommit, ScheduledBlockTick, ServerConfig, SessionRegistry, SimulationWorldAccess,
+    button_and_door_test_registry, button_test_registry, commit_cross_region_scheduled_block_tick,
+    commit_resident_block_edits, in_memory_button_world, play_loop_slow_client_test_config,
+    register_loaded_button_session, register_ticketed_button_session, simulation_channel,
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -573,7 +573,11 @@ async fn cross_region_scheduled_task_finishes_while_journal_writer_is_blocked() 
                 leaf_trigger_tick: None,
             },
             None,
-            None,
+            CrossRegionScheduledBlockTickContext {
+                material_debit: None,
+                zone_fence: None,
+                hook_approval: None,
+            },
         )
         .await
     });
@@ -678,7 +682,11 @@ async fn known_cross_region_append_failure_closes_reserved_decision_empty() {
             leaf_trigger_tick: None,
         },
         None,
-        None,
+        CrossRegionScheduledBlockTickContext {
+            material_debit: None,
+            zone_fence: None,
+            hook_approval: None,
+        },
     )
     .await
     .expect("known append failure closes its reservation")

@@ -1,3 +1,4 @@
+use super::containers::crafting_remainder_for_item;
 use super::*;
 use mc_protocol::packets::play::{
     ClientboundRecipeBookAdd, ClientboundUpdateRecipes, RecipeBookDisplay, RecipeBookEntry,
@@ -30,7 +31,7 @@ pub(super) fn stonecutter_recipe_entry(
     if recipe.result.item.as_str() == "minecraft:air" {
         return None;
     }
-    let result = recipe.result.to_stack(items)?;
+    let result = recipe.result.to_stack(items, item_facts)?;
     if result.count > item_max_stack(item_facts, items, &result) {
         return None;
     }
@@ -43,11 +44,12 @@ pub(super) fn stonecutter_recipe_entry(
 pub(super) fn initial_recipe_book(
     recipes: &[mc_data::recipes::Recipe],
     items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
 ) -> ClientboundRecipeBookAdd {
     let entries = recipes
         .iter()
         .enumerate()
-        .filter_map(|(display_id, recipe)| recipe_book_entry(display_id, recipe, items))
+        .filter_map(|(display_id, recipe)| recipe_book_entry(display_id, recipe, items, item_facts))
         .collect();
     ClientboundRecipeBookAdd {
         entries,
@@ -59,18 +61,19 @@ fn recipe_book_entry(
     display_id: usize,
     recipe: &mc_data::recipes::Recipe,
     items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
 ) -> Option<RecipeBookEntry> {
     let display_id = i32::try_from(display_id).ok()?;
-    let result = RecipeBookSlotDisplay::ItemStack(recipe.result.to_stack(items)?);
+    let result = RecipeBookSlotDisplay::ItemStack(recipe.result.to_stack(items, item_facts)?);
 
     let (display, category_id, crafting_requirements) = match &recipe.kind {
         mc_data::recipes::RecipeKind::Shapeless(shapeless) => {
             let ingredients = shapeless
                 .ingredients
                 .iter()
-                .map(|ingredient| recipe_book_slot(ingredient, items))
+                .map(|ingredient| recipe_book_slot(ingredient, items, item_facts))
                 .collect::<Option<Vec<_>>>()?;
-            let requirements = recipe_book_requirements(&shapeless.ingredients, items);
+            let requirements = recipe_book_requirements(&shapeless.ingredients, items, item_facts);
             let crafting_station = named_recipe_book_item(items, "minecraft:crafting_table")?;
             (
                 RecipeBookDisplay::Shapeless {
@@ -99,12 +102,12 @@ fn recipe_book_entry(
                         ingredients.push(RecipeBookSlotDisplay::Empty);
                     } else {
                         let ingredient = shaped.key.get(&key)?;
-                        ingredients.push(recipe_book_slot(ingredient, items)?);
+                        ingredients.push(recipe_book_slot(ingredient, items, item_facts)?);
                         requirement_sources.push(ingredient.clone());
                     }
                 }
             }
-            let requirements = recipe_book_requirements(&requirement_sources, items);
+            let requirements = recipe_book_requirements(&requirement_sources, items, item_facts);
             let crafting_station = named_recipe_book_item(items, "minecraft:crafting_table")?;
             (
                 RecipeBookDisplay::Shaped {
@@ -119,22 +122,28 @@ fn recipe_book_entry(
             )
         }
         mc_data::recipes::RecipeKind::Smelting(cooking) => (
-            recipe_book_cooking_display(cooking, result, items, "minecraft:furnace")?,
+            recipe_book_cooking_display(cooking, result, items, item_facts, "minecraft:furnace")?,
             6,
             None,
         ),
         mc_data::recipes::RecipeKind::Blasting(cooking) => (
-            recipe_book_cooking_display(cooking, result, items, "minecraft:blast_furnace")?,
+            recipe_book_cooking_display(
+                cooking,
+                result,
+                items,
+                item_facts,
+                "minecraft:blast_furnace",
+            )?,
             8,
             None,
         ),
         mc_data::recipes::RecipeKind::Smoking(cooking) => (
-            recipe_book_cooking_display(cooking, result, items, "minecraft:smoker")?,
+            recipe_book_cooking_display(cooking, result, items, item_facts, "minecraft:smoker")?,
             9,
             None,
         ),
         mc_data::recipes::RecipeKind::CampfireCooking(cooking) => (
-            recipe_book_cooking_display(cooking, result, items, "minecraft:campfire")?,
+            recipe_book_cooking_display(cooking, result, items, item_facts, "minecraft:campfire")?,
             12,
             None,
         ),
@@ -160,15 +169,27 @@ fn named_recipe_book_item(items: &ItemRegistry, name: &str) -> Option<RecipeBook
 fn recipe_book_slot(
     ingredient: &mc_data::recipes::Ingredient,
     items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
 ) -> Option<RecipeBookSlotDisplay> {
     let mut alternatives = ingredient
         .alternatives
         .iter()
         .map(|alternative| match alternative {
-            mc_data::recipes::IngredientAlternative::Item(item) => items
-                .id_of(item)
-                .and_then(|item_id| i32::try_from(item_id).ok())
-                .map(|item_id| RecipeBookSlotDisplay::Item { item_id }),
+            mc_data::recipes::IngredientAlternative::Item(item) => {
+                if let Some(custom) = item_facts.custom(item) {
+                    let item_id = items.id_of(&custom.carrier)?;
+                    Some(RecipeBookSlotDisplay::ItemStack(
+                        ItemStack::new(item_id, 1)
+                            .with_item_model(custom.id.clone())
+                            .with_custom_name(&custom.name),
+                    ))
+                } else {
+                    items
+                        .id_of(item)
+                        .and_then(|item_id| i32::try_from(item_id).ok())
+                        .map(|item_id| RecipeBookSlotDisplay::Item { item_id })
+                }
+            }
             mc_data::recipes::IngredientAlternative::Tag(tag) => {
                 Some(RecipeBookSlotDisplay::Tag(tag.clone()))
             }
@@ -184,10 +205,19 @@ fn recipe_book_slot(
 fn recipe_book_requirements(
     ingredients: &[mc_data::recipes::Ingredient],
     items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
 ) -> Option<Vec<RecipeBookIngredient>> {
     ingredients
         .iter()
-        .map(|ingredient| recipe_book_requirement(ingredient, items))
+        .map(|ingredient| {
+            if ingredient.alternatives.iter().any(|alternative| {
+                matches!(alternative, mc_data::recipes::IngredientAlternative::Item(item) if item_facts.custom(item).is_some())
+            }) {
+                None
+            } else {
+                recipe_book_requirement(ingredient, items)
+            }
+        })
         .collect()
 }
 
@@ -216,10 +246,11 @@ fn recipe_book_cooking_display(
     recipe: &mc_data::recipes::SmeltingRecipe,
     result: RecipeBookSlotDisplay,
     items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
     station: &str,
 ) -> Option<RecipeBookDisplay> {
     Some(RecipeBookDisplay::Furnace {
-        ingredient: recipe_book_slot(&recipe.ingredient, items)?,
+        ingredient: recipe_book_slot(&recipe.ingredient, items, item_facts)?,
         fuel: RecipeBookSlotDisplay::AnyFuel,
         result,
         crafting_station: named_recipe_book_item(items, station)?,
@@ -289,7 +320,13 @@ fn matching_ingredient_slot(
     for (slot, available_count) in available.iter().enumerate().take(45).skip(9) {
         let current = &inventory.slots[slot];
         if *available_count > 0
-            && ingredient_accepts_item(&state.items, &state.tags, current.item_id, ingredient)
+            && mc_data::recipes::ingredient_accepts_stack(
+                &state.items,
+                &state.item_facts,
+                &state.tags,
+                current,
+                ingredient,
+            )
         {
             return Some(slot);
         }
@@ -329,16 +366,18 @@ fn inventory_has_room_for_output(
     false
 }
 
+type CraftingStepChanges = (Vec<(usize, ItemStack)>, Vec<ItemStack>);
+
 fn craft_recipe_once(
     state: &InteractionState,
     inventory: &mut PlayerInventory,
     recipe: &mc_data::recipes::Recipe,
-) -> Option<Vec<(usize, ItemStack)>> {
+) -> Option<CraftingStepChanges> {
     let ingredients = recipe_ingredients(recipe)?;
     if ingredients.is_empty() {
         return None;
     }
-    let output = recipe.result.to_stack(&state.items)?;
+    let output = recipe.result.to_stack(&state.items, &state.item_facts)?;
     if !inventory_has_room_for_output(state, inventory, &output) {
         return None;
     }
@@ -351,14 +390,19 @@ fn craft_recipe_once(
         consumed_slots.push(slot);
     }
 
+    let mut remainders = Vec::new();
     let mut changed = BTreeMap::new();
     for slot in consumed_slots {
         let current = &mut inventory.slots[slot];
+        let item_id = current.item_id;
         current.count -= 1;
         if current.count <= 0 {
             *current = ItemStack::EMPTY;
         }
         changed.insert(slot, current.clone());
+        if let Some(remainder) = crafting_remainder_for_item(&state.items, item_id) {
+            remainders.push(remainder);
+        }
     }
 
     let max_stack = item_max_stack(&state.item_facts, &state.items, &output);
@@ -369,7 +413,18 @@ fn craft_recipe_once(
     for (slot, stack) in output_changed {
         changed.insert(slot, stack);
     }
-    Some(changed.into_iter().collect())
+    let mut overflow = Vec::new();
+    for remainder in remainders {
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &remainder);
+        let (remaining, slots) = inventory.merge_stack(remainder, max_stack);
+        for (slot, stack) in slots {
+            changed.insert(slot, stack);
+        }
+        if !remaining.is_empty() {
+            overflow.push(remaining);
+        }
+    }
+    Some((changed.into_iter().collect(), overflow))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +451,7 @@ impl CraftedItem {
 pub(super) struct CraftRecipeOutcome {
     pub(super) changed_slots: Vec<(usize, ItemStack)>,
     pub(super) crafted: CraftedItem,
+    pub(super) overflow_remainders: Vec<ItemStack>,
 }
 
 pub(super) fn craft_recipe(
@@ -403,14 +459,19 @@ pub(super) fn craft_recipe(
     recipe: &mc_data::recipes::Recipe,
     use_max_items: bool,
 ) -> Option<(PlayerInventory, CraftRecipeOutcome)> {
-    let item_id = state.items.id_of(&recipe.result.item)?;
+    let item_id = recipe
+        .result
+        .to_stack(&state.items, &state.item_facts)?
+        .item_id;
     let mut inventory = state.inventory.clone();
     if !use_max_items {
-        let changed_slots = craft_recipe_once(state, &mut inventory, recipe)?;
+        let (changed_slots, overflow_remainders) =
+            craft_recipe_once(state, &mut inventory, recipe)?;
         return Some((
             inventory,
             CraftRecipeOutcome {
                 changed_slots,
+                overflow_remainders,
                 crafted: CraftedItem {
                     item_id,
                     count: u64::from(recipe.result.count),
@@ -428,12 +489,14 @@ pub(super) fn craft_recipe(
         })
         .fold(0usize, usize::saturating_add);
     let mut all_changed = BTreeMap::new();
+    let mut overflow_remainders = Vec::new();
     let mut craft_count = 0_u32;
     for _ in 0..max_crafts {
-        let Some(changed) = craft_recipe_once(state, &mut inventory, recipe) else {
+        let Some((changed, overflow)) = craft_recipe_once(state, &mut inventory, recipe) else {
             break;
         };
         craft_count += 1;
+        overflow_remainders.extend(overflow);
         for (slot, stack) in changed {
             all_changed.insert(slot, stack);
         }
@@ -444,6 +507,7 @@ pub(super) fn craft_recipe(
             inventory,
             CraftRecipeOutcome {
                 changed_slots: all_changed.into_iter().collect(),
+                overflow_remainders,
                 crafted: CraftedItem {
                     item_id,
                     count,
@@ -624,7 +688,7 @@ mod tests {
             },
         ];
 
-        let packet = initial_recipe_book(&recipes, &items);
+        let packet = initial_recipe_book(&recipes, &items, &ItemFactsTable::default());
 
         assert!(packet.replace);
         assert_eq!(
@@ -691,7 +755,7 @@ mod tests {
 
         let recipes = mc_data::recipes::solaris_required_recipes();
         let items = mc_data::items::solaris_required_items();
-        let packet = initial_recipe_book(&recipes, &items);
+        let packet = initial_recipe_book(&recipes, &items, &ItemFactsTable::default());
         // Stonecutting has no book display; everything else must survive.
         let unsupported = recipes
             .iter()
@@ -704,5 +768,114 @@ mod tests {
         let back = ClientboundRecipeBookAdd::decode(&mut wire.as_slice())
             .expect("full baseline round-trips");
         assert_eq!(back, packet);
+    }
+
+    #[test]
+    fn recipe_book_craft_preserves_bucket_remainder_when_inventory_is_full() {
+        let milk = id("minecraft:milk_bucket");
+        let output = id("minecraft:test_output");
+        let items = std::sync::Arc::new(ItemRegistry::from_report(&[
+            item("minecraft:milk_bucket", 1),
+            item("minecraft:bucket", 2),
+            item("minecraft:test_output", 3),
+            item("minecraft:dirt", 4),
+        ]));
+        let mut state = crate::play::tests::interaction_state_for_items(items);
+        for slot in 9..=44 {
+            state.inventory.slots[slot] = ItemStack::new(4, 64);
+        }
+        state.inventory.slots[9] = ItemStack::new(1, 2);
+        state.inventory.slots[10] = ItemStack::new(3, 63);
+        let recipe = Recipe {
+            id: id("minecraft:test_bucket_recipe"),
+            kind: RecipeKind::Shapeless(ShapelessRecipe {
+                ingredients: vec![Ingredient {
+                    alternatives: vec![IngredientAlternative::Item(milk)],
+                }],
+            }),
+            result: RecipeResult {
+                item: output,
+                count: 1,
+                stew_effects: Vec::new(),
+            },
+        };
+
+        let (inventory, outcome) = craft_recipe(&state, &recipe, false).unwrap();
+        assert_eq!(inventory.slots[9], ItemStack::new(1, 1));
+        assert_eq!(inventory.slots[10], ItemStack::new(3, 64));
+        assert_eq!(outcome.overflow_remainders, vec![ItemStack::new(2, 1)]);
+    }
+    #[test]
+    fn custom_item_recipe_book_keeps_identity_and_never_autofills_a_paper_carrier() {
+        use mc_data::item_components::{CustomItemDefinition, ItemFacts};
+        use mc_protocol::packets::Packet;
+
+        let ruby = id("ruby-live:ruby");
+        let blade = id("ruby-live:blade");
+        let items = ItemRegistry::from_report(&[
+            item("minecraft:paper", 1),
+            item("minecraft:crafting_table", 2),
+        ]);
+        let facts = ItemFactsTable::default()
+            .with_custom_items(
+                [
+                    CustomItemDefinition {
+                        id: ruby.clone(),
+                        carrier: id("minecraft:paper"),
+                        name: "Ruby".to_owned(),
+                        crafting_ingredient: Some(id("minecraft:paper")),
+                        facts: ItemFacts {
+                            max_stack_size: Some(16),
+                            ..ItemFacts::default()
+                        },
+                    },
+                    CustomItemDefinition {
+                        id: blade.clone(),
+                        carrier: id("minecraft:paper"),
+                        name: "Ruby Blade".to_owned(),
+                        crafting_ingredient: Some(ruby.clone()),
+                        facts: ItemFacts {
+                            max_stack_size: Some(1),
+                            max_damage: Some(3),
+                            ..ItemFacts::default()
+                        },
+                    },
+                ],
+                &items,
+            )
+            .unwrap();
+        let recipe = Recipe {
+            id: blade.clone(),
+            kind: RecipeKind::Shapeless(ShapelessRecipe {
+                ingredients: vec![Ingredient {
+                    alternatives: vec![IngredientAlternative::Item(ruby.clone())],
+                }],
+            }),
+            result: RecipeResult {
+                item: blade.clone(),
+                count: 1,
+                stew_effects: Vec::new(),
+            },
+        };
+        let packet = initial_recipe_book(&[recipe], &items, &facts);
+        let mut wire = Vec::new();
+        packet.encode(&mut wire).unwrap();
+        let decoded = ClientboundRecipeBookAdd::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(decoded.entries.len(), 1);
+        assert!(decoded.entries[0].crafting_requirements.is_none());
+        let RecipeBookDisplay::Shapeless {
+            ingredients,
+            result,
+            ..
+        } = &decoded.entries[0].display
+        else {
+            panic!("expected shapeless client display");
+        };
+        assert!(
+            matches!(&ingredients[0], RecipeBookSlotDisplay::ItemStack(stack)
+            if stack.item_model.as_deref() == Some(&ruby))
+        );
+        assert!(matches!(result, RecipeBookSlotDisplay::ItemStack(stack)
+            if stack.item_model.as_deref() == Some(&blade)));
     }
 }

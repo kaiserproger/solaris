@@ -22,7 +22,7 @@
 // grants. Nothing in this interface invents a second vocabulary for the same
 // field.
 interface residents {
-    use inventories.{inventory-endpoint};
+    use inventories.{inventory-endpoint, inventory-material};
 
     /// One integer block coordinate.
     ///
@@ -187,16 +187,44 @@ interface residents {
         expected-revision: u64,
     }
 
-    /// One durable resident call.
+    /// Spend one bound warehouse material and heal this loaded resident.
+    record resident-treat {
+        operation-id: string,
+        handle: string,
+        expected-revision: u64,
+        source: inventory-endpoint,
+        material: inventory-material,
+        heal-milli: u32,
+    }
+
+    /// Read at most `mc_script::MAX_RESIDENT_QUERY_HANDLES` owner-scoped handles.
+    /// An empty list reads a bounded page; an explicit handle must exist and
+    /// belong to this plugin. This read has no durable operation id and observes
+    /// death before returning the server's current lifecycle.
+    record resident-query {
+        handles: list<string>,
+        cursor: option<string>,
+    }
+
+    record resident-page {
+        residents: list<resident-snapshot>,
+        cursor: option<string>,
+    }
+
+    /// One resident mutation or bounded read.
     variant resident-operation {
         claim(resident-claim),
         spawn(resident-spawn),
         set-pois(resident-set-pois),
+        query(resident-query),
+        treat(resident-treat),
     }
 
-    /// The answer to one resident call: the resident as the server now holds it.
+    /// The server's one resident or an owner-scoped page of snapshots.
     variant resident-result {
         snapshot(resident-snapshot),
+        page(resident-page),
+        treated(string),
     }
 
     /// One bounded axis-aligned work area the engine executes against.
@@ -244,11 +272,13 @@ interface residents {
 
     /// One craft: consume the recipe's inputs and produce its output.
     ///
-    /// `station` is one loaded crafting-table cell the native engine verifies
-    /// before consuming inputs. At most `mc_script::MAX_WORK_UNITS` (4096)
-    /// units are craftable in one order, and the recipe must be one the server's
-    /// own registry knows. The inputs are consumed exactly once: a worker
-    /// missing them pauses with `missing_input` and nothing is consumed.
+    /// `station` is one loaded stateless station cell whose capability matches
+    /// the recipe (crafting table, campfire, or stonecutter). Furnace-backed
+    /// recipes stay in the core furnace fuel/burn state machine. At most
+    /// `mc_script::MAX_WORK_UNITS` (4096) units are craftable in one order, and
+    /// the recipe must be one the server's own registry knows. The inputs,
+    /// output and applicable remainders commit exactly once; missing inputs or
+    /// recipient capacity leave them untouched.
     record craft-work {
         recipe: string,
         count: u32,
@@ -320,6 +350,10 @@ interface residents {
         revision: u64,
         allies: list<string>,
         permitted: list<hostile-category>,
+        /// Serving resident handle whose physical presence may rally this group.
+        officer: option<string>,
+        /// Separate, route-validated safe point required for every attack.
+        rally: block-position,
     }
 
     /// One opaque, server-issued target reference.
@@ -445,15 +479,28 @@ interface residents {
         expected-order-revisions: list<u64>,
     }
 
-    /// One demobilisation: turn a serving resident back into a civilian.
+    /// One fenced demobilisation transition for a serving resident.
     ///
-    /// The server returns the serving gear to the resident's own containers and
-    /// keeps the handle and the housing, so a demobilised resident is still the
-    /// plugin's resident. A resident that cannot hand its gear anywhere stays
-    /// `demobilizing` with the gear and a typed reason instead of losing a stack.
+    /// The first call cancels the resident's orders and work, retains the same
+    /// handle, housing and gear, and records `demobilizing`. This operation
+    /// never moves items: a caller may use a separate fenced owned-inventory
+    /// transfer according to its own policy before requesting the second call
+    /// that records `civilian`. A resident equipped before their first order
+    /// may still have a civilian order assignment.
+    /// `expected-revision` fences the resident order/gear record, not the
+    /// independently versioned resident-identity snapshot.
     record demobilize {
         operation-id: string,
         handle: string,
+        expected-revision: u64,
+    }
+
+    /// Capture one living, routing combatant only while a serving custodian
+    /// physically reaches them. No resident or equipment is created or moved.
+    record capture {
+        operation-id: string,
+        handle: string,
+        custodian: string,
         expected-revision: u64,
     }
 
@@ -464,6 +511,7 @@ interface residents {
         issue-order(issue-order),
         cancel-order(cancel-order),
         demobilize(demobilize),
+        capture(capture),
     }
 
     /// Closed pause reason for a work assignment or a demobilisation.
@@ -538,6 +586,9 @@ interface residents {
     /// One server-issued target reference surfaced to the plugin.
     record order-target {
         target-ref: string,
+        /// Fences issued with this reference; the caller returns both unchanged.
+        policy-revision: u64,
+        expires-revision: u64,
         category: hostile-category,
         position: block-position,
     }
@@ -601,6 +652,13 @@ interface residents {
         revision: u64,
     }
 
+    /// The original resident identity remains the only owner of their gear.
+    record capture-result {
+        handle: string,
+        custodian: string,
+        revision: u64,
+    }
+
     /// The answer to one resident work or squad call.
     variant resident-order-result {
         work(work-assignment),
@@ -608,5 +666,6 @@ interface residents {
         order(order-result),
         order-cancelled(order-cancelled),
         demobilized(demobilize-result),
+        captured(capture-result),
     }
 }

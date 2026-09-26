@@ -648,6 +648,89 @@ async fn a_storage_read_becomes_the_servers_own_request_and_its_answer_returns_t
     host.stop();
 }
 
+/// A result created after reload still belongs to the Store that issued its
+/// request, even when the replacement immediately reuses the same request id.
+#[tokio::test]
+async fn late_storage_reply_does_not_answer_the_replacement_guest() {
+    let root = tempfile::tempdir().expect("deployment root");
+    let limits = PluginLimits {
+        epoch_ticks_per_call: 64,
+        ..PluginLimits::default()
+    };
+    let host = start_deployment(
+        storage_deployment(root.path(), true),
+        limits,
+        HostQueues::default(),
+        Arc::new(Sessions),
+    )
+    .expect("host starts");
+    let boundary = host.boundary().clone();
+    boundary.try_enqueue_event(join_event()).unwrap();
+    let mut old_read = None;
+    for _ in 0..2 {
+        let command = tokio::time::timeout(Duration::from_secs(10), boundary.recv_command())
+            .await
+            .expect("old guest answered")
+            .expect("old guest command");
+        let admitted = boundary
+            .accept_host_command(command)
+            .expect("host admission");
+        if matches!(admitted.request(), ScriptCommand::PluginStorageGet { .. }) {
+            old_read = Some(admitted);
+        }
+    }
+
+    host.reload(storage_deployment(root.path(), true))
+        .await
+        .expect("same-contract replacement starts");
+    boundary.try_enqueue_event(join_event()).unwrap();
+    let mut new_read = None;
+    for _ in 0..2 {
+        let command = tokio::time::timeout(Duration::from_secs(10), boundary.recv_command())
+            .await
+            .expect("new guest answered")
+            .expect("new guest command");
+        let admitted = boundary
+            .accept_host_command(command)
+            .expect("host admission");
+        if matches!(admitted.request(), ScriptCommand::PluginStorageGet { .. }) {
+            new_read = Some(admitted);
+        }
+    }
+
+    boundary
+        .try_enqueue_event(
+            old_read
+                .expect("old read")
+                .plugin_storage_get_result(Some("7"), Some(4))
+                .unwrap(),
+        )
+        .expect("old reply enters the bounded queue");
+    boundary
+        .try_enqueue_event(
+            new_read
+                .expect("new read")
+                .plugin_storage_get_result(Some("9"), Some(5))
+                .unwrap(),
+        )
+        .expect("new reply enters the bounded queue");
+    let command = tokio::time::timeout(Duration::from_secs(10), boundary.recv_command())
+        .await
+        .expect("replacement guest reports its own read")
+        .expect("replacement guest command");
+    let ScriptCommand::HostAttached { request, .. } = command else {
+        panic!("replacement report has host provenance");
+    };
+    assert!(
+        matches!(
+            request.as_ref(),
+            ScriptCommand::SendChatMessage { message, .. } if message == "Hi there coins 9 at 5"
+        ),
+        "the late old result cannot be mistaken for the replacement's same-id read: {request:?}"
+    );
+    host.stop();
+}
+
 #[tokio::test]
 async fn a_storage_failure_reaches_the_plugin_as_a_failure_not_as_an_empty_key() {
     // A server without world-backed storage, and a storage actor that stopped,

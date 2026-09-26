@@ -859,6 +859,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         .expect("first server stops")
         .expect("first server task joins")
         .expect("first server serve result");
+    drop(first_save);
     drop(first_world);
 
     let second_world = Arc::new(tokio::sync::Mutex::new(

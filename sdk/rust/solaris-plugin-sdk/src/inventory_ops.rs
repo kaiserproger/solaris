@@ -43,10 +43,11 @@ pub fn query_owned_inventory(
 
 /// Move items between owned endpoints under one durable operation id.
 ///
-/// `actor_id` is the runtime player id whose own inventory must participate: a
-/// transfer naming any other player's inventory is refused `forbidden`, and one
-/// naming a session that has ended is refused `not-found` rather than reaching
-/// whoever holds that id now. `expected_revisions` is one fence per distinct
+/// A player endpoint requires the exact participating runtime player id:
+/// another player's inventory is `forbidden`, and a disconnected session is
+/// `not-found`. `actor_id` is zero only for a bound warehouse and this
+/// plugin's resident equipment/carry: stock may be issued or returned without
+/// a player participant. `expected_revisions` is one fence per distinct
 /// endpoint the transfers name - the fences the plugin read with
 /// [`query_owned_inventory`] - and a fence that has moved is refused
 /// `stale-revision`, never applied against the image the plugin did not see.
@@ -55,9 +56,9 @@ pub fn query_owned_inventory(
 /// transfer the plugin repeats with byte-identical content replays the recorded
 /// outcome and applies nothing, which is what makes retrying after a lost answer
 /// safe, while reusing the id for different content is refused
-/// `operation-conflict`. The answer is the `inventory-expected-revision` list of
-/// every endpoint the transfer touched, which is the fence a later transfer
-/// names.
+/// `operation-conflict`. The answer reports the committed server-owned endpoint
+/// fences; a participating player's fence is read again with a query after its
+/// world-journal decision id has been assigned.
 ///
 /// The items move as the stacks they are, components included: a transfer never
 /// substitutes a resource-only count for an item the owner holds.
@@ -94,8 +95,8 @@ pub fn transfer_owned_items(
 /// [`query_owned_inventory`]: a reservation against a fence that has moved is
 /// refused `stale-revision` rather than held against the wrong image, and a plan
 /// the endpoint cannot cover is refused `insufficient-items`. A warehouse
-/// endpoint is not a reservation target and is refused, because a server-owned
-/// container composite is not a player's or resident's own inventory.
+/// reservation is admitted only through the caller's bound warehouse handle;
+/// core locks the resolved physical container for the durable decision.
 #[must_use]
 pub fn reserve_inventory_items(
     request: &str,

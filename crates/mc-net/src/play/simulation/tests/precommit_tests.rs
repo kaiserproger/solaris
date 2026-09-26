@@ -534,3 +534,139 @@ async fn cancelled_journaled_structure_portion_keeps_blocks_and_receipt_uncommit
         "a refused portion records neither after-image nor receipt"
     );
 }
+
+/// A kept `before-build` ticket is spent only after the portion holds its
+/// source-image admission. A replacement roster while its journal turn waits
+/// must therefore refuse the uncommitted portion.
+#[tokio::test(flavor = "current_thread")]
+async fn revoked_build_approval_waiting_for_journal_turn_cannot_commit_portion() {
+    let (storage, support, _) = test_block_storage();
+    let target = BlockPos {
+        x: support.x + 1,
+        ..support
+    };
+    let read_view = storage.read_view();
+    let mutation_view = storage.mutation_view();
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let temp = tempfile::tempdir().unwrap();
+    let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let (journal, pending) =
+        crate::play::world_journal::WorldChunkJournal::open_for_test(temp.path(), blocks, items)
+            .unwrap();
+    assert!(pending.is_empty());
+    assert_eq!(journal.reserve_decision_ids(1).unwrap(), vec![1]);
+    let registry = SessionRegistry::new();
+    registry.install_world_chunk_journal(journal.clone());
+    let (handle, mut owner) = simulation_channel_with_capacity(4);
+    let (boundary, mut endpoint) = before_build_boundary();
+    let later_roster = boundary.clone();
+    let manifest = mc_script::ScriptPluginManifest::new(
+        "judge",
+        "Judge",
+        "0.1.0",
+        mc_script::COMPONENT_PLUGIN_API_VERSION,
+    )
+    .validate()
+    .expect("valid source plugin");
+    endpoint
+        .register_plugin_routes(&manifest)
+        .expect("live programmatic source registration");
+    handle.install_precommit_boundary(boundary);
+    let batch: crate::script::storage::PreparedStorageBatch =
+        serde_json::from_value(serde_json::json!({
+            "transaction_id": 1,
+            "plugin_id": "judge",
+            "mutations": [{
+                "kind": "compare_and_swap",
+                "key": "structure-progress",
+                "expected_version": null,
+                "value": "1"
+            }]
+        }))
+        .unwrap();
+    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
+    let mut request = Box::pin(handle.commit_server_owned_block_edits(
+        "judge",
+        vec![BlockEdit::new(target, BlockStateId(1))],
+        None,
+        batch.encode_world_decision().unwrap(),
+    ));
+
+    assert_request_enqueued(request.as_mut(), &handle).await;
+    assert_eq!(
+        owner
+            .process_commands_with_world_views(
+                &registry,
+                Some(&world),
+                SimulationWorldAccess {
+                    read: Some(&read_view),
+                    mutation: Some(&mutation_view),
+                    cpu: Some(&resources),
+                    light: None,
+                },
+                None,
+                1,
+            )
+            .await
+            .processed,
+        1
+    );
+    std::future::poll_fn(|context| {
+        assert!(
+            request.as_mut().poll(context).is_pending(),
+            "receipt portion must wait for before-build"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    keep_next_build(&mut endpoint);
+    assert_request_enqueued(request.as_mut(), &handle).await;
+    assert!(owner.wait_for_command().await);
+    let mut process = Box::pin(owner.process_commands_with_world_views(
+        &registry,
+        Some(&world),
+        SimulationWorldAccess {
+            read: Some(&read_view),
+            mutation: Some(&mutation_view),
+            cpu: Some(&resources),
+            light: None,
+        },
+        None,
+        1,
+    ));
+    std::future::poll_fn(|context| {
+        assert!(
+            process.as_mut().poll(context).is_pending(),
+            "the second decision waits for the first journal turn"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    tokio::task::spawn_blocking(move || {
+        later_roster.set_precommit_hooks(vec![HookRegistration::new(
+            "judge",
+            HookKind::Build,
+            0,
+            HookFailurePolicy::Deny,
+        )])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    journal
+        .record_reserved_snapshot_groups(1, vec![(1, Vec::new())])
+        .unwrap();
+    assert_eq!(process.await.processed, 1);
+    assert_eq!(request.await.unwrap(), None);
+    assert_eq!(
+        world.lock().await.get_cached_block(target),
+        Some(BlockStateId(0))
+    );
+    let pending = journal.pending_decisions_for_test();
+    assert!(
+        journal.decode_pending(&pending).unwrap().is_empty(),
+        "a revoked approval closes its reserved decision without a receipt"
+    );
+}

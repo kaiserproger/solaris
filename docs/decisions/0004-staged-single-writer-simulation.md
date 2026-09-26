@@ -304,6 +304,17 @@ still appends its reserved decision with no participant, so the run's single
 append stays contiguous, and an unstampable container chunk fails the run's
 append rather than publishing a receipt recoverable without its container.
 
+For an open player menu, the chest transaction also carries each block's
+`BlockMutationToken` captured at opening. The resident CAS compares those tokens
+under the region write lock along with the expected slots; the coordinator
+fallback compares them under the storage lock. An ABA replacement with identical
+slots and state id therefore rejects instead of applying a click to the new
+container. The connection closes an invalidated menu, unregisters its lid
+viewers, and resynchronizes the player's inventory and cursor; a warehouse
+receipt has no player menu token and retains its existing
+binding/slot/state-id fences. This is one additional opening fence on the same
+container authority, not a writable menu cache.
+
 The append-before-publication order is enforced, not merely structural. The
 regional run arms a test-only probe
 (`crates/mc-net/src/play/simulation/regional_mutation.rs`) before it appends,

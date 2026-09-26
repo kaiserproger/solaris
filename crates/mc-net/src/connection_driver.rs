@@ -131,10 +131,6 @@ pub(crate) async fn handle_connection(
             else {
                 return Ok(());
             };
-            let permissions = services
-                .config
-                .command_permissions
-                .permissions_for(&profile, peer);
             let configuration_outcome = before_pre_play_deadline(
                 deadline,
                 configuration::handle(
@@ -161,6 +157,10 @@ pub(crate) async fn handle_connection(
                 ),
             )
             .await?;
+            let permissions = services
+                .config
+                .command_permissions
+                .permissions_for(&profile, peer);
             drop(pre_auth_permit);
             Box::pin(play::handle(
                 &mut reader,
@@ -170,6 +170,7 @@ pub(crate) async fn handle_connection(
                 &profile,
                 &properties,
                 permissions,
+                peer,
                 services.config.as_ref(),
                 services.connection_world,
                 services.sessions,

@@ -20,6 +20,9 @@
 //! [`GameplayRules::validate`] enforces is refused for the same reason: the native
 //! owners downstream only bound what those checks let through.
 
+use mc_data::Identifier;
+use mc_data::item_components::{CustomItemDefinition, ItemFacts, ItemFactsTable};
+use mc_data::items::solaris_required_items;
 use std::collections::BTreeMap;
 
 use mc_script::{
@@ -28,7 +31,8 @@ use mc_script::{
 };
 
 use crate::bindings::exports::solaris::plugin::lifecycle::{
-    ClayRules, PlacementRules, SpawnGroup, SpawnRules, StartupContribution, TreeRules,
+    ClayRules, ItemDefinition, PlacementRules, SpawnGroup, SpawnRules, StartupContribution,
+    TreeRules,
 };
 use crate::package::LoadedPackage;
 
@@ -162,6 +166,27 @@ pub enum ContributionRefusal {
     /// The converted contribution breaks a bound the startup contract enforces.
     #[error(transparent)]
     Invalid(#[from] GameplayRulesError),
+    #[error("item declaration {0}")]
+    InvalidItem(String),
+}
+
+/// The distinct native startup domains one configure response contributes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedStartupContribution {
+    rules: Option<GameplayRules>,
+    items: Vec<CustomItemDefinition>,
+}
+
+impl ValidatedStartupContribution {
+    #[must_use]
+    pub fn rules(&self) -> Option<&GameplayRules> {
+        self.rules.as_ref()
+    }
+
+    #[must_use]
+    pub fn items(&self) -> &[CustomItemDefinition] {
+        &self.items
+    }
 }
 
 /// Convert a component's `configure` answer into the startup rule contract.
@@ -171,8 +196,9 @@ pub enum ContributionRefusal {
 /// contribution is refused. The result is validated, so the rules a caller
 /// receives are rules a native owner can be handed.
 pub fn convert_startup_contribution(
+    plugin_id: &str,
     contribution: &StartupContribution,
-) -> Result<GameplayRules, ContributionRefusal> {
+) -> Result<ValidatedStartupContribution, ContributionRefusal> {
     // `option<list<..>>` and `list<..>` are different absences: `None` is "this
     // package sets no such category" and `Some(vec![])` is "it sets an empty
     // one", which `validate` refuses below because the plan then sets nothing.
@@ -199,16 +225,82 @@ pub fn convert_startup_contribution(
         .map(convert_placement_rules)
         .transpose()?;
 
-    let rules = GameplayRules::new(spawning, trees, clay, placement);
-    // The one validator, so both runtimes refuse the same plans: an empty plan
-    // (`NoCategory`), more than 64 declarations (`TooManyDeclarations`), an
-    // unsupported or over-full spawn group (`UnsupportedSpawnGroup`), an
-    // over-long, duplicated or over-budget spawn entry (`InvalidSpawnEntry`), a
-    // tree declaration outside its bounds (`InvalidTreeRule`) or naming a biome
-    // twice (`InvalidTreeBiome`), and clay or placement outside the bounded
-    // deposit and search dimensions (`ClayOutOfBounds`, `PlacementOutOfBounds`).
-    rules.validate()?;
-    Ok(rules)
+    let has_rules = contribution.spawning.is_some()
+        || contribution.trees.is_some()
+        || contribution.clay.is_some()
+        || contribution.placement.is_some();
+    let rules = if has_rules {
+        let rules = GameplayRules::new(spawning, trees, clay, placement);
+        rules.validate()?;
+        Some(rules)
+    } else {
+        None
+    };
+    let items = contribution
+        .items
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| convert_item_definition(plugin_id, item))
+        .collect::<Result<Vec<_>, _>>()?;
+    if items.len() > 16 {
+        return Err(ContributionRefusal::InvalidItem(
+            "more than 16 item definitions".to_owned(),
+        ));
+    }
+    let items = ItemFactsTable::default()
+        .with_custom_items(items, &solaris_required_items())
+        .map_err(|error| ContributionRefusal::InvalidItem(error.to_string()))?;
+    let items = items.into_custom_items();
+    if rules.is_none() && items.is_empty() {
+        return Err(ContributionRefusal::Invalid(GameplayRulesError::NoCategory));
+    }
+    Ok(ValidatedStartupContribution { rules, items })
+}
+
+fn convert_item_definition(
+    plugin_id: &str,
+    item: &ItemDefinition,
+) -> Result<CustomItemDefinition, ContributionRefusal> {
+    let id = Identifier::parse(item.id.clone())
+        .map_err(|error| ContributionRefusal::InvalidItem(error.to_string()))?;
+    let carrier = Identifier::parse(item.carrier.clone())
+        .map_err(|error| ContributionRefusal::InvalidItem(error.to_string()))?;
+    if id.namespace() != plugin_id || carrier.namespace() != "minecraft" {
+        return Err(ContributionRefusal::InvalidItem(format!(
+            "{} must be owned by {plugin_id} and use a vanilla carrier",
+            item.id
+        )));
+    }
+    let crafting_ingredient = item
+        .crafting_ingredient
+        .as_ref()
+        .map(|ingredient| {
+            let id = Identifier::parse(ingredient.clone())
+                .map_err(|error| ContributionRefusal::InvalidItem(error.to_string()))?;
+            if id.namespace() != "minecraft" && id.namespace() != plugin_id {
+                return Err(ContributionRefusal::InvalidItem(format!(
+                    "recipe ingredient {id} is not owned by {plugin_id}"
+                )));
+            }
+            Ok(id)
+        })
+        .transpose()?;
+    Ok(CustomItemDefinition {
+        id,
+        carrier,
+        name: item.name.clone(),
+        crafting_ingredient,
+        facts: ItemFacts {
+            max_stack_size: Some(item.max_stack_size),
+            max_damage: item.max_damage,
+            weapon: item.weapon,
+            attack_damage_modifier: item.attack_damage_modifier,
+            attack_speed_modifier: item.attack_speed_modifier,
+            equippable_slot: item.equippable_slot.clone(),
+            ..ItemFacts::default()
+        },
+    })
 }
 
 /// One `spawn-rules` record as the contract's per-biome spawn groups.
@@ -292,9 +384,8 @@ fn narrow_to_u8(field: &'static str, value: u32) -> Result<u8, FieldOverflow> {
 pub enum ContributionOutcome {
     /// The package answered no contribution: a legitimate package, not a refusal.
     NoContribution,
-    /// The contribution converted and validated into the rules the world opens
-    /// with.
-    Rules(GameplayRules),
+    /// The validated categories, including server-owned item identities.
+    Configured(ValidatedStartupContribution),
     /// The contribution was refused and no caller may materialize it.
     Refused(ContributionRefusal),
 }
@@ -320,12 +411,20 @@ impl PackageContribution {
         &self.outcome
     }
 
-    /// The validated rules, when the package's contribution survived validation.
+    /// The validated worldgen rules, if this package declared them.
     #[must_use]
     pub fn rules(&self) -> Option<&GameplayRules> {
         match &self.outcome {
-            ContributionOutcome::Rules(rules) => Some(rules),
+            ContributionOutcome::Configured(content) => content.rules(),
             ContributionOutcome::NoContribution | ContributionOutcome::Refused(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn items(&self) -> &[CustomItemDefinition] {
+        match &self.outcome {
+            ContributionOutcome::Configured(content) => content.items(),
+            ContributionOutcome::NoContribution | ContributionOutcome::Refused(_) => &[],
         }
     }
 
@@ -335,7 +434,7 @@ impl PackageContribution {
     pub fn refusal(&self) -> Option<&ContributionRefusal> {
         match &self.outcome {
             ContributionOutcome::Refused(refusal) => Some(refusal),
-            ContributionOutcome::NoContribution | ContributionOutcome::Rules(_) => None,
+            ContributionOutcome::NoContribution | ContributionOutcome::Configured(_) => None,
         }
     }
 }
@@ -378,6 +477,12 @@ impl DeploymentContribution {
             .filter_map(|package| package.rules().map(|rules| (package.id(), rules)))
     }
 
+    pub fn items(&self) -> impl Iterator<Item = (&str, &CustomItemDefinition)> {
+        self.packages
+            .iter()
+            .flat_map(|package| package.items().iter().map(move |item| (package.id(), item)))
+    }
+
     /// Record what one package's `configure` answered.
     ///
     /// Called by the host on the same answer it already has, so the recorded
@@ -385,8 +490,8 @@ impl DeploymentContribution {
     pub(crate) fn record(&mut self, id: &str, contribution: Option<&StartupContribution>) {
         let outcome = match contribution {
             None => ContributionOutcome::NoContribution,
-            Some(contribution) => match convert_startup_contribution(contribution) {
-                Ok(rules) => ContributionOutcome::Rules(rules),
+            Some(contribution) => match convert_startup_contribution(id, contribution) {
+                Ok(content) => ContributionOutcome::Configured(content),
                 Err(refusal) => ContributionOutcome::Refused(refusal),
             },
         };

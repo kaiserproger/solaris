@@ -3,8 +3,9 @@ use std::sync::Arc;
 use mc_data::items::ItemReport;
 
 use super::{
-    BlockStateId, ChestBlockEntity, ChestView, ChestWindow, Chunk, ChunkPos, ContainerInput,
-    FurnaceSlot, Identifier, ItemRegistry, ItemStack, PlayerInventory, PlayerPose,
+    BlockStateId, ChestBlockEntity, ChestView, ChestWindow, Chunk, ChunkPos,
+    ClientboundContainerClose, ClientboundContainerSetContent, Compression, ContainerInput,
+    FurnaceSlot, Identifier, ItemRegistry, ItemStack, Packet, PlayerInventory, PlayerPose,
     ServerboundContainerClick, apply_chest_swap_click, apply_chest_throw_click,
     decode_container_set_content_packets, furnace_slot_to_stack, handle_chest_container_click,
     interaction_state_for_items, load_chest_commit_snapshot, stack_to_furnace_slot,
@@ -95,7 +96,10 @@ async fn stale_chest_click_after_peer_mutation_resyncs_without_mutating_storage(
         storage.set_chest_block_entity(position, chest).unwrap();
     }
 
-    let window = ChestWindow::new(vec![position], 7);
+    let mut window = ChestWindow::new(vec![position], 7);
+    window
+        .block_tokens
+        .push(state.world_read.block_mutation_token(position).unwrap());
     {
         let mut storage = state.world.lock().await;
         let mut chest = storage
@@ -128,6 +132,7 @@ async fn stale_chest_click_after_peer_mutation_resyncs_without_mutating_storage(
     )
     .await
     .unwrap();
+    let returned = returned.expect("chest window remains open");
 
     assert_eq!(returned.state_id, 2);
     assert!(state.carried_item.is_empty());
@@ -147,6 +152,110 @@ async fn stale_chest_click_after_peer_mutation_resyncs_without_mutating_storage(
     assert_eq!(packets[0].state_id, 2);
     assert_eq!(packets[0].items[0], ItemStack::new(stone_id, 2));
     assert!(packets[0].carried_item.is_empty());
+}
+
+#[tokio::test]
+async fn replaced_chest_closes_old_menu_even_when_contents_match() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: dirt,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let dirt_id = items
+        .id_of(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap();
+    let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let mut chest = ChestBlockEntity::default();
+    chest.slots[0] = stack_to_furnace_slot(&ItemStack::new(dirt_id, 2));
+    {
+        let mut storage = state.world.lock().await;
+        let chunk = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage.set_block_at(position, BlockStateId(1)).unwrap();
+        storage
+            .set_chest_block_entity(position, chest.clone())
+            .unwrap();
+    }
+    let mut window = ChestWindow::new(vec![position], 7);
+    window
+        .block_tokens
+        .push(state.world_read.block_mutation_token(position).unwrap());
+    state
+        .sessions
+        .register_chest_viewer(state.session_id, position);
+    {
+        let mut storage = state.world.lock().await;
+        storage.set_block_at(position, BlockStateId(0)).unwrap();
+        storage.set_block_at(position, BlockStateId(1)).unwrap();
+        storage
+            .set_chest_block_entity(position, chest.clone())
+            .unwrap();
+    }
+
+    let before_inventory = state.inventory.clone();
+    let mut writer = Vec::new();
+    let result = handle_chest_container_click(
+        &mut state,
+        &mut writer,
+        window,
+        PlayerPose::new(0.5, 65.0, 0.5),
+        ServerboundContainerClick {
+            container_id: 7,
+            state_id: 1,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::empty(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!(
+        state.inventory.as_wire_list(),
+        before_inventory.as_wire_list()
+    );
+    assert!(state.carried_item.is_empty());
+    assert_eq!(
+        state
+            .world
+            .lock()
+            .await
+            .chest_block_entity(position)
+            .unwrap(),
+        Some(chest)
+    );
+    let mut bytes = bytes::BytesMut::from(writer.as_slice());
+    let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+        .unwrap()
+        .expect("close packet");
+    assert_eq!(frame.id, ClientboundContainerClose::ID);
+    assert_eq!(
+        ClientboundContainerClose::decode(&mut frame.body)
+            .unwrap()
+            .container_id,
+        7
+    );
+    let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+        .unwrap()
+        .expect("authoritative inventory resync");
+    assert_eq!(frame.id, ClientboundContainerSetContent::ID);
+    let inventory = ClientboundContainerSetContent::decode(&mut frame.body).unwrap();
+    assert_eq!(inventory.container_id, 0);
+    assert_eq!(inventory.items, before_inventory.as_wire_list());
+    assert!(inventory.carried_item.is_empty());
+    assert!(bytes.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -223,6 +332,7 @@ async fn shared_chest_same_version_click_commits_once_and_conserves_items() {
     let mut actor = interaction_state_for_items(Arc::clone(&items));
     let mut observer = interaction_state_for_items(items);
     observer.world = Arc::clone(&actor.world);
+    observer.world_read = actor.world_read.clone();
     observer.sessions = Arc::clone(&actor.sessions);
     observer.session_id = 2;
 
@@ -258,26 +368,36 @@ async fn shared_chest_same_version_click_commits_once_and_conserves_items() {
             components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
         },
     };
+    let mut first_window = ChestWindow::new(vec![position], 7);
+    first_window
+        .block_tokens
+        .push(actor.world_read.block_mutation_token(position).unwrap());
+    let mut second_window = ChestWindow::new(vec![position], 8);
+    second_window
+        .block_tokens
+        .push(observer.world_read.block_mutation_token(position).unwrap());
     let mut actor_writer = Vec::new();
     let actor_window = handle_chest_container_click(
         &mut actor,
         &mut actor_writer,
-        ChestWindow::new(vec![position], 7),
+        first_window,
         PlayerPose::new(0.5, 65.0, 0.5),
         click(7),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect("actor chest window remains open");
     let mut observer_writer = Vec::new();
     let observer_window = handle_chest_container_click(
         &mut observer,
         &mut observer_writer,
-        ChestWindow::new(vec![position], 8),
+        second_window,
         PlayerPose::new(0.5, 65.0, 0.5),
         click(8),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect("observer chest window remains open");
 
     assert_eq!(actor_window.state_id, 3);
     assert_eq!(observer_window.state_id, 3);

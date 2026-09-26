@@ -21,9 +21,14 @@
 //! * a transfer moves the component-bearing tool exactly once, conserves every
 //!   other stack, and answers the resulting fence list - which the client can see
 //!   because the commit publishes the authoritative inventory;
-//! * the same durable operation id repeats byte-identically as a replay of the
-//!   recorded outcome - the replayed revision is the one the original commit
-//!   answered, so a second application would have changed it;
+//! * the same durable operation id repeats byte-identically after a disconnect
+//!   and a new session as a replay of the old session's recorded outcome - the
+//!   replayed revision is the original commit's, never a second application;
+//! * a status query retrieves that committed receipt without resubmitting the
+//!   transfer, while the ended session's inventory endpoint refuses `not-found`;
+//! * a committed answer held until after the player reconnects never sends its
+//!   old-session report to the replacement, although the new session can query
+//!   its durable outcome and observe the committed item effect;
 //! * the same durable operation id with different content is refused
 //!   `operation-conflict` rather than applied;
 //! * a fence past the one read is refused `stale-revision`, another runtime
@@ -35,6 +40,11 @@
 //! The fixture checks each answer against what its own operation implies and only
 //! then reports a marker; a step it could not conclude is an error log line
 //! instead, and this test fails on any of them.
+//!
+//! A normal hotbar swap and its reversal precede the component transfer on the
+//! same component-bearing tool. Both routes begin with the same inventory image
+//! and must publish the same slot and component outcome; the component's
+//! fenced transfer reads the owner snapshot after the ordinary client mutation.
 //!
 //! A second, non-network case pins the capability boundary the same way the
 //! storage vertical does: the very record the fixture sends converts under a
@@ -51,6 +61,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -72,7 +83,8 @@ use mc_plugin_host::{
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ClientboundCommands, ClientboundContainerSetContent, ClientboundSystemChat,
-    ConfirmTeleportation, ItemStack, ServerboundChatCommand, SynchronizePlayerPosition,
+    ConfirmTeleportation, ContainerInput, HashedStack, ItemStack, ServerboundChatCommand,
+    ServerboundContainerClick, SynchronizePlayerPosition,
 };
 use mc_script::{CommandCapabilities, ScriptPluginManifest};
 use mc_test_harness::client::Client;
@@ -117,23 +129,35 @@ const READY: &str = "P3_INV ready";
 /// could not be concluded is logged under.
 const MARKER: &str = "P3_INV ";
 const UNEXPECTED: &str = "P3_INV_UNEXPECTED";
+const LEFT: &str = "P3_INV_LEFT";
+const LATE_MOVE: &str = "P3_INV_MOVE_ANSWERED";
 
-/// The component deployment's manifest: the `inventory` root and the one
-/// capability every owned-inventory operation needs. The fixture subscribes to no
-/// event of its own: an operation answer is delivered to the plugin that asked for
-/// it, and a command invocation reaches the package that declared the command.
+/// The component deployment declares the inventory capability and listens for
+/// the original session leaving before the same identity reconnects. Operation
+/// answers remain targeted to the plugin that asked, not broadcast events.
 const MANIFEST: &str = r#"
 id = "owned-inventory"
 name = "Owned Inventory"
 version = "0.1.0"
 api = "0.7.0"
+events = ["player.left"]
 player_commands = ["inventory"]
-capabilities = ["inventory_transfers"]
-required_features = ["inventory_transfers"]
+capabilities = ["inventory_transfers", "storage_batches"]
+required_features = ["inventory_transfers", "storage_batches"]
 "#;
 
 /// What tells the fixture which mode to run.
 const CONFIG: &str = "mode = \"owned-inventory\"\n";
+/// A second, ordinary component whose command callbacks fill the host's event
+/// consumer while the first component's committed item answer is in flight.
+const FLOOD_MANIFEST: &str = r#"
+id = "hello-flood"
+name = "Hello Flood"
+version = "0.1.0"
+api = "0.7.0"
+player_commands = ["hello"]
+"#;
+const FLOOD_CONFIG: &str = "greeting = \"Hi there\"\n";
 
 /// How long one action may spend on its real round trips before this test calls it
 /// stalled. Nothing here sleeps: the wait ends on the fixture's own line.
@@ -166,6 +190,9 @@ struct LogLine {
 struct RecordingLog {
     id: String,
     lines: UnboundedSender<LogLine>,
+    /// Optional barrier after the real owner answers, before the guest publishes
+    /// its reply to the player.
+    release_move: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
 }
 
 impl HostServices for RecordingLog {
@@ -175,6 +202,15 @@ impl HostServices for RecordingLog {
             error: matches!(level, LogLevel::Error),
             message: message.to_owned(),
         });
+        if message == LATE_MOVE
+            && let Some(release) = &self.release_move
+        {
+            release
+                .lock()
+                .expect("the late-answer barrier is available")
+                .recv()
+                .expect("the test releases the late answer");
+        }
     }
 
     fn plugin_id(&self) -> &str {
@@ -255,6 +291,7 @@ impl Running {
         world_dir: &Path,
         packages: &[Package],
         motd: &str,
+        release_move: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
     ) -> Self {
         let deployment = tempfile::tempdir().expect("component deployment directory");
         for package in packages {
@@ -276,7 +313,13 @@ impl Running {
                 .iter()
                 .map(|package| package.id.to_owned())
                 .collect(),
-            grants: BTreeMap::from([(OWNER.to_owned(), vec!["inventory_transfers".to_owned()])]),
+            grants: BTreeMap::from([(
+                OWNER.to_owned(),
+                vec![
+                    "inventory_transfers".to_owned(),
+                    "storage_batches".to_owned(),
+                ],
+            )]),
             require_grants: true,
             precommit_hooks: Vec::new(),
         };
@@ -294,6 +337,7 @@ impl Running {
             move |id: &str| RecordingLog {
                 id: id.to_owned(),
                 lines: lines.clone(),
+                release_move: release_move.clone(),
             },
         )
         .expect("the component host starts");
@@ -385,6 +429,7 @@ async fn one_component_moves_and_reserves_real_owned_inventory_through_the_real_
             config: CONFIG,
         }],
         "owned inventory acceptance",
+        None,
     )
     .await;
     let items = Arc::clone(&registries.items);
@@ -405,6 +450,32 @@ async fn one_component_moves_and_reserves_real_owned_inventory_through_the_real_
         )),
         "the snapshot's own slot count and fence the owner answered: {query}"
     );
+
+    // Ordinary client input moves the same tool the component will move below.
+    // No component hash is supplied by the client: Swap is admitted and applied
+    // by the vanilla container owner, then the guest reads the owner's new fence.
+    for (source, button, destination) in [(TOOL_SLOT, 1, STOW_SLOT), (STOW_SLOT, 0, TOOL_SLOT)] {
+        let before = journal.frames;
+        client
+            .write_packet(&ServerboundContainerClick {
+                container_id: 0,
+                state_id: journal.last_inventory().state_id,
+                slot_num: i16::try_from(source).unwrap(),
+                button_num: button,
+                container_input: ContainerInput::Swap,
+                changed_slots: Vec::new(),
+                carried_item: HashedStack::empty(),
+            })
+            .await
+            .expect("send ordinary hotbar swap");
+        wait_for_inventory(&mut client, &mut running.log, &mut journal, before).await;
+        assert_eq!(&journal.last_inventory().items[destination], &tool);
+        assert!(journal.last_inventory().items[source].is_empty());
+        assert_eq!(
+            total_of(journal.last_inventory(), item_id(&items, EMERALD_ITEM)),
+            SEED_EMERALDS
+        );
+    }
 
     // The transfer: exactly one item moves, and the authoritative inventory the
     // commit publishes shows it - the tool in the destination slot, the slot it
@@ -451,6 +522,55 @@ async fn one_component_moves_and_reserves_real_owned_inventory_through_the_real_
         0,
         "the slot it was stowed in must be empty again"
     );
+
+    // The old session must be gone before a new connection takes its identity.
+    drop(client);
+    loop {
+        let line = tokio::time::timeout(WIRE_TIMEOUT, running.log.recv())
+            .await
+            .expect("the original inventory session did not leave")
+            .expect("component host stopped before the player left");
+        assert!(
+            !line.error,
+            "guest failed during disconnect: {}",
+            line.message
+        );
+        if line.message.starts_with(LEFT) {
+            break;
+        }
+    }
+    let mut client = login(running.address, PLAYER).await;
+    let fresh = loop {
+        let mut frame = client
+            .read_frame_with_timeout(WIRE_TIMEOUT)
+            .await
+            .expect("rejoined player inventory was not published");
+        if frame.id == ClientboundContainerSetContent::ID {
+            let content = ClientboundContainerSetContent::decode(&mut frame.body)
+                .expect("decode rejoined inventory");
+            if content.container_id == 0 {
+                break content;
+            }
+        }
+    };
+    journal.frames += 1;
+    journal.inventory = Some(fresh);
+    assert_tool_intact(&journal, &items, &tool);
+
+    // The old numeric player endpoint is not the same stable person's new
+    // session. Reading it must refuse rather than return the new inventory.
+    let expired = action(&mut client, &mut running.log, &mut journal, "expired").await;
+    assert_eq!(expired, format!("{MARKER}expired refused not-found"));
+    assert_tool_intact(&journal, &items, &tool);
+
+    // The status request names only the durable id. It returns the old
+    // session's typed outcome without moving the new session's items.
+    let status = action(&mut client, &mut running.log, &mut journal, "status").await;
+    assert_eq!(
+        status,
+        format!("{MARKER}status committed revision={restore_revision}")
+    );
+    assert_tool_intact(&journal, &items, &tool);
 
     // The replay: the same durable record, byte for byte, under a new correlation
     // id. A second application would have had nothing to move from the empty slot
@@ -531,6 +651,141 @@ async fn one_component_moves_and_reserves_real_owned_inventory_through_the_real_
         "the reservation holds units, it does not spend them"
     );
     assert_saved_tool(&saved);
+}
+
+/// Hold the actual owner's committed answer before guest callback output can
+/// reach the client. The replacement session must not receive the old reply.
+#[tokio::test]
+async fn late_committed_inventory_answer_does_not_target_the_rejoined_session() {
+    let world = tempfile::tempdir().expect("one temporary persistent world");
+    std::fs::create_dir_all(world.path().join("region")).expect("world region directory");
+    let registries = Registries::new();
+    seed_player_state(world.path());
+    let (release, wait) = std::sync::mpsc::channel();
+    let mut running = Running::start(
+        &registries,
+        world.path(),
+        &[
+            Package {
+                id: OWNER,
+                manifest: MANIFEST,
+                config: CONFIG,
+            },
+            Package {
+                id: "hello-flood",
+                manifest: FLOOD_MANIFEST,
+                config: FLOOD_CONFIG,
+            },
+        ],
+        "late owned inventory answer",
+        Some(Arc::new(Mutex::new(wait))),
+    )
+    .await;
+    let items = Arc::clone(&registries.items);
+    let tool = expected_tool(&items);
+    let mut journal = Journal::default();
+    let mut client = login(running.address, PLAYER).await;
+    wait_for_ready(&mut client, &mut running.log, &mut journal).await;
+    action(&mut client, &mut running.log, &mut journal, "query").await;
+    let mut flood = login(running.address, "Flood").await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "inventory move".to_owned(),
+        })
+        .await
+        .expect("stage the original session's transfer");
+    loop {
+        let line = tokio::time::timeout(ACTION_TIMEOUT, running.log.recv())
+            .await
+            .expect("the real owner never answered the transfer")
+            .expect("the component host stopped before the owner answered");
+        assert!(
+            !line.error,
+            "guest failed before delivery: {}",
+            line.message
+        );
+        if line.message == LATE_MOVE {
+            break;
+        }
+    }
+
+    // The log barrier holds the host before callback output is admitted. The
+    // server can publish the replacement's inventory while that worker is held.
+    drop(client);
+    let mut client = login(running.address, PLAYER).await;
+    let fresh = loop {
+        let mut frame = client
+            .read_frame_with_timeout(WIRE_TIMEOUT)
+            .await
+            .expect("the new session's inventory was not published");
+        if frame.id == ClientboundContainerSetContent::ID {
+            let content = ClientboundContainerSetContent::decode(&mut frame.body)
+                .expect("decode new session inventory");
+            if content.container_id == 0 {
+                break content;
+            }
+        }
+    };
+    journal.inventory = Some(fresh);
+    assert_eq!(&journal.last_inventory().items[STOW_SLOT], &tool);
+    assert!(journal.last_inventory().items[TOOL_SLOT].is_empty());
+    assert_eq!(
+        total_of(journal.last_inventory(), item_id(&items, EMERALD_ITEM)),
+        SEED_EMERALDS
+    );
+
+    // The other component receives real commands from another live player
+    // while the owner's committed response remains held at the guest boundary.
+    for _ in 0..32 {
+        flood
+            .write_packet(&ServerboundChatCommand {
+                command: "hello".to_owned(),
+            })
+            .await
+            .expect("send another player's component command");
+    }
+
+    let healthy_started = std::time::Instant::now();
+    release.send(()).expect("release the old session's answer");
+    let expired = action(&mut client, &mut running.log, &mut journal, "expired").await;
+    println!(
+        "accepted item decision alongside 32 other-component commands: healthy response {:.3} ms",
+        healthy_started.elapsed().as_secs_f64() * 1e3
+    );
+    assert_eq!(expired, format!("{MARKER}expired refused not-found"));
+
+    let status = action(&mut client, &mut running.log, &mut journal, "status").await;
+    assert!(
+        status.starts_with(&format!("{MARKER}status committed revision=")),
+        "the durable operation remains queryable after a lost reply: {status}"
+    );
+    assert!(
+        !journal
+            .chats
+            .iter()
+            .any(|line| line.starts_with(&format!("{MARKER}move "))),
+        "the old session's late callback must not address the replacement"
+    );
+    assert_eq!(&journal.last_inventory().items[STOW_SLOT], &tool);
+    assert!(journal.last_inventory().items[TOOL_SLOT].is_empty());
+    // A reply to the other player proves that this was delivered workload,
+    // not just network bytes written beside an already-completed transfer.
+    let deadline = tokio::time::Instant::now() + ACTION_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let mut frame = tokio::time::timeout(remaining, flood.read_frame())
+            .await
+            .expect("the other component never answered its accepted command")
+            .expect("the flood player's connection closed before a command reply");
+        if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode flood reply");
+            if literal_text_component_text(&chat.content_nbt) == "Hello from a WASM plugin." {
+                break;
+            }
+        }
+    }
+    drop(client);
+    assert!(error_lines(running.stop().await).is_empty());
 }
 
 /// The capability boundary: the very transfer record the fixture sends converts
@@ -1139,7 +1394,7 @@ fn server_config(
         tab_list: mc_net::TabListConfig::default(),
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: motd.to_owned(),
-        max_players: 1,
+        max_players: 2,
         view_distance: 2,
         data: Arc::clone(&registries.data),
         blocks: Arc::clone(&registries.blocks),

@@ -10,8 +10,8 @@
 
 use super::map_event;
 use crate::bindings::exports::solaris::plugin::events::{
-    ClientViewOutcome, Event, LoaderItemGrantFailure, LoaderItemGrantOutcome, ViewFailure,
-    ViewRequestKind,
+    ClientSelectionOutcome, ClientViewOutcome, Event, LoaderItemGrantFailure,
+    LoaderItemGrantOutcome, ViewFailure, ViewRequestKind,
 };
 use crate::bindings::solaris::plugin::client_presentation::ViewFieldValue;
 use mc_script::{
@@ -169,16 +169,45 @@ fn a_routed_view_request_carries_the_events_own_session_and_the_declared_kind() 
 }
 
 #[test]
-fn a_kind_this_contract_does_not_carry_is_dropped() {
-    // The world-selection lifecycle is not part of this slice: a client selection
-    // context is a server-issued value this contract never exposes, so its
-    // observations are dropped instead of being reported as a view event.
-    let kind = ScriptEventKind::ClientSelectionStarted {
-        request_id: "ctx-1".to_owned(),
+fn selection_start_exposes_only_the_owners_decided_context_or_refusal() {
+    let started = ScriptEventKind::ClientSelectionStarted {
+        request_id: "select-1".to_owned(),
         player_id: ScriptPlayerId::new(SESSION),
-        selection_context_id: Some("ctx-1".to_owned()),
+        selection_context_id: Some("solaris:selection-1".to_owned()),
         expires_at_tick: Some(1200),
         failure: None,
     };
-    assert!(map_event(&kind).is_none());
+    let Some(Event::ClientSelectionStarted(answer)) = map_event(&started) else {
+        panic!("an admitted selection is carried");
+    };
+    let ClientSelectionOutcome::Started(context) = answer.outcome else {
+        panic!("an admitted selection has a single-use context");
+    };
+    assert_eq!(answer.session, SESSION);
+    assert_eq!(context.id, "solaris:selection-1");
+    assert_eq!(context.expires_at_tick, 1200);
+
+    let refused = ScriptEventKind::ClientSelectionStarted {
+        request_id: "select-2".to_owned(),
+        player_id: ScriptPlayerId::new(SESSION),
+        selection_context_id: None,
+        expires_at_tick: None,
+        failure: Some(ScriptClientViewFailure::StaleRevision),
+    };
+    let Some(Event::ClientSelectionStarted(answer)) = map_event(&refused) else {
+        panic!("owner refusal is carried");
+    };
+    assert!(matches!(
+        answer.outcome,
+        ClientSelectionOutcome::Refused(ViewFailure::StaleRevision)
+    ));
+
+    let inconsistent = ScriptEventKind::ClientSelectionStarted {
+        request_id: "select-3".to_owned(),
+        player_id: ScriptPlayerId::new(SESSION),
+        selection_context_id: Some("solaris:selection-2".to_owned()),
+        expires_at_tick: None,
+        failure: None,
+    };
+    assert!(map_event(&inconsistent).is_none());
 }

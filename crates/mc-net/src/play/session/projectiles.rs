@@ -229,16 +229,60 @@ pub(super) fn spawn_arrow_locked(
     let owner = owner_session
         .and_then(|session_id| inner.sessions.get(&session_id))
         .map(|session| projectile_identity(EntityId(session.entity_id)));
+    spawn_arrow_with_owner_locked(
+        inner,
+        owner,
+        None,
+        entity_type_id,
+        position,
+        velocity,
+        rotation,
+    )
+}
+
+pub(super) fn spawn_resident_arrow_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    owner: EntityId,
+    target: EntityId,
+    entity_type_id: i32,
+    position: Vec3,
+    velocity: Vec3,
+    rotation: Rotation,
+) -> (EntityId, Vec<VisibilityDispatch>) {
+    spawn_arrow_with_owner_locked(
+        inner,
+        Some(projectile_identity(owner)),
+        Some(projectile_identity(target)),
+        entity_type_id,
+        position,
+        velocity,
+        rotation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_arrow_with_owner_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    owner: Option<EntityIdentity>,
+    restricted_target: Option<EntityIdentity>,
+    entity_type_id: i32,
+    position: Vec3,
+    velocity: Vec3,
+    rotation: Rotation,
+) -> (EntityId, Vec<VisibilityDispatch>) {
     let mut entity = SpawnEntity::new(entity_type_id, "minecraft:arrow", position);
     entity.velocity = velocity;
     entity.rotation = rotation;
     entity.on_ground = false;
     apply_entity_facts(&mut entity);
     entity.retained.spawn_tick = inner.entity_lifecycle_tick;
-    entity.retained.arrow_state = Some(
-        initial_arrow_state(owner, position, velocity, rotation)
-            .expect("finite spawned arrow must produce a valid kernel state"),
-    );
+    let mut arrow = initial_arrow_state(owner, position, velocity, rotation)
+        .expect("finite spawned arrow must produce a valid kernel state");
+    arrow.restricted_target = restricted_target;
+    if restricted_target.is_some() {
+        arrow.pickup = PickupMode::Disallowed;
+    }
+    entity.retained.arrow_state = Some(arrow);
     let aabb = entity_aabb(&entity.type_name);
     let id = inner.entities.spawn(entity);
     inner
@@ -2497,7 +2541,13 @@ fn prepare_arrow_tick_candidates_locked(
     scratch.owner_members.clear();
     scratch.owner_vehicle_entities.clear();
     let owner = state.projectile.owner;
-    if !collect_arrow_entity_candidate_snapshots_locked(
+    if let Some(target) = state.restricted_target {
+        if let Ok(raw) = i32::try_from(target.raw())
+            && let Some(snapshot) = inner.entities.snapshot(EntityId(raw))
+        {
+            scratch.candidate_snapshots.push(snapshot);
+        }
+    } else if !collect_arrow_entity_candidate_snapshots_locked(
         inner,
         start,
         end,
@@ -2516,6 +2566,9 @@ fn prepare_arrow_tick_candidates_locked(
     }
     while let Some(entity) = scratch.candidate_snapshots.pop() {
         if Some(projectile_identity(entity.id)) == owner
+            || state
+                .restricted_target
+                .is_some_and(|target| target != projectile_identity(entity.id))
             || !arrow_entity_is_candidate(arrow_id, &entity)
             || arrow_damage_is_invulnerable(inner, entity.id)
         {
@@ -2563,7 +2616,11 @@ fn prepare_arrow_tick_candidates_locked(
         let Some(session) = inner.sessions.get(&session_id) else {
             continue;
         };
-        if Some(projectile_identity(EntityId(session.entity_id))) == owner {
+        if Some(projectile_identity(EntityId(session.entity_id))) == owner
+            || state
+                .restricted_target
+                .is_some_and(|target| target != projectile_identity(EntityId(session.entity_id)))
+        {
             continue;
         }
         let Some(hit_t) = segment_target_aabb_t(

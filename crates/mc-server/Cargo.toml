@@ -30,6 +30,7 @@ mc-worldgen = { path = "../mc-worldgen" }
 clap = { workspace = true }
 reqwest = { workspace = true }
 sha1 = { workspace = true }
+sha2 = { workspace = true }
 zip = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -50,7 +51,6 @@ assert_cmd = "2"
 predicates = "3"
 bytes = { workspace = true }
 rsa = { workspace = true }
-sha2 = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 mc-data = { path = "../mc-data" }

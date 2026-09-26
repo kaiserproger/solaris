@@ -20,6 +20,7 @@
 
 use crate::bindings::solaris::plugin::settlements as wire;
 use mc_script::{
+    ScriptBuildingCertificate, ScriptBuildingCertificateRequest, ScriptBuildingInteractionPoint,
     ScriptChunkAvailability, ScriptDtoError, ScriptResidentSiteReservation,
     ScriptSettlementBuilding, ScriptSettlementOperation, ScriptSettlementPoi,
     ScriptSettlementResult, ScriptSettlementSite, ScriptSettlementSitePage, ScriptSitePoiKind,
@@ -74,11 +75,13 @@ pub(crate) fn decode(
         wire::SettlementOperation::PrepareStructure(prepare) => {
             ScriptSettlementOperation::PrepareStructure {
                 operation_id: prepare.operation_id,
+                site_id: prepare.site_id,
                 blueprint_id: prepare.blueprint_id,
                 anchor: position(prepare.anchor),
                 rotation: prepare.rotation,
                 survey_token: prepare.survey_token,
                 expected_site_revision: prepare.expected_site_revision,
+                expected_blueprint_hash: prepare.expected_blueprint_hash,
             }
         }
         wire::SettlementOperation::AdvanceStructure(advance) => {
@@ -129,6 +132,19 @@ pub(crate) fn decode(
                 container_id: bind.container_id,
             }
         }
+        wire::SettlementOperation::BindManualWarehouse(bind) => {
+            ScriptSettlementOperation::BindManualWarehouse {
+                operation_id: bind.operation_id,
+                survey_token: bind.survey_token,
+                position: position(bind.position),
+            }
+        }
+        wire::SettlementOperation::RecognizeBuilding(recognize) => {
+            ScriptSettlementOperation::RecognizeBuilding {
+                operation_id: recognize.operation_id,
+                request: Box::new(certificate_request(recognize.request)?),
+            }
+        }
     })
 }
 
@@ -152,6 +168,9 @@ pub(crate) fn encode_result(value: &ScriptSettlementResult) -> Option<wire::Sett
         }
         ScriptSettlementResult::Warehouse { binding } => {
             wire::SettlementResult::Warehouse(warehouse_binding(binding)?)
+        }
+        ScriptSettlementResult::Building { certificate } => {
+            wire::SettlementResult::Building(building_certificate(certificate)?)
         }
         _ => return None,
     })
@@ -188,6 +207,7 @@ pub(crate) fn max_text_bytes(value: &wire::SettlementOperation) -> usize {
         wire::SettlementOperation::Survey(survey) => survey.dimension.len(),
         wire::SettlementOperation::PrepareStructure(prepare) => longest(&[
             prepare.operation_id.as_str(),
+            prepare.site_id.as_str(),
             prepare.blueprint_id.as_str(),
             prepare.survey_token.as_str(),
         ]),
@@ -213,6 +233,14 @@ pub(crate) fn max_text_bytes(value: &wire::SettlementOperation) -> usize {
         wire::SettlementOperation::BindVillageWarehouse(bind) => {
             longest(&[bind.operation_id.as_str(), bind.site_id.as_str()])
         }
+        wire::SettlementOperation::BindManualWarehouse(bind) => {
+            longest(&[bind.operation_id.as_str(), bind.survey_token.as_str()])
+        }
+        wire::SettlementOperation::RecognizeBuilding(recognize) => longest(&[
+            recognize.operation_id.as_str(),
+            recognize.request.purpose.as_str(),
+            recognize.request.survey_token.as_str(),
+        ]),
     }
 }
 
@@ -390,6 +418,7 @@ fn survey_snapshot(value: &ScriptSurveySnapshot) -> Option<wire::SurveySnapshot>
         dimension: value.dimension.clone(),
         bounds: contract_bounds(&value.bounds),
         revision: value.revision,
+        world_revision: value.world_revision,
         chunk_availability: chunk_availability(value.chunk_availability)?,
         survey_token: value.survey_token.clone(),
         usable_plots: value.usable_plots,
@@ -480,6 +509,121 @@ fn warehouse_source(value: &ScriptWarehouseSource) -> Option<wire::WarehouseSour
             site_id: site_id.clone(),
             container_id: *container_id,
         }),
+        ScriptWarehouseSource::Manual { position } => {
+            wire::WarehouseSource::Manual(wire::ManualWarehouseSource {
+                position: contract_position(*position),
+            })
+        }
+        _ => return None,
+    })
+}
+
+/// One contract certificate request as the server's own DTO.
+fn certificate_request(
+    value: wire::BuildingCertificateRequest,
+) -> Result<ScriptBuildingCertificateRequest, ScriptDtoError> {
+    Ok(ScriptBuildingCertificateRequest::new(
+        bounds(value.footprint)?,
+        value.purpose,
+        value
+            .interaction_points
+            .into_iter()
+            .map(building_point)
+            .collect::<Result<Vec<_>, _>>()?,
+        value.survey_token,
+        value.expected_world_revision,
+    ))
+}
+
+/// One contract interaction point as the server's own DTO.
+fn building_point(
+    value: wire::BuildingInteractionPoint,
+) -> Result<ScriptBuildingInteractionPoint, ScriptDtoError> {
+    Ok(match value {
+        wire::BuildingInteractionPoint::Entrance(entrance) => {
+            ScriptBuildingInteractionPoint::Entrance {
+                at: position(entrance.at),
+            }
+        }
+        wire::BuildingInteractionPoint::Poi(point) => ScriptBuildingInteractionPoint::Poi {
+            poi_kind: contract_poi_kind(point.poi_kind),
+            at: position(point.at),
+            capacity: point.capacity,
+        },
+        wire::BuildingInteractionPoint::Workstation(station) => {
+            ScriptBuildingInteractionPoint::Workstation {
+                at: position(station.at),
+                capability: station.capability,
+                workplaces: station.workplaces,
+            }
+        }
+        wire::BuildingInteractionPoint::Storage(storage) => {
+            ScriptBuildingInteractionPoint::Storage {
+                at: position(storage.at),
+            }
+        }
+    })
+}
+
+/// One contract POI role as the server's own kind.
+fn contract_poi_kind(value: wire::SitePoiKind) -> ScriptSitePoiKind {
+    match value {
+        wire::SitePoiKind::Home => ScriptSitePoiKind::Home,
+        wire::SitePoiKind::Work => ScriptSitePoiKind::Work,
+        wire::SitePoiKind::Meeting => ScriptSitePoiKind::Meeting,
+        wire::SitePoiKind::Guard => ScriptSitePoiKind::Guard,
+    }
+}
+
+/// One server certificate as the contract names it.
+fn building_certificate(value: &ScriptBuildingCertificate) -> Option<wire::BuildingCertificate> {
+    Some(wire::BuildingCertificate {
+        certificate_id: value.certificate_id.clone(),
+        footprint: contract_bounds(&value.footprint),
+        purpose: value.purpose.clone(),
+        interaction_points: value
+            .interaction_points
+            .iter()
+            .map(contract_building_point)
+            .collect::<Option<Vec<_>>>()?,
+        world_revision: value.world_revision,
+        revision: value.revision,
+    })
+}
+
+/// One server interaction point as the contract names it.
+fn contract_building_point(
+    value: &ScriptBuildingInteractionPoint,
+) -> Option<wire::BuildingInteractionPoint> {
+    Some(match value {
+        ScriptBuildingInteractionPoint::Entrance { at } => {
+            wire::BuildingInteractionPoint::Entrance(wire::BuildingEntrance {
+                at: contract_position(*at),
+            })
+        }
+        ScriptBuildingInteractionPoint::Poi {
+            poi_kind: kind,
+            at,
+            capacity,
+        } => wire::BuildingInteractionPoint::Poi(wire::BuildingPoi {
+            poi_kind: poi_kind(*kind)?,
+            at: contract_position(*at),
+            capacity: *capacity,
+        }),
+        ScriptBuildingInteractionPoint::Workstation {
+            at,
+            capability,
+            workplaces,
+        } => wire::BuildingInteractionPoint::Workstation(wire::BuildingWorkstation {
+            at: contract_position(*at),
+            capability: capability.clone(),
+            workplaces: *workplaces,
+        }),
+        ScriptBuildingInteractionPoint::Storage { at } => {
+            wire::BuildingInteractionPoint::Storage(wire::BuildingStorage {
+                at: contract_position(*at),
+            })
+        }
         _ => return None,
     })
 }

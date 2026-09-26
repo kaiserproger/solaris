@@ -30,6 +30,66 @@ fn held_sharpness_uses_the_vanilla_26_1_2_damage_formula() {
     );
 }
 
+#[test]
+fn registered_paper_carrier_uses_custom_weapon_damage_and_wear() {
+    use mc_data::item_components::{CustomItemDefinition, ItemFacts};
+
+    let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    let model = Identifier::parse("ruby-live:blade").unwrap();
+    state.items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+        mc_data::items::ItemReport {
+            id: Identifier::parse("minecraft:paper").unwrap(),
+            protocol_id: 1,
+        },
+    ]));
+    let paper = Identifier::parse("minecraft:paper").unwrap();
+    let paper_id = state.items.id_of(&paper).unwrap();
+    state.item_facts = Arc::new(
+        mc_data::item_components::ItemFactsTable::default()
+            .with_custom_items(
+                [CustomItemDefinition {
+                    id: model.clone(),
+                    carrier: paper,
+                    name: "Ruby Blade".to_owned(),
+                    crafting_ingredient: None,
+                    facts: ItemFacts {
+                        max_stack_size: Some(1),
+                        max_damage: Some(2),
+                        weapon: true,
+                        attack_damage_modifier: Some(5.0),
+                        attack_speed_modifier: Some(-2.0),
+                        ..ItemFacts::default()
+                    },
+                }],
+                &state.items,
+            )
+            .unwrap(),
+    );
+    let mut blade = ItemStack::new(paper_id, 1).with_item_model(model);
+    assert_eq!(
+        held_attack_damage(&state.item_facts, &state.items, &blade),
+        6.0
+    );
+    assert_eq!(
+        super::held_attack_speed(&state.item_facts, &state.items, &blade),
+        2.0
+    );
+    let vanilla_paper = ItemStack::new(paper_id, 1);
+    assert_eq!(
+        held_attack_damage(&state.item_facts, &state.items, &vanilla_paper),
+        1.0
+    );
+    assert_eq!(
+        super::damage_held_weapon_stack(&state.items, &state.item_facts, &mut blade)
+            .unwrap()
+            .damage,
+        Some(1)
+    );
+    assert_eq!(
+        super::damage_held_weapon_stack(&state.items, &state.item_facts, &mut blade),
+        Some(ItemStack::EMPTY)
+    );
+}
 #[tokio::test]
 async fn held_weapon_tracks_owner_selection_and_rejected_selection_preserves_it() {
     let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));

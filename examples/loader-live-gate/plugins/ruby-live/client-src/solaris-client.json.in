@@ -47,12 +47,21 @@
     "id": "ruby-live:ruby",
     "base_item": "minecraft:paper",
     "name": "Ruby Fixture Item"
+  }, {
+    "id": "ruby-live:blade",
+    "base_item": "minecraft:paper",
+    "name": "Ruby Blade"
   }],
   "assets": [{
     "id": "ruby-live:ruby_item_definition",
     "path": "assets/ruby-live/items/ruby.json",
     "sha256": "@ITEM_SHA256@",
     "size_bytes": @ITEM_SIZE@
+  }, {
+    "id": "ruby-live:blade_item_definition",
+    "path": "assets/ruby-live/items/blade.json",
+    "sha256": "@BLADE_SHA256@",
+    "size_bytes": @BLADE_SIZE@
   }, {
     "id": "ruby-live:ruby_block_model",
     "path": "assets/ruby-live/models/block/ruby_block.json",

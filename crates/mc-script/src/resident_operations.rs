@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    MAX_SCRIPT_WORLD_TIME, ScriptDtoError, ScriptPosition, validate_bounded_nonempty,
-    validate_bounded_value, validate_script_id,
+    MAX_SCRIPT_WORLD_TIME, ScriptDtoError, ScriptInventoryEndpoint, ScriptInventoryMaterial,
+    ScriptPosition, validate_bounded_nonempty, validate_bounded_value, validate_script_id,
 };
 
 /// Maximum number of opaque handles one `query_residents` call may address.
@@ -282,12 +282,17 @@ pub enum ScriptResidentResult {
         residents: Vec<ScriptResidentSnapshot>,
         cursor: Option<String>,
     },
+    /// Native health restored by one paid and durably committed medical decision.
+    Treated {
+        handle: String,
+    },
 }
 
 impl ScriptResidentResult {
     pub fn validate(&self) -> Result<(), ScriptDtoError> {
         match self {
             Self::Snapshot { resident } => resident.validate(),
+            Self::Treated { handle } => validate_resident_handle(handle),
             Self::Page { residents, cursor } => {
                 if residents.len() > MAX_RESIDENT_PAGE {
                     return Err(ScriptDtoError::TooManyEntries {
@@ -347,6 +352,14 @@ pub enum ScriptResidentOperation {
         meeting_poi: Option<String>,
         expected_revision: u64,
     },
+    Treat {
+        operation_id: String,
+        handle: String,
+        expected_revision: u64,
+        source: ScriptInventoryEndpoint,
+        material: ScriptInventoryMaterial,
+        heal_milli: u32,
+    },
 }
 
 impl ScriptResidentOperation {
@@ -355,7 +368,8 @@ impl ScriptResidentOperation {
             Self::Claim { operation_id, .. }
             | Self::Spawn { operation_id, .. }
             | Self::Release { operation_id, .. }
-            | Self::SetPois { operation_id, .. } => Some(operation_id),
+            | Self::SetPois { operation_id, .. }
+            | Self::Treat { operation_id, .. } => Some(operation_id),
             Self::Query { .. } => None,
         }
     }
@@ -448,6 +462,27 @@ impl ScriptResidentOperation {
                 }
                 Ok(())
             }
+            Self::Treat {
+                handle,
+                expected_revision,
+                source,
+                material,
+                heal_milli,
+                ..
+            } => {
+                validate_resident_handle(handle)?;
+                source.validate()?;
+                crate::check_contract_resource_id(&material.resource_id)?;
+                if material.quantity == 0
+                    || material.quantity > 4096
+                    || *expected_revision > MAX_SCRIPT_WORLD_TIME
+                    || *heal_milli == 0
+                    || *heal_milli > 1_000_000
+                {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -505,6 +540,40 @@ pub fn resident_generation_id(
     hasher.update((site_id.len() as u32).to_le_bytes());
     hasher.update(site_id.as_bytes());
     hasher.update(inhabitant_slot.to_le_bytes());
+    Ok(hex_prefix(
+        hasher.finalize().as_slice(),
+        GENERATION_ID_BYTES,
+    ))
+}
+
+/// Derive a deterministic inhabitant identity from a durable point-of-interest
+/// identity instead of a mutable descriptor position.
+///
+/// Generated villages discover their POIs from the materialized world. Their
+/// sorted descriptor order can change as blocks appear or disappear, so using
+/// that order as a generation slot could reassign an existing resident. The POI
+/// id is the stable authority for the physical point, and this separate domain
+/// keeps generated identities distinct from the legacy slot-derived form.
+pub fn resident_generation_id_for_poi(
+    world_identity: &str,
+    site_id: &str,
+    poi_id: &str,
+) -> Result<String, ScriptDtoError> {
+    if world_identity.is_empty() {
+        return Err(ScriptDtoError::EmptyValue {
+            field: "world identity",
+        });
+    }
+    validate_bounded_nonempty("settlement site id", site_id, 128)?;
+    validate_bounded_nonempty("settlement poi id", poi_id, MAX_RESIDENT_POI_HANDLE_BYTES)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"solaris.resident.generation.poi.v1");
+    hasher.update((world_identity.len() as u32).to_le_bytes());
+    hasher.update(world_identity.as_bytes());
+    hasher.update((site_id.len() as u32).to_le_bytes());
+    hasher.update(site_id.as_bytes());
+    hasher.update((poi_id.len() as u32).to_le_bytes());
+    hasher.update(poi_id.as_bytes());
     Ok(hex_prefix(
         hasher.finalize().as_slice(),
         GENERATION_ID_BYTES,

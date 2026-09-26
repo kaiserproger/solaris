@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
@@ -249,6 +249,18 @@ pub(crate) struct WarehousePlayerParticipant {
     pub(crate) updated_carried_item: ItemStack,
 }
 
+/// A proposed native heal carried into the simulation turn alongside its
+/// physical medicine debit. Only that turn may prepare the regional phase.
+#[derive(Debug)]
+pub(crate) struct PlannedResidentTreatment {
+    pub(crate) expected: mc_entity::EntitySnapshot,
+    pub(crate) accepted: mc_entity::EntitySnapshot,
+    pub(crate) operation_revision: u64,
+    pub(crate) heal_milli: u32,
+    pub(crate) mutation: Option<mc_entity::PreparedSnapshotMutation>,
+}
+pub(crate) type PreparedTreatmentParticipant = Arc<Mutex<Option<PlannedResidentTreatment>>>;
+
 /// One planned server-owned warehouse deposit, as its caller observed it.
 ///
 /// The caller has already resolved the durable warehouse binding, read the
@@ -270,6 +282,18 @@ pub(crate) struct WarehouseTransferRequest {
     /// The encoded plugin operation receipt that rides the container's own
     /// world-journal decision.
     pub(crate) receipt: Vec<u8>,
+    pub(crate) treatment: Option<PreparedTreatmentParticipant>,
+}
+
+/// The physical warehouse after-image one construction portion consumes.
+///
+/// The released floor belongs to this same durable decision; competing
+/// reservations remain protected while the container and structure publish.
+#[derive(Debug, Clone)]
+pub(crate) struct WarehouseStructureMaterialDebit {
+    pub(crate) position: mc_world::BlockPos,
+    pub(crate) expected_container: Vec<ItemStack>,
+    pub(crate) updated_container: Vec<ItemStack>,
 }
 
 /// Result of one server-owned warehouse deposit.
@@ -281,6 +305,8 @@ pub(crate) enum WarehouseTransferOutcome {
     /// The player fence moved before the owner turn: recovery pending, a
     /// different inventory or a different carried item.
     StalePlayer,
+    /// The resident changed before the owning turn could fence its native health.
+    StaleResident,
     /// The container fence moved: its state id, or its authoritative slots.
     StaleContainer,
     /// The container is not a loaded container at the expected position.

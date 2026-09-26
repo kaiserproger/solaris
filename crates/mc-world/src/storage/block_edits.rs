@@ -106,6 +106,7 @@ impl WorldStorage {
             scheduled_block_ticks,
             light_table,
             leaf_trigger_tick,
+            chest: None,
         };
         match self
             .resident

@@ -90,7 +90,7 @@ where
         state,
         updated_inventory,
         state.carried_item.clone(),
-        None,
+        Vec::new(),
         player_pose,
     )
     .await?
@@ -131,7 +131,7 @@ where
         state,
         unchanged_inventory,
         state.carried_item.clone(),
-        Some(stack),
+        vec![stack],
         player_pose,
     )
     .await?

@@ -650,6 +650,7 @@ fn placement_contribution() -> StartupContribution {
         trees: None,
         clay: None,
         spawning: None,
+        items: None,
     }
 }
 
@@ -662,6 +663,52 @@ impl Plugin for Hello {
         let settings = settings_of(config);
         match settings.mode {
             Mode::Placement => Ok(Some(placement_contribution())),
+            Mode::LoaderLive => {
+                let item = config.toml().and_then(|config| {
+                    match config.get("item_owner").and_then(|owner| owner.as_str()) {
+                        Some("ruby-live") => Some(("ruby-live:ruby", "Ruby Fixture Item")),
+                        Some("sapphire-live") => {
+                            Some(("sapphire-live:sapphire", "Sapphire Fixture Item"))
+                        }
+                        _ => None,
+                    }
+                });
+                Ok(item.map(|(id, name)| {
+                    let mut items = vec![lifecycle::ItemDefinition {
+                        id: id.to_owned(),
+                        carrier: "minecraft:paper".to_owned(),
+                        name: name.to_owned(),
+                        max_stack_size: 16,
+                        max_damage: None,
+                        weapon: false,
+                        attack_damage_modifier: None,
+                        attack_speed_modifier: None,
+                        equippable_slot: None,
+                        crafting_ingredient: Some("minecraft:paper".to_owned()),
+                    }];
+                    if id == "ruby-live:ruby" {
+                        items.push(lifecycle::ItemDefinition {
+                            id: "ruby-live:blade".to_owned(),
+                            carrier: "minecraft:paper".to_owned(),
+                            name: "Ruby Blade".to_owned(),
+                            max_stack_size: 1,
+                            max_damage: Some(3),
+                            weapon: true,
+                            attack_damage_modifier: Some(5.0),
+                            attack_speed_modifier: Some(-2.0),
+                            equippable_slot: None,
+                            crafting_ingredient: Some(id.to_owned()),
+                        });
+                    }
+                    StartupContribution {
+                        placement: None,
+                        trees: None,
+                        clay: None,
+                        spawning: None,
+                        items: Some(items),
+                    }
+                }))
+            }
             // A nested contribution is the startup answer, so it is built here
             // rather than from an event.
             Mode::Nested => Ok(Some(StartupContribution {
@@ -677,6 +724,7 @@ impl Plugin for Hello {
                 ),
                 clay: None,
                 spawning: None,
+                items: None,
             })),
             // The one probe that the two phases do not share a store: this mode
             // answers a valid contribution like `placement` and writes a marker

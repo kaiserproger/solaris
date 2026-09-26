@@ -24,6 +24,7 @@ const JOURNAL_VERSION: u32 = 3;
 const JOURNAL_HEADER_BYTES: usize = JOURNAL_MAGIC.len() + size_of::<u32>() + size_of::<u64>() * 2;
 const MAX_JOURNAL_ID: u64 = i64::MAX as u64;
 const FRAME_MAGIC: &[u8; 4] = b"WCF1";
+const TREATMENT_ACK_FRAME_MAGIC: &[u8; 4] = b"WAM1";
 const FRAME_PREFIX_BYTES: usize = FRAME_MAGIC.len() + size_of::<u64>();
 const FRAME_SUFFIX_BYTES: usize = size_of::<u32>();
 const DECISION_FIXED_BYTES: usize = size_of::<u64>() * 2 + size_of::<u32>();
@@ -501,6 +502,7 @@ impl WorldChunkJournal {
                 images: self.encode_images(current_tick, snapshots)?,
                 inventory: batch.map(|payload| InventoryDecision {
                     payload,
+                    native_committed: false,
                     projected: false,
                 }),
             });
@@ -1170,11 +1172,11 @@ fn decode_journal(
         ));
     }
 
-    let mut pending = Vec::new();
+    let mut pending: Vec<WorldChunkDecision> = Vec::new();
     let mut offset = JOURNAL_HEADER_BYTES;
     while offset < bytes.len() {
         match decode_frame_at(bytes, offset) {
-            Ok((decision, next_offset)) => {
+            Ok((DecodedFrame::Decision(decision), next_offset)) => {
                 let previous_id = pending.last().map_or(base_id, WorldChunkDecision::id);
                 if previous_id >= decision.id {
                     return Err(corrupt(offset, "record ids are not strictly increasing"));
@@ -1192,6 +1194,34 @@ fn decode_journal(
                     ));
                 }
                 pending.push(decision);
+                offset = next_offset;
+            }
+            Ok((DecodedFrame::TreatmentAck(id), next_offset)) => {
+                let Some(decision) = pending.iter_mut().find(|decision| decision.id == id) else {
+                    return Err(corrupt(offset, "treatment acknowledgement has no decision"));
+                };
+                if decision
+                    .inventory
+                    .as_ref()
+                    .is_some_and(|inventory| inventory.native_committed)
+                {
+                    return Err(corrupt(offset, "duplicate treatment acknowledgement"));
+                }
+                if decision
+                    .inventory_batch()
+                    .map_err(|error| corrupt(offset, error.to_string()))?
+                    .is_none_or(|batch| batch.treatment().is_none())
+                {
+                    return Err(corrupt(
+                        offset,
+                        "treatment acknowledgement has no medical debit",
+                    ));
+                }
+                decision
+                    .inventory
+                    .as_mut()
+                    .expect("medical decision has inventory")
+                    .native_committed = true;
                 offset = next_offset;
             }
             Err(FrameDecodeError::Incomplete(reason)) => {
@@ -1212,13 +1242,17 @@ enum FrameDecodeError {
     Corrupt(String),
 }
 
-fn decode_frame_at(
-    bytes: &[u8],
-    offset: usize,
-) -> Result<(WorldChunkDecision, usize), FrameDecodeError> {
+enum DecodedFrame {
+    Decision(WorldChunkDecision),
+    TreatmentAck(u64),
+}
+
+fn decode_frame_at(bytes: &[u8], offset: usize) -> Result<(DecodedFrame, usize), FrameDecodeError> {
     let remaining = &bytes[offset..];
     if remaining.len() < FRAME_MAGIC.len() {
-        return if FRAME_MAGIC.starts_with(remaining) || INVENTORY_FRAME_MAGIC.starts_with(remaining)
+        return if FRAME_MAGIC.starts_with(remaining)
+            || INVENTORY_FRAME_MAGIC.starts_with(remaining)
+            || TREATMENT_ACK_FRAME_MAGIC.starts_with(remaining)
         {
             Err(FrameDecodeError::Incomplete(
                 "incomplete frame magic".to_owned(),
@@ -1233,8 +1267,10 @@ fn decode_frame_at(
     let prefix = bytes
         .get(offset..prefix_end)
         .ok_or_else(|| FrameDecodeError::Incomplete("incomplete frame prefix".to_owned()))?;
-    let has_inventory = &prefix[..FRAME_MAGIC.len()] == INVENTORY_FRAME_MAGIC;
-    if !has_inventory && &prefix[..FRAME_MAGIC.len()] != FRAME_MAGIC {
+    let magic = &prefix[..FRAME_MAGIC.len()];
+    let has_inventory = magic == INVENTORY_FRAME_MAGIC;
+    let is_treatment_ack = magic == TREATMENT_ACK_FRAME_MAGIC;
+    if !has_inventory && !is_treatment_ack && magic != FRAME_MAGIC {
         return Err(FrameDecodeError::Corrupt("invalid frame magic".to_owned()));
     }
     let payload_len = u64::from_le_bytes(
@@ -1272,9 +1308,23 @@ fn decode_frame_at(
             "frame checksum mismatch: stored {stored_crc:#010x}, computed {actual_crc:#010x}"
         )));
     }
+    if is_treatment_ack {
+        if payload.len() != size_of::<u64>() {
+            return Err(FrameDecodeError::Corrupt(
+                "invalid treatment acknowledgement length".to_owned(),
+            ));
+        }
+        let id = u64::from_le_bytes(payload.try_into().expect("ack payload has fixed length"));
+        if id == 0 {
+            return Err(FrameDecodeError::Corrupt(
+                "zero treatment acknowledgement id".to_owned(),
+            ));
+        }
+        return Ok((DecodedFrame::TreatmentAck(id), frame_end));
+    }
     let decision =
         decode_decision_payload(payload, has_inventory).map_err(FrameDecodeError::Corrupt)?;
-    Ok((decision, frame_end))
+    Ok((DecodedFrame::Decision(decision), frame_end))
 }
 
 fn has_valid_frame_after(bytes: &[u8], start: usize) -> bool {
@@ -1284,7 +1334,11 @@ fn has_valid_frame_after(bytes: &[u8], start: usize) -> bool {
     bytes[start..]
         .windows(FRAME_MAGIC.len())
         .enumerate()
-        .filter(|(_, candidate)| *candidate == FRAME_MAGIC || *candidate == INVENTORY_FRAME_MAGIC)
+        .filter(|(_, candidate)| {
+            *candidate == FRAME_MAGIC
+                || *candidate == INVENTORY_FRAME_MAGIC
+                || *candidate == TREATMENT_ACK_FRAME_MAGIC
+        })
         .any(|(relative, _)| decode_frame_at(bytes, start + relative).is_ok())
 }
 
@@ -1307,6 +1361,13 @@ fn encode_journal(
     })?;
     for decision in decisions {
         bytes.extend_from_slice(&encode_frame(decision)?);
+        if decision
+            .inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.native_committed)
+        {
+            bytes.extend_from_slice(&encode_treatment_ack(decision.id));
+        }
     }
     Ok(bytes)
 }
@@ -1337,6 +1398,17 @@ fn encode_frame(decision: &WorldChunkDecision) -> Result<Vec<u8>, WorldChunkJour
     Ok(frame)
 }
 
+/// Compact, checksummed proof that the native health WAL is durable for a WIF1.
+pub(super) fn encode_treatment_ack(id: u64) -> Vec<u8> {
+    let payload = id.to_le_bytes();
+    let mut frame = Vec::with_capacity(FRAME_PREFIX_BYTES + payload.len() + FRAME_SUFFIX_BYTES);
+    frame.extend_from_slice(TREATMENT_ACK_FRAME_MAGIC);
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    frame
+}
+
 fn encoded_frame_len(decision: &WorldChunkDecision) -> Result<usize, WorldChunkJournalError> {
     FRAME_PREFIX_BYTES
         .checked_add(decision_payload_len(decision)?)
@@ -1351,6 +1423,16 @@ fn encoded_decisions_len(
     let mut total = checked_journal_len(0, initial)?;
     for decision in decisions {
         total = checked_journal_len(total, encoded_frame_len(decision)?)?;
+        if decision
+            .inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.native_committed)
+        {
+            total = checked_journal_len(
+                total,
+                FRAME_PREFIX_BYTES + size_of::<u64>() + FRAME_SUFFIX_BYTES,
+            )?;
+        }
     }
     Ok(total)
 }
@@ -1485,6 +1567,7 @@ fn decode_decision_payload(
         Some(InventoryDecision {
             payload: reader.bytes(length, "inventory payload")?.to_vec(),
             projected: false,
+            native_committed: false,
         })
     } else {
         None

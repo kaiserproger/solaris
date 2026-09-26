@@ -33,6 +33,31 @@ pub enum ItemComponentsError {
 #[derive(Debug, Clone, Default)]
 pub struct ItemFactsTable {
     items: BTreeMap<Identifier, ItemFacts>,
+    custom_items: BTreeMap<Identifier, CustomItemDefinition>,
+}
+
+/// A server-owned item identity whose wire representation uses a vanilla carrier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomItemDefinition {
+    pub id: Identifier,
+    pub carrier: Identifier,
+    pub name: String,
+    pub crafting_ingredient: Option<Identifier>,
+    pub facts: ItemFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CustomItemError {
+    #[error("custom item identity already declared: {0}")]
+    Duplicate(Identifier),
+    #[error("custom item carrier is not registered: {0}")]
+    UnknownCarrier(Identifier),
+    #[error("custom item recipe ingredient is not registered: {0}")]
+    UnknownRecipeIngredient(Identifier),
+    #[error("custom item identity conflicts with vanilla: {0}")]
+    VanillaIdentity(Identifier),
+    #[error("custom item definition is invalid: {0}")]
+    InvalidDefinition(Identifier),
 }
 
 impl ItemFactsTable {
@@ -40,12 +65,98 @@ impl ItemFactsTable {
     pub fn from_entries(entries: impl IntoIterator<Item = (Identifier, ItemFacts)>) -> Self {
         Self {
             items: entries.into_iter().collect(),
+            custom_items: BTreeMap::new(),
         }
     }
 
     #[must_use]
     pub fn get(&self, item: &Identifier) -> Option<&ItemFacts> {
         self.items.get(item)
+    }
+
+    /// Register a complete, validated startup catalog before sharing the table.
+    pub fn with_custom_items(
+        mut self,
+        definitions: impl IntoIterator<Item = CustomItemDefinition>,
+        items: &crate::items::ItemRegistry,
+    ) -> Result<Self, CustomItemError> {
+        for definition in definitions {
+            if definition.id.namespace() == "minecraft" || items.id_of(&definition.id).is_some() {
+                return Err(CustomItemError::VanillaIdentity(definition.id));
+            }
+            if items.id_of(&definition.carrier).is_none() {
+                return Err(CustomItemError::UnknownCarrier(definition.carrier));
+            }
+            let facts = &definition.facts;
+            if definition.name.is_empty()
+                || definition.name.len() > 128
+                || !matches!(facts.max_stack_size, Some(1..=64))
+                || facts
+                    .max_damage
+                    .is_some_and(|damage| damage == 0 || damage > 32_767)
+                || (facts.max_damage.is_some() && facts.max_stack_size != Some(1))
+                || facts.equippable_slot.as_ref().is_some_and(|slot| {
+                    !matches!(slot.as_str(), "head" | "chest" | "legs" | "feet")
+                        || facts.max_stack_size != Some(1)
+                })
+                || facts
+                    .attack_damage_modifier
+                    .is_some_and(|value| !value.is_finite())
+                || facts
+                    .attack_speed_modifier
+                    .is_some_and(|value| !value.is_finite())
+            {
+                return Err(CustomItemError::InvalidDefinition(definition.id));
+            }
+            let id = definition.id.clone();
+            if self.custom_items.insert(id.clone(), definition).is_some() {
+                return Err(CustomItemError::Duplicate(id));
+            }
+        }
+        for definition in self.custom_items.values() {
+            if let Some(ingredient) = &definition.crafting_ingredient
+                && items.id_of(ingredient).is_none()
+                && !self.custom_items.contains_key(ingredient)
+            {
+                return Err(CustomItemError::UnknownRecipeIngredient(ingredient.clone()));
+            }
+        }
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn into_custom_items(self) -> Vec<CustomItemDefinition> {
+        self.custom_items.into_values().collect()
+    }
+
+    #[must_use]
+    pub fn custom(&self, id: &Identifier) -> Option<&CustomItemDefinition> {
+        self.custom_items.get(id)
+    }
+
+    #[must_use]
+    pub fn custom_for_stack(
+        &self,
+        stack: &crate::ItemStack,
+        items: &crate::items::ItemRegistry,
+    ) -> Option<&CustomItemDefinition> {
+        let model = stack.item_model.as_deref()?;
+        let definition = self.custom(model)?;
+        (items.id_of(&definition.carrier) == Some(stack.item_id)).then_some(definition)
+    }
+
+    #[must_use]
+    pub fn facts_for_stack<'a>(
+        &'a self,
+        stack: &crate::ItemStack,
+        items: &crate::items::ItemRegistry,
+    ) -> Option<&'a ItemFacts> {
+        if let Some(model) = stack.item_model.as_deref()
+            && self.custom(model).is_some()
+        {
+            return self.custom_for_stack(stack, items).map(|item| &item.facts);
+        }
+        self.get(items.name_of(stack.item_id)?)
     }
 
     #[must_use]
@@ -143,7 +254,7 @@ pub fn load_item_facts(
         let facts = load_one(&path)?;
         items.insert(id, facts);
     }
-    Ok(ItemFactsTable { items })
+    Ok(ItemFactsTable::from_entries(items))
 }
 
 #[must_use]

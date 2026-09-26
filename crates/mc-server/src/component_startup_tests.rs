@@ -310,6 +310,7 @@ async fn component_worldgen_records_open_the_same_world_however_the_component_ch
             &identities.settlement_profile,
             spawn,
             identities.gameplay_rules.as_deref(),
+            identities.custom_items.as_deref(),
         )
         .expect("the declared plan opens a fresh world"),
         WorldSource::SolarisGenerated,
@@ -351,6 +352,7 @@ async fn component_worldgen_records_open_the_same_world_however_the_component_ch
             &redeployed_identities.settlement_profile,
             spawn,
             redeployed_identities.gameplay_rules.as_deref(),
+            redeployed_identities.custom_items.as_deref(),
         )
         .expect("the same plan reopens the same world"),
         WorldSource::SolarisGenerated,
@@ -384,6 +386,7 @@ async fn component_worldgen_records_open_the_same_world_however_the_component_ch
         &undeclared.settlement_profile,
         spawn,
         undeclared.gameplay_rules.as_deref(),
+        undeclared.custom_items.as_deref(),
     )
     .expect_err("a different ore profile must not open the same world");
     assert_eq!(

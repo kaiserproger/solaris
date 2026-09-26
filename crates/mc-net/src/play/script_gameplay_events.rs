@@ -7,9 +7,9 @@ use mc_script::{
 use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use tracing::warn;
 
-use super::{CommandPermissions, PlayerPose};
+use super::PlayerPose;
 use crate::script::PluginZoneAdapter;
-use crate::server::ScriptEventSink;
+use crate::server::{CommandPermissionConfig, ScriptEventSink};
 
 #[derive(Clone)]
 pub(super) struct ScriptGameplayEventPublisher {
@@ -17,7 +17,9 @@ pub(super) struct ScriptGameplayEventPublisher {
     player_id: ScriptPlayerId,
     uuid: String,
     username: String,
-    permissions: CommandPermissions,
+    operator_name: String,
+    permissions: CommandPermissionConfig,
+    peer: std::net::SocketAddr,
     dimension: String,
     zones: Option<PluginZoneAdapter>,
 }
@@ -28,15 +30,21 @@ impl ScriptGameplayEventPublisher {
         player_id: ScriptPlayerId,
         uuid: impl Into<String>,
         username: impl Into<String>,
-        permissions: CommandPermissions,
+        permissions: CommandPermissionConfig,
+        peer: std::net::SocketAddr,
         dimension: impl Into<String>,
     ) -> Self {
+        let mut uuid = uuid.into();
+        uuid.make_ascii_lowercase();
+        let username = username.into();
         Self {
             sink,
             player_id,
-            uuid: uuid.into(),
-            username: username.into(),
+            uuid,
+            operator_name: username.to_ascii_lowercase(),
+            username,
             permissions,
+            peer,
             dimension: dimension.into(),
             zones: None,
         }
@@ -47,10 +55,16 @@ impl ScriptGameplayEventPublisher {
         self
     }
 
+    fn is_operator(&self) -> bool {
+        self.permissions
+            .live_permissions_for_normalized(&self.operator_name, &self.uuid, self.peer)
+            .is_op()
+    }
+
     pub(super) fn block_mutation_allowed(&self, position: BlockPos) -> bool {
         self.zones.as_ref().is_none_or(|zones| {
             zones
-                .block_mutation_allowed(&self.uuid, self.permissions.op, &self.dimension, position)
+                .block_mutation_allowed(&self.uuid, self.is_operator(), &self.dimension, position)
                 .unwrap_or(false)
         })
     }
@@ -95,7 +109,7 @@ impl ScriptGameplayEventPublisher {
         let context = ScriptPlayerContext::new(
             &self.uuid,
             &self.username,
-            self.permissions.op,
+            self.is_operator(),
             pose.x,
             pose.y,
             pose.z,
@@ -158,7 +172,7 @@ impl ScriptGameplayEventPublisher {
         let context = ScriptPlayerContext::new(
             &self.uuid,
             &self.username,
-            self.permissions.op,
+            self.is_operator(),
             pose.x,
             pose.y,
             pose.z,
@@ -225,7 +239,7 @@ impl ScriptGameplayEventPublisher {
         let context = ScriptPlayerContext::new(
             &self.uuid,
             &self.username,
-            self.permissions.op,
+            self.is_operator(),
             pose.x,
             pose.y,
             pose.z,
@@ -288,7 +302,7 @@ impl ScriptGameplayEventPublisher {
         let context = ScriptPlayerContext::new(
             &self.uuid,
             &self.username,
-            self.permissions.op,
+            self.is_operator(),
             pose.x,
             pose.y,
             pose.z,
@@ -353,7 +367,7 @@ impl ScriptGameplayEventPublisher {
         let context = ScriptPlayerContext::new(
             &self.uuid,
             &self.username,
-            self.permissions.op,
+            self.is_operator(),
             pose.x,
             pose.y,
             pose.z,

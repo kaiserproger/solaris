@@ -3,6 +3,9 @@ use crate::play::commands::{
     AdminCommand, CommandError, CommandPermissions, command_suggestions, command_tree_packet,
     parse_admin_command,
 };
+use mc_protocol::frame::Compression;
+use mc_protocol::packets::Packet;
+use mc_protocol::packets::play::ClientboundCommands;
 use mc_protocol::packets::play::GameMode;
 
 #[test]
@@ -168,4 +171,36 @@ fn local_dev_profiles_are_op_capable_for_now() {
 
     assert!(permissions.can_change_game_mode());
     assert!(permissions.can_use_admin_commands());
+}
+
+#[tokio::test]
+async fn revoked_operator_reissues_non_operator_command_tree_on_wire() {
+    let mut config = super::play_loop_slow_client_test_config();
+    config.command_permissions =
+        crate::server::CommandPermissionConfig::new(Vec::<String>::new(), false);
+    let mut writer = Vec::new();
+    let permissions = crate::play::refresh_live_permissions(
+        &mut writer,
+        Compression::Disabled,
+        None,
+        &config,
+        &uuid::Uuid::nil().to_string(),
+        "Builder",
+        CommandPermissions::from_op(true),
+        "192.168.1.20:40000".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(!permissions.is_op());
+
+    let mut bytes = bytes::BytesMut::from(writer.as_slice());
+    let frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.id, ClientboundCommands::ID);
+    let mut body = frame.body;
+    let tree = ClientboundCommands::decode(&mut body).unwrap();
+    assert!(body.is_empty());
+    assert!(bytes.is_empty());
+    assert!(tree.nodes[tree.root_index as usize].children.is_empty());
 }

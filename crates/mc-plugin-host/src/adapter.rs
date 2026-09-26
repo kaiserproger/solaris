@@ -12,15 +12,15 @@ use std::num::NonZeroUsize;
 
 use mc_script::{
     CommandBatch as ScriptCommandBatch, CommandBatchError, CommandCapabilities,
-    ScriptAxisAlignedZone, ScriptClientSound, ScriptClientViewAction, ScriptClientViewField,
-    ScriptClientViewFormation, ScriptClientViewMarker, ScriptClientViewModel, ScriptClientViewOpen,
-    ScriptClientViewPresent, ScriptClientViewResourceEntry, ScriptClientViewRow,
-    ScriptClientViewTab, ScriptCommand, ScriptDtoError, ScriptInventoryMenu,
-    ScriptInventoryMenuItem, ScriptInventoryMenuSlot, ScriptInventoryResourceDelta,
-    ScriptInventoryStorageTransaction, ScriptLoaderItemGrantRequest, ScriptOnlinePlayersRequest,
-    ScriptOperation, ScriptOperationRequest, ScriptPlayerId, ScriptPlayerTeleportRequest,
-    ScriptPluginStorageCompareAndSwapRequest, ScriptPluginStorageGetRequest, ScriptPosition,
-    ScriptStorageMutation, ScriptZoneProtection,
+    ScriptAxisAlignedZone, ScriptClientSelectionConstraints, ScriptClientSound,
+    ScriptClientViewAction, ScriptClientViewField, ScriptClientViewFormation,
+    ScriptClientViewMarker, ScriptClientViewModel, ScriptClientViewOpen, ScriptClientViewPresent,
+    ScriptClientViewResourceEntry, ScriptClientViewRow, ScriptClientViewTab, ScriptCommand,
+    ScriptDtoError, ScriptInventoryMenu, ScriptInventoryMenuItem, ScriptInventoryMenuSlot,
+    ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptLoaderItemGrantRequest,
+    ScriptOnlinePlayersRequest, ScriptOperation, ScriptOperationRequest, ScriptPlayerId,
+    ScriptPlayerTeleportRequest, ScriptPluginStorageCompareAndSwapRequest,
+    ScriptPluginStorageGetRequest, ScriptPosition, ScriptStorageMutation, ScriptZoneProtection,
 };
 
 use crate::bindings::solaris::plugin::client_presentation::{
@@ -382,6 +382,26 @@ fn convert(
                 player_id: ScriptPlayerId::new(close.session),
                 view_instance_id: close.view_instance_id,
             }),
+            ClientCommand::BeginClientSelection(begin) => Ok(ScriptCommand::BeginClientSelection {
+                request_id: begin.request,
+                player_id: ScriptPlayerId::new(begin.session),
+                view_instance_id: begin.view_instance_id,
+                view_revision: begin.view_revision,
+                action_id: begin.action_id,
+                constraints: ScriptClientSelectionConstraints::try_new(
+                    &begin.dimension,
+                    begin.range_limit,
+                    begin.ttl_ticks,
+                    begin.formation.map(formation),
+                    begin.radius,
+                )?,
+            }),
+            ClientCommand::CancelClientSelection(cancel) => {
+                Ok(ScriptCommand::CancelClientSelection {
+                    player_id: ScriptPlayerId::new(cancel.session),
+                    selection_context_id: cancel.selection_context_id,
+                })
+            }
             ClientCommand::PlayClientSound(play) => Ok(ScriptCommand::ClientSound {
                 player_id: ScriptPlayerId::new(play.session),
                 sound: ScriptClientSound::play(

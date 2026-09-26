@@ -112,7 +112,6 @@ pub fn release_resident_site(request: &str, operation_id: &str, spawn_site_token
         }),
     )
 }
-
 /// Survey one bounded region of one dimension.
 ///
 /// The answer is a bounded aggregate snapshot - the usable and water columns, the
@@ -141,16 +140,19 @@ pub fn survey_site(
     )
 }
 
-/// Plan one structure of one authored blueprint at one anchor.
+/// Plan one structure of one authored blueprint at one settlement site.
 ///
-/// The anchor is the structure's own base row, and the owner refuses a placement it
-/// cannot honestly make: a footprint whose chunks are not all loaded is `unloaded`,
-/// and one where terrain rises above the base row is `blocked`, so a structure is
-/// never planned where it would overwrite what is already there. `survey_token` is
-/// the token [`survey_site`] answered with: an expired token, one whose region
-/// changed since it was read, or one whose site revision moved is refused
-/// `stale-revision`, a foreign one is `forbidden` and one the owner does not hold is
-/// `not-found`. The answer is the planned `structure-snapshot`.
+/// `site_id` names the caller's adopted generated village or catalog-authored
+/// site. The anchor is the structure's own base row, and the owner refuses a
+/// placement it cannot honestly make: a footprint whose chunks are not all loaded
+/// is `unloaded`, and one where terrain rises above the base row is `blocked`, so
+/// a structure is never planned where it would overwrite what is already there.
+/// `survey_token` is the token [`survey_site`] answered with: an expired token,
+/// one whose region changed since it was read, or one whose site revision moved is
+/// refused `stale-revision`, a foreign one is `forbidden` and one the owner does
+/// not hold is `not-found`. An optional expected catalog hash binds a shown
+/// preview to the exact blueprint planned; a different server catalog refuses
+/// `stale-revision`. The answer is the planned `structure-snapshot`.
 ///
 /// `operation_id` is the durable name the plan is recorded under, with the same
 /// replay and `operation-conflict` rules as [`reserve_resident_site`].
@@ -158,21 +160,25 @@ pub fn survey_site(
 pub fn prepare_structure(
     request: &str,
     operation_id: &str,
+    site_id: &str,
     blueprint_id: &str,
     anchor: settlements::BlockPosition,
     rotation: u16,
     survey_token: &str,
     expected_site_revision: u64,
+    expected_blueprint_hash: Option<&str>,
 ) -> Command {
     operation(
         request,
         settlements::SettlementOperation::PrepareStructure(settlements::PrepareStructure {
             operation_id: operation_id.to_owned(),
+            site_id: site_id.to_owned(),
             blueprint_id: blueprint_id.to_owned(),
             anchor,
             rotation,
             survey_token: survey_token.to_owned(),
             expected_site_revision,
+            expected_blueprint_hash: expected_blueprint_hash.map(str::to_owned),
         }),
     )
 }
@@ -282,15 +288,16 @@ pub fn cancel_structure(
     )
 }
 
-/// Read one durable structure back.
+/// Read one durable structure or building certificate back.
 ///
 /// The answer is the structure's whole `structure-snapshot`: its state, its stage
 /// plan, the watermark and materials of the portions committed so far, and the
 /// reservation it is bound to. An id the owner does not hold is `not-found` and one
 /// another plugin owns is `forbidden`, never an empty snapshot.
 ///
-/// A query carries no durable operation id, exactly as [`list_settlement_sites`]
-/// does not.
+/// A certificate id answers its immutable `building` certificate instead, so a
+/// recognized workplace validates through the same query. A query carries no
+/// durable operation id, exactly as [`list_settlement_sites`] does not.
 #[must_use]
 pub fn structure_status(request: &str, structure_id: &str) -> Command {
     operation(
@@ -346,6 +353,53 @@ pub fn bind_village_warehouse(
             operation_id: operation_id.to_owned(),
             site_id: site_id.to_owned(),
             container_id,
+        }),
+    )
+}
+
+/// Bind one player-built container at its exact surveyed position.
+///
+/// `survey_token` is the fence from [`survey_site`]: the caller's own live
+/// token whose bounds contain `position`. Core re-checks foreign zones before
+/// the commit and mints the same opaque warehouse handle every resident haul
+/// uses. A repeat bind answers the original handle and revision.
+#[must_use]
+pub fn bind_manual_warehouse(
+    request: &str,
+    operation_id: &str,
+    survey_token: &str,
+    position: settlements::BlockPosition,
+) -> Command {
+    operation(
+        request,
+        settlements::SettlementOperation::BindManualWarehouse(settlements::BindManualWarehouse {
+            operation_id: operation_id.to_owned(),
+            survey_token: survey_token.to_owned(),
+            position,
+        }),
+    )
+}
+
+/// Recognize one player-built volume as a functional building.
+///
+/// The request is the DTO the server validates: the footprint, the
+/// content-defined purpose, the typed interaction points, the survey-token
+/// fence from [`survey_site`], and the expected world revision read from the
+/// survey's `world-revision`. Core validates every point against the live
+/// world and answers the `building` certificate. A repeat recognition of the
+/// same normalized volume answers the original certificate, never extra
+/// capacity or workplaces.
+#[must_use]
+pub fn recognize_building(
+    request: &str,
+    operation_id: &str,
+    certificate: settlements::BuildingCertificateRequest,
+) -> Command {
+    operation(
+        request,
+        settlements::SettlementOperation::RecognizeBuilding(settlements::RecognizeBuilding {
+            operation_id: operation_id.to_owned(),
+            request: certificate,
         }),
     )
 }

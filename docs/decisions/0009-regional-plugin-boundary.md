@@ -213,20 +213,29 @@ default and cannot weaken per-plugin FIFO ordering.
 
 ## Current implementation status
 
-`mc-script` already provides isolated Luau states multiplexed by one serial host
-thread, bounded immutable DTOs, capability-gated command batches, targeted
-result events, instruction and memory limits, and generic typed protected
-zones. Runtime failure isolation survives into a typed terminal `LuaHostExitReport`:
-shutdown can distinguish a normal drained event-queue close from non-normal host
-exits and enumerate bounded per-plugin disable diagnostics without exposing the VM,
-queue, lock, or owner internals. Prepared reload uses that same private host-input
+`mc-script` provides bounded immutable DTOs, capability-gated command batches,
+targeted result events, and generic typed protected zones. `mc-plugin-host`
+executes Wasmtime components with one Store per plugin on a serial worker, under
+fuel, epoch, and memory limits. A retired guest loses its routes without gaining
+access to owner queues or locks. Prepared reload uses the private host-input
 serialization point: component candidates are compiled, configured, and initialized
 outside live stores under a static combined old/candidate guest-memory capacity;
-their init effects remain staged. A committed replacement changes route registrations
-to fresh monotonic generations before it swaps instances, so old timers and targeted
-late results cannot enter a same-id component replacement. Unix `mc-server` exposes
-strict SIGHUP preparation without replacing the `ScriptBoundary`.
-player inventory transactions, teleports, durable resident handles, work and
+their init effects remain staged. A committed replacement gives routes fresh
+monotonic generations before it swaps instances. Candidate init commands
+reserve queue and admission before the switch; their tickets bind to the
+committed registration under the admission lock before publication, not when
+the server eventually consumes the command. Events queued before the swap
+retain their admission generation; results constructed from an admitted plugin
+storage, compound inventory/storage, or typed operation request also retain
+the issuing command's generation, including when the owner replies after the
+swap. The retired Store cannot receive a replacement's result, and the new
+Store cannot receive that old request's result under the same plugin id. A
+committed operation remains queryable through its durable id if its callback
+is lost; the host does not reinterpret a missing callback as rollback. This
+generation fence is not a claim about events without an admitted request.
+Unix `mc-server` exposes strict SIGHUP preparation without replacing the
+`ScriptBoundary`. Native owner routes include player inventory transactions,
+teleports, durable resident handles, work and
 orders. Colony identity, roles and durable domain intent remain plugin-owned;
 runtime adapters receive bounded requests and return owner-scoped results,
 without exposing region keys, ECS references or pathing internals.
@@ -261,6 +270,147 @@ existing world fail-stop path. Native/session/regional commit preconditions
 check the inventory fence before effects, including callbacks reacquiring the
 mutex after planning. This is a concrete compound recovery mechanism, not a
 claim of global gameplay atomicity.
+
+The server-owned warehouse-to-resident equipment/carry transfer has no player
+session participant (`actor_id = 0`). The inventory owner resolves the plugin's
+bound container and live resident handle, checks both endpoint fences and
+reserved stock, then journals the physical container after-image, changed
+resident gear record and operation receipt under one decision. A gear-only
+record update advances its inventory fence without replacing its work, squad
+order or their nested revisions. Settlement role, employer and kit policy stay
+in the Wasm guest: it CAS-persists the exact transfer intent before issuing the
+native move and CAS-finalizes the role only after the committed receipt. On
+reload it reissues the same operation id and fenced content; native receipt
+replay precedes fence checking, so a lost callback cannot pay or equip twice.
+
+Dismissal reverses that same inventory composite, not its authority. The guest
+persists source-stack components and destination slots for the issued kit
+separately from the resident's personal wage. It reads the resident equipment
+fence (not the independent resident-identity revision), then CAS-persists a
+`Stop` intent before the native owner cancels any active goals and work and
+records `Civilian` or `Military → Demobilizing` without moving items. It snapshots
+the bound warehouse and resident slots, matches only the issued stacks by
+components and slot, CAS-persists a fenced `Return` intent, then requests a
+zero-actor equipment/carry-to-warehouse transfer. The owner refuses a fresh
+transfer when the bound entity cannot be confirmed present; a committed receipt
+still replays before a later lifecycle check. The owner journals the container
+after-image, changed resident gear and replay receipt as one decision. A lost
+reply replays the same operation id; the guest queries the current resident
+equipment fence after the return, so resumed owner work cannot stale the
+durable `Finish` intent and second native transition to `Civilian`. That owner
+transition rejects a dead, converted or stale resident; only after its receipt
+does the guest CAS-clear the role and issued kit. An unavailable destination
+leaves the same resident demobilizing with gear intact. Identical replacement
+stacks cannot be distinguished without an item-identity API; item resource,
+enchantments, custom name, model and nondecreasing wear avoid seizing visibly
+different personal gear. No plugin-owned inventory ledger, synthetic returned
+item or second population identity is introduced.
+
+Paid resident treatment is also a typed compound owner operation, not a
+standalone heal. The settlement guest checks owner/steward rights and the bound
+warehouse, reads the current native resident revision, and chooses a fixed cost:
+one bread for three health points. Core checks the live villager, actual native
+max-health attribute, physical stock and reservation floors. It plans the
+conditional regional snapshot containing both new health and the plugin
+transaction-revision marker, then the simulation owner prepares that regional
+phase inside the same turn as the chest command, after the region tick. Only
+then does it append the chest after-image, plugin receipt and exact health
+intent in one world-inventory decision. The regional journal commits and the
+shared writer flushes the native decision; the world journal then appends and
+syncs a checksummed `WAM1` acknowledgement linked to that inventory decision
+before either health or chest slots are published or the operation acknowledged.
+A definite refusal aborts the prepared regional phase; an uncertain world append,
+failed regional commit or uncertain acknowledgement stops publication and fences
+admission until restart. Startup projects the plugin receipt but retains the
+world decision, restores the regional entity WAL, and either recognizes its
+transaction-revision marker or journals the exact expected-to-next health
+transition. It flushes and records the linked acknowledgement before projecting
+the world decision. An absent resident can be projected only if that
+acknowledgement survived entity WAL compaction; without it recovery fails closed.
+The world checkpoint retains and re-encodes acknowledgements with unprojected
+decisions. The guest cannot create health or supplies through a separate path.
+
+Resident combat remains a typed owner operation. The settlement component
+checks owner/steward authority and serving role, then issues a bounded hold
+order and returns one server-issued hostile reference with its policy and
+expiry revisions in an attack order; it never submits damage or movement per
+tick. The resident owner checks live identity, equipment, reach, line of
+sight and a persisted attack cooldown. Melee damage uses the existing entity
+damage owner; a bow consumes one canonical arrow only when it launches an
+owner-and-target-bound projectile into the shared physics/visibility path.
+The projectile kernel, not the order response, determines later impact and
+publishes the one hit; scripted arrows cannot collide with other entities.
+An admitted attack retains one authenticated target reference in its durable
+order. The storage actor subscribes to simulation-tick notifications and
+rechecks only indexed active attackers after their persisted cooldown; native
+movement into reach can therefore finish the same order without guest polling.
+A combat-progress journal entry advances ammo/cooldown while preserving the
+guest-visible order/work revisions; cancellation removes the active index.
+Pre-upgrade target-bearing receipts decode with zero policy/expiry metadata
+and cannot authorize a fresh attack without a newly issued reference.
+
+For CP-047 operational morale, core advances a resident's durable categorical
+state at most once per newly observed physical event: own health loss, a
+distinct allied death, first exposure to an enemy on the flank, or loss of
+the assigned officer. Each event moves steady → shaken → wavering → routing;
+repeated ticks, the same casualty and continuous flank exposure do not advance
+it again. Routing replaces chase with a native walking goal to a separately
+chosen, route-validated safe anchor; it never treats the defended post as safe
+by default. Arrival at that anchor permits rallied; if the order names an
+officer, that officer must still be live and nearby. A blocked route remains
+routing: the current route helper also reports unloaded terrain and unavailable
+world adapters, which cannot prove surrender. Native capture must establish
+physical custody separately before a prisoner assignment. No numeric morale
+meter, timer-decay, artificial immunity or abstract casualty refund substitutes
+for these transitions. The guest chooses the officer and safe anchor; it cannot
+publish native morale or motion directly.
+
+Capture consumes a live routing attacker's public order revision, which native
+morale progress does not change, only when another live, bound villager guard
+is within three blocks. The native receipt and original resident order record
+commit together: the original UUID and gear stay in place,
+the attack stops, and the native assignment becomes prisoner/surrendered. An
+unloaded, dead, converted or released guard/victim, or a distant guard, cannot
+claim a prisoner.
+The native marker denies fresh work, military orders and demobilization; it
+does not name the political custodian. The settlement guest first CAS-fences
+the victim out of its old military roster, persists the physical capture
+operation id and guard handle, then replays that id after restart until the
+native result is known. One final registry CAS records the captor settlement
+on the original resident entry, without adding a second resident entry to
+the captor's roster. Explicit native refusal restores the former role under
+a CAS; unknown outcomes leave the intent fenced rather than re-enlist a
+possibly captured resident. War legality and release/exchange remain the
+separate treaty-policy boundary; custody does not authorize a later attack.
+
+This is not a cross-journal atomic commit between order/ammunition persistence
+and projectile spawn. The order receipt reports committed melee damage, not a
+prospective bow hit; durable projectile outcomes remain a separate boundary.
+
+Settlement `march` and `halt` name a bounded roster of hired aliases with
+each member's current order revision. The guest re-reads owner/steward rights
+and resolves those aliases to durable resident handles; it emits one native
+group request, never one request per member or per movement tick. Native
+admission fences every live member and commits the entire roster's order and
+receipt together. That acceptance is atomic; walking to each assigned slot
+is subsequent regional simulation and a blocked route reports its own member
+without rolling back the other accepted movement goals. The owner places a
+formation once per distinct anchor per order, then checks at most one route
+per eligible member. Each accepted movement destination is journaled with the
+member record so pending-admission replay restores distinct slots without
+terrain re-query or stacking. A later subset order replans only its named
+roster, while omitted members retain their previous order. Cancellation fences
+and idles only the named members; it does not teleport lagging residents.
+
+Ambulatory evacuation uses that same native Move admission for the original
+wounded resident and a nearby hired medic. The guest checks a live wound and
+four-block proximity, then requires both members to report `Applied` before
+calling the order admitted. This is neither atomic arrival nor a coupled
+escort: each regional entity walks its own route and may be interrupted after
+admission. A partial route reports partial/blocked rather than claiming
+transport. No patient copy, captive roster entry or second equipment ledger
+is created; the separately journaled medical operation remains the only
+healing/supply debit.
 
 The `storage_batches` feature adds owner-scoped operation receipts and bounded
 snapshot pagination behind the same storage actor. Successful batch identity

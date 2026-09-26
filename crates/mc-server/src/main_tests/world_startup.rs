@@ -301,6 +301,7 @@ fn world_contract_schema_two_is_rejected_cleanly_before_spawn_validation() {
         "vanilla",
         mc_world::WorldSpawn::new(320, -192),
         None,
+        None,
     )
     .unwrap_err();
     let message = error.to_string();
@@ -324,6 +325,7 @@ fn world_contract_persists_and_rejects_changed_spawn() {
             "vanilla",
             spawn,
             None,
+            None,
         )
         .unwrap(),
         WorldSource::SolarisGenerated,
@@ -341,6 +343,7 @@ fn world_contract_persists_and_rejects_changed_spawn() {
         "vanilla",
         "vanilla",
         mc_world::WorldSpawn::new(384, -192),
+        None,
         None,
     )
     .unwrap_err();

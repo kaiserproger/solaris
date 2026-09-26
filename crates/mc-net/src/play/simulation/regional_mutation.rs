@@ -89,6 +89,7 @@ enum RegionalMutationJob {
         transaction: Option<ChestTransaction>,
         primary_position: BlockPos,
         positions: Vec<BlockPos>,
+        expected_tokens: Option<Vec<mc_world::BlockMutationToken>>,
         expected_state_id: i32,
         expected: Vec<ChestBlockEntity>,
         updated: Vec<ChestBlockEntity>,
@@ -264,6 +265,72 @@ impl SimulationOwner {
         let block_light_owned = access.light;
         let lane_count = resources.cpu_capacity().max(1);
         let world_tick = sessions.simulation_tick();
+        // Regional phases must not span simulation turns: the region tick
+        // precedes command processing and cannot enter while this turn owns
+        // a prepared patient. Fence before assigning a world decision id.
+        let mut admitted = Vec::with_capacity(run.len());
+        let mut refused = 0;
+        for envelope in run {
+            if let SimulationCommand::CommitChest {
+                treatment: Some(participant),
+                ..
+            } = &envelope.command
+            {
+                let (expected, accepted, operation_revision, heal_milli) = {
+                    let guard = participant.lock().expect("planned treatment lock");
+                    let treatment = guard.as_ref().expect("planned treatment participant");
+                    (
+                        treatment.expected.clone(),
+                        treatment.accepted.clone(),
+                        treatment.operation_revision,
+                        treatment.heal_milli,
+                    )
+                };
+                match sessions
+                    .prepare_resident_treatment(expected, operation_revision, heal_milli)
+                    .await
+                {
+                    Ok(Some((mutation, next))) if next == accepted => {
+                        participant
+                            .lock()
+                            .expect("planned treatment lock")
+                            .as_mut()
+                            .expect("planned treatment participant")
+                            .mutation = Some(mutation);
+                    }
+                    Ok(Some(_))
+                    | Ok(None)
+                    | Err(mc_entity::RegionOwnerLaneError::InvalidMutation)
+                    | Err(mc_entity::RegionOwnerLaneError::Busy) => {
+                        self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+                        refused += 1;
+                        envelope.respond(Ok(SimulationResponse::WarehouseTransfer(Ok(
+                            WarehouseTransferOutcome::StaleResident,
+                        ))));
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(?error, "resident treatment regional preparation failed");
+                        sessions.report_world_chunk_journal_failure();
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        refused += 1;
+                        envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                        continue;
+                    }
+                }
+            }
+            admitted.push(envelope);
+        }
+        let run = admitted;
+        if run.is_empty() {
+            return SimulationTickReport {
+                processed: refused,
+                remaining_depth: self.metrics.depth.load(Ordering::Relaxed),
+                ..SimulationTickReport::default()
+            };
+        }
         let journal_ids = if let Some(journal) = journal {
             let journal = journal.clone();
             let command_count = run.len();
@@ -318,6 +385,7 @@ impl SimulationOwner {
                     zone_fence,
                     hook_approval,
                     plugin_receipt,
+                    ..
                 } => RegionalMutationJob::BlockEdits {
                     actor_session: *actor_session,
                     edits: resident_block_edits(edits),
@@ -353,17 +421,20 @@ impl SimulationOwner {
                 SimulationCommand::CommitChest {
                     primary_position,
                     positions,
+                    expected_tokens,
                     expected_state_id,
                     actor_session,
                     expected,
                     updated,
                     player,
                     plugin_receipt,
+                    ..
                 } => RegionalMutationJob::Chest {
                     transaction: sessions
                         .prepare_chest_transaction(*actor_session, *primary_position),
                     primary_position: *primary_position,
                     positions: positions.clone(),
+                    expected_tokens: expected_tokens.clone(),
                     expected_state_id: *expected_state_id,
                     expected: expected.clone(),
                     updated: updated.clone(),
@@ -736,6 +807,7 @@ impl SimulationOwner {
                                 transaction,
                                 primary_position,
                                 positions,
+                                expected_tokens,
                                 expected_state_id,
                                 expected,
                                 updated,
@@ -751,6 +823,7 @@ impl SimulationOwner {
                                                 ChestTransactionRequest {
                                                     primary_position,
                                                     positions: &positions,
+                                                    expected_tokens: None,
                                                     expected_state_id,
                                                     expected: &expected,
                                                     updated: &updated,
@@ -848,6 +921,7 @@ impl SimulationOwner {
                                                 ChestTransactionRequest {
                                                     primary_position,
                                                     positions: &positions,
+                                                    expected_tokens: expected_tokens.as_deref(),
                                                     expected_state_id,
                                                     expected: &expected,
                                                     updated: &updated,
@@ -1110,6 +1184,18 @@ impl SimulationOwner {
         let processed = run.len();
         for envelope in run {
             let Some(outcome) = results.remove(&envelope.sequence) else {
+                if let SimulationCommand::CommitChest {
+                    treatment: Some(participant),
+                    ..
+                } = &envelope.command
+                    && let Some(treatment) =
+                        participant.lock().expect("prepared treatment lock").take()
+                {
+                    if let Some(mutation) = treatment.mutation {
+                        mutation.leave_fenced_for_recovery();
+                    }
+                    sessions.report_world_chunk_journal_failure();
+                }
                 envelope.respond(Err(if world_journal_failed {
                     SimulationRequestError::WorldMutationFailed
                 } else {
@@ -1360,10 +1446,20 @@ impl SimulationOwner {
                     dispatches,
                     ..
                 } => {
+                    let treatment = match &envelope.command {
+                        SimulationCommand::CommitChest {
+                            treatment: Some(participant),
+                            ..
+                        } => participant.lock().expect("prepared treatment lock").take(),
+                        _ => None,
+                    };
                     if world_journal_failed {
-                        // The decision never landed: nothing may be published,
-                        // and a committed container whose after-image is not
-                        // journaled is not recoverable with its receipt.
+                        // The append may have reached durable storage before a
+                        // journal error. Keep the regional phase fenced until
+                        // recovery rather than letting the patient die unpaid.
+                        if let Some(mutation) = treatment.and_then(|treatment| treatment.mutation) {
+                            mutation.leave_fenced_for_recovery();
+                        }
                         self.metrics
                             .rejected_world_mutation
                             .fetch_add(1, Ordering::Relaxed);
@@ -1374,7 +1470,32 @@ impl SimulationOwner {
                         !matches!(decision, Some(RegionalWarehouseDecision::Unjournaled)),
                         "an unjournaled container commit fails the run's append"
                     );
-                    if outcome.is_ok() {
+                    if matches!(
+                        outcome.as_ref(),
+                        Ok(WarehouseTransferOutcome::Committed { .. })
+                    ) {
+                        if let Some(treatment) = treatment {
+                            let accepted = treatment.accepted;
+                            let journal =
+                                (*journal.expect("paid treatment requires world journal")).clone();
+                            let decision_id = journal_ids[&envelope.sequence];
+                            let committed = tokio::task::spawn_blocking(move || {
+                                treatment
+                                    .mutation
+                                    .expect("fenced treatment")
+                                    .commit()
+                                    .is_ok()
+                                    && journal.writer.flush().is_ok()
+                                    && journal.confirm_treatment_committed(decision_id).is_ok()
+                            })
+                            .await;
+                            if !matches!(committed, Ok(true)) {
+                                sessions.report_world_chunk_journal_failure();
+                                envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                                continue;
+                            }
+                            sessions.publish_resident_treatment(&accepted);
+                        }
                         dispatch_visibility_commands(dispatches);
                     }
                     envelope.respond(Ok(SimulationResponse::WarehouseTransfer(*outcome)));
@@ -1435,8 +1556,11 @@ impl SimulationOwner {
             }
         }
 
+        #[cfg(test)]
+        crate::play::session::publication_probe::disarm();
+
         SimulationTickReport {
-            processed,
+            processed: processed + refused,
             remaining_depth: self.metrics.depth.load(Ordering::Relaxed),
             lane_attribution,
         }

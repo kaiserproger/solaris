@@ -22,10 +22,16 @@ use mc_script::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::play::SessionRegistry;
 use crate::play::resident_work::RESIDENT_WORLD_DIMENSION;
 
-use crate::play::owned_inventory::owned_inventory_fingerprint;
+use crate::play::owned_inventory::{
+    PlannedResidentTreatment, inventory_resource_stock, owned_inventory_fingerprint,
+};
 
+use super::world_inventory::{
+    DurableTreatmentIntent, PreparedDepositCommit, PreparedDepositContainer,
+};
 use super::{
     DurableOperationReceipt, PluginStorage, PluginStorageMutationError, PluginStorageStartError,
     PreparedStorageBatch, ScriptStoragePrepareOutcome,
@@ -427,6 +433,7 @@ impl PluginStorage {
                 resident: changes,
                 settlement: Vec::new(),
                 order: Vec::new(),
+                treatment: None,
             },
         ))
     }
@@ -518,13 +525,16 @@ fn resident_snapshot(
     )
 }
 
-fn resident_entity_is_current(snapshot: &EntitySnapshot) -> bool {
+pub(super) fn resident_entity_is_current(snapshot: &EntitySnapshot) -> bool {
     snapshot.lifecycle == EntityLifecycle::Alive && snapshot.type_name == "minecraft:villager"
 }
 
 /// A live entity that no longer is the bound villager is a conversion or death:
 /// the record keeps its identity and becomes a tombstone.
-fn resident_death_observed(record: &DurableResidentRecord, live: Option<&EntitySnapshot>) -> bool {
+pub(super) fn resident_death_observed(
+    record: &DurableResidentRecord,
+    live: Option<&EntitySnapshot>,
+) -> bool {
     record.disposition == ResidentDisposition::Alive
         && live.is_some_and(|snapshot| !resident_entity_is_current(snapshot))
 }
@@ -865,10 +875,134 @@ impl super::InventoryRuntime {
                 )
                 .await
             }
+            ScriptResidentOperation::Treat { .. } => {
+                self.treat_resident(storage, plugin_id, request).await
+            }
             ScriptResidentOperation::Query { .. } => {
                 Ok(rejected(ScriptOperationFailure::InvalidRequest))
             }
             _ => Ok(rejected(ScriptOperationFailure::InvalidRequest)),
+        }
+    }
+
+    async fn treat_resident(
+        &self,
+        storage: &mut PluginStorage,
+        plugin_id: &str,
+        request: &ScriptOperationRequest,
+    ) -> Result<ScriptOperationOutcome, PluginStorageMutationError> {
+        let ScriptOperation::Resident {
+            operation:
+                ScriptResidentOperation::Treat {
+                    handle,
+                    expected_revision,
+                    source,
+                    material,
+                    heal_milli,
+                    ..
+                },
+        } = request.operation()
+        else {
+            return Ok(rejected(ScriptOperationFailure::InvalidRequest));
+        };
+        let _save_guard = self.save_coordinator.lock().await;
+        let Some(record) = storage.residents().record(handle).cloned() else {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        };
+        if record.plugin_id != plugin_id {
+            return Ok(rejected(ScriptOperationFailure::Forbidden));
+        }
+        if record.revision != *expected_revision {
+            return Ok(rejected(ScriptOperationFailure::StaleRevision));
+        }
+        if record.disposition != ResidentDisposition::Alive {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        }
+        let live = self
+            .resident_live(std::slice::from_ref(&record.entity_uuid))
+            .await;
+        let Some(snapshot) = live.first().and_then(Option::as_ref) else {
+            return Ok(rejected(ScriptOperationFailure::Unloaded));
+        };
+        if !resident_entity_is_current(snapshot) {
+            return Ok(rejected(ScriptOperationFailure::NotFound));
+        }
+        let debit = match self.plan_structure_material_debit(
+            storage,
+            plugin_id,
+            source,
+            &BTreeMap::from([(material.resource_id.clone(), material.quantity)]),
+        ) {
+            Ok(debit) => debit,
+            Err(failure) => return Ok(rejected(failure)),
+        };
+        if storage
+            .reserved_quantities(source)
+            .iter()
+            .any(|(resource, reserved)| {
+                !inventory_resource_stock(&debit.updated, self.items(), resource)
+                    .is_ok_and(|stock| stock >= *reserved)
+            })
+        {
+            return Ok(rejected(ScriptOperationFailure::InsufficientItems));
+        }
+        let payload = ScriptOperationPayload::Resident {
+            result: Box::new(ScriptResidentResult::Treated {
+                handle: handle.to_owned(),
+            }),
+        };
+        let mut prepared = match storage.prepare_owned_batch(plugin_id, request, payload, None)? {
+            ScriptStoragePrepareOutcome::Prepared(prepared) => prepared,
+            ScriptStoragePrepareOutcome::Rejected => {
+                return Ok(rejected(ScriptOperationFailure::Busy));
+            }
+        };
+        let accepted = match SessionRegistry::plan_resident_treatment(
+            snapshot,
+            prepared.transaction_id,
+            *heal_milli,
+        ) {
+            Ok(accepted) => accepted,
+            Err(mc_entity::RegionOwnerLaneError::InvalidMutation) => {
+                return Ok(rejected(ScriptOperationFailure::Blocked));
+            }
+            Err(_) => return Ok(rejected(ScriptOperationFailure::RuntimeUnavailable)),
+        };
+        prepared.treatment = Some(DurableTreatmentIntent {
+            entity_uuid: record.entity_uuid.clone(),
+            expected_health_bits: snapshot.health.to_bits(),
+            next_health_bits: accepted.health.to_bits(),
+        });
+        let participant = PlannedResidentTreatment {
+            expected: snapshot.clone(),
+            accepted,
+            operation_revision: prepared.transaction_id,
+            heal_milli: *heal_milli,
+            mutation: None,
+        };
+        let result = self
+            .commit_prepared_deposit(
+                storage,
+                prepared,
+                PreparedDepositContainer {
+                    position: debit.position,
+                    expected: debit.expected,
+                    updated: debit.updated,
+                },
+                None,
+                Some(participant),
+            )
+            .await?;
+        match result {
+            PreparedDepositCommit::Committed(_) => Ok(storage
+                .operation_receipt(
+                    plugin_id,
+                    request.operation_id().expect("treatment decision identity"),
+                )
+                .expect("committed treatment receipt")
+                .outcome
+                .clone()),
+            PreparedDepositCommit::Refused(failure) => Ok(rejected(failure)),
         }
     }
 

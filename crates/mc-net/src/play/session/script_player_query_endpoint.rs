@@ -52,10 +52,14 @@ impl SessionRegistry {
             .into_iter()
             .take(limit)
             .map(|(&session_id, session)| {
+                let uuid = session.uuid.to_string();
                 let context = ScriptPlayerContext::try_new(
-                    session.uuid.to_string(),
+                    &uuid,
                     &session.name,
-                    session.script_operator,
+                    session
+                        .script_permissions
+                        .live_permissions_for(&session.name, &uuid, session.peer)
+                        .is_op(),
                     session.pose.x,
                     session.pose.y,
                     session.pose.z,

@@ -9,6 +9,7 @@ pub(crate) struct ChatCommandIngressContext<'a, W> {
     pub(in crate::play) player_uuid: &'a str,
     pub(in crate::play) player_name: &'a str,
     pub(in crate::play) permissions: CommandPermissions,
+    pub(in crate::play) peer: std::net::SocketAddr,
     pub(in crate::play) player_pose: &'a mut PlayerPose,
     pub(in crate::play) game_mode: &'a mut GameMode,
     pub(in crate::play) survival_state: &'a mut SurvivalState,
@@ -35,6 +36,10 @@ pub(crate) fn is_serverbound_chat_command_packet(id: i32) -> bool {
 ///
 /// The console can grant or revoke operator status while a player is online;
 /// the refreshed command tree keeps client suggestions in step.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the writer, live connection and identity are distinct authorities"
+)]
 pub(crate) async fn refresh_live_permissions<W>(
     writer: &mut W,
     compression: Compression,
@@ -43,14 +48,14 @@ pub(crate) async fn refresh_live_permissions<W>(
     player_uuid: &str,
     player_name: &str,
     login_resolved: CommandPermissions,
+    peer: std::net::SocketAddr,
 ) -> Result<CommandPermissions, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let live =
-        config
-            .command_permissions
-            .live_permissions_for(player_name, player_uuid, login_resolved);
+    let live = config
+        .command_permissions
+        .live_permissions_for(player_name, player_uuid, peer);
     if live != login_resolved {
         let plugin_roots = scripts.map_or_else(Vec::new, ScriptEventSink::player_command_roots);
         let operator_roots = scripts.map_or_else(Vec::new, ScriptEventSink::operator_command_roots);
@@ -80,6 +85,7 @@ where
         player_uuid,
         player_name,
         permissions,
+        peer,
         player_pose,
         game_mode,
         survival_state,
@@ -102,6 +108,7 @@ where
         player_uuid,
         player_name,
         permissions,
+        peer,
     )
     .await?;
     let mut body = frame.body;

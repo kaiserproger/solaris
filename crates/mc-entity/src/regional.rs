@@ -1752,6 +1752,72 @@ enum SnapshotSelection {
     },
 }
 
+/// A regional mutation prepared before an external durable participant commits.
+/// Drop waits for abort acknowledgement; after the external decision commits,
+/// `commit` never aborts on an uncertain regional journal outcome.
+pub struct PreparedSnapshotMutation {
+    owner: RegionalOwnerHandle,
+    phase: RegionPhase,
+    lane: usize,
+    sequence: u64,
+    entity: EntityId,
+    committed: bool,
+}
+
+impl std::fmt::Debug for PreparedSnapshotMutation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedSnapshotMutation")
+            .field("phase", &self.phase)
+            .field("entity", &self.entity)
+            .finish()
+    }
+}
+
+impl PreparedSnapshotMutation {
+    pub fn commit(mut self) -> Result<(), RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.owner
+            .sender
+            .send(RegionalOwnerCommand::CommitPreparedSnapshot {
+                phase: self.phase,
+                lane: self.lane,
+                sequence: self.sequence,
+                entity: self.entity,
+                reply,
+            })
+            .map_err(|_| self.owner.unavailable_error())?;
+        self.committed = true;
+        result.recv().map_err(|_| self.owner.unavailable_error())?
+    }
+    /// The external journal's outcome is unknown; keep the phase fenced until
+    /// process recovery rather than admitting a conflicting native mutation.
+    pub fn leave_fenced_for_recovery(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PreparedSnapshotMutation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let (reply, result) = channel();
+            if self
+                .owner
+                .sender
+                .send(RegionalOwnerCommand::AbortPreparedSnapshot {
+                    phase: self.phase,
+                    lane: self.lane,
+                    reply,
+                })
+                .is_ok()
+            {
+                let _ = result.recv();
+            }
+        }
+    }
+}
+
+type PreparedSnapshotReply = Result<Option<(RegionPhase, usize, u64)>, RegionOwnerLaneError>;
+
 enum RegionalOwnerCommand {
     Snapshot {
         entity: EntityId,
@@ -1843,6 +1909,23 @@ enum RegionalOwnerCommand {
         defer_journal: bool,
         allow_type_change: bool,
         reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
+    PrepareSnapshot {
+        expected: Box<EntitySnapshot>,
+        next: Box<EntitySnapshot>,
+        reply: std::sync::mpsc::Sender<PreparedSnapshotReply>,
+    },
+    CommitPreparedSnapshot {
+        phase: RegionPhase,
+        lane: usize,
+        sequence: u64,
+        entity: EntityId,
+        reply: std::sync::mpsc::Sender<Result<(), RegionOwnerLaneError>>,
+    },
+    AbortPreparedSnapshot {
+        phase: RegionPhase,
+        lane: usize,
+        reply: std::sync::mpsc::Sender<Result<(), RegionOwnerLaneError>>,
     },
     ReplaceSnapshotsIfCurrent {
         snapshots: Vec<(EntitySnapshot, EntitySnapshot)>,
@@ -2079,6 +2162,9 @@ impl RegionalOwnerCommand {
                 | Self::Remove { .. }
                 | Self::RemoveIfCurrent { .. }
                 | Self::ReplaceSnapshotIfCurrent { .. }
+                | Self::PrepareSnapshot { .. }
+                | Self::CommitPreparedSnapshot { .. }
+                | Self::AbortPreparedSnapshot { .. }
                 | Self::ReplaceSnapshotsIfCurrent { .. }
                 | Self::MergeItemSnapshotsIfCurrent { .. }
                 | Self::SetAnimalStatesIfCurrent { .. }
@@ -2829,6 +2915,33 @@ impl RegionalOwnerHandle {
             })
             .map_err(|_| self.unavailable_error())?;
         result.recv().map_err(|_| self.unavailable_error())?
+    }
+
+    pub fn prepare_snapshot_if_current(
+        &self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<Option<PreparedSnapshotMutation>, RegionOwnerLaneError> {
+        let entity = expected.id;
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::PrepareSnapshot {
+                expected: Box::new(expected),
+                next: Box::new(next),
+                reply,
+            })
+            .map_err(|_| self.unavailable_error())?;
+        Ok(result
+            .recv()
+            .map_err(|_| self.unavailable_error())??
+            .map(|(phase, lane, sequence)| PreparedSnapshotMutation {
+                owner: self.clone(),
+                phase,
+                lane,
+                sequence,
+                entity,
+                committed: false,
+            }))
     }
 
     pub fn replace_snapshot_if_current(
@@ -5168,6 +5281,42 @@ fn run_regional_owner_runtime(
                 }
                 let _ = reply.send(result);
             }
+            RegionalOwnerCommand::PrepareSnapshot {
+                expected,
+                next,
+                reply,
+            } => {
+                let _ = reply.send(coordinator.prepare_snapshot_if_current(*expected, *next));
+            }
+            RegionalOwnerCommand::CommitPreparedSnapshot {
+                phase,
+                lane,
+                sequence,
+                entity,
+                reply,
+            } => {
+                let result = coordinator.commit_prepared_snapshot(phase, lane, sequence, entity);
+                if result.is_ok() {
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
+                        .clear();
+                } else {
+                    coordinator
+                        .commit_state
+                        .outcome_unknown
+                        .store(true, Ordering::Release);
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::AbortPreparedSnapshot { phase, lane, reply } => {
+                let result = coordinator.abort_prepared_snapshot(phase, lane);
+                if result.is_err() {
+                    coordinator
+                        .commit_state
+                        .outcome_unknown
+                        .store(true, Ordering::Release);
+                }
+                let _ = reply.send(result);
+            }
             RegionalOwnerCommand::ReplaceSnapshotsIfCurrent { snapshots, reply } => {
                 let result = coordinator.replace_snapshots_if_current(snapshots);
                 if matches!(&result, Ok(true)) {
@@ -6806,6 +6955,163 @@ impl RegionalOwnerCoordinator {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn prepare_snapshot_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<Option<(RegionPhase, usize, u64)>, RegionOwnerLaneError> {
+        if expected.id != next.id
+            || expected.uuid != next.uuid
+            || expected.position != next.position
+            || expected.type_id != next.type_id
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        let key = RegionKey::from_position(expected.position)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        if self.locations.get(&expected.id).copied() != Some(key)
+            || self.in_flight_transfers.contains_key(&expected.id)
+            || self.snapshot(expected.id)?.as_ref() != Some(&expected)
+        {
+            return Ok(None);
+        }
+        let (.., sequence) = self.commit_state.reserve_sequences(1)?;
+        let phase = self.commit_state.reserve_phase()?;
+        let lease = self
+            .ownership
+            .lease(key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        self.ownership
+            .begin_allocated_phase_for_lanes(phase, BTreeSet::from([lease.lane]))
+            .map_err(|_| RegionOwnerLaneError::Busy)?;
+        let prepared = self.lanes[&lease.lane].prepare(RegionOwnerBatch {
+            phase,
+            sequence_watermark: sequence,
+            mutations: vec![SequencedRegionMutation {
+                sequence,
+                lease,
+                mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                    expected: Box::new(expected),
+                    next: Box::new(next),
+                    allow_type_change: false,
+                },
+            }],
+        });
+        let result = prepared.and_then(|completion| {
+            completion
+                .recv()
+                .map_err(|_| RegionOwnerLaneError::Closed)?
+        });
+        match result {
+            Ok(ready) if ready == phase => Ok(Some((phase, lease.lane, sequence))),
+            Ok(_) => {
+                self.abort_prepared_snapshot(phase, lease.lane)?;
+                Err(RegionOwnerLaneError::StalePhase)
+            }
+            Err(RegionOwnerLaneError::Closed) => {
+                self.commit_state
+                    .outcome_unknown
+                    .store(true, Ordering::Release);
+                Err(RegionOwnerLaneError::Closed)
+            }
+            Err(error) => {
+                self.finish_prepared_snapshot(phase, lease.lane)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_prepared_snapshot(
+        &mut self,
+        phase: RegionPhase,
+        lane: usize,
+    ) -> Result<(), RegionOwnerLaneError> {
+        self.ownership
+            .acknowledge_lane(phase, lane)
+            .map_err(|_| RegionOwnerLaneError::StalePhase)?;
+        self.ownership
+            .finish_phase(phase)
+            .map_err(|_| RegionOwnerLaneError::StalePhase)
+    }
+
+    fn abort_prepared_snapshot(
+        &mut self,
+        phase: RegionPhase,
+        lane: usize,
+    ) -> Result<(), RegionOwnerLaneError> {
+        if self.ownership.active_phase != Some(phase)
+            || !self.ownership.pending_lanes.contains(&lane)
+        {
+            return Err(RegionOwnerLaneError::StalePhase);
+        }
+        let aborted = self.lanes[&lane]
+            .abort(phase)?
+            .recv()
+            .map_err(|_| RegionOwnerLaneError::Closed)??;
+        if aborted != phase {
+            return Err(RegionOwnerLaneError::StalePhase);
+        }
+        self.finish_prepared_snapshot(phase, lane)
+    }
+
+    fn commit_prepared_snapshot(
+        &mut self,
+        phase: RegionPhase,
+        lane: usize,
+        sequence: u64,
+        entity: EntityId,
+    ) -> Result<(), RegionOwnerLaneError> {
+        if self.ownership.active_phase != Some(phase)
+            || !self.ownership.pending_lanes.contains(&lane)
+        {
+            return Err(RegionOwnerLaneError::StalePhase);
+        }
+        let key = self
+            .locations
+            .get(&entity)
+            .copied()
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let lease = self
+            .ownership
+            .lease(key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        if lease.lane != lane {
+            return Err(RegionOwnerLaneError::StaleLease);
+        }
+        let committed = self.lanes[&lane]
+            .commit(phase)?
+            .recv()
+            .map_err(|_| RegionOwnerLaneError::Closed)??;
+        if committed.phase != phase {
+            return Err(RegionOwnerLaneError::StalePhase);
+        }
+        if self
+            .record_commit_decision(
+                phase,
+                sequence,
+                &BTreeMap::from([(lane, vec![(lease, entity)])]),
+            )
+            .is_err()
+        {
+            let rollback = self.lanes[&lane]
+                .rollback(phase)?
+                .recv()
+                .map_err(|_| RegionOwnerLaneError::Closed)??;
+            if rollback != phase {
+                return Err(RegionOwnerLaneError::StalePhase);
+            }
+            return Err(RegionOwnerLaneError::Journal);
+        }
+        let finalized = self.lanes[&lane]
+            .finalize(phase)?
+            .recv()
+            .map_err(|_| RegionOwnerLaneError::Closed)??;
+        if finalized != phase {
+            return Err(RegionOwnerLaneError::StalePhase);
+        }
+        self.finish_prepared_snapshot(phase, lane)
     }
 
     pub fn replace_snapshot_if_current(

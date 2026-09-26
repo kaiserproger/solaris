@@ -26,7 +26,8 @@ use super::movement::{
     PlayerMovementAuthorityResources, PlayerMovementRejection, PlayerPoseCommitKind,
 };
 use super::owned_inventory::{
-    WarehouseTransferOutcome, WarehouseTransferRequest, container_chest_image,
+    WarehouseStructureMaterialDebit, WarehouseTransferOutcome, WarehouseTransferRequest,
+    container_chest_image,
 };
 use super::persistence::PersistedEntityCheckpoint;
 #[cfg(test)]
@@ -462,6 +463,8 @@ pub(super) enum SimulationCommand {
         /// The encoded plugin receipt a server-owned structure portion journals
         /// beside its block after-images. Ordinary block edits carry none.
         plugin_receipt: Option<Vec<u8>>,
+        /// One physical warehouse after-image published with this receipt.
+        material_debit: Option<PreparedStructureMaterialDebit>,
     },
     CommitBlockDrops {
         actor_session: SessionId,
@@ -505,6 +508,7 @@ pub(super) enum SimulationCommand {
     CommitChest {
         primary_position: BlockPos,
         positions: Vec<BlockPos>,
+        expected_tokens: Option<Vec<BlockMutationToken>>,
         expected_state_id: i32,
         /// The acting session, or `None` for a server-owned deposit that acts
         /// for no player.
@@ -520,6 +524,7 @@ pub(super) enum SimulationCommand {
         /// and publishes the container's slots to every viewer including the
         /// actor.
         plugin_receipt: Option<Vec<u8>>,
+        treatment: Option<super::owned_inventory::PreparedTreatmentParticipant>,
     },
     CommitFurnace {
         position: BlockPos,
@@ -620,6 +625,24 @@ impl SimulationCommand {
         };
         completion.complete(result);
     }
+}
+
+/// A construction material debit fenced against the exact container block
+/// image that the simulation owner captured before it admitted the build.
+#[derive(Debug, Clone)]
+pub(in crate::play) struct PreparedStructureMaterialDebit {
+    pub(in crate::play) debit: WarehouseStructureMaterialDebit,
+    pub(in crate::play) precondition: mc_world::ResidentBlockPrecondition,
+}
+
+/// One complete server-owned block-edit submission prepared by a plugin.
+struct ServerOwnedBlockEditSubmission {
+    edits: Vec<BlockEdit>,
+    expected_preconditions: Option<Vec<BlockEditPrecondition>>,
+    leaf_trigger: bool,
+    zone_fence: Option<crate::script::ZoneProtectionFence>,
+    plugin_receipt: Option<Vec<u8>>,
+    material_debit: Option<WarehouseStructureMaterialDebit>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1483,6 +1506,7 @@ enum WorldContainerCommitError {
 struct ChestCommitRequest<'a> {
     primary_position: BlockPos,
     positions: &'a [BlockPos],
+    expected_tokens: Option<&'a [BlockMutationToken]>,
     expected_state_id: i32,
     actor_session: Option<SessionId>,
     expected: &'a [ChestBlockEntity],
@@ -2631,6 +2655,7 @@ impl SimulationHandle {
                 edits,
                 preconditions,
                 scheduled_block_ticks,
+                material_debit: None,
                 leaf_trigger: true,
                 hook_approval: None,
                 plugin_receipt: None,
@@ -2658,7 +2683,17 @@ impl SimulationHandle {
         zone_fence: Option<crate::script::ZoneProtectionFence>,
     ) -> Result<Option<BlockEditBatchOutcome>, SimulationRequestError> {
         match self
-            .submit_server_owned_block_edits(plugin_id, edits, None, true, zone_fence, None)
+            .submit_server_owned_block_edits(
+                plugin_id,
+                ServerOwnedBlockEditSubmission {
+                    edits,
+                    expected_preconditions: None,
+                    leaf_trigger: true,
+                    zone_fence,
+                    plugin_receipt: None,
+                    material_debit: None,
+                },
+            )
             .await?
         {
             SimulationResponse::BlockEdits(Ok(outcome)) => Ok(*outcome),
@@ -2670,6 +2705,7 @@ impl SimulationHandle {
     /// Commit one server-owned block batch and plugin receipt under one
     /// world-journal decision. The owner captures the exact source image before
     /// admission.
+    #[cfg(test)]
     pub(crate) async fn commit_server_owned_block_edits(
         &self,
         plugin_id: &str,
@@ -2677,8 +2713,40 @@ impl SimulationHandle {
         zone_fence: Option<crate::script::ZoneProtectionFence>,
         receipt: Vec<u8>,
     ) -> Result<Option<u64>, SimulationRequestError> {
-        self.commit_server_owned_block_edits_with_preconditions(
-            plugin_id, edits, None, true, zone_fence, receipt,
+        self.commit_server_owned_block_edits_inner(
+            plugin_id,
+            ServerOwnedBlockEditSubmission {
+                edits,
+                expected_preconditions: None,
+                leaf_trigger: true,
+                zone_fence,
+                plugin_receipt: Some(receipt),
+                material_debit: None,
+            },
+        )
+        .await
+    }
+
+    /// Commit one structure portion and the exact physical warehouse material
+    /// debit under the receipt's one world-journal decision.
+    pub(crate) async fn commit_server_owned_structure_portion(
+        &self,
+        plugin_id: &str,
+        edits: Vec<BlockEdit>,
+        zone_fence: Option<crate::script::ZoneProtectionFence>,
+        receipt: Vec<u8>,
+        material_debit: WarehouseStructureMaterialDebit,
+    ) -> Result<Option<u64>, SimulationRequestError> {
+        self.commit_server_owned_block_edits_inner(
+            plugin_id,
+            ServerOwnedBlockEditSubmission {
+                edits,
+                expected_preconditions: None,
+                leaf_trigger: true,
+                zone_fence,
+                plugin_receipt: Some(receipt),
+                material_debit: Some(material_debit),
+            },
         )
         .await
     }
@@ -2695,15 +2763,27 @@ impl SimulationHandle {
         zone_fence: Option<crate::script::ZoneProtectionFence>,
         receipt: Vec<u8>,
     ) -> Result<Option<u64>, SimulationRequestError> {
-        match self
-            .submit_server_owned_block_edits(
-                plugin_id,
+        self.commit_server_owned_block_edits_inner(
+            plugin_id,
+            ServerOwnedBlockEditSubmission {
                 edits,
-                preconditions,
+                expected_preconditions: preconditions,
                 leaf_trigger,
                 zone_fence,
-                Some(receipt),
-            )
+                plugin_receipt: Some(receipt),
+                material_debit: None,
+            },
+        )
+        .await
+    }
+
+    async fn commit_server_owned_block_edits_inner(
+        &self,
+        plugin_id: &str,
+        submission: ServerOwnedBlockEditSubmission,
+    ) -> Result<Option<u64>, SimulationRequestError> {
+        match self
+            .submit_server_owned_block_edits(plugin_id, submission)
             .await?
         {
             SimulationResponse::SettlementPortion(outcome) => outcome,
@@ -2714,12 +2794,16 @@ impl SimulationHandle {
     async fn submit_server_owned_block_edits(
         &self,
         plugin_id: &str,
-        edits: Vec<BlockEdit>,
-        expected_preconditions: Option<Vec<BlockEditPrecondition>>,
-        leaf_trigger: bool,
-        zone_fence: Option<crate::script::ZoneProtectionFence>,
-        plugin_receipt: Option<Vec<u8>>,
+        submission: ServerOwnedBlockEditSubmission,
     ) -> Result<SimulationResponse, SimulationRequestError> {
+        let ServerOwnedBlockEditSubmission {
+            edits,
+            expected_preconditions,
+            leaf_trigger,
+            zone_fence,
+            plugin_receipt,
+            material_debit,
+        } = submission;
         if self.session_fence.is_some() {
             return Err(SimulationRequestError::InvalidCommand);
         }
@@ -2746,6 +2830,23 @@ impl SimulationHandle {
         } else {
             (Vec::new(), None)
         };
+        let material_debit = if let Some(debit) = material_debit {
+            let Some(snapshot) = self.read_block_snapshot(debit.position).await? else {
+                return Err(SimulationRequestError::Precommit(
+                    mc_script::precommit::HookFailure::Stale,
+                ));
+            };
+            Some(PreparedStructureMaterialDebit {
+                precondition: mc_world::ResidentBlockPrecondition {
+                    pos: debit.position,
+                    expected_state: snapshot.state,
+                    expected_token: snapshot.token,
+                },
+                debit,
+            })
+        } else {
+            None
+        };
         let receiver = self.enqueue_with_fence(
             None,
             SimulationCommand::ApplyBlockEdits {
@@ -2755,6 +2856,7 @@ impl SimulationHandle {
                 scheduled_block_ticks: Vec::new(),
                 leaf_trigger,
                 hook_approval,
+                material_debit,
                 zone_fence,
                 plugin_receipt,
             },
@@ -3323,10 +3425,15 @@ impl SimulationHandle {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the chest snapshot and player plan must remain explicit at this test boundary"
+    )]
     pub(super) async fn commit_chest(
         &self,
         primary_position: BlockPos,
         positions: Vec<BlockPos>,
+        expected_tokens: Vec<BlockMutationToken>,
         expected_state_id: i32,
         expected: Vec<ChestBlockEntity>,
         updated: Vec<ChestBlockEntity>,
@@ -3336,12 +3443,14 @@ impl SimulationHandle {
         let receiver = self.enqueue_player_command(SimulationCommand::CommitChest {
             primary_position,
             positions,
+            expected_tokens: Some(expected_tokens),
             expected_state_id,
             actor_session: Some(actor_session),
             expected,
             updated,
             player: Some(Box::new(player)),
             plugin_receipt: None,
+            treatment: None,
         })?;
         match receiver.await {
             Ok(Ok(SimulationResponse::ChestCommit(Ok(outcome)))) => Ok(*outcome),
@@ -3374,6 +3483,7 @@ impl SimulationHandle {
             updated_container,
             player,
             receipt,
+            treatment,
         } = request;
         let Some(expected) = container_chest_image(&expected_container) else {
             return Err(SimulationRequestError::InvalidCommand);
@@ -3408,12 +3518,14 @@ impl SimulationHandle {
                     .enqueue_player_command(SimulationCommand::CommitChest {
                         primary_position: position,
                         positions: vec![position],
+                        expected_tokens: None,
                         expected_state_id,
                         actor_session: Some(participant.actor_id),
                         expected: vec![expected],
                         updated: vec![updated],
                         player: Some(Box::new(plan)),
                         plugin_receipt: Some(receipt),
+                        treatment: treatment.clone(),
                     })?
             }
             None => {
@@ -3425,12 +3537,14 @@ impl SimulationHandle {
                     SimulationCommand::CommitChest {
                         primary_position: position,
                         positions: vec![position],
+                        expected_tokens: None,
                         expected_state_id,
                         actor_session: None,
                         expected: vec![expected],
                         updated: vec![updated],
                         player: None,
                         plugin_receipt: Some(receipt),
+                        treatment,
                     },
                 )?
             }
@@ -4713,14 +4827,15 @@ impl SimulationOwner {
             processed += report.processed;
             lane_attribution.extend(report.lane_attribution);
             if owner_fail_stopped {
-                for envelope in runs.flat_map(|run| run.envelopes) {
-                    self.reject_drained_envelope(envelope, SimulationRequestError::OwnerStopped);
+                for remaining in runs {
+                    for envelope in remaining.envelopes {
+                        envelope.respond(Err(SimulationRequestError::OwnerStopped));
+                    }
                 }
                 self.shutdown();
                 break;
             }
         }
-
         SimulationTickReport {
             processed,
             remaining_depth: self.metrics.depth.load(Ordering::Relaxed),
@@ -4768,6 +4883,7 @@ impl SimulationOwner {
                 zone_fence,
                 hook_approval,
                 plugin_receipt: Some(plugin_receipt),
+                material_debit,
             } = &envelope.command
             else {
                 envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
@@ -4783,10 +4899,52 @@ impl SimulationOwner {
                 )));
                 continue;
             }
-            if let Err(error) = precommit::refuse_build_approval(hook_approval) {
-                envelope.respond(Err(SimulationRequestError::Precommit(error)));
+            // A non-keep decision can refuse before any world preparation; a
+            // Keep remains unspent until the receipt-bearing transaction has
+            // revalidated its source images at the common durable commit.
+            if hook_approval.as_ref().is_some_and(|approval| {
+                !matches!(
+                    approval.decision(),
+                    mc_script::precommit::HookDecision::Keep
+                )
+            }) {
+                if let Err(error) = precommit::refuse_build_approval(hook_approval) {
+                    envelope.respond(Err(SimulationRequestError::Precommit(error)));
+                } else {
+                    envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                }
                 continue;
             }
+            let _warehouse_admission = if let Some(material_debit) = material_debit {
+                let Some(admission) = sessions
+                    .try_lock_warehouse_reservation_admission(material_debit.debit.position)
+                else {
+                    envelope.respond(Ok(SimulationResponse::SettlementPortion(Ok(None))));
+                    continue;
+                };
+                let Some(expected) =
+                    container_chest_image(&material_debit.debit.expected_container)
+                else {
+                    envelope.respond(Ok(SimulationResponse::SettlementPortion(Ok(None))));
+                    continue;
+                };
+                let Some(updated) = container_chest_image(&material_debit.debit.updated_container)
+                else {
+                    envelope.respond(Ok(SimulationResponse::SettlementPortion(Ok(None))));
+                    continue;
+                };
+                if !sessions.warehouse_reservation_stock_survives_after_consuming(
+                    material_debit.debit.position,
+                    &expected,
+                    &updated,
+                ) {
+                    envelope.respond(Ok(SimulationResponse::SettlementPortion(Ok(None))));
+                    continue;
+                }
+                Some(admission)
+            } else {
+                None
+            };
             let edits = super::block_edit_commit::resident_block_edits(edits);
             let preconditions =
                 super::block_edit_commit::resident_block_preconditions(preconditions);
@@ -4804,7 +4962,11 @@ impl SimulationOwner {
                     leaf_trigger_tick: Some(world_tick.saturating_add(1)),
                 },
                 Some(plugin_receipt.clone()),
-                zone_fence.clone(),
+                super::CrossRegionScheduledBlockTickContext {
+                    material_debit: material_debit.as_ref(),
+                    zone_fence: zone_fence.clone(),
+                    hook_approval: hook_approval.clone(),
+                },
             )
             .await
             {
@@ -4820,6 +4982,18 @@ impl SimulationOwner {
                         &mut outcome,
                     );
                     dispatch_regional_block_outcome(sessions, *actor_session, &outcome);
+                    if let Some(material_debit) = material_debit {
+                        let (position, slots) = Self::material_debit_chest_slot_dispatch(
+                            mutation.block_registry(),
+                            world_read,
+                            mutation,
+                            material_debit.debit.position,
+                            material_debit.debit.updated_container.clone(),
+                        );
+                        let (_, dispatches) =
+                            sessions.server_chest_slot_dispatches(position, slots);
+                        dispatch_visibility_commands(dispatches);
+                    }
                     self.metrics
                         .block_edits_processed
                         .fetch_add(1, Ordering::Relaxed);
@@ -4854,6 +5028,38 @@ impl SimulationOwner {
         }
     }
 
+    fn material_debit_chest_slot_dispatch(
+        blocks: &BlockRegistry,
+        world_read: &WorldReadView,
+        mutation: &WorldMutationView,
+        position: BlockPos,
+        fallback_slots: Vec<ItemStack>,
+    ) -> (BlockPos, Vec<ItemStack>) {
+        let Some(state) = world_read.get_cached_block(position) else {
+            return (position, fallback_slots);
+        };
+        let mut positions = vec![position];
+        if let Some(partner) = super::block_placement::chest::paired_position(
+            blocks,
+            |candidate| world_read.get_cached_block(candidate),
+            position,
+            state,
+        ) {
+            positions.push(partner);
+            positions.sort_by_key(|candidate| (candidate.x, candidate.y, candidate.z));
+        }
+        let mut chests = Vec::with_capacity(positions.len());
+        for slot_position in &positions {
+            let Some(mut image) = mutation.chest_block_entities(&[*slot_position]) else {
+                return (position, fallback_slots);
+            };
+            let Some(image) = image.pop() else {
+                return (position, fallback_slots);
+            };
+            chests.push(image);
+        }
+        (positions[0], chest_slot_stacks(&ChestView { chests }))
+    }
     fn reject_drained_envelope(
         &self,
         envelope: SimulationCommandEnvelope,
@@ -5365,6 +5571,7 @@ impl SimulationOwner {
         let ChestCommitRequest {
             primary_position,
             positions,
+            expected_tokens,
             expected_state_id,
             actor_session,
             expected,
@@ -5390,6 +5597,7 @@ impl SimulationOwner {
             || positions.first() != Some(&primary_position)
             || expected.len() != positions.len()
             || updated.len() != positions.len()
+            || expected_tokens.is_none_or(|tokens| tokens.len() != positions.len())
             || !valid_container_player_plan(player)
         {
             return Err(SimulationRequestError::InvalidCommand);
@@ -5426,7 +5634,13 @@ impl SimulationOwner {
                 }
             }
         }
-        if authoritative != expected {
+        if authoritative != expected
+            || expected_tokens.is_some_and(|tokens| {
+                positions.iter().zip(tokens).any(|(position, token)| {
+                    storage.block_mutation_token(*position) != Some(*token)
+                })
+            })
+        {
             let (inventory, carried_item) = sessions
                 .player_container_state(actor_session)
                 .ok_or(SimulationRequestError::StaleSession)?;
@@ -7215,27 +7429,38 @@ impl SimulationOwner {
                 SimulationCommand::CommitChest {
                     primary_position,
                     positions,
+                    expected_tokens,
                     expected_state_id,
                     actor_session,
                     expected,
                     updated,
                     player,
                     plugin_receipt,
-                } => self.chest_commit_response(
-                    sessions,
-                    storage.as_deref_mut(),
-                    world_error,
-                    ChestCommitRequest {
-                        primary_position: *primary_position,
-                        positions,
-                        expected_state_id: *expected_state_id,
-                        actor_session: *actor_session,
-                        expected,
-                        updated,
-                        player: player.as_deref(),
-                        plugin_receipt: plugin_receipt.as_deref(),
-                    },
-                ),
+                    treatment,
+                } => {
+                    if treatment.is_some() {
+                        SimulationResponse::WarehouseTransfer(Err(
+                            SimulationRequestError::InvalidCommand,
+                        ))
+                    } else {
+                        self.chest_commit_response(
+                            sessions,
+                            storage.as_deref_mut(),
+                            world_error,
+                            ChestCommitRequest {
+                                primary_position: *primary_position,
+                                expected_tokens: expected_tokens.as_deref(),
+                                positions,
+                                expected_state_id: *expected_state_id,
+                                actor_session: *actor_session,
+                                expected,
+                                updated,
+                                player: player.as_deref(),
+                                plugin_receipt: plugin_receipt.as_deref(),
+                            },
+                        )
+                    }
+                }
                 SimulationCommand::CommitFurnace {
                     position,
                     expected_state_id,

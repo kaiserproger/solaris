@@ -62,6 +62,60 @@ fn unprojected_player_only_decision_survives_checkpoint_and_restart() {
 }
 
 #[test]
+fn treatment_ack_survives_world_checkpoint_cutoff() {
+    let root = tempfile::tempdir().unwrap();
+    let (blocks, items) = registries();
+    let (journal, _) =
+        WorldChunkJournal::open_for_test(root.path(), blocks.clone(), items.clone()).unwrap();
+    let earlier = journal
+        .record_snapshots(1, vec![snapshot(&blocks, ChunkPos { x: 1, z: 0 }, 1)])
+        .unwrap();
+    let id = journal.reserve_decision_ids(1).unwrap()[0];
+    let batch: PreparedStorageBatch = serde_json::from_value(serde_json::json!({
+        "transaction_id": 1,
+        "plugin_id": "settlement",
+        "mutations": [{
+            "kind": "compare_and_swap",
+            "key": "medicine-charge",
+            "expected_version": null,
+            "value": "1"
+        }],
+        "treatment": {
+            "entity_uuid": uuid::Uuid::from_u128(42).to_string(),
+            "expected_health_bits": 10.0_f32.to_bits(),
+            "next_health_bits": 13.0_f32.to_bits()
+        }
+    }))
+    .unwrap();
+    journal
+        .record_reserved_inventory_decision(2, id, Vec::new(), &batch)
+        .unwrap();
+    journal.confirm_treatment_committed(id).unwrap();
+    journal.checkpoint_through(earlier).unwrap();
+    drop(journal);
+
+    let (journal, pending) =
+        WorldChunkJournal::open_for_test(root.path(), blocks.clone(), items.clone()).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id(), id);
+    assert!(journal.pending_treatments().unwrap()[0].3);
+    assert_eq!(journal.watermark(), None);
+    drop(journal);
+    let path = root.path().join(SOLARIS_DIRECTORY).join(JOURNAL_FILE);
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let (journal, pending) = WorldChunkJournal::open_for_test(root.path(), blocks, items).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "incomplete acknowledgement must retain the debit"
+    );
+    assert!(!journal.pending_treatments().unwrap()[0].3);
+}
+
+#[test]
 fn save_cutoff_cannot_capture_a_later_inventory_publication() {
     let root = tempfile::tempdir().unwrap();
     let (blocks, items) = registries();

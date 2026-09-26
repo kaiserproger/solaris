@@ -59,6 +59,8 @@ pub(crate) struct PreparedComponent {
     pub(crate) plugin_ids: Vec<String>,
     /// The validated startup rules, or `None` when no package declared any.
     pub(crate) rules: Option<mc_script::GameplayRules>,
+    /// Validated guest item definitions, owned by their declaring package.
+    pub(crate) items: Vec<mc_data::item_components::CustomItemDefinition>,
     /// The ore profile the deployment's packages declared, or `None` when none
     /// did. Read back from the started host, where `configure` ran.
     pub(crate) ore_profile: Option<mc_script::PluginWorldgenOreProfile>,
@@ -173,6 +175,11 @@ pub(crate) async fn prepare_component_deployment(
         .rules()
         .map(|(id, rules)| (id.to_owned(), rules.clone()))
         .collect::<Vec<_>>();
+    let items = host
+        .contribution()
+        .items()
+        .map(|(_, item)| item.clone())
+        .collect::<Vec<_>>();
     if let Some((id, refusal)) = refusal {
         stop_component_host(host).await?;
         bail!("component plugin {id} declared a rule plan the host refused: {refusal}");
@@ -203,6 +210,7 @@ pub(crate) async fn prepare_component_deployment(
         host: Some(host),
         plugin_ids,
         rules,
+        items,
         ore_profile,
         settlement_plan,
         client_bundles,

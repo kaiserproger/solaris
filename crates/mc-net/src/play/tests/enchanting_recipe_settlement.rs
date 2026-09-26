@@ -1,8 +1,8 @@
 use super::{
-    ActiveContainer, CommandPermissions, ContainerInput, CraftedItem, CraftingTableWindow,
-    EnchantingTableWindow, GameMode, Identifier, ItemFactsTable, ItemRegistry, ItemStack,
-    LoggedInProfile, PlayerPersistedState, PlayerPose, ScriptCraftingSource, ScriptEvent,
-    ScriptEventSink, ScriptGameplayEventPublisher, ScriptPlayerId, ServerboundContainerClick,
+    ActiveContainer, ContainerInput, CraftedItem, CraftingTableWindow, EnchantingTableWindow,
+    GameMode, Identifier, ItemFactsTable, ItemRegistry, ItemStack, LoggedInProfile,
+    PlayerPersistedState, PlayerPose, ScriptCraftingSource, ScriptEvent, ScriptEventSink,
+    ScriptGameplayEventPublisher, ScriptPlayerId, ServerboundContainerClick,
     ServerboundPlaceRecipe, SurvivalState, XpState, craft_recipe, crafting_table_input_projection,
     handle_enchanting_container_click, handle_place_recipe, interaction_state_for_items,
     register_interaction_player, settle_disconnected_inventory, simulation_channel,
@@ -270,7 +270,8 @@ async fn placed_recipe_commits_inventory_and_publishes_aggregate_craft() {
         ScriptPlayerId::new(session_id),
         "recipe-owner",
         "RecipeOwner",
-        CommandPermissions::from_op(false),
+        crate::server::CommandPermissionConfig::default(),
+        "192.168.1.20:40000".parse().unwrap(),
         "minecraft:overworld",
     );
 

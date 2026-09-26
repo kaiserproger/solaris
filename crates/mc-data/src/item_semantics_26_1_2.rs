@@ -21,10 +21,10 @@ pub fn is_mining_loot_enchantable_path(path: &str) -> bool {
 pub fn equippable_player_slot(
     item_facts: &crate::item_components::ItemFactsTable,
     items: &crate::items::ItemRegistry,
-    item_id: u32,
+    stack: &crate::ItemStack,
 ) -> Option<usize> {
     match item_facts
-        .get(items.name_of(item_id)?)?
+        .facts_for_stack(stack, items)?
         .equippable_slot
         .as_deref()?
     {
@@ -42,7 +42,26 @@ pub fn max_stack_for_stack(
     items: &crate::items::ItemRegistry,
     stack: &crate::ItemStack,
 ) -> i32 {
-    if stack.is_empty() || stack.damage.is_some() {
+    if stack.is_empty() {
+        return 1;
+    }
+    if let Some(model) = stack.item_model.as_deref()
+        && item_facts.custom(model).is_some()
+    {
+        let Some(definition) = item_facts.custom_for_stack(stack, items) else {
+            return 0;
+        };
+        if stack.damage.is_some() || definition.facts.max_damage.is_some() {
+            return 1;
+        }
+        return definition
+            .facts
+            .max_stack_size
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(64)
+            .clamp(1, 64);
+    }
+    if stack.damage.is_some() {
         return 1;
     }
     let Some(name) = items.name_of(stack.item_id) else {
@@ -125,5 +144,83 @@ mod tests {
         assert_eq!(max_tool_damage_for_path("netherite_axe"), Some(2031));
         assert_eq!(max_tool_damage_for_path("copper_axe"), None);
         assert_eq!(max_tool_damage_for_path("stick"), None);
+    }
+
+    #[test]
+    fn registered_item_identity_sets_stack_limit_independent_of_carrier() {
+        use crate::Identifier;
+        use crate::item_components::{CustomItemDefinition, ItemFacts, ItemFactsTable};
+        use crate::items::{ItemRegistry, ItemReport};
+
+        let id = |value: &str| Identifier::parse(value.to_owned()).unwrap();
+        let items = ItemRegistry::from_report(&[
+            ItemReport {
+                id: id("minecraft:paper"),
+                protocol_id: 1,
+            },
+            ItemReport {
+                id: id("minecraft:iron_sword"),
+                protocol_id: 2,
+            },
+        ]);
+        let facts = ItemFactsTable::default()
+            .with_custom_items(
+                [CustomItemDefinition {
+                    id: id("ruby-live:ruby"),
+                    carrier: id("minecraft:paper"),
+                    name: "Ruby".to_owned(),
+                    crafting_ingredient: None,
+                    facts: ItemFacts {
+                        max_stack_size: Some(4),
+                        weapon: false,
+                        ..ItemFacts::default()
+                    },
+                }],
+                &items,
+            )
+            .unwrap();
+        let ruby_paper = crate::ItemStack::new(1, 2).with_item_model(id("ruby-live:ruby"));
+        let wrong_carrier = crate::ItemStack::new(2, 1).with_item_model(id("ruby-live:ruby"));
+        assert_eq!(max_stack_for_stack(&facts, &items, &ruby_paper), 4);
+        assert_eq!(max_stack_for_stack(&facts, &items, &wrong_carrier), 0);
+        assert_eq!(
+            max_stack_for_stack(&facts, &items, &crate::ItemStack::new(1, 2)),
+            64
+        );
+    }
+
+    #[test]
+    fn registered_head_slot_uses_identity_not_paper_carrier() {
+        use crate::Identifier;
+        use crate::item_components::{CustomItemDefinition, ItemFacts, ItemFactsTable};
+        use crate::items::{ItemRegistry, ItemReport};
+
+        let id = |value: &str| Identifier::parse(value.to_owned()).unwrap();
+        let items = ItemRegistry::from_report(&[ItemReport {
+            id: id("minecraft:paper"),
+            protocol_id: 1,
+        }]);
+        let facts = ItemFactsTable::default()
+            .with_custom_items(
+                [CustomItemDefinition {
+                    id: id("ruby-live:helm"),
+                    carrier: id("minecraft:paper"),
+                    name: "Ruby Helm".to_owned(),
+                    crafting_ingredient: None,
+                    facts: ItemFacts {
+                        max_stack_size: Some(1),
+                        equippable_slot: Some("head".to_owned()),
+                        ..ItemFacts::default()
+                    },
+                }],
+                &items,
+            )
+            .unwrap();
+        let helm = crate::ItemStack::new(1, 1).with_item_model(id("ruby-live:helm"));
+        assert_eq!(equippable_player_slot(&facts, &items, &helm), Some(5));
+        assert_eq!(
+            equippable_player_slot(&facts, &items, &crate::ItemStack::new(1, 1)),
+            None
+        );
     }
 }

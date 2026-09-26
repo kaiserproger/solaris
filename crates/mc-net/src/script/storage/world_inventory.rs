@@ -1,7 +1,10 @@
+mod warehouse_resident;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use mc_data::Identifier;
 use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
@@ -24,9 +27,9 @@ use super::{
 };
 use crate::play::SessionRegistry;
 use crate::play::owned_inventory::{
-    OwnedInventoryCommit, OwnedInventoryPrepare, ResidentEndpointState, ResidentGearStack,
-    ResidentGearUpdate, WarehousePlayerParticipant, WarehouseTransferRequest, gear_slots_to_items,
-    items_to_gear_slots, owned_inventory_fingerprint,
+    OwnedInventoryCommit, OwnedInventoryPrepare, PlannedResidentTreatment, ResidentEndpointState,
+    ResidentGearStack, ResidentGearUpdate, WarehousePlayerParticipant, WarehouseTransferRequest,
+    gear_slots_to_items, items_to_gear_slots, owned_inventory_fingerprint,
 };
 use crate::play::persistence::inventory_recovery::PlayerInventoryRecovery;
 use crate::play::resident_work::ResidentWorldEdit;
@@ -36,8 +39,23 @@ use crate::play::{
 };
 use crate::server::ShutdownHandle;
 
+/// Replay fence for one physical supply debit and exact native health after-image.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DurableTreatmentIntent {
+    pub(crate) entity_uuid: String,
+    pub(crate) expected_health_bits: u32,
+    pub(crate) next_health_bits: u32,
+}
+
 impl PreparedStorageBatch {
     pub(crate) const MAX_ENCODED_BYTES: usize = MAX_TRANSACTION_FRAME_BYTES;
+    pub(crate) fn treatment(&self) -> Option<&DurableTreatmentIntent> {
+        self.treatment.as_ref()
+    }
+    pub(crate) fn transaction_id(&self) -> u64 {
+        self.transaction_id
+    }
 
     /// Encode any prepared plugin storage projection for one world-journal
     /// decision. A world decision may carry a settlement portion rather than an
@@ -74,7 +92,11 @@ impl PreparedStorageBatch {
                 mc_script::ScriptOperationPayload::OwnedInventory { .. }
             )
         });
-        if self.inventory.is_none() && self.order.is_empty() && !receipt_participates {
+        if self.inventory.is_none()
+            && self.order.is_empty()
+            && self.treatment.is_none()
+            && !receipt_participates
+        {
             return Err(PluginStorageStartError::Malformed(
                 "inventory decision has no inventory participant",
             ));
@@ -89,7 +111,7 @@ pub(crate) struct InventoryRuntime {
     sessions: Arc<SessionRegistry>,
     items: Arc<ItemRegistry>,
     item_facts: Arc<ItemFactsTable>,
-    save_coordinator: Arc<tokio::sync::Mutex<()>>,
+    pub(super) save_coordinator: Arc<tokio::sync::Mutex<()>>,
     settlement: Option<Arc<super::settlement::SettlementRuntime>>,
     settlement_world: Option<Arc<dyn super::settlement::SettlementWorld>>,
     resident_world: Option<Arc<dyn crate::play::resident_work::ResidentWorld>>,
@@ -217,6 +239,79 @@ impl InventoryRuntime {
                 .map_err(std::io::Error::other)?;
         }
         self.refresh_warehouse_reservation_floors(storage);
+        Ok(())
+    }
+    /// Finish world-journal medicine decisions after regional entity restore.
+    /// Each native health after-image and receipt revision enter one regional
+    /// WAL decision; only a proven heal marks the world decision projected.
+    pub(crate) async fn recover_pending_treatments(&self) -> std::io::Result<()> {
+        let Some((_, journal)) = &self.world else {
+            return Ok(());
+        };
+        for (decision_id, revision, treatment, native_committed) in journal
+            .pending_treatments()
+            .map_err(std::io::Error::other)?
+        {
+            let uuid = uuid::Uuid::parse_str(&treatment.entity_uuid)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let snapshots = self.sessions.resident_entity_snapshots(&[uuid]).await;
+            let Some(mut snapshot) = snapshots.into_iter().next().flatten() else {
+                if native_committed {
+                    journal
+                        .mark_inventory_projected(decision_id)
+                        .map_err(std::io::Error::other)?;
+                    continue;
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "paid treatment resident not restored without native acknowledgement",
+                ));
+            };
+            if snapshot.retained.treatment_decision_id < revision {
+                if native_committed {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "paid treatment native acknowledgement diverged from resident",
+                    ));
+                }
+                let expected = f32::from_bits(treatment.expected_health_bits);
+                let next_health = f32::from_bits(treatment.next_health_bits);
+                if snapshot.lifecycle != mc_entity::EntityLifecycle::Alive
+                    || snapshot.type_name != "minecraft:villager"
+                    || !expected.is_finite()
+                    || !next_health.is_finite()
+                    || next_health <= expected
+                    || snapshot.health.to_bits() != treatment.expected_health_bits
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "paid treatment entity fence diverged",
+                    ));
+                }
+                let expected_snapshot = snapshot.clone();
+                snapshot.health = next_health;
+                snapshot.retained.treatment_decision_id = revision;
+                if !self
+                    .sessions
+                    .replay_resident_treatment(expected_snapshot, snapshot)
+                    .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "paid treatment entity changed during startup",
+                    ));
+                }
+            }
+            if !native_committed {
+                journal.writer.flush().map_err(std::io::Error::other)?;
+                journal
+                    .confirm_treatment_committed(decision_id)
+                    .map_err(std::io::Error::other)?;
+            }
+            journal
+                .mark_inventory_projected(decision_id)
+                .map_err(std::io::Error::other)?;
+        }
         Ok(())
     }
 
@@ -642,7 +737,6 @@ pub(super) enum PreparedStructurePortionCommit {
 impl InventoryRuntime {
     /// Commit one prepared deposit: the container's canonical slots and the
     /// receipt's own second participant move under ONE world-journal decision.
-    ///
     /// This is the whole tail every server-owned deposit shares - the player's
     /// canonical inventory, a worker's canonical record, or the receipt's own
     /// owned-inventory projection - so the append, the projection and the
@@ -658,6 +752,7 @@ impl InventoryRuntime {
         prepared: PreparedStorageBatch,
         container: PreparedDepositContainer,
         player: Option<WarehousePlayerParticipant>,
+        treatment: Option<PlannedResidentTreatment>,
     ) -> Result<PreparedDepositCommit, PluginStorageMutationError> {
         let Some(world) = self.settlement_world() else {
             return Ok(PreparedDepositCommit::Refused(
@@ -669,6 +764,7 @@ impl InventoryRuntime {
                 ScriptOperationFailure::RuntimeUnavailable,
             ));
         };
+        let needs_treatment = prepared.treatment().is_some();
         let encoded = prepared.encode_world_inventory()?;
         let position = mc_world::BlockPos {
             x: container.position[0],
@@ -683,10 +779,17 @@ impl InventoryRuntime {
                 updated_container: container.updated,
                 player,
                 receipt: encoded,
+                treatment: treatment
+                    .map(|treatment| Arc::new(std::sync::Mutex::new(Some(treatment)))),
             })
             .await
         {
             Ok(decision_id) => decision_id,
+            Err(ScriptOperationFailure::RuntimeUnavailable) if needs_treatment => {
+                return Err(PluginStorageMutationError::DurabilityUnknown(
+                    std::io::Error::other("medical world decision outcome unknown"),
+                ));
+            }
             Err(failure) => return Ok(PreparedDepositCommit::Refused(failure)),
         };
         let mut batch = prepared;
@@ -710,6 +813,58 @@ impl InventoryRuntime {
 }
 
 impl InventoryRuntime {
+    /// Plan the exact physical warehouse after-image a construction portion
+    /// spends. A reservation against any non-container endpoint cannot build:
+    /// accepting it would advance the durable receipt without removing real
+    /// world stock.
+    pub(super) fn plan_structure_material_debit(
+        &self,
+        storage: &PluginStorage,
+        plugin_id: &str,
+        endpoint: &ScriptInventoryEndpoint,
+        consumed: &BTreeMap<String, u64>,
+    ) -> Result<super::settlement::StructureMaterialDebit, ScriptOperationFailure> {
+        let ScriptInventoryEndpoint::Warehouse { handle } = endpoint else {
+            return Err(ScriptOperationFailure::InvalidRequest);
+        };
+        let container = self.resolve_warehouse_container(storage, plugin_id, handle)?;
+        let expected = container.items;
+        let mut updated = expected.clone();
+        for (resource, required) in consumed {
+            let identifier =
+                Identifier::parse(resource).map_err(|_| ScriptOperationFailure::InvalidRequest)?;
+            let item_id = self
+                .items
+                .id_of(&identifier)
+                .ok_or(ScriptOperationFailure::InvalidRequest)?;
+            let mut remaining = *required;
+            for stack in &mut updated {
+                if stack.item_id != item_id || remaining == 0 {
+                    continue;
+                }
+                let available = u64::try_from(stack.count)
+                    .map_err(|_| ScriptOperationFailure::InvalidRequest)?;
+                let taken = available.min(remaining);
+                stack.count -=
+                    i32::try_from(taken).map_err(|_| ScriptOperationFailure::InvalidRequest)?;
+                if stack.count == 0 {
+                    *stack = ItemStack::EMPTY;
+                }
+                remaining -= taken;
+            }
+            if remaining != 0 {
+                return Err(ScriptOperationFailure::InsufficientItems);
+            }
+        }
+        Ok(super::settlement::StructureMaterialDebit {
+            position: container.position,
+            expected,
+            updated,
+        })
+    }
+}
+
+impl InventoryRuntime {
     /// Commit a finite construction portion: its server-owned block edits and
     /// settlement receipt share one world-journal decision, then the receipt
     /// projects into the plugin ledger from that same decision.
@@ -719,6 +874,7 @@ impl InventoryRuntime {
         plugin_id: &str,
         structure_id: &str,
         blocks: &[super::settlement::StructureBlockPlacement],
+        material_debit: &super::settlement::StructureMaterialDebit,
         prepared: PreparedStorageBatch,
     ) -> Result<PreparedStructurePortionCommit, PluginStorageMutationError> {
         let Some(world) = self.settlement_world() else {
@@ -736,7 +892,7 @@ impl InventoryRuntime {
         storage.compact_before_append_if_needed(projection.len())?;
         let encoded = batch.encode_world_decision()?;
         let decision_id = match world
-            .commit_structure_portion(plugin_id, structure_id, blocks, encoded)
+            .commit_structure_portion(plugin_id, structure_id, blocks, material_debit, encoded)
             .await
         {
             Ok(decision_id) => decision_id,
@@ -958,6 +1114,7 @@ impl InventoryRuntime {
                 // The worker's own second participant is the record inside the
                 // receipt: no player is fenced or after-imaged by this deposit.
                 None,
+                None,
             )
             .await?;
         Ok(match commit {
@@ -1120,10 +1277,22 @@ impl InventoryRuntime {
                     .iter()
                     .any(|endpoint| matches!(endpoint, ScriptInventoryEndpoint::Warehouse { .. }))
                 {
-                    // A warehouse endpoint is a server-owned container
-                    // composite: the container's real slots and the actor's
-                    // canonical inventory move under ONE journal decision, so
-                    // the player/resident planner below never sees it.
+                    // A warehouse endpoint owns the physical container half
+                    // of one world decision. The zero-actor server-owned path
+                    // persists resident gear beside it; a player actor uses
+                    // the existing session participant instead.
+                    if *actor_id == 0 {
+                        return self
+                            .commit_warehouse_resident_transfer(
+                                storage,
+                                plugin_id,
+                                request,
+                                *actor_id,
+                                transfers,
+                                expected_revisions,
+                            )
+                            .await;
+                    }
                     return self
                         .commit_warehouse_transfer(
                             storage,
@@ -1585,6 +1754,7 @@ impl InventoryRuntime {
                     updated_inventory: planned_player,
                     updated_carried_item: actor.carried_item,
                 }),
+                None,
             )
             .await?;
         let decision_id = match commit {
@@ -1729,11 +1899,14 @@ impl InventoryRuntime {
         };
         match result {
             Ok(OwnedInventoryCommit::Rejected(outcome)) => Ok(outcome),
-            Ok(OwnedInventoryCommit::Committed) => Ok(storage
-                .operation_receipt(plugin_id, operation_id)
-                .expect("committed owned inventory receipt remains installed")
-                .outcome
-                .clone()),
+            Ok(OwnedInventoryCommit::Committed) => {
+                self.refresh_warehouse_reservation_floors(storage);
+                Ok(storage
+                    .operation_receipt(plugin_id, operation_id)
+                    .expect("committed owned inventory receipt remains installed")
+                    .outcome
+                    .clone())
+            }
             Err(error) => Err(error),
         }
     }

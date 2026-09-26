@@ -215,6 +215,13 @@ async fn serve(
     // Component package bundles are the ones their manifests declared and whose
     // artifacts were verified against.
     let loader_manifest = records.loader_manifest()?;
+    if !records.items.is_empty() {
+        loader_manifest
+            .as_ref()
+            .context("custom items require a Loader bundle with register_items permission")?
+            .validate_custom_items(records.items)
+            .context("checking custom item Loader declarations")?;
+    }
     let content = content_import::resolve_or_import(&content_search(&cfg)).await?;
     let vanilla_data_dir = content.root();
     let StartupData {
@@ -230,6 +237,11 @@ async fn serve(
         entity_types,
         mut biome_spawns,
     } = StartupData::load(vanilla_data_dir, loader_manifest.as_deref())?;
+    let item_facts = Arc::new(
+        Arc::unwrap_or_clone(item_facts)
+            .with_custom_items(records.items.iter().cloned(), &items)
+            .context("validating configured custom item identities")?,
+    );
     let structure_rules = structure_rules_for_startup(
         cfg.data.seed,
         cfg.data.worldgen_mode,
@@ -239,6 +251,27 @@ async fn serve(
         records.settlement_plan,
         cfg.data.settlement_profile,
     )?;
+    let mut recipes = Arc::unwrap_or_clone(recipes);
+    for item in records.items {
+        if let Some(ingredient) = &item.crafting_ingredient {
+            recipes.push(mc_data::recipes::Recipe {
+                id: item.id.clone(),
+                kind: mc_data::recipes::RecipeKind::Shapeless(mc_data::recipes::ShapelessRecipe {
+                    ingredients: vec![mc_data::recipes::Ingredient {
+                        alternatives: vec![mc_data::recipes::IngredientAlternative::Item(
+                            ingredient.clone(),
+                        )],
+                    }],
+                }),
+                result: mc_data::recipes::RecipeResult {
+                    item: item.id.clone(),
+                    count: 1,
+                    stew_effects: Vec::new(),
+                },
+            });
+        }
+    }
+    let recipes = Arc::new(recipes);
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
     let chest_loot =
         chest_loot_catalog_for_startup(vanilla_data_dir).map(|catalog| (catalog, (*items).clone()));
@@ -290,6 +323,7 @@ async fn serve(
         &identities.settlement_profile,
         configured_spawn,
         identities.gameplay_rules.as_deref(),
+        identities.custom_items.as_deref(),
     )?;
     let world_spawn = match world_source {
         WorldSource::SolarisGenerated => configured_spawn,

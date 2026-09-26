@@ -43,6 +43,7 @@ async fn login_frames(
         &profile,
         &[],
         CommandPermissions { op: false },
+        "127.0.0.1:40000".parse().unwrap(),
         config,
         crate::server::ConnectionWorld::default(),
         Arc::clone(sessions),
@@ -99,7 +100,8 @@ async fn login_sends_tab_list_header_footer_and_full_roster() {
             pose: PlayerPose::new(0.5, 64.0, 0.5),
             game_mode: GameMode::Creative,
             max_sessions: 8,
-            script_operator: false,
+            script_permissions: crate::server::CommandPermissionConfig::default(),
+            peer: "127.0.0.1:40000".parse().unwrap(),
             dimension: "minecraft:overworld",
             loader_session: None,
         })

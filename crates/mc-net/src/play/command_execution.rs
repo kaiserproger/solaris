@@ -391,7 +391,7 @@ where
         state,
         candidate,
         state.carried_item.clone(),
-        None,
+        Vec::new(),
         player_pose,
     )
     .await?
@@ -682,7 +682,7 @@ where
                 state,
                 inventory,
                 state.carried_item.clone(),
-                None,
+                Vec::new(),
                 context.player_pose,
             )
             .await?

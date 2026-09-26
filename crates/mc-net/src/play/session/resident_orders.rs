@@ -6,14 +6,24 @@
 //! each push is fenced on the same entity snapshot the owner reports.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::Ordering;
 
-use mc_entity::{EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, GoalState, Vec3};
+use mc_entity::{
+    EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, GoalState, Rotation, Vec3,
+};
 use mc_script::ScriptHostileCategory;
 use uuid::Uuid;
 
+use super::entity_combat::{
+    begin_server_entity_death_locked, entity_kill_rewards_locked,
+    publish_accepted_entity_health_locked,
+};
 use super::entity_lifecycle::nearby_entity_candidate_ids_locked;
+use super::outbound::{VisibilityDispatch, dispatch_visibility_commands};
+use super::projectiles::spawn_resident_arrow_locked;
+use super::visibility::entity_hurt_dispatches_locked;
 
-use super::{ENTITY_DEATH_TICKS, SessionRegistry};
+use super::{ENTITY_DEATH_TICKS, SessionEntityGuards, SessionRegistry};
 use mc_script::precommit::HookKind;
 
 /// One resident order push target: the engine goal to set, keyed by identity.
@@ -106,6 +116,74 @@ impl SessionRegistry {
         }
     }
 
+    /// Launch a single world-physical arrow only if both actors still match
+    /// their server-observed snapshots. Impact damage belongs to the shared
+    /// projectile kernel, never to a plugin tick or the order receipt.
+    pub(crate) fn launch_resident_arrow(
+        &self,
+        attacker: &EntitySnapshot,
+        target: &EntitySnapshot,
+    ) -> bool {
+        let arrow_type = self.hostile_arrow_entity_type_id.load(Ordering::Acquire);
+        if arrow_type < 0 {
+            return false;
+        }
+        let mut inner = self.lock_session_entities("launch resident arrow");
+        if inner.entities.snapshot(attacker.id).as_ref() != Some(attacker)
+            || inner.entities.snapshot(target.id).as_ref() != Some(target)
+            || attacker.lifecycle != EntityLifecycle::Alive
+            || target.lifecycle != EntityLifecycle::Alive
+        {
+            return false;
+        }
+        let eye = Vec3::new(
+            attacker.position.x,
+            attacker.position.y + 1.5,
+            attacker.position.z,
+        );
+        let horizontal = (target.position.x - eye.x).hypot(target.position.z - eye.z);
+        let aim = Vec3::new(
+            target.position.x - eye.x,
+            target.position.y + 0.6 - eye.y + horizontal * 0.2,
+            target.position.z - eye.z,
+        );
+        let length = (aim.x * aim.x + aim.y * aim.y + aim.z * aim.z).sqrt();
+        if !length.is_finite() || length <= f64::EPSILON {
+            return false;
+        }
+        let direction = Vec3::new(aim.x / length, aim.y / length, aim.z / length);
+        let speed = crate::play::SKELETON_ARROW_SPEED;
+        let velocity = Vec3::new(
+            direction.x * speed,
+            direction.y * speed,
+            direction.z * speed,
+        );
+        let position = Vec3::new(
+            eye.x + direction.x * 0.7,
+            eye.y + direction.y * 0.7,
+            eye.z + direction.z * 0.7,
+        );
+        let yaw = velocity.z.atan2(velocity.x).to_degrees() as f32 - 90.0;
+        let pitch = (-velocity.y)
+            .atan2(velocity.x.hypot(velocity.z))
+            .to_degrees() as f32;
+        let (_, dispatches) = spawn_resident_arrow_locked(
+            &mut inner,
+            attacker.id,
+            target.id,
+            arrow_type,
+            position,
+            velocity,
+            Rotation {
+                yaw,
+                pitch,
+                head_yaw: yaw,
+            },
+        );
+        drop(inner);
+        dispatch_visibility_commands(dispatches);
+        true
+    }
     /// Commit one bounded damage volley through the engine's own damage path.
     /// Each request is fenced on the snapshot it was decided from, so a stale
     /// or forged target commits nothing.
@@ -171,14 +249,28 @@ impl SessionRegistry {
             .into_iter()
             .map(|damage| (damage.snapshot.id, damage))
             .collect::<BTreeMap<_, _>>();
-        ids.iter()
-            .map(|(_, id, before)| {
-                by_id.remove(id).map(|damage| ResidentHit {
-                    damage: (before - damage.snapshot.health).max(0.0),
-                    killed: damage.killed,
-                })
-            })
-            .collect()
+        let mut hits = Vec::with_capacity(ids.len());
+        let mut committed = Vec::with_capacity(ids.len());
+        for (_, id, before) in &ids {
+            let Some(damage) = by_id.remove(id) else {
+                hits.push(None);
+                continue;
+            };
+            hits.push(Some(ResidentHit {
+                damage: (*before - damage.snapshot.health).max(0.0),
+                killed: damage.killed,
+            }));
+            committed.push(damage);
+        }
+        // The native batch already committed off-thread; the accepted state
+        // must still reach the same health, hurt/death and reward publication
+        // every other damage source uses.
+        let mut inner = self.lock_session_entities("publish resident damage");
+        let mut dispatches = publish_committed_resident_damage_locked(&mut inner, &committed);
+        drop(inner);
+        self.append_spawned_xp_pickup_candidates(&mut dispatches);
+        dispatch_visibility_commands(dispatches);
+        hits
     }
 
     /// Bounded local perception: entities already tracked in chunks around
@@ -302,6 +394,19 @@ impl SessionRegistry {
         let mut inner = self.lock_session_entities("resident order test remove");
         super::entity_lifecycle::remove_server_entity_state_locked(&mut inner, id).is_some()
     }
+    pub(crate) fn resident_arrows_for_test(&self, center: Vec3) -> Vec<EntitySnapshot> {
+        let inner = self.lock_session_entities("inspect resident arrows");
+        nearby_entity_candidate_ids_locked(&inner, center, 16.0)
+            .into_iter()
+            .filter_map(|id| inner.entities.snapshot(id))
+            .filter(|entity| {
+                entity
+                    .retained
+                    .arrow_state
+                    .is_some_and(|arrow| arrow.restricted_target.is_some())
+            })
+            .collect()
+    }
 }
 
 fn resident_category(
@@ -336,4 +441,57 @@ fn resident_category(
         }
         _ => Some(ScriptHostileCategory::NeutralAnimal),
     }
+}
+
+/// Publish one committed off-thread resident damage batch into the session
+/// projection: the committed health plus the hurt, death and reward dispatches
+/// every other damage source uses.
+///
+/// The melee batch commits on the region owner lane while the session lock is
+/// released, so the victim's motion, goal and ticking timers can advance before
+/// this runs. The live snapshot therefore replaces the committed one only while
+/// it still carries that exact damage; an entity whose damage state was changed
+/// underneath belongs to that newer update.
+pub(in crate::play::session) fn publish_committed_resident_damage_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    committed: &[mc_entity::EntityDamage],
+) -> Vec<VisibilityDispatch> {
+    let mut dispatches = Vec::new();
+    for damage in committed {
+        let stamped = inner
+            .entities
+            .snapshot(damage.snapshot.id)
+            .filter(|current| carries_committed_resident_damage(current, &damage.snapshot));
+        let rewards = damage.killed.then(|| {
+            entity_kill_rewards_locked(inner, stamped.as_ref().unwrap_or(&damage.snapshot))
+        });
+        let health = stamped.as_ref().map_or_else(Vec::new, |stamped| {
+            publish_accepted_entity_health_locked(inner, stamped)
+        });
+        if let Some(rewards) = rewards {
+            let (_, mut death) = begin_server_entity_death_locked(inner, damage, &rewards);
+            death.splice(0..0, health);
+            dispatches.append(&mut death);
+        } else {
+            let mut hurt = health;
+            hurt.extend(entity_hurt_dispatches_locked(inner, damage.snapshot.id));
+            dispatches.append(&mut hurt);
+        }
+    }
+    dispatches
+}
+
+/// Whether `current` still carries the damage this off-thread batch committed.
+/// Only the fields that mutation owns have to match: motion, goals, pathing and
+/// ticking timers legitimately advance between the commit and the publication,
+/// while a newer hit or a paid heal changes one of these fields and owns the
+/// published health from then on.
+fn carries_committed_resident_damage(current: &EntitySnapshot, committed: &EntitySnapshot) -> bool {
+    current.id == committed.id
+        && current.uuid == committed.uuid
+        && current.health == committed.health
+        && current.lifecycle == committed.lifecycle
+        && current.retained.last_damage_tick == committed.retained.last_damage_tick
+        && current.retained.death_remove_tick == committed.retained.death_remove_tick
+        && current.retained.treatment_decision_id == committed.retained.treatment_decision_id
 }

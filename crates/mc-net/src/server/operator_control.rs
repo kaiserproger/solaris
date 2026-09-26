@@ -53,8 +53,8 @@ impl OperatorControlHandle {
 
     /// Grant or revoke operator authority and return the resulting identities.
     ///
-    /// Applies to future logins immediately and to already connected players on
-    /// their next command.
+    /// Applies to future logins and already connected players on their
+    /// next command or script snapshot.
     pub fn set_operator(&self, identity: &str, op: bool) -> Vec<String> {
         let identity = identity.trim().to_ascii_lowercase();
         self.operators

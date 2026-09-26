@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mc_data::blocks::solaris_required_blocks_report;
@@ -32,8 +32,8 @@ use mc_script::{
 use mc_world::{BlockPos, BlockStateId, Chunk, ChunkPos, WorldStorage};
 use uuid::Uuid;
 
-use crate::play::SessionRegistry;
 use crate::play::resident_work::{LiveResidentWorld, ResidentWorld, ResidentWorldEdit};
+use crate::play::{ArrowPhysicsFact, EntityPhysicsStep, ResidentGoal, SessionRegistry};
 use crate::script::storage::resident_orders::{DurableResidentOrderChange, DurableResidentStack};
 use crate::script::storage::world_inventory::InventoryRuntime;
 use crate::script::storage::{PluginStorage, PluginStorageHandle, StorageFaultPoint};
@@ -93,6 +93,10 @@ impl ResidentWorld for ReplacingResidentWorld {
         self.inner.state_for(block_path)
     }
 
+    fn crop_is_mature(&self, state: u32) -> bool {
+        self.inner.crop_is_mature(state)
+    }
+
     fn preview_break(
         &self,
         dimension: &str,
@@ -148,6 +152,8 @@ impl ResidentWorld for ReplacingResidentWorld {
 struct ProtectionGatedResidentWorld {
     inner: Arc<LiveResidentWorld>,
     protected: Arc<AtomicBool>,
+    standable_queries: Arc<AtomicUsize>,
+    route_queries: Arc<AtomicUsize>,
 }
 
 impl ResidentWorld for ProtectionGatedResidentWorld {
@@ -164,10 +170,12 @@ impl ResidentWorld for ProtectionGatedResidentWorld {
     }
 
     fn standable(&self, dimension: &str, pos: [i32; 3]) -> Option<bool> {
+        self.standable_queries.fetch_add(1, Ordering::Relaxed);
         self.inner.standable(dimension, pos)
     }
 
     fn route_open(&self, dimension: &str, from: [i32; 3], to: [i32; 3]) -> Option<bool> {
+        self.route_queries.fetch_add(1, Ordering::Relaxed);
         self.inner.route_open(dimension, from, to)
     }
 
@@ -187,6 +195,10 @@ impl ResidentWorld for ProtectionGatedResidentWorld {
 
     fn state_for(&self, block_path: &str) -> Option<u32> {
         self.inner.state_for(block_path)
+    }
+
+    fn crop_is_mature(&self, state: u32) -> bool {
+        self.inner.crop_is_mature(state)
     }
 
     fn preview_break(
@@ -234,23 +246,38 @@ struct Fixture {
 
 impl Fixture {
     fn new(wall: bool) -> Self {
-        Self::with_options(wall, None, false, false, None)
+        Self::with_options(wall, None, false, false, None, None)
     }
 
     fn with_replacement(wall: bool, replacement: Option<&str>) -> Self {
-        Self::with_options(wall, replacement, false, false, None)
+        Self::with_options(wall, replacement, false, false, None, None)
     }
 
     fn with_replant_replacement(wall: bool, replacement: &str) -> Self {
-        Self::with_options(wall, Some(replacement), false, true, None)
+        Self::with_options(wall, Some(replacement), false, true, None, None)
     }
 
     fn with_regional_edge_crop(wall: bool) -> Self {
-        Self::with_options(wall, None, true, false, None)
+        Self::with_options(wall, None, true, false, None, None)
     }
 
     fn with_protection_gate(protected: Arc<AtomicBool>) -> Self {
-        Self::with_options(false, None, false, false, Some(protected))
+        Self::with_options(false, None, false, false, Some(protected), None)
+    }
+
+    fn with_query_counts(
+        wall: bool,
+        standable: Arc<AtomicUsize>,
+        routes: Arc<AtomicUsize>,
+    ) -> Self {
+        Self::with_options(
+            wall,
+            None,
+            false,
+            false,
+            Some(Arc::new(AtomicBool::new(false))),
+            Some((standable, routes)),
+        )
     }
 
     fn with_options(
@@ -259,6 +286,7 @@ impl Fixture {
         regional_edge_crop: bool,
         only_placements: bool,
         protected: Option<Arc<AtomicBool>>,
+        query_counts: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
     ) -> Self {
         let blocks = Arc::new(
             mc_world::BlockRegistry::from_report(&solaris_required_blocks_report()).unwrap(),
@@ -313,6 +341,15 @@ impl Fixture {
             }
             // Ore inside the stone band.
             chunk.set_block(4, SURFACE_Y - 2, 4, ore);
+            // A narrow, loaded stair exposes the ore from a real reachable
+            // stance; all other stone-band cells remain sealed.
+            chunk.set_block(4, SURFACE_Y, 7, air);
+            chunk.set_block(4, SURFACE_Y - 1, 6, air);
+            chunk.set_block(4, SURFACE_Y, 6, air);
+            chunk.set_block(4, SURFACE_Y - 2, 5, air);
+            chunk.set_block(4, SURFACE_Y - 1, 5, air);
+            chunk.set_block(5, SURFACE_Y - 2, 5, air);
+            chunk.set_block(5, SURFACE_Y - 1, 5, air);
             // A single water column.
             chunk.set_block(8, SURFACE_Y, 8, water);
             // A loaded workstation for the craft-work contract.
@@ -388,10 +425,17 @@ impl Fixture {
                 replacement,
                 only_placements,
             }),
-            (None, Some(protected)) => Arc::new(ProtectionGatedResidentWorld {
-                inner: adapter,
-                protected,
-            }),
+            (None, Some(protected)) => {
+                let (standable_queries, route_queries) = query_counts.unwrap_or_else(|| {
+                    (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)))
+                });
+                Arc::new(ProtectionGatedResidentWorld {
+                    inner: adapter,
+                    protected,
+                    standable_queries,
+                    route_queries,
+                })
+            }
             (None, None) => adapter,
         };
         let runtime = InventoryRuntime::new(
@@ -410,6 +454,50 @@ impl Fixture {
             sessions,
             runtime,
         }
+    }
+    fn enable_arrows(&self) {
+        self.sessions.configure_arrow_kill_rewards(
+            None,
+            None,
+            Some(77),
+            Arc::new(solaris_required_items()),
+            Arc::new(solaris_required_item_facts()),
+            Arc::new(mc_data::loot::LootTables::default()),
+        );
+    }
+
+    fn advance_resident_arrows(&self, tick: u64, center: Vec3) -> usize {
+        let arrows = self.sessions.resident_arrows_for_test(center);
+        let steps = arrows
+            .iter()
+            .map(|arrow| EntityPhysicsStep {
+                id: arrow.id,
+                position: Vec3::new(
+                    arrow.position.x + arrow.velocity.x,
+                    arrow.position.y + arrow.velocity.y,
+                    arrow.position.z + arrow.velocity.z,
+                ),
+                velocity: arrow.velocity,
+                on_ground: false,
+                horizontal_collision: false,
+            })
+            .collect::<Vec<_>>();
+        let facts = arrows
+            .iter()
+            .map(|arrow| ArrowPhysicsFact {
+                arrow_id: arrow.id,
+                block_hit: None,
+                embedded_in_block: false,
+                current_block_state: mc_world::BlockStateId(0),
+                should_fall: false,
+                fall_velocity_scale: Vec3::new(0.1, 0.1, 0.1),
+                in_water: false,
+                in_water_or_rain: false,
+            })
+            .collect::<Vec<_>>();
+        self.sessions
+            .apply_entity_physics_with_arrow_facts_and_dispatch(tick, &steps, &facts);
+        arrows.len()
     }
 
     fn storage(&self) -> PluginStorage {
@@ -434,6 +522,12 @@ impl Fixture {
         let handle = mc_script::resident_handle_for_generation(OWNER, &generation).expect("handle");
         assert_eq!(handle, snapshot.handle);
         (handle, Uuid::parse_str(&snapshot.entity_uuid).unwrap())
+    }
+
+    /// Materialise a resident at the fixture's only physical mine entrance.
+    async fn mining_resident(&self, storage: &mut PluginStorage, slot: u32) -> (String, Uuid) {
+        self.resident(storage, slot, Vec3::new(4.5, 64.0, 8.5))
+            .await
     }
 
     async fn execute(
@@ -678,6 +772,26 @@ fn demobilize_request(
         },
     )
     .expect("valid demobilise request")
+}
+
+fn capture_request(
+    operation_id: &str,
+    handle: &str,
+    custodian: &str,
+    expected_revision: u64,
+) -> ScriptOperationRequest {
+    ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::ResidentOrder {
+            operation: ScriptResidentOrderOperation::Capture {
+                operation_id: operation_id.to_owned(),
+                handle: handle.to_owned(),
+                custodian: custodian.to_owned(),
+                expected_revision,
+            },
+        },
+    )
+    .expect("valid capture request")
 }
 
 fn area(min: [i32; 3], max: [i32; 3]) -> ScriptWorkArea {
@@ -927,6 +1041,230 @@ async fn world_event_resumes_the_same_paused_craft_once() {
             .map(|work| work.done),
         Some(1)
     );
+}
+
+/// (CP-013) A growth update retries the same harvest that paused only because
+/// its crop was immature; a later unchanged world event cannot harvest twice.
+#[tokio::test]
+async fn world_event_resumes_the_same_matured_harvest_once() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 23, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos { x: 2, y: 64, z: 2 },
+            state_with_props(&fixture.blocks, "wheat", &[("age", "6")]),
+        )
+        .expect("fixture field accepts an immature crop");
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "pause-immature-harvest",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([2, 64, 2], [2, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    drop(storage);
+    let mut storage = fixture.storage();
+
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos { x: 2, y: 64, z: 2 },
+            state_with_props(&fixture.blocks, "wheat", &[("age", "7")]),
+        )
+        .expect("fixture field accepts the growth update");
+    let resumed = fixture
+        .runtime
+        .resume_paused_work_for_chunks(&mut storage, "minecraft:overworld", &[[0, 0]], |_| true)
+        .await
+        .expect("mature crop resumes the paused harvest");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        work_of(&resumed[0].outcome).state,
+        ScriptWorkState::Committed
+    );
+    assert_eq!(
+        fixture.block(2, 64, 2).await,
+        Some(state_of(&fixture.blocks, "air"))
+    );
+    assert!(
+        fixture
+            .runtime
+            .resume_paused_work_for_chunks(
+                &mut storage,
+                "minecraft:overworld",
+                &[[0, 0]],
+                |_| true,
+            )
+            .await
+            .expect("completed harvest cannot loop")
+            .is_empty()
+    );
+}
+
+/// (CP-013) A missing craft ingredient waits for the addressed inventory
+/// transfer, not every changed block in the same active work region.
+#[tokio::test]
+async fn world_event_does_not_retry_inventory_missing_craft() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 24, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "pause-missing-craft-input",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:oak_planks".to_owned(),
+                    count: 1,
+                    station: crafting_station(),
+                },
+                1,
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    let paused_revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("paused craft is durable")
+        .revision;
+    assert!(
+        fixture
+            .runtime
+            .resume_paused_work_for_chunks(
+                &mut storage,
+                "minecraft:overworld",
+                &[[0, 0]],
+                |_| true,
+            )
+            .await
+            .expect("world wake stays bounded to source waits")
+            .is_empty()
+    );
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .expect("world wake preserves the paused craft")
+            .revision,
+        paused_revision,
+        "an unrelated world wake must not create a replacement receipt"
+    );
+
+    seed_gear(&mut storage, &handle, uuid, &[("minecraft:oak_log", 1)]);
+    let resumed = fixture
+        .runtime
+        .resume_paused_work_for_inventory_change(
+            &mut storage,
+            std::slice::from_ref(&handle),
+            &[],
+            |_| true,
+        )
+        .await
+        .expect("addressed inventory event resumes the craft");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        work_of(&resumed[0].outcome).state,
+        ScriptWorkState::Committed
+    );
+}
+
+/// (CP-013) Cancelling a source wait removes its world wake classification
+/// before the record reaches durable replay.
+#[tokio::test]
+async fn cancelling_a_world_input_wait_reopens_cleanly() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 25, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos { x: 2, y: 64, z: 2 },
+            state_with_props(&fixture.blocks, "wheat", &[("age", "6")]),
+        )
+        .expect("fixture field accepts an immature crop");
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "pause-before-cancel",
+                &handle,
+                ScriptResidentWorkOrder::Harvest {
+                    area: area([2, 64, 2], [2, 64, 2]),
+                    tool: "minecraft:iron_hoe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    let paused_revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("paused work is durable")
+        .revision;
+    let cancel = ScriptOperationRequest::try_new(
+        "request",
+        ScriptOperation::ResidentOrder {
+            operation: ScriptResidentOrderOperation::CancelWork {
+                operation_id: "cancel-world-wait".to_owned(),
+                handle: handle.clone(),
+                expected_revision: paused_revision,
+            },
+        },
+    )
+    .expect("valid cancel request");
+    fixture.execute(&mut storage, &cancel).await;
+
+    drop(storage);
+    let reopened = fixture.storage();
+    let record = reopened
+        .resident_orders()
+        .record(&handle)
+        .expect("cancelled work survives storage replay");
+    let work = record.work.as_ref().expect("cancelled work record");
+    assert_eq!(work.state, ScriptWorkState::Cancelled);
+    assert_eq!(work.reason, None);
+    assert!(!work.world_input_wait);
+    assert_eq!(work.revision, record.revision);
+    assert_ne!(work.revision, 0);
 }
 
 /// (CP-013) A work target absent from the resident world stays unloaded until
@@ -1421,6 +1759,59 @@ async fn harvest_recovers_cargo_and_progress_after_storage_projection_fails() {
     assert_eq!(wheat, 1, "recovery must not duplicate the canonical crop");
 }
 
+/// (CP-007) A mining receipt recovers its exact ore cargo and work progress
+/// after storage projection fails following the accepted world decision.
+#[tokio::test]
+async fn mine_recovers_cargo_and_progress_after_storage_projection_fails() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_pickaxe", 1)],
+    );
+    let request = work_request(
+        "mine-projection-recovery",
+        &handle,
+        ScriptResidentWorkOrder::Mine {
+            area: area([4, SURFACE_Y - 2, 4], [4, SURFACE_Y - 2, 4]),
+            tool: "minecraft:iron_pickaxe".to_owned(),
+        },
+        1,
+        revision,
+    );
+
+    storage.inject_fault_for_test(StorageFaultPoint::Write);
+    assert!(matches!(
+        fixture
+            .runtime
+            .execute_resident_order_operation(&mut storage, OWNER, &request)
+            .await,
+        Err(super::PluginStorageMutationError::DurabilityUnknown(_))
+    ));
+    assert_eq!(
+        fixture.block(4, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "air")),
+        "the accepted world decision keeps the broken ore"
+    );
+
+    drop(storage);
+    let mut reopened = fixture.storage();
+    fixture
+        .runtime
+        .recover(&mut reopened)
+        .expect("the accepted mine receipt projects at recovery");
+    let recovered = fixture.execute(&mut reopened, &request).await;
+    assert_eq!(work_of(&recovered).work_units_done, 1);
+    let raw_iron = carry(&reopened, &handle)
+        .iter()
+        .filter(|(item, _)| item == "minecraft:raw_iron")
+        .map(|(_, count)| *count)
+        .sum::<u32>();
+    assert_eq!(raw_iron, 1, "recovery must not duplicate canonical ore");
+}
 /// (CP-007) Replacing a crop after preview consumes neither the replacement
 /// block nor the previewed loot; the worker record keeps its old progress.
 #[tokio::test]
@@ -1558,6 +1949,117 @@ async fn harvest_then_replant_commits_crop_seed_and_work_together() {
             .iter()
             .any(|(item, count)| item == "minecraft:wheat" && *count >= 1),
         "the first cycle's canonical harvest remains worker-owned"
+    );
+}
+
+/// (CP-008) A replanted crop only starts its next cycle after the real world
+/// reports maturity; its second harvest and replant retain worker-owned output.
+#[tokio::test]
+async fn a_matured_replanted_crop_completes_a_second_cycle() {
+    let fixture = Fixture::with_regional_edge_crop(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(0.5, 64.0, 5.5))
+        .await;
+    let harvest_work = ScriptResidentWorkOrder::Harvest {
+        area: area([0, 64, 2], [0, 64, 2]),
+        tool: "minecraft:iron_hoe".to_owned(),
+    };
+    let replant_work = ScriptResidentWorkOrder::Replant {
+        area: area([0, SURFACE_Y, 2], [0, SURFACE_Y, 2]),
+        seed: "minecraft:wheat_seeds".to_owned(),
+        tool: "minecraft:iron_hoe".to_owned(),
+    };
+    let mut revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_hoe", 1), ("minecraft:wheat_seeds", 3)],
+    );
+    for (operation_id, work) in [
+        ("first-harvest", harvest_work.clone()),
+        ("first-replant", replant_work.clone()),
+    ] {
+        let outcome = fixture
+            .execute(
+                &mut storage,
+                &work_request(operation_id, &handle, work, 1, revision),
+            )
+            .await;
+        assert_eq!(outcome.failure(), None, "{outcome:?}");
+        revision = storage
+            .resident_orders()
+            .record(&handle)
+            .expect("completed first-cycle record")
+            .revision;
+    }
+    assert_eq!(
+        fixture.block(0, 64, 2).await,
+        Some(state_of(&fixture.blocks, "wheat")),
+        "a newly replanted crop is not mature by receipt alone"
+    );
+    let premature = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "premature-second-harvest",
+                &handle,
+                harvest_work.clone(),
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&premature).reason,
+        Some(ScriptWorkPauseReason::MissingInput),
+        "an immature crop cannot become loot before a world growth update"
+    );
+    assert_eq!(work_of(&premature).work_units_done, 0);
+    revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("paused premature harvest record")
+        .revision;
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos { x: 0, y: 64, z: 2 },
+            state_with_props(&fixture.blocks, "wheat", &[("age", "7")]),
+        )
+        .expect("the loaded field accepts a real growth update");
+    for (operation_id, work) in [
+        ("second-harvest", harvest_work),
+        ("second-replant", replant_work),
+    ] {
+        let outcome = fixture
+            .execute(
+                &mut storage,
+                &work_request(operation_id, &handle, work, 1, revision),
+            )
+            .await;
+        assert_eq!(outcome.failure(), None, "{outcome:?}");
+        revision = storage
+            .resident_orders()
+            .record(&handle)
+            .expect("completed second-cycle record")
+            .revision;
+    }
+    assert_eq!(
+        fixture.block(0, 64, 2).await,
+        Some(state_of(&fixture.blocks, "wheat")),
+        "the second cycle replants the world-grown crop"
+    );
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .filter(|(item, _)| item == "minecraft:wheat")
+            .map(|(_, count)| *count)
+            .sum::<u32>()
+            >= 2,
+        "both actual harvests remain worker-owned"
     );
 }
 
@@ -1866,9 +2368,7 @@ async fn a_full_worker_reports_no_storage_and_leaves_the_crop_standing() {
 async fn mined_ore_reaches_the_worker_cargo() {
     let fixture = Fixture::new(false);
     let mut storage = fixture.storage();
-    let (handle, uuid) = fixture
-        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
-        .await;
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
     let revision = seed_gear(
         &mut storage,
         &handle,
@@ -1915,9 +2415,7 @@ async fn mined_ore_reaches_the_worker_cargo() {
 async fn mine_with_full_cargo_leaves_ore_untouched() {
     let fixture = Fixture::new(false);
     let mut storage = fixture.storage();
-    let (handle, uuid) = fixture
-        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
-        .await;
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
     let fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_CARRY_SLOTS)
         .map(|_| ("minecraft:stone", 64))
         .collect();
@@ -1967,9 +2465,7 @@ async fn mine_with_full_cargo_leaves_ore_untouched() {
 async fn mine_with_unsuitable_tool_preserves_ore() {
     let fixture = Fixture::new(false);
     let mut storage = fixture.storage();
-    let (handle, uuid) = fixture
-        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
-        .await;
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
     let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_hoe", 1)]);
     let outcome = fixture
         .execute(
@@ -2034,9 +2530,7 @@ async fn mine_pauses_for_a_later_ore_that_needs_a_better_tool() {
             .expect("the later ore remains in the loaded fixture chunk");
     }
     let mut storage = fixture.storage();
-    let (handle, uuid) = fixture
-        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 5.5))
-        .await;
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
     let revision = seed_gear(
         &mut storage,
         &handle,
@@ -2082,6 +2576,212 @@ async fn mine_pauses_for_a_later_ore_that_needs_a_better_tool() {
     );
 }
 
+/// (CP-010) An ore block inside solid terrain remains unavailable until a
+/// resident can reach one of its bounded mining stances.
+#[tokio::test]
+async fn mine_does_not_extract_a_hidden_ore_without_a_route() {
+    let fixture = Fixture::new(false);
+    let hidden = [10, SURFACE_Y - 2, 10];
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: hidden[0],
+                y: hidden[1],
+                z: hidden[2],
+            },
+            state_of(&fixture.blocks, "iron_ore"),
+        )
+        .expect("hidden ore remains inside the loaded stone band");
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_pickaxe", 1)],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-hidden-ore",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area(hidden, hidden),
+                    tool: "minecraft:iron_pickaxe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::BlockedRoute)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
+    assert_eq!(
+        fixture.block(hidden[0], hidden[1], hidden[2]).await,
+        Some(state_of(&fixture.blocks, "iron_ore"))
+    );
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:raw_iron"),
+        "a sealed ore cannot become worker cargo"
+    );
+}
+
+/// (CP-010) Protected mine cells pause before a physical preview can alter the
+/// world or the worker's cargo.
+#[tokio::test]
+async fn mine_in_a_protected_zone_leaves_the_ore_untouched() {
+    let protected = Arc::new(AtomicBool::new(true));
+    let fixture = Fixture::with_protection_gate(protected);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_pickaxe", 1)],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-protected-ore",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area([4, SURFACE_Y - 2, 4], [4, SURFACE_Y - 2, 4]),
+                    tool: "minecraft:iron_pickaxe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::Protected)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
+    assert_eq!(
+        fixture.block(4, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "iron_ore"))
+    );
+}
+
+/// (CP-010) A source changed after an accessible mine preview commits neither
+/// canonical ore loot nor progress.
+#[tokio::test]
+async fn replaced_ore_after_preview_does_not_create_cargo_or_work_progress() {
+    let fixture = Fixture::with_replacement(false, Some("stone"));
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_pickaxe", 1)],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-replaced-after-preview",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area([4, SURFACE_Y - 2, 4], [4, SURFACE_Y - 2, 4]),
+                    tool: "minecraft:iron_pickaxe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::StaleRevision)
+    );
+    assert_eq!(
+        fixture.block(4, SURFACE_Y - 2, 4).await,
+        Some(state_of(&fixture.blocks, "stone"))
+    );
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:raw_iron"),
+        "a stale mine preview cannot mint ore cargo"
+    );
+    let record = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("seeded resident record remains");
+    assert_eq!(record.revision, revision);
+    assert!(
+        record.work.is_none(),
+        "the stale call records no work progress"
+    );
+}
+
+/// (CP-010) An unloaded work cell has no route or loot fallback and leaves the
+/// resident work record at zero progress.
+#[tokio::test]
+async fn mine_in_an_unloaded_area_pauses_without_cargo() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture.mining_resident(&mut storage, 3).await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_pickaxe", 1)],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "mine-unloaded-ore",
+                &handle,
+                ScriptResidentWorkOrder::Mine {
+                    area: area([32, SURFACE_Y - 2, 32], [32, SURFACE_Y - 2, 32]),
+                    tool: "minecraft:iron_pickaxe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::Unloaded)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:raw_iron")
+    );
+}
+
 /// (CP-007) Tree cutting uses the same receipt-bearing break boundary as crop
 /// harvest and mining.
 #[tokio::test]
@@ -2124,6 +2824,71 @@ async fn cut_tree_commits_the_log_and_worker_cargo_together() {
     );
 }
 
+/// (CP-009) Every trunk cell in one bounded taller tree shares the route to
+/// its rooted standing position, so one receipt cannot strand the upper log.
+#[tokio::test]
+async fn cut_tree_reaches_the_full_tall_trunk_from_its_rooted_route() {
+    let fixture = Fixture::new(false);
+    let log = state_of(&fixture.blocks, "oak_log");
+    let leaves = state_of(&fixture.blocks, "oak_leaves");
+    {
+        let mut world = fixture.world.lock().await;
+        world
+            .set_block_at(
+                BlockPos {
+                    x: 6,
+                    y: SURFACE_Y + 3,
+                    z: 6,
+                },
+                log,
+            )
+            .expect("the fixture canopy column accepts the taller trunk");
+        for x in 5..=7 {
+            for z in 5..=7 {
+                world
+                    .set_block_at(
+                        BlockPos {
+                            x,
+                            y: SURFACE_Y + 4,
+                            z,
+                        },
+                        leaves,
+                    )
+                    .expect("the fixture accepts the lifted canopy");
+            }
+        }
+    }
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_axe", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "cut-tall-tree",
+                &handle,
+                ScriptResidentWorkOrder::CutTree {
+                    area: area([6, SURFACE_Y + 1, 6], [6, SURFACE_Y + 3, 6]),
+                    tool: "minecraft:iron_axe".to_owned(),
+                },
+                3,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).work_units_done, 3);
+    assert_eq!(
+        carry(&storage, &handle)
+            .iter()
+            .filter(|(item, _)| item == "minecraft:oak_log")
+            .map(|(_, count)| *count)
+            .sum::<u32>(),
+        3
+    );
+}
 /// (CP-009) A grounded house column beside a real tree remains untouched.
 #[tokio::test]
 async fn cut_tree_keeps_adjacent_grounded_house_logs() {
@@ -2180,6 +2945,206 @@ async fn cut_tree_keeps_adjacent_grounded_house_logs() {
         "only the two natural-tree trunk logs reach the worker"
     );
 }
+
+/// (CP-009) A real tree behind a blocked route remains in the world; a work
+/// receipt does not teleport the logger into a reachable-looking area.
+#[tokio::test]
+async fn cut_tree_with_no_standable_route_leaves_the_trunk_untouched() {
+    let fixture = Fixture::new(false);
+    let stone = state_of(&fixture.blocks, "stone");
+    {
+        let mut world = fixture.world.lock().await;
+        for (x, z) in [(5, 6), (7, 6), (6, 5), (6, 7)] {
+            world
+                .set_block_at(
+                    BlockPos {
+                        x,
+                        y: SURFACE_Y + 1,
+                        z,
+                    },
+                    stone,
+                )
+                .expect("the loaded fixture can close every adjacent route");
+        }
+    }
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_axe", 1)]);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "cut-tree-blocked-route",
+                &handle,
+                ScriptResidentWorkOrder::CutTree {
+                    area: area([6, SURFACE_Y + 1, 6], [6, SURFACE_Y + 2, 6]),
+                    tool: "minecraft:iron_axe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::BlockedRoute));
+    assert_eq!(assignment.work_units_done, 0);
+    assert_eq!(
+        fixture.block(6, SURFACE_Y + 1, 6).await,
+        Some(state_of(&fixture.blocks, "oak_log")),
+        "the unreachable trunk remains intact"
+    );
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:oak_log"),
+        "an unreachable tree cannot mint log cargo"
+    );
+}
+
+/// (CP-009) A logger without its real axe cannot consume an otherwise valid
+/// natural trunk.
+#[tokio::test]
+async fn cut_tree_without_an_axe_leaves_the_tree_untouched() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, _uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "cut-tree-without-axe",
+                &handle,
+                ScriptResidentWorkOrder::CutTree {
+                    area: area([6, SURFACE_Y + 1, 6], [6, SURFACE_Y + 2, 6]),
+                    tool: "minecraft:iron_axe".to_owned(),
+                },
+                1,
+                0,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::MissingTool)
+    );
+    assert_eq!(
+        fixture.block(6, SURFACE_Y + 1, 6).await,
+        Some(state_of(&fixture.blocks, "oak_log"))
+    );
+}
+
+/// (CP-009) A full logger cannot turn a real tree into unowned drops.
+#[tokio::test]
+async fn cut_tree_with_full_cargo_leaves_the_tree_untouched() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_CARRY_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    let mut revision = seed_gear_in(&mut storage, &handle, uuid, &fill, false);
+    let equipment: Vec<(&str, u32)> = (0..MAX_RESIDENT_EQUIPMENT_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    revision = seed_gear_in(&mut storage, &handle, uuid, &equipment, true).max(revision);
+    revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_axe", 1)]).max(revision);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "cut-tree-full",
+                &handle,
+                ScriptResidentWorkOrder::CutTree {
+                    area: area([6, SURFACE_Y + 1, 6], [6, SURFACE_Y + 2, 6]),
+                    tool: "minecraft:iron_axe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::NoStorage)
+    );
+    assert_eq!(
+        fixture.block(6, SURFACE_Y + 1, 6).await,
+        Some(state_of(&fixture.blocks, "oak_log"))
+    );
+}
+
+/// (CP-009) Removing the matching permission fence resumes the same logger
+/// once; an unchanged protected tree remains unmodified.
+#[tokio::test]
+async fn released_tree_permission_resumes_the_paused_logger_once() {
+    let protected = Arc::new(AtomicBool::new(true));
+    let fixture = Fixture::with_protection_gate(Arc::clone(&protected));
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_axe", 1)]);
+    let paused = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "pause-protected-tree",
+                &handle,
+                ScriptResidentWorkOrder::CutTree {
+                    area: area([6, SURFACE_Y + 1, 6], [6, SURFACE_Y + 2, 6]),
+                    tool: "minecraft:iron_axe".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        work_of(&paused).reason,
+        Some(ScriptWorkPauseReason::Protected)
+    );
+    assert_eq!(
+        fixture.block(6, SURFACE_Y + 1, 6).await,
+        Some(state_of(&fixture.blocks, "oak_log"))
+    );
+    let released_zone = ScriptAxisAlignedZone::try_new(
+        "released-tree",
+        "minecraft:overworld",
+        ScriptPosition::try_new(5.5, 63.0, 5.5).expect("valid zone minimum"),
+        ScriptPosition::try_new(7.5, 66.0, 7.5).expect("valid zone maximum"),
+    )
+    .expect("valid released zone");
+    protected.store(false, Ordering::Release);
+    let resumed = fixture
+        .runtime
+        .resume_paused_work_for_zone(&mut storage, &released_zone, |_| true)
+        .await
+        .expect("released tree permission resumes work");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        work_of(&resumed[0].outcome).state,
+        ScriptWorkState::Committed
+    );
+    assert_eq!(
+        fixture.block(6, SURFACE_Y + 1, 6).await,
+        Some(state_of(&fixture.blocks, "air"))
+    );
+    assert!(
+        fixture
+            .runtime
+            .resume_paused_work_for_zone(&mut storage, &released_zone, |_| true)
+            .await
+            .expect("the completed logger cannot resume twice")
+            .is_empty()
+    );
+}
 /// (CP-011) Fishing pays a durable owner only from water currently present in
 /// the named work area; its deterministic cod result is not a vanilla-loot claim.
 #[tokio::test]
@@ -2187,24 +3152,20 @@ async fn fish_uses_real_water_and_credits_resident_cargo() {
     let fixture = Fixture::new(false);
     let mut storage = fixture.storage();
     let (handle, uuid) = fixture
-        .resident(&mut storage, 3, Vec3::new(8.5, 64.0, 8.5))
+        .resident(&mut storage, 3, Vec3::new(7.5, 64.0, 8.5))
         .await;
     let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:fishing_rod", 1)]);
-    let outcome = fixture
-        .execute(
-            &mut storage,
-            &work_request(
-                "fish-water-column",
-                &handle,
-                ScriptResidentWorkOrder::Fish {
-                    area: area([8, SURFACE_Y, 8], [8, SURFACE_Y, 8]),
-                    tool: "minecraft:fishing_rod".to_owned(),
-                },
-                1,
-                revision,
-            ),
-        )
-        .await;
+    let request = work_request(
+        "fish-water-column",
+        &handle,
+        ScriptResidentWorkOrder::Fish {
+            area: area([8, SURFACE_Y, 8], [8, SURFACE_Y, 8]),
+            tool: "minecraft:fishing_rod".to_owned(),
+        },
+        1,
+        revision,
+    );
+    let outcome = fixture.execute(&mut storage, &request).await;
     let assignment = work_of(&outcome);
 
     assert_eq!(outcome.failure(), None, "{outcome:?}");
@@ -2217,6 +3178,265 @@ async fn fish_uses_real_water_and_credits_resident_cargo() {
             .any(|(item, count)| item == "minecraft:cod" && *count == 1),
         "the catch belongs to the worker"
     );
+    drop(storage);
+    let mut reopened = fixture.storage();
+    let replay = fixture.execute(&mut reopened, &request).await;
+    assert_eq!(work_of(&replay).work_units_done, 1);
+    assert_eq!(
+        carry(&reopened, &handle)
+            .iter()
+            .filter(|(item, _)| item == "minecraft:cod")
+            .map(|(_, count)| *count)
+            .sum::<u32>(),
+        1,
+        "restart and replay preserve the one committed catch"
+    );
+}
+
+/// (CP-011) A changed water source cannot produce another catch after the
+/// previous durable result.
+#[tokio::test]
+async fn fish_stops_when_its_water_source_is_removed() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(7.5, 64.0, 8.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:fishing_rod", 1)]);
+    let work = ScriptResidentWorkOrder::Fish {
+        area: area([8, SURFACE_Y, 8], [8, SURFACE_Y, 8]),
+        tool: "minecraft:fishing_rod".to_owned(),
+    };
+    let first = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "fish-before-water-removal",
+                &handle,
+                work.clone(),
+                1,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(work_of(&first).work_units_done, 1);
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("first fish work record")
+        .revision;
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 8,
+                y: SURFACE_Y,
+                z: 8,
+            },
+            state_of(&fixture.blocks, "air"),
+        )
+        .expect("fixture water cell remains loaded");
+
+    let removed = fixture
+        .execute(
+            &mut storage,
+            &work_request("fish-after-water-removal", &handle, work, 2, revision),
+        )
+        .await;
+    assert_eq!(removed.failure(), None, "{removed:?}");
+    assert_eq!(work_of(&removed).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&removed).reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    assert_eq!(work_of(&removed).work_units_done, 0);
+    assert_eq!(
+        carry(&storage, &handle)
+            .iter()
+            .filter(|(item, _)| item == "minecraft:cod")
+            .map(|(_, count)| *count)
+            .sum::<u32>(),
+        1
+    );
+}
+
+/// (CP-011) A fisher with no cargo space retains its real water source and
+/// receives neither a virtual catch nor progress.
+#[tokio::test]
+async fn fish_with_full_cargo_pauses_without_a_catch() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(7.5, 64.0, 8.5))
+        .await;
+    let fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_CARRY_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    let mut revision = seed_gear_in(&mut storage, &handle, uuid, &fill, false);
+    let equipment: Vec<(&str, u32)> = (0..MAX_RESIDENT_EQUIPMENT_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    revision = seed_gear_in(&mut storage, &handle, uuid, &equipment, true).max(revision);
+    revision =
+        seed_gear(&mut storage, &handle, uuid, &[("minecraft:fishing_rod", 1)]).max(revision);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "fish-full-cargo",
+                &handle,
+                ScriptResidentWorkOrder::Fish {
+                    area: area([8, SURFACE_Y, 8], [8, SURFACE_Y, 8]),
+                    tool: "minecraft:fishing_rod".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::NoStorage)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:cod")
+    );
+}
+
+/// (CP-011) Visible water behind a closed route is not a remote fishing source.
+#[tokio::test]
+async fn fish_with_no_route_leaves_the_water_and_cargo_untouched() {
+    let fixture = Fixture::new(true);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(12.5, 64.0, 8.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:fishing_rod", 1)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "fish-blocked-water",
+                &handle,
+                ScriptResidentWorkOrder::Fish {
+                    area: area([8, SURFACE_Y, 8], [8, SURFACE_Y, 8]),
+                    tool: "minecraft:fishing_rod".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::BlockedRoute)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
+    assert_eq!(
+        fixture.block(8, SURFACE_Y, 8).await,
+        Some(state_of(&fixture.blocks, "water"))
+    );
+    assert!(
+        !carry(&storage, &handle)
+            .iter()
+            .any(|(item, _)| item == "minecraft:cod")
+    );
+}
+
+/// (CP-011) An unloaded first shore candidate does not hide a later loaded,
+/// reachable shore at a chunk boundary.
+#[tokio::test]
+async fn fish_uses_a_loaded_boundary_shore_after_an_unloaded_stance() {
+    let fixture = Fixture::new(false);
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 0,
+                y: SURFACE_Y,
+                z: 8,
+            },
+            state_of(&fixture.blocks, "water"),
+        )
+        .expect("boundary water remains in the loaded fixture chunk");
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(0.5, 64.0, 7.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:fishing_rod", 1)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "fish-boundary-shore",
+                &handle,
+                ScriptResidentWorkOrder::Fish {
+                    area: area([0, SURFACE_Y, 8], [0, SURFACE_Y, 8]),
+                    tool: "minecraft:fishing_rod".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Committed);
+    assert_eq!(work_of(&outcome).work_units_done, 1);
+}
+
+/// (CP-011) An unloaded first animal stance does not mask a later loaded,
+/// reachable stance at the same chunk boundary.
+#[tokio::test]
+async fn tend_livestock_uses_a_loaded_boundary_stance_after_an_unloaded_one() {
+    let fixture = Fixture::new(false);
+    let mut cow = SpawnEntity::new(0, "minecraft:cow", Vec3::new(0.5, 64.0, 8.5));
+    cow.animal = Some(mc_entity::AnimalBreedingState::adult());
+    fixture
+        .sessions
+        .spawn_tracked_entity_for_test(cow, false)
+        .expect("cow joins the local session index");
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(0.5, 64.0, 7.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:wheat", 1)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "tend-boundary-cow",
+                &handle,
+                ScriptResidentWorkOrder::TendLivestock {
+                    area: area([0, 64, 8], [0, 64, 8]),
+                    feed: "minecraft:wheat".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Committed);
+    assert_eq!(work_of(&outcome).work_units_done, 1);
 }
 
 /// (CP-011) Tending spends feed only while a live, locally tracked animal is
@@ -2267,6 +3487,48 @@ async fn tend_livestock_consumes_feed_for_a_visible_animal() {
         "tending does not mint livestock output: {:?}",
         assignment.changes
     );
+}
+
+/// (CP-011) A live compatible animal does not turn an absent feed reserve into
+/// a completed tending unit.
+#[tokio::test]
+async fn tend_livestock_without_feed_pauses_before_work() {
+    let fixture = Fixture::new(false);
+    let mut cow = SpawnEntity::new(0, "minecraft:cow", Vec3::new(6.5, 64.0, 6.5));
+    cow.animal = Some(mc_entity::AnimalBreedingState::adult());
+    fixture
+        .sessions
+        .spawn_tracked_entity_for_test(cow, false)
+        .expect("cow joins the local session index");
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "tend-without-feed",
+                &handle,
+                ScriptResidentWorkOrder::TendLivestock {
+                    area: area([6, 64, 6], [6, 64, 6]),
+                    feed: "minecraft:wheat".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
 }
 
 /// (CP-011) A resident cannot spend wheat on a chicken or a baby cow: the
@@ -2330,6 +3592,103 @@ async fn tend_livestock_refuses_incompatible_or_immature_animals() {
             "{case}: an ineligible animal cannot consume feed"
         );
     }
+}
+
+/// (CP-011) A mature, compatible animal behind a closed route cannot consume
+/// the resident's feed.
+#[tokio::test]
+async fn tend_livestock_with_no_route_preserves_feed() {
+    let fixture = Fixture::new(true);
+    let mut cow = SpawnEntity::new(0, "minecraft:cow", Vec3::new(6.5, 64.0, 6.5));
+    cow.animal = Some(mc_entity::AnimalBreedingState::adult());
+    fixture
+        .sessions
+        .spawn_tracked_entity_for_test(cow, false)
+        .expect("cow joins the local session index");
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(12.5, 64.0, 6.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:wheat", 1)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "tend-blocked-cow",
+                &handle,
+                ScriptResidentWorkOrder::TendLivestock {
+                    area: area([6, 64, 6], [6, 64, 6]),
+                    feed: "minecraft:wheat".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::BlockedRoute)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:wheat" && *count == 1)
+    );
+}
+
+/// (CP-011) A removed animal is not retained as an invisible livestock source.
+#[tokio::test]
+async fn dead_livestock_preserves_feed_and_work_progress() {
+    let fixture = Fixture::new(false);
+    let mut cow = SpawnEntity::new(0, "minecraft:cow", Vec3::new(6.5, 64.0, 6.5));
+    cow.animal = Some(mc_entity::AnimalBreedingState::adult());
+    let cow_id = fixture
+        .sessions
+        .spawn_tracked_entity_for_test(cow, false)
+        .expect("cow joins the local session index");
+    assert!(
+        fixture.sessions.remove_tracked_entity_for_test(cow_id),
+        "the test removes the live source before work begins"
+    );
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(6.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:wheat", 1)]);
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "tend-dead-cow",
+                &handle,
+                ScriptResidentWorkOrder::TendLivestock {
+                    area: area([6, 64, 6], [6, 64, 6]),
+                    feed: "minecraft:wheat".to_owned(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+
+    assert_eq!(outcome.failure(), None, "{outcome:?}");
+    assert_eq!(work_of(&outcome).state, ScriptWorkState::Paused);
+    assert_eq!(
+        work_of(&outcome).reason,
+        Some(ScriptWorkPauseReason::MissingInput)
+    );
+    assert_eq!(work_of(&outcome).work_units_done, 0);
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:wheat" && *count == 1)
+    );
 }
 
 /// (CP-011) Water and livestock work both preserve their input when their
@@ -2539,6 +3898,198 @@ async fn craft_requires_inputs_and_consumes_them_exactly_once() {
     assert_eq!(planks, 8, "no second craft ran");
 }
 
+/// (CP-012) A recipe uses its own stateless station capability: campfire food
+/// does not run at a crafting table, and the mismatch preserves the real input.
+#[tokio::test]
+async fn craft_requires_the_recipe_matching_station_for_campfire_food() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(&mut storage, &handle, uuid, &[("minecraft:cod", 1)]);
+    let work = ScriptResidentWorkOrder::Craft {
+        recipe: "minecraft:cooked_cod_from_campfire_cooking".to_owned(),
+        count: 1,
+        station: crafting_station(),
+    };
+
+    let missing_station = fixture
+        .execute(
+            &mut storage,
+            &work_request("cook-cod-wrong-station", &handle, work.clone(), 1, revision),
+        )
+        .await;
+    let assignment = work_of(&missing_station);
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(
+        assignment.reason,
+        Some(ScriptWorkPauseReason::MissingStation)
+    );
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:cod" && *count == 1),
+        "a table cannot consume campfire food"
+    );
+
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 9,
+                y: SURFACE_Y + 1,
+                z: 9,
+            },
+            state_with_props(
+                &fixture.blocks,
+                "campfire",
+                &[
+                    ("facing", "north"),
+                    ("lit", "false"),
+                    ("signal_fire", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+        )
+        .expect("fixture station remains loaded");
+    let unlit = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "cook-cod-unlit-campfire",
+                &handle,
+                work.clone(),
+                1,
+                assignment.revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&unlit);
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(
+        assignment.reason,
+        Some(ScriptWorkPauseReason::MissingStation)
+    );
+    assert_eq!(assignment.work_units_done, 0);
+
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 9,
+                y: SURFACE_Y + 1,
+                z: 9,
+            },
+            state_with_props(
+                &fixture.blocks,
+                "campfire",
+                &[
+                    ("facing", "north"),
+                    ("lit", "true"),
+                    ("signal_fire", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+        )
+        .expect("fixture station remains loaded");
+    let cooked = fixture
+        .execute(
+            &mut storage,
+            &work_request("cook-cod-campfire", &handle, work, 1, assignment.revision),
+        )
+        .await;
+    let assignment = work_of(&cooked);
+    assert_eq!(
+        assignment.state,
+        ScriptWorkState::Committed,
+        "{assignment:?}"
+    );
+    assert_eq!(assignment.work_units_done, 1);
+    assert_eq!(
+        assignment
+            .changes
+            .iter()
+            .map(|change| (change.item_id.as_str(), change.delta))
+            .collect::<BTreeMap<_, _>>(),
+        BTreeMap::from([("minecraft:cod", -1), ("minecraft:cooked_cod", 1)])
+    );
+}
+
+/// (CP-012) A real container input returns its recipe remainder beside the
+/// result; all output entries belong to the same durable craft receipt.
+#[tokio::test]
+async fn craft_returns_recipe_container_remainders_with_its_output() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let revision = seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[
+            ("minecraft:milk_bucket", 1),
+            ("minecraft:milk_bucket", 1),
+            ("minecraft:milk_bucket", 1),
+            ("minecraft:sugar", 2),
+            ("minecraft:egg", 1),
+            ("minecraft:wheat", 3),
+        ],
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "craft-cake-remainders",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:cake".to_owned(),
+                    count: 1,
+                    station: crafting_station(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(
+        assignment.state,
+        ScriptWorkState::Committed,
+        "{assignment:?}"
+    );
+    assert_eq!(assignment.work_units_done, 1);
+    assert_eq!(
+        assignment
+            .changes
+            .iter()
+            .map(|change| (change.item_id.as_str(), change.delta))
+            .collect::<BTreeMap<_, _>>(),
+        BTreeMap::from([
+            ("minecraft:bucket", 3),
+            ("minecraft:cake", 1),
+            ("minecraft:egg", -1),
+            ("minecraft:milk_bucket", -3),
+            ("minecraft:sugar", -2),
+            ("minecraft:wheat", -3),
+        ])
+    );
+    assert!(
+        carry(&storage, &handle)
+            .iter()
+            .any(|(item, count)| item == "minecraft:bucket" && *count == 3),
+        "the three milk buckets become three owned empty buckets"
+    );
+}
+
 /// (CP-012) A full inventory keeps every ingredient and leaves no partial output
 /// when a recipe can fill only part of an existing output stack.
 #[tokio::test]
@@ -2599,6 +4150,83 @@ async fn craft_without_output_capacity_preserves_ingredients() {
         62,
         "a failed partial merge leaves no phantom output"
     );
+}
+
+/// (CP-012) A failed output cannot simplify a component-bearing input during
+/// rollback: the resident keeps its exact named stack and reports no delta.
+#[tokio::test]
+async fn craft_with_full_output_keeps_component_bearing_input_unchanged() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(2.5, 64.0, 5.5))
+        .await;
+    let carry_fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_CARRY_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    let revision = seed_gear_in(&mut storage, &handle, uuid, &carry_fill, false);
+    let equipment_fill: Vec<(&str, u32)> = (0..MAX_RESIDENT_EQUIPMENT_SLOTS)
+        .map(|_| ("minecraft:stone", 64))
+        .collect();
+    let revision = seed_gear_in(&mut storage, &handle, uuid, &equipment_fill, true).max(revision);
+    let mut record = storage
+        .resident_orders()
+        .record(&handle)
+        .cloned()
+        .expect("seeded resident record");
+    record.carry[0]
+        .as_mut()
+        .expect("first carry stack")
+        .custom_name = Some("owned stone".to_owned());
+    let revision = storage
+        .append_resident_order_change(DurableResidentOrderChange::Record {
+            record: Box::new(record),
+        })
+        .expect("named input is durable")
+        .max(revision);
+    fixture
+        .world
+        .lock()
+        .await
+        .set_block_at(
+            BlockPos {
+                x: 9,
+                y: SURFACE_Y + 1,
+                z: 9,
+            },
+            state_of(&fixture.blocks, "stonecutter"),
+        )
+        .expect("fixture station remains loaded");
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &work_request(
+                "craft-named-stone-without-output-capacity",
+                &handle,
+                ScriptResidentWorkOrder::Craft {
+                    recipe: "minecraft:stone_slab_from_stone_stonecutting".to_owned(),
+                    count: 1,
+                    station: crafting_station(),
+                },
+                1,
+                revision,
+            ),
+        )
+        .await;
+    let assignment = work_of(&outcome);
+    assert_eq!(assignment.state, ScriptWorkState::Paused);
+    assert_eq!(assignment.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert_eq!(assignment.work_units_done, 0);
+    assert!(assignment.changes.is_empty());
+    let input = storage
+        .resident_orders()
+        .record(&handle)
+        .and_then(|record| record.carry[0].as_ref())
+        .expect("named source stays in its original slot");
+    assert_eq!(input.item_id, "minecraft:stone");
+    assert_eq!(input.count, 64);
+    assert_eq!(input.custom_name.as_deref(), Some("owned stone"));
 }
 
 /// (CP-012) A craft pauses before consuming material when its named station
@@ -2825,12 +4453,18 @@ async fn a_named_item_haul_of_an_absent_item_moves_nothing() {
 }
 
 /// (A09) A squad ordered through open terrain reforms into distinct standable
-/// slots; the same order across a closed passage reports `blocked_route` with no
-/// teleport and no shared coordinate.
+/// slots. A closed passage or one unplaceable slot blocks the formation without
+/// teleportation; clearing that slot and reissuing the order reforms the squad.
 #[tokio::test]
 async fn squad_reforms_through_an_open_passage_and_refuses_a_closed_one() {
-    for wall in [false, true] {
-        let fixture = Fixture::new(wall);
+    for (wall, blocked_slot) in [(false, false), (true, false), (false, true)] {
+        let standable_queries = Arc::new(AtomicUsize::new(0));
+        let route_queries = Arc::new(AtomicUsize::new(0));
+        let fixture = Fixture::with_query_counts(
+            wall,
+            Arc::clone(&standable_queries),
+            Arc::clone(&route_queries),
+        );
         let mut storage = fixture.storage();
         let mut members = Vec::new();
         for slot in 3..6 {
@@ -2843,12 +4477,31 @@ async fn squad_reforms_through_an_open_passage_and_refuses_a_closed_one() {
                 .await;
             members.push(member);
         }
+        if blocked_slot {
+            fixture
+                .world
+                .lock()
+                .await
+                .set_block_at(
+                    BlockPos { x: 13, y: 64, z: 8 },
+                    state_of(&fixture.blocks, "stone"),
+                )
+                .expect("block one formation slot");
+        }
+        standable_queries.store(0, Ordering::Relaxed);
+        route_queries.store(0, Ordering::Relaxed);
         let handles = members
             .iter()
             .map(|(handle, _)| handle.clone())
             .collect::<Vec<_>>();
         let request = order_request(
-            if wall { "move-closed" } else { "move-open" },
+            if wall {
+                "move-closed"
+            } else if blocked_slot {
+                "move-blocked-slot"
+            } else {
+                "move-open"
+            },
             &handles,
             &vec![0; handles.len()],
             ScriptResidentOrder::Move {
@@ -2860,14 +4513,37 @@ async fn squad_reforms_through_an_open_passage_and_refuses_a_closed_one() {
         );
         let outcome = fixture.execute(&mut storage, &request).await;
         assert_eq!(outcome.failure(), None, "batch admitted: {outcome:?}");
-        let (_, outcomes, _) = order_of(&outcome);
+        let (first_revision, outcomes, _) = order_of(&outcome);
         assert_eq!(outcomes.len(), 3);
-        if wall {
+        let placement_queries = standable_queries.load(Ordering::Relaxed);
+        let member_routes = route_queries.load(Ordering::Relaxed);
+        if blocked_slot {
+            assert!(
+                placement_queries <= handles.len() * 2,
+                "one bounded formation scan, not one scan per member"
+            );
+            assert_eq!(member_routes, 0, "unplaceable squad does not query paths");
+        } else {
+            assert_eq!(
+                placement_queries,
+                handles.len(),
+                "one flat-ground placement query per squad member"
+            );
+            assert_eq!(member_routes, 3, "one route decision per member");
+        }
+        eprintln!(
+            "squad wall={wall} blocked_slot={blocked_slot} size=3 standable_queries={placement_queries} route_queries={member_routes}"
+        );
+        let repeated = fixture.execute(&mut storage, &request).await;
+        assert_eq!(members_revision(&repeated), first_revision);
+        assert_eq!(standable_queries.load(Ordering::Relaxed), placement_queries);
+        assert_eq!(route_queries.load(Ordering::Relaxed), member_routes);
+        if wall || blocked_slot {
             assert!(
                 outcomes
                     .iter()
                     .all(|member| member.state == ScriptOrderMemberState::BlockedRoute),
-                "closed passage: {outcomes:?}"
+                "unreachable formation: {outcomes:?}"
             );
             assert!(
                 outcomes
@@ -2886,6 +4562,43 @@ async fn squad_reforms_through_an_open_passage_and_refuses_a_closed_one() {
                     mc_entity::GoalState::Idle,
                     "no goal was pushed"
                 );
+            }
+            if blocked_slot {
+                fixture
+                    .world
+                    .lock()
+                    .await
+                    .set_block_at(
+                        BlockPos { x: 13, y: 64, z: 8 },
+                        state_of(&fixture.blocks, "air"),
+                    )
+                    .expect("clear the obstructed slot");
+                standable_queries.store(0, Ordering::Relaxed);
+                route_queries.store(0, Ordering::Relaxed);
+                let cleared = fixture
+                    .execute(
+                        &mut storage,
+                        &order_request(
+                            "move-cleared-slot",
+                            &handles,
+                            &[first_revision; 3],
+                            ScriptResidentOrder::Move {
+                                dimension: "minecraft:overworld".to_owned(),
+                                anchor: ScriptBlockPosition::new(13, 64, 8),
+                                heading_degrees: 0,
+                                formation: formation(),
+                            },
+                        ),
+                    )
+                    .await;
+                let (_, clear_members, _) = order_of(&cleared);
+                assert!(
+                    clear_members
+                        .iter()
+                        .all(|member| member.state == ScriptOrderMemberState::Applied)
+                );
+                assert_eq!(standable_queries.load(Ordering::Relaxed), 3);
+                assert_eq!(route_queries.load(Ordering::Relaxed), 3);
             }
         } else {
             assert!(
@@ -2908,16 +4621,160 @@ async fn squad_reforms_through_an_open_passage_and_refuses_a_closed_one() {
                 );
                 goals.push(goal);
             }
+            let records = handles
+                .iter()
+                .map(|handle| {
+                    storage
+                        .resident_orders()
+                        .record(handle)
+                        .cloned()
+                        .expect("accepted member record")
+                })
+                .collect::<Vec<_>>();
+            storage
+                .force_pending_admission_for_test(OWNER, "reform-replay", &records)
+                .expect("one group replay is durable");
+            fixture
+                .sessions
+                .apply_resident_goals(
+                    members
+                        .iter()
+                        .map(|(_, uuid)| ResidentGoal {
+                            uuid: *uuid,
+                            goal: mc_entity::GoalState::Idle,
+                        })
+                        .collect(),
+                )
+                .await;
+            let mut reopened =
+                PluginStorage::open(fixture.storage_root.path()).expect("reopen squad");
+            fixture
+                .runtime
+                .recover_resident_orders(&mut reopened)
+                .await
+                .unwrap();
+            for ((_, uuid), expected) in members.iter().zip(&goals) {
+                assert_eq!(
+                    fixture.goal(*uuid).await,
+                    expected.clone(),
+                    "replay preserves each member's distinct formation destination"
+                );
+            }
+            let mut storage = reopened;
+            standable_queries.store(0, Ordering::Relaxed);
+            route_queries.store(0, Ordering::Relaxed);
+            let moving_roster = handles[..2].to_vec();
+            let second = fixture
+                .execute(
+                    &mut storage,
+                    &order_request(
+                        "move-smaller-roster",
+                        &moving_roster,
+                        &[first_revision; 2],
+                        ScriptResidentOrder::Move {
+                            dimension: "minecraft:overworld".to_owned(),
+                            anchor: ScriptBlockPosition::new(12, 64, 11),
+                            heading_degrees: 0,
+                            formation: formation(),
+                        },
+                    ),
+                )
+                .await;
+            let (second_revision, next_members, _) = order_of(&second);
+            assert!(
+                next_members
+                    .iter()
+                    .all(|member| member.state == ScriptOrderMemberState::Applied)
+            );
+            let reformed_queries = standable_queries.load(Ordering::Relaxed);
+            assert_eq!(route_queries.load(Ordering::Relaxed), 2);
+            assert_eq!(reformed_queries, moving_roster.len());
+            eprintln!(
+                "squad wall=false size=2 standable_queries={reformed_queries} route_queries=2"
+            );
+            assert_eq!(next_members.len(), 2);
+            assert_ne!(
+                fixture.goal(members[0].1).await,
+                fixture.goal(members[1].1).await
+            );
+            assert_eq!(
+                fixture.goal(members[2].1).await,
+                goals[2],
+                "a member omitted from a new roster retains its previous order"
+            );
+            let moving_goals = vec![
+                ResidentGoal {
+                    uuid: members[0].1,
+                    goal: fixture.goal(members[0].1).await,
+                },
+                ResidentGoal {
+                    uuid: members[1].1,
+                    goal: fixture.goal(members[1].1).await,
+                },
+            ];
+            let cancel = ScriptOperationRequest::try_new(
+                "cancel-smaller-roster",
+                ScriptOperation::ResidentOrder {
+                    operation: ScriptResidentOrderOperation::CancelOrder {
+                        operation_id: "cancel-smaller-roster".to_owned(),
+                        handles: moving_roster,
+                        expected_order_revisions: vec![second_revision; 2],
+                    },
+                },
+            )
+            .expect("fenced group cancellation");
+            let cancelled = fixture.execute(&mut storage, &cancel).await;
+            assert_eq!(cancelled.failure(), None);
+            for (_, uuid) in members.iter().take(2) {
+                assert_eq!(fixture.goal(*uuid).await, mc_entity::GoalState::Idle);
+            }
+            assert_eq!(fixture.goal(members[2].1).await, goals[2]);
+            let cancelled_records = handles[..2]
+                .iter()
+                .map(|handle| {
+                    storage
+                        .resident_orders()
+                        .record(handle)
+                        .cloned()
+                        .expect("cancelled member remains durable")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                cancelled_records
+                    .iter()
+                    .all(|record| record.order.is_none())
+            );
+            storage
+                .force_pending_admission_for_test(OWNER, "cancel-replay", &cancelled_records)
+                .expect("pending group cancellation is durable");
+            fixture.sessions.apply_resident_goals(moving_goals).await;
+            let mut reopened =
+                PluginStorage::open(fixture.storage_root.path()).expect("reopen cancellation");
+            fixture
+                .runtime
+                .recover_resident_orders(&mut reopened)
+                .await
+                .unwrap();
+            assert!(reopened.resident_orders().pending_admissions().is_empty());
+            for (_, uuid) in members.iter().take(2) {
+                assert_eq!(
+                    fixture.goal(*uuid).await,
+                    mc_entity::GoalState::Idle,
+                    "pending cancellation must replay Idle before acknowledgement"
+                );
+            }
+            assert_eq!(fixture.goal(members[2].1).await, goals[2]);
         }
     }
 }
 
-/// (A10) Combat is committed through the real damage path: an archer without
-/// arrows deals nothing, a wall stops the shot, an allied resident is never
-/// hit and a supplied archer really damages the hostile.
+/// (A10) An archer consumes one arrow only on launch; the shared projectile
+/// kernel hits an authorized target later, while no ammo, a wall and ally policy
+/// prevent launch or damage.
 #[tokio::test]
 async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
     let fixture = Fixture::new(false);
+    fixture.enable_arrows();
     let mut storage = fixture.storage();
     let (archer_handle, archer) = fixture
         .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
@@ -2985,25 +4842,34 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
             .any(|target| { target.position == ScriptBlockPosition::new(5, 64, 5) }),
         "a proximity order offers hostile mobs only, never the allied resident: {perceived:?}"
     );
-    let hostile_ref = perceived
+    let mut hostile_target = perceived
         .iter()
         .find(|target| target.category == ScriptHostileCategory::Hostile)
         .expect("hostile reference")
-        .target_ref
         .clone();
 
     let attack_order = |targets: Vec<ScriptOrderTargetRef>, policy: ScriptEngagementPolicy| {
         ScriptResidentOrder::Attack { targets, policy }
     };
-    let reference = |value: String| ScriptOrderTargetRef::new(value, 1, 0);
-    let policy_with_ally = ScriptEngagementPolicy::new(
-        1,
-        vec![ally_handle.clone()],
-        vec![
-            ScriptHostileCategory::Hostile,
-            ScriptHostileCategory::OwnedResident,
-        ],
-    );
+    let reference = |target: &mc_script::ScriptOrderTarget| {
+        ScriptOrderTargetRef::new(
+            target.target_ref.clone(),
+            target.policy_revision,
+            target.expires_revision,
+        )
+    };
+    let policy_with_ally = {
+        let mut policy = ScriptEngagementPolicy::new(
+            0,
+            vec![ally_handle.clone()],
+            vec![
+                ScriptHostileCategory::Hostile,
+                ScriptHostileCategory::OwnedResident,
+            ],
+        );
+        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+        policy
+    };
     // A bow with no arrows: the archer engages nothing, no damage, no event.
     // The bow must be equipped, or the resident would simply punch.
     seed_gear(
@@ -3021,22 +4887,49 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
                 "attack-no-ammo",
                 &holders,
                 &[bow_revision],
-                attack_order(
-                    vec![reference(hostile_ref.clone())],
-                    policy_with_ally.clone(),
-                ),
+                attack_order(vec![reference(&hostile_target)], policy_with_ally.clone()),
             ),
         )
         .await;
-    let (_, _, combat) = order_of(&outcome);
+    let (_, members, combat) = order_of(&outcome);
     assert!(combat.is_empty(), "no ammo means no committed damage");
     assert_eq!(
         fixture.health(zombie_uuid).await,
         health_before,
         "health is unchanged by a refused engagement"
     );
+    hostile_target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("refreshed hostile target")
+        .clone();
 
-    // With arrows the shot commits through the engine damage path.
+    // A crowded lane cannot stall the one-target arrow or make it hit a
+    // bystander: the restricted shot resolves just its issued entity.
+    let mut bystander = None;
+    for ordinal in 0..12 {
+        let cow = fixture
+            .sessions
+            .spawn_tracked_entity_for_test(
+                SpawnEntity::new(
+                    11,
+                    "minecraft:cow",
+                    Vec3::new(5.0 + f64::from(ordinal) * 0.08, 64.0, 4.5),
+                ),
+                false,
+            )
+            .expect("bystander spawns");
+        bystander.get_or_insert(cow);
+    }
+    let bystander = bystander.expect("first bystander");
+    let bystander_health = fixture
+        .sessions
+        .snapshot_entity_for_test(bystander)
+        .expect("bystander is live")
+        .health;
+    // With arrows the resident launches a physical projectile; there is no
+    // instant-damage receipt before its flight and impact.
     let ammo_revision = seed_gear(
         &mut storage,
         &archer_handle,
@@ -3050,20 +4943,40 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
                 "attack-arrows",
                 &holders,
                 &[ammo_revision],
-                attack_order(
-                    vec![reference(hostile_ref.clone())],
-                    policy_with_ally.clone(),
-                ),
+                attack_order(vec![reference(&hostile_target)], policy_with_ally.clone()),
             ),
         )
         .await;
-    let (_, _, combat) = order_of(&outcome);
-    assert_eq!(combat.len(), 1, "one committed volley: {combat:?}");
-    assert_eq!(combat[0].attacker_handle, archer_handle);
-    assert!(combat[0].damage_milli > 0);
+    let (_, members, combat) = order_of(&outcome);
+    assert!(
+        combat.is_empty(),
+        "launch is not an impact receipt: {combat:?}"
+    );
+    assert_eq!(fixture.health(zombie_uuid).await, health_before);
+    assert_eq!(
+        fixture
+            .sessions
+            .resident_arrows_for_test(Vec3::new(4.5, 64.0, 4.5))
+            .len(),
+        1,
+        "one physical arrow launched"
+    );
+    assert_eq!(
+        fixture.advance_resident_arrows(1, Vec3::new(4.5, 64.0, 4.5)),
+        1
+    );
     assert!(
         fixture.health(zombie_uuid).await < health_before,
-        "the hostile really lost health"
+        "the projectile kernel hit the hostile"
+    );
+    assert_eq!(
+        fixture
+            .sessions
+            .snapshot_entity_for_test(bystander)
+            .expect("bystander remains live")
+            .health,
+        bystander_health,
+        "the physical arrow ignored bystanders in its path"
     );
     assert_eq!(
         arrow_count(&storage, &archer_handle),
@@ -3071,13 +4984,48 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
         "exactly one arrow was consumed"
     );
     let after_arrows = members_revision(&outcome);
+    hostile_target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("refreshed hostile target")
+        .clone();
+    let health_after_first = fixture.health(zombie_uuid).await;
+    let repeated = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "attack-same-tick",
+                &holders,
+                &[after_arrows],
+                attack_order(vec![reference(&hostile_target)], policy_with_ally.clone()),
+            ),
+        )
+        .await;
+    let (_, members, repeated_combat) = order_of(&repeated);
+    assert!(
+        repeated_combat.is_empty(),
+        "same-tick repeated order cannot bypass attack cooldown"
+    );
+    assert_eq!(fixture.health(zombie_uuid).await, health_after_first);
+    assert_eq!(arrow_count(&storage, &archer_handle), 7);
+    let after_repeat = members_revision(&repeated);
+    hostile_target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("refreshed hostile target")
+        .clone();
 
     // The ally policy gate. The ally is a real target on the damage path: the
     // control volley, whose policy names no ally, hurts it through the same
     // issued reference; the same reference is refused once the policy covers
     // the ally.
     let neutral_policy = |allies: Vec<String>| {
-        ScriptEngagementPolicy::new(1, allies, vec![ScriptHostileCategory::NeutralAnimal])
+        let mut policy =
+            ScriptEngagementPolicy::new(1, allies, vec![ScriptHostileCategory::NeutralAnimal]);
+        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+        policy
     };
     let outcome = fixture
         .execute(
@@ -3085,11 +5033,8 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
             &order_request(
                 "attack-observe-ally",
                 &holders,
-                &[after_arrows],
-                attack_order(
-                    vec![reference(hostile_ref.clone())],
-                    neutral_policy(Vec::new()),
-                ),
+                &[after_repeat],
+                attack_order(vec![reference(&hostile_target)], neutral_policy(Vec::new())),
             ),
         )
         .await;
@@ -3098,16 +5043,16 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
         combat.is_empty(),
         "a policy permitting neutral animals only never shoots the hostile: {combat:?}"
     );
-    let ally_ref = members[0]
+    let mut ally_target = members[0]
         .targets
         .iter()
         .find(|target| target.position == ScriptBlockPosition::new(5, 64, 5))
         .expect("the adjacent resident is issued when no ally excludes it")
-        .target_ref
         .clone();
 
     let after_observe = members_revision(&outcome);
     let ally_health = fixture.health(ally_uuid).await;
+    fixture.sessions.synchronize_entity_lifecycle_epoch(20);
     let outcome = fixture
         .execute(
             &mut storage,
@@ -3115,24 +5060,31 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
                 "attack-ally-control",
                 &holders,
                 &[after_observe],
-                attack_order(
-                    vec![reference(ally_ref.clone())],
-                    neutral_policy(Vec::new()),
-                ),
+                attack_order(vec![reference(&ally_target)], neutral_policy(Vec::new())),
             ),
         )
         .await;
-    let (_, _, combat) = order_of(&outcome);
+    let (_, members, combat) = order_of(&outcome);
+    assert!(
+        combat.is_empty(),
+        "the projectile has not landed: {combat:?}"
+    );
+    assert_eq!(fixture.health(ally_uuid).await, ally_health);
     assert_eq!(
-        combat.len(),
-        1,
-        "the control volley hits the resident: {combat:?}"
+        fixture.advance_resident_arrows(21, Vec3::new(4.5, 64.0, 4.5)),
+        1
     );
     assert!(
         fixture.health(ally_uuid).await < ally_health,
         "the issued reference really addresses the resident"
     );
     let after_control = members_revision(&outcome);
+    ally_target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.position == ScriptBlockPosition::new(5, 64, 5))
+        .expect("the neutral resident target is refreshed")
+        .clone();
 
     let ally_health = fixture.health(ally_uuid).await;
     let arrows_before = arrow_count(&storage, &archer_handle);
@@ -3143,17 +5095,18 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
                 "attack-ally-gated",
                 &holders,
                 &[after_control],
-                attack_order(
-                    vec![reference(ally_ref)],
-                    ScriptEngagementPolicy::new(
+                attack_order(vec![reference(&ally_target)], {
+                    let mut policy = ScriptEngagementPolicy::new(
                         1,
                         vec![ally_handle.clone()],
                         vec![
                             ScriptHostileCategory::Hostile,
                             ScriptHostileCategory::NeutralAnimal,
                         ],
-                    ),
-                ),
+                    );
+                    policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                    policy
+                }),
             ),
         )
         .await;
@@ -3191,6 +5144,7 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
 
     // A wall between the archer and the hostile stops the shot.
     let walled = Fixture::new(true);
+    walled.enable_arrows();
     let mut walled_storage = walled.storage();
     let (walled_handle, walled_archer) = walled
         .resident(&mut walled_storage, 3, Vec3::new(4.5, 64.0, 4.5))
@@ -3222,12 +5176,11 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
         )
         .await;
     let (_, members, _) = order_of(&outcome);
-    let walled_ref = members[0]
+    let walled_target = members[0]
         .targets
         .iter()
         .find(|target| target.category == ScriptHostileCategory::Hostile)
         .expect("the hostile is perceived through the wall")
-        .target_ref
         .clone();
     let walled_health = walled.health(walled_uuid).await;
     let walled_order_revision = members_revision(&outcome);
@@ -3236,8 +5189,12 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
     } else {
         walled_order_revision
     };
-    let walled_policy =
-        ScriptEngagementPolicy::new(1, Vec::new(), vec![ScriptHostileCategory::Hostile]);
+    let walled_policy = {
+        let mut policy =
+            ScriptEngagementPolicy::new(0, Vec::new(), vec![ScriptHostileCategory::Hostile]);
+        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+        policy
+    };
     let outcome = walled
         .execute(
             &mut walled_storage,
@@ -3245,7 +5202,7 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
                 "wall-attack",
                 &walled_holders,
                 &[walled_order_revision],
-                attack_order(vec![reference(walled_ref)], walled_policy),
+                attack_order(vec![reference(&walled_target)], walled_policy),
             ),
         )
         .await;
@@ -3266,6 +5223,584 @@ async fn archer_ammo_line_of_sight_and_ally_policy_gate_committed_damage() {
     );
 }
 
+#[tokio::test]
+async fn changing_equipped_bow_to_sword_uses_melee_without_spending_an_arrow() {
+    let fixture = Fixture::new(false);
+    fixture.enable_arrows();
+    let mut storage = fixture.storage();
+    let (handle, resident_uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .await;
+    seed_gear_in(
+        &mut storage,
+        &handle,
+        resident_uuid,
+        &[("minecraft:bow", 1), ("minecraft:arrow", 4)],
+        true,
+    );
+    let zombie_id = fixture
+        .sessions
+        .spawn_tracked_entity_for_test(
+            SpawnEntity::new(54, "minecraft:zombie", Vec3::new(6.5, 64.0, 4.5)),
+            true,
+        )
+        .expect("zombie is tracked");
+    let zombie_uuid = fixture
+        .sessions
+        .snapshot_entity_for_test(zombie_id)
+        .expect("zombie is live")
+        .uuid;
+    let handles = vec![handle.clone()];
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .unwrap()
+        .order_revision();
+    let hold = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "weapon-hold",
+                &handles,
+                &[revision],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(4, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    let (_, members, _) = order_of(&hold);
+    let target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("hold issued a hostile reference")
+        .clone();
+    let before = fixture.health(zombie_uuid).await;
+    seed_gear_in(
+        &mut storage,
+        &handle,
+        resident_uuid,
+        &[("minecraft:iron_sword", 1)],
+        true,
+    );
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .unwrap()
+        .order_revision();
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "weapon-sword-attack",
+                &handles,
+                &[revision],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        target.target_ref,
+                        target.policy_revision,
+                        target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    let (_, members, combat) = order_of(&outcome);
+    assert_eq!(combat.len(), 1, "the new sword commits a melee hit");
+    assert!(fixture.health(zombie_uuid).await < before);
+    assert_eq!(arrow_count(&storage, &handle), 4);
+    assert!(
+        fixture
+            .sessions
+            .resident_arrows_for_test(Vec3::new(4.5, 64.0, 4.5))
+            .is_empty(),
+        "the previous bow is not used after the weapon changes"
+    );
+    let target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("live target reference refreshed")
+        .clone();
+    seed_gear_in(
+        &mut storage,
+        &handle,
+        resident_uuid,
+        &[("minecraft:bow", 1)],
+        true,
+    );
+    assert!(fixture.sessions.remove_tracked_entity_for_test(zombie_id));
+    fixture.sessions.synchronize_entity_lifecycle_epoch(20);
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .unwrap()
+        .order_revision();
+    let departed = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "weapon-departed-target",
+                &handles,
+                &[revision],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        target.target_ref,
+                        target.policy_revision,
+                        target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    let (_, _, combat) = order_of(&departed);
+    assert!(combat.is_empty(), "departed target cannot be hit");
+    assert_eq!(arrow_count(&storage, &handle), 4);
+    assert!(
+        fixture
+            .sessions
+            .resident_arrows_for_test(Vec3::new(4.5, 64.0, 4.5))
+            .is_empty(),
+        "the old reference cannot launch a projectile after the target leaves"
+    );
+}
+
+/// A permitted distant target is chased, then attacked by the native owner
+/// once movement reaches melee range; a guest does not issue per-tick damage.
+#[tokio::test]
+async fn distant_guard_engages_after_chasing_without_a_second_plugin_order() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, resident_uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .await;
+    let zombie_id = fixture
+        .sessions
+        .spawn_tracked_entity_for_test(
+            SpawnEntity::new(54, "minecraft:zombie", Vec3::new(9.5, 64.0, 4.5)),
+            true,
+        )
+        .expect("zombie spawns");
+    let zombie_uuid = fixture
+        .sessions
+        .snapshot_entity_for_test(zombie_id)
+        .expect("zombie is live")
+        .uuid;
+    let hold = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "distant-hold",
+                std::slice::from_ref(&handle),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(4, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    let (_, members, _) = order_of(&hold);
+    let target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("guard perceives the hostile")
+        .clone();
+    let attack = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "distant-attack",
+                std::slice::from_ref(&handle),
+                &[members_revision(&hold)],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        target.target_ref,
+                        target.policy_revision,
+                        target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    let attack_revision = members_revision(&attack);
+    assert_eq!(
+        order_of(&attack).1[0].state,
+        ScriptOrderMemberState::Applied,
+        "accepted combat must not report a blocked formation route"
+    );
+    assert!(
+        order_of(&attack).2.is_empty(),
+        "out-of-reach order deals no damage"
+    );
+    let health = fixture.health(zombie_uuid).await;
+    assert!(matches!(
+        fixture.goal(resident_uuid).await,
+        mc_entity::GoalState::FollowTarget { .. }
+    ));
+    let resident = fixture
+        .sessions
+        .resident_entity_snapshots(&[resident_uuid])
+        .await
+        .remove(0)
+        .expect("guard stays live");
+    fixture.sessions.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: resident.id,
+            position: Vec3::new(7.5, 64.0, 4.5),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+    );
+    assert!(fixture.position(resident_uuid).await.x >= 7.5);
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 1)
+        .await
+        .expect("native combat tick");
+    let damaged = fixture.health(zombie_uuid).await;
+    assert!(damaged < health, "native follow-up hits after approaching");
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 1)
+        .await
+        .expect("duplicate tick");
+    assert_eq!(
+        fixture.health(zombie_uuid).await,
+        damaged,
+        "cooldown gates repeat"
+    );
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .expect("guard record")
+            .order_revision(),
+        attack_revision,
+        "native follow-up does not invalidate the guest's order fence"
+    );
+    let mut reopened = PluginStorage::open(fixture.storage_root.path()).expect("reopen combat");
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut reopened, 21)
+        .await
+        .expect("cooldown elapsed after reopen");
+    assert!(
+        fixture.health(zombie_uuid).await < damaged,
+        "the accepted chase and ammo/cooldown state survive reopening"
+    );
+    assert_eq!(
+        reopened
+            .resident_orders()
+            .record(&handle)
+            .expect("reopened guard")
+            .order_revision(),
+        attack_revision
+    );
+    let cancel = ScriptOperationRequest::try_new(
+        "cancel",
+        ScriptOperation::ResidentOrder {
+            operation: ScriptResidentOrderOperation::CancelOrder {
+                operation_id: "distant-cancel".to_owned(),
+                handles: vec![handle],
+                expected_order_revisions: vec![attack_revision],
+            },
+        },
+    )
+    .expect("valid cancellation");
+    let outcome = fixture.execute(&mut reopened, &cancel).await;
+    assert_eq!(outcome.failure(), None, "accepted cancel: {outcome:?}");
+    let health = fixture.health(zombie_uuid).await;
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut reopened, 41)
+        .await
+        .expect("cancelled order no longer runs");
+    assert_eq!(fixture.health(zombie_uuid).await, health);
+}
+
+/// A standing archer order spends its own canonical arrows on subsequent
+/// native cooldown-ready shots, and stops launching when the stack runs out.
+#[tokio::test]
+async fn native_archer_follow_up_spends_each_arrow_once() {
+    let fixture = Fixture::new(false);
+    fixture.enable_arrows();
+    let mut storage = fixture.storage();
+    let (handle, archer) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .await;
+    let zombie_id = fixture
+        .sessions
+        .spawn_tracked_entity_for_test(
+            SpawnEntity::new(54, "minecraft:zombie", Vec3::new(10.5, 64.0, 4.5)),
+            true,
+        )
+        .expect("zombie spawns");
+    seed_gear(&mut storage, &handle, archer, &[("minecraft:bow", 1)]);
+    let bow_revision = equip_bow(&mut storage, &handle);
+    let hold = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "native-bow-hold",
+                std::slice::from_ref(&handle),
+                &[bow_revision],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(4, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    let (_, members, _) = order_of(&hold);
+    let target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("hostile reference");
+    seed_gear(&mut storage, &handle, archer, &[("minecraft:arrow", 2)]);
+    let revision = storage
+        .resident_orders()
+        .record(&handle)
+        .expect("archer record")
+        .order_revision();
+    let attack = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "native-bow-attack",
+                std::slice::from_ref(&handle),
+                &[revision],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        target.target_ref.clone(),
+                        target.policy_revision,
+                        target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    let (_, _, combat) = order_of(&attack);
+    assert!(combat.is_empty(), "launch is not impact");
+    assert_eq!(arrow_count(&storage, &handle), 1);
+    assert_eq!(
+        fixture
+            .sessions
+            .resident_arrows_for_test(Vec3::new(4.5, 64.0, 4.5))
+            .len(),
+        1
+    );
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 20)
+        .await
+        .expect("next cooldown shot");
+    assert_eq!(arrow_count(&storage, &handle), 0);
+    assert_eq!(
+        fixture
+            .sessions
+            .resident_arrows_for_test(Vec3::new(4.5, 64.0, 4.5))
+            .len(),
+        2
+    );
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 40)
+        .await
+        .expect("empty quiver does not launch");
+    assert_eq!(
+        fixture
+            .sessions
+            .resident_arrows_for_test(Vec3::new(4.5, 64.0, 4.5))
+            .len(),
+        2,
+        "no ammunition yields no third world arrow"
+    );
+    assert!(
+        fixture
+            .sessions
+            .snapshot_entity_for_test(zombie_id)
+            .is_some(),
+        "the target remains live until the shared arrow kernel resolves impact"
+    );
+}
+
+/// A retreat whose rally cannot be placed must still stop the interrupted
+/// chase and keep reporting the blocked route, instead of leaving the old
+/// attack goal installed.
+#[tokio::test]
+async fn retreat_with_an_unplaceable_rally_stops_the_chase_and_reports_blocked() {
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .await;
+    let handles = vec![handle.clone()];
+    let zombie_id = fixture
+        .sessions
+        .spawn_tracked_entity_for_test(
+            SpawnEntity::new(54, "minecraft:zombie", Vec3::new(6.5, 64.0, 5.5)),
+            true,
+        )
+        .expect("zombie spawns");
+    let zombie_uuid = fixture
+        .sessions
+        .snapshot_entity_for_test(zombie_id)
+        .expect("zombie is live")
+        .uuid;
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "blocked-retreat-1",
+                &handles,
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(4, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    let (_, members, _) = order_of(&outcome);
+    let hostile_target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("hostile perceived")
+        .clone();
+    let order_revision = members_revision(&outcome);
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "blocked-retreat-2",
+                &handles,
+                &[order_revision],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        hostile_target.target_ref.clone(),
+                        hostile_target.policy_revision,
+                        hostile_target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    let attack_revision = members_revision(&outcome);
+    assert!(
+        matches!(
+            fixture.goal(uuid).await,
+            mc_entity::GoalState::FollowTarget { .. }
+        ),
+        "attack chases the hostile"
+    );
+    // The fixture's bounded tree occupies this cell, so its formation slot
+    // cannot be placed.
+    assert_eq!(
+        fixture.block(6, SURFACE_Y + 1, 6).await,
+        Some(state_of(&fixture.blocks, "oak_log")),
+        "the blocked rally cell is occupied"
+    );
+
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "blocked-retreat-3",
+                &handles,
+                &[attack_revision],
+                ScriptResidentOrder::Retreat {
+                    anchor: ScriptBlockPosition::new(6, SURFACE_Y + 1, 6),
+                    formation: formation(),
+                },
+            ),
+        )
+        .await;
+    let (_, members, _) = order_of(&outcome);
+    assert_eq!(
+        members[0].state,
+        ScriptOrderMemberState::BlockedRoute,
+        "an unplaceable rally reports blocked_route"
+    );
+    assert_eq!(
+        fixture.goal(uuid).await,
+        mc_entity::GoalState::Idle,
+        "the blocked retreat stops the interrupted chase"
+    );
+    let health_after_retreat = fixture.health(zombie_uuid).await;
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 100)
+        .await
+        .expect("retreat leaves no attack continuation");
+    assert_eq!(
+        fixture.health(zombie_uuid).await,
+        health_after_retreat,
+        "the prior chase cannot land another hit after a blocked retreat"
+    );
+}
+
 /// (A11) Retreat interrupts the attack chase and patrol restores the route
 /// after the threat is gone.
 #[tokio::test]
@@ -3276,13 +5811,18 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
         .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
         .await;
     let handles = vec![handle.clone()];
-    fixture
+    let zombie_id = fixture
         .sessions
         .spawn_tracked_entity_for_test(
             SpawnEntity::new(54, "minecraft:zombie", Vec3::new(6.5, 64.0, 4.5)),
             true,
         )
         .expect("zombie spawns");
+    let zombie_uuid = fixture
+        .sessions
+        .snapshot_entity_for_test(zombie_id)
+        .expect("zombie is live")
+        .uuid;
 
     let outcome = fixture
         .execute(
@@ -3301,14 +5841,14 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
         )
         .await;
     let (_, members, _) = order_of(&outcome);
-    let hostile_ref = members[0]
+    let hostile_target = members[0]
         .targets
         .iter()
         .find(|target| target.category == ScriptHostileCategory::Hostile)
         .expect("hostile perceived")
-        .target_ref
         .clone();
     let order_revision = members_revision(&outcome);
+    let hostile_health = fixture.health(zombie_uuid).await;
 
     let outcome = fixture
         .execute(
@@ -3318,17 +5858,33 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
                 &handles,
                 &[order_revision],
                 ScriptResidentOrder::Attack {
-                    targets: vec![ScriptOrderTargetRef::new(hostile_ref.clone(), 1, 0)],
-                    policy: ScriptEngagementPolicy::new(
-                        1,
-                        Vec::new(),
-                        vec![ScriptHostileCategory::Hostile],
-                    ),
+                    targets: vec![ScriptOrderTargetRef::new(
+                        hostile_target.target_ref.clone(),
+                        hostile_target.policy_revision,
+                        hostile_target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                        policy
+                    },
                 },
             ),
         )
         .await;
-    let (_, _, _) = order_of(&outcome);
+    let (_, _, combat) = order_of(&outcome);
+    assert_eq!(
+        combat.len(),
+        1,
+        "the melee action committed exactly one hit"
+    );
+    assert_eq!(combat[0].attacker_handle, handle);
+    assert!(combat[0].damage_milli > 0);
+    assert!(fixture.health(zombie_uuid).await < hostile_health);
     let attack_revision = members_revision(&outcome);
     assert!(
         matches!(
@@ -3366,6 +5922,17 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
         4.5,
         "retreat never teleports the member"
     );
+    let health_after_retreat = fixture.health(zombie_uuid).await;
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 100)
+        .await
+        .expect("retreat leaves no attack continuation");
+    assert_eq!(
+        fixture.health(zombie_uuid).await,
+        health_after_retreat,
+        "the prior chase cannot land another hit after retreat"
+    );
 
     let waypoints = vec![
         ScriptBlockPosition::new(3, 64, 3),
@@ -3402,7 +5969,7 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
             &order_request("stage-5", &handles, &[patrol_revision], patrol.clone()),
         )
         .await;
-    let (_, _, _) = order_of(&outcome);
+    let (_, members, _) = order_of(&outcome);
     let record = storage
         .resident_orders()
         .record(&handle)
@@ -3414,6 +5981,12 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
         "the route advances to the next waypoint"
     );
     let advanced_revision = members_revision(&outcome);
+    let hostile_target = members[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("patrol refreshed hostile reference")
+        .clone();
 
     // A threat interrupts the route: the member chases instead of walking.
     let outcome = fixture
@@ -3424,12 +5997,20 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
                 &handles,
                 &[advanced_revision],
                 ScriptResidentOrder::Attack {
-                    targets: vec![ScriptOrderTargetRef::new(hostile_ref, 1, 0)],
-                    policy: ScriptEngagementPolicy::new(
-                        1,
-                        Vec::new(),
-                        vec![ScriptHostileCategory::Hostile],
-                    ),
+                    targets: vec![ScriptOrderTargetRef::new(
+                        hostile_target.target_ref,
+                        hostile_target.policy_revision,
+                        hostile_target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(2, 64, 4));
+                        policy
+                    },
                 },
             ),
         )
@@ -3467,6 +6048,971 @@ async fn retreat_interrupts_attack_and_patrol_walks_its_waypoints() {
         ),
         "the resumed order is the patrol route"
     );
+}
+
+#[tokio::test]
+async fn injury_and_flank_route_then_capture_the_same_resident() {
+    use crate::play::ResidentAttack;
+    use crate::script::storage::resident_morale::MoralePhase;
+
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .await;
+    seed_gear(&mut storage, &handle, uuid, &[("minecraft:emerald", 1)]);
+    let zombie_id = fixture
+        .sessions
+        .spawn_tracked_entity_for_test(
+            SpawnEntity::new(54, "minecraft:zombie", Vec3::new(6.5, 64.0, 4.5)),
+            true,
+        )
+        .expect("hostile spawns");
+    let zombie_uuid = fixture
+        .sessions
+        .snapshot_entity_for_test(zombie_id)
+        .expect("hostile exists")
+        .uuid;
+    let hold = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "morale-hold",
+                std::slice::from_ref(&handle),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(4, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    let target = order_of(&hold).1[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("hostile is perceived")
+        .clone();
+    let attack = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "morale-attack",
+                std::slice::from_ref(&handle),
+                &[members_revision(&hold)],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        target.target_ref,
+                        target.policy_revision,
+                        target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            Vec::new(),
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.rally = Some(ScriptBlockPosition::new(1, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    assert_eq!(attack.failure(), None);
+    let public_order_revision = members_revision(&attack);
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .unwrap()
+            .morale
+            .as_ref()
+            .unwrap()
+            .phase,
+        MoralePhase::Shaken,
+        "the hostile is physically on the resident's flank"
+    );
+    for (tick, expected) in [(101, MoralePhase::Wavering), (102, MoralePhase::Routing)] {
+        let snapshot = fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+            .clone()
+            .expect("resident remains native and alive");
+        let hit = fixture
+            .sessions
+            .commit_resident_damage(
+                OWNER,
+                vec![ResidentAttack {
+                    uuid,
+                    amount: 1.0,
+                    expected: snapshot,
+                }],
+            )
+            .await;
+        assert!(
+            hit[0].is_some(),
+            "each injury must be a committed native hit"
+        );
+        fixture
+            .runtime
+            .continue_active_resident_combat(&mut storage, tick)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .resident_orders()
+                .record(&handle)
+                .unwrap()
+                .morale
+                .as_ref()
+                .unwrap()
+                .phase,
+            expected
+        );
+    }
+    assert_eq!(fixture.position(uuid).await, Vec3::new(4.5, 64.0, 4.5));
+    assert!(matches!(
+        fixture.goal(uuid).await,
+        mc_entity::GoalState::FollowPosition { target, .. }
+            if target == Vec3::new(1.5, 64.0, 4.5)
+    ));
+    let hostile_health = fixture.health(zombie_uuid).await;
+    let mut reopened = PluginStorage::open(fixture.storage_root.path()).unwrap();
+    fixture
+        .runtime
+        .recover_resident_orders(&mut reopened)
+        .await
+        .unwrap();
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut reopened, 200)
+        .await
+        .unwrap();
+    assert_eq!(fixture.health(zombie_uuid).await, hostile_health);
+    assert_eq!(
+        reopened
+            .resident_orders()
+            .record(&handle)
+            .unwrap()
+            .morale
+            .as_ref()
+            .unwrap()
+            .phase,
+        MoralePhase::Routing,
+        "reload cannot silently restore the interrupted chase"
+    );
+    let (distant_guard, _) = fixture
+        .resident(&mut reopened, 4, Vec3::new(11.5, 64.0, 4.5))
+        .await;
+    let distant_hold = fixture
+        .execute(
+            &mut reopened,
+            &order_request(
+                "distant-guard-hold",
+                std::slice::from_ref(&distant_guard),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(11, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(distant_hold.failure(), None);
+    let revision = public_order_revision;
+    let internal_revision = reopened.resident_orders().record(&handle).unwrap().revision;
+    assert!(
+        internal_revision > revision,
+        "morale and gear progress must not fence off the public attack order"
+    );
+    let distant = fixture
+        .execute(
+            &mut reopened,
+            &capture_request("capture-too-far", &handle, &distant_guard, revision),
+        )
+        .await;
+    assert_eq!(
+        distant.failure(),
+        Some(ScriptOperationFailure::InvalidRequest)
+    );
+    assert_eq!(
+        reopened.resident_orders().record(&handle).unwrap().revision,
+        internal_revision
+    );
+
+    let (converted_guard, converted_uuid) = fixture
+        .resident(&mut reopened, 6, Vec3::new(5.5, 64.0, 4.5))
+        .await;
+    let converted_hold = fixture
+        .execute(
+            &mut reopened,
+            &order_request(
+                "converted-guard-hold",
+                std::slice::from_ref(&converted_guard),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(5, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(converted_hold.failure(), None);
+    let converted_id = fixture
+        .sessions
+        .resident_entity_snapshots(&[converted_uuid])
+        .await[0]
+        .as_ref()
+        .expect("guard is originally a villager")
+        .id;
+    assert!(
+        fixture
+            .sessions
+            .convert_resident_entity_for_test(converted_id)
+    );
+    let converted_capture = fixture
+        .execute(
+            &mut reopened,
+            &capture_request(
+                "capture-converted-guard",
+                &handle,
+                &converted_guard,
+                revision,
+            ),
+        )
+        .await;
+    assert_eq!(
+        converted_capture.failure(),
+        Some(ScriptOperationFailure::NotFound),
+        "a former villager converted to a zombie cannot claim custody"
+    );
+
+    let (guard, _) = fixture
+        .resident(&mut reopened, 5, Vec3::new(5.5, 64.0, 5.5))
+        .await;
+    let nearby_hold = fixture
+        .execute(
+            &mut reopened,
+            &order_request(
+                "nearby-guard-hold",
+                std::slice::from_ref(&guard),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(5, 64, 5),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(nearby_hold.failure(), None);
+    let before_gear = gear(&reopened, &handle);
+    let capture = capture_request("capture-nearby", &handle, &guard, revision);
+    let captured = fixture.execute(&mut reopened, &capture).await;
+    let ScriptOperationPayload::ResidentOrder { result } = captured.payload() else {
+        panic!("capture must return the original identity");
+    };
+    assert!(matches!(&**result,
+        ScriptResidentOrderResult::Captured { handle: victim, custodian, .. }
+            if victim == &handle && custodian == &guard
+    ));
+    let prisoner = reopened.resident_orders().record(&handle).unwrap();
+    assert_eq!(
+        prisoner.assignment,
+        crate::script::storage::resident_orders::DurableAssignment::Prisoner
+    );
+    assert_eq!(prisoner.entity_uuid, uuid.to_string());
+    assert_eq!(prisoner.custodian.as_deref(), Some(guard.as_str()));
+    assert_eq!(
+        prisoner.morale.as_ref().unwrap().phase,
+        MoralePhase::Surrendered
+    );
+    assert_eq!(gear(&reopened, &handle), before_gear);
+    assert_eq!(fixture.goal(uuid).await, mc_entity::GoalState::Idle);
+    assert_eq!(fixture.position(uuid).await, Vec3::new(4.5, 64.0, 4.5));
+    let repeat = fixture.execute(&mut reopened, &capture).await;
+    assert_eq!(
+        repeat, captured,
+        "same native decision is replayed exactly once"
+    );
+    let mut restored = PluginStorage::open(fixture.storage_root.path()).unwrap();
+    fixture
+        .runtime
+        .recover_resident_orders(&mut restored)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .resident_orders()
+            .record(&handle)
+            .unwrap()
+            .entity_uuid,
+        uuid.to_string()
+    );
+    assert_eq!(gear(&restored, &handle), before_gear);
+    assert_eq!(
+        fixture
+            .execute(
+                &mut restored,
+                &demobilize_request("prisoner-demob", &handle, captured.revision().unwrap()),
+            )
+            .await
+            .failure(),
+        Some(ScriptOperationFailure::NotFound),
+        "a captive cannot be enrolled or demobilized as a second army member"
+    );
+}
+
+/// (CP-047 / WAR-07) A real ally death and a real officer death each advance one
+/// morale category past the physical flank, and the routed squad receives its
+/// rally as the native goal instead of the interrupted chase.
+#[tokio::test]
+async fn physical_ally_and_officer_losses_route_the_squad_to_its_rally() {
+    use crate::play::ResidentAttack;
+    use crate::script::storage::resident_morale::MoralePhase;
+
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (guard, guard_uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .await;
+    let (ally, ally_uuid) = fixture
+        .resident(&mut storage, 4, Vec3::new(5.5, 64.0, 4.5))
+        .await;
+    let (officer, officer_uuid) = fixture
+        .resident(&mut storage, 5, Vec3::new(5.5, 64.0, 5.5))
+        .await;
+    for (operation, member) in [("ally-post", &ally), ("officer-post", &officer)] {
+        let post = fixture
+            .execute(
+                &mut storage,
+                &order_request(
+                    operation,
+                    std::slice::from_ref(member),
+                    &[0],
+                    ScriptResidentOrder::Hold {
+                        anchor: ScriptBlockPosition::new(5, 64, 5),
+                        heading_degrees: 0,
+                        formation: formation(),
+                        engagement_radius: 16,
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(post.failure(), None, "{operation}: {post:?}");
+    }
+    fixture
+        .sessions
+        .spawn_tracked_entity_for_test(
+            SpawnEntity::new(54, "minecraft:zombie", Vec3::new(6.5, 64.0, 4.5)),
+            true,
+        )
+        .expect("hostile spawns");
+    let hold = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "loss-hold",
+                std::slice::from_ref(&guard),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(4, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    let target = order_of(&hold).1[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("hostile is perceived")
+        .clone();
+    let attack = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "loss-attack",
+                std::slice::from_ref(&guard),
+                &[members_revision(&hold)],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        target.target_ref,
+                        target.policy_revision,
+                        target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            vec![guard.clone(), ally.clone(), officer.clone()],
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.officer = Some(officer.clone());
+                        policy.rally = Some(ScriptBlockPosition::new(1, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    assert_eq!(attack.failure(), None, "{attack:?}");
+    let phase = |storage: &PluginStorage| {
+        storage
+            .resident_orders()
+            .record(&guard)
+            .expect("the guard keeps its military record")
+            .morale
+            .as_ref()
+            .expect("the attack order carries morale")
+            .phase
+    };
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&storage),
+        MoralePhase::Shaken,
+        "the hostile stands on the guard's flank"
+    );
+
+    let expected = fixture
+        .sessions
+        .resident_entity_snapshots(&[ally_uuid])
+        .await[0]
+        .clone()
+        .expect("the ally is native and alive");
+    let hit = fixture
+        .sessions
+        .commit_resident_damage(
+            OWNER,
+            vec![ResidentAttack {
+                uuid: ally_uuid,
+                amount: 1_000.0,
+                expected,
+            }],
+        )
+        .await;
+    assert!(
+        hit[0].as_ref().is_some_and(|hit| hit.killed),
+        "the ally must really die: {hit:?}"
+    );
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 101)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&storage),
+        MoralePhase::Wavering,
+        "one perceived ally loss is one category"
+    );
+
+    let expected = fixture
+        .sessions
+        .resident_entity_snapshots(&[officer_uuid])
+        .await[0]
+        .clone()
+        .expect("the officer is native and alive");
+    let hit = fixture
+        .sessions
+        .commit_resident_damage(
+            OWNER,
+            vec![ResidentAttack {
+                uuid: officer_uuid,
+                amount: 1_000.0,
+                expected,
+            }],
+        )
+        .await;
+    assert!(
+        hit[0].as_ref().is_some_and(|hit| hit.killed),
+        "the officer must really die: {hit:?}"
+    );
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 102)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&storage),
+        MoralePhase::Routing,
+        "the officer's real death ends morale"
+    );
+    assert!(
+        matches!(
+            fixture.goal(guard_uuid).await,
+            mc_entity::GoalState::FollowPosition { target, .. }
+                if target == Vec3::new(1.5, 64.0, 4.5)
+        ),
+        "routing replaces the chase with the squad's rally"
+    );
+    let reopened = PluginStorage::open(fixture.storage_root.path()).expect("reopen morale");
+    assert_eq!(
+        reopened
+            .resident_orders()
+            .record(&guard)
+            .unwrap()
+            .morale
+            .as_ref()
+            .unwrap()
+            .phase,
+        MoralePhase::Routing,
+        "the routed squad survives a restart"
+    );
+}
+
+/// (CP-047 / WAR-07) A routed squad that physically walks to its rally with its
+/// officer attending is restored: arrival, not elapsed time, ends the rout.
+#[tokio::test]
+async fn physical_rally_arrival_restores_the_routed_squad() {
+    use crate::play::ResidentAttack;
+    use crate::script::storage::resident_morale::MoralePhase;
+    use mc_physics::{BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
+
+    struct Terrain<'a> {
+        chunks: &'a mc_world::WorldReadSnapshot,
+        materials: &'a BlockMaterialIds,
+    }
+    impl BlockSampler for Terrain<'_> {
+        fn material_at(&self, x: i32, y: i32, z: i32) -> BlockMaterial {
+            self.chunks
+                .get_cached_block(BlockPos { x, y, z })
+                .map_or(BlockMaterial::Air, |state| self.materials.classify(state.0))
+        }
+    }
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (guard, guard_uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .await;
+    let (officer, _) = fixture
+        .resident(&mut storage, 5, Vec3::new(5.5, 64.0, 5.5))
+        .await;
+    let post = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "rally-officer-post",
+                std::slice::from_ref(&officer),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(5, 64, 5),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(post.failure(), None, "{post:?}");
+    fixture
+        .sessions
+        .spawn_tracked_entity_for_test(
+            SpawnEntity::new(54, "minecraft:zombie", Vec3::new(6.5, 64.0, 4.5)),
+            true,
+        )
+        .expect("hostile spawns");
+    let hold = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "rally-hold",
+                std::slice::from_ref(&guard),
+                &[0],
+                ScriptResidentOrder::Hold {
+                    anchor: ScriptBlockPosition::new(4, 64, 4),
+                    heading_degrees: 0,
+                    formation: formation(),
+                    engagement_radius: 16,
+                },
+            ),
+        )
+        .await;
+    let target = order_of(&hold).1[0]
+        .targets
+        .iter()
+        .find(|target| target.category == ScriptHostileCategory::Hostile)
+        .expect("hostile is perceived")
+        .clone();
+    let attack = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "rally-attack",
+                std::slice::from_ref(&guard),
+                &[members_revision(&hold)],
+                ScriptResidentOrder::Attack {
+                    targets: vec![ScriptOrderTargetRef::new(
+                        target.target_ref,
+                        target.policy_revision,
+                        target.expires_revision,
+                    )],
+                    policy: {
+                        let mut policy = ScriptEngagementPolicy::new(
+                            0,
+                            vec![guard.clone(), officer.clone()],
+                            vec![ScriptHostileCategory::Hostile],
+                        );
+                        policy.officer = Some(officer.clone());
+                        policy.rally = Some(ScriptBlockPosition::new(1, 64, 4));
+                        policy
+                    },
+                },
+            ),
+        )
+        .await;
+    assert_eq!(attack.failure(), None, "{attack:?}");
+    let phase = |storage: &PluginStorage| {
+        storage
+            .resident_orders()
+            .record(&guard)
+            .expect("the guard keeps its military record")
+            .morale
+            .as_ref()
+            .expect("the attack order carries morale")
+            .phase
+    };
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 100)
+        .await
+        .unwrap();
+    assert_eq!(phase(&storage), MoralePhase::Shaken);
+    let mut before_routing = None;
+    for tick in [101, 102] {
+        let expected = fixture
+            .sessions
+            .resident_entity_snapshots(&[guard_uuid])
+            .await[0]
+            .clone()
+            .expect("the guard stays native and alive");
+        let hit = fixture
+            .sessions
+            .commit_resident_damage(
+                OWNER,
+                vec![ResidentAttack {
+                    uuid: guard_uuid,
+                    amount: 1.0,
+                    expected,
+                }],
+            )
+            .await;
+        assert!(hit[0].is_some(), "each injury is a committed native hit");
+        if tick == 102 {
+            before_routing = Some(fixture.position(guard_uuid).await);
+        }
+        fixture
+            .runtime
+            .continue_active_resident_combat(&mut storage, tick)
+            .await
+            .unwrap();
+    }
+    assert_eq!(phase(&storage), MoralePhase::Routing);
+    assert!(
+        matches!(
+            fixture.goal(guard_uuid).await,
+            mc_entity::GoalState::FollowPosition { target, .. }
+                if target == Vec3::new(1.5, 64.0, 4.5)
+        ),
+        "the rout walks the squad to its rally instead of chasing"
+    );
+    // Routing replaces the goal; it must not move the guard itself, and the
+    // guard must still start outside the rally's two-block arrival radius.
+    let before_routing = before_routing.expect("the routing tick captured the guard's position");
+    let routed_at = fixture.position(guard_uuid).await;
+    assert!(
+        (routed_at.x - before_routing.x).abs() < 0.001
+            && (routed_at.z - before_routing.z).abs() < 0.001,
+        "routing must not move the guard: {before_routing:?} -> {routed_at:?}"
+    );
+    assert!(
+        (routed_at.x - 1.5).powi(2) + (routed_at.z - 4.5).powi(2) > 4.0,
+        "the guard must walk to its rally instead of starting inside the arrival radius: {routed_at:?}"
+    );
+
+    // The squad reaches the rally by its own native walking goal.
+    fixture
+        .sessions
+        .register_loaded_for_server_test("RallyObserver", (0, 0));
+    let world_read = fixture.world.lock().await.read_view();
+    let materials = BlockMaterialIds::new(
+        state_of(&fixture.blocks, "air").0,
+        Some(state_of(&fixture.blocks, "water").0),
+        None,
+    );
+    let chunks = world_read.snapshot_chunks(&[ChunkPos { x: 0, z: 0 }]);
+    let terrain = Terrain {
+        chunks: &chunks,
+        materials: &materials,
+    };
+    let guard_id = fixture
+        .sessions
+        .resident_entity_snapshots(&[guard_uuid])
+        .await[0]
+        .as_ref()
+        .expect("living guard")
+        .id;
+    let mut walked_from = routed_at;
+    for tick in 200..=400 {
+        let queries = fixture
+            .sessions
+            .tick_entities_and_collect_physics_queries_with_terrain(tick, &world_read, &materials);
+        let steps = queries
+            .iter()
+            .filter(|query| query.id == guard_id)
+            .map(|query| {
+                let stepped = mc_physics::step_entity(
+                    EntityBody {
+                        position: mc_physics::Vec3::new(
+                            query.position.x,
+                            query.position.y,
+                            query.position.z,
+                        ),
+                        velocity: mc_physics::Vec3::new(
+                            query.velocity.x,
+                            query.velocity.y,
+                            query.velocity.z,
+                        ),
+                        aabb: query.aabb,
+                        on_ground: query.on_ground,
+                    },
+                    &terrain,
+                    PhysicsConfig::living_entity(),
+                );
+                EntityPhysicsStep {
+                    id: query.id,
+                    position: Vec3::new(
+                        stepped.body.position.x,
+                        stepped.body.position.y,
+                        stepped.body.position.z,
+                    ),
+                    velocity: Vec3::new(
+                        stepped.body.velocity.x,
+                        stepped.body.velocity.y,
+                        stepped.body.velocity.z,
+                    ),
+                    on_ground: stepped.body.on_ground,
+                    horizontal_collision: stepped.horizontal_collision,
+                }
+            })
+            .collect::<Vec<_>>();
+        fixture
+            .sessions
+            .apply_entity_physics_if_current_and_dispatch(tick, &queries, &steps);
+        let at = fixture.position(guard_uuid).await;
+        let step = ((at.x - walked_from.x).powi(2) + (at.z - walked_from.z).powi(2)).sqrt();
+        assert!(
+            step < 1.0,
+            "one native physics tick must not teleport the guard: {walked_from:?} -> {at:?}"
+        );
+        walked_from = at;
+        if (at.x - 1.5).abs() < 0.5 && (at.z - 4.5).abs() < 0.5 {
+            break;
+        }
+    }
+    let arrived = fixture.position(guard_uuid).await;
+    assert!(
+        (arrived.x - 1.5).abs() < 0.5 && (arrived.z - 4.5).abs() < 0.5,
+        "the routed guard must walk to its rally, not teleport: {arrived:?}"
+    );
+    fixture
+        .runtime
+        .continue_active_resident_combat(&mut storage, 401)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&storage),
+        MoralePhase::Rallied,
+        "the officer at the rally restores the squad"
+    );
+    assert_eq!(fixture.goal(guard_uuid).await, mc_entity::GoalState::Idle);
+    let reopened = PluginStorage::open(fixture.storage_root.path()).expect("reopen morale");
+    let record = reopened.resident_orders().record(&guard).unwrap().clone();
+    let morale = record.morale.as_ref().expect("terminal morale");
+    assert_eq!(morale.phase, MoralePhase::Rallied);
+    assert!(
+        morale.goal_applied,
+        "the restored squad's goal is durably applied"
+    );
+}
+
+/// (CP-047) A resident that dies while demobilising publishes the loot its
+/// configured mob table declares, keeps exactly one owner of its issued gear
+/// (the durable record) and cannot finish the demobilisation, before or after a
+/// restart. No corpse loot can carry the same gear.
+#[tokio::test]
+async fn a_demobilising_resident_killed_outright_keeps_one_gear_owner_and_configured_loot() {
+    use crate::play::ResidentAttack;
+    use mc_data::items::{ItemRegistry, ItemReport};
+    use mc_data::loot::{LootDrop, LootTables};
+
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 3, Vec3::new(5.5, 64.0, 4.5))
+        .await;
+    seed_gear(
+        &mut storage,
+        &handle,
+        uuid,
+        &[("minecraft:iron_sword", 1), ("minecraft:arrow", 8)],
+    );
+    let leather = Identifier::parse("minecraft:leather").expect("leather identifier");
+    let villager = Identifier::parse("minecraft:villager").expect("villager identifier");
+    fixture.sessions.configure_arrow_kill_rewards(
+        Some(98),
+        None,
+        None,
+        Arc::new(ItemRegistry::from_report(&[ItemReport {
+            id: leather.clone(),
+            protocol_id: 41,
+        }])),
+        Arc::new(solaris_required_item_facts()),
+        Arc::new(LootTables::from_drop_lists(
+            std::collections::BTreeMap::from([(villager, vec![LootDrop::single(leather)])]),
+            std::collections::BTreeMap::new(),
+        )),
+    );
+    let before = gear(&storage, &handle);
+    // Death must be handled on a resident that is already demobilising.
+    let record = storage
+        .resident_orders()
+        .record(&handle)
+        .cloned()
+        .expect("the seeded gear carries a record");
+    let outcome = fixture
+        .execute(
+            &mut storage,
+            &demobilize_request("demob-before-death", &handle, record.revision),
+        )
+        .await;
+    let ScriptOperationPayload::ResidentOrder { result } = outcome.payload() else {
+        panic!("expected a resident order payload");
+    };
+    let ScriptResidentOrderResult::Demobilized { resident } = &**result else {
+        panic!("expected a demobilisation result, got {result:?}");
+    };
+    assert_eq!(
+        resident.state,
+        mc_script::ScriptDemobilizeState::Demobilizing,
+        "a resident with no warehouse to hand its gear to stays demobilising"
+    );
+    assert_eq!(resident.reason, Some(ScriptWorkPauseReason::NoStorage));
+    assert!(resident.returned.is_empty());
+    assert_eq!(
+        gear(&storage, &handle),
+        before,
+        "an unfinished demobilisation keeps the gear on the resident"
+    );
+    let record = storage
+        .resident_orders()
+        .record(&handle)
+        .cloned()
+        .expect("the demobilising record survives");
+    let expected = fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+        .clone()
+        .expect("the resident is native and alive");
+    let entity = expected.id;
+    let hit = fixture
+        .sessions
+        .commit_resident_damage(
+            OWNER,
+            vec![ResidentAttack {
+                uuid,
+                amount: 1_000.0,
+                expected,
+            }],
+        )
+        .await;
+    assert!(
+        hit[0].as_ref().is_some_and(|hit| hit.killed),
+        "the resident must really die: {hit:?}"
+    );
+    assert_eq!(
+        fixture.sessions.published_entity_health_for_test(entity),
+        Some(0.0),
+        "an accepted death reaches the session projection every other source uses"
+    );
+    let drops = fixture
+        .sessions
+        .persisted_entity_records()
+        .into_iter()
+        .filter(|record| record.snapshot.type_name == "minecraft:item")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        drops.len(),
+        1,
+        "the death publishes exactly the loot its configured mob table declares"
+    );
+    let stack = drops[0]
+        .snapshot
+        .item_stack
+        .as_ref()
+        .expect("a dropped item entity carries its stack");
+    assert_eq!(
+        (stack.item_id, stack.count),
+        (41, 1),
+        "the published loot is the configured drop, never the issued gear"
+    );
+    assert_eq!(
+        gear(&storage, &handle),
+        before,
+        "the durable record stays the only owner of the issued gear"
+    );
+    assert_eq!(
+        storage
+            .resident_orders()
+            .record(&handle)
+            .expect("the record survives the death")
+            .assignment,
+        crate::script::storage::resident_orders::DurableAssignment::Demobilizing,
+        "a death does not undo the pending demobilisation"
+    );
+    for attempt in ["demob-after-real-death", "demob-after-real-death-repeat"] {
+        let outcome = fixture
+            .execute(
+                &mut storage,
+                &demobilize_request(attempt, &handle, record.revision),
+            )
+            .await;
+        assert_eq!(
+            outcome.failure(),
+            Some(ScriptOperationFailure::NotFound),
+            "a dead resident cannot finish demobilisation ({attempt})"
+        );
+    }
+    assert_eq!(gear(&storage, &handle), before);
+
+    // A restart keeps the same single owner and the same refusal.
+    let mut reopened = PluginStorage::open(fixture.storage_root.path()).expect("reopen orders");
+    assert_eq!(gear(&reopened, &handle), before);
+    let outcome = fixture
+        .execute(
+            &mut reopened,
+            &demobilize_request("demob-after-restart", &handle, record.revision),
+        )
+        .await;
+    assert_eq!(
+        outcome.failure(),
+        Some(ScriptOperationFailure::NotFound),
+        "a restart does not let a dead resident finish demobilisation"
+    );
+    assert_eq!(gear(&reopened, &handle), before);
 }
 
 /// (A11) A member that dies between prepare and commit invalidates the whole
@@ -3606,12 +7152,20 @@ async fn a_committed_admission_replays_exactly_once() {
         reopened.resident_orders().pending_admissions(),
         vec![(admission_id, handles.clone())]
     );
-    fixture.runtime.recover_resident_orders(&mut reopened).await;
+    fixture
+        .runtime
+        .recover_resident_orders(&mut reopened)
+        .await
+        .unwrap();
     assert!(
         reopened.resident_orders().pending_admissions().is_empty(),
         "the accepted batch is applied exactly once"
     );
-    fixture.runtime.recover_resident_orders(&mut reopened).await;
+    fixture
+        .runtime
+        .recover_resident_orders(&mut reopened)
+        .await
+        .unwrap();
     assert!(
         reopened.resident_orders().pending_admissions().is_empty(),
         "a second replay has nothing left to apply"
@@ -3648,14 +7202,14 @@ async fn a_committed_admission_replays_exactly_once() {
     );
 }
 
-/// (f) Demobilisation without a reachable warehouse keeps the resident handle,
-/// its order record and every item.
+/// (f) Demobilising a serving resident interrupts movement durably, even when
+/// no warehouse can yet take its issued gear.
 #[tokio::test]
 async fn demobilisation_without_a_warehouse_keeps_handle_and_gear() {
     let fixture = Fixture::new(false);
     let mut storage = fixture.storage();
     let (handle, uuid) = fixture
-        .resident(&mut storage, 3, Vec3::new(4.5, 64.0, 4.5))
+        .resident(&mut storage, 3, Vec3::new(5.5, 64.0, 4.5))
         .await;
     seed_gear(
         &mut storage,
@@ -3663,6 +7217,28 @@ async fn demobilisation_without_a_warehouse_keeps_handle_and_gear() {
         uuid,
         &[("minecraft:iron_sword", 1), ("minecraft:arrow", 8)],
     );
+    let march = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "march-before-demob",
+                std::slice::from_ref(&handle),
+                &[0],
+                ScriptResidentOrder::Move {
+                    dimension: "minecraft:overworld".to_owned(),
+                    anchor: ScriptBlockPosition::new(13, 64, 8),
+                    heading_degrees: 0,
+                    formation: formation(),
+                },
+            ),
+        )
+        .await;
+    assert_eq!(march.failure(), None);
+    let prior_goal = fixture.goal(uuid).await;
+    assert!(matches!(
+        prior_goal,
+        mc_entity::GoalState::FollowPosition { .. }
+    ));
     let before = gear(&storage, &handle);
     let revision = storage
         .resident_orders()
@@ -3695,9 +7271,30 @@ async fn demobilisation_without_a_warehouse_keeps_handle_and_gear() {
         .expect("record");
     assert_eq!(record.entity_uuid, uuid.to_string(), "same resident handle");
     assert_eq!(gear(&storage, &handle), before, "no item was lost");
+    assert_eq!(fixture.goal(uuid).await, mc_entity::GoalState::Idle);
+    let admission_id = storage
+        .force_pending_admission_for_test(OWNER, "demob-replay", std::slice::from_ref(&record))
+        .expect("committed demobilization requires Idle on replay");
+    fixture
+        .sessions
+        .apply_resident_goals(vec![ResidentGoal {
+            uuid,
+            goal: prior_goal,
+        }])
+        .await;
 
     // Everything is durable: the reopened journal still shows the same state.
-    let reopened = PluginStorage::open(fixture.storage_root.path()).unwrap();
+    let mut reopened = PluginStorage::open(fixture.storage_root.path()).unwrap();
+    fixture
+        .runtime
+        .recover_resident_orders(&mut reopened)
+        .await
+        .unwrap();
+    assert_eq!(fixture.goal(uuid).await, mc_entity::GoalState::Idle);
+    assert!(
+        reopened.resident_orders().pending_admissions().is_empty(),
+        "demobilization admission {admission_id} is acknowledged after Idle"
+    );
     let record = reopened
         .resident_orders()
         .record(&handle)
@@ -3708,6 +7305,273 @@ async fn demobilisation_without_a_warehouse_keeps_handle_and_gear() {
         crate::script::storage::resident_orders::DurableAssignment::Demobilizing
     );
     assert_eq!(gear(&reopened, &handle), before);
+    let entity_id = fixture.sessions.resident_entity_snapshots(&[uuid]).await[0]
+        .as_ref()
+        .expect("resident still present before conversion")
+        .id;
+    assert!(fixture.sessions.convert_resident_entity_for_test(entity_id));
+    let deceased = fixture
+        .execute(
+            &mut reopened,
+            &demobilize_request("demob-after-death", &handle, record.revision),
+        )
+        .await;
+    assert_eq!(
+        deceased.failure(),
+        Some(ScriptOperationFailure::NotFound),
+        "a converted or dead villager cannot finish demobilization"
+    );
+    assert_eq!(
+        reopened
+            .resident_orders()
+            .record(&handle)
+            .unwrap()
+            .assignment,
+        crate::script::storage::resident_orders::DurableAssignment::Demobilizing
+    );
+    assert_eq!(
+        gear(&reopened, &handle),
+        before,
+        "death does not mint a second gear owner"
+    );
+}
+
+#[tokio::test]
+async fn civilian_with_issued_gear_demobilizes_without_a_prior_military_order() {
+    use crate::script::storage::resident_orders::DurableAssignment;
+
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (handle, uuid) = fixture
+        .resident(&mut storage, 4, Vec3::new(5.5, 64.0, 4.5))
+        .await;
+    seed_gear(&mut storage, &handle, uuid, &[("minecraft:iron_sword", 1)]);
+    let before = storage.resident_orders().record(&handle).unwrap().clone();
+    assert_eq!(before.assignment, DurableAssignment::Civilian);
+    let first = fixture
+        .execute(
+            &mut storage,
+            &demobilize_request("civilian-stop", &handle, before.revision),
+        )
+        .await;
+    assert_eq!(first.failure(), None, "{first:?}");
+    let stopped = storage.resident_orders().record(&handle).unwrap().clone();
+    assert_eq!(stopped.assignment, DurableAssignment::Demobilizing);
+    assert!(stopped.work.is_none());
+    assert_eq!(fixture.goal(uuid).await, mc_entity::GoalState::Idle);
+    let finished = fixture
+        .execute(
+            &mut storage,
+            &demobilize_request("civilian-finish", &handle, stopped.revision),
+        )
+        .await;
+    assert_eq!(finished.failure(), None, "{finished:?}");
+    let restored = storage.resident_orders().record(&handle).unwrap();
+    assert_eq!(restored.assignment, DurableAssignment::Civilian);
+    assert_eq!(restored.entity_uuid, uuid.to_string());
+    assert_eq!(
+        gear(&storage, &handle),
+        vec![("minecraft:iron_sword".to_owned(), 1)]
+    );
+}
+
+/// Ambulatory evacuation moves the original wounded patient and medic on the
+/// regional physics path; injuries, UUID and gear stay on the original entity.
+#[tokio::test]
+async fn wounded_patient_and_medic_walk_without_replacing_patient() {
+    use mc_physics::{BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
+
+    struct Terrain<'a> {
+        chunks: &'a mc_world::WorldReadSnapshot,
+        materials: &'a BlockMaterialIds,
+    }
+    impl BlockSampler for Terrain<'_> {
+        fn material_at(&self, x: i32, y: i32, z: i32) -> BlockMaterial {
+            self.chunks
+                .get_cached_block(BlockPos { x, y, z })
+                .map_or(BlockMaterial::Air, |state| self.materials.classify(state.0))
+        }
+    }
+    let fixture = Fixture::new(false);
+    let mut storage = fixture.storage();
+    let (medic, medic_uuid) = fixture
+        .resident(&mut storage, 31, Vec3::new(3.5, 64.0, 10.5))
+        .await;
+    let (patient, patient_uuid) = fixture
+        .resident(&mut storage, 32, Vec3::new(4.5, 64.0, 10.5))
+        .await;
+    seed_gear(
+        &mut storage,
+        &patient,
+        patient_uuid,
+        &[("minecraft:emerald", 1)],
+    );
+    let before_hit = fixture
+        .sessions
+        .resident_entity_snapshots(&[patient_uuid])
+        .await[0]
+        .clone()
+        .expect("same living patient");
+    let patient_id = before_hit.id;
+    let injury = fixture
+        .sessions
+        .commit_resident_damage(
+            OWNER,
+            vec![crate::play::ResidentAttack {
+                uuid: patient_uuid,
+                amount: 4.0,
+                expected: before_hit,
+            }],
+        )
+        .await;
+    assert!(injury[0].is_some());
+    let injured_health = fixture.health(patient_uuid).await;
+    assert!(injured_health > 0.0 && injured_health < 20.0);
+    let mut handles = vec![medic, patient.clone()];
+    handles.sort_unstable();
+    let result = fixture
+        .execute(
+            &mut storage,
+            &order_request(
+                "wounded-escort",
+                &handles,
+                &[0, 0],
+                ScriptResidentOrder::Move {
+                    dimension: "minecraft:overworld".to_owned(),
+                    anchor: ScriptBlockPosition::new(7, 64, 10),
+                    heading_degrees: 0,
+                    formation: formation(),
+                },
+            ),
+        )
+        .await;
+    let (_, outcomes, _) = order_of(&result);
+    assert!(
+        outcomes
+            .iter()
+            .all(|member| member.state == ScriptOrderMemberState::Applied),
+        "{result:?}"
+    );
+    for uuid in [medic_uuid, patient_uuid] {
+        assert!(
+            matches!(
+                fixture.goal(uuid).await,
+                mc_entity::GoalState::FollowPosition { .. }
+            ),
+            "both members receive native walking goals without a teleport"
+        );
+    }
+    assert_eq!(
+        fixture.position(patient_uuid).await,
+        Vec3::new(4.5, 64.0, 10.5)
+    );
+    let current = fixture
+        .sessions
+        .resident_entity_snapshots(&[patient_uuid])
+        .await[0]
+        .clone()
+        .expect("patient remains native");
+    assert_eq!(current.id, patient_id);
+    assert_eq!(fixture.health(patient_uuid).await, injured_health);
+    let original_positions = [
+        fixture.position(medic_uuid).await,
+        fixture.position(patient_uuid).await,
+    ];
+    let medic_id = fixture
+        .sessions
+        .resident_entity_snapshots(&[medic_uuid])
+        .await[0]
+        .as_ref()
+        .expect("living medic")
+        .id;
+    fixture
+        .sessions
+        .register_loaded_for_server_test("EvacuationObserver", (0, 0));
+    let world_read = fixture.world.lock().await.read_view();
+    let materials = BlockMaterialIds::new(
+        state_of(&fixture.blocks, "air").0,
+        Some(state_of(&fixture.blocks, "water").0),
+        None,
+    );
+    let chunks = world_read.snapshot_chunks(&[ChunkPos { x: 0, z: 0 }]);
+    let terrain = Terrain {
+        chunks: &chunks,
+        materials: &materials,
+    };
+    for tick in 1..=30 {
+        let queries = fixture
+            .sessions
+            .tick_entities_and_collect_physics_queries_with_terrain(tick, &world_read, &materials);
+        if tick == 1 {
+            assert!(
+                queries.iter().any(|query| query.id == medic_id)
+                    && queries.iter().any(|query| query.id == patient_id),
+                "both residents must enter native simulation"
+            );
+        }
+        let steps = queries
+            .iter()
+            .filter(|query| [medic_id, patient_id].contains(&query.id))
+            .map(|query| {
+                let stepped = mc_physics::step_entity(
+                    EntityBody {
+                        position: mc_physics::Vec3::new(
+                            query.position.x,
+                            query.position.y,
+                            query.position.z,
+                        ),
+                        velocity: mc_physics::Vec3::new(
+                            query.velocity.x,
+                            query.velocity.y,
+                            query.velocity.z,
+                        ),
+                        aabb: query.aabb,
+                        on_ground: query.on_ground,
+                    },
+                    &terrain,
+                    PhysicsConfig::living_entity(),
+                );
+                EntityPhysicsStep {
+                    id: query.id,
+                    position: Vec3::new(
+                        stepped.body.position.x,
+                        stepped.body.position.y,
+                        stepped.body.position.z,
+                    ),
+                    velocity: Vec3::new(
+                        stepped.body.velocity.x,
+                        stepped.body.velocity.y,
+                        stepped.body.velocity.z,
+                    ),
+                    on_ground: stepped.body.on_ground,
+                    horizontal_collision: stepped.horizontal_collision,
+                }
+            })
+            .collect::<Vec<_>>();
+        fixture
+            .sessions
+            .apply_entity_physics_if_current_and_dispatch(tick, &queries, &steps);
+    }
+    for (uuid, before) in [
+        (medic_uuid, original_positions[0]),
+        (patient_uuid, original_positions[1]),
+    ] {
+        let after = fixture.position(uuid).await;
+        let dx = after.x - before.x;
+        let dz = after.z - before.z;
+        assert!(
+            dx * dx + dz * dz > 0.04,
+            "{uuid} failed to walk from {before:?} to {after:?}"
+        );
+    }
+    assert_eq!(fixture.health(patient_uuid).await, injured_health);
+    let reopened = PluginStorage::open(fixture.storage_root.path()).unwrap();
+    let same_patient = reopened.resident_orders().record(&patient).unwrap();
+    assert_eq!(same_patient.entity_uuid, patient_uuid.to_string());
+    assert_eq!(
+        gear(&reopened, &patient),
+        vec![("minecraft:emerald".to_owned(), 1)]
+    );
 }
 
 fn members_revision(outcome: &ScriptOperationOutcome) -> u64 {

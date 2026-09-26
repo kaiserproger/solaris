@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use mc_data::items::{ItemRegistry, ItemReport};
 use mc_entity::EntityId;
@@ -10,7 +12,6 @@ use mc_script::{
 use mc_world::{BlockPos, BlockRegistry};
 
 use super::PlayerPose;
-use super::commands::CommandPermissions;
 use super::script_gameplay_events::ScriptGameplayEventPublisher;
 use crate::server::ScriptEventSink;
 
@@ -20,7 +21,8 @@ fn publisher(sink: ScriptEventSink) -> ScriptGameplayEventPublisher {
         ScriptPlayerId::new(9),
         "123e4567-e89b-12d3-a456-426614174000",
         "Builder",
-        CommandPermissions::from_op(true),
+        crate::server::CommandPermissionConfig::new(["Builder"], false),
+        "192.168.1.20:40000".parse().unwrap(),
         "minecraft:overworld",
     )
 }
@@ -91,6 +93,53 @@ async fn required_block_break_waits_for_exact_queue_capacity_then_publishes_snap
             && dimension == "minecraft:overworld"
             && block_id == "minecraft:grass_block"
     ));
+}
+
+#[tokio::test]
+async fn committed_block_event_rechecks_revoked_operator_context() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, mut endpoint) = script_boundary_pair(one, one);
+    let permissions = crate::server::CommandPermissionConfig::new(["Builder"], false);
+    let publisher = ScriptGameplayEventPublisher::new(
+        ScriptEventSink::new(boundary),
+        ScriptPlayerId::new(9),
+        "123e4567-e89b-12d3-a456-426614174000",
+        "Builder",
+        permissions.clone(),
+        "192.168.1.20:40000".parse().unwrap(),
+        "minecraft:overworld",
+    );
+    let blocks = blocks();
+    let stone = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    let position = BlockPos { x: 0, y: 64, z: 0 };
+    let pose = PlayerPose::new(0.5, 65.0, 0.5);
+    assert!(
+        publisher
+            .publish_block_broken(&blocks, stone, position, pose, GameMode::Survival)
+            .await
+    );
+    let event = endpoint.recv_event().await.unwrap();
+    let ScriptEventKind::PlayerBlockBroken { context, .. } = event.kind() else {
+        panic!("expected committed block break");
+    };
+    assert!(context.operator());
+
+    permissions
+        .operator_identities()
+        .store(Arc::new(BTreeSet::new()));
+    assert!(
+        publisher
+            .publish_block_broken(&blocks, stone, position, pose, GameMode::Survival)
+            .await
+    );
+    let event = endpoint.recv_event().await.unwrap();
+    let ScriptEventKind::PlayerBlockBroken { context, .. } = event.kind() else {
+        panic!("expected committed block break");
+    };
+    assert!(!context.operator());
 }
 
 #[tokio::test]
