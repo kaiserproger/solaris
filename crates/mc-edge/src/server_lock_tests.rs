@@ -3,16 +3,18 @@ use super::*;
 #[test]
 fn routing_snapshot_only_rebuilds_changed_rosters() {
     let registry = ConnectionRegistry::new();
-    let id = registry.alloc_id();
+    let id = registry.joining_id();
     let (reliable_tx, _reliable_rx) = mpsc::channel(2);
     let (world_tx, _world_rx) = mpsc::channel(2);
-    registry.register(
-        id,
-        ConnectionHandles {
-            reliable_tx,
-            world_tx,
-        },
-    );
+    registry
+        .register(
+            id,
+            ConnectionHandles {
+                reliable_tx,
+                world_tx,
+            },
+        )
+        .unwrap();
     assert!(registry.routing_snapshot().1.is_none());
     registry.set_name(id, "Zoe".into());
     registry.set_name(ConnectionId(99), "Alex".into());
@@ -34,16 +36,18 @@ fn routing_snapshot_only_rebuilds_changed_rosters() {
 #[tokio::test]
 async fn registry_removal_clears_all_connection_state() {
     let registry = ConnectionRegistry::new();
-    let id = registry.alloc_id();
+    let id = registry.joining_id();
     let (reliable_tx, mut reliable_rx) = mpsc::channel(2);
     let (world_tx, mut world_rx) = mpsc::channel(2);
-    registry.register(
-        id,
-        ConnectionHandles {
-            reliable_tx,
-            world_tx,
-        },
-    );
+    registry
+        .register(
+            id,
+            ConnectionHandles {
+                reliable_tx,
+                world_tx,
+            },
+        )
+        .unwrap();
     registry.set_name(id, "Alex".into());
     registry.stash_disconnect_reason(id, "test".into());
     let waiter = registry.wait_join(id);
@@ -60,7 +64,7 @@ async fn registry_removal_clears_all_connection_state() {
 #[tokio::test]
 async fn join_waiter_observes_join_stashed_between_check_and_registration() {
     let registry = ConnectionRegistry::new();
-    let id = registry.alloc_id();
+    let id = registry.joining_id();
     assert!(registry.take_join(id).is_none());
     let joined = (
         mc_core::boundary::EntityId(7),

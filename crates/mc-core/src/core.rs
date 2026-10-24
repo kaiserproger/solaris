@@ -44,11 +44,15 @@ mod stop;
 #[path = "core_stop_tests.rs"]
 mod stop_tests;
 
+type OutboxBatch = Vec<(ConnectionId, Vec<PlayerChange>)>;
+
+#[path = "core_session.rs"]
+mod session;
+pub use session::PlayerSession;
+
 #[cfg(test)]
 #[path = "core_session_tests.rs"]
 mod session_tests;
-
-type OutboxBatch = Vec<(ConnectionId, Vec<PlayerChange>)>;
 
 /// Only edge consumers share this receiver; the tick owns its sender.
 #[derive(Debug)]
@@ -1007,7 +1011,7 @@ impl Core {
         }
 
         // Channels.
-        let (input_tx, input_rx) = mpsc_channel::<PlayerInput>(config.input_queue_cap.max(1));
+        let (input_tx, input_rx) = mpsc_channel::<PlayerInput>(config.input_queue_cap.max(4));
         let (spawn_tx, spawn_rx) = mpsc_channel::<SpawnRequest>(16);
         let (ticket_tx, ticket_rx) = mpsc_channel::<RemoteTicket>(16);
         let (tick_tx, _) = broadcast::channel::<TickOutput>(config.broadcast_cap.max(1));
@@ -1187,6 +1191,28 @@ impl Core {
         self.submit(PlayerInput::BuildResync {
             request: refusal.correction,
         })
+    }
+
+    /// Admit the initial view, locale and Join together, reserving one FIFO Leave slot
+    /// for every exit, including task cancellation before Play registration.
+    pub fn join_session(
+        &self,
+        connection: ConnectionId,
+        uuid: uuid::Uuid,
+        name: String,
+        permission_level: u8,
+        view_distance: u8,
+        locale: String,
+    ) -> Result<PlayerSession, CoreError> {
+        PlayerSession::admit(
+            &self.inner.input_tx,
+            connection,
+            uuid,
+            name,
+            permission_level,
+            view_distance,
+            locale,
+        )
     }
 
     /// Submit one decoded player input. Bounded and push-woken: returns

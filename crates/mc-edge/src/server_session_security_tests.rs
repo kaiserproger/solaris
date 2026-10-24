@@ -10,20 +10,20 @@ fn pending_login_reserves_capacity_until_retirement_finishes() {
     assert!(registry.admit(a, 1, policy).is_none());
     assert_eq!(registry.len(), 0, "Configuration has no Play handles yet");
     assert!(registry.admit(b, 1, policy).is_some());
-    registry.retire(a);
+    registry.remove(a);
     assert!(
         registry.admit(b, 1, policy).is_some(),
         "queued Leave retains capacity"
     );
-    registry.remove(a);
+    registry.finish(a);
     assert!(registry.admit(b, 1, policy).is_none());
 }
 
 #[test]
 fn retired_connections_never_recreate_join_or_reliable_stashes() {
     let registry = ConnectionRegistry::new();
-    let id = registry.alloc_id();
-    registry.retire(id);
+    let id = registry.joining_id();
+    registry.remove(id);
     let joined = (
         mc_core::boundary::EntityId(1),
         [0.0; 3],

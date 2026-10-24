@@ -58,17 +58,20 @@ fn register(
     name: &str,
     op: bool,
 ) -> (ConnectionId, mpsc::Receiver<bytes::Bytes>) {
-    let id = server.connections.alloc_id();
+    let id = server.connections.joining_id();
     let uuid = crate::crypto::offline_uuid(name);
     let (reliable_tx, reliable_rx) = mpsc::channel(64);
     let (world_tx, _) = mpsc::channel(64);
-    server.connections.register(
-        id,
-        ConnectionHandles {
-            reliable_tx,
-            world_tx,
-        },
-    );
+    server
+        .connections
+        .register(
+            id,
+            ConnectionHandles {
+                reliable_tx,
+                world_tx,
+            },
+        )
+        .unwrap();
     server.connections.set_name(id, name.into());
     server
         .admin

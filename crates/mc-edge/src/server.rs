@@ -47,7 +47,7 @@ use mc_core::Core;
 use mc_core::boundary::{ChangeSet, ConnectionId, PlayerInput, TickOutput};
 use mc_data::VanillaData;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -310,6 +310,10 @@ pub(crate) fn loader_manifest(
     Ok(Some(manifest))
 }
 
+#[path = "server_lifecycle.rs"]
+mod lifecycle;
+use lifecycle::ConnectionLifecycle;
+
 impl EdgeServer {
     /// Build a server from its owned pieces plus fresh live state.
     /// Fails when the biome registry, block table, or light table cannot
@@ -461,7 +465,7 @@ impl EdgeServer {
         if let Some(sender) = sender
             && sender.try_send(frame.freeze()).is_err()
         {
-            self.connections.retire(id);
+            self.connections.remove(id);
             anyhow::bail!("reliable command queue full");
         }
         Ok(())
@@ -1128,10 +1132,12 @@ pub struct ConnectionRegistry {
 
 #[derive(Default)]
 struct RegistryInner {
+    // A Closing connection retains its slot until native/admin cleanup runs.
+    admitted: HashSet<ConnectionId>,
+    joining: HashSet<ConnectionId>,
+    closers: HashMap<ConnectionId, tokio::sync::oneshot::Sender<()>>,
     handles: HashMap<ConnectionId, ConnectionHandles>,
-    /// Admitted Login sessions, including Configuration and queued retirement.
-    admitted: std::collections::HashSet<ConnectionId>,
-    active: std::collections::HashSet<ConnectionId>,
+
     names: HashMap<ConnectionId, String>,
     view_distances: HashMap<ConnectionId, i32>,
     /// Client locale last admitted to the core (`ClientInformation.language`);
@@ -1165,23 +1171,31 @@ impl ConnectionRegistry {
 
     /// Allocate the next connection id.
     pub fn alloc_id(&self) -> ConnectionId {
-        let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.inner.lock().active.insert(id);
-        id
+        ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Reserve a player slot atomically with the actual admission policy.
+    /// Joining connections count too; the policy retains operator bypass.
     fn admit(
         &self,
         id: ConnectionId,
-        max: usize,
-        policy: impl FnOnce(bool) -> Option<serde_json::Value>,
+        maximum: usize,
+        check: impl FnOnce(bool) -> Option<serde_json::Value>,
     ) -> Option<serde_json::Value> {
         let mut inner = self.inner.lock();
-        if let Some(reason) = policy(inner.admitted.len() >= max) {
-            return Some(reason);
+        let refusal = check(inner.admitted.len() >= maximum);
+        if refusal.is_none() {
+            inner.admitted.insert(id);
+            inner.joining.insert(id);
         }
-        inner.admitted.insert(id);
-        None
+        refusal
+    }
+
+    #[cfg(test)]
+    fn joining_id(&self) -> ConnectionId {
+        let id = self.alloc_id();
+        assert!(self.admit(id, usize::MAX, |_| None).is_none());
+        id
     }
 
     /// Register a connection's queue handles and take the reliable changes the
@@ -1193,10 +1207,14 @@ impl ConnectionRegistry {
         &self,
         id: ConnectionId,
         handles: ConnectionHandles,
-    ) -> Vec<mc_core::boundary::PlayerChange> {
+    ) -> anyhow::Result<Vec<mc_core::boundary::PlayerChange>> {
         let mut inner = self.inner.lock();
+        anyhow::ensure!(
+            inner.joining.remove(&id),
+            "connection admission already closed"
+        );
         inner.handles.insert(id, handles);
-        inner.pending_reliable.remove(&id).unwrap_or_default()
+        Ok(inner.pending_reliable.remove(&id).unwrap_or_default())
     }
 
     /// Read actual mpsc occupied-or-reserved slots only on telemetry requests.
@@ -1240,7 +1258,7 @@ impl ConnectionRegistry {
     fn stash_join(&self, id: ConnectionId, joined: JoinedSpawn) {
         let senders = {
             let mut inner = self.inner.lock();
-            if !inner.active.contains(&id) {
+            if !inner.joining.contains(&id) && !inner.handles.contains_key(&id) {
                 return;
             }
             inner.pending_joins.insert(id, joined);
@@ -1284,7 +1302,7 @@ impl ConnectionRegistry {
             if let Some(handles) = inner.handles.get(&id) {
                 return Some(handles.clone());
             }
-            if !inner.active.contains(&id) {
+            if !inner.joining.contains(&id) {
                 changes.clear();
                 return None;
             }
@@ -1304,7 +1322,7 @@ impl ConnectionRegistry {
     /// loop takes it after flushing the kick packet and logs peer+reason.
     pub fn stash_disconnect_reason(&self, id: ConnectionId, reason: String) {
         let mut inner = self.inner.lock();
-        if inner.active.contains(&id) {
+        if inner.joining.contains(&id) || inner.handles.contains_key(&id) {
             inner.disconnect_reasons.insert(id, reason);
         }
     }
@@ -1323,35 +1341,43 @@ impl ConnectionRegistry {
         let mut inner = self.inner.lock();
         if let Some(joined) = inner.pending_joins.get(&id) {
             let _ = sender.send(*joined);
-        } else {
+        } else if inner.joining.contains(&id) {
             inner.join_waiters.entry(id).or_default().push(sender);
         }
         receiver
     }
 
-    /// Remove a connection (on disconnect); drops queue senders, the
+    /// Stop delivery and wake the connection owner, including a blocked writer.
+    /// Admission is released only by the lifecycle owner's final cleanup.
+    /// Drops queue senders, the
     /// stashed join, stashed pre-registration reliable changes, any join
     /// waiters (their receivers fail closed), and the stashed disconnect
     /// reason.
     pub fn remove(&self, id: ConnectionId) {
-        self.retire(id);
-        self.inner.lock().admitted.remove(&id);
+        crate::vanilla_items::unmark(id);
+        let closer = {
+            let mut inner = self.inner.lock();
+            inner.joining.remove(&id);
+            inner.handles.remove(&id);
+            if inner.names.remove(&id).is_some() {
+                inner.roster_dirty = true;
+            }
+            inner.pending_joins.remove(&id);
+            inner.pending_reliable.remove(&id);
+            inner.join_waiters.remove(&id);
+            inner.disconnect_reasons.remove(&id);
+            inner.view_distances.remove(&id);
+            inner.locales.remove(&id);
+            inner.closers.remove(&id)
+        };
+        if let Some(closer) = closer {
+            let _ = closer.send(());
+        }
     }
 
-    fn retire(&self, id: ConnectionId) {
-        crate::vanilla_items::unmark(id);
-        let mut inner = self.inner.lock();
-        inner.handles.remove(&id);
-        inner.active.remove(&id);
-        if inner.names.remove(&id).is_some() {
-            inner.roster_dirty = true;
-        }
-        inner.pending_joins.remove(&id);
-        inner.pending_reliable.remove(&id);
-        inner.join_waiters.remove(&id);
-        inner.disconnect_reasons.remove(&id);
-        inner.view_distances.remove(&id);
-        inner.locales.remove(&id);
+    fn finish(&self, id: ConnectionId) {
+        self.remove(id);
+        self.inner.lock().admitted.remove(&id);
     }
 
     /// Look up one connection's handles.
@@ -1645,44 +1671,33 @@ fn accept_failure(error: &std::io::Error, open_sessions: usize) -> AcceptFailure
 
 /// Per-connection pipeline. Status connections return after the ping;
 /// Play connections run until disconnect or overflow.
-/// The guard begins before admission. A submitted Join always has a retirement
-/// owner, including cancellation while waiting for Joined.
-struct JoinedConnectionCleanup {
-    server: Arc<EdgeServer>,
-    id: ConnectionId,
-    join_submitted: bool,
-}
-
-impl Drop for JoinedConnectionCleanup {
-    fn drop(&mut self) {
-        self.server.admin.remove(self.id);
-        self.server.connections.retire(self.id);
-        if self.join_submitted {
-            let server = Arc::clone(&self.server);
-            let id = self.id;
-            // Keep capacity reserved while backpressured; disconnected sessions
-            // cannot create an unbounded detached cleanup backlog.
-            tokio::spawn(async move {
-                server.hub.leave(id).await;
-                server.connections.remove(id);
-            });
-        } else {
-            self.server.connections.remove(self.id);
-        }
-    }
-}
-
 async fn handle_connection(stream: TcpStream, server: Arc<EdgeServer>) -> anyhow::Result<()> {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "<unknown>".to_owned());
     let id = server.connections.alloc_id();
-    let mut joined_cleanup = JoinedConnectionCleanup {
-        server: Arc::clone(&server),
-        id,
-        join_submitted: false,
+    let mut lifecycle = ConnectionLifecycle::new(&server.connections, &server.admin, id);
+    let cancelled = lifecycle.cancelled.take().expect("one connection owner");
+    let result = tokio::select! {
+        biased;
+        _ = cancelled => {
+            warn!(%peer, connection = id.0, "connection closed by delivery policy");
+            Err(anyhow::anyhow!("connection delivery stopped"))
+        }
+        result = run_connection(stream, Arc::clone(&server), id, peer.clone(), &mut lifecycle) => result,
     };
+    lifecycle.stop_writer().await;
+    result
+}
+
+async fn run_connection(
+    stream: TcpStream,
+    server: Arc<EdgeServer>,
+    id: ConnectionId,
+    peer: String,
+    lifecycle: &mut ConnectionLifecycle<'_>,
+) -> anyhow::Result<()> {
     let mut conn = crate::connection::Connection::new(stream);
     let pre_play = async {
         // --- Handshake: route to status or login. Every `?` below logs the
@@ -1794,36 +1809,18 @@ async fn handle_connection(stream: TcpStream, server: Arc<EdgeServer>) -> anyhow
         config_outcome.client_view_distance,
         server.cfg.server.view_distance,
     );
-    for input in [
-        PlayerInput::SetViewDistance {
-            connection: id,
-            view_distance: view_distance as u8,
-        },
-        PlayerInput::SetLocale {
-            connection: id,
-            locale: config_outcome.client_language.clone(),
-        },
-        PlayerInput::Join {
-            connection: id,
-            uuid: outcome.uuid,
-            name: outcome.name.clone(),
-            permission_level: server.admin.level(outcome.uuid),
-        },
-    ] {
-        let mut sheds = 0u32;
-        loop {
-            if server.hub.submit(input.clone()) {
-                joined_cleanup.join_submitted = true;
-                break;
-            }
-            sheds += 1;
-            if sheds >= MAX_SUBMIT_SHEDS {
-                warn!(%peer, connection = id.0, stage = "join-submit", name = %outcome.name, "hub queue full; connection closed");
-                return Ok(());
-            }
-            tokio::task::yield_now().await;
-        }
-    }
+    lifecycle.native = Some(
+        server.hub.join_session(
+            id,
+            outcome.uuid,
+            outcome.name.clone(),
+            server.admin.level(outcome.uuid),
+            view_distance as u8,
+            config_outcome.client_language.clone(),
+        ).inspect_err(|error| {
+            warn!(%peer, connection = id.0, stage = "join-submit", name = %outcome.name, %error, "native session refused; connection closed");
+        })?
+    );
 
     // --- Wait for our Joined (bounded): the tick loop answers with the
     // --- entity id + spawn the burst needs.
@@ -1854,15 +1851,10 @@ async fn handle_connection(stream: TcpStream, server: Arc<EdgeServer>) -> anyhow
         // The input follows Join on the same reliable authority queue. It is
         // never inferred from declared bundles or a client-provided brand.
         let ready = PlayerInput::PluginClientReady { connection: id };
-        let mut ready_sheds = 0;
-        while !server.hub.submit(ready.clone()) {
-            ready_sheds += 1;
-            if ready_sheds >= MAX_SUBMIT_SHEDS {
-                warn!(%peer, connection = id.0, stage = "loader-ready-submit", name = %outcome.name, "hub queue full; connection closed");
-                anyhow::bail!("authoritative Loader session admission queue is full");
-            }
-            tokio::task::yield_now().await;
-        }
+        anyhow::ensure!(
+            server.hub.submit(ready),
+            "authoritative Loader session admission queue is full or stopped"
+        );
     }
 
     // --- Join burst (compressed from here on). ---
@@ -1907,7 +1899,7 @@ async fn handle_connection(stream: TcpStream, server: Arc<EdgeServer>) -> anyhow
             reliable_tx,
             world_tx,
         },
-    );
+    )?;
     if !stashed.is_empty() {
         let handles = server
             .connections
@@ -2002,7 +1994,7 @@ async fn handle_connection(stream: TcpStream, server: Arc<EdgeServer>) -> anyhow
     let mut packet_limiter = PacketLimiter::new(&server.cfg.anti_cheat);
     let (mut reader, writer) = conn.into_play_halves();
     let (keepalive_tx, keepalive_rx) = mpsc::channel(1);
-    let mut writer_task = tokio::spawn(play_writer(
+    lifecycle.writer = Some(tokio::spawn(play_writer(
         writer,
         Arc::clone(&server.net_counters),
         Arc::clone(&server.connections),
@@ -2013,11 +2005,12 @@ async fn handle_connection(stream: TcpStream, server: Arc<EdgeServer>) -> anyhow
             dh: dh_rx,
             keepalive: keepalive_rx,
         },
-    ));
+    )));
+    let writer_task = lifecycle.writer.as_mut().expect("one writer owner");
     let mut writer_finished = false;
     let exit_stage: &'static str = 'play_loop: loop {
         tokio::select! {
-            ended = &mut writer_task => {
+            ended = &mut *writer_task => {
                 writer_finished = true;
                 match ended {
                     Ok((stage, Some(reason))) => {
@@ -2226,9 +2219,9 @@ async fn handle_connection(stream: TcpStream, server: Arc<EdgeServer>) -> anyhow
         writer_task.abort();
         let _ = writer_task.await;
     }
+    lifecycle.writer.take();
     warn!(%peer, connection = id.0, stage = "play", exit = exit_stage, name = %outcome.name, "connection closed");
 
-    drop(joined_cleanup);
     Ok(())
 }
 
@@ -2622,7 +2615,7 @@ fn route_outbox(
         }
         for planned in crate::plan::plan_player_changes(&changes, viewer) {
             if handles.reliable_tx.try_send(planned.data).is_err() {
-                server.connections.retire(connection);
+                server.connections.remove(connection);
                 connections.remove(&connection);
                 server
                     .net_counters
@@ -2678,7 +2671,7 @@ async fn publish_and_route(
     });
     // Reliable overflow takes precedence: disconnect victims first.
     for victim in crate::fanout::reliable_overflow(&packets) {
-        server.connections.retire(victim);
+        server.connections.remove(victim);
         connections.remove(&victim);
         server
             .net_counters
@@ -2695,7 +2688,7 @@ async fn publish_and_route(
                 // In-order, never dropped: a full reliable queue
                 // disconnects the connection.
                 if handles.reliable_tx.try_send(packet.data).is_err() {
-                    server.connections.retire(packet.connection);
+                    server.connections.remove(packet.connection);
                     connections.remove(&packet.connection);
                     server
                         .net_counters
@@ -2810,6 +2803,11 @@ pub fn core_config(cfg: &EdgeConfig) -> mc_core::config::CoreConfig {
     let mut core = mc_core::config::CoreConfig::new(cfg.data.world_dir.clone(), cfg.data.seed);
     core.view_distance = cfg.server.view_distance;
     core.simulation_distance = cfg.server.simulation_distance;
+    // Each admitted session reserves one cleanup slot without consuming the
+    // ordinary-input budget at the configured player limit.
+    core.input_queue_cap = core
+        .input_queue_cap
+        .saturating_add(cfg.server.max_players as usize);
     // Full item facts/tags/recipes/loot/mining come from the content cache;
     // without this the core keeps embedded subsets with no tool rules and
     // drops ignore the correct-tool gate.
@@ -2913,31 +2911,37 @@ mod tests {
     #[test]
     fn load_queues_aggregate_real_slots_and_expose_unavailable_metrics() {
         let registry = ConnectionRegistry::new();
+        assert!(registry.admit(ConnectionId(1), 2, |_| None).is_none());
+        assert!(registry.admit(ConnectionId(2), 2, |_| None).is_none());
         let (reliable_tx, mut reliable_rx) = mpsc::channel(4);
         let (world_tx, _world_rx) = mpsc::channel(4);
         reliable_tx
             .try_send(bytes::Bytes::from_static(b"abc"))
             .unwrap();
         let reserved = world_tx.try_reserve().unwrap();
-        registry.register(
-            ConnectionId(1),
-            ConnectionHandles {
-                reliable_tx: reliable_tx.clone(),
-                world_tx: world_tx.clone(),
-            },
-        );
+        registry
+            .register(
+                ConnectionId(1),
+                ConnectionHandles {
+                    reliable_tx: reliable_tx.clone(),
+                    world_tx: world_tx.clone(),
+                },
+            )
+            .unwrap();
         let (reliable_tx2, _reliable_rx2) = mpsc::channel(2);
         let (world_tx2, _world_rx2) = mpsc::channel(2);
         world_tx2
             .try_send(bytes::Bytes::from_static(b"longer payload"))
             .unwrap();
-        registry.register(
-            ConnectionId(2),
-            ConnectionHandles {
-                reliable_tx: reliable_tx2,
-                world_tx: world_tx2,
-            },
-        );
+        registry
+            .register(
+                ConnectionId(2),
+                ConnectionHandles {
+                    reliable_tx: reliable_tx2,
+                    world_tx: world_tx2,
+                },
+            )
+            .unwrap();
         let snapshot = registry.load_queues().unwrap();
         assert_eq!(snapshot.viewers, 2);
         assert_eq!(snapshot.reliable.capacity_slots, 6);
@@ -2964,16 +2968,18 @@ mod tests {
     #[test]
     fn registry_insert_remove_roster() {
         let registry = ConnectionRegistry::new();
-        let id = registry.alloc_id();
+        let id = registry.joining_id();
         let (reliable_tx, _) = mpsc::channel(2);
         let (world_tx, _) = mpsc::channel(2);
-        registry.register(
-            id,
-            ConnectionHandles {
-                reliable_tx,
-                world_tx,
-            },
-        );
+        registry
+            .register(
+                id,
+                ConnectionHandles {
+                    reliable_tx,
+                    world_tx,
+                },
+            )
+            .unwrap();
         assert_eq!(registry.len(), 1);
         registry.set_name(id, "Alex".to_owned());
         assert_eq!(registry.roster(), vec!["Alex".to_owned()]);
@@ -3025,8 +3031,8 @@ mod tests {
     #[tokio::test]
     async fn simultaneous_joins_both_resolve() {
         let registry = ConnectionRegistry::new();
-        let a = registry.alloc_id();
-        let b = registry.alloc_id();
+        let a = registry.joining_id();
+        let b = registry.joining_id();
         // Both register interest BEFORE either Joined arrives (simultaneous).
         let rx_a = registry.wait_join(a);
         let rx_b = registry.wait_join(b);
@@ -3060,7 +3066,7 @@ mod tests {
     #[tokio::test]
     async fn late_waiter_sees_stash() {
         let registry = ConnectionRegistry::new();
-        let id = registry.alloc_id();
+        let id = registry.joining_id();
         let joined = (
             mc_core::boundary::EntityId(7),
             [8.0, 80.0, 8.0],
@@ -3078,7 +3084,7 @@ mod tests {
     fn pending_reliable_keeps_burst_order() {
         use mc_core::boundary::PlayerChange;
         let registry = ConnectionRegistry::new();
-        let id = registry.alloc_id();
+        let id = registry.joining_id();
         let burst = vec![
             PlayerChange::Joined {
                 entity: mc_core::boundary::EntityId(41),
@@ -3122,7 +3128,7 @@ mod tests {
             reliable_tx,
             world_tx,
         };
-        assert_eq!(registry.register(id, handles.clone()), expected);
+        assert_eq!(registry.register(id, handles.clone()).unwrap(), expected);
         // Once registered the pump routes instead of stashing.
         let mut routed = vec![expected[1].clone()];
         assert!(registry.handles_or_stash(id, &mut routed).is_some());
@@ -3131,7 +3137,7 @@ mod tests {
         registry.remove(id);
         assert!(registry.handles_or_stash(id, &mut routed).is_none());
         registry.remove(id);
-        assert!(registry.register(id, handles).is_empty());
+        assert!(registry.register(id, handles).is_err());
     }
 
     /// P1: the stashed Joined is the viewer entity source, so repeated
@@ -3139,7 +3145,7 @@ mod tests {
     #[test]
     fn stashed_join_survives_repeated_takes() {
         let registry = ConnectionRegistry::new();
-        let id = registry.alloc_id();
+        let id = registry.joining_id();
         let joined = (
             mc_core::boundary::EntityId(99),
             [1.0, 2.0, 3.0],
@@ -3292,6 +3298,10 @@ mod tests {
 #[cfg(test)]
 #[path = "admin_tests.rs"]
 mod admin_tests;
+
+#[cfg(test)]
+#[path = "server_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 #[path = "server_lock_tests.rs"]

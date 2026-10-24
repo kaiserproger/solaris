@@ -147,7 +147,8 @@ async fn cancellation_while_waiting_for_join_retires_native_player() {
         !snapshot.entities.iter().any(|row| row.uuid == login.uuid)
     })
     .await;
-    assert!(server.connections.inner.lock().active.is_empty());
+    assert!(server.connections.inner.lock().admitted.is_empty());
+    assert!(server.connections.inner.lock().joining.is_empty());
     core.shutdown();
 }
 

@@ -49,7 +49,7 @@ inventory or a separate ingredient store.
 
 Edge admission reserves capacity across Login, Configuration, pending Join and
 queued Leave. Its connection guard owns retirement before native submission.
-Leave uses the existing bounded native FIFO with asynchronous backpressure,
+Leave uses a credit reserved at admission on the existing bounded native FIFO,
 never a second gameplay owner or a best-effort dropped lifecycle message.
 Retired edges discard subsequent reliable output instead of reopening a stash.
 
@@ -183,6 +183,30 @@ order, calculates its own destruction rays, block effects and RNG stream, and
 emits its own event; the cache never combines explosions. The release perf
 fence is the ignored 1,000-TNT stack and fired-cannon scenarios in
 `tnt_tests.rs`, measured only in a frozen serialized window.
+
+## Native connection lifecycle (2026-10-19)
+
+The edge reserves player admission atomically before Configuration: Joining,
+Live and Closing consume a slot, with the existing operator bypass policy. Outbound
+registration requires active Joining; closed or unknown IDs cannot recreate
+pending join/reliable state. No lifetime tombstone set is needed.
+
+`Core::join_session` reserves all four input credits before publishing the
+negotiated view, locale and Join. Its single-owner session retains one credit for Leave
+on that same FIFO. The edge lifecycle guard drops it on normal return, pre-Play
+failure and task cancellation, and also releases admission/admin state and the
+writer task. Cleanup never waits or retries a full ordinary-input queue. Full
+initial admission and an already stopped core are distinct refusals.
+
+Delivery overflow stops routing and pushes a cancellation event to the outer
+connection owner, even when its socket writer is blocked. Only the final guard,
+after queuing native Leave and clearing admin state, releases admission. Closing
+delivery is not itself completion of the native session lifecycle.
+
+Native input capacity has a minimum of four slots and includes these reserved
+cleanup credits. Edge composition adds one credit per configured player slot to
+the ordinary input budget. Gameplay/session removal remains native tick work;
+there is no second player authority or persistence stream.
 
 ## G1-A event-driven allocator (2026-10-16)
 

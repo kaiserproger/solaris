@@ -83,7 +83,7 @@ fn radii(frames: &[RawFrame]) -> Vec<i32> {
 async fn client_view_distance_join_grow_and_shrink() {
     let root = tempfile::tempdir().unwrap();
     let server = server(root.path());
-    let id = server.connections.alloc_id();
+    let id = server.connections.joining_id();
     let entity = EntityId(1);
     let spawn = [8.0, 64.0, 8.0];
     server
@@ -94,13 +94,16 @@ async fn client_view_distance_join_grow_and_shrink() {
         .unwrap();
     let (reliable_tx, mut reliable_rx) = mpsc::channel(512);
     let (world_tx, mut world_rx) = mpsc::channel(512);
-    server.connections.register(
-        id,
-        ConnectionHandles {
-            reliable_tx,
-            world_tx,
-        },
-    );
+    server
+        .connections
+        .register(
+            id,
+            ConnectionHandles {
+                reliable_tx,
+                world_tx,
+            },
+        )
+        .unwrap();
     let mut connections = server.connections.snapshot().into_iter().collect();
     let mut viewers = HashMap::new();
     route_outbox(&server, &mut viewers, &mut connections);
@@ -240,7 +243,7 @@ async fn client_view_distance_join_grow_and_shrink() {
 async fn play_client_information_admits_the_client_locale() {
     let root = tempfile::tempdir().unwrap();
     let server = server(root.path());
-    let id = server.connections.alloc_id();
+    let id = server.connections.joining_id();
     server
         .connections
         .stash_join(id, (EntityId(1), [8.0, 64.0, 8.0], 0, Default::default()));

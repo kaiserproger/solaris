@@ -15,7 +15,8 @@ pub struct CoreConfig {
     pub view_distance: u8,
     /// Chunk gameplay simulation radius (independent of client residency).
     pub simulation_distance: u8,
-    /// Bounded submit queue depth for [`PlayerInput`](crate::boundary::PlayerInput).
+    /// Bounded submit queue depth, including reserved session Leave credits.
+    /// At least four slots are needed for atomic view/locale/Join/Leave admission.
     pub input_queue_cap: usize,
     /// Broadcast channel depth for [`TickOutput`](crate::boundary::TickOutput).
     pub broadcast_cap: usize,
@@ -134,6 +135,9 @@ pub enum CoreError {
     /// The tick thread has stopped.
     #[error("tick thread stopped")]
     TickStopped,
+    /// Input capacity cannot admit the complete initial native session.
+    #[error("native input queue full")]
+    InputFull,
     /// Remote ticket exceeds its budget.
     #[error("ticket over budget: {0}")]
     TicketOverBudget(String),

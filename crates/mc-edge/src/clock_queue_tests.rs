@@ -21,16 +21,19 @@ fn clock_output(tick: u64, day_time: i64) -> TickOutput {
 async fn queued_heartbeat_then_dirty_jump_is_fifo_at_the_play_writer() {
     let (server, dir) = fixture();
     let server = Arc::new(server);
-    let id = server.connections.alloc_id();
+    let id = server.connections.joining_id();
     let (reliable_tx, mut reliable_rx) = mpsc::channel(32);
     let (world_tx, mut world_rx) = mpsc::channel(32);
-    server.connections.register(
-        id,
-        ConnectionHandles {
-            reliable_tx,
-            world_tx: world_tx.clone(),
-        },
-    );
+    server
+        .connections
+        .register(
+            id,
+            ConnectionHandles {
+                reliable_tx,
+                world_tx: world_tx.clone(),
+            },
+        )
+        .unwrap();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -155,19 +158,22 @@ async fn queued_heartbeat_then_dirty_jump_is_fifo_at_the_play_writer() {
 async fn routing_snapshot_drops_overflow_victim_before_any_later_packets() {
     let (server, dir) = fixture();
     let server = Arc::new(server);
-    let id = server.connections.alloc_id();
+    let id = server.connections.joining_id();
     let (reliable_tx, mut reliable_rx) = mpsc::channel(1);
     let (world_tx, mut world_rx) = mpsc::channel(8);
     reliable_tx
         .try_send(bytes::Bytes::from_static(b"already queued"))
         .unwrap();
-    server.connections.register(
-        id,
-        ConnectionHandles {
-            reliable_tx,
-            world_tx,
-        },
-    );
+    server
+        .connections
+        .register(
+            id,
+            ConnectionHandles {
+                reliable_tx,
+                world_tx,
+            },
+        )
+        .unwrap();
     let (mut connections, _) = server.connections.routing_snapshot();
     let mut viewers = HashMap::from([(
         id,

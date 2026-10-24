@@ -31,16 +31,19 @@ async fn core_halt_routes_terminal_disconnect_reason() {
     let server = server(dir.path());
     let journal = server.cfg.data.world_dir.join("journal");
     let core = Arc::clone(&server.hub);
-    let id = server.connections.alloc_id();
+    let id = server.connections.joining_id();
     let (reliable_tx, mut reliable_rx) = mpsc::channel(256);
     let (world_tx, _world_rx) = mpsc::channel(256);
-    server.connections.register(
-        id,
-        ConnectionHandles {
-            reliable_tx,
-            world_tx,
-        },
-    );
+    server
+        .connections
+        .register(
+            id,
+            ConnectionHandles {
+                reliable_tx,
+                world_tx,
+            },
+        )
+        .unwrap();
     assert!(core.submit(mc_core::boundary::PlayerInput::Join {
         connection: id,
         uuid: uuid::Uuid::new_v4(),
