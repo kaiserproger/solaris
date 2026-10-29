@@ -16,6 +16,10 @@ spawn_protection = 16
 # checkpoint. Logs player input as sent (auth commands and locked-session text
 # are withheld): treat the files as sensitive. Off by default.
 input_log = false
+# Overworld chunk density on the GPU, batched across chunk workers. Needs a
+# build with `--features gpu` and a hardware adapter; otherwise startup logs
+# why and the CPU generates. Terrain is the same either way.
+worldgen_gpu = false
 
 [network]
 # 0.0.0.0 accepts remote IPv4 connections; use 127.0.0.1 for local play.

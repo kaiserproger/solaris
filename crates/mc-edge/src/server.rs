@@ -1543,6 +1543,7 @@ pub fn core_config(cfg: &EdgeConfig) -> mc_core::config::CoreConfig {
     core.enable_command_block = cfg.server.enable_command_block;
     core.spawn_protection = cfg.server.spawn_protection;
     core.input_log = cfg.server.input_log;
+    core.worldgen_gpu = cfg.server.worldgen_gpu;
     core.mob_griefing = mc_core::config::MobGriefingRules {
         creeper_block_damage: cfg.mob_griefing.creeper_block_damage,
         ghast_block_damage: cfg.mob_griefing.ghast_block_damage,

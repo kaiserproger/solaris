@@ -99,7 +99,7 @@ fn gpu_densities(gpu: &Gpu) -> SolidGrid {
     let solids = gpu.fill_chunks(&origins).unwrap().chunks;
     let mut grid = SolidGrid::default();
     for (pos, solids) in ring.into_iter().zip(solids) {
-        grid.insert(pos, solids);
+        grid.insert(pos, std::sync::Arc::new(solids));
     }
     grid
 }
@@ -109,34 +109,52 @@ fn gpu_densities(_: &Gpu) -> SolidGrid {
     unreachable!()
 }
 
-/// Blocks and biomes of chunks generated from GPU densities against the CPU
-/// path, on separate generators so no cached column hides a difference.
+/// Blocks and biomes of chunks generated through the GPU service against the
+/// CPU path, on separate generators so no cached column hides a difference.
+/// Four threads generate at once, as chunk workers do, so batches mix their
+/// requests.
 #[test]
 #[ignore = "GPU worldgen experiment; needs --features gpu and a GPU"]
 fn gpu_density_chunks_match_cpu_chunks() {
     for seed in [712816, 42] {
-        let (cpu, gpu) = (generator(seed), generator(seed));
-        let densities = gpu_densities(&gpu_device(&gpu));
+        let cpu = generator(seed);
+        let mut gpu = generator(seed);
+        gpu.enable_gpu().unwrap();
+        let positions: Vec<ChunkPos> = (-3..3)
+            .flat_map(|z| (-3..3).map(move |x| ChunkPos { x, z }))
+            .collect();
+        let generated: Vec<Chunk> = std::thread::scope(|scope| {
+            let gpu = &gpu;
+            let workers: Vec<_> = positions
+                .chunks(9)
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|&pos| gpu.generate(pos))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect()
+        });
         let (mut blocks, mut biomes) = (0, 0);
-        for z in -3..3 {
-            for x in -3..3 {
-                let pos = ChunkPos { x, z };
-                let expected = cpu.generate_with_solids(pos, None);
-                let actual = gpu.generate_with_solids(pos, Some(&densities));
-                let min_y = expected.geometry().min_y();
-                for y in min_y..expected.geometry().max_y() {
-                    for column in 0..256u16 {
-                        let (lx, lz) = ((column % 16) as u8, (column / 16) as u8);
-                        blocks += usize::from(
-                            expected.get_block(lx, y, lz) != actual.get_block(lx, y, lz),
-                        );
-                    }
+        for (&pos, actual) in positions.iter().zip(&generated) {
+            let expected = cpu.generate_with_solids(pos, None);
+            let min_y = expected.geometry().min_y();
+            for y in min_y..expected.geometry().max_y() {
+                for column in 0..256u16 {
+                    let (lx, lz) = ((column % 16) as u8, (column / 16) as u8);
+                    blocks +=
+                        usize::from(expected.get_block(lx, y, lz) != actual.get_block(lx, y, lz));
                 }
-                for (e, a) in expected.biomes.iter().zip(&actual.biomes) {
-                    for cell in 0..64u8 {
-                        let (cx, cy, cz) = (cell % 4, cell / 16, cell / 4 % 4);
-                        biomes += usize::from(e.get(cx, cy, cz) != a.get(cx, cy, cz));
-                    }
+            }
+            for (e, a) in expected.biomes.iter().zip(&actual.biomes) {
+                for cell in 0..64u8 {
+                    let (cx, cy, cz) = (cell % 4, cell / 16, cell / 4 % 4);
+                    biomes += usize::from(e.get(cx, cy, cz) != a.get(cx, cy, cz));
                 }
             }
         }

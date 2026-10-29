@@ -36,6 +36,8 @@ mod biome_routing;
 mod biome_rules;
 mod gameplay_rules;
 mod geological_ores;
+#[cfg(feature = "gpu")]
+mod gpu_service;
 mod ore_rules;
 mod ore_veins;
 mod overworld;
@@ -327,6 +329,10 @@ pub struct TerrainGenerator {
     /// Block registry the generator was built with; spawn clearance reads
     /// fluid states from it.
     blocks: Arc<BlockRegistry>,
+    /// Batched GPU density (`[server] worldgen_gpu`); `None` evaluates it on
+    /// the CPU.
+    #[cfg(feature = "gpu")]
+    gpu: Option<gpu_service::GpuSolidService>,
 }
 
 #[derive(Clone)]
@@ -1029,6 +1035,8 @@ impl TerrainGenerator {
             vanilla_worldgen: None,
             diagnostic_cache: DiagnosticCache::default(),
             blocks: registry,
+            #[cfg(feature = "gpu")]
+            gpu: None,
         })
     }
 
@@ -2764,6 +2772,27 @@ impl TerrainGenerator {
             None => Ok(None),
         }
     }
+
+    /// Evaluate chunk density on the GPU in batches shared by every thread
+    /// generating chunks (call after [`Self::load_vanilla_worldgen`]).
+    /// Returns the adapter's name; errors leave generation on the CPU.
+    pub fn enable_gpu(&mut self) -> Result<String, String> {
+        #[cfg(feature = "gpu")]
+        {
+            let (_, density) = self
+                .vanilla()
+                .ok_or("GPU worldgen needs vanilla worldgen content")?;
+            let gpu = crate::vanilla_density::gpu::GpuDensity::new(density)?;
+            let adapter = gpu.adapter().to_owned();
+            self.gpu = Some(
+                gpu_service::GpuSolidService::spawn(gpu)
+                    .map_err(|error| format!("worldgen GPU thread: {error}"))?,
+            );
+            Ok(adapter)
+        }
+        #[cfg(not(feature = "gpu"))]
+        Err("this build has no GPU worldgen (feature `gpu`)".into())
+    }
 }
 
 impl ChunkGenerator for TerrainGenerator {
@@ -2816,6 +2845,10 @@ impl ChunkGenerator for TerrainGenerator {
     }
 
     fn generate(&self, pos: ChunkPos) -> Chunk {
+        #[cfg(feature = "gpu")]
+        if let Some(grid) = self.gpu.as_ref().and_then(|gpu| gpu.solids_around(pos)) {
+            return self.generate_with_solids(pos, Some(&grid));
+        }
         self.generate_with_solids(pos, None)
     }
 }

@@ -2,6 +2,7 @@
 //! Generation reads density only through that sign, so the GPU worldgen
 //! experiment returns these bits instead of the densities themselves.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mc_world::ChunkPos;
 
@@ -28,7 +29,7 @@ impl ChunkSolids {
         assert_eq!(values.len(), height * 256);
         let stride = Self::words_per_column(height);
         let mut words = vec![0u32; 256 * stride].into_boxed_slice();
-        for (offset, layer) in values.chunks_exact(256).enumerate() {
+        for (offset, layer) in values.as_chunks::<256>().0.iter().enumerate() {
             let (word, bit) = (offset / 32, offset % 32);
             for (column, value) in layer.iter().enumerate() {
                 words[column * stride + word] |= u32::from(*value > 0.0) << bit;
@@ -63,7 +64,7 @@ impl ChunkSolids {
         let stride = Self::words_per_column(self.height);
         let column = &self.words[column * stride..][..stride];
         let mut word = end / 32;
-        let mut mask = if end % 32 == 0 {
+        let mut mask = if end.is_multiple_of(32) {
             word = word.checked_sub(1)?;
             u32::MAX
         } else {
@@ -85,17 +86,17 @@ impl ChunkSolids {
 /// ore halo and surfaces reach instead of evaluating density.
 #[derive(Default)]
 pub struct SolidGrid {
-    chunks: HashMap<(i32, i32), ChunkSolids>,
+    chunks: HashMap<(i32, i32), Arc<ChunkSolids>>,
 }
 
 impl SolidGrid {
-    pub fn insert(&mut self, pos: ChunkPos, solids: ChunkSolids) {
+    pub fn insert(&mut self, pos: ChunkPos, solids: Arc<ChunkSolids>) {
         self.chunks.insert((pos.x, pos.z), solids);
     }
 
     #[must_use]
     pub fn chunk(&self, pos: ChunkPos) -> Option<&ChunkSolids> {
-        self.chunks.get(&(pos.x, pos.z))
+        self.chunks.get(&(pos.x, pos.z)).map(Arc::as_ref)
     }
 
     fn column(&self, world_x: i32, world_z: i32) -> Option<(&ChunkSolids, usize)> {

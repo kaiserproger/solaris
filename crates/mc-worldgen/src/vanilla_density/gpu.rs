@@ -20,6 +20,7 @@ pub struct GpuDensity {
     data: wgpu::Buffer,
     program: ChunkWords,
     timestamps: bool,
+    adapter: String,
 }
 
 /// Solid bits of each requested chunk, in request order, and the GPU time of
@@ -45,6 +46,12 @@ impl GpuDensity {
             ..Default::default()
         }))
         .map_err(|e| format!("gpu adapter unavailable: {e}"))?;
+        let info = adapter.get_info();
+        // A software rasteriser (llvmpipe) is slower than the CPU path and
+        // would take the CPU cores that path needs.
+        if info.device_type == wgpu::DeviceType::Cpu {
+            return Err(format!("gpu adapter {} is a CPU rasteriser", info.name));
+        }
         let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let supported = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -124,7 +131,38 @@ impl GpuDensity {
             data,
             program,
             timestamps,
+            adapter: format!("{} ({:?})", info.name, info.backend),
         })
+    }
+
+    /// Adapter name and backend, for logs.
+    #[must_use]
+    pub fn adapter(&self) -> &str {
+        &self.adapter
+    }
+
+    /// Most chunks one [`Self::fill_chunks`] call fits in the device's
+    /// storage-binding and dispatch limits.
+    #[must_use]
+    pub fn max_batch(&self) -> usize {
+        let p = &self.program;
+        let columns = (16 / p.cell_width + 1).pow(2) as u64;
+        let levels = (p.height / p.cell_height + 1) as u64;
+        let chunk_words = 256 * ChunkSolids::words_per_column(p.height as usize) as u64;
+        let jobs = [columns, columns * levels, chunk_words];
+        let bytes = [
+            columns * u64::from(p.corner[3]) * 4,
+            u64::from(p.slots) * levels * columns * 4,
+            chunk_words * 4,
+        ];
+        let binding = u64::from(self.device.limits().max_storage_buffer_binding_size);
+        let by_jobs = jobs.map(|jobs| 65_535 * u64::from(WORKGROUP) / jobs);
+        let by_bytes = bytes.map(|bytes| binding / bytes.max(1));
+        by_jobs
+            .into_iter()
+            .chain(by_bytes)
+            .min()
+            .map_or(1, |n| n as usize)
     }
 
     /// Solids of the chunks at block `(min_x, min_z)`.
@@ -293,8 +331,10 @@ impl GpuDensity {
             .chunks_exact(chunk_words * 4)
             .map(|bytes| {
                 let words = bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .collect();
                 ChunkSolids::from_words(words, p.height as usize)
             })
@@ -304,8 +344,10 @@ impl GpuDensity {
             let ticks: Vec<u64> = read
                 .slice(..)
                 .get_mapped_range()
-                .chunks_exact(8)
-                .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| u64::from_le_bytes(*b))
                 .collect();
             let period = f64::from(self.queue.get_timestamp_period());
             std::array::from_fn(|pass| {

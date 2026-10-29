@@ -136,6 +136,9 @@ pause_when_empty_seconds = 60
 enable_command_block = false
 # Opt-in per-tick input log for replay from a checkpoint (default off).
 input_log = false
+# Overworld chunk density on the GPU, batched across chunk workers (build with
+# `--features gpu`; without it or a hardware adapter the CPU generates).
+worldgen_gpu = false
 
 [network]
 bind_address = "127.0.0.1"

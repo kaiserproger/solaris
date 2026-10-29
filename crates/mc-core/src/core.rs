@@ -401,7 +401,16 @@ pub(crate) fn overworld_terrain(
             terrain = terrain.with_jigsaw_source(Arc::new(source));
         }
     }
-    crate::plugin_startup::apply_worldgen(registry, terrain)
+    let mut terrain = crate::plugin_startup::apply_worldgen(registry, terrain)?;
+    if config.worldgen_gpu {
+        match terrain.enable_gpu() {
+            Ok(adapter) => tracing::info!(%adapter, "Overworld chunk density runs on the GPU"),
+            Err(error) => {
+                tracing::warn!(%error, "GPU worldgen unavailable; chunk density runs on the CPU");
+            }
+        }
+    }
+    Ok(terrain)
 }
 
 /// Serving and offline conversion share the same immutable Nether generator.

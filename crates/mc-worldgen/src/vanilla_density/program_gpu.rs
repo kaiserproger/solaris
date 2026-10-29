@@ -85,8 +85,8 @@ pub(crate) fn chunk_words(density: &VanillaDensity) -> Result<ChunkWords, String
     let mut w = Vec::with_capacity(64 * 1024);
     let octaves = w.len() as u32;
     for octave in &exporter.octaves {
-        for bytes in octave.p.chunks_exact(4) {
-            w.push(u32::from_le_bytes(bytes.try_into().expect("4 bytes")));
+        for bytes in octave.p.as_chunks::<4>().0 {
+            w.push(u32::from_le_bytes(*bytes));
         }
         for value in [octave.xo, octave.yo, octave.zo] {
             w.extend(fixed(value)?);
