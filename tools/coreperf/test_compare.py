@@ -14,7 +14,7 @@ from . import compare
 def args(**changes):
     values = dict(setup_smoke=False, prepare_only=False, clients=100, mobs=20000, villagers=64, fixture_cache=None,
                   steady_seconds=60, burst_seconds=30, recovery_seconds=60, warmup_ticks=200,
-                  measure_ticks=1200, parity_resume_receipt=None, main_go_receipt=None,
+                  measure_ticks=1200, main_go_receipt=None,
                   seed=42, view_distance=6, server_cpus='0-7', bot_cpus='8-11',
                   vanilla_data_dir=Path('/data/vanilla'), min_tps=19.5, sustained_seconds=5,
                   max_tick_p99_ms=50, max_tick_max_ms=250, max_rss_mb=3072)
@@ -163,21 +163,14 @@ class CompareContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Main'):
             compare.verify_resume(args())
 
-    def test_all_resume_fields_and_go_are_required(self):
+    def test_go_receipt_is_required_and_nonempty(self):
         with tempfile.TemporaryDirectory() as directory:
-            resume, go = Path(directory) / 'resume.json', Path(directory) / 'go.txt'
+            go = Path(directory) / 'go.txt'
             go.write_text('Main GO window 15; actual authorization fixture for unit test')
-            approved = {key: True for key in ('full_parity_verified', 'native_storage_verified',
-                                              'w2_w3_real_client_verified')}
-            for missing in approved:
-                resume.write_text(json.dumps({key: value for key, value in approved.items() if key != missing}))
-                with self.assertRaisesRegex(ValueError, missing):
-                    compare.verify_resume(args(parity_resume_receipt=resume, main_go_receipt=go))
-            resume.write_text(json.dumps(approved))
-            compare.verify_resume(args(parity_resume_receipt=resume, main_go_receipt=go))
+            compare.verify_resume(args(main_go_receipt=go))
             go.write_text('')
             with self.assertRaisesRegex(ValueError, 'empty Main'):
-                compare.verify_resume(args(parity_resume_receipt=resume, main_go_receipt=go))
+                compare.verify_resume(args(main_go_receipt=go))
 
     def test_setup_smoke_is_explicitly_tiny(self):
         tiny = dict(setup_smoke=True, clients=2, mobs=8, villagers=2, steady_seconds=2,

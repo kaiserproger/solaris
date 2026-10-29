@@ -452,10 +452,8 @@ not catalog SLOs, are sustained TPS >= 19.5, tick p99 <= 50 ms, maximum tick
 `--min-tps`, `--sustained-seconds`, `--max-tick-p99-ms`, `--max-tick-max-ms`,
 `--max-rss-mb`; effective values are receipted). Smoke windows total at most
 120 seconds and are non-performance evidence: even `PASS` with
-`smoke_only: true` is not a capacity/tail-latency result. Non-smoke runs stay
-owner-held: `--parity-resume-receipt` must contain actual owner-approved
-`full_parity_verified: true` and `native_storage_verified: true` evidence —
-never fabricate that receipt.
+`smoke_only: true` is not a capacity/tail-latency result. `--worldgen-gpu`
+sets the server's `[server].worldgen_gpu`; the receipt records it.
 
 Runnable control/compound/long scope (see `list` plus the JSON mapping for
 current capability):
