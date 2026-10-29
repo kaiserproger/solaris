@@ -44,19 +44,20 @@ impl Node {
             children,
         }
     }
-    fn search(&self, target: &[i64; 7], best: &mut Option<(usize, i64)>) {
-        let limit = best.map(|(_, distance)| distance);
+    /// Visits subtrees nearer than `best.1`; a leaf strictly nearer becomes the
+    /// best, so equal distances keep the first leaf in tree order.
+    fn search(&self, target: &[i64; 7], best: &mut (Option<usize>, i64)) {
         let mut distance = 0;
         for (bounds, target) in self.bounds.iter().zip(target) {
             let d = (target - bounds[1]).max(bounds[0] - target).max(0);
             distance += d * d;
-            // Remaining terms cannot improve the bound; equal distances retain the first leaf.
-            if limit.is_some_and(|limit| distance >= limit) {
+            // Remaining terms cannot improve the bound.
+            if distance >= best.1 {
                 return;
             }
         }
         if let Some(id) = self.leaf {
-            *best = Some((id, distance));
+            *best = (Some(id), distance);
         } else {
             for child in &self.children {
                 child.search(target, best);
@@ -227,33 +228,51 @@ impl VanillaClimate {
             y.wrapping_mul(4),
             z.wrapping_mul(4),
         );
-        self.select(climate, None).0
+        self.select(climate, None, false).0
     }
-    /// Reuses only proven Y-independent raw density nodes. Selection remains
-    /// stateless, including first-leaf ties, like [`Self::sample`].
+    /// Reuses only proven Y-independent raw density nodes. The previous leaf
+    /// only bounds the search: the result is the first nearest leaf in tree
+    /// order, exactly as [`Self::sample`] picks it.
     pub(crate) fn column_sampler(&self) -> ClimateColumnSampler<'_> {
         ClimateColumnSampler {
             climate: self,
             density: RawColumnSampler::new(&self.runtime, &self.y_free),
+            last: None,
         }
     }
-    fn select(&self, climate: [f32; 6], last: Option<usize>) -> (ClimateSample<'_>, usize) {
+    /// `last` seeds the search with its distance. Kept as the result
+    /// (`keep_last`), it wins ties like vanilla's warm start; otherwise it only
+    /// prunes subtrees farther than it, and the search still returns the first
+    /// nearest leaf in tree order, as without it.
+    fn select(
+        &self,
+        climate: [f32; 6],
+        last: Option<usize>,
+        keep_last: bool,
+    ) -> (ClimateSample<'_>, usize) {
         let quantized = climate.map(|value| (value * 10000.0) as i64);
         let mut target = [0; 7];
         target[..6].copy_from_slice(&quantized);
-        let mut best = last.map(|id| {
-            let distance = self.parameters[id]
-                .iter()
-                .zip(target)
-                .map(|(b, t)| {
-                    let d = (t - b[1]).max(b[0] - t).max(0);
-                    d * d
-                })
-                .sum();
-            (id, distance)
-        });
+        let mut best = match last {
+            Some(id) => {
+                let distance = self.parameters[id]
+                    .iter()
+                    .zip(target)
+                    .map(|(b, t)| {
+                        let d = (t - b[1]).max(b[0] - t).max(0);
+                        d * d
+                    })
+                    .sum();
+                if keep_last {
+                    (Some(id), distance)
+                } else {
+                    (None, distance + 1)
+                }
+            }
+            None => (None, i64::MAX),
+        };
         self.tree.search(&target, &mut best);
-        let id = best.expect("nonempty biome tree").0;
+        let id = best.0.expect("nonempty biome tree");
         (
             ClimateSample {
                 climate,
@@ -310,7 +329,7 @@ impl<'a> ClimateSampler<'a> {
                 z.wrapping_mul(4),
             )
         });
-        let (sample, id) = self.climate.select(climate, self.last);
+        let (sample, id) = self.climate.select(climate, self.last, true);
         self.last = Some(id);
         sample
     }
@@ -319,6 +338,7 @@ impl<'a> ClimateSampler<'a> {
 pub(crate) struct ClimateColumnSampler<'a> {
     climate: &'a VanillaClimate,
     density: RawColumnSampler<'a>,
+    last: Option<usize>,
 }
 impl<'a> ClimateColumnSampler<'a> {
     pub(crate) fn sample(&mut self, x: i32, y: i32, z: i32) -> ClimateSample<'a> {
@@ -328,6 +348,8 @@ impl<'a> ClimateColumnSampler<'a> {
             y.div_euclid(4).wrapping_mul(4),
             z.div_euclid(4).wrapping_mul(4),
         );
-        self.climate.select(climate, None).0
+        let (sample, id) = self.climate.select(climate, self.last, false);
+        self.last = Some(id);
+        sample
     }
 }

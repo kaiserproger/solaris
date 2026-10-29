@@ -20,5 +20,31 @@ fn column_sampler_matches_stateless_climate() {
                 assert_eq!(actual.biome, expected.biome);
             }
         }
+        // The previous leaf only bounds the next search: any query order picks
+        // the stateless biome.
+        let cells: Vec<(i32, i32, i32)> = (-1500..1500)
+            .step_by(97)
+            .flat_map(|x| (-1500..1500).step_by(89).map(move |z| (x, z)))
+            .flat_map(|(x, z)| [-60, 0, 64, 160].map(|y| (x, y, z)))
+            .collect();
+        let (mut forward, mut backward) = (climate.column_sampler(), climate.column_sampler());
+        let expected: Vec<_> = cells
+            .iter()
+            .map(|&(x, y, z)| climate.sample(x, y, z).biome)
+            .collect();
+        for (&(x, y, z), expected) in cells.iter().zip(&expected) {
+            assert_eq!(
+                forward.sample(x, y, z).biome,
+                *expected,
+                "seed={seed} ({x},{y},{z})"
+            );
+        }
+        for (&(x, y, z), expected) in cells.iter().zip(&expected).rev() {
+            assert_eq!(
+                backward.sample(x, y, z).biome,
+                *expected,
+                "seed={seed} ({x},{y},{z})"
+            );
+        }
     }
 }
