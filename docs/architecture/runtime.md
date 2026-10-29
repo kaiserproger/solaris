@@ -21,6 +21,9 @@ Offline commands (`content import|verify`, `backup`, `restore`,
 `--no-console` disables stdin commands; it is not a TUI/plain-input switch.
 Normal serving, console `stop` and SIGINT/SIGTERM share native shutdown and
 final checkpoint behavior. Tracing goes to stderr; console feedback to stdout.
+The console rejects invalid UTF-8 input lines without terminating the stdin reader.
+Play chat and command packets containing §, ASCII control characters, or DEL
+are disconnected with the vanilla illegal-characters reason.
 
 ## Execution boundaries
 

@@ -116,7 +116,7 @@ fn nodes(mut path: &str) -> Result<Vec<Node>, String> {
     Ok(result)
 }
 
-fn matches(pattern: &Tag, value: &Tag) -> bool {
+pub(crate) fn matches(pattern: &Tag, value: &Tag) -> bool {
     match (pattern, value) {
         (Tag::Compound(pattern), Tag::Compound(value)) => pattern.iter().all(|(key, expected)| {
             value

@@ -78,6 +78,22 @@ pub(crate) fn load(state: &mut TickState, chunks: &[ChunkPos], changes: &mut Cha
                     .entities
                     .set_rot(slot, marker.yaw, marker.pitch.clamp(-90.0, 90.0));
                 state.entities.row_mut(slot).persistent |= marker.persistent;
+                if marker.entity_type == "minecraft:chest_minecart"
+                    && marker.claim.starts_with("mineshaft:")
+                {
+                    let vehicle = state
+                        .entities
+                        .row_mut(slot)
+                        .entity_life
+                        .vehicle
+                        .as_mut()
+                        .expect("chest minecart blueprint has a vehicle");
+                    vehicle.loot_table = Some(
+                        mc_data::Identifier::parse("minecraft:chests/abandoned_mineshaft")
+                            .expect("static loot table identifier"),
+                    );
+                    vehicle.loot_seed = generated_uuid(&marker.claim).as_u128() as u64 as i64;
+                }
                 changes.entities_spawned.push(id);
                 state.generated_entity_claims.insert(marker.claim.clone());
                 state.new_generated_entity_claims.push(marker.claim);

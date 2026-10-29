@@ -236,6 +236,41 @@ pub(super) fn plan_break(
             state.registry.states.water,
         ),
     )];
+    let is_ice = state
+        .registry
+        .blocks
+        .by_id(mc_world::BlockStateId(current))
+        .is_some_and(|block| block.block.id.as_str() == "minecraft:ice");
+    let melts = state.players.get(&entity).is_some_and(|player| {
+        let held = &player.inventory.slots[held_slot_index(player, Hand::Main)];
+        !player.creative()
+            && !held.enchantments.iter().any(|enchantment| {
+                enchantment.id.as_str() == "minecraft:silk_touch" && enchantment.level > 0
+            })
+    });
+    if is_ice && melts && !state.dimension.water_evaporates() {
+        let below = BlockPos {
+            y: position.y - 1,
+            ..position
+        };
+        if let Some(support) = state.world.block_at(below.x, below.y, below.z) {
+            block_expect.push((below, support));
+            let tagged = state
+                .registry
+                .blocks
+                .by_id(mc_world::BlockStateId(support))
+                .is_some_and(|block| {
+                    state.registry.tags.contains_raw_id(
+                        "minecraft:block",
+                        "minecraft:ice_melts_when_destroyed_above",
+                        block.block.raw_id,
+                    )
+                });
+            if tagged || crate::fluids::fluid_at(&state.registry.states, support).is_some() {
+                block_write[0].1 = state.registry.states.water;
+            }
+        }
+    }
     let mut broken = position;
     if let Some((other, primary)) =
         crate::placement::other_half(&state.registry.blocks, position, current)

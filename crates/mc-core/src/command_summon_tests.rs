@@ -656,25 +656,17 @@ fn summon_equipment_components_match_give_and_survive_native_anvil() {
 
 #[test]
 fn summon_equipment_rejects_the_same_unsupported_components_as_give() {
-    for (component, value) in [
-        ("minecraft:unbreakable", "{}"),
-        ("minecraft:attack_range", "{}"),
-    ] {
-        assert!(
-            crate::command_items::ItemArgument::parse(&format!(
-                "minecraft:diamond_sword[{component}={value}]"
-            ))
-            .is_err(),
-            "{component}"
-        );
-        rejected_tag_reaches_sender(
-            "cow",
-            "equipment",
-            &format!(
-                "{{mainhand:{{id:'minecraft:diamond_sword',components:{{'{component}':{value}}}}}}}"
-            ),
-        );
-    }
+    assert!(
+        crate::command_items::ItemArgument::parse(
+            "minecraft:diamond_sword[minecraft:attack_range={}]"
+        )
+        .is_err()
+    );
+    rejected_tag_reaches_sender(
+        "cow",
+        "equipment",
+        "{mainhand:{id:'minecraft:diamond_sword',components:{'minecraft:attack_range':{}}}}",
+    );
 }
 
 #[test]

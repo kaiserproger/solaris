@@ -156,6 +156,7 @@ fn new_26_3_mob_visibility_named_and_direct_sets() {
 
 #[test]
 fn new_26_3_unit_color_and_villager_food() {
+    fixture("minecraft:unbreakable", fields(vec![]), vec![]);
     fixture("minecraft:waxed", fields(vec![]), vec![]);
     fixture("minecraft:cushion/color", text("red"), vec![14]);
     fixture(

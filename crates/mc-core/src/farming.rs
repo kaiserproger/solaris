@@ -41,6 +41,8 @@ enum Kind {
     Copper,
     /// Renewable minerals: pointed dripstone and budding amethyst.
     Mineral,
+    Ice,
+    Snow,
 }
 
 impl Kind {
@@ -57,6 +59,8 @@ impl Kind {
                 | Self::Leaves
                 | Self::Copper
                 | Self::Mineral
+                | Self::Ice
+                | Self::Snow
         )
     }
 
@@ -73,11 +77,13 @@ fn kind_of(path: &str) -> Kind {
         "grass_block" => Kind::Grass,
         "mycelium" => Kind::Mycelium,
         "farmland" => Kind::Farmland,
-        "wheat" | "carrots" | "potatoes" | "beetroots" => Kind::Crop,
+        "ice" => Kind::Ice,
+        "snow" => Kind::Snow,
+        "wheat" | "carrots" | "potatoes" | "beetroots" | "torchflower_crop" => Kind::Crop,
         "bamboo_sapling" | "cactus" | "sugar_cane" | "bamboo" | "nether_wart" | "melon_stem"
         | "pumpkin_stem" | "sweet_berry_bush" | "cocoa" | "kelp" | "cave_vines"
         | "weeping_vines" | "twisting_vines" | "vine" | "brown_mushroom" | "red_mushroom"
-        | "chorus_flower" => Kind::Plant,
+        | "chorus_flower" | "pitcher_crop" => Kind::Plant,
         _ if crate::copper::family(path).is_some_and(|(_, age, waxed)| age < 3 && !waxed) => {
             Kind::Copper
         }
@@ -558,13 +564,25 @@ pub(crate) fn bone_meal_state(state: &TickState, pos: BlockPos, seed: u64) -> Op
         return None;
     }
     let (age, max) = age_of(blocks, current)?;
-    if age >= max {
+    if age >= max && !is_block(blocks, current, "torchflower_crop") {
         return None;
     }
     let mut roll = Roll::new(seed);
-    let mut grown = 2 + roll.below(4);
+    let mut grown = if is_block(blocks, current, "torchflower_crop") {
+        1
+    } else {
+        2 + roll.below(4)
+    };
     if is_block(blocks, current, "beetroots") {
         grown /= 3;
+    }
+    if is_block(blocks, current, "torchflower_crop") && age + grown > max {
+        return blocks
+            .by_name_and_props(
+                &mc_data::Identifier::parse("minecraft:torchflower").ok()?,
+                &[],
+            )
+            .map(|id| id.0);
     }
     with_prop(blocks, current, "age", &(age + grown).min(max).to_string())
 }
@@ -868,6 +886,31 @@ fn tick_cell(
         Kind::Crop => crop(state, at, id, roll),
         Kind::Farmland => farmland(state, at, id),
         Kind::Grass | Kind::Mycelium => grass(state, at, roll),
+        Kind::Ice | Kind::Snow => {
+            let light = state
+                .world
+                .light_at(at.x, at.y, at.z)
+                .map(|(_, block)| block);
+            let dampening = if kind == Kind::Ice {
+                state.registry.light.opacity(id).unwrap_or(0)
+            } else {
+                0
+            };
+            if light.is_some_and(|light| light > 11_u8.saturating_sub(dampening)) {
+                if kind == Kind::Snow {
+                    Some(Outcome::Pop)
+                } else {
+                    let next = if state.dimension.water_evaporates() {
+                        state.registry.states.air
+                    } else {
+                        state.registry.states.water
+                    };
+                    Some(Outcome::Set(vec![(at, next)]))
+                }
+            } else {
+                None
+            }
+        }
         Kind::Sapling => sapling(state, at, id, roll),
         Kind::Copper => {
             let gate = roll.below(u32::MAX);
@@ -886,7 +929,13 @@ fn tick_cell(
             }
         }
         Kind::Plant => {
-            if !can_stand(state, id, at) {
+            if is_block(&state.registry.blocks, id, "pitcher_crop") {
+                if prop(&state.registry.blocks, id, "half") == Some("lower") {
+                    crop(state, at, id, roll)
+                } else {
+                    None
+                }
+            } else if !can_stand(state, id, at) {
                 Some(Outcome::Pop)
             } else {
                 crate::plants::random_growth(
@@ -934,15 +983,36 @@ fn crop(state: &TickState, at: BlockPos, id: u32, roll: &mut Roll) -> Option<Out
     }
     let blocks = &state.registry.blocks;
     let (age, max) = age_of(blocks, id)?;
+    let torchflower = is_block(blocks, id, "torchflower_crop");
+    let pitcher = is_block(blocks, id, "pitcher_crop");
     if state.raw_brightness(at.x, at.y, at.z) < 9
-        || age >= max
+        || (!torchflower && age >= max)
         || roll.below((25.0 / growth_speed(state, at, id)) as u32 + 1) != 0
         || (is_block(blocks, id, "beetroots") && roll.below(3) != 0)
+        || (torchflower && roll.below(3) == 0)
     {
         return None;
     }
-    let grown = with_prop(blocks, id, "age", &(age + 1).to_string())?;
-    Some(Outcome::Set(vec![(at, grown)]))
+    let grown = if torchflower && age == max {
+        blocks
+            .by_name_and_props(
+                &mc_data::Identifier::parse("minecraft:torchflower").ok()?,
+                &[],
+            )?
+            .0
+    } else {
+        with_prop(blocks, id, "age", &(age + 1).to_string())?
+    };
+    let mut writes = vec![(at, grown)];
+    if pitcher && age + 1 >= 3 {
+        let above = BlockPos { y: at.y + 1, ..at };
+        let previous = state.world.block_at(above.x, above.y, above.z)?;
+        if previous != state.registry.states.air && !is_block(blocks, previous, "pitcher_crop") {
+            return None;
+        }
+        writes.push((above, with_prop(blocks, grown, "half", "upper")?));
+    }
+    Some(Outcome::Set(writes))
 }
 
 /// Vanilla `CropBlock.getGrowthSpeed`: farmland under and around the crop
@@ -1022,6 +1092,7 @@ fn farmland(state: &TickState, at: BlockPos, id: u32) -> Option<Outcome> {
         || is_block(&state.registry.blocks, above, "melon_stem")
         || is_block(&state.registry.blocks, above, "pumpkin_stem")
         || is_block(&state.registry.blocks, above, "attached_melon_stem")
+        || is_block(&state.registry.blocks, above, "pitcher_crop")
         || is_block(&state.registry.blocks, above, "attached_pumpkin_stem")
     {
         return None;

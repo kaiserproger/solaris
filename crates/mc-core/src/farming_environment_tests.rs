@@ -10,6 +10,60 @@ fn set_result(outcome: Option<Outcome>, at: BlockPos, expected: u32) {
 }
 
 #[test]
+fn s9_torchflower_random_growth_and_bonemeal() {
+    let (mut state, _) = setup();
+    let at = pos(2, Y + 1, 2);
+    let farm = block(&state, "farmland", &[("moisture", "7")]);
+    let young = block(&state, "torchflower_crop", &[("age", "0")]);
+    let grown = block(&state, "torchflower_crop", &[("age", "1")]);
+    put(&mut state, 2, Y, 2, farm);
+    put(&mut state, at.x, at.y, at.z, young);
+    assert_eq!(state.registry.farming.kind(young), Kind::Crop);
+    assert!((0..100).any(|seed| matches!(crop(&state, at, young, &mut Roll::new(seed)), Some(Outcome::Set(edits)) if edits.contains(&(at, grown)))));
+    assert_eq!(bone_meal_state(&state, at, 0), Some(grown));
+    put(&mut state, at.x, at.y, at.z, grown);
+    let flower = block(&state, "torchflower", &[]);
+    assert_eq!(bone_meal_state(&state, at, 0), Some(flower));
+    assert!((0..100).any(|seed| matches!(crop(&state, at, grown, &mut Roll::new(seed)), Some(Outcome::Set(edits)) if edits.contains(&(at, flower)))));
+}
+
+#[test]
+fn s9_dry_farmland_under_torchflower_stays_farmland() {
+    let (mut state, _) = setup();
+    let at = pos(-5, Y, -5);
+    let dry = block(&state, "farmland", &[("moisture", "0")]);
+    let crop = block(&state, "torchflower_crop", &[("age", "0")]);
+    put(&mut state, at.x, at.y, at.z, dry);
+    put(&mut state, at.x, at.y + 1, at.z, crop);
+    assert!(farmland(&state, at, dry).is_none());
+}
+
+#[test]
+fn s9_dry_farmland_under_pitcher_stays_farmland() {
+    let (mut state, _) = setup();
+    let at = pos(-5, Y, -5);
+    let dry = block(&state, "farmland", &[("moisture", "0")]);
+    let crop = block(&state, "pitcher_crop", &[("age", "0"), ("half", "lower")]);
+    put(&mut state, at.x, at.y, at.z, dry);
+    put(&mut state, at.x, at.y + 1, at.z, crop);
+    assert!(farmland(&state, at, dry).is_none());
+}
+
+#[test]
+fn s9_pitcher_random_growth_creates_upper_half_at_age_three() {
+    let (mut state, _) = setup();
+    let at = pos(2, Y + 1, 2);
+    let farm = block(&state, "farmland", &[("moisture", "7")]);
+    let young = block(&state, "pitcher_crop", &[("age", "2"), ("half", "lower")]);
+    let lower = block(&state, "pitcher_crop", &[("age", "3"), ("half", "lower")]);
+    let upper = block(&state, "pitcher_crop", &[("age", "3"), ("half", "upper")]);
+    put(&mut state, 2, Y, 2, farm);
+    put(&mut state, at.x, at.y, at.z, young);
+    assert_eq!(state.registry.farming.kind(young), Kind::Plant);
+    assert!((0..100).any(|seed| matches!(crop(&state, at, young, &mut Roll::new(seed)), Some(Outcome::Set(edits)) if edits.contains(&(at, lower)) && edits.contains(&(pos(at.x, at.y + 1, at.z), upper)))));
+}
+
+#[test]
 fn gap_waterlogged_irrigation_and_exposed_rain_hydrate_farmland() {
     let (mut state, _) = setup();
     let at = pos(-5, Y, -5);

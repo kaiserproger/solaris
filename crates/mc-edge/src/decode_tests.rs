@@ -40,6 +40,48 @@ fn decode(id: i32, body: Vec<u8>, state: &mut DecodeState) -> Result<Vec<PlayerI
 }
 
 #[test]
+fn illegal_characters_are_rejected_in_chat_and_commands() {
+    for text in ["§cspoof", "bad\ttext", "bad\u{7f}text"] {
+        let chat = ServerboundChat {
+            message: text.into(),
+            timestamp_millis: 0,
+            salt: 0,
+            signature: None,
+            last_seen_offset: 0,
+            last_seen_acknowledged: [0; 3],
+            last_seen_checksum: 0,
+        };
+        assert_eq!(
+            decode(ServerboundChat::ID, body(&chat), &mut state()).unwrap_err(),
+            ILLEGAL_CHAT_CHARACTERS
+        );
+        let command = ServerboundChatCommand {
+            command: format!("me {text}"),
+        };
+        assert_eq!(
+            decode(ServerboundChatCommand::ID, body(&command), &mut state()).unwrap_err(),
+            ILLEGAL_CHAT_CHARACTERS
+        );
+        let mut signed = Vec::new();
+        signed.write_string(&command.command, 32767).unwrap();
+        signed.write_i64(0);
+        signed.write_i64(0);
+        signed.write_varint(0);
+        signed.write_varint(0);
+        signed.extend_from_slice(&[0; 3]);
+        signed.write_i8(0);
+        assert_eq!(
+            decode(0x08, signed, &mut state()).unwrap_err(),
+            ILLEGAL_CHAT_CHARACTERS
+        );
+    }
+    let command = ServerboundChatCommand {
+        command: "me café \u{0085}".into(),
+    };
+    assert!(decode(ServerboundChatCommand::ID, body(&command), &mut state()).is_ok());
+}
+
+#[test]
 fn edit_book_wire_reaches_native_input_and_rejects_trailing_bytes() {
     // Local 26.1.2 packet report + ServerboundEditBookPacket javap:
     // slot VarInt, bounded page strings, optional title string.

@@ -343,6 +343,7 @@ pub(super) fn encode_one<B: BufMut>(
         | ids::PROVIDES_POTTERY_PATTERN
         | ids::SIGN_TEXT_FRONT
         | ids::SIGN_TEXT_BACK
+        | ids::UNBREAKABLE
         | ids::WAXED
         | ids::CUSHION_COLOR => v263::encode(buf, id, &value, depth)?,
         _ => {
@@ -450,6 +451,7 @@ pub(super) fn decode<B: Buf>(
         | ids::PROVIDES_POTTERY_PATTERN
         | ids::SIGN_TEXT_FRONT
         | ids::SIGN_TEXT_BACK
+        | ids::UNBREAKABLE
         | ids::WAXED
         | ids::CUSHION_COLOR => v263::decode(buf, id, depth)?,
         _ => return Ok(None),

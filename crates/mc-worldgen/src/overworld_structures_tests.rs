@@ -45,7 +45,12 @@ fn generated_fully_eyed_stronghold_activates_portal() {
         state(&registry, "minecraft:stone").unwrap(),
         id("minecraft:plains"),
     );
-    structures.paste(&mut chunk, |_, _| 32, |_, _, _| id("minecraft:plains"));
+    structures.paste(
+        &mut chunk,
+        |_, _| 32,
+        |_, _| 32,
+        |_, _, _| id("minecraft:plains"),
+    );
     let portal = state(&registry, "minecraft:end_portal").unwrap();
     for x in 6..=8 {
         for z in 6..=8 {
@@ -76,7 +81,12 @@ fn generated_stronghold_eye_patterns_vary_between_sites_in_one_world() {
             state(&registry, "minecraft:stone").unwrap(),
             id("minecraft:plains"),
         );
-        structures.paste(&mut chunk, |_, _| 32, |_, _, _| id("minecraft:plains"));
+        structures.paste(
+            &mut chunk,
+            |_, _| 32,
+            |_, _| 32,
+            |_, _, _| id("minecraft:plains"),
+        );
         let pattern: Vec<_> = template
             .blocks()
             .iter()
@@ -127,7 +137,12 @@ fn generated_stronghold_frame_eyes_are_independent_and_seeded() {
                 state(&registry, "minecraft:stone").unwrap(),
                 id("minecraft:plains"),
             );
-            structures.paste(&mut chunk, |_, _| 32, |_, _, _| id("minecraft:plains"));
+            structures.paste(
+                &mut chunk,
+                |_, _| 32,
+                |_, _| 32,
+                |_, _, _| id("minecraft:plains"),
+            );
             chunk
         };
         let chunk = generate();
@@ -318,9 +333,12 @@ fn vanilla_catalog_loads_and_located_stronghold_generates_portal() {
 fn mineshaft_has_walkable_crossing_rails_cave_spiders_and_loot() {
     let registry = registry();
     let template = mineshaft(&registry).unwrap();
-    assert_eq!(
-        template.chests()[0].loot_table,
-        Some(id("minecraft:chests/abandoned_mineshaft"))
+    assert!(template.chests().is_empty());
+    assert!(
+        template
+            .entities()
+            .iter()
+            .any(|entity| entity.entity_type == "minecraft:chest_minecart")
     );
     assert_eq!(template.block_entities().len(), 1);
     assert!(template.blocks().iter().any(|b| b.pos==[24,1,24] && b.state==state(&registry,"minecraft:rail").unwrap()));
@@ -392,6 +410,14 @@ fn classic_catalog_contains_every_family_with_interactive_contents() {
                 "{name}"
             );
             assert!(t.chests().iter().all(|c| c.loot_table.is_some()), "{name}");
+            if name == "mineshaft" || name == "mineshaft_mesa" {
+                assert!(
+                    t.entities()
+                        .iter()
+                        .any(|entity| entity.entity_type == "minecraft:chest_minecart"),
+                    "{name}"
+                );
+            }
         }
     }
     let (temples, _) = catalog::templates(&root(), "jungle_pyramid", &registry).unwrap();
@@ -506,6 +532,7 @@ fn igloo_basement_has_continuous_ladder_and_pastes_north_of_start() {
     structures.paste(
         &mut chunk,
         |_, _| 64,
+        |_, _| 64,
         |_, _, _| id("minecraft:snowy_plains"),
     );
     let mut checked = 0;
@@ -555,6 +582,7 @@ fn outpost_exclusion_rejects_nearby_village_placement_before_terrain_sampling() 
                 (0, 0),
                 (0, 0),
                 |_, _| panic!("excluded start must not sample terrain"),
+                |_, _| panic!("excluded start must not sample terrain"),
                 |_, _, _| id("minecraft:plains")
             )
             .is_empty()
@@ -562,10 +590,110 @@ fn outpost_exclusion_rejects_nearby_village_placement_before_terrain_sampling() 
     structures.families[0].exclusion = None;
     assert_eq!(
         structures
-            .sites((0, 0), (0, 0), |_, _| 64, |_, _, _| id("minecraft:plains"))
+            .sites(
+                (0, 0),
+                (0, 0),
+                |_, _| 64,
+                |_, _| 64,
+                |_, _, _| id("minecraft:plains")
+            )
             .len(),
         1
     );
     assert!(near_placement(42, grid, 10, -90, 190));
+
     assert!(!near_placement(42, grid, 10, -89, 189));
+}
+#[test]
+fn ocean_monument_start_is_underwater() {
+    let registry = registry();
+    let mut structures = OverworldStructures::load(&root(), 42, &registry).unwrap();
+    structures.strongholds.clear();
+    structures
+        .families
+        .retain(|family| family.id.path() == "monument");
+    let family = &mut structures.families[0];
+    family.frequency = 1.0;
+    family.exclusion = None;
+    family.biomes.insert(id("minecraft:deep_ocean"));
+    let (x, z) = family.placement.potential_chunk(42, 0, 0);
+    let sites = structures.sites(
+        (x, z),
+        (x, z),
+        |_, _| 62,
+        |_, _| 51,
+        |_, _, _| id("minecraft:deep_ocean"),
+    );
+    assert_eq!(sites.len(), 1);
+    assert!(
+        sites[0].position.y + 16 < 63,
+        "monument roof must be underwater"
+    );
+}
+
+#[test]
+fn ocean_wrecks_and_ruins_use_seabed_and_beached_wrecks_use_surface() {
+    let registry = registry();
+    for (name, expected) in [
+        ("shipwreck", 52),
+        ("ocean_ruin_cold", 52),
+        ("ocean_ruin_warm", 52),
+        ("shipwreck_beached", 63),
+    ] {
+        let mut structures = OverworldStructures::load(&root(), 42, &registry).unwrap();
+        structures.strongholds.clear();
+        structures
+            .families
+            .retain(|family| family.id.path() == name);
+        let family = &mut structures.families[0];
+        family.frequency = 1.0;
+        family.exclusion = None;
+        family.biomes.insert(id("minecraft:ocean"));
+        let (x, z) = family.placement.potential_chunk(42, 0, 0);
+        let sites = structures.sites(
+            (x, z),
+            (x, z),
+            |_, _| 62,
+            |_, _| 51,
+            |_, _, _| id("minecraft:ocean"),
+        );
+        assert_eq!(sites.len(), 1, "{name}");
+        assert_eq!(sites[0].position.y, expected, "{name}");
+        let mut chunk = Chunk::empty(
+            ChunkPos { x, z },
+            state(&registry, "minecraft:stone").unwrap(),
+            id("minecraft:ocean"),
+        );
+        structures.paste(
+            &mut chunk,
+            |_, _| 62,
+            |_, _| 51,
+            |_, _, _| id("minecraft:ocean"),
+        );
+        let saved = mc_world::structure_starts::read(&chunk.extras, chunk.pos, false).unwrap();
+        assert!(saved.iter().any(|site| site == &sites[0]), "{name}");
+    }
+}
+
+#[test]
+fn mineshaft_places_chest_minecart_on_rail_in_owner_chunk() {
+    let registry = registry();
+    let template = mineshaft(&registry).unwrap();
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 2, z: 1 },
+        state(&registry, "minecraft:stone").unwrap(),
+        id("minecraft:plains"),
+    );
+    paste_template(&mut chunk, &template, BlockPos { x: 0, y: 32, z: 0 }, 42);
+    let markers = chunk.generated_entities();
+    let cart = markers
+        .iter()
+        .find(|m| m.entity_type == "minecraft:chest_minecart")
+        .expect("mineshaft cart");
+    assert_eq!(
+        chunk.get_block(8, 33, 9),
+        Some(state(&registry, "minecraft:rail").unwrap())
+    );
+    assert_eq!(cart.position, [40.5, 33.0, 25.5]);
+    assert!(chunk.chests.is_empty());
 }

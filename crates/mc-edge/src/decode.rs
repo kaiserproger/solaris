@@ -476,9 +476,14 @@ fn validate_chat(message: &str) -> Result<(), String> {
     validate_text_characters(message)
 }
 
+pub(crate) const ILLEGAL_CHAT_CHARACTERS: &str = "illegal characters in chat";
+
 fn validate_text_characters(message: &str) -> Result<(), String> {
-    if message.chars().any(|c| c.is_control() && c != '\t') {
-        return Err("text contains control characters".to_owned());
+    if message
+        .chars()
+        .any(|c| c == '§' || c < ' ' || c == '\u{7f}')
+    {
+        return Err(ILLEGAL_CHAT_CHARACTERS.to_owned());
     }
     Ok(())
 }

@@ -23,6 +23,230 @@ fn diamond(state: &TickState, position: [i32; 3]) -> bool {
 }
 
 #[test]
+fn selector_self_type_filters_command_path() {
+    let (mut state, entity) = fixture();
+    command(
+        &mut state,
+        entity,
+        "execute if entity @s[type=minecraft:player] run time add 1",
+    );
+    command(
+        &mut state,
+        entity,
+        "execute if entity @s[type=!minecraft:player] run time add 10",
+    );
+    assert_eq!(state.day_time, 1);
+}
+
+#[test]
+fn selector_nested_scores_and_repeated_nbt_command_path() {
+    let (mut state, entity) = fixture();
+    command(&mut state, entity, "scoreboard objectives add a dummy");
+    command(&mut state, entity, "scoreboard objectives add b dummy");
+    let name = state.connections.name_of(entity).unwrap().to_owned();
+    command(
+        &mut state,
+        entity,
+        &format!("scoreboard players set {name} a 1"),
+    );
+    command(
+        &mut state,
+        entity,
+        &format!("scoreboard players set {name} b 2"),
+    );
+    command(
+        &mut state,
+        entity,
+        "execute if entity @s[scores={a=1,b=..2},nbt={},nbt=!{Missing:1b}] run time add 1",
+    );
+    command(
+        &mut state,
+        entity,
+        "execute if entity @s[nbt={Missing:1b}] run time add 10",
+    );
+    assert_eq!(state.day_time, 1);
+}
+
+#[test]
+fn selector_empty_tag_command_path() {
+    let (mut state, entity) = fixture();
+    command(
+        &mut state,
+        entity,
+        "execute if entity @s[tag=] run time add 1",
+    );
+    command(
+        &mut state,
+        entity,
+        "execute if entity @s[tag=!] run time add 10",
+    );
+    let cow = state.spawn_mob(state.registry.cow_type_id, [2.0, 60.0, 2.0], 10.0);
+    let slot = state.entities.slot_of(cow).unwrap();
+    mc_nbt::write_named(
+        &mut state.entities.row_mut(slot).opaque_entity_fields,
+        "",
+        &mc_nbt::Tag::Compound(vec![
+            (
+                "Tags".into(),
+                mc_nbt::Tag::List(mc_nbt::ListTag {
+                    element_type: 8,
+                    elements: vec![mc_nbt::Tag::String("probe".into())],
+                }),
+            ),
+            ("Silent".into(), mc_nbt::Tag::Byte(1)),
+            ("NoGravity".into(), mc_nbt::Tag::Byte(1)),
+        ]),
+    )
+    .unwrap();
+    command(
+        &mut state,
+        entity,
+        "execute if entity @e[type=minecraft:cow,tag=!,tag=probe,nbt={Silent:1b,NoGravity:1b},nbt=!{Missing:1b}] run time add 2",
+    );
+    command(
+        &mut state,
+        entity,
+        "execute if entity @e[type=minecraft:cow,tag=] run time add 10",
+    );
+    assert_eq!(state.day_time, 3);
+}
+
+#[test]
+fn execute_blocks_matches_and_rejects_regions() {
+    let (mut state, entity) = fixture();
+    command(
+        &mut state,
+        entity,
+        "setblock 4 60 4 minecraft:diamond_block",
+    );
+    command(
+        &mut state,
+        entity,
+        "setblock 5 60 4 minecraft:diamond_block",
+    );
+    command(&mut state, entity, "setblock 6 60 4 minecraft:stone");
+    command(
+        &mut state,
+        entity,
+        "execute if blocks 4 60 4 4 60 4 5 60 4 all run time add 1",
+    );
+    command(
+        &mut state,
+        entity,
+        "execute unless blocks 4 60 4 4 60 4 6 60 4 all run time add 1",
+    );
+    assert_eq!(state.day_time, 2);
+}
+
+#[test]
+fn clone_is_operator_only() {
+    assert!(crate::commands::parse("clone 4 60 4 4 60 4 5 60 4", false).is_err());
+    assert!(crate::commands::parse("clone 4 60 4 4 60 4 5 60 4", true).is_ok());
+}
+
+#[test]
+fn clone_filtered_accepts_block_tags() {
+    let (mut state, entity) = fixture();
+    command(
+        &mut state,
+        entity,
+        "setblock 4 60 4 minecraft:diamond_block",
+    );
+    command(
+        &mut state,
+        entity,
+        "clone 4 60 4 4 60 4 5 60 4 filtered #minecraft:mineable/pickaxe",
+    );
+    assert!(diamond(&state, [5, 60, 4]));
+}
+
+#[test]
+fn region_compare_and_clone_follow_command_path() {
+    let (mut state, entity) = fixture();
+    command(
+        &mut state,
+        entity,
+        "setblock 4 60 4 minecraft:diamond_block",
+    );
+    command(&mut state, entity, "setblock 6 60 4 minecraft:stone");
+    command(&mut state, entity, "clone 4 60 4 4 60 4 5 60 4");
+    assert!(diamond(&state, [5, 60, 4]));
+    command(
+        &mut state,
+        entity,
+        "execute if blocks 4 60 4 4 60 4 5 60 4 all run time add 1",
+    );
+    assert_eq!(state.day_time, 1);
+    command(
+        &mut state,
+        entity,
+        "execute unless blocks 4 60 4 4 60 4 6 60 4 all run time add 1",
+    );
+    assert_eq!(state.day_time, 2);
+}
+
+#[test]
+fn clone_modes_and_masked_region_comparison() {
+    let (mut state, entity) = fixture();
+    command(
+        &mut state,
+        entity,
+        "setblock 4 60 4 minecraft:diamond_block",
+    );
+    command(&mut state, entity, "setblock 5 60 4 minecraft:air");
+    command(&mut state, entity, "setblock 7 60 4 minecraft:stone");
+    command(&mut state, entity, "clone 4 60 4 5 60 4 6 60 4 masked");
+    assert!(diamond(&state, [6, 60, 4]));
+    command(
+        &mut state,
+        entity,
+        "execute if blocks 4 60 4 5 60 4 6 60 4 masked run time add 1",
+    );
+    assert_eq!(state.day_time, 1);
+    command(
+        &mut state,
+        entity,
+        "execute unless blocks 4 60 4 5 60 4 6 60 4 all run time add 1",
+    );
+    assert_eq!(state.day_time, 2);
+    command(&mut state, entity, "clone 4 60 4 5 60 4 5 60 4 replace");
+    assert!(!diamond(&state, [5, 60, 4]), "normal overlap must fail");
+    command(
+        &mut state,
+        entity,
+        "clone 4 60 4 5 60 4 5 60 4 filtered minecraft:diamond_block move",
+    );
+    assert!(!diamond(&state, [4, 60, 4]));
+    assert!(diamond(&state, [5, 60, 4]));
+}
+
+#[test]
+fn clone_copies_live_container_contents() {
+    let (mut state, entity) = fixture();
+    command(&mut state, entity, "setblock 4 60 4 minecraft:chest");
+    crate::tick::run_tick(&mut state, &[]);
+    let item = crate::crafter::tests::stack(&state, "diamond", 13);
+    state.block_entities.get_mut(&(4, 60, 4)).unwrap().slots[0] = item.clone();
+    command(&mut state, entity, "clone 4 60 4 4 60 4 5 60 4");
+    crate::tick::run_tick(&mut state, &[]);
+    assert_eq!(state.block_entities[&(5, 60, 4)].slots[0], item);
+    let before = state.day_time;
+    command(
+        &mut state,
+        entity,
+        "execute if blocks 4 60 4 4 60 4 5 60 4 all run time add 1",
+    );
+    assert_eq!(state.day_time, before + 1);
+    state.block_entities.get_mut(&(5, 60, 4)).unwrap().slots[0] = mc_data::ItemStack::EMPTY;
+    command(
+        &mut state,
+        entity,
+        "execute unless blocks 4 60 4 4 60 4 5 60 4 all run time add 1",
+    );
+    assert_eq!(state.day_time, before + 2);
+}
+
+#[test]
 fn command_parity_configured_fork_budget_rejects_before_execution() {
     let (mut state, entity) = fixture();
     command(&mut state, entity, "gamerule minecraft:max_command_forks 0");

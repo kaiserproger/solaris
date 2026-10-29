@@ -545,6 +545,12 @@ async fn run_connection(
                     )
                 {
                     warn!(%peer, connection = id.0, stage = "play-decode", name = %outcome.name, frame = frame.id, reason = %reason, "connection closed");
+                    if reason == crate::decode::ILLEGAL_CHAT_CHARACTERS {
+                        server.kick(id, serde_json::json!({"translate":"multiplayer.disconnect.illegal_characters"}))?;
+                        let _ = (&mut *writer_task).await;
+                        writer_finished = true;
+                        break 'play_loop "illegal-chat-characters";
+                    }
                     break 'play_loop "decode-error";
                 }
                 if inputs.iter().any(|input| matches!(input, PlayerInput::Respawn { .. }))

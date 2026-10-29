@@ -467,6 +467,12 @@ and nearest selectors originate at world spawn; executor-dependent commands
 need an explicit player/selector. Player-only component commands report their
 normal admission error rather than inventing a console player.
 
+Entity selectors support type filters on `@s`, multiple score objectives in
+one `scores={...}` filter, repeated positive or negated NBT compound filters,
+and empty `tag=` / `tag=!` tests for entities with no tags / at least one tag.
+NBT and tag tests use the entity's available serialized data; `/tag` itself is
+not implemented.
+
 Examples in the running console:
 
 ```text
@@ -715,6 +721,11 @@ Solaris-authored layouts. Dungeon cavities are admitted against generated local
 blocks; wells, fossils and geodes follow bounded placed-feature attempts.
 All template loot tables retain their unopened table id and seed until the
 runtime has first-open context; generation never rolls exploration maps.
+Ocean wrecks and ruins use the solid seabed height; beached wrecks use the
+water-inclusive surface. The authored monument is capped below sea level rather
+than reproducing vanilla's full monument placement. Mineshaft loot is an
+unopened seeded chest minecart on rails, claimed once like other generated
+entities.
 These remain partial families: complete rotations/processors and room
 assemblers, stronghold biome relocation, the jungle piston puzzle and full
 monument/mansion variations are not implemented by the classic catalog.
@@ -912,6 +923,11 @@ and provide page-dependent comparator output plus a two-tick page-turn pulse.
 `/setblock` and fill placement accept block-entity SNBT, including container `Items`;
 supplied data replaces the target's native storage, including when the block state
 itself is unchanged. Position and block-entity identity come from the placement.
+`/clone` supports replace, masked and block-predicate filtered copies, with normal,
+force and move overlap modes. Region comparisons use `execute if|unless blocks`
+with `all` or `masked`. Regions must be loaded and obey the block-modification limit.
+Block-entity copies use the command-data snapshot; live state held outside that
+snapshot (such as crafter, lectern and campfire state) is not fully covered.
 
 ## Block log and rollback
 
@@ -998,7 +1014,9 @@ and retained in native inventory snapshots: `attack_animation`,
 `compostable`, `cooking_fuel`, `brewing_fuel`, `mob_visibility`,
 `provides_pottery_pattern`, `sign_text_front`, `sign_text_back`, `waxed`, and
 `cushion/color`. This is lossless component custody, not a claim that native
-gameplay implements each component's effect. `pot_decorations` stores optional
+gameplay implements each component's effect. The `unbreakable={}` item component
+is also admitted and preserved in inventory and on the wire; native durability
+wear does not yet respect it. `pot_decorations` stores optional
 `back`/`left`/`right`/`front` item templates, including counts and nested patches;
 absent sides remain absent rather than being rewritten as explicit brick faces.
 Cracked-pot drops keep each present template's count and component patch; missing

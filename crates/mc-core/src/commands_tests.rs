@@ -13,6 +13,18 @@ fn id(name: &str) -> Identifier {
 }
 
 #[test]
+fn selector_nested_options_and_duplicate_score_filter() {
+    assert!(
+        parse(
+            "kill @e[scores={a=1,b=..2},nbt={CustomName:'a,b'},nbt=!{Missing:1b}]",
+            true,
+        )
+        .is_ok()
+    );
+    assert!(parse("kill @e[scores={a=1},scores={b=2}]", true).is_err());
+}
+
+#[test]
 fn advancement_actions_and_scopes_parse_with_operator_permissions() {
     use super::AdvancementScope;
     for (action, grant) in [("grant", true), ("revoke", false)] {

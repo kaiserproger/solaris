@@ -44,7 +44,8 @@ pub(crate) fn supports_store_result(command: &Command) -> bool {
         | Command::WorldBorder(crate::command_border::BorderCommand::Get)
         | Command::World(
             crate::command_world::WorldCommand::SetBlock { .. }
-            | crate::command_world::WorldCommand::Fill { .. },
+            | crate::command_world::WorldCommand::Fill { .. }
+            | crate::command_world::WorldCommand::Clone { .. },
         ) => true,
         Command::Scoreboard(command) => command.supports_store_result(),
         _ => false,

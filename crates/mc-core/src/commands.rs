@@ -65,8 +65,8 @@ pub struct Selector {
     pub pitch: Option<(Option<f32>, Option<f32>)>,
     /// Yaw range in degrees, wrapped (`y_rotation=0..90`).
     pub yaw: Option<(Option<f32>, Option<f32>)>,
-    /// NBT exact-match predicate (SNBT compound).
-    pub nbt: Option<mc_nbt::Tag>,
+    /// Repeated, optionally negated NBT compound predicates.
+    pub nbt: Vec<(mc_nbt::Tag, bool)>,
     /// Advancement filters (`advancements={id=true}`).
     pub advancements: Vec<(String, bool)>,
     /// Loot-predicate filters (`predicate=namespace:id`, negatable).
@@ -387,7 +387,7 @@ pub fn parse(command: &str, operator: bool) -> Result<Command, CommandError> {
         "worldborder" => crate::command_border::parse(args).map(Command::WorldBorder),
         "forceload" => crate::forceload::parse(args).map(Command::ForceLoad),
         "co" => crate::block_log::parse(args).map(Command::BlockLog),
-        "setblock" | "fill" | "spawnpoint" | "setworldspawn" => {
+        "setblock" | "fill" | "clone" | "spawnpoint" | "setworldspawn" => {
             crate::command_world::parse(name, args).map(Command::World)
         }
         "bossbar" => crate::command_bossbar::parse(args, command).map(Command::BossBar),
@@ -524,7 +524,7 @@ pub(crate) fn target_of(word: &str) -> Result<Target, CommandError> {
         gamemode: None,
         pitch: None,
         yaw: None,
-        nbt: None,
+        nbt: Vec::new(),
         advancements: Vec::new(),
         predicates: Vec::new(),
         distance: None,
@@ -540,17 +540,38 @@ pub(crate) fn target_of(word: &str) -> Result<Target, CommandError> {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .ok_or_else(|| CommandError::Message("Expected end of options".into()))?;
-    let mut quote = false;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0_u32;
+    let mut scores_seen = false;
     let mut offset = 0;
     let mut parts = Vec::new();
     for (index, ch) in options.char_indices() {
-        if ch == '"' {
-            quote = !quote;
+        if escaped {
+            escaped = false;
+        } else if quote.is_some() && ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() {
+            match ch {
+                '"' | '\'' => quote = Some(ch),
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| CommandError::Message("Expected end of options".into()))?;
+                }
+                ',' if depth == 0 => {
+                    parts.push(&options[offset..index]);
+                    offset = index + 1;
+                }
+                _ => {}
+            }
         }
-        if ch == ',' && !quote {
-            parts.push(&options[offset..index]);
-            offset = index + 1;
-        }
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(CommandError::Message("Expected end of options".into()));
     }
     parts.push(&options[offset..]);
     for option in parts.into_iter().filter(|s| !s.trim().is_empty()) {
@@ -581,9 +602,7 @@ pub(crate) fn target_of(word: &str) -> Result<Target, CommandError> {
                 *target = Some(number);
             }
             "type" => {
-                // Java forbids `type=` on player-only variables (@p/@a/@r/@s);
-                // the bare kind already constrains to players.
-                if !matches!(kind, SelectorKind::Entities) {
+                if !matches!(kind, SelectorKind::Entities | SelectorKind::Executor) {
                     return Err(invalid());
                 }
                 let negated = value.starts_with('!');
@@ -654,9 +673,6 @@ pub(crate) fn target_of(word: &str) -> Result<Target, CommandError> {
             "tag" => {
                 let negated = value.starts_with('!');
                 let tag = value.strip_prefix('!').unwrap_or(value).to_owned();
-                if tag.is_empty() {
-                    return Err(invalid());
-                }
                 selector.tags.push((tag, negated));
             }
             "team" => {
@@ -701,10 +717,13 @@ pub(crate) fn target_of(word: &str) -> Result<Target, CommandError> {
                 selector.yaw = Some(float_range(value).ok_or_else(invalid)?);
             }
             "nbt" => {
-                if selector.nbt.is_some() {
+                let negated = value.starts_with('!');
+                let value = value.strip_prefix('!').unwrap_or(value);
+                let nbt = crate::command_snbt::parse(value).map_err(|_| invalid())?;
+                if !matches!(nbt, mc_nbt::Tag::Compound(_)) {
                     return Err(invalid());
                 }
-                selector.nbt = Some(crate::command_snbt::parse(value).map_err(|_| invalid())?);
+                selector.nbt.push((nbt, negated));
             }
             "predicate" => {
                 let negated = value.starts_with('!');
@@ -736,6 +755,10 @@ pub(crate) fn target_of(word: &str) -> Result<Target, CommandError> {
                 }
             }
             "scores" => {
+                if scores_seen {
+                    return Err(invalid());
+                }
+                scores_seen = true;
                 let body = value
                     .strip_prefix('{')
                     .and_then(|body| body.strip_suffix('}'))

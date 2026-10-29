@@ -74,7 +74,7 @@ fn targets(
             gamemode: None,
             pitch: None,
             yaw: None,
-            nbt: None,
+            nbt: Vec::new(),
             advancements: Vec::new(),
             predicates: Vec::new(),
             distance: None,

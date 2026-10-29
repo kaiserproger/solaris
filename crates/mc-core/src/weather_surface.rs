@@ -73,6 +73,9 @@ pub(super) fn precipitate(
     };
     let weather = at(state, pos);
     let name = block.block.id.path();
+    if state.weather.0 == crate::commands::Weather::Clear && name != "water" {
+        return;
+    }
     let level = block
         .properties
         .iter()
@@ -124,7 +127,7 @@ pub(super) fn precipitate(
         write(state, writes, pos, next);
         return;
     }
-    if weather != Precipitation::Snow {
+    if state.weather.0 == crate::commands::Weather::Clear || weather != Precipitation::Snow {
         return;
     }
     let maximum = crate::command_rules::integer(

@@ -72,18 +72,22 @@ pub(crate) async fn remote(server: &EdgeServer, line: &str) -> anyhow::Result<St
         .map_err(anyhow::Error::msg)
 }
 
+fn read_console(reader: impl BufRead, sender: tokio::sync::mpsc::Sender<std::io::Result<String>>) {
+    for line in reader.lines() {
+        let failed = line
+            .as_ref()
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::InvalidData);
+        if sender.blocking_send(line).is_err() || failed {
+            break;
+        }
+    }
+}
+
 pub(crate) fn spawn(server: Arc<EdgeServer>) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let (sender, mut lines) = tokio::sync::mpsc::channel(16);
     std::thread::Builder::new()
         .name("server-console".into())
-        .spawn(move || {
-            for line in std::io::stdin().lock().lines() {
-                let failed = line.is_err();
-                if sender.blocking_send(line).is_err() || failed {
-                    break;
-                }
-            }
-        })?;
+        .spawn(move || read_console(std::io::stdin().lock(), sender))?;
     Ok(tokio::spawn(async move {
         while let Some(line) = lines.recv().await {
             match line {
@@ -94,7 +98,6 @@ pub(crate) fn spawn(server: Arc<EdgeServer>) -> std::io::Result<tokio::task::Joi
                 }
                 Err(error) => {
                     print_line(&format!("Console input failed: {error}"));
-                    break;
                 }
             }
         }

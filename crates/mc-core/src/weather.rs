@@ -239,10 +239,7 @@ pub(crate) fn rains_at(state: &TickState, pos: crate::boundary::BlockPos) -> boo
 /// One column per active chunk per sixteen ticks. Retain the worklist capacity;
 /// sorting fixes write/spawn order independent of the active hash-set layout.
 pub(crate) fn settle(state: &mut TickState, writes: &mut Vec<(crate::boundary::BlockPos, u32)>) {
-    if !state.dimension.has_weather()
-        || state.weather.0 == Weather::Clear
-        || !state.tick.is_multiple_of(16)
-    {
+    if !state.dimension.has_weather() || !state.tick.is_multiple_of(16) {
         return;
     }
     let mut chunks = std::mem::take(&mut state.weather_chunks);

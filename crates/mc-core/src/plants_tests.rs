@@ -19,6 +19,111 @@ fn apply(state: &mut crate::tick::TickState, plan: plants::Plan) {
 }
 
 #[test]
+fn s9_sniffer_crops_pop_when_farmland_is_removed() {
+    for (name, props) in [
+        ("torchflower_crop", vec![("age", "0")]),
+        ("pitcher_crop", vec![("age", "0"), ("half", "lower")]),
+    ] {
+        let (mut state, _) = setup();
+        plant(&mut state, 2, Y, 2, "farmland", &[("moisture", "7")]);
+        plant(&mut state, 2, Y + 1, 2, name, &props);
+        let air = state.registry.states.air;
+        put(&mut state, 2, Y, 2, air);
+        plants::neighbor_updates(&mut state, pos(2, 0, 2), &mut Vec::new(), &mut Vec::new());
+        assert_eq!(at(&state, 2, Y + 1, 2), air, "{name}");
+    }
+}
+
+#[test]
+fn s9_propagules_pop_when_support_is_removed() {
+    for hanging in [false, true] {
+        let (mut state, _) = setup();
+        let props = [
+            ("age", "4"),
+            ("hanging", if hanging { "true" } else { "false" }),
+            ("stage", "0"),
+            ("waterlogged", "false"),
+        ];
+        plant(&mut state, 2, Y + 1, 2, "mangrove_propagule", &props);
+        let support_y = if hanging { Y + 2 } else { Y };
+        let air = state.registry.states.air;
+        put(&mut state, 2, support_y, 2, air);
+        plants::neighbor_updates(
+            &mut state,
+            BlockPos {
+                x: 2,
+                y: support_y,
+                z: 2,
+            },
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(at(&state, 2, Y + 1, 2), air);
+    }
+}
+
+#[test]
+fn s9_floor_bell_pops_when_support_is_removed() {
+    let (mut state, _) = setup();
+    let stone = state.registry.states.stone;
+    put(&mut state, 2, Y, 2, stone);
+    plant(
+        &mut state,
+        2,
+        Y + 1,
+        2,
+        "bell",
+        &[
+            ("attachment", "floor"),
+            ("facing", "north"),
+            ("powered", "false"),
+        ],
+    );
+    let air = state.registry.states.air;
+    put(&mut state, 2, Y, 2, air);
+    plants::neighbor_updates(&mut state, pos(2, 0, 2), &mut Vec::new(), &mut Vec::new());
+    assert_eq!(at(&state, 2, Y + 1, 2), air);
+}
+
+#[test]
+fn s9_double_wall_bell_becomes_single_before_last_support_is_removed() {
+    let (mut state, _) = setup();
+    let stone = state.registry.states.stone;
+    put(&mut state, 2, Y + 1, 1, stone);
+    put(&mut state, 2, Y + 1, 3, stone);
+    plant(
+        &mut state,
+        2,
+        Y + 1,
+        2,
+        "bell",
+        &[
+            ("attachment", "double_wall"),
+            ("facing", "north"),
+            ("powered", "false"),
+        ],
+    );
+    let air = state.registry.states.air;
+    put(&mut state, 2, Y + 1, 1, air);
+    plants::neighbor_updates(&mut state, pos(2, 1, 1), &mut Vec::new(), &mut Vec::new());
+    assert_eq!(
+        at(&state, 2, Y + 1, 2),
+        block(
+            &state,
+            "bell",
+            &[
+                ("attachment", "single_wall"),
+                ("facing", "south"),
+                ("powered", "false")
+            ]
+        )
+    );
+    put(&mut state, 2, Y + 1, 3, air);
+    plants::neighbor_updates(&mut state, pos(2, 1, 3), &mut Vec::new(), &mut Vec::new());
+    assert_eq!(at(&state, 2, Y + 1, 2), air);
+}
+
+#[test]
 fn columns_obey_height_and_support_and_cascade_once() {
     let (mut state, _) = setup();
     let sand = block(&state, "sand", &[]);

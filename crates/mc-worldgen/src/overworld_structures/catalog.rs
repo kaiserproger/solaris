@@ -9,6 +9,8 @@ pub(super) fn templates(
 ) -> Result<(Vec<StructureTemplate>, Height), String> {
     let height = match name {
         "mineshaft" => Height::Underground,
+        "shipwreck" | "ocean_ruin_warm" | "ocean_ruin_cold" => Height::OceanFloor,
+        "monument" => Height::Monument,
         "buried_treasure" => Height::Buried(3),
         "desert_pyramid" => Height::Buried(12),
         "jungle_pyramid" => Height::Buried(4),
@@ -31,7 +33,8 @@ pub(super) fn templates(
             vec![
                 StructureTemplate::new(t.size(), blocks)
                     .with_chests(t.chests().to_vec())
-                    .with_block_entities(t.block_entities().to_vec()),
+                    .with_block_entities(t.block_entities().to_vec())
+                    .with_entities(t.entities().to_vec()),
             ]
         }
         "igloo" => igloos(root, registry)?,

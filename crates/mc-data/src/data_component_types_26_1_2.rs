@@ -10,6 +10,7 @@ pub const ITEM_COMPONENT_CODECS: &[(&str, i32)] = &[
     ("minecraft:custom_data", 0),
     ("minecraft:max_damage", 2),
     ("minecraft:damage", 3),
+    ("minecraft:unbreakable", 4),
     ("minecraft:custom_name", 6),
     ("minecraft:item_name", 9),
     ("minecraft:item_model", 10),
@@ -62,6 +63,7 @@ pub const ITEM_COMPONENT_CODECS: &[(&str, i32)] = &[
 pub const CUSTOM_DATA: i32 = 0;
 pub const MAX_DAMAGE: i32 = 2;
 pub const DAMAGE: i32 = 3;
+pub const UNBREAKABLE: i32 = 4;
 pub const CUSTOM_NAME: i32 = 6;
 pub const ITEM_NAME: i32 = 9;
 pub const ITEM_MODEL: i32 = 10;

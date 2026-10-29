@@ -259,10 +259,7 @@ fn command_parity_sort_limit_options_and_typed_filters() {
     assert!(resolve_target(&state, alice, &target).is_empty());
     let target = crate::commands::target_of("@a[y_rotation=0..360]").unwrap();
     assert_eq!(resolve_target(&state, alice, &target).len(), 2);
-    // nbt: exact-match against the full serialized entity tag, so a
-    // single-field expectation rejects (documents the exact-match
-    // semantic rather than NBT-subset matching). Behavior covered:
-    // a mismatched expectation admits nobody.
+    // An NBT predicate with a mismatched field admits nobody.
     let target = crate::commands::target_of("@e[nbt={Health:0.5f}]").unwrap();
     assert!(resolve_target(&state, alice, &target).is_empty());
     // advancements: flagged root=true admits only the granted player.

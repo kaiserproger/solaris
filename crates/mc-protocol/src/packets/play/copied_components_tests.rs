@@ -464,7 +464,6 @@ const UNSUPPORTED: &[&str] = &[
     "minecraft:tropical_fish/base_color",
     "minecraft:tropical_fish/pattern",
     "minecraft:tropical_fish/pattern_color",
-    "minecraft:unbreakable",
     "minecraft:use_cooldown",
     "minecraft:use_effects",
     "minecraft:villager/variant",

@@ -559,8 +559,8 @@ fn item_stack_item_model_component_matches_26_1_2_registry_codec() {
 
 #[test]
 fn item_stack_decoder_refuses_unsupported_component_patches() {
-    // count=1, item_id=1, n_add=1, n_remove=0, unsupported component id=4.
-    let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00, 0x04];
+    // count=1, item_id=1, n_add=1, n_remove=0, unsupported attribute_modifiers id=16.
+    let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00, 0x10];
     let mut cur: &[u8] = &bytes;
     let err = ItemStack::decode(&mut cur).unwrap_err();
     assert!(matches!(err, CodecError::NotSupported(_)));

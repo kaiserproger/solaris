@@ -8,6 +8,8 @@ impl mc_world::ChunkGenerator for MarkerGenerator {
         chunk.set_generated_entities(&[mc_world::GeneratedEntityMarker {
             claim: if self.1 == "minecraft:item_frame" {
                 "minecraft:end_city/ship@0:80:0#elytra"
+            } else if self.1 == "minecraft:chest_minecart" {
+                "mineshaft:0:32:0#0"
             } else {
                 "village:0:0:resident:1"
             }
@@ -93,6 +95,29 @@ fn preloaded_village_resident_spawns_once_and_claim_survives_death() {
     generated::load(&mut state, &[chunk], &mut changes);
     assert!(changes.entities_spawned.is_empty());
     assert_eq!(state.generated_entity_claims.len(), 1);
+}
+
+#[test]
+fn generated_mineshaft_cart_has_unopened_loot_and_is_claimed_once() {
+    let mut state = fixture_for("minecraft:chest_minecart", true);
+    let mut changes = ChangeSet::default();
+    generated::load(&mut state, &[], &mut changes);
+    assert_eq!(changes.entities_spawned.len(), 1);
+    let slot = state.entities.slot_of(changes.entities_spawned[0]).unwrap();
+    let vehicle = state
+        .entities
+        .row(slot)
+        .entity_life
+        .vehicle
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        vehicle.loot_table.as_ref().unwrap().as_str(),
+        "minecraft:chests/abandoned_mineshaft"
+    );
+    changes.entities_spawned.clear();
+    generated::load(&mut state, &[ChunkPos { x: 0, z: 0 }], &mut changes);
+    assert!(changes.entities_spawned.is_empty());
 }
 
 #[test]

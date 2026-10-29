@@ -89,7 +89,7 @@ pub(super) fn encode<B: BufMut>(
                     != 0,
             );
         }
-        ids::WAXED => {
+        ids::WAXED | ids::UNBREAKABLE => {
             if !compound(value)?.is_empty() {
                 return Err(invalid());
             }
@@ -177,7 +177,7 @@ pub(super) fn decode<B: Buf>(buf: &mut B, id: i32, depth: usize) -> Result<Tag, 
             ));
             Tag::Compound(fields)
         }
-        ids::WAXED => Tag::Compound(Vec::new()),
+        ids::WAXED | ids::UNBREAKABLE => Tag::Compound(Vec::new()),
         ids::CUSHION_COLOR => Tag::String(color_name(buf.read_varint()?)?.into()),
         _ => return Err(invalid()),
     })

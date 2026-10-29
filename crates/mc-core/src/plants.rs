@@ -173,7 +173,16 @@ pub(crate) fn egg_hatch(state: &TickState, at: BlockPos, id: u32, seed: u64) -> 
 
 pub(crate) fn bonemeal(state: &TickState, at: BlockPos, seed: u64) -> Option<Plan> {
     let id = state.world.block_at(at.x, at.y, at.z)?;
-    if !can_stand(state, id, at) {
+    // Vanilla's hanging propagule bone-meal target checks age, not survival.
+    // An unsupported command-created propagule remains usable until a
+    // neighbor update removes it.
+    let hanging_propagule = state
+        .registry
+        .blocks
+        .by_id(BlockStateId(id))
+        .is_some_and(|block| block.block.id.path() == "mangrove_propagule")
+        && crate::farming::prop(&state.registry.blocks, id, "hanging") == Some("true");
+    if !hanging_propagule && !can_stand(state, id, at) {
         return None;
     }
     plan(state, at, |read| {
@@ -219,6 +228,34 @@ fn path_at(state: &TickState, at: BlockPos) -> Option<&str> {
     )
 }
 
+fn sturdy(state: &TickState, at: BlockPos, support: BlockPos) -> bool {
+    use mc_data::block_facts::{SturdyFace, has_center_sturdy_face, has_full_sturdy_face};
+    let Some(id) = state.world.block_at(support.x, support.y, support.z) else {
+        return true;
+    };
+    let Some(block) = state.registry.blocks.by_id(BlockStateId(id)) else {
+        return true;
+    };
+    let face = if support.y < at.y {
+        SturdyFace::Up
+    } else if support.y > at.y {
+        SturdyFace::Down
+    } else if support.x < at.x {
+        SturdyFace::East
+    } else if support.x > at.x {
+        SturdyFace::West
+    } else if support.z < at.z {
+        SturdyFace::South
+    } else {
+        SturdyFace::North
+    };
+    if support.y > at.y {
+        has_center_sturdy_face(id, &block.block.id, &block.properties, face)
+    } else {
+        has_full_sturdy_face(id, &block.block.id, &block.properties, face)
+    }
+}
+
 pub(crate) fn can_stand(state: &TickState, id: u32, at: BlockPos) -> bool {
     let Some(block) = state.registry.blocks.by_id(BlockStateId(id)) else {
         return false;
@@ -241,7 +278,61 @@ pub(crate) fn can_stand(state: &TickState, id: u32, at: BlockPos) -> bool {
         | "melon_stem"
         | "pumpkin_stem"
         | "attached_melon_stem"
-        | "attached_pumpkin_stem" => support == "farmland",
+        | "attached_pumpkin_stem"
+        | "torchflower_crop" => support == "farmland",
+        "pitcher_crop" => {
+            let half = crate::farming::prop(&state.registry.blocks, id, "half");
+            if half == Some("upper") {
+                support == "pitcher_crop"
+                    && state
+                        .world
+                        .block_at(below.x, below.y, below.z)
+                        .is_none_or(|other| {
+                            crate::farming::prop(&state.registry.blocks, other, "half")
+                                == Some("lower")
+                        })
+            } else {
+                support == "farmland"
+                    && (crate::farming::prop(&state.registry.blocks, id, "age")
+                        .and_then(|age| age.parse::<u32>().ok())
+                        .is_none_or(|age| age < 3)
+                        || path_at(state, BlockPos { y: at.y + 1, ..at })
+                            .is_none_or(|path| path == "pitcher_crop"))
+            }
+        }
+        "mangrove_propagule" => {
+            if crate::farming::prop(&state.registry.blocks, id, "hanging") == Some("true") {
+                path_at(state, BlockPos { y: at.y + 1, ..at })
+                    .is_none_or(|path| path == "mangrove_leaves")
+            } else {
+                soil(support) || support == "farmland"
+            }
+        }
+        "bell" => {
+            let support = match crate::farming::prop(&state.registry.blocks, id, "attachment") {
+                Some("floor") => below,
+                Some("ceiling") => BlockPos { y: at.y + 1, ..at },
+                Some("single_wall" | "double_wall") => {
+                    match crate::farming::prop(&state.registry.blocks, id, "facing") {
+                        Some("north") => BlockPos { z: at.z - 1, ..at },
+                        Some("south") => BlockPos { z: at.z + 1, ..at },
+                        Some("west") => BlockPos { x: at.x - 1, ..at },
+                        Some("east") => BlockPos { x: at.x + 1, ..at },
+                        _ => return true,
+                    }
+                }
+                _ => return true,
+            };
+            let other = BlockPos {
+                x: at.x * 2 - support.x,
+                y: at.y * 2 - support.y,
+                z: at.z * 2 - support.z,
+            };
+            sturdy(state, at, support)
+                || (crate::farming::prop(&state.registry.blocks, id, "attachment")
+                    == Some("double_wall")
+                    && sturdy(state, at, other))
+        }
         "nether_wart" => support == "soul_sand",
         "cactus" => {
             (support == "cactus" || sand)
@@ -354,12 +445,20 @@ pub(crate) fn neighbor_updates(
                 if !state.pop_block_loot(at, id, spawned) {
                     continue;
                 }
-                state
-                    .world
-                    .set_block(at.x, at.y, at.z, state.registry.states.air);
+                let replacement = crate::placement::break_state(
+                    &state.registry.blocks,
+                    id,
+                    state.registry.states.air,
+                    state.registry.states.water_levels[0],
+                );
+                state.world.set_block(at.x, at.y, at.z, replacement);
                 writes.retain(|(pos, _)| *pos != at);
-                writes.push((at, state.registry.states.air));
+                writes.push((at, replacement));
                 pending.push(at);
+            } else if let Some(new) = bell_wall_update(state, at, id) {
+                state.world.set_block(at.x, at.y, at.z, new);
+                writes.retain(|(pos, _)| *pos != at);
+                writes.push((at, new));
             } else if let Some(new) = detached_stem(state, at, id) {
                 state.world.set_block(at.x, at.y, at.z, new);
                 writes.retain(|(pos, _)| *pos != at);
@@ -374,6 +473,51 @@ pub(crate) fn neighbor_updates(
             crate::leaves::schedule(state, changed, id);
         }
     }
+}
+
+fn bell_wall_update(state: &TickState, at: BlockPos, id: u32) -> Option<u32> {
+    let blocks = &state.registry.blocks;
+    if blocks.by_id(BlockStateId(id))?.block.id.path() != "bell"
+        || crate::farming::prop(blocks, id, "attachment") != Some("double_wall")
+    {
+        return None;
+    }
+    let facing = crate::farming::prop(blocks, id, "facing")?;
+    let (dx, dz, opposite) = match facing {
+        "north" => (0, -1, "south"),
+        "south" => (0, 1, "north"),
+        "west" => (-1, 0, "east"),
+        "east" => (1, 0, "west"),
+        _ => return None,
+    };
+    let front = sturdy(
+        state,
+        at,
+        BlockPos {
+            x: at.x + dx,
+            z: at.z + dz,
+            ..at
+        },
+    );
+    let back = sturdy(
+        state,
+        at,
+        BlockPos {
+            x: at.x - dx,
+            z: at.z - dz,
+            ..at
+        },
+    );
+    if front == back {
+        return None;
+    }
+    let single = crate::farming::with_prop(blocks, id, "attachment", "single_wall")?;
+    crate::farming::with_prop(
+        blocks,
+        single,
+        "facing",
+        if front { facing } else { opposite },
+    )
 }
 
 fn detached_stem(state: &TickState, at: BlockPos, id: u32) -> Option<u32> {

@@ -9,7 +9,14 @@ fn setup(name: &str) -> (TickState, EntityId, u32) {
     state.players.get_mut(&actor).unwrap().game_mode = crate::commands::GameMode::Survival;
     state.players.get_mut(&actor).unwrap().awaiting_teleport = None;
     let current = block(&state, name, &[]);
-    let mut registry = crate::registry::CoreRegistry::load(None).unwrap();
+    // Ice support uses vanilla's block tag; the bootstrap fixture intentionally
+    // contains only a small client-required subset of tags.
+    let mut registry = if name == "ice" {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
+        crate::registry::CoreRegistry::load(Some(&root)).unwrap()
+    } else {
+        crate::registry::CoreRegistry::load(None).unwrap()
+    };
     let mut hardness = Vec::new();
     // Real vanilla hardness, independently supplied rather than bootstrap defaults.
     for (name, speed) in [
@@ -18,6 +25,7 @@ fn setup(name: &str) -> (TickState, EntityId, u32) {
         ("obsidian", 50.0),
         ("bedrock", -1.0),
         ("torch", 0.0),
+        ("ice", 0.5),
     ] {
         let id = block(&state, name, &[]);
         if hardness.len() <= id as usize {
@@ -512,4 +520,80 @@ fn zero_hardness_break_does_not_damage_tool() {
         Some(state.registry.states.air)
     );
     assert_eq!(state.players[&actor].inventory.slots[0].damage, None);
+}
+
+#[test]
+fn breaking_supported_ice_leaves_water() {
+    let (mut state, _, _) = setup("ice");
+    state
+        .world
+        .set_block(POS.x, POS.y - 1, POS.z, state.registry.states.stone);
+    state.world.fold_overlay();
+    ready_to_finish(&mut state, CONNECTION, POS);
+    run_tick(&mut state, &[input(DigAction::Finish)]);
+    assert_eq!(
+        state.world.block_at(POS.x, POS.y, POS.z),
+        Some(state.registry.states.water)
+    );
+}
+
+#[test]
+fn ice_break_respects_support_silk_touch_creative_and_nether() {
+    let (mut state, actor, ice) = setup("ice");
+    let below = BlockPos {
+        y: POS.y - 1,
+        ..POS
+    };
+    let air = state.registry.states.air;
+    let water = state.registry.states.water;
+    state.world.set_block(below.x, below.y, below.z, air);
+    assert_eq!(
+        build::plan_break(&state, actor, POS, ice)
+            .footprint
+            .block_write[0]
+            .1,
+        air
+    );
+    state.world.set_block(below.x, below.y, below.z, water);
+    assert_eq!(
+        build::plan_break(&state, actor, POS, ice)
+            .footprint
+            .block_write[0]
+            .1,
+        water
+    );
+    let stone = state.registry.states.stone;
+    state.world.set_block(below.x, below.y, below.z, stone);
+    let tool = &mut state.players.get_mut(&actor).unwrap().inventory.slots[0];
+    tool.enchantments.push(mc_data::ItemEnchantment {
+        id: mc_data::Identifier::parse("minecraft:silk_touch").unwrap(),
+        level: 1,
+    });
+    assert_eq!(
+        build::plan_break(&state, actor, POS, ice)
+            .footprint
+            .block_write[0]
+            .1,
+        air
+    );
+    state.players.get_mut(&actor).unwrap().inventory.slots[0]
+        .enchantments
+        .clear();
+    state.players.get_mut(&actor).unwrap().game_mode = crate::commands::GameMode::Creative;
+    assert_eq!(
+        build::plan_break(&state, actor, POS, ice)
+            .footprint
+            .block_write[0]
+            .1,
+        air
+    );
+    state.players.get_mut(&actor).unwrap().game_mode = crate::commands::GameMode::Survival;
+    state.dimension = crate::dimensions::Dimension::Nether;
+    assert_eq!(
+        build::plan_break(&state, actor, POS, ice)
+            .footprint
+            .block_write[0]
+            .1,
+        air
+    );
 }

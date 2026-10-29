@@ -65,6 +65,7 @@ const ROOTS: &[(&str, u8)] = &[
     ("worldborder", 2),
     ("setblock", 2),
     ("fill", 2),
+    ("clone", 2),
     ("experience", 2),
     ("xp", 2),
     ("spawnpoint", 2),
@@ -923,6 +924,18 @@ pub(crate) fn tree(op_level: u8, plugins: &[(String, u8)]) -> ClientboundCommand
         t.literals(block, &["destroy", "keep", "hollow", "outline"]);
         let replace = t.literal(block, "replace", true);
         t.argument(replace, "filter", Parser::BlockPredicate, true);
+    }
+    if let Some(root) = t.root("clone", false) {
+        let from = t.argument(root, "begin", Parser::BlockPos, false);
+        let to = t.argument(from, "end", Parser::BlockPos, false);
+        let destination = t.argument(to, "destination", Parser::BlockPos, true);
+        for filter in ["replace", "masked"] {
+            let node = t.literal(destination, filter, true);
+            t.literals(node, &["normal", "force", "move"]);
+        }
+        let filtered = t.literal(destination, "filtered", false);
+        let filter = t.argument(filtered, "filter", Parser::BlockPredicate, true);
+        t.literals(filter, &["normal", "force", "move"]);
     }
     if let Some(root) = t.root("advancement", false) {
         for action in ["grant", "revoke"] {

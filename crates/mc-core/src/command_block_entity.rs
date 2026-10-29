@@ -11,6 +11,18 @@ pub(crate) struct Prepared {
     storage: Option<BlockEntityState>,
 }
 
+impl Prepared {
+    pub(crate) fn tag_at(&self, pos: BlockPos) -> Tag {
+        let mut fields = self.fields.clone();
+        fields.extend([
+            ("x".into(), Tag::Int(pos.x)),
+            ("y".into(), Tag::Int(pos.y)),
+            ("z".into(), Tag::Int(pos.z)),
+        ]);
+        Tag::Compound(fields)
+    }
+}
+
 pub(crate) fn prepare(
     state: &TickState,
     block: u32,

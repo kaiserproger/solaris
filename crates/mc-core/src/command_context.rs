@@ -307,7 +307,103 @@ fn condition(state: &TickState, context: Context, text: &mut &str) -> Result<i32
                 }))
             }
         }
-        "blocks" => Err("execute if/unless blocks is not implemented".into()),
+        "blocks" => {
+            let a = coordinates(text, context)?.map(|v| v.floor() as i32);
+            let b = coordinates(text, context)?.map(|v| v.floor() as i32);
+            let dest = coordinates(text, context)?.map(|v| v.floor() as i32);
+            let masked = match word(text)? {
+                "all" => false,
+                "masked" => true,
+                _ => return Err("Expected all or masked".into()),
+            };
+            let min = std::array::from_fn::<_, 3, _>(|i| a[i].min(b[i]));
+            let size = std::array::from_fn::<_, 3, _>(|i| {
+                i64::from(a[i].max(b[i])) - i64::from(min[i]) + 1
+            });
+            let volume = size[0]
+                .checked_mul(size[1])
+                .and_then(|v| v.checked_mul(size[2]))
+                .ok_or("Too many blocks")?;
+            let world = crate::dimensions::travel::world(state, context.dimension)
+                .ok_or("Unknown dimension")?;
+            let limit = i64::from(crate::command_rules::integer(
+                world,
+                crate::command_rules::IntRule::MAX_BLOCK_MODIFICATIONS,
+            ));
+            if volume > limit {
+                return Err("Too many blocks".into());
+            }
+            let mut count = 0;
+            for x in 0..size[0] {
+                for y in 0..size[1] {
+                    for z in 0..size[2] {
+                        let source = [
+                            i64::from(min[0]) + x,
+                            i64::from(min[1]) + y,
+                            i64::from(min[2]) + z,
+                        ];
+                        let target = [
+                            i64::from(dest[0]) + x,
+                            i64::from(dest[1]) + y,
+                            i64::from(dest[2]) + z,
+                        ];
+                        let pos = |p: [i64; 3]| -> Result<crate::boundary::BlockPos, String> {
+                            Ok(crate::boundary::BlockPos {
+                                x: i32::try_from(p[0]).map_err(|_| "Position outside world")?,
+                                y: i32::try_from(p[1]).map_err(|_| "Position outside world")?,
+                                z: i32::try_from(p[2]).map_err(|_| "Position outside world")?,
+                            })
+                        };
+                        let source = pos(source)?;
+                        let target = pos(target)?;
+                        let s = world
+                            .world
+                            .block_at(source.x, source.y, source.z)
+                            .ok_or("Condition position is not loaded")?;
+                        let d = world
+                            .world
+                            .block_at(target.x, target.y, target.z)
+                            .ok_or("Condition position is not loaded")?;
+                        if masked && crate::command_world::is_air(&world.registry.blocks, s) {
+                            continue;
+                        }
+                        if s != d {
+                            return Ok(0);
+                        }
+                        if mc_data::block_entity_kinds::BlockEntityKind::for_block(
+                            world
+                                .registry
+                                .blocks
+                                .by_id(mc_world::BlockStateId(s))
+                                .ok_or("Unknown block state")?
+                                .block
+                                .id
+                                .path(),
+                        )
+                        .is_some()
+                        {
+                            let normalize = |pos| -> Result<mc_nbt::Tag, String> {
+                                let mut tag = crate::command_world::block_image(world, pos)?;
+                                if let mc_nbt::Tag::Compound(fields) = &mut tag {
+                                    fields.retain(|(name, _)| {
+                                        !matches!(name.as_str(), "x" | "y" | "z")
+                                    });
+                                }
+                                Ok(tag)
+                            };
+                            if !crate::command_world::nbt_equal(
+                                &normalize(source)?,
+                                &normalize(target)?,
+                            ) {
+                                return Ok(0);
+                            }
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            Ok(count)
+        }
         _ => Err("Unsupported execute condition".into()),
     }
 }

@@ -28,6 +28,8 @@ struct Family {
 #[derive(Clone, Copy)]
 enum Height {
     Surface,
+    OceanFloor,
+    Monument,
     Underground,
     Buried(i32),
 }
@@ -259,6 +261,7 @@ impl OverworldStructures {
         min: (i32, i32),
         max: (i32, i32),
         surface: &impl Fn(i32, i32) -> i32,
+        ocean_floor: &impl Fn(i32, i32) -> i32,
         biome: &impl Fn(i32, i32, i32) -> Identifier,
         mut emit: impl FnMut(&Identifier, (i32, i32), BlockPos, &StructureTemplate),
     ) {
@@ -298,10 +301,16 @@ impl OverworldStructures {
                     }) {
                         continue;
                     }
-                    let h = surface(x * 16 + 8, z * 16 + 8);
+                    let h = match family.height {
+                        Height::OceanFloor | Height::Monument => {
+                            ocean_floor(x * 16 + 8, z * 16 + 8)
+                        }
+                        _ => surface(x * 16 + 8, z * 16 + 8),
+                    };
                     let y = match family.height {
                         Height::Underground => (h - 28).clamp(-40, 32),
-                        Height::Surface => h + 1,
+                        Height::Surface | Height::OceanFloor => h + 1,
+                        Height::Monument => h.min(crate::terrain::SEA_LEVEL - 17),
                         Height::Buried(depth) => h - depth,
                     };
                     if !family.biomes.contains(&biome(x * 16 + 8, y, z * 16 + 8)) {
@@ -328,6 +337,7 @@ impl OverworldStructures {
         min: (i32, i32),
         max: (i32, i32),
         surface: impl Fn(i32, i32) -> i32,
+        ocean_floor: impl Fn(i32, i32) -> i32,
         biome: impl Fn(i32, i32, i32) -> Identifier,
     ) -> Vec<GeneratedStructureSite> {
         let mut sites = Vec::new();
@@ -335,6 +345,7 @@ impl OverworldStructures {
             min,
             max,
             &surface,
+            &ocean_floor,
             &biome,
             |structure, start_chunk, position, _| {
                 sites.push(GeneratedStructureSite {
@@ -351,6 +362,7 @@ impl OverworldStructures {
         &self,
         chunk: &mut Chunk,
         surface: impl Fn(i32, i32) -> i32,
+        ocean_floor: impl Fn(i32, i32) -> i32,
         biome: impl Fn(i32, i32, i32) -> Identifier,
     ) -> [bool; 256] {
         let pos = chunk.pos;
@@ -360,6 +372,7 @@ impl OverworldStructures {
             (pos.x - self.reach_before[0], pos.z - self.reach_before[1]),
             (pos.x + self.reach_after[0], pos.z + self.reach_after[1]),
             &surface,
+            &ocean_floor,
             &biome,
             |structure, start_chunk, origin, template| {
                 let (min, max) = template.bounds();
@@ -514,7 +527,14 @@ fn paste_template_with_eyes(
             }
             let villager = entity.villager.as_ref();
             inhabitants.push(mc_world::chunk::GeneratedEntityMarker {
-                claim: format!("overworld:{}:{}:{}#{}", origin.x, origin.y, origin.z, index),
+                claim: if entity.entity_type == "minecraft:chest_minecart" {
+                    format!(
+                        "mineshaft:{seed}:{}:{}:{}#{index}",
+                        origin.x, origin.y, origin.z
+                    )
+                } else {
+                    format!("overworld:{}:{}:{}#{index}", origin.x, origin.y, origin.z)
+                },
                 entity_type: entity.entity_type.clone(),
                 position: [
                     entity.position[0] + f64::from(origin.x),
@@ -841,8 +861,17 @@ fn mineshaft(registry: &BlockRegistry) -> Result<StructureTemplate, String> {
         b.put([n, 2, 23], "minecraft:cobweb")?;
     }
     b.spawner([5, 1, 24], "minecraft:cave_spider")?;
-    b.chest([40, 1, 25], "minecraft:chests/abandoned_mineshaft")?;
-    Ok(b.finish([49, 5, 49]))
+    b.put([40, 1, 25], "minecraft:rail")?;
+    let cart = crate::structures::TemplateEntity {
+        entity_type: "minecraft:chest_minecart".into(),
+        persistent: true,
+        position: [40.5, 1.0, 25.5],
+        block_position: [40, 1, 25],
+        yaw: 0.0,
+        pitch: 0.0,
+        villager: None,
+    };
+    Ok(b.finish([49, 5, 49]).with_entities(vec![cart]))
 }
 
 #[path = "overworld_structures/catalog.rs"]

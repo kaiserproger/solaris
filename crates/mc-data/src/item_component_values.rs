@@ -468,7 +468,7 @@ fn value_shape(
                 return Err("invalid sign glow boolean");
             }
         }
-        ids::WAXED => {
+        ids::WAXED | ids::UNBREAKABLE => {
             if !compound(value)?.is_empty() {
                 return Err("unit must be empty");
             }

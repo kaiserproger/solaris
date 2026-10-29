@@ -42,6 +42,32 @@ fn give_water_potion_component_is_typed_and_not_plain_empty_potion() {
 }
 
 #[test]
+fn give_unbreakable_sword_preserves_component_in_inventory() {
+    let item = argument("give @s diamond_sword[unbreakable={}]");
+    let stack = item.stack(&registry().items).unwrap();
+    let mut inventory = PlayerInventory::default();
+    commands::give(&registry().item_rules(), &mut inventory, &stack, 1);
+    let given = inventory
+        .slots
+        .iter()
+        .find(|stack| !stack.is_empty())
+        .unwrap();
+    let fields = mc_data::item_nbt::stack_to_fields(&registry().items, given).unwrap();
+    let Some(Tag::Compound(components)) = mc_data::item_nbt::field(&fields, "components") else {
+        panic!("missing components");
+    };
+    assert_eq!(
+        mc_data::item_nbt::field(components, "minecraft:unbreakable"),
+        Some(&Tag::Compound(Vec::new()))
+    );
+    assert!(
+        argument("give @s diamond_sword[unbreakable=1]")
+            .stack(&registry().items)
+            .is_err()
+    );
+}
+
+#[test]
 fn give_dyed_color_is_admitted_and_survives_inventory_and_durable_storage() {
     let item = argument("give @s minecraft:leather_boots[minecraft:dyed_color=16711935]");
     let stack = item.stack(&registry().items).unwrap();

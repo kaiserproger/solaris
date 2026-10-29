@@ -1225,3 +1225,43 @@ fn bone_meal_cadence_gates_azalea_fungus_and_mangrove() {
         "hanging propagule ages one stage"
     );
 }
+
+#[test]
+fn ice_random_tick_melts_in_block_light() {
+    let (mut state, _) = setup();
+    state
+        .gamerules
+        .insert("random_tick_speed".into(), FAST.into());
+    let ice = block(&state, "ice", &[]);
+    let glowstone = block(&state, "glowstone", &[]);
+    put(&mut state, 0, Y + 1, 0, ice);
+    put(&mut state, -9, Y + 1, 0, ice);
+    put(&mut state, 1, Y + 1, 0, glowstone);
+    run(&mut state, 30);
+    assert_eq!(at(&state, 0, Y + 1, 0), state.registry.states.water);
+    assert_eq!(
+        at(&state, -9, Y + 1, 0),
+        ice,
+        "sky light alone must not melt ice"
+    );
+}
+
+#[test]
+fn snow_random_tick_melts_in_block_light() {
+    let (mut state, _) = setup();
+    state
+        .gamerules
+        .insert("random_tick_speed".into(), FAST.into());
+    let snow = block(&state, "snow", &[("layers", "1")]);
+    let glowstone = block(&state, "glowstone", &[]);
+    put(&mut state, 0, Y + 1, 0, snow);
+    put(&mut state, -9, Y + 1, 0, snow);
+    put(&mut state, 1, Y + 1, 0, glowstone);
+    run(&mut state, 30);
+    assert_eq!(at(&state, 0, Y + 1, 0), state.registry.states.air);
+    assert_eq!(
+        at(&state, -9, Y + 1, 0),
+        snow,
+        "sky light alone must not melt snow"
+    );
+}

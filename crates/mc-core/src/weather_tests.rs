@@ -727,3 +727,23 @@ fn weather_gap_microbench_precipitation_and_rod_search() {
         precipitation[3], attraction[3]
     );
 }
+
+#[test]
+fn clear_weather_still_freezes_exposed_cold_water() {
+    let mut state = precipitation_fixture("minecraft:snowy_plains");
+    state.weather = (Weather::Clear, 1000);
+    for x in 1..15 {
+        for z in 1..15 {
+            state.world.set_block(x, 65, z, state.registry.states.water);
+        }
+    }
+    state.world.fold_overlay();
+    let mut writes = Vec::new();
+    for tick in 1..=1024 {
+        state.tick = tick * 16;
+        settle(&mut state, &mut writes);
+    }
+    let ice = crate::portals::state_id(&state, "minecraft:ice", &[]);
+    assert!(writes.iter().any(|(_, id)| *id == ice));
+    assert!(!writes.iter().any(|(_, id)| *id != ice));
+}

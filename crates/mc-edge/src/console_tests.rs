@@ -1,5 +1,15 @@
 use super::*;
 
+#[test]
+fn invalid_utf8_line_does_not_stop_console_reader() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+    read_console(std::io::Cursor::new(b"bad\xff\nlist\nstop\n"), sender);
+    let lines: Vec<_> = std::iter::from_fn(|| receiver.blocking_recv())
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(lines, ["list", "stop"]);
+}
+
 pub(crate) fn server(root: &std::path::Path) -> EdgeServer {
     let mut config = mc_core::CoreConfig::new(root.join("world"), 42);
     config.vanilla_data_dir =

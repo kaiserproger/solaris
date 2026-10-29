@@ -2764,6 +2764,7 @@ impl ChunkGenerator for TerrainGenerator {
                 structures.sites(
                     min,
                     max,
+                    |x, z| self.world_surface_y(self.surface_height(x, z)),
                     |x, z| self.surface_height(x, z),
                     |x, y, z| self.noise_biome(x, y, z),
                 )
@@ -2996,6 +2997,7 @@ impl ChunkGenerator for TerrainGenerator {
             let touched = structures.paste(
                 &mut chunk,
                 |x, z| heights_cell.borrow_mut().structure_surface(x, z),
+                |x, z| heights_cell.borrow_mut().adjusted_height(x, z),
                 |x, y, z| self.noise_biome(x, y, z),
             );
             for (index, changed) in touched.into_iter().enumerate() {

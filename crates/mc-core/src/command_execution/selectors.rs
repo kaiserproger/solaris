@@ -33,15 +33,34 @@ pub(super) fn options_match(
             return false;
         }
     }
-    for (tag, inverted) in &selector.tags {
-        // Scoreboard tags ride the entity's opaque NBT `Tags` list; absent
-        // `/tag` support means no entity carries one yet, so a positive
-        // filter matches nothing while a negative filter admits everything.
-        let matched = false;
-        if matched == *inverted {
-            return false;
+    let entity_data = if !selector.tags.is_empty() || !selector.nbt.is_empty() {
+        match crate::command_data::entity(state, body.id) {
+            Ok(tag) => Some(tag),
+            Err(_) => return false,
         }
-        let _ = tag;
+    } else {
+        None
+    };
+    if let Some(Tag::Compound(fields)) = &entity_data {
+        let tags = fields
+            .iter()
+            .find_map(|(name, value)| match (name.as_str(), value) {
+                ("Tags", Tag::List(list)) => Some(&list.elements),
+                _ => None,
+            });
+        for (tag, inverted) in &selector.tags {
+            let matched = if tag.is_empty() {
+                tags.is_none_or(Vec::is_empty)
+            } else {
+                tags.is_some_and(|tags| {
+                    tags.iter()
+                        .any(|value| matches!(value, Tag::String(value) if value == tag))
+                })
+            };
+            if matched == *inverted {
+                return false;
+            }
+        }
     }
     if let Some((team, inverted)) = &selector.team {
         let id_label = format!("entity_{}", body.id.0);
@@ -114,13 +133,11 @@ pub(super) fn options_match(
             }
         }
     }
-    if let Some(expected) = &selector.nbt {
-        let actual = match crate::command_data::entity(state, body.id) {
-            Ok(tag) => tag,
-            Err(_) => return false,
-        };
-        if &actual != expected {
-            return false;
+    if let Some(actual) = &entity_data {
+        for (expected, inverted) in &selector.nbt {
+            if crate::command_nbt_path::matches(expected, actual) == *inverted {
+                return false;
+            }
         }
     }
     for (id, granted) in &selector.advancements {
@@ -340,7 +357,7 @@ pub(crate) fn resolve_target(
                 gamemode: None,
                 pitch: None,
                 yaw: None,
-                nbt: None,
+                nbt: Vec::new(),
                 advancements: Vec::new(),
                 predicates: Vec::new(),
                 distance: None,

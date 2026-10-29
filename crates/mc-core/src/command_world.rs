@@ -31,6 +31,20 @@ pub enum FillMode {
     Outline,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneFilter {
+    Replace,
+    Masked,
+    Filtered { spec: BlockSpec, tag: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneMode {
+    Normal,
+    Force,
+    Move,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum WorldCommand {
@@ -44,6 +58,13 @@ pub enum WorldCommand {
         to: [Coord; 3],
         block: BlockSpec,
         mode: FillMode,
+    },
+    Clone {
+        from: [Coord; 3],
+        to: [Coord; 3],
+        destination: [Coord; 3],
+        filter: CloneFilter,
+        mode: CloneMode,
     },
     SpawnPoint {
         target: Target,
@@ -230,6 +251,46 @@ pub fn parse(root: &str, args: &[&str]) -> Result<WorldCommand, CommandError> {
                 from,
                 to,
                 block,
+                mode,
+            })
+        }
+        "clone" => {
+            let usage = CommandError::Usage(
+                "clone <begin> <end> <destination> [replace|masked|filtered <filter>] [force|move|normal]",
+            );
+            if !(9..=12).contains(&args.len()) {
+                return Err(usage);
+            }
+            let from = coords(&args[..3]).ok_or(usage.clone())?;
+            let to = coords(&args[3..6]).ok_or(usage.clone())?;
+            let destination = coords(&args[6..9]).ok_or(usage.clone())?;
+            let (filter, rest) = match &args[9..] {
+                [] => (CloneFilter::Replace, &args[9..]),
+                ["replace", rest @ ..] => (CloneFilter::Replace, rest),
+                ["masked", rest @ ..] => (CloneFilter::Masked, rest),
+                ["filtered", filter, rest @ ..] => {
+                    let tag = filter.starts_with('#');
+                    (
+                        CloneFilter::Filtered {
+                            spec: block_spec(filter.strip_prefix('#').unwrap_or(filter))?,
+                            tag,
+                        },
+                        rest,
+                    )
+                }
+                _ => return Err(usage),
+            };
+            let mode = match rest {
+                [] | ["normal"] => CloneMode::Normal,
+                ["force"] => CloneMode::Force,
+                ["move"] => CloneMode::Move,
+                _ => return Err(usage),
+            };
+            Ok(WorldCommand::Clone {
+                from,
+                to,
+                destination,
+                filter,
                 mode,
             })
         }
@@ -431,6 +492,19 @@ fn execute_inner(
             }
             edit_region(state, from, to, block, image, mode)
         }
+        WorldCommand::Clone {
+            from,
+            to,
+            destination,
+            filter,
+            mode,
+        } => {
+            let geometry = state.dimension.geometry();
+            let from = position(state, *from, base, base_rotation, geometry)?;
+            let to = position(state, *to, base, base_rotation, geometry)?;
+            let destination = position(state, *destination, base, base_rotation, geometry)?;
+            clone_region(state, from, to, destination, filter, *mode)
+        }
         WorldCommand::SpawnPoint {
             target,
             position: pos,
@@ -492,6 +566,247 @@ fn execute_inner(
             ))
         }
     }
+}
+
+pub(crate) fn block_image(state: &TickState, pos: BlockPos) -> Result<mc_nbt::Tag, String> {
+    if let Some((_, image)) = state
+        .merge_command_block_entities
+        .iter()
+        .rev()
+        .find(|(cell, _)| *cell == pos)
+    {
+        Ok(image.tag_at(pos))
+    } else {
+        crate::command_data::block(state, pos)
+    }
+}
+
+pub(crate) fn nbt_equal(left: &mc_nbt::Tag, right: &mc_nbt::Tag) -> bool {
+    match (left, right) {
+        (mc_nbt::Tag::Compound(left), mc_nbt::Tag::Compound(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .iter()
+                        .any(|(other, other_value)| key == other && nbt_equal(value, other_value))
+                })
+        }
+        (mc_nbt::Tag::List(left), mc_nbt::Tag::List(right)) => {
+            left.element_type == right.element_type
+                && left.elements.len() == right.elements.len()
+                && left
+                    .elements
+                    .iter()
+                    .zip(&right.elements)
+                    .all(|(a, b)| nbt_equal(a, b))
+        }
+        _ => left == right,
+    }
+}
+
+fn nbt_subset(expected: &mc_nbt::Tag, actual: &mc_nbt::Tag) -> bool {
+    match (expected, actual) {
+        (mc_nbt::Tag::Compound(expected), mc_nbt::Tag::Compound(actual)) => {
+            expected.iter().all(|(key, value)| {
+                actual
+                    .iter()
+                    .any(|(other, actual)| key == other && nbt_subset(value, actual))
+            })
+        }
+        (mc_nbt::Tag::List(expected), mc_nbt::Tag::List(actual)) => {
+            if expected.elements.is_empty() {
+                actual.elements.is_empty()
+            } else {
+                expected.elements.iter().all(|item| {
+                    actual
+                        .elements
+                        .iter()
+                        .any(|actual| nbt_subset(item, actual))
+                })
+            }
+        }
+        _ => expected == actual,
+    }
+}
+
+fn clone_region(
+    state: &mut TickState,
+    from: BlockPos,
+    to: BlockPos,
+    destination: BlockPos,
+    filter: &CloneFilter,
+    mode: CloneMode,
+) -> Result<(String, crate::command_execution::CommandResult), CommandError> {
+    let min = [from.x.min(to.x), from.y.min(to.y), from.z.min(to.z)];
+    let max = [from.x.max(to.x), from.y.max(to.y), from.z.max(to.z)];
+    let dest = [destination.x, destination.y, destination.z];
+    let size = std::array::from_fn::<_, 3, _>(|i| i64::from(max[i]) - i64::from(min[i]) + 1);
+    let volume = size[0]
+        .checked_mul(size[1])
+        .and_then(|n| n.checked_mul(size[2]))
+        .ok_or_else(|| message("Too many blocks"))?;
+    let limit = i64::from(crate::command_rules::integer(
+        state,
+        crate::command_rules::IntRule::MAX_BLOCK_MODIFICATIONS,
+    ));
+    if volume > limit {
+        return Err(message("Too many blocks"));
+    }
+    let end = std::array::from_fn::<_, 3, _>(|i| i64::from(dest[i]) + size[i] - 1);
+    let geometry = state.dimension.geometry();
+    if end[0] > 30_000_000 || end[2] > 30_000_000 || end[1] >= i64::from(geometry.max_y()) {
+        return Err(message("Position is outside the world"));
+    }
+    if mode == CloneMode::Normal
+        && (0..3).all(|i| i64::from(dest[i]) <= i64::from(max[i]) && end[i] >= i64::from(min[i]))
+    {
+        return Err(message("Source and destination overlap"));
+    }
+    if let CloneFilter::Filtered { spec, tag } = filter {
+        if *tag {
+            let registry = Identifier::parse("minecraft:block").expect("built-in registry");
+            if state
+                .registry
+                .tags
+                .registries
+                .get(&registry)
+                .is_none_or(|tags| !tags.contains_key(&spec.name))
+            {
+                return Err(message(format!("Unknown block tag {}", spec.name)));
+            }
+        } else {
+            spec.validate(&state.registry.blocks)?;
+        }
+    }
+    let mut blocks = Vec::new();
+    for x in 0..size[0] {
+        for y in 0..size[1] {
+            for z in 0..size[2] {
+                let offset = [x, y, z];
+                let source = BlockPos {
+                    x: (i64::from(min[0]) + x) as i32,
+                    y: (i64::from(min[1]) + y) as i32,
+                    z: (i64::from(min[2]) + z) as i32,
+                };
+                let target = BlockPos {
+                    x: (i64::from(dest[0]) + offset[0]) as i32,
+                    y: (i64::from(dest[1]) + offset[1]) as i32,
+                    z: (i64::from(dest[2]) + offset[2]) as i32,
+                };
+                let block = state
+                    .world
+                    .block_at(source.x, source.y, source.z)
+                    .ok_or_else(|| message("Position is not loaded"))?;
+                state
+                    .world
+                    .block_at(target.x, target.y, target.z)
+                    .ok_or_else(|| message("Position is not loaded"))?;
+                if matches!(filter, CloneFilter::Masked) && is_air(&state.registry.blocks, block) {
+                    continue;
+                }
+                if let CloneFilter::Filtered { spec, tag } = filter {
+                    let block_state = state
+                        .registry
+                        .blocks
+                        .by_id(BlockStateId(block))
+                        .ok_or_else(|| message("Unknown block state"))?;
+                    let matches_base = if *tag {
+                        state.registry.tags.contains_raw_id(
+                            "minecraft:block",
+                            spec.name.as_str(),
+                            block_state.block.raw_id,
+                        ) && spec
+                            .properties
+                            .iter()
+                            .all(|property| block_state.properties.contains(property))
+                    } else {
+                        spec.matches(&state.registry.blocks, block)
+                    };
+                    if !matches_base {
+                        continue;
+                    }
+                    if let Some(nbt) = &spec.nbt {
+                        let expected = mc_nbt::read_network(&mut nbt.as_slice())
+                            .map_err(|e| message(e.to_string()))?;
+                        let actual = match block_image(state, source) {
+                            Ok(tag) => tag,
+                            Err(_) => continue,
+                        };
+                        if !nbt_subset(&expected, &actual) {
+                            continue;
+                        }
+                    }
+                }
+                let image = if let Some((_, image)) = state
+                    .merge_command_block_entities
+                    .iter()
+                    .rev()
+                    .find(|(pos, _)| *pos == source)
+                {
+                    Some(image.clone())
+                } else if state
+                    .registry
+                    .blocks
+                    .by_id(BlockStateId(block))
+                    .and_then(|s| {
+                        mc_data::block_entity_kinds::BlockEntityKind::for_block(s.block.id.path())
+                    })
+                    .is_some()
+                {
+                    let tag = crate::command_data::block(state, source).map_err(message)?;
+                    let mut bytes = Vec::new();
+                    mc_nbt::write_network(&mut bytes, &tag).map_err(|e| message(e.to_string()))?;
+                    crate::command_block_entity::prepare(state, block, Some(&bytes))
+                        .map_err(message)?
+                } else {
+                    None
+                };
+                blocks.push((source, target, block, image));
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return Err(message("No blocks were cloned"));
+    }
+    let mut pending: std::collections::HashMap<BlockPos, usize> = state
+        .merge_block_writes
+        .iter()
+        .enumerate()
+        .map(|(i, (pos, _))| (*pos, i))
+        .collect();
+    let mut stage = |state: &mut TickState,
+                     pos: BlockPos,
+                     block: u32,
+                     image: Option<crate::command_block_entity::Prepared>| {
+        state.stage_command_container_removal(pos);
+        state
+            .merge_command_block_entities
+            .retain(|(p, _)| *p != pos);
+        if let Some(image) = image {
+            state.merge_command_block_entities.push((pos, image));
+        }
+        if let Some(index) = pending.get(&pos) {
+            state.merge_block_writes[*index].1 = block;
+        } else {
+            pending.insert(pos, state.merge_block_writes.len());
+            state.merge_block_writes.push((pos, block));
+        }
+        state.world.set_block(pos.x, pos.y, pos.z, block);
+    };
+    if mode == CloneMode::Move {
+        let air = state.registry.states.air;
+        for (source, _, _, _) in &blocks {
+            stage(state, *source, air, None);
+        }
+    }
+    let count = blocks.len() as i32;
+    for (_, target, block, image) in blocks {
+        stage(state, target, block, image);
+    }
+    Ok((
+        format!("Cloned {count} block(s)"),
+        crate::command_execution::CommandResult::Success(count),
+    ))
 }
 
 fn edit_region(
@@ -618,7 +933,7 @@ fn edit_region(
     ))
 }
 
-fn is_air(registry: &BlockRegistry, state: u32) -> bool {
+pub(crate) fn is_air(registry: &BlockRegistry, state: u32) -> bool {
     registry
         .by_id(BlockStateId(state))
         .is_some_and(|state| matches!(state.block.id.path(), "air" | "cave_air" | "void_air"))

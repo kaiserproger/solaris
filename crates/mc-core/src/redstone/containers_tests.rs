@@ -1038,6 +1038,25 @@ fn dispenser_flint_primes_tnt_without_duplicate_spawn_or_direct_air_publication(
 }
 
 #[test]
+fn s9_dispenser_bone_meal_grows_torchflower() {
+    let mut state = state();
+    let target = super::super::offset(HOPPER, (1, 0, 0)).unwrap();
+    let below = super::super::offset(target, (0, -1, 0)).unwrap();
+    place(&mut state, HOPPER, "dispenser", &[("facing", "east")]);
+    place(&mut state, below, "farmland", &[("moisture", "7")]);
+    place(&mut state, target, "torchflower_crop", &[("age", "0")]);
+    let bone = item(&state, "bone_meal", 2);
+    set_slot(&mut state, HOPPER, 0, bone);
+    trigger(&mut state, HOPPER, &mut Vec::new(), &mut Vec::new());
+    let id = state.world.block_at(target.x, target.y, target.z).unwrap();
+    assert_eq!(
+        crate::farming::prop(&state.registry.blocks, id, "age"),
+        Some("1")
+    );
+    assert_eq!(state.block_entities[&key(HOPPER)].slots[0].count, 1);
+}
+
+#[test]
 fn dispenser_bone_meal_applies_complete_multicell_tree_plan_once() {
     let mut state = state();
     let target = super::super::offset(HOPPER, (1, 0, 0)).unwrap();
