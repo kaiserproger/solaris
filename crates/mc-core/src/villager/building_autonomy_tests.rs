@@ -12,6 +12,7 @@ use std::sync::Arc;
 struct VillageGenerator {
     terrain: mc_worldgen::TerrainGenerator,
     registry: Arc<CoreRegistry>,
+    sparse: bool,
 }
 
 impl VillageGenerator {
@@ -51,21 +52,31 @@ impl mc_world::ChunkGenerator for VillageGenerator {
                 let wx = position.x * 16 + i32::from(x);
                 let wz = position.z * 16 + i32::from(z);
                 for y in 188..200 {
-                    let material = if wx >= 16 && (wx + wz + y).rem_euclid(5) == 0 {
+                    let material = if !self.sparse && wx >= 16 && (wx + wz + y).rem_euclid(5) == 0 {
                         coal
                     } else {
                         stone
                     };
                     chunk.set_block(x, y, z, material);
                 }
-                chunk.set_block(x, 200, z, soil);
+                chunk.set_block(
+                    x,
+                    200,
+                    z,
+                    if self.sparse && wx >= 16 { stone } else { soil },
+                );
                 for y in 201..225 {
                     chunk.set_block(x, y, z, air);
+                }
+                if self.sparse && [wx, wz] == [10, -1] {
+                    chunk.set_block(x, 201, z, stone);
+                    chunk.set_block(x, 202, z, stone);
                 }
                 if (-15..=-1).contains(&wx)
                     && (0..=14).contains(&wz)
                     && (wx + 14).rem_euclid(3) == 0
                     && (wz - 1).rem_euclid(3) == 0
+                    && (!self.sparse || wz == 1)
                 {
                     for y in 201..211 {
                         chunk.set_block(x, y, z, log);
@@ -169,7 +180,7 @@ impl mc_world::ChunkGenerator for VillageGenerator {
     }
 }
 
-fn village() -> TickState {
+fn village_with(sparse: bool) -> TickState {
     let mut state = super::conversion_tests::state();
     let registry = Arc::clone(&state.registry);
     state.world = crate::world::ChunkWorld::new(
@@ -177,6 +188,7 @@ fn village() -> TickState {
         Arc::new(VillageGenerator {
             terrain: mc_worldgen::TerrainGenerator::new(42, Arc::clone(&registry.blocks)),
             registry,
+            sparse,
         }),
         &state.registry,
         mc_world::BlockStateId(state.registry.states.air),
@@ -215,6 +227,94 @@ fn village() -> TickState {
         );
     }
     state
+}
+
+fn village() -> TickState {
+    village_with(false)
+}
+#[test]
+fn empty_village_gathers_and_starts_storage_through_native_ticks() {
+    let mut state = village_with(true);
+    let id = state.settlements.records().next().unwrap().id;
+    let stock = state
+        .settlements
+        .get(id)
+        .unwrap()
+        .bootstrap_storage
+        .unwrap();
+    assert!(
+        state.block_entities[&(stock[0], stock[1], stock[2])]
+            .slots
+            .iter()
+            .all(mc_data::ItemStack::is_empty)
+    );
+    let log = state
+        .registry
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:oak_log").unwrap())
+        .unwrap();
+    let cobble = state
+        .registry
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:cobblestone").unwrap())
+        .unwrap();
+    let mut original_logs = std::collections::HashSet::new();
+    let mut original_stone = std::collections::HashSet::new();
+    for x in -16..32 {
+        for z in -16..32 {
+            for y in 188..212 {
+                let pos = (x, y, z);
+                let Some(block) = state
+                    .world
+                    .block_at(x, y, z)
+                    .and_then(|id| state.registry.blocks.by_id(mc_world::BlockStateId(id)))
+                else {
+                    continue;
+                };
+                match block.block.id.path() {
+                    "oak_log" => {
+                        original_logs.insert(pos);
+                    }
+                    "stone" if (y == 200 && x >= 16) || ([x, z] == [10, -1] && y >= 201) => {
+                        original_stone.insert(pos);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut removed = [false; 2];
+    let mut deposited = [false; 2];
+    for _ in 0..30_000 {
+        let (output, _, _) = crate::tick::run_tick(&mut state, &[]);
+        for change in &output.changes.blocks {
+            let p = change.position;
+            if change.state == state.registry.states.air {
+                removed[0] |= original_logs.contains(&(p.x, p.y, p.z));
+                removed[1] |= original_stone.contains(&(p.x, p.y, p.z));
+            }
+        }
+        for stack in &state.block_entities[&(stock[0], stock[1], stock[2])].slots {
+            deposited[0] |= stack.item_id == log && stack.count > 0;
+            deposited[1] |= stack.item_id == cobble && stack.count > 0;
+        }
+        if removed == [true; 2]
+            && deposited == [true; 2]
+            && state
+                .settlements
+                .get(id)
+                .unwrap()
+                .project
+                .as_ref()
+                .is_some_and(|project| project.blueprint == "storage")
+        {
+            return;
+        }
+    }
+    panic!(
+        "native settlement failed: removed={removed:?}, deposited={deposited:?}, project={:?}",
+        crate::settlements::construction::project_status(&state, id)
+    );
 }
 
 #[test]
