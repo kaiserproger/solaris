@@ -53,6 +53,7 @@ impl mc_world::ChunkGenerator for VillageGenerator {
         let stone = mc_world::BlockStateId(self.registry.states.stone);
         let soil = self.block("grass_block", &[]);
         let log = self.block("oak_log", &[]);
+        let leaves = self.block("oak_leaves", &[("persistent", "false")]);
         for x in 0..16_u8 {
             for z in 0..16_u8 {
                 let wx = position.x * 16 + i32::from(x);
@@ -68,6 +69,7 @@ impl mc_world::ChunkGenerator for VillageGenerator {
                     for y in 202..206 {
                         chunk.set_block(x, y, z, log);
                     }
+                    chunk.set_block(x, 206, z, leaves);
                 }
             }
         }
@@ -221,7 +223,9 @@ fn fixture(
         .collect();
     world.ensure_blocking(&chunks.iter().map(|chunk| (*chunk, 0)).collect());
     let mut state = TickState::new(registry, world, 2, 512);
-    state.tickets.insert("autonomy-test".into(), (ChunkPos { x: 0, z: 0 }, 4));
+    state
+        .tickets
+        .insert("autonomy-test".into(), (ChunkPos { x: 0, z: 0 }, 4));
     state.refresh_active_chunks(0);
     (state, chunks)
 }
@@ -599,23 +603,157 @@ fn natural_lumber_and_mine_zones_certify_after_deferred_route_proofs() {
 }
 
 #[test]
+fn natural_grove_ignores_structure_logs_and_finds_an_unblocked_side() {
+    let (mut state, chunks) = fixture(
+        vec![BELL],
+        vec![(
+            generated_claim(
+                "minecraft:village/plains/houses/plains_house_1",
+                [0, 201, 0],
+            ),
+            [-2.5, 202.0, 6.5],
+            "none".into(),
+        )],
+        vec![[-8, 4], [-4, 4], [4, 4]],
+    );
+    state.world.set_block(-8, 206, 4, state.registry.states.air);
+    for y in 202..=207 {
+        state.world.set_block(-5, y, 4, state.registry.states.stone);
+    }
+    adopt(&mut state, &chunks);
+    settle_natural_proofs(&mut state, &[BuildingKind::LumberCamp]);
+    let camp = state
+        .settlements
+        .records()
+        .next()
+        .unwrap()
+        .buildings
+        .values()
+        .find(|building| building.kind == BuildingKind::LumberCamp)
+        .unwrap();
+    assert!(camp.bounds.min[0] <= -4 && camp.bounds.max[0] >= -4);
+    assert!(
+        camp.bounds.max[0] < 0,
+        "generated house must remain protected"
+    );
+    assert_ne!(camp.work_points[0], [-5, 202, 4]);
+}
+
+#[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_lumberjack_deposits_real_logs() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
+    let mut config = crate::config::CoreConfig::new(std::path::PathBuf::new(), 100);
+    config.vanilla_data_dir = Some(data.clone());
+    let registry = Arc::new(CoreRegistry::load(Some(&data)).unwrap());
+    let terrain = crate::core::overworld_terrain(&config, &registry).unwrap();
+    let world = crate::world::ChunkWorld::new(
+        100,
+        Arc::new(terrain),
+        &registry,
+        mc_world::BlockStateId(registry.states.air),
+        [128, 70, 0],
+        mc_world::OVERWORLD_GEOMETRY,
+    );
+    let mut state = TickState::new(registry, world, 4, 512);
+    let chunks: Vec<_> = (2..=11)
+        .flat_map(|x| (-4..=4).map(move |z| ChunkPos { x, z }))
+        .collect();
+    state
+        .world
+        .ensure_blocking(&chunks.iter().map(|p| (*p, 0)).collect());
+    for (index, chunk) in chunks.iter().filter(|p| p.x >= 3).enumerate() {
+        state
+            .tickets
+            .insert(format!("seed100-{index}"), (*chunk, 0));
+    }
+    state.refresh_active_chunks(0);
+    let mut changes = ChangeSet::default();
+    crate::villager::generated::load(&mut state, &chunks, &mut changes);
+    changes.chunks_loaded.extend(chunks);
+    tick(&mut state, &mut changes);
+    let id = state.settlements.records().next().unwrap().id;
+    for _ in 0..12_000 {
+        crate::tick::run_tick(&mut state, &[]);
+        let record = state.settlements.get(id).unwrap();
+        if let Some([x, y, z]) = record.bootstrap_storage
+            && let Some(chest) = state.block_entities.get(&(x, y, z))
+            && let Some(stack) = chest.slots.iter().find(|stack| {
+                stack.count > 0
+                    && state
+                        .registry
+                        .items
+                        .name_of(stack.item_id)
+                        .is_some_and(|name| name.path().ends_with("_log"))
+            })
+        {
+            let camp = record
+                .buildings
+                .values()
+                .find(|b| b.kind == BuildingKind::LumberCamp)
+                .unwrap();
+            let [camp_x, _, camp_z] = camp.work_points[0];
+            assert!(
+                state
+                    .world
+                    .is_active(camp_x.div_euclid(16), camp_z.div_euclid(16))
+            );
+            eprintln!(
+                "tick={} camp={camp:?} deposited {:?} in [{x}, {y}, {z}]",
+                state.tick, stack
+            );
+            return;
+        }
+        if state.tick.is_multiple_of(2000) {
+            for slot in state.entities.slots() {
+                if let Some(v) = state.entities.row(slot).villager.as_ref()
+                    && v.data.profession == crate::villager::VillagerProfession::Lumberjack
+                {
+                    eprintln!(
+                        "tick={} pos={:?} job={:?} activity={:?} navigation={:?} progress={:?} inventory={:?}",
+                        state.tick,
+                        state.entities.pos(slot),
+                        v.job_site,
+                        v.activity,
+                        v.navigation_target,
+                        v.lumber_progress,
+                        v.inventory
+                    );
+                }
+            }
+        }
+    }
+    panic!(
+        "seed 100: no logs deposited; buildings={:?}",
+        state.settlements.get(id).unwrap().buildings
+    );
+}
+
+#[test]
 fn loaded_but_unsimulated_natural_worksite_is_not_certified() {
     let (mut state, chunks) = fixture(
         vec![BELL],
         vec![(
-            generated_claim("minecraft:village/plains/houses/plains_house_1", [0, 201, 0]),
+            generated_claim(
+                "minecraft:village/plains/houses/plains_house_1",
+                [0, 201, 0],
+            ),
             [6.5, 202.0, 6.5],
             "none".into(),
         )],
         vec![],
     );
-    state.world.ensure_blocking(
-        &(1..=5).map(|x| (ChunkPos { x, z: 0 }, 0)).collect(),
-    );
+    state
+        .world
+        .ensure_blocking(&(1..=5).map(|x| (ChunkPos { x, z: 0 }, 0)).collect());
     adopt(&mut state, &chunks);
     let id = state.settlements.records().next().unwrap().id;
     state.settlements.get_mut(id).unwrap().radius = 136;
-    let residents = state.entities.slots().map(|slot| state.entities.row(slot).uuid).collect();
+    let residents = state
+        .entities
+        .slots()
+        .map(|slot| state.entities.row(slot).uuid)
+        .collect();
     let mut candidates = VecDeque::from([NaturalCandidate {
         kind: BuildingKind::Mine,
         bounds: ScriptWorldBounds::new([80, 188, 0], [94, 203, 14]).unwrap(),
@@ -740,7 +878,9 @@ fn dense_village_finds_natural_zones_beyond_generated_footprints() {
         .flat_map(|x| (-1..=2).map(move |z| (ChunkPos { x, z }, 0)))
         .collect();
     state.world.ensure_blocking(&outside);
-    state.tickets.insert("dense-test".into(), (ChunkPos { x: 0, z: 0 }, 5));
+    state
+        .tickets
+        .insert("dense-test".into(), (ChunkPos { x: 0, z: 0 }, 5));
     state.refresh_active_chunks(state.tick);
     adopt(&mut state, &chunks);
     let id = state.settlements.records().next().unwrap().id;

@@ -146,6 +146,50 @@ pub(crate) fn complete(state: &mut TickState, id: SettlementId, slot: EntitySlot
 }
 
 #[test]
+fn storage_uses_available_acacia_logs_for_real_acacia_blocks() {
+    let (mut state, id, slot) = fixture();
+    let item = |name| {
+        state
+            .registry
+            .items
+            .id_of(&mc_data::Identifier::parse(name).unwrap())
+            .unwrap()
+    };
+    let acacia = item("minecraft:acacia_log");
+    let cobble = item("minecraft:cobblestone");
+    let chest = &mut state.block_entities.get_mut(&(1, 201, 1)).unwrap().slots;
+    chest[0] = ItemStack::new(acacia, 64);
+    chest[1] = ItemStack::new(acacia, 64);
+    chest[2] = ItemStack::new(cobble, 64);
+    plan(&mut state, id);
+    let project = state
+        .settlements
+        .get(id)
+        .unwrap()
+        .project
+        .as_ref()
+        .expect("acacia stock funds storage");
+    assert_eq!(project.blueprint, "storage");
+    let origin = project.origin;
+    complete(&mut state, id, slot);
+    let placed = state
+        .world
+        .block_at(origin[0], origin[1] + 1, origin[2])
+        .unwrap();
+    assert_eq!(
+        state
+            .registry
+            .blocks
+            .by_id(mc_world::BlockStateId(placed))
+            .unwrap()
+            .block
+            .id
+            .path(),
+        "acacia_log"
+    );
+}
+
+#[test]
 fn planner_prioritizes_storage_then_housing() {
     let (mut state, id, slot) = fixture();
     let extra = crate::boundary::ChunkPos { x: 1, z: 0 };

@@ -575,11 +575,12 @@ fn natural_zones(
         }
     }
     if !has_kind(state, id, BuildingKind::LumberCamp) {
-        let mut lo = [i32::MAX; 3];
-        let mut hi = [i32::MIN; 3];
-        let mut logs = 0;
-        for x in probe[0] - 31..probe[0] {
+        let mut queued = 0;
+        'columns: for x in probe[0] - 31..probe[0] {
             for z in probe[2] - 15..=probe[2] + 15 {
+                let mut lo = i32::MAX;
+                let mut hi = i32::MIN;
+                let mut logs = 0;
                 for y in probe[1] - 3..=probe[1] + 12 {
                     if state
                         .world
@@ -588,32 +589,78 @@ fn natural_zones(
                         .is_some_and(|block| block.block.id.path().ends_with("_log"))
                     {
                         logs += 1;
-                        for (axis, value) in [x, y, z].into_iter().enumerate() {
-                            lo[axis] = lo[axis].min(value);
-                            hi[axis] = hi[axis].max(value);
+                        lo = lo.min(y);
+                        hi = hi.max(y);
+                    }
+                }
+                if logs < 4 || hi - lo + 1 != logs || !natural_tree(state, x, lo, hi, z) {
+                    continue;
+                }
+                for [dx, dz] in [[-1, 0], [1, 0], [0, -1], [0, 1]] {
+                    let entrance_x = x + dx;
+                    let entrance_z = z + dz;
+                    let min = [x.min(entrance_x), lo - 1, z.min(entrance_z)];
+                    let max = [x.max(entrance_x), hi + 1, z.max(entrance_z)];
+                    if let Ok(bounds) = ScriptWorldBounds::new(min, max)
+                        && let Some(entrance) =
+                            open_entrance(state, &bounds, [entrance_x, anchor[1], entrance_z])
+                    {
+                        let before = candidates.len();
+                        queue_natural(
+                            site,
+                            BuildingKind::LumberCamp,
+                            bounds,
+                            entrance,
+                            state.tick,
+                            candidates,
+                        );
+                        queued += candidates.len() - before;
+                        if queued == 16 {
+                            break 'columns;
                         }
                     }
                 }
             }
         }
-        if logs >= 4 {
-            let min = [lo[0] - 1, lo[1] - 1, lo[2]];
-            let max = [hi[0], hi[1] + 1, hi[2]];
-            if let Ok(bounds) = ScriptWorldBounds::new(min, max)
-                && let Some(entrance) =
-                    open_entrance(state, &bounds, [min[0], anchor[1], (min[2] + max[2]) / 2])
-            {
-                queue_natural(
-                    site,
-                    BuildingKind::LumberCamp,
-                    bounds,
-                    entrance,
-                    state.tick,
-                    candidates,
-                );
-            }
-        }
     }
+}
+
+// Match the lumberjack's harvestable trunk and wild-crown requirements.
+fn natural_tree(state: &TickState, x: i32, base: i32, top: i32, z: i32) -> bool {
+    let block = |x, y, z| {
+        state
+            .world
+            .block_at(x, y, z)
+            .and_then(|id| state.registry.blocks.by_id(mc_world::BlockStateId(id)))
+    };
+    if !block(x, base - 1, z).is_some_and(|b| {
+        matches!(
+            b.block.id.path(),
+            "grass_block"
+                | "dirt"
+                | "coarse_dirt"
+                | "podzol"
+                | "rooted_dirt"
+                | "mud"
+                | "farmland"
+                | "moss_block"
+        )
+    }) || !block(x, base, z).is_some_and(|b| !b.block.id.path().starts_with("stripped_"))
+    {
+        return false;
+    }
+    (-2..=2).any(|dx| {
+        (-2..=2).any(|dz| {
+            (-2..=2).any(|dy| {
+                block(x + dx, top + dy, z + dz).is_some_and(|b| {
+                    b.block.id.path().ends_with("_leaves")
+                        && b.properties
+                            .iter()
+                            .any(|(k, v)| k == "persistent" && v == "false")
+                })
+            })
+        })
+    })
 }
 
 fn queue_natural(
