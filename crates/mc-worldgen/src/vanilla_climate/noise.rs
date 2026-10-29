@@ -71,8 +71,11 @@ impl NoiseFactory {
         let seed = i64::from(x.wrapping_mul(3_129_871))
             ^ i64::from(z).wrapping_mul(116_129_781)
             ^ i64::from(y);
-        let seed = seed.wrapping_mul(seed).wrapping_mul(42_317_861)
-            .wrapping_add(seed.wrapping_mul(11)) >> 16;
+        let seed = seed
+            .wrapping_mul(seed)
+            .wrapping_mul(42_317_861)
+            .wrapping_add(seed.wrapping_mul(11))
+            >> 16;
         Xoroshiro::halves(self.lo ^ seed as u64, self.hi)
     }
     pub(crate) fn normal(

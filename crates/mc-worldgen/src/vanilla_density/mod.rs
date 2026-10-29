@@ -183,7 +183,12 @@ impl VanillaDensity {
 
     pub(crate) fn validate_aquifer_fields(&self) -> Result<(), String> {
         for field in [
-            "barrier", "fluid_level_floodedness", "fluid_level_spread", "lava", "erosion", "depth",
+            "barrier",
+            "fluid_level_floodedness",
+            "fluid_level_spread",
+            "lava",
+            "erosion",
+            "depth",
         ] {
             self.runtime.field(field)?;
         }

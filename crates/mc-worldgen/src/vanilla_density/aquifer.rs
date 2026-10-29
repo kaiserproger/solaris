@@ -9,8 +9,19 @@ use super::{DensitySampler, Id, VanillaDensity};
 use crate::vanilla_climate::noise::NoiseFactory;
 
 const OFFSETS: [(i32, i32); 13] = [
-    (0, 0), (-2, -1), (-1, -1), (0, -1), (1, -1), (-3, 0),
-    (-2, 0), (-1, 0), (1, 0), (-2, 1), (-1, 1), (0, 1), (1, 1),
+    (0, 0),
+    (-2, -1),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-3, 0),
+    (-2, 0),
+    (-1, 0),
+    (1, 0),
+    (-2, 1),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
 ];
 const DRY: i32 = -32512;
 
@@ -58,10 +69,16 @@ impl<'a> Aquifer<'a> {
         Self {
             density,
             sampler: runtime.sampler(),
-            random: NoiseFactory::new(seed).random("minecraft:aquifer").positional(),
+            random: NoiseFactory::new(seed)
+                .random("minecraft:aquifer")
+                .positional(),
             barrier: runtime.field("barrier").expect("overworld barrier"),
-            floodedness: runtime.field("fluid_level_floodedness").expect("overworld floodedness"),
-            spread: runtime.field("fluid_level_spread").expect("overworld spread"),
+            floodedness: runtime
+                .field("fluid_level_floodedness")
+                .expect("overworld floodedness"),
+            spread: runtime
+                .field("fluid_level_spread")
+                .expect("overworld spread"),
             lava: runtime.field("lava").expect("overworld lava"),
             erosion: runtime.field("erosion").expect("overworld erosion"),
             depth: runtime.field("depth").expect("overworld depth"),
@@ -71,9 +88,15 @@ impl<'a> Aquifer<'a> {
     }
     fn global(&self, y: i32) -> Status {
         if y < -54 {
-            Status { level: -54, lava: true }
+            Status {
+                level: -54,
+                lava: true,
+            }
         } else {
-            Status { level: self.density.sea_level(), lava: false }
+            Status {
+                level: self.density.sea_level(),
+                lava: false,
+            }
         }
     }
     fn center(&mut self, cell: Point) -> Point {
@@ -97,7 +120,9 @@ impl<'a> Aquifer<'a> {
         if let Some(&value) = self.surfaces.get(&key) {
             return value;
         }
-        let value = self.sample(self.density.preliminary_surface, key.0, 0, key.1).floor() as i32;
+        let value = self
+            .sample(self.density.preliminary_surface, key.0, 0, key.1)
+            .floor() as i32;
         self.surfaces.insert(key, value);
         value
     }
@@ -138,8 +163,8 @@ impl<'a> Aquifer<'a> {
         };
         let flood = self.sample(self.floodedness, x, y, z).clamp(-1.0, 1.0);
         // 26.3 aquifer exclusion: min(-0.225 - erosion, max(depth - 0.9, 0)).
-        let excluded = self.sample(self.erosion, x, y, z) < -0.225
-            && self.sample(self.depth, x, y, z) > 0.9;
+        let excluded =
+            self.sample(self.erosion, x, y, z) < -0.225 && self.sample(self.depth, x, y, z) > 0.9;
         let level = if excluded {
             DRY
         } else if flood > 0.8 - 1.1 * factor {
@@ -154,16 +179,22 @@ impl<'a> Aquifer<'a> {
         let lava = global.lava
             || (level <= -10
                 && level != DRY
-                && self.sample(self.lava, x.div_euclid(64), y.div_euclid(40), z.div_euclid(64)).abs() > 0.3);
+                && self
+                    .sample(
+                        self.lava,
+                        x.div_euclid(64),
+                        y.div_euclid(40),
+                        z.div_euclid(64),
+                    )
+                    .abs()
+                    > 0.3);
         let status = Status { level, lava };
         self.cells.get_mut(&cell).unwrap().1 = Some(status);
         status
     }
     fn pressure(&mut self, x: i32, y: i32, z: i32, a: Status, b: Status) -> f64 {
         let (fa, fb) = (a.at(y), b.at(y));
-        if (fa == Fluid::Water && fb == Fluid::Lava)
-            || (fa == Fluid::Lava && fb == Fluid::Water)
-        {
+        if (fa == Fluid::Water && fb == Fluid::Lava) || (fa == Fluid::Lava && fb == Fluid::Water) {
             return 2.0;
         }
         let difference = (a.level - b.level).abs();
@@ -236,8 +267,11 @@ impl<'a> Aquifer<'a> {
             }
         }
         if pressure > 0.0
-            && f64::from(self.sampler.sample_terrain(self.density.final_density, x, y, z))
-                + pressure > 0.0
+            && f64::from(
+                self.sampler
+                    .sample_terrain(self.density.final_density, x, y, z),
+            ) + pressure
+                > 0.0
         {
             Fluid::Solid
         } else {

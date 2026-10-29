@@ -3034,7 +3034,11 @@ impl TerrainGenerator {
                         }
                     } else {
                         use crate::vanilla_density::aquifer::Fluid;
-                        match aquifer.as_mut().expect("vanilla aquifer").substance(plan.wx, y, plan.wz) {
+                        match aquifer
+                            .as_mut()
+                            .expect("vanilla aquifer")
+                            .substance(plan.wx, y, plan.wz)
+                        {
                             Fluid::Air => self.air,
                             Fluid::Water => self.water,
                             Fluid::Lava => self.cave_lava,

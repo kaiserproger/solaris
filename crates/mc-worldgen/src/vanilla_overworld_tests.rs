@@ -249,7 +249,12 @@ fn overworld_aquifers_fill_underground_caves() {
     let blocks = Arc::new(
         BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
     );
-    let state = |name: &str| blocks.block(&Identifier::parse(name).unwrap()).unwrap().default;
+    let state = |name: &str| {
+        blocks
+            .block(&Identifier::parse(name).unwrap())
+            .unwrap()
+            .default
+    };
     let (water, lava) = (state("minecraft:water"), state("minecraft:lava"));
     let mut terrain = TerrainGenerator::new(712816, blocks);
     terrain.load_vanilla_worldgen(&root).unwrap();
