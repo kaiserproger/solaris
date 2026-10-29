@@ -30,6 +30,14 @@ cadence varies, see Mob blueprints), remote physical tickets keep chosen areas
 simulated without players, radical hardware-level optimizations are allowed
 when measured and documented.
 
+## Command storage custody (2026-10-29)
+
+Namespaced command-storage compounds have one tick-owned, world-global
+authority. Dimension execution swaps that authority with the other shared
+globals. Mutations journal an NBT post-image and the native checkpoint carries
+the same state; absent storage in an older checkpoint means an empty store.
+This does not create an Anvil live-write path.
+
 ## Item and station custody (2026-10-23)
 
 The native player retains independent gameplay RNG and enchanting-offer seed

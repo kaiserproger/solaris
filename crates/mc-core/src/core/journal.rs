@@ -18,6 +18,7 @@ pub(super) struct CheckpointJob {
     pub(super) world_spawn: [i32; 3],
     pub(super) world_spawn_rotation: [f32; 2],
     pub(super) scoreboard: crate::scoreboard::Scoreboard,
+    pub(super) command_storage: crate::command_storage::Storage,
     pub(super) saved_maps: std::collections::BTreeMap<i32, Arc<crate::maps::SavedMap>>,
     pub(super) bossbars: crate::bossbar::BossBars,
     pub(super) raids: crate::raids::Raids,
@@ -121,6 +122,7 @@ pub(super) fn start_checkpoint_with_reply(
         world_spawn: state.world.world_spawn(),
         world_spawn_rotation: state.world.world_spawn_rotation(),
         scoreboard: state.scoreboard.clone(),
+        command_storage: state.command_storage.clone(),
         saved_maps: state.maps.records.clone(),
         bossbars: state.bossbars.clone(),
         raids: state.raids.clone(),
@@ -324,6 +326,13 @@ pub(crate) fn journal_entries_for_tick(
     {
         entries.push(JournalEntry::Scoreboard {
             value: state.scoreboard.clone(),
+        });
+    }
+    if state.dimension == crate::dimensions::Dimension::Overworld
+        && std::mem::take(&mut state.command_storage_dirty)
+    {
+        entries.push(JournalEntry::CommandStorage {
+            value: crate::command_storage::encode(&state.command_storage),
         });
     }
     if state.dimension == crate::dimensions::Dimension::Overworld
@@ -970,6 +979,13 @@ pub(super) fn commit_checkpoint(
     globals.insert(
         "scoreboard".into(),
         crate::native_checkpoint::tag_record(job.tick, &job.scoreboard.to_nbt())?,
+    );
+    globals.insert(
+        "command_storage".into(),
+        crate::native_checkpoint::tag_record(
+            job.tick,
+            &crate::command_storage::to_tag(&job.command_storage),
+        )?,
     );
     globals.insert(
         "bossbars".into(),

@@ -21,6 +21,7 @@ pub struct Replay {
     pub tickets: BTreeMap<String, ([i32; 2], (u64, i32))>,
     /// Latest scoreboard image, including an empty-board reset.
     pub scoreboard: Option<crate::scoreboard::Scoreboard>,
+    pub command_storage: Option<Vec<u8>>,
     pub saved_maps: BTreeMap<i32, Arc<crate::maps::SavedMap>>,
     /// Latest bossbar image (named-NBT bytes), including an empty-registry reset.
     pub bossbars: Option<Vec<u8>>,
@@ -625,6 +626,9 @@ pub(crate) fn apply_batch_images(
                 }
                 JournalEntry::Scoreboard { value } => {
                     replay.scoreboard = Some(value.clone());
+                }
+                JournalEntry::CommandStorage { value } => {
+                    replay.command_storage = Some(value.clone());
                 }
                 JournalEntry::SavedMap { id, value } => {
                     replay.saved_maps.insert(*id, Arc::clone(value));

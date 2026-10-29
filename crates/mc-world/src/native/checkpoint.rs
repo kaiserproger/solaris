@@ -326,6 +326,7 @@ fn validate_globals(
     }
     let sequence_rows = usize::from(globals.contains_key("settlement_sequence"));
     let map_sequence_rows = usize::from(globals.contains_key("map_sequence"));
+    let command_storage_rows = usize::from(globals.contains_key("command_storage"));
     if globals.len()
         != DOMAINS.len()
             + plugin_domains.len()
@@ -333,8 +334,17 @@ fn validate_globals(
             + sequence_rows
             + map_rows
             + map_sequence_rows
+            + command_storage_rows
     {
         return Err(NativeError::GlobalDomains);
+    }
+    if let Some(record) = globals.get("command_storage") {
+        validate_envelope(record)?;
+        if record.captured_tick != tick
+            || !matches!(codec::decode(&record.payload)?, Tag::Compound(_))
+        {
+            return Err(failure("command_storage", "invalid command storage"));
+        }
     }
     for key in DOMAINS.iter().chain(plugin_domains) {
         let record = globals.get(*key).ok_or_else(|| failure(key, "missing"))?;

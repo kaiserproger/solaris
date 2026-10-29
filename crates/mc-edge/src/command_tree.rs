@@ -93,6 +93,9 @@ const ROOTS: &[(&str, u8)] = &[
     ("datapack", 2),
     ("reload", 2),
     ("data", 2),
+    ("tag", 2),
+    ("playsound", 2),
+    ("particle", 2),
     ("tick", 3),
     ("kick", 3),
     ("mute", 3),
@@ -718,12 +721,141 @@ pub(crate) fn tree(op_level: u8, plugins: &[(String, u8)]) -> ClientboundCommand
     let mut t = Tree::new(op_level, plugins);
     t.root("reload", true);
     if let Some(root) = t.root("data", false) {
-        t.argument(
+        let get = t.literal(root, "get", false);
+        for kind in ["entity", "block", "storage"] {
+            let branch = t.literal(get, kind, false);
+            let parser = match kind {
+                "entity" => entities(true),
+                "block" => Parser::BlockPos,
+                _ => Parser::ResourceLocation,
+            };
+            let target = t.argument(branch, "target", parser, true);
+            let path = t.argument(target, "path", Parser::NbtPath, true);
+            t.argument(
+                path,
+                "scale",
+                Parser::Double {
+                    min: None,
+                    max: None,
+                },
+                true,
+            );
+        }
+        let merge = t.literal(root, "merge", false);
+        for kind in ["block", "storage"] {
+            let branch = t.literal(merge, kind, false);
+            let parser = if kind == "block" {
+                Parser::BlockPos
+            } else {
+                Parser::ResourceLocation
+            };
+            let target = t.argument(branch, "target", parser, false);
+            t.argument(target, "nbt", Parser::NbtCompoundTag, true);
+        }
+        let remove = t.literal(root, "remove", false);
+        let storage = t.literal(remove, "storage", false);
+        let target = t.argument(storage, "target", Parser::ResourceLocation, false);
+        t.argument(target, "path", Parser::NbtPath, true);
+        let modify = t.literal(root, "modify", false);
+        let storage = t.literal(modify, "storage", false);
+        let target = t.argument(storage, "target", Parser::ResourceLocation, false);
+        let path = t.argument(target, "path", Parser::NbtPath, false);
+        for operation in ["set", "merge", "append", "prepend", "insert"] {
+            let action = t.literal(path, operation, false);
+            let action = if operation == "insert" {
+                t.argument(action, "index", integer(None, None), false)
+            } else {
+                action
+            };
+            let value = t.literal(action, "value", false);
+            t.argument(value, "value", Parser::NbtTag, true);
+            let from = t.literal(action, "from", false);
+            let storage = t.literal(from, "storage", false);
+            let source = t.argument(storage, "source", Parser::ResourceLocation, true);
+            t.argument(source, "path", Parser::NbtPath, true);
+        }
+    }
+    if let Some(root) = t.root("tag", false) {
+        let targets = t.argument(root, "targets", entities(false), false);
+        for action in ["add", "remove"] {
+            let action = t.literal(targets, action, false);
+            t.argument(
+                action,
+                "name",
+                Parser::String(CommandStringKind::SingleWord),
+                true,
+            );
+        }
+        t.literal(targets, "list", true);
+    }
+    if let Some(root) = t.root("playsound", false) {
+        let sound = t.suggested(
             root,
-            "arguments",
-            Parser::String(CommandStringKind::GreedyPhrase),
+            "sound",
+            Parser::String(CommandStringKind::SingleWord),
             true,
+            "ask_server",
         );
+        for source in [
+            "master", "music", "record", "weather", "block", "hostile", "neutral", "player",
+            "ambient", "voice",
+        ] {
+            let source = t.literal(sound, source, true);
+            let targets = t.argument(source, "targets", players(false), true);
+            let pos = t.argument(targets, "pos", Parser::Vec3, true);
+            let volume = t.argument(
+                pos,
+                "volume",
+                Parser::Float {
+                    min: Some(0.0_f32.to_bits()),
+                    max: None,
+                },
+                true,
+            );
+            let pitch = t.argument(
+                volume,
+                "pitch",
+                Parser::Float {
+                    min: Some(0.0_f32.to_bits()),
+                    max: Some(2.0_f32.to_bits()),
+                },
+                true,
+            );
+            t.argument(
+                pitch,
+                "minVolume",
+                Parser::Float {
+                    min: Some(0.0_f32.to_bits()),
+                    max: Some(1.0_f32.to_bits()),
+                },
+                true,
+            );
+        }
+    }
+    if let Some(root) = t.root("particle", false) {
+        let name = t.suggested(
+            root,
+            "name",
+            Parser::String(CommandStringKind::SingleWord),
+            true,
+            "ask_server",
+        );
+        let pos = t.argument(name, "pos", Parser::Vec3, true);
+        let delta = t.argument(pos, "delta", Parser::Vec3, false);
+        let speed = t.argument(
+            delta,
+            "speed",
+            Parser::Float {
+                min: None,
+                max: None,
+            },
+            false,
+        );
+        let count = t.argument(speed, "count", integer(Some(0), None), true);
+        for mode in ["normal", "force"] {
+            let mode = t.literal(count, mode, true);
+            t.argument(mode, "viewers", players(false), true);
+        }
     }
     if let Some(root) = t.root("function", false) {
         t.argument(

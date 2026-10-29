@@ -111,6 +111,62 @@ impl Packet for ClientboundSound {
         })
     }
 }
+/// Parameterless particle with command-specified distribution (26.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClientboundCommandParticle {
+    pub particle_id: i32,
+    pub position: [f64; 3],
+    pub delta: [f32; 3],
+    pub speed: f32,
+    pub count: i32,
+    pub force: bool,
+}
+
+impl Packet for ClientboundCommandParticle {
+    const ID: i32 = 0x30;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.particle_id);
+        buf.write_bool(self.force);
+        buf.write_bool(self.force);
+        for coordinate in self.position {
+            buf.write_f64(coordinate);
+        }
+        for coordinate in self.delta {
+            buf.write_f32(coordinate);
+        }
+        for _ in 0..3 {
+            buf.write_f32(self.speed);
+        }
+        buf.write_varint(self.count);
+        buf.write_varint(0);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let particle_id = buf.read_varint()?;
+        let force = buf.read_bool()?;
+        let _always_show = buf.read_bool()?;
+        let position = [buf.read_f64()?, buf.read_f64()?, buf.read_f64()?];
+        let delta = [buf.read_f32()?, buf.read_f32()?, buf.read_f32()?];
+        let speed = buf.read_f32()?;
+        if buf.read_f32()? != speed || buf.read_f32()? != speed {
+            return Err(CodecError::NotSupported("asymmetric particle speed"));
+        }
+        let count = buf.read_varint()?;
+        if buf.read_varint()? != 0 {
+            return Err(CodecError::NotSupported("particle randomization"));
+        }
+        Ok(Self {
+            particle_id,
+            position,
+            delta,
+            speed,
+            count,
+            force,
+        })
+    }
+}
 
 /// Vanilla parameterless sweep particle (26.3 `minecraft:sweep_attack` = 77).
 #[derive(Debug, Clone, Copy, PartialEq)]

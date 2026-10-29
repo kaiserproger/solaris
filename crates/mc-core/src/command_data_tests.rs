@@ -581,3 +581,173 @@ fn execute_store_block_mutations_report_counts_and_unchanged_data_failure() {
         10,
     );
 }
+
+#[test]
+fn tag_commands_update_selector_data_and_report_counts() {
+    use crate::command_execution::CommandResult::{Failed, Success};
+    let (mut state, _, context) = fixture();
+    let mut changes = ChangeSet::default();
+    let mut command = |state: &mut TickState, text| {
+        crate::command_context::native(state, text, context, &mut changes, true).unwrap()
+    };
+    assert_eq!(command(&mut state, "tag @s add map_test"), Success(1));
+    assert_eq!(command(&mut state, "tag @s add map_test"), Failed);
+    assert_eq!(command(&mut state, "tag @s list"), Success(1));
+    assert_eq!(
+        command(&mut state, "tag @s[tag=map_test] remove map_test"),
+        Success(1)
+    );
+    assert_eq!(command(&mut state, "tag @s remove map_test"), Failed);
+    assert_eq!(command(&mut state, "tag @s list"), Success(0));
+    state.spawn_mob(state.registry.cow_type_id, [2.0, 60.0, 2.0], 10.0);
+    assert_eq!(
+        command(&mut state, "tag @e[type=minecraft:cow] add herd"),
+        Success(1)
+    );
+    assert_eq!(
+        command(&mut state, "tag @e[type=minecraft:cow,tag=herd] list"),
+        Success(1)
+    );
+    assert_eq!(
+        command(
+            &mut state,
+            "tag @e[type=minecraft:cow,tag=herd] remove herd"
+        ),
+        Success(1)
+    );
+}
+
+#[test]
+fn map_sound_and_particle_commands_report_delivery() {
+    use crate::command_execution::CommandResult::{Failed, Success};
+    let (mut state, _, context) = fixture();
+    let mut changes = ChangeSet::default();
+    for command in [
+        "playsound minecraft:block.bell.use master @s ~ ~ ~ 1 1 0",
+        "particle minecraft:sweep_attack ~ ~ ~ 0 0 0 0 1 normal @s",
+    ] {
+        assert_eq!(
+            crate::command_context::native(&mut state, command, context, &mut changes, true)
+                .unwrap(),
+            Success(1),
+            "{command}"
+        );
+    }
+    assert!(state.outbox[&crate::boundary::ConnectionId(1)].iter().any(|change| matches!(change, crate::boundary::PlayerChange::CommandSound { sound, .. } if sound.as_str() == "minecraft:block.bell.use")));
+    assert!(
+        state.outbox[&crate::boundary::ConnectionId(1)]
+            .iter()
+            .any(|change| matches!(
+                change,
+                crate::boundary::PlayerChange::CommandParticle {
+                    particle_id: 77,
+                    count: 1,
+                    ..
+                }
+            ))
+    );
+    assert_eq!(
+        crate::command_context::native(
+            &mut state,
+            "particle minecraft:unsupported ~ ~ ~",
+            context,
+            &mut changes,
+            true
+        )
+        .unwrap(),
+        Failed
+    );
+}
+
+#[test]
+fn data_storage_modify_reports_results_and_survives_reads() {
+    use crate::command_execution::CommandResult::{Failed, Success};
+    let (mut state, _, context) = fixture();
+    let mut changes = ChangeSet::default();
+    let mut command = |state: &mut TickState, text| {
+        crate::command_context::native(state, text, context, &mut changes, true).unwrap()
+    };
+    assert_eq!(
+        command(
+            &mut state,
+            "data merge storage test:map {list:[1,2],value:3}"
+        ),
+        Success(1)
+    );
+    assert_eq!(
+        command(&mut state, "data modify storage test:map value set value 7"),
+        Success(1)
+    );
+    assert_eq!(
+        command(&mut state, "data get storage test:map value"),
+        Success(7)
+    );
+    assert_eq!(
+        command(
+            &mut state,
+            "data modify storage test:map list append value 4"
+        ),
+        Success(1)
+    );
+    assert_eq!(
+        command(&mut state, "data get storage test:map list"),
+        Success(3)
+    );
+    assert_eq!(
+        command(&mut state, "data modify storage test:map value set value 7"),
+        Failed
+    );
+    assert_eq!(
+        command(
+            &mut state,
+            "data modify storage test:map list prepend value 0"
+        ),
+        Success(1)
+    );
+    assert_eq!(
+        command(
+            &mut state,
+            "data modify storage test:map list insert 1 value 9"
+        ),
+        Success(1)
+    );
+    assert_eq!(
+        command(
+            &mut state,
+            "data modify storage test:map copied set from storage test:map value"
+        ),
+        Success(1)
+    );
+    assert_eq!(
+        command(&mut state, "data get storage test:map copied"),
+        Success(7)
+    );
+    assert_eq!(
+        command(
+            &mut state,
+            "data modify storage test:map compound merge value {key:1}"
+        ),
+        Success(1)
+    );
+    assert_eq!(
+        command(&mut state, "data remove storage test:map copied"),
+        Success(1)
+    );
+    assert_eq!(
+        command(&mut state, "data get storage test:map copied"),
+        Failed
+    );
+    let image = crate::command_storage::encode(&state.command_storage);
+    let replay = crate::journal::replay_batches(
+        crate::journal::Replay::default(),
+        &[(
+            1,
+            1,
+            vec![crate::journal::JournalEntry::CommandStorage { value: image }],
+        )],
+    );
+    assert_eq!(
+        crate::command_storage::decode(replay.command_storage.as_ref().unwrap()).unwrap(),
+        state.command_storage
+    );
+}

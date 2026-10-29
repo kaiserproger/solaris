@@ -314,6 +314,22 @@ pub(crate) fn command(
     input: &str,
 ) -> crate::command_execution::CommandResult {
     use crate::command_execution::CommandResult::{Failed, Success};
+    if input.split_whitespace().nth(2) == Some("storage") {
+        let context = state
+            .command_context
+            .current
+            .unwrap_or_else(|| Context::source(state, connection, executor, 2));
+        return crate::command_storage::command(state, context, input);
+    }
+    if input.split_whitespace().nth(1) == Some("modify") {
+        state.push_player(
+            connection,
+            crate::boundary::PlayerChange::Chat {
+                message: "Data modify block and entity is not supported".into(),
+            },
+        );
+        return Failed;
+    }
     if input.split_whitespace().nth(1) != Some("get") {
         return crate::command_blocks::data(state, connection, executor, input);
     }

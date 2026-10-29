@@ -99,6 +99,10 @@ pub enum JournalEntry {
     Scoreboard {
         value: crate::scoreboard::Scoreboard,
     },
+    /// World-global command storage as a named NBT compound.
+    CommandStorage {
+        value: Vec<u8>,
+    },
     SavedMap {
         id: i32,
         value: Arc<crate::maps::SavedMap>,

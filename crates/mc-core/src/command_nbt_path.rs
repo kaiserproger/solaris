@@ -212,6 +212,176 @@ pub(crate) fn get<'a>(root: &'a Tag, path: &str) -> Result<Cow<'a, Tag>, String>
     Ok(values.pop().expect("one NBT value"))
 }
 
+/// Mutate selected NBT path values. Callers apply this to a copy before commit.
+pub(crate) fn modify(
+    root: &mut Tag,
+    path: &str,
+    operation: &str,
+    value: Option<&Tag>,
+    index: i32,
+) -> Result<i32, String> {
+    fn merge(target: &mut Vec<(String, Tag)>, patch: &[(String, Tag)]) {
+        for (key, value) in patch {
+            if let Some((_, old)) = target.iter_mut().find(|(name, _)| name == key) {
+                if let (Tag::Compound(old), Tag::Compound(new)) = (&mut *old, value) {
+                    merge(old, new);
+                } else {
+                    *old = value.clone();
+                }
+            } else {
+                target.push((key.clone(), value.clone()));
+            }
+        }
+    }
+    fn apply(
+        tag: &mut Tag,
+        operation: &str,
+        value: Option<&Tag>,
+        index: i32,
+    ) -> Result<i32, String> {
+        let old = tag.clone();
+        match operation {
+            "set" => *tag = value.ok_or("Missing value")?.clone(),
+            "merge" => {
+                let (Tag::Compound(target), Some(Tag::Compound(patch))) = (&mut *tag, value) else {
+                    return Err("Merge requires compounds".into());
+                };
+                merge(target, patch);
+            }
+            "append" | "prepend" | "insert" => {
+                let Tag::List(list) = &mut *tag else {
+                    return Err("Expected an NBT list".into());
+                };
+                let value = value.ok_or("Missing value")?;
+                if !list.elements.is_empty() && list.element_type != value.type_id() {
+                    return Err("NBT list element type mismatch".into());
+                }
+                list.element_type = value.type_id();
+                let at = match operation {
+                    "append" => list.elements.len(),
+                    "prepend" => 0,
+                    _ => {
+                        let at = if index < 0 {
+                            list.elements.len() as i64 + i64::from(index) + 1
+                        } else {
+                            i64::from(index)
+                        };
+                        if at < 0 || at > list.elements.len() as i64 {
+                            return Err("Invalid list index".into());
+                        }
+                        at as usize
+                    }
+                };
+                list.elements.insert(at, value.clone());
+            }
+            _ => return Err("Unsupported NBT operation".into()),
+        }
+        Ok(i32::from(*tag != old))
+    }
+    fn descend(
+        tag: &mut Tag,
+        nodes: &[Node],
+        operation: &str,
+        value: Option<&Tag>,
+        index: i32,
+    ) -> Result<i32, String> {
+        if nodes.is_empty() {
+            return apply(tag, operation, value, index);
+        }
+        match (&nodes[0], tag) {
+            (Node::Key(key), Tag::Compound(fields)) => {
+                let position = fields.iter().position(|(name, _)| name == key);
+                let created = position.is_none();
+                let position = match position {
+                    Some(position) => position,
+                    None if operation != "remove" => {
+                        let initial = if nodes.len() == 1
+                            && matches!(operation, "append" | "prepend" | "insert")
+                        {
+                            Tag::List(mc_nbt::ListTag {
+                                element_type: 0,
+                                elements: Vec::new(),
+                            })
+                        } else {
+                            Tag::Compound(Vec::new())
+                        };
+                        fields.push((key.clone(), initial));
+                        fields.len() - 1
+                    }
+                    None => return Ok(0),
+                };
+                if nodes.len() == 1 && operation == "remove" {
+                    fields.remove(position);
+                    return Ok(1);
+                }
+                let count = descend(
+                    &mut fields[position].1,
+                    &nodes[1..],
+                    operation,
+                    value,
+                    index,
+                )?;
+                Ok(if created { count.max(1) } else { count })
+            }
+            (Node::Index(number), Tag::List(list)) => {
+                let at = if *number < 0 {
+                    list.elements.len() as i64 + i64::from(*number)
+                } else {
+                    i64::from(*number)
+                };
+                if at < 0 || at >= list.elements.len() as i64 {
+                    return Ok(0);
+                }
+                if nodes.len() == 1 && operation == "remove" {
+                    list.elements.remove(at as usize);
+                    return Ok(1);
+                }
+                let count = descend(
+                    &mut list.elements[at as usize],
+                    &nodes[1..],
+                    operation,
+                    value,
+                    index,
+                )?;
+                if list.elements[at as usize].type_id() != list.element_type {
+                    return Err("NBT list element type mismatch".into());
+                }
+                Ok(count)
+            }
+            (Node::All | Node::Filter(_), Tag::List(list)) => {
+                let selected = |tag: &Tag| match &nodes[0] {
+                    Node::Filter(pattern) => matches(pattern, tag),
+                    _ => true,
+                };
+                if nodes.len() == 1 && operation == "remove" {
+                    let before = list.elements.len();
+                    list.elements.retain(|tag| !selected(tag));
+                    return Ok((before - list.elements.len()) as i32);
+                }
+                let mut count = 0;
+                for tag in &mut list.elements {
+                    if selected(tag) {
+                        count += descend(tag, &nodes[1..], operation, value, index)?;
+                        if tag.type_id() != list.element_type {
+                            return Err("NBT list element type mismatch".into());
+                        }
+                    }
+                }
+                Ok(count)
+            }
+            (Node::Match(pattern), tag) if matches(pattern, tag) => {
+                descend(tag, &nodes[1..], operation, value, index)
+            }
+            _ => Ok(0),
+        }
+    }
+    let count = descend(root, &nodes(path)?, operation, value, index)?;
+    if count == 0 {
+        return Err(format!("Nothing changed at path {path}"));
+    }
+    Ok(count)
+}
+
 pub(crate) fn number(tag: &Tag) -> Option<f64> {
     Some(match tag {
         Tag::Byte(v) => f64::from(*v),

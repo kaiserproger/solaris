@@ -430,6 +430,53 @@ fn scoreboard_survives_core_checkpoint_and_recovery_and_syncs_rejoining_viewer()
 }
 
 #[test]
+fn command_storage_survives_native_checkpoint_and_reopen() {
+    let (core, dir) = open_core(512);
+    join_and_drain(&core, ConnectionId(70), 2);
+    let mut rx = core.subscribe();
+    core.submit(PlayerInput::Command {
+        connection: ConnectionId(70),
+        command: "data merge storage test:map {value:37}".into(),
+        permission_level: 4,
+    });
+    let mut applied = false;
+    for _ in 0..100 {
+        rx.blocking_recv().expect("live core tick");
+        applied |= core.try_drain_outbox().iter().flat_map(|(_, queue)| queue)
+            .any(|change| matches!(change, PlayerChange::Chat { message } if message == "Storage data updated"));
+        if applied {
+            break;
+        }
+    }
+    assert!(applied);
+    core.shutdown();
+    let config = test_config(dir.clone(), 512);
+    let store = mc_world::native::NativeReadOnlyStore::open_with_cache(
+        &dir.join("native/state.redb"),
+        crate::native_checkpoint::native_identity(&config),
+        16 * 1024 * 1024,
+    )
+    .unwrap();
+    let image = store
+        .checkpoint_reader()
+        .unwrap()
+        .read_checkpoint()
+        .unwrap();
+    let tag =
+        crate::native_checkpoint::decode_tag(&image.globals["command_storage"], "command_storage")
+            .unwrap();
+    let storage = crate::command_storage::from_tag(tag).unwrap();
+    assert_eq!(
+        *crate::command_nbt_path::get(&storage["test:map"], "value").unwrap(),
+        mc_nbt::Tag::Int(37)
+    );
+    drop(store);
+    let restored = Core::open(config).expect("recover command storage");
+    restored.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn bossbars_survive_core_checkpoint_and_reopen() {
     let (core, dir) = open_core(512);
     join_and_drain(&core, ConnectionId(72), 2);

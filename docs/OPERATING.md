@@ -477,8 +477,8 @@ normal admission error rather than inventing a console player.
 Entity selectors support type filters on `@s`, multiple score objectives in
 one `scores={...}` filter, repeated positive or negated NBT compound filters,
 and empty `tag=` / `tag=!` tests for entities with no tags / at least one tag.
-NBT and tag tests use the entity's available serialized data; `/tag` itself is
-not implemented.
+NBT and tag tests use the entity's available serialized data. Operator `/tag`
+add/remove/list updates that same retained player or entity data.
 
 Examples in the running console:
 
@@ -822,8 +822,12 @@ one value. Numeric results are floored (after optional scale); unscaled strings
 return UTF-16 length and collections return size. Root queries return 1.
 Current vanilla keys include `active_effects`, `equipment`, and furnace
 `cooking_time_spent`; absent optional fields are errors, not invented defaults.
-`/data merge` still writes only command-block `Command` and `auto`; entity/storage
-modification and other block-entity writes are not supported.
+`/data merge block` writes only command-block `Command` and `auto`. Namespaced
+storage supports `/data get`, `/data merge`, `/data remove`, and `/data modify`
+with set/merge/append/prepend/insert and literal or storage sources. Storage is
+world-global and journaled. Entity and block `/data modify` are not supported.
+`/playsound` delivers positional sounds; `/particle` supports parameterless
+particles and refuses option-bearing particle types.
 Impulse blocks respond to
 redstone rising edges; repeating blocks use the durable scheduled-block queue;
 chains follow facing, with a bounded traversal and once-per-tick execution.

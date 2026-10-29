@@ -333,6 +333,33 @@ pub(crate) fn suggestions(
         }
         return result;
     }
+    if matches!(root, "playsound" | "particle") && argument_index == 1 {
+        let names: &[&str] = if root == "playsound" {
+            &[
+                "minecraft:block.bell.use",
+                "minecraft:entity.player.levelup",
+                "minecraft:entity.experience_orb.pickup",
+            ]
+        } else {
+            &[
+                "minecraft:flame",
+                "minecraft:smoke",
+                "minecraft:heart",
+                "minecraft:cloud",
+                "minecraft:sweep_attack",
+            ]
+        };
+        for name in names {
+            add(name);
+        }
+        return result;
+    }
+    if root == "tag" && argument_index == 2 {
+        for action in ["add", "remove", "list"] {
+            add(action);
+        }
+        return result;
+    }
     let registry = match (root, second, argument_index) {
         ("give" | "clear", _, 2) | ("debug", Some("give"), 2) => Some(item_ids),
         ("summon", _, 1) => Some(entity_ids),
@@ -350,6 +377,7 @@ pub(crate) fn suggestions(
             | "w"
             | "give"
             | "clear"
+            | "tag"
             | "kill"
             | "kick"
             | "ban"
@@ -363,6 +391,8 @@ pub(crate) fn suggestions(
             | "enchant"
     ) && argument_index == 1)
         || (matches!(root, "tp" | "teleport") && (1..=2).contains(&argument_index))
+        || (root == "playsound" && argument_index == 3)
+        || (root == "particle" && argument_index == 11)
         || (root == "gamemode" && argument_index == 2)
         || (matches!(root, "xp" | "experience") && argument_index == 2)
         || (root == "advancement" && argument_index == 2)
