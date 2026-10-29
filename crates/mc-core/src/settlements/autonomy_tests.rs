@@ -497,6 +497,51 @@ fn generated_chunk_load_order_does_not_change_identity() {
 }
 
 #[test]
+fn natural_mine_candidate_rejects_water_beside_its_first_cut() {
+    let (mut state, chunks) = fixture(
+        vec![BELL],
+        vec![(
+            generated_claim(
+                "minecraft:village/plains/houses/plains_house_1",
+                [0, 201, 0],
+            ),
+            [6.5, 202.0, 6.5],
+            "none".into(),
+        )],
+        vec![],
+    );
+    adopt(&mut state, &chunks);
+    let id = state.settlements.records().next().unwrap().id;
+    let site = state
+        .world
+        .village_sites_in_region((0, 0), (0, 0))
+        .remove(0);
+    let mut candidates = VecDeque::new();
+    natural_zones(&mut state, id, BELL, &site, 0, &mut candidates);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.kind == BuildingKind::Mine)
+    );
+    candidates.clear();
+    let water = state
+        .registry
+        .blocks
+        .block(&mc_data::Identifier::parse("minecraft:water").unwrap())
+        .unwrap()
+        .default
+        .0;
+    state.world.set_block(19, 201, 7, water);
+    natural_zones(&mut state, id, BELL, &site, 0, &mut candidates);
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.kind != BuildingKind::Mine),
+        "a flooded first cut must not become a mine job"
+    );
+}
+
+#[test]
 fn natural_lumber_and_mine_zones_certify_after_deferred_route_proofs() {
     // Grove west of the bell (x in [-15,-1] band style, local columns) and a
     // stone band below the surface for the quarry box.
@@ -1470,4 +1515,92 @@ fn an_unloaded_generated_house_does_not_starve_a_loaded_farm_certificate() {
     let record = state.settlements.records().next().unwrap();
     assert!(record.buildings.values().any(|building| building.kind
         == BuildingKind::Workshop(crate::villager::VillagerProfession::Farmer,)));
+}
+
+#[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_natural_miner_deposits_cobblestone() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
+    let mut config = crate::config::CoreConfig::new(std::path::PathBuf::new(), 100);
+    config.vanilla_data_dir = Some(data.clone());
+    let registry = Arc::new(CoreRegistry::load(Some(&data)).unwrap());
+    let terrain = crate::core::overworld_terrain(&config, &registry).unwrap();
+    let world = crate::world::ChunkWorld::new(
+        100,
+        Arc::new(terrain),
+        &registry,
+        mc_world::BlockStateId(registry.states.air),
+        [128, 70, 0],
+        mc_world::OVERWORLD_GEOMETRY,
+    );
+    let mut state = TickState::new(registry, world, 4, 512);
+    let chunks: Vec<_> = (2..=11)
+        .flat_map(|x| (-4..=4).map(move |z| ChunkPos { x, z }))
+        .collect();
+    state
+        .world
+        .ensure_blocking(&chunks.iter().map(|p| (*p, 0)).collect());
+    for (index, chunk) in chunks.iter().filter(|p| p.x >= 3).enumerate() {
+        state
+            .tickets
+            .insert(format!("seed100-{index}"), (*chunk, 0));
+    }
+    state.refresh_active_chunks(0);
+    let mut changes = ChangeSet::default();
+    crate::villager::generated::load(&mut state, &chunks, &mut changes);
+    changes.chunks_loaded.extend(chunks);
+    tick(&mut state, &mut changes);
+    let cobble = state
+        .registry
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:cobblestone").unwrap())
+        .unwrap();
+    for _ in 0..12_000 {
+        crate::tick::run_tick(&mut state, &[]);
+        if state.tick.is_multiple_of(1_000) {
+            for record in state.settlements.records() {
+                for mine in record
+                    .buildings
+                    .values()
+                    .filter(|b| b.kind == BuildingKind::Mine)
+                {
+                    eprintln!(
+                        "tick={} mine={:?} active={}",
+                        state.tick,
+                        mine.work_points,
+                        state.world.is_active(
+                            mine.work_points[0][0].div_euclid(16),
+                            mine.work_points[0][2].div_euclid(16)
+                        )
+                    );
+                }
+            }
+            for slot in state.entities.slots() {
+                if let Some(v) = state.entities.row(slot).villager.as_ref()
+                    && v.data.profession == crate::villager::VillagerProfession::Miner
+                {
+                    eprintln!(
+                        "tick={} pos={:?} progress={:?} inventory={:?}",
+                        state.tick,
+                        state.entities.pos(slot),
+                        v.mining_progress,
+                        v.inventory
+                    );
+                }
+            }
+        }
+        for record in state.settlements.records() {
+            if let Some([x, y, z]) = record.bootstrap_storage
+                && let Some(chest) = state.block_entities.get(&(x, y, z))
+                && chest
+                    .slots
+                    .iter()
+                    .any(|stack| stack.item_id == cobble && stack.count > 0)
+            {
+                eprintln!("tick={} cobblestone deposited at {x},{y},{z}", state.tick);
+                return;
+            }
+        }
+    }
+    panic!("seed 100 miner did not deposit cobblestone");
 }
