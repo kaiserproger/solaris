@@ -273,6 +273,14 @@ fn well(r: &BlockRegistry) -> Result<StructureTemplate, String> {
     for p in [[2, 0, 2], [1, 0, 2], [3, 0, 2], [2, 0, 1], [2, 0, 3]] {
         b.put(p, "minecraft:water")?;
     }
+    b.put([2, -3, 2], "minecraft:sandstone")?;
+    for pos in [[2, -1, 2], [2, -2, 2]] {
+        b.archaeology(
+            pos,
+            "minecraft:suspicious_sand",
+            "minecraft:archaeology/desert_well",
+        )?;
+    }
     for x in [0, 4] {
         for z in [0, 4] {
             b.fill([x, 1, z], [x, 3, z], "minecraft:sandstone")?;

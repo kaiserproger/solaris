@@ -243,6 +243,24 @@ fn desert_pyramid(r: &BlockRegistry) -> Result<StructureTemplate, String> {
     for p in [[8, 1, 10], [12, 1, 10], [10, 1, 8], [10, 1, 12]] {
         b.chest(p, "minecraft:chests/desert_pyramid")?;
     }
+    // Buried archaeology chamber at the rear of the pyramid.
+    b.fill([2, 5, 15], [6, 5, 19], "minecraft:sandstone")?;
+    b.fill([2, 6, 15], [6, 10, 19], "minecraft:sand")?;
+    for pos in [
+        [2, 6, 15],
+        [4, 6, 15],
+        [6, 6, 15],
+        [3, 6, 17],
+        [5, 6, 17],
+        [2, 6, 19],
+        [6, 6, 19],
+    ] {
+        b.archaeology(
+            pos,
+            "minecraft:suspicious_sand",
+            "minecraft:archaeology/desert_pyramid",
+        )?;
+    }
     Ok(b.finish([21, 24, 21]))
 }
 fn jungle_pyramid(r: &BlockRegistry) -> Result<StructureTemplate, String> {

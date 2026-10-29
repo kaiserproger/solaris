@@ -159,7 +159,36 @@ fn interact_parity_painting_places_on_wall() {
 fn interact_parity_brushing_completes_once() {
     for (source, result) in [("suspicious_sand", "sand"), ("suspicious_gravel", "gravel")] {
         let (mut state, actor) = setup();
+        let table_id = Identifier::parse("minecraft:archaeology/desert_pyramid").unwrap();
+        let expected = state
+            .registry
+            .chest_loot
+            .get(&table_id)
+            .unwrap()
+            .roll(
+                &mut mc_data::loot::chest_26_1_2::ChestRng::new(42),
+                &state.registry.items,
+                0.0,
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("seed yields an archaeology item");
         install(&mut state, source, &[("dusted", "0")]);
+        let nbt = mc_nbt::Tag::Compound(vec![
+            (
+                "id".into(),
+                mc_nbt::Tag::String("minecraft:brushable_block".into()),
+            ),
+            (
+                "LootTable".into(),
+                mc_nbt::Tag::String("minecraft:archaeology/desert_pyramid".into()),
+            ),
+            ("LootTableSeed".into(), mc_nbt::Tag::Long(42)),
+        ]);
+        let mut bytes = Vec::new();
+        mc_nbt::write_network(&mut bytes, &nbt).unwrap();
+        state.world.set_opaque_block_entity(POS, Some(bytes));
         give(&mut state, actor, "brush", 1);
         let slot = state.entities.slot_of(actor).unwrap();
         let [x, y, z] = state.entities.pos(slot);
@@ -174,9 +203,34 @@ fn interact_parity_brushing_completes_once() {
         };
         state.entities.set_rot(slot, yaw, pitch);
         use_on(&mut state, POS, 1, [0.5; 3]);
+        let mut dusted = [false; 4];
+        dusted[0] = true;
         for _ in 0..200 {
             run_tick(&mut state, &[]);
+            for (n, seen) in dusted.iter_mut().enumerate().skip(1) {
+                if state.world.block_at(POS.x, POS.y, POS.z)
+                    == Some(block(&state, source, &[("dusted", &n.to_string())]))
+                {
+                    *seen = true;
+                }
+            }
+            if state.world.block_at(POS.x, POS.y, POS.z) == Some(block(&state, result, &[])) {
+                break;
+            }
         }
+        assert!(
+            dusted.into_iter().all(|seen| seen),
+            "all dust stages appear"
+        );
+        let expected_id = expected.item_id;
+        assert!(state.entities.item_slots().any(|slot| {
+            state
+                .entities
+                .row(slot)
+                .item
+                .as_ref()
+                .is_some_and(|item| item.item_id == expected_id)
+        }));
         assert_eq!(
             state.world.block_at(POS.x, POS.y, POS.z),
             Some(block(&state, result, &[]))
