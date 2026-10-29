@@ -292,25 +292,45 @@ pub(super) fn clientbound(
         }
         "set_player_team" => team(&mut r, &mut w)?,
         "container_set_content" => {
-            w.write_varint(r.read_varint()?);
+            let window = r.read_varint()?;
+            w.write_varint(window);
             w.write_varint(r.read_varint()?);
             let n = r.read_varint()?;
             ensure!((0..=1024).contains(&n), "container size");
             w.write_varint(n);
-            for _ in 0..=n {
-                items::stack(t, To::Legacy, &mut r, &mut w)?;
+            if window == 0 {
+                session.inventory_polyfills.lock().clear();
             }
+            for slot in 0..n {
+                inventory_stack(
+                    session,
+                    (window == 0).then_some(slot as i16),
+                    &mut r,
+                    &mut w,
+                )?;
+            }
+            items::stack(t, To::Legacy, &mut r, &mut w)?;
         }
         "container_set_slot" => {
+            let window = r.read_varint()?;
+            w.write_varint(window);
             w.write_varint(r.read_varint()?);
-            w.write_varint(r.read_varint()?);
-            w.write_i16(r.read_i16()?);
-            items::stack(t, To::Legacy, &mut r, &mut w)?;
+            let slot = r.read_i16()?;
+            w.write_i16(slot);
+            inventory_stack(session, (window == 0).then_some(slot), &mut r, &mut w)?;
         }
         "set_cursor_item" => items::stack(t, To::Legacy, &mut r, &mut w)?,
         "set_player_inventory" => {
-            w.write_varint(r.read_varint()?);
-            items::stack(t, To::Legacy, &mut r, &mut w)?;
+            let slot = r.read_varint()?;
+            w.write_varint(slot);
+            let menu_slot = match slot {
+                0..=8 => Some((slot + 36) as i16),
+                9..=35 => Some(slot as i16),
+                36..=39 => Some((44 - slot) as i16),
+                40 => Some(45),
+                _ => None,
+            };
+            inventory_stack(session, menu_slot, &mut r, &mut w)?;
         }
         "set_equipment" => {
             w.write_varint(r.read_varint()?);
@@ -452,7 +472,16 @@ pub(super) fn serverbound(
             w.write_varint(i32::from(front));
         }
         "set_creative_mode_slot" => {
-            w.write_i16(r.read_i16()?);
+            let slot = r.read_i16()?;
+            let mut polyfills = session.inventory_polyfills.lock();
+            if polyfills
+                .get(&slot)
+                .is_some_and(|sent| sent.as_slice() == r)
+            {
+                return Ok(None);
+            }
+            polyfills.remove(&slot);
+            w.write_i16(slot);
             items::stack(t, To::Canonical, &mut r, &mut w)?;
         }
         "container_click" => {
@@ -474,6 +503,36 @@ pub(super) fn serverbound(
     }
     ensure!(r.is_empty(), "{} trailing bytes", r.len());
     Ok(Some(w))
+}
+
+/// Record only lossy item-id substitutions, not ordinary legacy stacks.
+fn inventory_stack(
+    session: &Session,
+    slot: Option<i16>,
+    r: &mut &[u8],
+    w: &mut Vec<u8>,
+) -> Result<()> {
+    let t = &session.profile.tables;
+    let mut peek = *r;
+    let count = peek.read_varint()?;
+    let lossy = if count > 0 {
+        let item = peek.read_varint()?;
+        let legacy = t.items.get(item).unwrap_or(1);
+        t.items.back(legacy) != Some(item)
+    } else {
+        false
+    };
+    let start = w.len();
+    items::stack(t, To::Legacy, r, w)?;
+    if let Some(slot @ 5..=45) = slot {
+        let mut polyfills = session.inventory_polyfills.lock();
+        if lossy {
+            polyfills.insert(slot, w[start..].to_vec());
+        } else {
+            polyfills.remove(&slot);
+        }
+    }
+    Ok(())
 }
 
 /// Absolute target of a teleport, resolving relative components (vanilla

@@ -504,3 +504,61 @@ fn new_cube_spawns_as_slime_with_legacy_size_metadata() {
         "size moves to index 16; new age fields vanish"
     );
 }
+
+#[test]
+fn creative_polyfill_tracks_player_inventory_images_and_updates() {
+    let mut writer = test_session(Tables {
+        items: IdMap::by_name([("stone", 10), ("sulfur", 11)], [("stone", 1)], |name| {
+            (name == "sulfur").then(|| "stone".to_owned())
+        }),
+        ..Tables::default()
+    });
+    let mut reader = writer.split();
+    let echo = [0, 36, 1, 1, 0, 0];
+    let mut content = Vec::new();
+    content.write_varint(0);
+    content.write_varint(1);
+    content.write_varint(46);
+    for slot in 0..46 {
+        if slot == 36 {
+            content.extend([1, 11, 0, 0]);
+        } else {
+            content.push(0);
+        }
+    }
+    content.push(0);
+    clientbound(&mut writer, "container_set_content", &content).unwrap();
+    assert!(
+        serverbound(&mut reader, "set_creative_mode_slot", &echo)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut update = Vec::new();
+    update.write_varint(0);
+    update.write_varint(2);
+    update.write_i16(36);
+    update.extend([1, 10, 0, 0]);
+    clientbound(&mut writer, "container_set_slot", &update).unwrap();
+    assert!(
+        serverbound(&mut reader, "set_creative_mode_slot", &echo)
+            .unwrap()
+            .is_some()
+    );
+
+    update[5] = 11;
+    clientbound(&mut writer, "container_set_slot", &update).unwrap();
+    assert!(
+        serverbound(&mut reader, "set_creative_mode_slot", &echo)
+            .unwrap()
+            .is_none()
+    );
+
+    let empty = [0, 3, 0, 0]; // Window 0, state 3, empty list and cursor.
+    clientbound(&mut writer, "container_set_content", &empty).unwrap();
+    assert!(
+        serverbound(&mut reader, "set_creative_mode_slot", &echo)
+            .unwrap()
+            .is_some()
+    );
+}

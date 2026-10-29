@@ -60,6 +60,10 @@ Current server-fixes behavior (source and focused regression scope, not live acc
   dispenser bone meal. Crop, propagule and bell support is checked on neighboring
   block changes. These changes have focused regression cases but no new
   real-client acceptance.
+- Legacy creative inventory updates matching a sent 26.3-only item stand-in are
+  ignored to preserve the real item; other replacements still apply. Identical
+  stand-in selections in that same slot cannot be distinguished from echoes.
+  This has focused translation coverage, not a new real-client gate.
 
 ## Protocol, login, chat and commands
 

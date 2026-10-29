@@ -139,6 +139,8 @@ pub struct Session {
     profile: Arc<Profile>,
     phase: Phase,
     teleports: Arc<Mutex<Teleports>>,
+    /// Last lossy player-inventory images sent on the wire, keyed by menu slot.
+    inventory_polyfills: Arc<Mutex<HashMap<i16, Vec<u8>>>>,
     /// Entities whose metadata layout differs (canonical type policy).
     entities: HashMap<i32, Metadata>,
 }
@@ -150,6 +152,7 @@ impl Session {
             profile,
             phase: Phase::Login,
             teleports: Arc::default(),
+            inventory_polyfills: Arc::default(),
             entities: HashMap::new(),
         }
     }
@@ -166,6 +169,7 @@ impl Session {
             profile: Arc::clone(&self.profile),
             phase: self.phase,
             teleports: Arc::clone(&self.teleports),
+            inventory_polyfills: Arc::clone(&self.inventory_polyfills),
             entities: HashMap::new(),
         }
     }

@@ -16,8 +16,8 @@ const CANONICAL: &str = r#"{
         "serverbound": {"minecraft:finish_configuration": {"protocol_id": 3}}
     },
     "play": {
-        "clientbound": {"minecraft:block_update": {"protocol_id": 9}, "minecraft:add_transient_block": {"protocol_id": 37}, "minecraft:keep_alive": {"protocol_id": 45}},
-        "serverbound": {"minecraft:keep_alive": {"protocol_id": 28}, "minecraft:punch": {"protocol_id": 46}}
+        "clientbound": {"minecraft:block_update": {"protocol_id": 9}, "minecraft:add_transient_block": {"protocol_id": 37}, "minecraft:keep_alive": {"protocol_id": 45}, "minecraft:set_player_inventory": {"protocol_id": 100}},
+        "serverbound": {"minecraft:keep_alive": {"protocol_id": 28}, "minecraft:punch": {"protocol_id": 46}, "minecraft:set_creative_mode_slot": {"protocol_id": 57}}
     }
 }"#;
 
@@ -31,8 +31,8 @@ const LEGACY: &str = r#"{
         "serverbound": {"minecraft:finish_configuration": {"protocol_id": 3}}
     },
     "play": {
-        "clientbound": {"minecraft:block_update": {"protocol_id": 9}, "minecraft:keep_alive": {"protocol_id": 44}},
-        "serverbound": {"minecraft:keep_alive": {"protocol_id": 27}, "minecraft:swing": {"protocol_id": 63}}
+        "clientbound": {"minecraft:block_update": {"protocol_id": 9}, "minecraft:keep_alive": {"protocol_id": 44}, "minecraft:set_player_inventory": {"protocol_id": 99}},
+        "serverbound": {"minecraft:keep_alive": {"protocol_id": 27}, "minecraft:swing": {"protocol_id": 63}, "minecraft:set_creative_mode_slot": {"protocol_id": 98}}
     }
 }"#;
 
@@ -50,6 +50,127 @@ fn frame(id: i32, body: &[u8]) -> RawFrame {
         id,
         body: Bytes::copy_from_slice(body),
     }
+}
+
+#[test]
+fn legacy_creative_echo_keeps_unknown_item_but_real_changes_pass() {
+    use super::tables::IdMap;
+    use mc_protocol::codec::WriteMc;
+
+    let mut writer = session();
+    Arc::get_mut(&mut writer.profile).unwrap().tables.items =
+        IdMap::by_name([("stone", 10), ("new_item", 11)], [("stone", 1)], |name| {
+            (name == "new_item").then(|| "stone".to_owned())
+        });
+    writer.phase = Phase::Play;
+    let mut reader = writer.split();
+    let mut sent = Vec::new();
+    sent.write_varint(0);
+    for value in [1, 11, 0, 0] {
+        sent.write_varint(value);
+    }
+    let (_, legacy) = writer.clientbound(100, &sent).unwrap().unwrap();
+    let mut echo = Vec::new();
+    echo.write_i16(36);
+    echo.extend_from_slice(&legacy[1..]);
+    assert!(
+        reader.serverbound(frame(98, &echo)).unwrap().is_none(),
+        "stand-in echo must not replace the real item"
+    );
+    let mut changed = Vec::new();
+    changed.write_i16(37);
+    for value in [1, 1, 0, 0] {
+        changed.write_varint(value);
+    }
+    let translated = reader.serverbound(frame(98, &changed)).unwrap().unwrap();
+    assert_eq!(&translated.body[..], &[0, 37, 1, 10, 0, 0]);
+}
+
+#[test]
+fn legacy_creative_echo_and_replacement_reach_player_inventory() {
+    use super::tables::IdMap;
+    use mc_core::boundary::{ConnectionId, PlayerInput};
+    use mc_core::commands::GameMode;
+    use mc_core::inventory::ItemRules;
+    use mc_core::player::PlayerState;
+    use mc_data::{Identifier, ItemStack};
+    use mc_protocol::codec::WriteMc;
+
+    let items = mc_data::items::solaris_required_items();
+    let facts = mc_data::item_components::solaris_required_item_facts();
+    let tags = mc_data::tags::TagsData::default();
+    let rules = ItemRules {
+        items: &items,
+        facts: &facts,
+        tags: &tags,
+        recipes: &[],
+    };
+    let stone = items
+        .id_of(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap();
+    let unknown = items
+        .id_of(&Identifier::parse("minecraft:wooden_sword").unwrap())
+        .unwrap();
+    let mut writer = session();
+    Arc::get_mut(&mut writer.profile).unwrap().tables.items = IdMap::by_name(
+        [("stone", stone), ("new_item", unknown)],
+        [("stone", 1)],
+        |name| (name == "new_item").then(|| "stone".to_owned()),
+    );
+    writer.phase = Phase::Play;
+    let mut reader = writer.split();
+    let mut player = PlayerState::new(ConnectionId(1), GameMode::Creative);
+    player.inventory.slots[0] = ItemStack::new(unknown, 1);
+    let mut sent = Vec::new();
+    sent.write_varint(0);
+    for value in [1, unknown as i32, 0, 0] {
+        sent.write_varint(value);
+    }
+    let (_, legacy) = writer.clientbound(100, &sent).unwrap().unwrap();
+    let mut echo = Vec::new();
+    echo.write_i16(36);
+    echo.extend_from_slice(&legacy[1..]);
+    let mut decode = crate::decode::DecodeState::default();
+    let mut inputs = Vec::new();
+    if let Some(frame) = reader.serverbound(frame(98, &echo)).unwrap() {
+        crate::decode::decode_play_frame(
+            ConnectionId(1),
+            frame.id,
+            &frame.body,
+            &mut decode,
+            &mut inputs,
+        )
+        .unwrap();
+    }
+    for input in inputs.drain(..) {
+        if let PlayerInput::CreativeSlot { slot, stack, .. } = input {
+            player.creative_slot(&rules, slot, stack);
+        }
+    }
+    assert_eq!(player.inventory.slots[0], ItemStack::new(unknown, 1));
+    let mut replacement = Vec::new();
+    replacement.write_i16(36);
+    for value in [2, 1, 0, 0] {
+        replacement.write_varint(value);
+    }
+    let frame = reader
+        .serverbound(frame(98, &replacement))
+        .unwrap()
+        .unwrap();
+    crate::decode::decode_play_frame(
+        ConnectionId(1),
+        frame.id,
+        &frame.body,
+        &mut decode,
+        &mut inputs,
+    )
+    .unwrap();
+    for input in inputs {
+        if let PlayerInput::CreativeSlot { slot, stack, .. } = input {
+            player.creative_slot(&rules, slot, stack);
+        }
+    }
+    assert_eq!(player.inventory.slots[0], ItemStack::new(stone, 2));
 }
 
 #[test]
