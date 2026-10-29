@@ -563,6 +563,15 @@ fn natural_zones(
                 [min[0], entrance[1] - 14, min[2]],
                 [max[0], entrance[1] + 1, max[2]],
             )
+            && crate::villager::mining::initial_cut_safe(
+                state,
+                bounds,
+                crate::boundary::BlockPos {
+                    x: entrance[0],
+                    y: entrance[1],
+                    z: entrance[2],
+                },
+            )
         {
             queue_natural(
                 site,

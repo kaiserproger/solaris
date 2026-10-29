@@ -518,6 +518,16 @@ fn safe(
     Ok(())
 }
 
+/// Check the first actual staircase cut before installing a natural mine job.
+pub(crate) fn initial_cut_safe(
+    state: &TickState,
+    bounds: ScriptWorldBounds,
+    entrance: BlockPos,
+) -> bool {
+    cell_in_flight(bounds, entrance, 0, 0, 0)
+        .is_some_and(|current| safe(state, bounds, entrance, current, entrance, 3, 0, 0).is_ok())
+}
+
 /// Open cells of an earlier tunnel of this mine, flooded from `start`: it
 /// stays inside the zone, is small, opens onto the surface under the entrance
 /// (never a sealed pocket) and touches no fluid. Anything else is a cave.
