@@ -187,7 +187,9 @@ const MAX_RECIPE_BOOK_INGREDIENT_ITEMS: usize = 2048;
 const MAX_RECIPE_BOOK_SLOT_DEPTH: usize = 16;
 const MAX_COMMAND_LEN: usize = 32_767;
 const MAX_CHAT_MESSAGE_LEN: usize = 256;
-const MAX_COMMAND_NODE_COUNT: usize = 1024;
+// The full operator tree passed 1024 nodes in RC2; matches the native
+// client's reader bound (solaris-client src/ui/commands.rs `read_tree`).
+const MAX_COMMAND_NODE_COUNT: usize = 65_536;
 const MAX_COMMAND_CHILD_COUNT: usize = 1024;
 const MAX_COMMAND_SUGGESTION_LEN: usize = 32_500;
 const SIGN_LINE_COUNT: usize = 4;
