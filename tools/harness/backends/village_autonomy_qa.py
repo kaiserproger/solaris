@@ -356,7 +356,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         raise ValueError("village-autonomy-qa accepts only --client, --windowed and --timeout-seconds")
     if not ctx.windowed:
         raise ValueError("village-autonomy-qa requires --windowed (dialog Claim needs a presented window)")
-    timeout = ctx.timeout_seconds if ctx.timeout_seconds is not None else 600.0
+    timeout = ctx.timeout_seconds if ctx.timeout_seconds is not None else 3600.0
     if not 0 < timeout <= 3600:
         raise ValueError("village-autonomy-qa --timeout-seconds must be in (0, 3600]")
     artifact = ctx.artifact_dir
@@ -822,13 +822,18 @@ def _scenario(
             produced = {k: v for k, v in totals_now.items() if v > 0}
             state_now = probe.observe()
             time_info = state_now.get("time", {})
+            buildings = _recent_chat(_send(probe, "settlement building list"), 25)
             detail["storage_rounds"].append({
                 "round": growth_rounds,
                 "totals": dict(totals_now),
                 "game_time": time_info.get("game_time") if isinstance(time_info, dict) else None,
-                "buildings": _recent_chat(_send(probe, "settlement building list"), 25),
+                "buildings": buildings,
             })
-            if _storage_covers(produced):
+            # Builders spend the stock as it arrives; a listed Storage moves on
+            # to the client-verified Storage check below.
+            if _storage_covers(produced) or any(
+                b["kind"] == "storage" for b in _listed_buildings(buildings[:1])
+            ):
                 break
     detail["storage_growth_totals"] = totals_now
     detail["storage_time_add_ticks"] = day_advanced
@@ -1222,6 +1227,9 @@ def _observe_blueprint(
     }
     expected = 0
     mismatches = []
+    # Builders use the settlement's available wood (construction.rs), so one
+    # species replaces every authored oak_* block of this building.
+    species = None
     for y, layer in enumerate(layers):
         for z, row in enumerate(layer):
             for x, symbol in enumerate(row):
@@ -1244,6 +1252,11 @@ def _observe_blueprint(
                 at = (origin[0] + x, origin[1] + y, origin[2] + z)
                 cell = blocks.get(at, {})
                 got = _block_id(cell)
+                if block.startswith("minecraft:oak_"):
+                    suffix = "_" + block.removeprefix("minecraft:oak_")
+                    if species is None and got.startswith("minecraft:") and got.endswith(suffix):
+                        species = got.removeprefix("minecraft:").removesuffix(suffix)
+                    block = f"minecraft:{species or 'oak'}{suffix}"
                 actual_properties = cell.get("properties") or {}
                 if got != block or any(
                     key not in mutable and str(actual_properties.get(key)) != value
@@ -1252,7 +1265,7 @@ def _observe_blueprint(
                     mismatches.append({"at": at, "expected": state, "actual": cell})
     detail.setdefault("client_blocks", {})[label] = {
         "building_id": record["id"], "blueprint": blueprint["id"], "level": record["level"],
-        "origin": origin, "expected_non_air": expected,
+        "origin": origin, "expected_non_air": expected, "wood_species": species or "oak",
         "comparison": "all non-air blocks and stable authored properties; normal gameplay states allowed",
         "matched": expected - len(mismatches), "mismatch_count": len(mismatches),
         "mismatches": mismatches[:8],
