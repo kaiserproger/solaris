@@ -42,6 +42,7 @@ mod ore_rules;
 mod ore_veins;
 mod overworld;
 mod sediments;
+mod solid_cache;
 mod solids;
 mod trees;
 
@@ -333,6 +334,8 @@ pub struct TerrainGenerator {
     /// the CPU.
     #[cfg(feature = "gpu")]
     gpu: Option<gpu_service::GpuSolidService>,
+    /// Chunk solids shared between the generations that read them.
+    solid_cache: solid_cache::SolidCache,
 }
 
 #[derive(Clone)]
@@ -1037,6 +1040,7 @@ impl TerrainGenerator {
             blocks: registry,
             #[cfg(feature = "gpu")]
             gpu: None,
+            solid_cache: solid_cache::SolidCache::default(),
         })
     }
 
@@ -2849,8 +2853,27 @@ impl ChunkGenerator for TerrainGenerator {
         if let Some(grid) = self.gpu.as_ref().and_then(|gpu| gpu.solids_around(pos)) {
             return self.generate_with_solids(pos, Some(&grid));
         }
-        self.generate_with_solids(pos, None)
+        match self.vanilla() {
+            Some((_, density)) => {
+                let grid = self
+                    .solid_cache
+                    .around(pos, |pos| chunk_solids(density, pos));
+                self.generate_with_solids(pos, Some(&grid))
+            }
+            None => self.generate_with_solids(pos, None),
+        }
     }
+}
+
+/// Which blocks of the chunk at `pos` the density makes solid, on the CPU.
+fn chunk_solids(density: &VanillaDensity, pos: ChunkPos) -> ChunkSolids {
+    let mut values = vec![0.0; density.height() as usize * 256];
+    density.fill_density_chunk(
+        world_block_coordinate(pos.x, 0),
+        world_block_coordinate(pos.z, 0),
+        &mut values,
+    );
+    ChunkSolids::from_densities(&values, density.height() as usize)
 }
 
 impl TerrainGenerator {
@@ -2874,17 +2897,9 @@ impl TerrainGenerator {
         let native_solids = self.vanilla().map(|(climate, noise)| {
             let min_x = world_block_coordinate(pos.x, 0);
             let min_z = world_block_coordinate(pos.z, 0);
-            let held = solids.and_then(|solids| solids.chunk(pos));
-            let values = match held {
+            let values = match solids.and_then(|solids| solids.chunk(pos)) {
                 Some(held) => std::borrow::Cow::Borrowed(held),
-                None => {
-                    let mut values = vec![0.0; noise.height() as usize * 256];
-                    noise.fill_density_chunk(min_x, min_z, &mut values);
-                    std::borrow::Cow::Owned(ChunkSolids::from_densities(
-                        &values,
-                        noise.height() as usize,
-                    ))
-                }
+                None => std::borrow::Cow::Owned(chunk_solids(noise, pos)),
             };
             // Density offsets inside the geometry: the top search's range.
             let low = (self.geometry.min_y() - noise.min_y()).max(0);

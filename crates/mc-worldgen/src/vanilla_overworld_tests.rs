@@ -160,6 +160,65 @@ fn generated_biomes_are_noise_biomes_at_their_cells() {
     }
 }
 
+/// Chunks generated through the shared solids cache, several at once as chunk
+/// workers do, are the chunks generated on their own.
+#[test]
+fn chunks_from_shared_solids_match_chunks_generated_alone() {
+    let Some(root) = content_cache() else { return };
+    let blocks = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
+    );
+    let generator = || {
+        let mut terrain = TerrainGenerator::new(712816, Arc::clone(&blocks));
+        terrain.load_vanilla_worldgen(&root).unwrap();
+        terrain
+    };
+    let (shared, alone) = (generator(), generator());
+    let positions: Vec<ChunkPos> = (-1..2)
+        .flat_map(|z| (-1..2).map(move |x| ChunkPos { x, z }))
+        .collect();
+    let generated: Vec<_> = std::thread::scope(|scope| {
+        let shared = &shared;
+        let workers: Vec<_> = positions
+            .chunks(3)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|&pos| shared.generate(pos))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect()
+    });
+    for (&pos, chunk) in positions.iter().zip(&generated) {
+        let expected = alone.generate_with_solids(pos, None);
+        for y in expected.geometry().min_y()..expected.geometry().max_y() {
+            for column in 0..256u16 {
+                let (x, z) = ((column % 16) as u8, (column / 16) as u8);
+                assert_eq!(
+                    chunk.get_block(x, y, z),
+                    expected.get_block(x, y, z),
+                    "{pos:?} ({x},{y},{z})"
+                );
+            }
+        }
+        for (section, (actual, expected)) in chunk.biomes.iter().zip(&expected.biomes).enumerate() {
+            for cell in 0..64u8 {
+                let (cx, cy, cz) = (cell % 4, cell / 16, cell / 4 % 4);
+                assert_eq!(
+                    actual.get(cx, cy, cz),
+                    expected.get(cx, cy, cz),
+                    "{pos:?} section {section}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn vanilla_density_height_and_ocean_water_reach_generated_blocks() {
     let Some(root) = content_cache() else { return };
