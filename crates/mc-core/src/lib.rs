@@ -61,9 +61,9 @@ pub(crate) use command_debug::{Profiler as DebugProfiler, TraceArtifact as Debug
 pub mod command_enchant;
 mod command_execution;
 mod command_item_replace;
-pub mod command_loot;
 pub mod command_items;
 pub mod command_locate;
+pub mod command_loot;
 mod command_nbt_path;
 pub mod command_rules;
 pub(crate) mod command_snbt;
@@ -184,6 +184,7 @@ mod shelf;
 pub mod shrieker;
 mod shulker;
 mod signs;
+mod singleplayer_pause;
 pub mod sleep;
 mod spawn_egg;
 pub mod special_mobs;

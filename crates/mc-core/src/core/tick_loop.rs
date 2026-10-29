@@ -2,6 +2,7 @@
 //! Moved verbatim from `core.rs`.
 
 use super::*;
+use crate::singleplayer_pause::{SingleplayerPause, online_players};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Tick loop: 20 TPS, event-driven wake (no sleeps beyond the tick timer).
@@ -36,14 +37,6 @@ pub(super) struct TickChannels {
     pub(super) input_log: Option<crate::input_log::InputLog>,
 }
 
-/// Online players across every dimension; the empty-server pause counts them.
-pub(super) fn online_players(state: &TickState) -> usize {
-    std::iter::once(state)
-        .chain(state.other_dimensions.values().map(|world| &**world))
-        .map(|world| world.players.len())
-        .sum()
-}
-
 pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
     let mut next_tick = std::time::Instant::now();
     let mut admission_reserve_us = state
@@ -67,8 +60,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
     // Empty-server pause bookkeeping (vanilla `pause-when-empty-seconds`).
     let mut empty_ticks = 0u64;
     let mut paused = false;
-    // The local operator's menu pauses the entire world, not `/tick freeze`.
-    let mut singleplayer_pause: Option<ConnectionId> = None;
+    let mut singleplayer_pause = SingleplayerPause::default();
     'ticks: loop {
         let wall_start = std::time::Instant::now();
         let wall_start_unix_ns = std::time::SystemTime::now()
@@ -99,64 +91,8 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
         while let Ok(input) = channels.input_rx.try_recv() {
             inputs.push(input);
         }
-        let joining = inputs
-            .iter()
-            .any(|input| matches!(input, PlayerInput::Join { .. }));
-        let leaving = inputs
-            .iter()
-            .any(|input| matches!(input, PlayerInput::Leave { .. }));
-        if joining
-            || inputs.iter().any(|input| {
-                matches!(input,
-                    PlayerInput::Leave { connection } if Some(*connection) == singleplayer_pause
-                )
-            })
-        {
-            singleplayer_pause = None;
-        }
-        inputs.retain(|input| {
-            let PlayerInput::Command {
-                connection,
-                command,
-                permission_level,
-            } = input
-            else {
-                return true;
-            };
-            let requested = match command.as_str() {
-                "solaris_pause on" => true,
-                "solaris_pause off" => false,
-                _ => return true,
-            };
-            let owner_online = std::iter::once(&state)
-                .chain(state.other_dimensions.values().map(|world| &**world))
-                .any(|world| {
-                    world.connections.entity_of(*connection).is_some()
-                        && !world.session_locked(*connection)
-                });
-            let allowed = *permission_level >= 4
-                && owner_online
-                && online_players(&state) == 1
-                && !joining
-                && !leaving
-                && (requested || singleplayer_pause == Some(*connection));
-            if allowed {
-                singleplayer_pause = requested.then_some(*connection);
-            } else {
-                let _ = channels.outbox.send(vec![(
-                    *connection,
-                    vec![PlayerChange::Chat {
-                        message: "Cannot pause: one online operator is required.".into(),
-                    }],
-                )]);
-            }
-            false
-        });
-        if singleplayer_pause.is_some() {
-            // Network keepalives are handled by the edge independently. Do not
-            // let movement or other gameplay inputs advance a paused world.
-            inputs.clear();
-        }
+        let singleplayer_runs =
+            singleplayer_pause.filter_inputs(&state, &mut inputs, &channels.outbox);
         let mut activity = !inputs.is_empty();
         while let Ok(request) = channels.moderation_selector_rx.try_recv() {
             moderation_selector::answer(&state, request);
@@ -164,9 +100,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
         // Debug/test spawns drain here (bench + tests only).
         let logging = channels.input_log.is_some();
         let mut logged_spawns = Vec::new();
-        while singleplayer_pause.is_none()
-            && let Ok(request) = channels.spawn_rx.try_recv()
-        {
+        while singleplayer_runs && let Ok(request) = channels.spawn_rx.try_recv() {
             if logging {
                 logged_spawns.push(crate::input_log::LoggedSpawn::new(&request));
             }
@@ -175,9 +109,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
         }
         // Remote tickets drain here; the journal records them each tick.
         let mut logged_tickets = Vec::new();
-        while singleplayer_pause.is_none()
-            && let Ok(ticket) = channels.ticket_rx.try_recv()
-        {
+        while singleplayer_runs && let Ok(ticket) = channels.ticket_rx.try_recv() {
             if logging {
                 logged_tickets.push(crate::input_log::LoggedTicket {
                     owner: ticket.owner.clone(),
@@ -229,7 +161,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
             empty_ticks = 0;
             paused = false;
         }
-        if (paused && !activity) || singleplayer_pause.is_some() {
+        if (paused && !activity) || !singleplayer_runs {
             if !checkpoint_in_flight && let Ok(reply) = channels.checkpoint_rx.try_recv() {
                 checkpoint_in_flight = start_checkpoint_with_reply(
                     &mut state,
