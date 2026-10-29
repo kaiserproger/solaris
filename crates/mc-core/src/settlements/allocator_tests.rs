@@ -98,6 +98,37 @@ fn step(state: &mut TickState) -> ChangeSet {
 }
 
 #[test]
+fn unemployed_villager_does_not_reserve_work_before_shift() {
+    let mut state = test_state();
+    state.day_time = 1000;
+    let composter = block(&state, "minecraft:composter", &[]);
+    state.world.set_block(4, 201, 4, composter);
+    state.world.fold_overlay();
+    let slot = villager(&mut state, [2.5, 201.0, 2.5]);
+    for _ in 0..60 {
+        step(&mut state);
+    }
+    assert!(
+        state
+            .entities
+            .row(slot)
+            .villager
+            .as_ref()
+            .unwrap()
+            .job_site
+            .is_none()
+    );
+    state.day_time = 2000;
+    for _ in 0..240 {
+        step(&mut state);
+    }
+    assert_eq!(
+        state.entities.row(slot).villager.as_ref().unwrap().job_site,
+        Some(BlockPos { x: 4, y: 201, z: 4 })
+    );
+}
+
+#[test]
 fn allocator_assigns_home_job_and_meeting_point_as_sole_authority() {
     let mut state = test_state();
     state.day_time = 2000;
@@ -254,6 +285,7 @@ fn allocator_shares_one_pool_across_dimensions_without_local_reset() {
 #[test]
 fn allocator_route_refusal_retries_on_next_pass() {
     let mut state = test_state();
+    state.day_time = 2000;
     let composter = block(&state, "minecraft:composter", &[]);
     state.world.set_block(10, 201, 8, composter);
     state.world.fold_overlay();
@@ -327,6 +359,7 @@ fn allocator_rebuilds_member_counts_from_live_columns() {
 #[test]
 fn allocator_scopes_acquisition_to_bound_settlement_radius() {
     let mut state = test_state();
+    state.day_time = 2000;
     let slot = villager(&mut state, [8.5, 201.0, 8.5]);
     // Certified in-settlement workstation vs a closer uncertified one:
     // the bound villager must skip the closer POI and claim the building slot.
@@ -1222,8 +1255,49 @@ fn blocked_home_with_resource_job() -> (TickState, EntitySlot, BlockPos) {
 }
 
 #[test]
+fn settlement_without_storage_fills_a_reachable_resource_job_before_a_nearby_workshop() {
+    let (mut state, slot, resource_job) = blocked_home_with_resource_job();
+    state.day_time = 2000;
+    let settlement = state
+        .entities
+        .row(slot)
+        .villager
+        .as_ref()
+        .unwrap()
+        .settlement
+        .unwrap();
+    let composter = block(&state, "minecraft:composter", &[]);
+    state.world.set_block(2, 201, 8, composter);
+    state.world.fold_overlay();
+    let id = super::super::buildings::BuildingId((settlement.0 << 32) | 2);
+    let record = state.settlements.get_mut(settlement).unwrap();
+    record.building_sequence = 2;
+    record.buildings.insert(
+        id,
+        super::super::buildings::Building {
+            id,
+            settlement,
+            kind: super::super::buildings::BuildingKind::Workshop(Profession::Farmer),
+            level: 1,
+            bounds: mc_script::ScriptWorldBounds::new([1, 200, 7], [2, 203, 8]).unwrap(),
+            work_points: vec![[2, 201, 8]],
+            revision: 1,
+            natural_zone: false,
+        },
+    );
+    for _ in 0..60 {
+        step(&mut state);
+    }
+    assert_eq!(
+        state.entities.row(slot).villager.as_ref().unwrap().job_site,
+        Some(resource_job)
+    );
+}
+
+#[test]
 fn exhausted_home_search_does_not_starve_reachable_resource_job() {
     let (mut state, slot, job) = blocked_home_with_resource_job();
+    state.day_time = 2000;
     for time in 0..40 {
         scarce_path_nodes(&mut state, time);
         tick(&mut state, &mut ChangeSet::default());

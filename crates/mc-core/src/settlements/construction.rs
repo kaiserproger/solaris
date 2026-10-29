@@ -67,12 +67,107 @@ fn preempt(state: &mut TickState, id: SettlementId) -> Result<(), String> {
     Ok(())
 }
 
+/// Pick the wood actually available in storage, so the placed blocks and the
+/// crafting bill have the same species rather than turning one wood into another.
+fn wood_species<'a>(state: &'a TickState, images: &[super::inventory::Image]) -> &'a str {
+    images
+        .iter()
+        .flat_map(|image| &image.slots)
+        .filter(|stack| !stack.is_empty())
+        .filter_map(|stack| {
+            let name = state.registry.items.name_of(stack.item_id)?;
+            let path = name.path();
+            let (species, weight) = if let Some(species) = path.strip_suffix("_log") {
+                (species, 4)
+            } else {
+                (path.strip_suffix("_planks")?, 1)
+            };
+            if name.as_str().starts_with("minecraft:")
+                && !species.starts_with("stripped_")
+                && state
+                    .registry
+                    .items
+                    .id_of(&mc_data::Identifier::parse(format!("minecraft:{species}_log")).ok()?)
+                    .is_some()
+            {
+                Some((stack.count * weight, species))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(amount, _)| *amount)
+        .map_or("oak", |(_, species)| species)
+}
+
+fn species_item(state: &TickState, item: u32, species: &str) -> Option<u32> {
+    let name = state.registry.items.name_of(item)?;
+    if species == "oak" || !name.as_str().starts_with("minecraft:") {
+        return Some(item);
+    }
+    let Some(suffix) = name.path().strip_prefix("oak_") else {
+        return Some(item);
+    };
+    state
+        .registry
+        .items
+        .id_of(&mc_data::Identifier::parse(format!("minecraft:{species}_{suffix}")).ok()?)
+}
+
+fn species_bill(
+    state: &TickState,
+    materials: &[(u32, u32)],
+    species: &str,
+) -> Option<Vec<(u32, u32)>> {
+    materials
+        .iter()
+        .map(|&(item, count)| Some((species_item(state, item, species)?, count)))
+        .collect()
+}
+
+/// A real worker load can complete the first storage bill before a stack is full.
+pub(crate) fn first_storage_funded_by_delivery(
+    state: &TickState,
+    id: SettlementId,
+    carry: &[Option<mc_data::ItemStack>],
+) -> bool {
+    let Some(record) = state.settlements.get(id) else {
+        return false;
+    };
+    if record.project.is_some()
+        || record
+            .buildings
+            .values()
+            .any(|b| b.kind == BuildingKind::Storage)
+        || carry.iter().all(Option::is_none)
+    {
+        return false;
+    }
+    let Some(level) = blueprints::get(&state.registry, "storage").and_then(|b| b.level(1)) else {
+        return false;
+    };
+    let mut images = executor::source_images(state, id);
+    let Some(chest) = images.first_mut() else {
+        return false;
+    };
+    // This is a read-only funding probe; only the regular inventory authority
+    // can transfer the actual carry to the real container.
+    chest.slots.extend(carry.iter().flatten().cloned());
+    let Some(materials) = species_bill(state, &level.materials, wood_species(state, &images))
+    else {
+        return false;
+    };
+    super::construction_crafting::can_fund(state, &materials, &images)
+}
+
 fn funding_error(state: &TickState, id: SettlementId, materials: &[(u32, u32)]) -> Option<String> {
     let images = executor::source_images(state, id);
-    if super::construction_crafting::can_fund(state, materials, &images) {
+    let Some(materials) = species_bill(state, materials, wood_species(state, &images)) else {
+        return Some("wood species is unavailable for this blueprint".into());
+    };
+    if super::construction_crafting::can_fund(state, &materials, &images) {
         return None;
     }
-    for &(item, count) in materials {
+    for &(item, count) in &materials {
         if !super::construction_crafting::can_fund(state, &[(item, count)], &images) {
             return Some(match state.registry.items.name_of(item) {
                 Some(name) => format!("not enough: {name} x{count}"),
@@ -416,6 +511,8 @@ fn planned_cells(
     let level = blueprint.level(project.level)?;
     let rotated = level.rotated(Rotation::from_quarter_turns(project.rotation));
     let mut quota = level.materials.clone();
+    let images = executor::source_images(state, project.settlement);
+    let species = wood_species(state, &images);
     let mut cells: Vec<_> = rotated
         .removals
         .iter()
@@ -479,12 +576,31 @@ fn planned_cells(
         }
     }
     for (offset, block) in &rotated.blocks {
+        let original = state.registry.blocks.by_id(*block)?;
+        let placed = if species != "oak"
+            && original.block.id.as_str().starts_with("minecraft:")
+            && let Some(suffix) = original.block.id.path().strip_prefix("oak_")
+        {
+            let name = mc_data::Identifier::parse(format!("minecraft:{species}_{suffix}")).ok()?;
+            state
+                .registry
+                .blocks
+                .by_name_and_props(&name, &original.properties)?
+        } else {
+            *block
+        };
         let (resource, quantity) =
             if let Some((item, quantity)) = blueprints::material_for(&state.registry, *block) {
                 let (_, remaining) = quota.iter_mut().find(|(id, _)| *id == item)?;
                 *remaining = remaining.checked_sub(quantity)?;
                 (
-                    Some(state.registry.items.name_of(item)?.to_string()),
+                    Some(
+                        state
+                            .registry
+                            .items
+                            .name_of(species_item(state, item, species)?)?
+                            .to_string(),
+                    ),
                     quantity,
                 )
             } else {
@@ -492,7 +608,7 @@ fn planned_cells(
             };
         cells.push(executor::PlannedCell {
             at: rotated.world(project.origin, *offset),
-            state: block.0,
+            state: placed.0,
             resource,
             quantity,
         });
@@ -591,7 +707,13 @@ fn upgrade_project(state: &TickState, record: &SettlementRecord) -> Option<Proje
     record.buildings.values().find_map(|building| {
         let blueprint = upgrade_blueprint(state, record.id, building)?;
         let level = building.level + 1;
-        if !executor::can_fund(state, record.id, &blueprint.level(level)?.materials) {
+        let images = executor::source_images(state, record.id);
+        let materials = species_bill(
+            state,
+            &blueprint.level(level)?.materials,
+            wood_species(state, &images),
+        )?;
+        if !executor::can_fund(state, record.id, &materials) {
             return None;
         }
         Some(Project {
@@ -742,8 +864,8 @@ fn plan(state: &mut TickState, id: SettlementId) {
     let blueprint = needed_kinds(record, residents).find_map(|kind| {
         let blueprint = catalog.iter().find(|blueprint| blueprint.kind == kind)?;
         let level = blueprint.level(1)?;
-        super::construction_crafting::can_fund(state, &level.materials, &images)
-            .then_some(blueprint)
+        let materials = species_bill(state, &level.materials, wood_species(state, &images))?;
+        super::construction_crafting::can_fund(state, &materials, &images).then_some(blueprint)
     });
     let Some(blueprint) = blueprint else {
         if let Some(project) = upgrade_project(state, record) {
@@ -1073,12 +1195,15 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
         let Some(level) = blueprint.level(1) else {
             continue;
         };
-        if super::construction_crafting::can_fund(state, &level.materials, &images) {
+        let Some(materials) = species_bill(state, &level.materials, wood_species(state, &images))
+        else {
+            continue;
+        };
+        if super::construction_crafting::can_fund(state, &materials, &images) {
             continue;
         }
         let mut needs = Vec::new();
-        for (item, count) in
-            super::construction_crafting::missing_base(state, &level.materials, &images)
+        for (item, count) in super::construction_crafting::missing_base(state, &materials, &images)
         {
             if let Some(leaf) = availability::missing_source(state, id, item, &images) {
                 if let Some(name) = state.registry.items.name_of(leaf) {

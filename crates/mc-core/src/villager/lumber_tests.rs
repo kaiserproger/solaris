@@ -296,6 +296,48 @@ fn lumberjack_finds_a_simulated_tree_in_a_village_sized_radius_within_a_few_atte
 }
 
 #[test]
+fn lumberjack_delivers_substack_that_funds_first_storage() {
+    let (mut state, slot, mut v) = fixture(BuildingKind::LumberCamp);
+    let oak = mining::item_id(&state, "oak_log").unwrap();
+    let cobble = mining::item_id(&state, "cobblestone").unwrap();
+    let chest = block(&state, "chest");
+    state.world.set_block(4, 201, 3, chest);
+    let mut slots = vec![ItemStack::EMPTY; 27];
+    slots[0] = ItemStack::new(cobble, 52);
+    state.block_entities.insert(
+        (4, 201, 3),
+        crate::tick::BlockEntityState {
+            slots,
+            furnace: None,
+        },
+    );
+    state
+        .settlements
+        .get_mut(v.settlement.unwrap())
+        .unwrap()
+        .bootstrap_storage = Some([4, 201, 3]);
+    v.inventory[0] = Some(ItemStack::new(oak, 40));
+    lumber::work(&mut state, slot, &mut v, &mut ChangeSet::default());
+    assert_eq!(
+        v.inventory[0].as_ref().unwrap().count,
+        40,
+        "an incomplete bill stays in carry"
+    );
+    v.inventory[0] = Some(ItemStack::new(oak, 60));
+    lumber::work(&mut state, slot, &mut v, &mut ChangeSet::default());
+    assert!(
+        v.inventory[0].is_none(),
+        "a fully fundable first storage must not wait for a 64-log stack"
+    );
+    assert!(
+        state.block_entities[&(4, 201, 3)]
+            .slots
+            .iter()
+            .any(|s| s.item_id == oak && s.count == 60)
+    );
+}
+
+#[test]
 fn lumberjack_completes_trunk_and_replants_across_stack_haul() {
     let (mut state, slot, mut v) = fixture(BuildingKind::LumberCamp);
     tree(&mut state, 10, 10, 5);

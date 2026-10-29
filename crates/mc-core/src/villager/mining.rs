@@ -518,6 +518,16 @@ fn safe(
     Ok(())
 }
 
+/// Check the first actual staircase cut before installing a natural mine job.
+pub(crate) fn initial_cut_safe(
+    state: &TickState,
+    bounds: ScriptWorldBounds,
+    entrance: BlockPos,
+) -> bool {
+    cell_in_flight(bounds, entrance, 0, 0, 0)
+        .is_some_and(|current| safe(state, bounds, entrance, current, entrance, 3, 0, 0).is_ok())
+}
+
 /// Open cells of an earlier tunnel of this mine, flooded from `start`: it
 /// stays inside the zone, is small, opens onto the surface under the entrance
 /// (never a sealed pocket) and touches no fluid. Anything else is a cave.
@@ -724,12 +734,17 @@ pub(super) fn work(
     if building.kind != buildings::BuildingKind::Mine {
         return None;
     }
+    let bounds = operational_bounds(state, building)?;
     // The shaft starts in the floor interior, inside the footprint the
     // upgrade fences: digging it mid-upgrade pauses the structure for good.
-    let (id, revision, bounds, upgrading) = (
+    let (id, revision, surface_bounds, upgrading) = (
         building.id.0,
         building.revision,
-        operational_bounds(state, building)?,
+        if building.natural_zone {
+            building.bounds
+        } else {
+            bounds
+        },
         state
             .settlements
             .get(building.settlement)
@@ -804,7 +819,7 @@ pub(super) fn work(
     let origin = if column == base {
         base
     } else if pass == 0
-        && let Some(origin) = surface_origin(state, bounds, column)
+        && let Some(origin) = surface_origin(state, surface_bounds, column)
     {
         origin
     } else {
