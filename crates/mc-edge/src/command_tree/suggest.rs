@@ -72,6 +72,54 @@ pub(crate) fn suggestions(
     {
         return result;
     }
+    if matches!(root, "item" | "loot") && second == Some("replace") {
+        let kind = preceding.split_whitespace().nth(2);
+        let destination_slot = (kind == Some("entity") && argument_index == 4)
+            || (kind == Some("block") && argument_index == 6);
+        let source_kind = preceding
+            .split_whitespace()
+            .find(|word| *word == "from")
+            .and_then(|_| {
+                let mut parts = preceding
+                    .split_whitespace()
+                    .skip_while(|word| *word != "from");
+                parts.next();
+                parts.next()
+            });
+        let source_slot = source_kind.is_some_and(|source| {
+            let source_len = if source == "entity" { 2 } else { 4 };
+            preceding
+                .split_whitespace()
+                .position(|word| word == "from")
+                .is_some_and(|at| argument_index == at + 1 + source_len)
+        });
+        if destination_slot || source_slot {
+            let kind = if source_slot { source_kind } else { kind };
+            if kind == Some("block") {
+                for index in 0..54 {
+                    add(&format!("container.{index}"));
+                }
+            } else {
+                for name in [
+                    "weapon.mainhand",
+                    "weapon.offhand",
+                    "armor.head",
+                    "armor.chest",
+                    "armor.legs",
+                    "armor.feet",
+                ] {
+                    add(name);
+                }
+                for index in 0..9 {
+                    add(&format!("hotbar.{index}"));
+                }
+                for index in 0..27 {
+                    add(&format!("inventory.{index}"));
+                }
+            }
+            return result;
+        }
+    }
     if root == "settlement" {
         if argument_index == 1 {
             for &(action, _) in SETTLEMENT_HELP {

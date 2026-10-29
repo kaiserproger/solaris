@@ -67,6 +67,222 @@ fn has_translation(state: &TickState, connection: ConnectionId, key: &str) -> bo
         })
     })
 }
+fn chat_contains(state: &TickState, text: &str) -> bool {
+    state.outbox.get(&ConnectionId(1)).is_some_and(|queue| {
+        queue.iter().any(|change| match change {
+            PlayerChange::Chat { message } => message.contains(text),
+            PlayerChange::StyledChat {
+                content: Tag::Compound(fields),
+            } => fields.iter().any(|(key, value)| {
+                key == "text" && matches!(value, Tag::String(message) if message.contains(text))
+            }),
+            _ => false,
+        })
+    })
+}
+
+#[test]
+fn admin_item_replace_entity_changes_slot() {
+    let (mut state, alice, _) = fixture();
+    command(
+        &mut state,
+        alice,
+        "item replace entity @s hotbar.0 with minecraft:stone 3",
+    );
+    let stack = &state.players[&alice].inventory.slots[0];
+    assert_eq!(stack.count, 3);
+    assert_eq!(
+        state
+            .registry
+            .items
+            .name_of(stack.item_id)
+            .unwrap()
+            .as_str(),
+        "minecraft:stone"
+    );
+    assert!(chat_contains(&state, "Replaced item"));
+    command(
+        &mut state,
+        alice,
+        "item replace entity @s hotbar.1 from entity @s hotbar.0",
+    );
+    assert_eq!(
+        state.players[&alice].inventory.slots[1],
+        state.players[&alice].inventory.slots[0]
+    );
+    command(
+        &mut state,
+        alice,
+        "item replace entity @s wrong.slot with stone",
+    );
+    assert!(chat_contains(&state, "slot"));
+    command(
+        &mut state,
+        alice,
+        "item replace entity @s armor.head with stone",
+    );
+    assert!(chat_contains(&state, "cannot be placed"));
+    command(
+        &mut state,
+        alice,
+        "item modify entity @s weapon.mainhand test:modifier",
+    );
+    assert!(chat_contains(&state, "modifiers are not supported"));
+}
+
+#[test]
+fn admin_loot_unknown_table_reports_error() {
+    let (mut state, alice, _) = fixture();
+    command(
+        &mut state,
+        alice,
+        "loot give @s loot minecraft:no_such_table",
+    );
+    assert!(chat_contains(&state, "Unknown or unsupported loot table"));
+}
+
+#[test]
+fn admin_item_and_loot_block_destinations() {
+    let (mut state, alice, _) = fixture();
+    state.block_entities.insert(
+        (1, 80, 1),
+        crate::tick::BlockEntityState {
+            slots: vec![mc_data::ItemStack::EMPTY; 27],
+            furnace: None,
+        },
+    );
+    command(
+        &mut state,
+        alice,
+        "item replace block 1 80 1 container.0 with stone 3",
+    );
+    assert_eq!(state.block_entities[&(1, 80, 1)].slots[0].count, 3);
+    command(
+        &mut state,
+        alice,
+        "item replace entity @s hotbar.0 from block 1 80 1 container.0",
+    );
+    assert_eq!(state.players[&alice].inventory.slots[0].count, 3);
+    command(
+        &mut state,
+        alice,
+        "loot insert 1 80 1 loot minecraft:chests/simple_dungeon",
+    );
+    assert!(
+        state.block_entities[&(1, 80, 1)].slots[1..]
+            .iter()
+            .any(|stack| !stack.is_empty())
+    );
+    command(
+        &mut state,
+        alice,
+        "loot replace entity @s hotbar.1 1 loot minecraft:chests/simple_dungeon",
+    );
+    assert!(!state.players[&alice].inventory.slots[1].is_empty());
+}
+
+#[test]
+fn admin_loot_kill_rolls_without_killing_target() {
+    let (mut state, alice, _) = fixture();
+    let cow = state.spawn_mob(state.registry.cow_type_id, [2.0, 80.0, 0.0], 10.0);
+    command(
+        &mut state,
+        alice,
+        "loot spawn 0 80 0 kill @e[type=minecraft:cow,limit=1]",
+    );
+    assert!(chat_contains(&state, "Distributed"));
+    assert!(
+        state
+            .entities
+            .body(state.entities.slot_of(cow).unwrap())
+            .alive
+    );
+}
+
+#[test]
+fn admin_loot_give_generates_chest_loot() {
+    let (mut state, alice, _) = fixture();
+    command(
+        &mut state,
+        alice,
+        "loot give @s loot minecraft:chests/simple_dungeon",
+    );
+    assert!(
+        state.players[&alice]
+            .inventory
+            .slots
+            .iter()
+            .any(|stack| !stack.is_empty())
+    );
+    assert!(chat_contains(&state, "Distributed"));
+}
+
+#[test]
+fn admin_attribute_unknown_reports_error() {
+    let (mut state, alice, _) = fixture();
+    let cow = state.spawn_mob(state.registry.cow_type_id, [2.0, 80.0, 0.0], 10.0);
+    command(
+        &mut state,
+        alice,
+        "attribute @e[type=minecraft:cow,limit=1] minecraft:no_such_attribute get",
+    );
+    assert!(chat_contains(&state, "Unknown or unsupported attribute"));
+    command(
+        &mut state,
+        alice,
+        "attribute @e[type=minecraft:cow,limit=1] minecraft:max_health base set 30",
+    );
+    let slot = state.entities.slot_of(cow).unwrap();
+    assert_eq!(state.entities.row(slot).loot.attributes[0].base, 30.0);
+    assert!(chat_contains(&state, "updated"));
+    command(
+        &mut state,
+        alice,
+        "attribute @e[type=minecraft:cow,limit=1] minecraft:max_health modifier add test:bonus 5 add_value",
+    );
+    assert_eq!(
+        state.entities.row(slot).loot.attributes[0].modifiers[0].amount,
+        5.0
+    );
+    command(
+        &mut state,
+        alice,
+        "attribute @e[type=minecraft:cow,limit=1] minecraft:max_health get 2",
+    );
+    assert!(chat_contains(&state, "value: 35"));
+    command(
+        &mut state,
+        alice,
+        "attribute @e[type=minecraft:cow,limit=1] minecraft:max_health modifier value get test:bonus",
+    );
+    assert!(chat_contains(&state, "modifier value: 5"));
+    command(
+        &mut state,
+        alice,
+        "attribute @e[type=minecraft:cow,limit=1] minecraft:max_health modifier remove test:bonus",
+    );
+    assert!(
+        state.entities.row(slot).loot.attributes[0]
+            .modifiers
+            .is_empty()
+    );
+    command(
+        &mut state,
+        alice,
+        "attribute @e[type=minecraft:cow,limit=1] minecraft:max_health base reset",
+    );
+    assert_eq!(
+        state.entities.row(slot).loot.attributes[0].base,
+        f64::from(
+            state
+                .registry
+                .blueprint(state.registry.cow_type_id)
+                .unwrap()
+                .params
+                .max_health
+        )
+    );
+}
 
 #[test]
 fn command_parity_nearest_entity_selects_closest_alive() {

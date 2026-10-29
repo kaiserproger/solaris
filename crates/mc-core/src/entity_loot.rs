@@ -86,7 +86,7 @@ fn stack_entity(items: &ItemRules<'_>, entity: &mut EntityLootEntity, held: &Ite
         LootContextItem::new(name.clone()).with_enchantments(entity.active_enchantments.clone())
     });
 }
-fn loot_entity(state: &TickState, entity: EntityId) -> Option<EntityLootEntity> {
+pub(crate) fn loot_entity(state: &TickState, entity: EntityId) -> Option<EntityLootEntity> {
     let slot = state.entities.slot_of_any(entity)?;
     let body = state.entities.body(slot);
     let row = state.entities.row(slot);

@@ -54,6 +54,9 @@ const ROOTS: &[(&str, u8)] = &[
     ("tp", 2),
     ("execute", 2),
     ("give", 2),
+    ("item", 2),
+    ("loot", 2),
+    ("attribute", 2),
     ("clear", 2),
     ("kill", 2),
     ("damage", 2),
@@ -799,6 +802,15 @@ pub(crate) fn tree(op_level: u8, plugins: &[(String, u8)]) -> ClientboundCommand
             true,
         );
     }
+    if let Some(root) = t.root("item", false) {
+        admin_item_tree(&mut t, root);
+    }
+    if let Some(root) = t.root("loot", false) {
+        admin_loot_tree(&mut t, root);
+    }
+    if let Some(root) = t.root("attribute", false) {
+        admin_attribute_tree(&mut t, root);
+    }
     if let Some(root) = t.root("give", false) {
         let targets = t.argument(root, "targets", players(false), false);
         let item = t.argument(targets, "item", Parser::ItemStack, true);
@@ -1175,6 +1187,195 @@ pub(crate) fn tree(op_level: u8, plugins: &[(String, u8)]) -> ClientboundCommand
         nodes: t.nodes,
         root_index: 0,
     }
+}
+
+fn admin_item_tree(t: &mut Tree<'_>, root: i32) {
+    let replace = t.literal(root, "replace", false);
+    for kind in ["entity", "block"] {
+        let branch = t.literal(replace, kind, false);
+        let target = t.argument(
+            branch,
+            "target",
+            if kind == "entity" {
+                entities(false)
+            } else {
+                Parser::BlockPos
+            },
+            false,
+        );
+        let slot = t.suggested(
+            target,
+            "slot",
+            Parser::String(CommandStringKind::SingleWord),
+            false,
+            "ask_server",
+        );
+        let with = t.literal(slot, "with", false);
+        let item = t.argument(with, "item", Parser::ItemStack, true);
+        t.argument(item, "count", integer(Some(1), Some(99)), true);
+        let from = t.literal(slot, "from", false);
+        for source_kind in ["entity", "block"] {
+            let branch = t.literal(from, source_kind, false);
+            let source = t.argument(
+                branch,
+                "source",
+                if source_kind == "entity" {
+                    entities(false)
+                } else {
+                    Parser::BlockPos
+                },
+                false,
+            );
+            t.suggested(
+                source,
+                "sourceSlot",
+                Parser::String(CommandStringKind::SingleWord),
+                true,
+                "ask_server",
+            );
+        }
+    }
+    let modify = t.literal(root, "modify", false);
+    t.argument(
+        modify,
+        "arguments",
+        Parser::String(CommandStringKind::GreedyPhrase),
+        true,
+    );
+}
+
+fn admin_loot_sources(t: &mut Tree<'_>, parent: i32) {
+    let loot = t.literal(parent, "loot", false);
+    t.argument(loot, "loot_table", Parser::ResourceLocation, true);
+    let kill = t.literal(parent, "kill", false);
+    t.argument(kill, "target", entities(true), true);
+    for name in ["fish", "mine"] {
+        let node = t.literal(parent, name, false);
+        t.argument(
+            node,
+            "arguments",
+            Parser::String(CommandStringKind::GreedyPhrase),
+            true,
+        );
+    }
+}
+
+fn admin_loot_tree(t: &mut Tree<'_>, root: i32) {
+    let give = t.literal(root, "give", false);
+    let players = t.argument(give, "players", players(false), false);
+    admin_loot_sources(t, players);
+    for name in ["insert", "spawn"] {
+        let node = t.literal(root, name, false);
+        let position = t.argument(
+            node,
+            "position",
+            if name == "spawn" {
+                Parser::Vec3
+            } else {
+                Parser::BlockPos
+            },
+            false,
+        );
+        admin_loot_sources(t, position);
+    }
+    let replace = t.literal(root, "replace", false);
+    for kind in ["entity", "block"] {
+        let branch = t.literal(replace, kind, false);
+        let target = t.argument(
+            branch,
+            "target",
+            if kind == "entity" {
+                entities(false)
+            } else {
+                Parser::BlockPos
+            },
+            false,
+        );
+        let slot = t.suggested(
+            target,
+            "slot",
+            Parser::String(CommandStringKind::SingleWord),
+            false,
+            "ask_server",
+        );
+        admin_loot_sources(t, slot);
+        let count = t.argument(slot, "count", integer(Some(0), None), false);
+        admin_loot_sources(t, count);
+    }
+}
+
+fn admin_attribute_tree(t: &mut Tree<'_>, root: i32) {
+    let target = t.argument(root, "target", entities(true), false);
+    let attribute = t.argument(
+        target,
+        "attribute",
+        Parser::Resource {
+            registry: identifier("attribute"),
+        },
+        false,
+    );
+    let get = t.literal(attribute, "get", true);
+    t.argument(
+        get,
+        "scale",
+        Parser::Double {
+            min: None,
+            max: None,
+        },
+        true,
+    );
+    let base = t.literal(attribute, "base", false);
+    let get = t.literal(base, "get", true);
+    t.argument(
+        get,
+        "scale",
+        Parser::Double {
+            min: None,
+            max: None,
+        },
+        true,
+    );
+    let set = t.literal(base, "set", false);
+    t.argument(
+        set,
+        "value",
+        Parser::Double {
+            min: None,
+            max: None,
+        },
+        true,
+    );
+    t.literal(base, "reset", true);
+    let modifier = t.literal(attribute, "modifier", false);
+    let add = t.literal(modifier, "add", false);
+    let id = t.argument(add, "id", Parser::ResourceLocation, false);
+    let value = t.argument(
+        id,
+        "value",
+        Parser::Double {
+            min: None,
+            max: None,
+        },
+        false,
+    );
+    t.literals(
+        value,
+        &["add_value", "add_multiplied_base", "add_multiplied_total"],
+    );
+    let remove = t.literal(modifier, "remove", false);
+    t.argument(remove, "id", Parser::ResourceLocation, true);
+    let value = t.literal(modifier, "value", false);
+    let get = t.literal(value, "get", false);
+    let id = t.argument(get, "id", Parser::ResourceLocation, true);
+    t.argument(
+        id,
+        "scale",
+        Parser::Double {
+            min: None,
+            max: None,
+        },
+        true,
+    );
 }
 
 #[cfg(test)]
