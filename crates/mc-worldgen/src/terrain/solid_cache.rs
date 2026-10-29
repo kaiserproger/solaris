@@ -119,16 +119,22 @@ impl SolidCache {
             }
             if !claimed.is_empty() {
                 drop(state);
-                let filled: Vec<_> = claimed
-                    .into_iter()
-                    .map(|key| (key, fill(ChunkPos { x: key.0, z: key.1 })))
+                let claims = Claims {
+                    cache: self,
+                    keys: claimed,
+                };
+                let filled: Vec<_> = claims
+                    .keys
+                    .iter()
+                    .map(|&key| (key, fill(ChunkPos { x: key.0, z: key.1 })))
                     .collect();
                 state = self.lock();
                 for (key, solids) in filled {
-                    state.filling.remove(&key);
                     state.solids.insert(key, solids);
                 }
-                self.filled.notify_all();
+                drop(state);
+                drop(claims);
+                state = self.lock();
                 continue;
             }
             if keys.iter().all(|key| state.solids.contains(key)) {
@@ -143,5 +149,23 @@ impl SolidCache {
 
     fn lock(&self) -> MutexGuard<'_, CacheState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Keys one generation is filling. Released (and waiters woken) when the
+/// fills are stored or when a fill unwinds, so no waiter is left behind.
+struct Claims<'a> {
+    cache: &'a SolidCache,
+    keys: Vec<Key>,
+}
+
+impl Drop for Claims<'_> {
+    fn drop(&mut self) {
+        let mut state = self.cache.lock();
+        for key in &self.keys {
+            state.filling.remove(key);
+        }
+        drop(state);
+        self.cache.filled.notify_all();
     }
 }

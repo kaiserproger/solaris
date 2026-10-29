@@ -11,6 +11,7 @@
 //! behind two capped batches evaluates density on the CPU instead, and a GPU
 //! failure turns the service off for the rest of the run.
 use std::collections::{HashSet, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -101,13 +102,16 @@ impl GpuSolidService {
     }
 
     /// Solids of `pos` and its eight neighbours, or `None` when this chunk
-    /// should evaluate density on the CPU: the GPU failed or is two batches
-    /// behind.
+    /// should evaluate density on the CPU: the GPU failed, or the chunk's own
+    /// solids would wait behind two capped batches (then nothing is queued, so
+    /// the queue stays within a few batches).
     pub(crate) fn solids_around(&self, pos: ChunkPos) -> Option<SolidGrid> {
         let keys = ring(pos);
         let center = (pos.x, pos.z);
         let mut state = self.shared.lock();
-        let behind = state.queued.len();
+        if !state.solids.contains(&center) && state.queued.len() >= state.cap * 2 {
+            return None;
+        }
         loop {
             if state.failed {
                 return None;
@@ -125,9 +129,6 @@ impl GpuSolidService {
                 return Some(state.solids.read(&keys));
             }
             self.shared.work.notify_one();
-            if !state.solids.contains(&center) && behind >= state.cap * 2 {
-                return None;
-            }
             state = self
                 .shared
                 .filled
@@ -171,7 +172,21 @@ fn dispatch(gpu: &GpuDensity, shared: &Shared, max: usize) {
         };
         let origins: Vec<(i32, i32)> = batch.iter().map(|&(x, z)| (x * 16, z * 16)).collect();
         let start = Instant::now();
-        let result = gpu.fill_chunks(&origins);
+        // wgpu reports device and validation errors by panicking: waiting
+        // workers must still learn the GPU is gone.
+        let result = catch_unwind(AssertUnwindSafe(|| gpu.fill_chunks(&origins)))
+            .unwrap_or_else(|_| Err("GPU fill panicked".into()))
+            .and_then(|filled| {
+                if filled.chunks.len() == batch.len() {
+                    Ok(filled)
+                } else {
+                    Err(format!(
+                        "GPU filled {} of {} chunks",
+                        filled.chunks.len(),
+                        batch.len()
+                    ))
+                }
+            });
         let elapsed = start.elapsed();
         let mut state = shared.lock();
         match result {
