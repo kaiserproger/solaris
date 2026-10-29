@@ -254,6 +254,7 @@ pub struct EdgeServer {
     pub cfg: EdgeConfig,
     /// Live connection registry (for pump routing + dashboard roster).
     pub connections: Arc<ConnectionRegistry>,
+    pre_play_addresses: crate::conn_limit::AddressLimiter,
     /// Dashboard state (updated off the tick path).
     pub dashboard: Arc<DashboardState>,
     /// Tick stats for the dashboard rollup.
@@ -456,6 +457,7 @@ impl EdgeServer {
             wire,
             cfg,
             connections,
+            pre_play_addresses: crate::conn_limit::AddressLimiter::new(0, 8),
             dashboard,
             tick_stats: Arc::new(TickStats::new()),
             net_counters: Arc::new(NetCounters::new()),

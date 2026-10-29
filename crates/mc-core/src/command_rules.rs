@@ -8,6 +8,9 @@
 use crate::commands::CommandError;
 use crate::tick::TickState;
 
+/// Operational limit: random ticks scale with each active section every tick.
+pub(crate) const MAX_RANDOM_TICK_SPEED: i32 = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleKind {
     Boolean,
@@ -223,6 +226,11 @@ pub fn parse(args: &[&str]) -> Result<(String, Option<String>), CommandError> {
                     return Err(USAGE);
                 }
                 let number = value.parse::<i32>().map_err(|_| USAGE)?;
+                if rule.name == "random_tick_speed" && number > MAX_RANDOM_TICK_SPEED {
+                    return Err(CommandError::Message(format!(
+                        "randomTickSpeed must not exceed {MAX_RANDOM_TICK_SPEED}"
+                    )));
+                }
                 if !(min..=max).contains(&number) {
                     return Err(USAGE);
                 }
@@ -444,11 +452,16 @@ mod tests {
             let RuleKind::Integer { min, max } = rule.kind else {
                 continue;
             };
-            for bound in [min, max] {
+            let effective_max = if rule.name == "random_tick_speed" {
+                MAX_RANDOM_TICK_SPEED
+            } else {
+                max
+            };
+            for bound in [min, effective_max] {
                 assert!(parse(&[rule.name, &bound.to_string()]).is_ok());
             }
             assert!(parse(&[rule.name, &(i64::from(min) - 1).to_string()]).is_err());
-            assert!(parse(&[rule.name, &(i64::from(max) + 1).to_string()]).is_err());
+            assert!(parse(&[rule.name, &(i64::from(effective_max) + 1).to_string()]).is_err());
         }
         assert_eq!(
             default_value("fire_spread_radius_around_player"),

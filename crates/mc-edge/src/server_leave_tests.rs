@@ -222,3 +222,53 @@ async fn pre_play_deadline_is_absolute_across_repeated_configuration_packets() {
     );
     core.shutdown();
 }
+
+#[tokio::test]
+async fn stalled_configurations_do_not_take_player_slots_and_are_bounded_per_ip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = server(dir.path());
+    server.cfg.server.max_players = 1;
+    let server = Arc::new(server);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut clients = Vec::new();
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let mut client = Client::connect(address).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        tasks.push(tokio::spawn(handle_connection(socket, Arc::clone(&server))));
+        client
+            .drive_login(address, &format!("Pending{index}"))
+            .await
+            .unwrap();
+        clients.push(client);
+    }
+    assert!(server.connections.inner.lock().admitted.is_empty());
+    let mut refused = Client::connect(address).await.unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let denied = tokio::spawn(handle_connection(socket, Arc::clone(&server)));
+    assert!(refused.drive_login(address, "Denied").await.is_err());
+    assert!(
+        denied
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("pre-play")
+    );
+    drop(clients.remove(0));
+    assert!(tasks.remove(0).await.unwrap().is_err());
+    let mut replacement = Client::connect(address).await.unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    tasks.push(tokio::spawn(handle_connection(socket, Arc::clone(&server))));
+    replacement
+        .drive_login(address, "Replacement")
+        .await
+        .unwrap();
+    drop(replacement);
+    drop(clients);
+    for task in tasks {
+        let _ = task.await;
+    }
+    server.hub.shutdown();
+}

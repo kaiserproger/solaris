@@ -170,6 +170,18 @@ pub(super) fn load_dimension_state(
         tick_state.fluid_ticks.hydrate(chunk, recovered_tick);
     }
     tick_state.gamerules = replay.gamerules.into_iter().collect();
+    if let Some(value) = tick_state.gamerules.get_mut("random_tick_speed")
+        && let Ok(speed) = value.parse::<i32>()
+        && speed > crate::command_rules::MAX_RANDOM_TICK_SPEED
+    {
+        tracing::warn!(
+            speed,
+            maximum = crate::command_rules::MAX_RANDOM_TICK_SPEED,
+            "clamping persisted randomTickSpeed"
+        );
+        *value = crate::command_rules::MAX_RANDOM_TICK_SPEED.to_string();
+        tick_state.gamerules_dirty = true;
+    }
     replay.border.validate()?;
     tick_state.border = replay.border;
     tick_state.difficulty = replay.difficulty;

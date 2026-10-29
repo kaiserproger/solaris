@@ -640,13 +640,13 @@ chat sessions. This is not secure-chat verification or reportable signed-chat
 delivery. Online login authenticates the connection's identity, not each chat
 message's signature.
 
-Login reserves player capacity atomically before Configuration; pending joins
-and backpressured retirement retain their reservation. Access-list policy is
-checked again before native Join. A connection owns its cleanup before any
-Join submission, and its Leave waits for native input capacity rather than
-being dropped. Retired connections cannot recreate pre-registration stashes.
+Player capacity is reserved atomically after Configuration, before native Join;
+pending joins and backpressured retirement retain their reservation. Access-list
+policy is checked during Login and again before native Join. A connection owns
+its cleanup before Join submission, and its Leave waits for native input capacity
+rather than being dropped. Retired connections cannot recreate pre-registration stashes.
 
-Handshake, Login and Configuration share one absolute 45-second deadline,
+Handshake, Login and Configuration share one absolute 30-second deadline,
 in addition to individual read and write deadlines. Play sends a fresh
 keepalive challenge every 15 seconds when none is outstanding, accepts only
 its matching echo, and closes after 30 seconds without that reply. Ordinary
@@ -668,6 +668,14 @@ Connection admission has two optional per-address limits under `[network]`:
 `connection_throttle_ms` (minimum gap between two accepted connections from one
 address) and `max_connections_per_ip` (concurrent cap). Both default to `0`
 (disabled) and a refused connection is closed before the handshake.
+Independently, at most eight pre-play connections per socket IP are accepted;
+excess sockets close before a handshake can identify a protocol state, with a
+reason in the server log. Play sessions do not occupy this pre-play allowance.
+Velocity proxy deployments see the proxy's socket IP at this boundary.
+
+`/gamerule randomTickSpeed` is limited to 4096 to protect tick time; Minecraft
+26.3 itself permits larger integers. Existing saved values above 4096 are
+clamped on load with a warning.
 When accepting a connection exhausts file descriptors or socket buffers while
 sessions are open, the listener logs a warning and pauses admission until one of
 those sessions ends; existing sessions and the core keep running. The same failure

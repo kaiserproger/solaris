@@ -1218,6 +1218,11 @@ fn named_and_uuid_entity_targets_preserve_player_only_command_filtering() {
 }
 
 #[test]
+fn gamerule_random_tick_speed_rejects_unsafe_values() {
+    assert!(parse("gamerule randomTickSpeed 2147483647", true).is_err());
+}
+
+#[test]
 fn gamerule_wal_images_preserve_canonical_aliases_and_absent_subsystem_overrides() {
     use crate::journal::{
         JournalEntry, JournalWriter, Replay, read_complete_batches_after, replay_batches,
