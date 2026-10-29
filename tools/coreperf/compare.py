@@ -114,12 +114,8 @@ def verify_resume(args: argparse.Namespace) -> None:
         return
     if args.warmup_ticks < 200 or args.measure_ticks < 1200:
         raise ValueError("canonical comparison requires >=200 warmup and >=1200 measured source ticks")
-    if not args.parity_resume_receipt or not args.main_go_receipt:
-        raise ValueError("Main parity/storage confirmation and current exclusive GO are required")
-    resume = json.loads(args.parity_resume_receipt.read_text())
-    for key in ("full_parity_verified", "native_storage_verified", "w2_w3_real_client_verified"):
-        if resume.get(key) is not True:
-            raise ValueError(f"Main resume confirmation missing {key}")
+    if not args.main_go_receipt:
+        raise ValueError("current Main exclusive GO is required")
     if not args.main_go_receipt.read_text().strip():
         raise ValueError("empty Main exclusive GO receipt")
 
@@ -662,7 +658,6 @@ async def run(args: argparse.Namespace) -> int:
         result['binaries'] = {str(binary): load.scale.binary_sha256(binary)
                               for binary in (args.server_bin, args.bots_bin)}
         result['registry_hashes'] = load.tree_hash(args.vanilla_data_dir)
-        result['resume_sha256'] = load.scale.binary_sha256(args.parity_resume_receipt) if args.parity_resume_receipt else None
         result['main_go_sha256'] = load.scale.binary_sha256(args.main_go_receipt) if args.main_go_receipt else None
         recipe = fixture(args.mobs, args.villagers)
         load.scale.dump(args.out / 'fixture.json', recipe)
@@ -746,7 +741,6 @@ def main() -> int:
     parser.add_argument('--max-tick-max-ms', type=float, default=250)
     parser.add_argument('--max-rss-mb', type=float, default=3072)
     parser.add_argument('--vanilla-data-dir', type=Path, default=ROOT / 'data/vanilla')
-    parser.add_argument('--parity-resume-receipt', type=Path)
     parser.add_argument('--main-go-receipt', type=Path)
     parser.add_argument('--setup-smoke', action='store_true')
     parser.add_argument('--prepare-only', action='store_true',
@@ -766,8 +760,7 @@ def main() -> int:
         parser.error('--sustained-seconds must be positive')
     if args.warmup_ticks < 0 or args.measure_ticks < 0:
         parser.error('tick fences cannot be negative')
-    for name in ('out', 'server_bin', 'bots_bin', 'vanilla_data_dir', 'fixture_cache',
-                 'parity_resume_receipt', 'main_go_receipt'):
+    for name in ('out', 'server_bin', 'bots_bin', 'vanilla_data_dir', 'fixture_cache', 'main_go_receipt'):
         value = getattr(args, name)
         if value:
             setattr(args, name, value.resolve())

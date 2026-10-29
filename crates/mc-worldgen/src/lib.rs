@@ -64,9 +64,9 @@ pub use nether::{
 };
 pub use structures::{StructureError, StructureTemplate, TemplateBlock, TemplateChest};
 pub use terrain::{
-    BiomeRules, BiomeScope, ClayRule, OreRule, OreRules, OreRulesError, OreSpacing, SpawnLocation,
-    TerrainDiagnosticSample, TerrainGenerator, TerrainGeneratorError, TreeRule, WorldgenMode,
-    YRange,
+    BiomeRules, BiomeScope, ChunkSolids, ClayRule, OreRule, OreRules, OreRulesError, OreSpacing,
+    SolidGrid, SpawnLocation, TerrainDiagnosticSample, TerrainGenerator, TerrainGeneratorError,
+    TreeRule, WorldgenMode, YRange,
 };
 #[cfg(feature = "worldgen-counters")]
 pub use terrain::{HeightContextStats, height_context_stats, reset_height_context_stats};

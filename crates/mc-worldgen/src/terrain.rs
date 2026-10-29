@@ -36,10 +36,14 @@ mod biome_routing;
 mod biome_rules;
 mod gameplay_rules;
 mod geological_ores;
+#[cfg(feature = "gpu")]
+mod gpu_service;
 mod ore_rules;
 mod ore_veins;
 mod overworld;
 mod sediments;
+mod solid_cache;
+mod solids;
 mod trees;
 
 pub use biome_rules::BiomeRules;
@@ -53,6 +57,7 @@ use ore_rules::{
     MAX_ORE_ANCHORS_PER_CELL, MAX_ORE_VEIN_SIZE, ORE_ANCHOR_CELL_EDGE, ORE_ANCHOR_CELL_VOLUME,
 };
 use overworld::{OverworldRouter, TerrainSample};
+pub use solids::{ChunkSolids, SolidGrid};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TerrainGeneratorError {
@@ -325,6 +330,12 @@ pub struct TerrainGenerator {
     /// Block registry the generator was built with; spawn clearance reads
     /// fluid states from it.
     blocks: Arc<BlockRegistry>,
+    /// Batched GPU density (`[server] worldgen_gpu`); `None` evaluates it on
+    /// the CPU.
+    #[cfg(feature = "gpu")]
+    gpu: Option<gpu_service::GpuSolidService>,
+    /// Chunk solids shared between the generations that read them.
+    solid_cache: solid_cache::SolidCache,
 }
 
 #[derive(Clone)]
@@ -367,6 +378,8 @@ pub(crate) struct HeightContext<'h> {
     source_heights: HashMap<(i32, i32), i32>,
     native_sampler: Option<SurfaceHeightSampler<'h>>,
     plans: HashMap<(i32, i32), Option<VillagePlanSet>>,
+    /// Precomputed solids, with the density's min y.
+    solids: Option<(&'h SolidGrid, i32)>,
 }
 
 impl<'h> HeightContext<'h> {
@@ -393,15 +406,30 @@ impl<'h> HeightContext<'h> {
             source_heights,
             native_sampler,
             plans: HashMap::new(),
+            solids: None,
         }
     }
 
-    /// Native terrain density at one block through the shared halo sampler;
-    /// `None` without vanilla density.
-    fn native_density(&mut self, world_x: i32, y: i32, world_z: i32) -> Option<f32> {
+    /// Answer SOURCE heights and cave checks of the chunks `solids` holds
+    /// from them instead of the halo sampler (same answers). `min_y` is the
+    /// density's.
+    pub(crate) fn with_solids(mut self, solids: &'h SolidGrid, min_y: i32) -> Self {
+        self.solids = Some((solids, min_y));
+        self
+    }
+
+    /// Whether native terrain density leaves one block empty (`<= 0`), from
+    /// held solids or the shared halo sampler; `None` without vanilla density.
+    fn native_empty(&mut self, world_x: i32, y: i32, world_z: i32) -> Option<bool> {
+        if let Some(solid) = self
+            .solids
+            .and_then(|(solids, min_y)| solids.solid(world_x, y, world_z, min_y))
+        {
+            return Some(!solid);
+        }
         self.native_sampler
             .as_mut()
-            .map(|sampler| sampler.density(world_x, y, world_z))
+            .map(|sampler| sampler.density(world_x, y, world_z) <= 0.0)
     }
 
     /// The SOURCE (pre-village) surface for one column: ready central-chunk
@@ -414,7 +442,12 @@ impl<'h> HeightContext<'h> {
         }
         // ONE shared sampler: lazily computed halo columns retain lattice
         // corners across columns instead of one sampler per column.
-        let raw = if let Some(sampler) = self.native_sampler.as_mut() {
+        let held = self
+            .solids
+            .and_then(|(solids, min_y)| solids.surface_height(world_x, world_z, min_y));
+        let raw = if let Some(held) = held.filter(|_| self.native_sampler.is_some()) {
+            held
+        } else if let Some(sampler) = self.native_sampler.as_mut() {
             sampler.surface_height(world_x, world_z)
         } else {
             self.generator.base_surface_y(world_x, world_z)
@@ -633,11 +666,10 @@ impl OreColumnCache<'_, '_> {
                 .or_insert_with(|| {
                     sample_y < surface_y
                         && heights
-                            .native_density(world_x, sample_y, world_z)
-                            .map_or_else(
-                                || generator.is_cave_cell(world_x, sample_y, world_z, surface_y),
-                                |density| density <= 0.0,
-                            )
+                            .native_empty(world_x, sample_y, world_z)
+                            .unwrap_or_else(|| {
+                                generator.is_cave_cell(world_x, sample_y, world_z, surface_y)
+                            })
                 });
         };
         match self.cave_samples[index] {
@@ -1006,6 +1038,9 @@ impl TerrainGenerator {
             vanilla_worldgen: None,
             diagnostic_cache: DiagnosticCache::default(),
             blocks: registry,
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            solid_cache: solid_cache::SolidCache::default(),
         })
     }
 
@@ -2741,6 +2776,27 @@ impl TerrainGenerator {
             None => Ok(None),
         }
     }
+
+    /// Evaluate chunk density on the GPU in batches shared by every thread
+    /// generating chunks (call after [`Self::load_vanilla_worldgen`]).
+    /// Returns the adapter's name; errors leave generation on the CPU.
+    pub fn enable_gpu(&mut self) -> Result<String, String> {
+        #[cfg(feature = "gpu")]
+        {
+            let (_, density) = self
+                .vanilla()
+                .ok_or("GPU worldgen needs vanilla worldgen content")?;
+            let gpu = crate::vanilla_density::gpu::GpuDensity::new(density)?;
+            let adapter = gpu.adapter().to_owned();
+            self.gpu = Some(
+                gpu_service::GpuSolidService::spawn(gpu)
+                    .map_err(|error| format!("worldgen GPU thread: {error}"))?,
+            );
+            Ok(adapter)
+        }
+        #[cfg(not(feature = "gpu"))]
+        Err("this build has no GPU worldgen (feature `gpu`)".into())
+    }
 }
 
 impl ChunkGenerator for TerrainGenerator {
@@ -2794,6 +2850,39 @@ impl ChunkGenerator for TerrainGenerator {
     }
 
     fn generate(&self, pos: ChunkPos) -> Chunk {
+        #[cfg(feature = "gpu")]
+        if let Some(grid) = self.gpu.as_ref().and_then(|gpu| gpu.solids_around(pos)) {
+            return self.generate_with_solids(pos, Some(&grid));
+        }
+        match self.vanilla() {
+            Some((_, density)) => {
+                let grid = self
+                    .solid_cache
+                    .around(pos, |pos| chunk_solids(density, pos));
+                self.generate_with_solids(pos, Some(&grid))
+            }
+            None => self.generate_with_solids(pos, None),
+        }
+    }
+}
+
+/// Which blocks of the chunk at `pos` the density makes solid, on the CPU.
+fn chunk_solids(density: &VanillaDensity, pos: ChunkPos) -> ChunkSolids {
+    let mut values = vec![0.0; density.height() as usize * 256];
+    density.fill_density_chunk(
+        world_block_coordinate(pos.x, 0),
+        world_block_coordinate(pos.z, 0),
+        &mut values,
+    );
+    ChunkSolids::from_densities(&values, density.height() as usize)
+}
+
+impl TerrainGenerator {
+    /// [`ChunkGenerator::generate`] reading which blocks the density makes
+    /// solid from `solids` (computed elsewhere, e.g. the GPU worldgen
+    /// experiment) for this chunk and any held neighbour; anything not held
+    /// is computed here.
+    pub fn generate_with_solids(&self, pos: ChunkPos, solids: Option<&SolidGrid>) -> Chunk {
         #[cfg(test)]
         let mut stage_clock = profile_tests::StageClock::new();
         let mut chunk =
@@ -2806,11 +2895,19 @@ impl ChunkGenerator for TerrainGenerator {
             .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
         #[cfg(test)]
         stage_clock.end(5);
-        let native_density = self.vanilla().map(|(climate, density)| {
+        let native_solids = self.vanilla().map(|(climate, noise)| {
             let min_x = world_block_coordinate(pos.x, 0);
             let min_z = world_block_coordinate(pos.z, 0);
-            let mut values = vec![0.0; density.height() as usize * 256];
-            density.fill_density_chunk(min_x, min_z, &mut values);
+            let values = match solids.and_then(|solids| solids.chunk(pos)) {
+                Some(held) => std::borrow::Cow::Borrowed(held),
+                None => std::borrow::Cow::Owned(chunk_solids(noise, pos)),
+            };
+            // Density offsets inside the geometry: the top search's range.
+            let low = (self.geometry.min_y() - noise.min_y()).max(0);
+            let high = (self.geometry.max_y() - noise.min_y()).clamp(0, noise.height());
+            let density = noise;
+            #[cfg(test)]
+            stage_clock.end(0);
             // Block columns grouped by biome quart: one column sampler then
             // reuses each quart's Y-free climate fields for its 16 columns.
             let mut sampler = climate.column_sampler();
@@ -2820,15 +2917,12 @@ impl ChunkGenerator for TerrainGenerator {
                 let idx = (quart / 4 * 4 + inner / 4) * 16 + quart % 4 * 4 + inner % 4;
                 let x = min_x + (idx % 16) as i32;
                 let z = min_z + (idx / 16) as i32;
-                let top = (self.geometry.min_y()..self.geometry.max_y())
-                    .rev()
-                    .find(|&y| {
-                        let offset = y - density.min_y();
-                        offset >= 0
-                            && offset < density.height()
-                            && values[offset as usize * 256 + idx] > 0.0
-                    })
-                    .unwrap_or(self.geometry.min_y());
+                let top = values
+                    .top_below(idx, high as usize)
+                    .filter(|offset| *offset as i32 >= low)
+                    .map_or(self.geometry.min_y(), |offset| {
+                        density.min_y() + offset as i32
+                    });
                 let native = sampler.sample(x, top, z);
                 let biome = match parsed.iter().find(|(name, _)| *name == native.biome) {
                     Some((_, biome)) => biome.clone(),
@@ -2855,7 +2949,7 @@ impl ChunkGenerator for TerrainGenerator {
             values
         });
         #[cfg(test)]
-        stage_clock.end(0);
+        stage_clock.end(6);
         let village = self.village_plans_for_chunk(pos);
         #[cfg(test)]
         stage_clock.end(4);
@@ -2903,16 +2997,19 @@ impl ChunkGenerator for TerrainGenerator {
                 )
             }),
         );
+        if let (Some(solids), Some((_, density))) = (solids, self.vanilla()) {
+            heights = heights.with_solids(solids, density.min_y());
+        }
 
         for plan in &columns {
-            if let (Some(values), Some((_, density))) = (&native_density, self.vanilla()) {
+            if let (Some(values), Some((_, density))) = (&native_solids, self.vanilla()) {
                 let idx = usize::from(plan.lz) * 16 + usize::from(plan.lx);
                 let badlands = plan.biome.path().contains("badlands");
                 for y in self.geometry.min_y()..=plan.top_non_air {
                     let offset = y - density.min_y();
                     let solid = offset >= 0
                         && offset < density.height()
-                        && values[offset as usize * 256 + idx] > 0.0;
+                        && values.solid(idx, offset as usize);
                     let state = if y == self.geometry.min_y() {
                         self.bedrock
                     } else if y == plan.height {
@@ -2980,7 +3077,7 @@ impl ChunkGenerator for TerrainGenerator {
         stage_clock.end(3);
         self.assign_biomes(&mut chunk, &columns);
         #[cfg(test)]
-        stage_clock.end(0);
+        stage_clock.end(6);
         if let Some(plans) = village.as_ref() {
             {
                 self.apply_village_pieces(&mut chunk, plans, &mut heights);
@@ -2992,6 +3089,8 @@ impl ChunkGenerator for TerrainGenerator {
         {
             self.apply_decorations(&mut chunk, &columns, &mut heights);
         }
+        #[cfg(test)]
+        stage_clock.end(7);
         if let Some(structures) = &self.overworld_structures {
             let heights_cell = std::cell::RefCell::new(&mut heights);
             let touched = structures.paste(
@@ -3011,7 +3110,7 @@ impl ChunkGenerator for TerrainGenerator {
             }
         }
         #[cfg(test)]
-        stage_clock.end(3);
+        stage_clock.end(8);
         chunk.status = "minecraft:full".into();
         chunk.mark_dirty();
         #[cfg(test)]

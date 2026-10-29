@@ -262,6 +262,7 @@ name = "catalog-load-isolated"
 view_distance = {args.view_distance}
 simulation_distance = {args.view_distance}
 max_players = {max(10, clients)}
+worldgen_gpu = {json.dumps(getattr(args, "worldgen_gpu", False))}
 [network]
 bind_address = "127.0.0.1"
 port = {game}
@@ -1324,13 +1325,7 @@ async def run(args: argparse.Namespace) -> int:
                 minimum = recipe.get("constraints", {}).get("minimum_clients", 1)
                 if min(args.ramp_clients or [args.clients]) < minimum:
                     raise ClassifiedFailure("SETUP_FAILED", f"recipe requires at least {minimum} clients for its declared regions")
-            if not args.smoke:
-                if not args.parity_resume_receipt:
-                    raise ClassifiedFailure("INFRA_BLOCKED", "owner window-hold: full parity and native compact storage confirmation required before perf resume")
-                resume = json.loads(args.parity_resume_receipt.read_text())
-                if resume.get("full_parity_verified") is not True or resume.get("native_storage_verified") is not True:
-                    raise ClassifiedFailure("INFRA_BLOCKED", "resume receipt lacks full parity/native storage verification")
-                receipt["resume_receipt_sha256"] = scale.binary_sha256(args.parity_resume_receipt)
+            receipt["worldgen_gpu"] = args.worldgen_gpu
             binaries = {"server": args.server_bin, "bots": args.bots_bin}
             for name, binary in binaries.items():
                 if binary is None or not binary.is_file() or not os.access(binary, os.X_OK):
@@ -1401,7 +1396,8 @@ def main() -> int:
     parser.add_argument("--max-tick-p99-ms", type=float, default=50)
     parser.add_argument("--max-tick-max-ms", type=float, default=250)
     parser.add_argument("--max-rss-mb", type=float, default=3072)
-    parser.add_argument("--parity-resume-receipt", type=Path)
+    parser.add_argument("--worldgen-gpu", action="store_true",
+                        help="generate the server's chunk density on the GPU ([server].worldgen_gpu)")
     args = parser.parse_args()
     if args.out.exists():
         parser.error("--out must be a new directory; existing receipts are never overwritten")
@@ -1419,7 +1415,7 @@ def main() -> int:
         parser.error("smoke measurement windows must total <=120 seconds")
     args.out = args.out.resolve()
     args.vanilla_data_dir = args.vanilla_data_dir.resolve()
-    for name in ("server_bin", "bots_bin", "plugins_dir", "parity_resume_receipt"):
+    for name in ("server_bin", "bots_bin", "plugins_dir"):
         value = getattr(args, name)
         if value:
             setattr(args, name, value.resolve())

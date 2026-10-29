@@ -11,6 +11,8 @@ use crate::vanilla_climate::noise::NormalNoise;
 mod blended;
 mod compile;
 mod evaluate;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod program;
 
 use blended::BlendedNoise;

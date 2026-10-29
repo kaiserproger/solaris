@@ -59,6 +59,11 @@ pub struct CoreConfig {
     /// Opt-in per-tick input log under `<world>/input-log/` (replay support;
     /// see `input_log.rs`). Off by default.
     pub input_log: bool,
+    /// Evaluate Overworld chunk density on the GPU in shared batches when the
+    /// build has GPU worldgen and an adapter is present; otherwise, and after
+    /// any GPU failure, the CPU does it. GPU rounding can flip single blocks
+    /// where density is near zero.
+    pub worldgen_gpu: bool,
 }
 
 /// Finer block-damage switches under vanilla `mobGriefing` (which stays the
@@ -114,6 +119,7 @@ impl CoreConfig {
             mob_griefing: MobGriefingRules::default(),
             block_log: crate::block_log::Settings::default(),
             input_log: false,
+            worldgen_gpu: false,
         }
     }
 }

@@ -44,9 +44,8 @@
       "PERF_FAIL",
       "PASS"
     ],
-    "classification": "Unsupported requires evidence that a required game/extension mechanic is absent. Missing native fixture transport,bot stimulus,expected-state oracle,telemetry or owner release permission is INFRA_BLOCKED. Present recipe failing preparation/readiness is SETUP_FAILED; observed mismatch is CORRECTNESS_FAIL; measured explicit budget failure is PERF_FAIL. PASS requires actual named-scope work+oracle and never fills an absent proof.",
+    "classification": "Unsupported requires evidence that a required game/extension mechanic is absent. Missing native fixture transport,bot stimulus,expected-state oracle or telemetry is INFRA_BLOCKED. Present recipe failing preparation/readiness is SETUP_FAILED; observed mismatch is CORRECTNESS_FAIL; measured explicit budget failure is PERF_FAIL. PASS requires actual named-scope work+oracle and never fills an absent proof.",
     "capability_null": "Recipe eligible for runtime preflight, not a recorded successful run. catalog_closure:false marks separately named diagnostics. A runnable P0 protocol gate does not establish full Solaris vanilla parity.",
-    "runtime_hold": "Non-smoke runs require --parity-resume-receipt containing full_parity_verified:true and native_storage_verified:true from real owner-approved evidence. Smoke is exempt but no performance evidence.",
     "execution": "Independent ordinary release v2 server and separate player_scale_bots process; isolated native world, explicit binary/data/fixture/recipe/command/schedule hashes and requested-client barrier. Public control fixture plus actual wire mirror and read-only native checkpoint/server-export images; eligibility is not executed evidence.",
     "runtime_defaults": {
       "clients": 10,

@@ -194,6 +194,11 @@ pub struct ServerSection {
     /// from a checkpoint (see `docs/OPERATING.md`). Off by default.
     #[serde(default)]
     pub input_log: bool,
+    /// Evaluate Overworld chunk density on the GPU, batched across chunk
+    /// workers. Needs a build with GPU worldgen (feature `gpu`) and a
+    /// hardware adapter; otherwise startup logs why and the CPU does it.
+    #[serde(default)]
+    pub worldgen_gpu: bool,
     /// Initial enforcement policy when whitelist.enabled has not been persisted.
     #[serde(default)]
     pub whitelist: Option<bool>,
@@ -212,6 +217,7 @@ impl Default for ServerSection {
             enable_command_block: false,
             spawn_protection: default_spawn_protection(),
             input_log: false,
+            worldgen_gpu: false,
             whitelist: None,
         }
     }
@@ -743,6 +749,7 @@ fn unknown_leaves(table: &toml::Table) -> Vec<String> {
                 "enable_command_block",
                 "spawn_protection",
                 "input_log",
+                "worldgen_gpu",
                 "whitelist",
             ],
         ),

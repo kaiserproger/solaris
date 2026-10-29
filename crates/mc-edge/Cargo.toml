@@ -11,6 +11,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Batched GPU chunk density (`[server] worldgen_gpu`); pulls in wgpu.
+gpu = ["mc-worldgen/gpu"]
+
 [[bin]]
 name = "solaris-v2"
 path = "src/bin/solaris-v2.rs"
