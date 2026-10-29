@@ -1139,6 +1139,7 @@ fn compute_chunk_light_slow_in(
         &mut ws.sky,
         &mut ws.queue,
         world_height,
+        neighbourhood.map(|row| row.map(|slot| slot.is_none())),
         |from, to| {
             let target = grid_idx(to.0, to.1, to.2);
             let marked = ws.opacity[target] & 128 != 0
@@ -1450,19 +1451,35 @@ fn populate_indirect_section(
     }
 }
 
+/// `missing` marks absent neighbour slabs (`[z][x]`): all air, so every one of
+/// their columns is open sky down to the floor.
 fn seed_sky_from_open_columns(
     propagates_sky: &[bool],
     sky: &mut [u8],
     queue: &mut VecDeque<u32>,
     world_height: usize,
+    missing: [[bool; 3]; 3],
     occludes: impl Fn(WCoord, WCoord) -> bool,
 ) {
+    for (cz, row) in missing.iter().enumerate() {
+        for (cx, _) in row.iter().enumerate().filter(|(_, missing)| **missing) {
+            for ly in 0..world_height {
+                for lz in 0..SECTION_DIM {
+                    let start = grid_idx(cx * SECTION_DIM, ly, cz * SECTION_DIM + lz);
+                    sky[start..start + SECTION_DIM].fill(15);
+                }
+            }
+        }
+    }
     // Each column's direct sky is one interval [bottom, world_height).
     // Its boundary consists of the bottom cell and the portions below
     // neighbouring columns' bottoms; no full-volume neighbour scan is needed.
     let mut bottoms = [0; N_X * N_Z];
     for gx in 0..N_X {
         for gz in 0..N_Z {
+            if missing[gz / SECTION_DIM][gx / SECTION_DIM] {
+                continue;
+            }
             for ly in (0..world_height).rev() {
                 let idx = grid_idx(gx, ly, gz);
                 if propagates_sky[idx] && !occludes((gx, ly + 1, gz), (gx, ly, gz)) {

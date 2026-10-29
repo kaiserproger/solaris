@@ -246,8 +246,22 @@ fn stage_profile(seeds: &[i64], runs: usize, solids: Solids) {
                 }
             }
             let lighting = start.elapsed().as_secs_f64() * 1000.0 / 16.0;
+            // What chunk workers pay: light baked with no neighbours loaded.
+            let start = Instant::now();
+            for chunk in &chunks {
+                std::hint::black_box(mc_world::light::compute_chunk_light_in(
+                    &mut workspace,
+                    [
+                        [None, None, None],
+                        [None, Some(chunk), None],
+                        [None, None, None],
+                    ],
+                    &light_table,
+                ));
+            }
+            let bake = start.elapsed().as_secs_f64() * 1000.0 / 36.0;
             println!(
-                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} fill={fill} density={} climate_biome={} surface_fill={} carvers={} ores={} decorations={} structure_paste={} villages_jigsaw={} other={} lighting={lighting}",
+                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} fill={fill} density={} climate_biome={} surface_fill={} carvers={} ores={} decorations={} structure_paste={} villages_jigsaw={} other={} lighting={lighting} bake={bake}",
                 stages[0],
                 stages[6],
                 stages[1],

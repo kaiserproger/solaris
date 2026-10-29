@@ -334,15 +334,45 @@ fn three_by_three_seam_propagates_block_light() {
 }
 
 #[test]
-fn missing_neighbours_treated_as_air() {
+fn missing_neighbours_light_like_air_neighbours() {
     let table = tiny_table();
-    let input = solo(air_chunk()); // only centre, others None
-    let out = compute_chunk_light(borrow(&input), &table);
-    // No surrounding chunks, but the centre is still all air —
-    // sky should be 15 everywhere, block 0.
-    assert_eq!(out.sky_at(0, MIN_Y, 0), 15);
-    assert_eq!(out.sky_at(15, MAX_Y - 1, 15), 15);
-    assert_eq!(out.block_at(0, 0, 0), 0);
+    // Stone up to y=59 with tunnels open at the z=0 and x=15 edges and a
+    // glowstone in a side pocket of the first one.
+    let mut chunk = air_chunk();
+    for x in 0..16 {
+        for z in 0..16 {
+            for y in MIN_Y..60 {
+                chunk.set_block(x, y, z, BlockStateId(1));
+            }
+        }
+    }
+    for x in 0..16 {
+        for y in 40..43 {
+            chunk.set_block(x, y, 0, BlockStateId(0));
+        }
+    }
+    for z in 0..6 {
+        for y in 30..33 {
+            chunk.set_block(15, y, z, BlockStateId(0));
+        }
+    }
+    chunk.set_block(3, 41, 1, BlockStateId(0));
+    chunk.set_block(3, 41, 2, BlockStateId(3));
+    let missing = solo(chunk.clone());
+    let air = std::array::from_fn(|z| {
+        std::array::from_fn(|x| {
+            Some(if (z, x) == (1, 1) {
+                chunk.clone()
+            } else {
+                air_chunk()
+            })
+        })
+    });
+    let missing = compute_chunk_light(borrow(&missing), &table);
+    let air = compute_chunk_light(borrow(&air), &table);
+    assert_light_eq(&missing, &air, "missing vs air neighbours");
+    assert_eq!(missing.sky_at(5, 41, 0), 14, "side sky enters the tunnel");
+    assert_eq!(missing.block_at(3, 41, 2), 15);
 }
 
 /// When the real .analysis/test-world block_light.json + blocks

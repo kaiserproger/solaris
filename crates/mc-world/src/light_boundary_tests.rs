@@ -40,6 +40,7 @@ fn irregular_sky_boundaries_match_full_source_propagation() {
         &mut actual,
         &mut boundary_sources,
         height,
+        [[false; 3]; 3],
         |_, _| false,
     );
     bfs(
