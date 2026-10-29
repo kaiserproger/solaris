@@ -299,7 +299,7 @@ pub(crate) fn execute_tellraw(
     executor: EntityId,
     target: &crate::commands::Target,
     message: &mc_nbt::Tag,
-) {
+) -> crate::command_execution::CommandResult {
     let targets = crate::command_execution::player_targets(state, executor, target);
     if targets.is_empty() {
         crate::command_execution::feedback(
@@ -308,14 +308,15 @@ pub(crate) fn execute_tellraw(
             "argument.entity.notfound.player",
             Vec::new(),
         );
-        return;
+        return crate::command_execution::CommandResult::Failed;
     }
+    let count = targets.len() as i32;
     for target in targets {
         let resolved = match resolve_component(state, target, message) {
             Ok(tag) => tag,
             Err(message) => {
                 error_text(state, connection, message);
-                return;
+                return crate::command_execution::CommandResult::Failed;
             }
         };
         let recipient = state.connections.entity_connection(target);
@@ -326,6 +327,7 @@ pub(crate) fn execute_tellraw(
             );
         }
     }
+    crate::command_execution::CommandResult::Success(count)
 }
 
 /// `/title`: resolve title/subtitle/actionbar components per target player and
@@ -337,7 +339,7 @@ pub(crate) fn execute_title(
     executor: EntityId,
     target: &crate::commands::Target,
     action: &TitleAction,
-) {
+) -> crate::command_execution::CommandResult {
     let targets = crate::command_execution::player_targets(state, executor, target);
     if targets.is_empty() {
         crate::command_execution::feedback(
@@ -346,7 +348,7 @@ pub(crate) fn execute_title(
             "argument.entity.notfound.player",
             Vec::new(),
         );
-        return;
+        return crate::command_execution::CommandResult::Failed;
     }
     match action {
         TitleAction::Clear { reset_times } => {
@@ -368,7 +370,7 @@ pub(crate) fn execute_title(
                     Ok(tag) => tag,
                     Err(message) => {
                         error_text(state, connection, message);
-                        return;
+                        return crate::command_execution::CommandResult::Failed;
                     }
                 };
                 let change = match action {
@@ -400,6 +402,7 @@ pub(crate) fn execute_title(
         }
     }
     title_feedback(state, connection, &targets, action);
+    crate::command_execution::CommandResult::Success(targets.len() as i32)
 }
 
 fn push_title(state: &mut TickState, target: EntityId, change: crate::boundary::TitleChange) {

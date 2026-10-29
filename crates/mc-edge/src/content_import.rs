@@ -307,6 +307,7 @@ async fn derive_into(request: &ImportRequest, staging: &Path) -> Result<ImportRe
     let bundle = unpack_bundle(&jar, &identity_work)?;
     let gameplay = unpack_bundle(&gameplay_jar, &gameplay_work)?;
     copy_data_subset(&gameplay.inner_jar, staging)?;
+    copy_language(&bundle.inner_jar, staging)?;
     copy_client_tag_subset(&bundle.inner_jar, staging)?;
     run_datagen(&java, &jar, &identity_work, staging)?;
     run_java_extractors(
@@ -695,6 +696,15 @@ fn install_version_json(jar: &Path, expected: &str, version_file: &Path) -> Resu
         "the supplied jar is {id} but this cache needs {expected}"
     );
     fs::write(version_file, &raw).with_context(|| format!("write {}", version_file.display()))?;
+    Ok(())
+}
+
+fn copy_language(inner_jar: &Path, staging: &Path) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(File::open(inner_jar)?)?;
+    let mut language = archive.by_name("assets/minecraft/lang/en_us.json")?;
+    let dest = staging.join("assets/minecraft/lang/en_us.json");
+    fs::create_dir_all(dest.parent().expect("language parent"))?;
+    io::copy(&mut language, &mut File::create(dest)?)?;
     Ok(())
 }
 

@@ -70,6 +70,7 @@ pub(crate) fn resolve_coords(
 pub(crate) struct Job {
     pub text: String,
     pub context: Context,
+    pub block: Option<crate::boundary::BlockPos>,
 }
 #[derive(Default)]
 pub(crate) struct Runtime {
@@ -120,6 +121,7 @@ pub(crate) fn submit(state: &mut TickState, text: &str, context: Context, change
             state.command_context.jobs.push(Job {
                 text: text.to_owned(),
                 context,
+                block: None,
             });
         } else {
             error(state, context, "Command queue budget exceeded");
@@ -417,14 +419,19 @@ fn face(context: &mut Context, target: [f64; 3]) {
     ];
 }
 /// Iterative branches prevent a long `run execute ...` chain from using the Rust stack.
-pub(crate) fn run(state: &mut TickState, text: &str, context: Context, changes: &mut ChangeSet) {
+pub(crate) fn run(
+    state: &mut TickState,
+    text: &str,
+    context: Context,
+    changes: &mut ChangeSet,
+) -> i32 {
     if state.command_context.depth >= 64 {
         error(
             state,
             context,
             "Nested command/function depth exceeded (64)",
         );
-        return;
+        return 0;
     }
     if !state.datapacks.running {
         begin_sequence(state);
@@ -438,6 +445,7 @@ pub(crate) fn run(state: &mut TickState, text: &str, context: Context, changes: 
         Vec::<crate::command_store::Store>::new(),
     )]);
     let mut stage = None;
+    let mut successes = 0i32;
     let mut produced = 0usize;
     while let Some((mut text, mut context, mut continuation, mut stores)) = branches.pop_front() {
         let mut resume = false;
@@ -458,6 +466,8 @@ pub(crate) fn run(state: &mut TickState, text: &str, context: Context, changes: 
                 return match native(state, text, context, changes, !stores.is_empty())? {
                     CommandResult::Success(value) => Ok(Some((true, value))),
                     CommandResult::Failed => Ok(Some((false, 0))),
+                    CommandResult::Completed if stores.is_empty() => Ok(Some((true, 0))),
+                    CommandResult::Completed => Err("Command has no execute-store result".into()),
                     CommandResult::Unavailable if stores.is_empty() => Ok(None),
                     CommandResult::Unavailable => Err("Command has no execute-store result".into()),
                 };
@@ -666,6 +676,9 @@ pub(crate) fn run(state: &mut TickState, text: &str, context: Context, changes: 
             }
         };
         if let Some((success, value)) = outcome {
+            if success {
+                successes = successes.saturating_add(1);
+            }
             for store in &stores {
                 store.apply(state, success, value);
             }
@@ -676,6 +689,7 @@ pub(crate) fn run(state: &mut TickState, text: &str, context: Context, changes: 
     }
     state.command_context.current = previous;
     state.command_context.depth -= 1;
+    successes
 }
 pub(crate) fn native(
     state: &mut TickState,

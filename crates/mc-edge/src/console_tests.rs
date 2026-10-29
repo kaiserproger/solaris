@@ -81,6 +81,7 @@ async fn console_runs_native_and_admin_commands_and_stop_checkpoints() {
 
 #[test]
 fn console_feedback_keeps_translated_arguments_and_literal_text() {
+    let language = [("commands.time.set".into(), "Set the time to %s".into())].into();
     let content = mc_nbt::Tag::Compound(vec![
         (
             "translate".into(),
@@ -94,10 +95,42 @@ fn console_feedback_keeps_translated_arguments_and_literal_text() {
             }),
         ),
     ]);
-    assert_eq!(component_text(&content), "commands.time.set: 4321");
+    assert_eq!(component_text(&content, &language), "Set the time to 4321");
     assert_eq!(
-        component_text(&mc_nbt::Tag::String("saved".into())),
+        component_text(&mc_nbt::Tag::String("saved".into()), &language),
         "saved"
+    );
+}
+
+#[test]
+fn console_substitutes_indexed_nested_components() {
+    let language = [
+        ("outer".into(), "%2$s then %1$s and %%".into()),
+        ("inner".into(), "diamond".into()),
+    ]
+    .into();
+    let content = mc_nbt::Tag::Compound(vec![
+        ("translate".into(), mc_nbt::Tag::String("outer".into())),
+        (
+            "with".into(),
+            mc_nbt::Tag::List(mc_nbt::ListTag {
+                element_type: mc_nbt::tag_type::COMPOUND,
+                elements: vec![
+                    mc_nbt::Tag::Compound(vec![(
+                        "text".into(),
+                        mc_nbt::Tag::String("Alice".into()),
+                    )]),
+                    mc_nbt::Tag::Compound(vec![(
+                        "translate".into(),
+                        mc_nbt::Tag::String("inner".into()),
+                    )]),
+                ],
+            }),
+        ),
+    ]);
+    assert_eq!(
+        component_text(&content, &language),
+        "diamond then Alice and %"
     );
 }
 

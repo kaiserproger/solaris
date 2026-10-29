@@ -186,7 +186,7 @@ pub(crate) fn execute(
     mut request: Request,
     changes: &mut BTreeMap<Dimension, ChangeSet>,
 ) -> Result<crate::command_execution::CommandResult, String> {
-    use crate::command_execution::CommandResult::{Failed, Success, Unavailable};
+    use crate::command_execution::CommandResult::{Completed, Failed, Success, Unavailable};
     let source_dimension = locate(state, request.executor)
         .map(|(dimension, _)| dimension)
         .unwrap_or(state.dimension);
@@ -261,15 +261,14 @@ pub(crate) fn execute(
                 ),
             },
         );
-        return Ok(Unavailable);
+        return Ok(Completed);
     }
     let title_action = match &request.command {
         Command::Title { action, .. } => Some(action.clone()),
         _ => None,
     };
     if let Some(action) = title_action {
-        return execute_title_global(state, request, changes, selected, action)
-            .map(|()| Unavailable);
+        return execute_title_global(state, request, changes, selected, action).map(|()| Completed);
     }
     let mut result = Failed;
     for entity in selected {
@@ -306,6 +305,7 @@ pub(crate) fn execute(
         };
         result = match (result, outcome) {
             (Unavailable, _) | (_, Unavailable) => Unavailable,
+            (Completed, _) | (_, Completed) => Completed,
             (Success(total), Success(value)) => Success(total.wrapping_add(value)),
             (Success(total), Failed) => Success(total),
             (Failed, outcome) => outcome,

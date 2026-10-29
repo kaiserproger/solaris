@@ -45,6 +45,131 @@ fn advance(state: &mut TickState) {
     run(state, &mut ChangeSet::default());
 }
 #[test]
+fn conditional_chain_tracks_predecessor_success() {
+    let mut state = fixture();
+    let first = place(&mut state, 0, "command_block", "not_a_command", true);
+    let second = place(&mut state, 1, "chain_command_block", "time add 3", true);
+    let block_id = state.world.block_at(second.x, second.y, second.z).unwrap();
+    let block = state.registry.blocks.by_id(BlockStateId(block_id)).unwrap();
+    let name = block.block.id.clone();
+    let mut properties = block.properties.clone();
+    properties
+        .iter_mut()
+        .find(|(key, _)| key == "conditional")
+        .unwrap()
+        .1 = "true".into();
+    let conditional_id = state
+        .registry
+        .blocks
+        .by_name_and_props(&name, &properties)
+        .unwrap();
+    state
+        .world
+        .set_block(second.x, second.y, second.z, conditional_id.0);
+    schedule(&mut state, first);
+    advance(&mut state);
+    assert_eq!(state.day_time, 0);
+    let mut fields = read(&state, first).unwrap();
+    put(
+        &mut fields,
+        "Command",
+        Tag::String("forceload query 0 0".into()),
+    );
+    save(&mut state, first, fields);
+    schedule(&mut state, first);
+    advance(&mut state);
+    assert_eq!(state.day_time, 0);
+    let mut fields = read(&state, first).unwrap();
+    put(
+        &mut fields,
+        "Command",
+        Tag::String("scoreboard objectives add test dummy".into()),
+    );
+    save(&mut state, first, fields);
+    schedule(&mut state, first);
+    advance(&mut state);
+    assert_eq!(state.day_time, 3);
+    let mut fields = read(&state, first).unwrap();
+    put(&mut fields, "Command", Tag::String("time add 2".into()));
+    save(&mut state, first, fields);
+    schedule(&mut state, first);
+    advance(&mut state);
+    assert_eq!(state.day_time, 8);
+}
+#[test]
+fn conditional_chain_follows_common_command_outcomes() {
+    let mut state = fixture();
+    let first = place(&mut state, 0, "command_block", "time add 0", true);
+    let second = place(&mut state, 1, "chain_command_block", "time add 3", true);
+    place(&mut state, 3, "command_block", "time add 0", false);
+    let id = state.world.block_at(second.x, second.y, second.z).unwrap();
+    let block = state.registry.blocks.by_id(BlockStateId(id)).unwrap();
+    let name = block.block.id.clone();
+    let mut properties = block.properties.clone();
+    properties
+        .iter_mut()
+        .find(|(key, _)| key == "conditional")
+        .unwrap()
+        .1 = "true".into();
+    let id = state
+        .registry
+        .blocks
+        .by_name_and_props(&name, &properties)
+        .unwrap();
+    state.world.set_block(second.x, second.y, second.z, id.0);
+    for (command, expected) in [
+        ("setblock 0 61 0 minecraft:diamond_block", 3),
+        ("give @a minecraft:diamond_sword", 6),
+        ("enchant @a minecraft:sharpness 1", 9),
+        ("enchant @a minecraft:sharpness 1", 9),
+        (
+            "execute if block 0 61 0 minecraft:diamond_block run say hello",
+            12,
+        ),
+        ("data merge block 3 60 0 {Command:\"time add 4\"}", 15),
+    ] {
+        let mut fields = read(&state, first).unwrap();
+        put(&mut fields, "Command", Tag::String(command.into()));
+        save(&mut state, first, fields);
+        schedule(&mut state, first);
+        advance(&mut state);
+        assert_eq!(state.day_time, expected, "{command}");
+    }
+}
+
+#[test]
+fn conditional_chain_executes_at_shared_command_boundary() {
+    let mut state = fixture();
+    state.dimension_globals.active = true;
+    let first = place(&mut state, 0, "command_block", "time add 2", true);
+    let second = place(&mut state, 1, "chain_command_block", "time add 3", true);
+    let block_id = state.world.block_at(second.x, second.y, second.z).unwrap();
+    let block = state.registry.blocks.by_id(BlockStateId(block_id)).unwrap();
+    let name = block.block.id.clone();
+    let mut properties = block.properties.clone();
+    properties
+        .iter_mut()
+        .find(|(key, _)| key == "conditional")
+        .unwrap()
+        .1 = "true".into();
+    let conditional_id = state
+        .registry
+        .blocks
+        .by_name_and_props(&name, &properties)
+        .unwrap();
+    state
+        .world
+        .set_block(second.x, second.y, second.z, conditional_id.0);
+    schedule(&mut state, first);
+    advance(&mut state);
+    let (mut output, mut drains, _) = crate::tick::run_dimension_tick(&mut state, &[]);
+    assert_eq!(state.command_context.jobs.len(), 1);
+    let before = state.day_time;
+    crate::dimensions::travel::finish(&mut state, &mut output, &mut drains);
+    assert_eq!(state.day_time, before + 5);
+}
+
+#[test]
 fn impulse_rising_edge_drives_unconditional_chain_once() {
     let mut state = fixture();
     let impulse = place(&mut state, 0, "command_block", "time add 2", false);

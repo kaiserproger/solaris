@@ -86,7 +86,7 @@ async fn serverops_rcon_password_admin_and_native_console_feedback() {
         .unwrap()
         .unwrap();
     assert_eq!(reply.id, 5);
-    assert!(reply.body.contains("4321"), "{}", reply.body);
+    assert_eq!(reply.body.trim(), "Set minecraft:overworld to 4321 tick(s)");
     assert!(!reply.body.contains("Alice"));
     connection.abort();
     pump.abort();

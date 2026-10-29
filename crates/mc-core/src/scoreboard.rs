@@ -466,7 +466,7 @@ fn execute_inner(
 ) -> Result<(String, CommandResult), String> {
     if command.root == "trigger" {
         return execute_trigger(state, executor, &command.args)
-            .map(|message| (message, CommandResult::Unavailable));
+            .map(|message| (message, CommandResult::Completed));
     }
     let a = &command.args;
     let mut events = Vec::new();
@@ -515,7 +515,7 @@ fn execute_inner(
                                 .join(", ")
                         )
                     },
-                    CommandResult::Unavailable,
+                    CommandResult::Completed,
                 ));
             }
             "remove" => {
@@ -655,7 +655,7 @@ fn execute_inner(
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
-                    CommandResult::Unavailable,
+                    CommandResult::Completed,
                 ));
             }
             "add" => {
@@ -735,7 +735,7 @@ fn execute_inner(
         return execute_players(state, executor, a);
     }
     publish(state, events);
-    Ok((message, CommandResult::Unavailable))
+    Ok((message, CommandResult::Completed))
 }
 
 fn execute_trigger(
@@ -819,7 +819,7 @@ fn execute_players(
                         .join(", ")
                 )
             },
-            CommandResult::Unavailable,
+            CommandResult::Completed,
         ));
     }
     let owners = holders(state, executor, &a[2])?;
@@ -1021,7 +1021,7 @@ fn execute_players(
     publish(state, events);
     let result = match a[1].as_str() {
         "reset" => CommandResult::Success(owners.len() as i32),
-        "enable" => CommandResult::Unavailable,
+        "enable" => CommandResult::Completed,
         _ => CommandResult::Success(total),
     };
     Ok((

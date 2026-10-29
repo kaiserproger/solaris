@@ -16,9 +16,24 @@ pub(crate) struct ConsoleState {
     drained: std::sync::atomic::AtomicU64,
     ready: tokio::sync::Notify,
     pub(crate) running: std::sync::atomic::AtomicBool,
+    language: std::collections::HashMap<String, String>,
 }
 
 impl ConsoleState {
+    pub(crate) fn load(root: &std::path::Path) -> anyhow::Result<Self> {
+        let path = root.join("assets/minecraft/lang/en_us.json");
+        let bytes = std::fs::read(&path).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot read {}: {error}; reimport vanilla content",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            language: serde_json::from_slice(&bytes)?,
+            ..Self::default()
+        })
+    }
+
     pub(crate) fn feedback(&self, message: &str) {
         if let Some(response) = self.response.lock().as_mut()
             && let Ok(text) = response
@@ -204,11 +219,18 @@ pub(crate) fn print_line(message: &str) {
     let _ = stdout.flush();
 }
 
-fn component_text(component: &mc_nbt::Tag) -> String {
+fn component_text(
+    component: &mc_nbt::Tag,
+    language: &std::collections::HashMap<String, String>,
+) -> String {
     use mc_nbt::Tag;
     match component {
         Tag::String(text) => text.clone(),
-        Tag::List(list) => list.elements.iter().map(component_text).collect(),
+        Tag::List(list) => list
+            .elements
+            .iter()
+            .map(|value| component_text(value, language))
+            .collect(),
         Tag::Compound(fields) => {
             let field = |key: &str| {
                 fields
@@ -216,26 +238,59 @@ fn component_text(component: &mc_nbt::Tag) -> String {
                     .find(|(name, _)| name == key)
                     .map(|(_, value)| value)
             };
-            let mut text = field("text").map(component_text).unwrap_or_else(|| {
-                let mut text = field("fallback")
-                    .or_else(|| field("translate"))
-                    .map(component_text)
-                    .unwrap_or_default();
-                if let Some(Tag::List(arguments)) = field("with") {
-                    text.push_str(": ");
-                    text.push_str(
-                        &arguments
-                            .elements
-                            .iter()
-                            .map(component_text)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
+            let mut text = if let Some(text) = field("text") {
+                component_text(text, language)
+            } else if let Some(Tag::String(key)) = field("translate") {
+                let fallback = match field("fallback") {
+                    Some(Tag::String(value)) => value.as_str(),
+                    _ => key,
+                };
+                let template = language.get(key).map_or(fallback, String::as_str);
+                let args = match field("with") {
+                    Some(Tag::List(args)) => args
+                        .elements
+                        .iter()
+                        .map(|arg| component_text(arg, language))
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let mut rendered = String::new();
+                let mut rest = template;
+                let mut next = 0usize;
+                while let Some(index) = rest.find('%') {
+                    rendered.push_str(&rest[..index]);
+                    rest = &rest[index + 1..];
+                    if let Some(suffix) = rest.strip_prefix('%') {
+                        rendered.push('%');
+                        rest = suffix;
+                    } else if let Some(suffix) = rest.strip_prefix('s') {
+                        if let Some(arg) = args.get(next) {
+                            rendered.push_str(arg);
+                        }
+                        next += 1;
+                        rest = suffix;
+                    } else {
+                        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                        if digits > 0 && rest[digits..].starts_with("$s") {
+                            if let Ok(index) = rest[..digits].parse::<usize>()
+                                && let Some(arg) =
+                                    index.checked_sub(1).and_then(|index| args.get(index))
+                            {
+                                rendered.push_str(arg);
+                            }
+                            rest = &rest[digits + 2..];
+                        } else {
+                            rendered.push('%');
+                        }
+                    }
                 }
-                text
-            });
+                rendered.push_str(rest);
+                rendered
+            } else {
+                String::new()
+            };
             if let Some(extra) = field("extra") {
-                text.push_str(&component_text(extra));
+                text.push_str(&component_text(extra, language));
             }
             text
         }
@@ -247,13 +302,15 @@ pub(crate) fn output(state: &ConsoleState, changes: &[PlayerChange]) {
     for change in changes {
         match change {
             PlayerChange::Chat { message, .. } => state.feedback(message),
-            PlayerChange::StyledChat { content, .. } => state.feedback(&component_text(content)),
+            PlayerChange::StyledChat { content, .. } => {
+                state.feedback(&component_text(content, &state.language))
+            }
             PlayerChange::Disconnect { reason, .. } => state.feedback(reason),
             PlayerChange::Title(
                 mc_core::boundary::TitleChange::Title(content)
                 | mc_core::boundary::TitleChange::Subtitle(content)
                 | mc_core::boundary::TitleChange::ActionBar(content),
-            ) => state.feedback(&component_text(content)),
+            ) => state.feedback(&component_text(content, &state.language)),
             _ => {}
         }
     }
