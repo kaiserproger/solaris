@@ -600,7 +600,7 @@ fn omitted_java_flowers_compost_and_grass_block_does_not() {
 #[test]
 fn singleplayer_pause_holds_scheduled_block_deadline_and_entity() {
     use crate::journal::{JournalEntry, JournalWriter};
-    use crate::native_checkpoint::tests::{read_manifest, read_player};
+    use crate::native_checkpoint::tests::{fixture_store, read_manifest, read_player};
     use crate::{Core, CoreConfig};
     use std::time::Duration;
 
@@ -672,6 +672,7 @@ fn singleplayer_pause_holds_scheduled_block_deadline_and_entity() {
         permission_level: 4,
     });
     let mut mob_uuid = None;
+    let mut held = None;
     for _ in 0..100 {
         let output = next(&mut rx, Duration::from_secs(10)).expect("joined tick");
         if snapshot_block(&output) == Some(full) {
@@ -682,6 +683,7 @@ fn singleplayer_pause_holds_scheduled_block_deadline_and_entity() {
                 .find(|entity| entity.type_id == state.registry.zombie_type_id)
                 .map(|entity| entity.uuid);
             if mob_uuid.is_some() {
+                held = Some(output.snapshot.clone());
                 break;
             }
         }
@@ -692,10 +694,27 @@ fn singleplayer_pause_holds_scheduled_block_deadline_and_entity() {
         command: "solaris_pause on".into(),
         permission_level: 4,
     });
-    while next(&mut rx, Duration::from_millis(500)).is_some() {}
+    while let Some(output) = next(&mut rx, Duration::from_millis(500)) {
+        held = Some(output.snapshot);
+    }
+    let held = held.expect("last snapshot before pause");
     assert!(core.checkpoint());
     let before = read_manifest(&config).unwrap();
     let player_before = read_player(&config, &uuid.to_string(), &state.registry.items).unwrap();
+    let entity_record = || {
+        fixture_store(&config)
+            .unwrap()
+            .checkpoint_reader()
+            .unwrap()
+            .read_checkpoint()
+            .unwrap()
+            .entities
+            .into_iter()
+            .find(|entity| entity.identity == *mob_uuid.as_bytes())
+            .expect("checkpointed mob")
+            .payload
+    };
+    let mob_before = entity_record();
     let scheduled = before
         .block_ticks
         .chunks
@@ -708,6 +727,7 @@ fn singleplayer_pause_holds_scheduled_block_deadline_and_entity() {
     assert!(core.checkpoint());
     let after = read_manifest(&config).unwrap();
     let player_after = read_player(&config, &uuid.to_string(), &state.registry.items).unwrap();
+    assert_eq!(entity_record(), mob_before, "paused mob does not change");
     assert_eq!(
         player_after.pos, player_before.pos,
         "paused player does not move"
@@ -721,6 +741,11 @@ fn singleplayer_pause_holds_scheduled_block_deadline_and_entity() {
     });
     let resumed = next(&mut rx, Duration::from_secs(10)).expect("resumed tick");
     assert_eq!(resumed.tick, before.tick + 1);
+    assert_eq!(
+        resumed.snapshot.day_time,
+        held.day_time + 1,
+        "day clock advances only on resume"
+    );
     assert!(
         resumed
             .snapshot
