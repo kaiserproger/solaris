@@ -52,6 +52,28 @@ fn generator(seed: i64) -> TerrainGenerator {
 }
 
 #[test]
+#[ignore = "requires the local licensed vanilla content cache"]
+fn vanilla_fixed_seed_region_block_fingerprint() {
+    let generator = generator(712816);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for z in -2..2 {
+        for x in -2..2 {
+            let chunk = generator.generate(ChunkPos { x, z });
+            for y in chunk.geometry().min_y()..chunk.geometry().max_y() {
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        for byte in chunk.get_block(lx, y, lz).unwrap().0.to_le_bytes() {
+                            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(hash, 7_212_625_076_892_161_529);
+}
+
+#[test]
 #[ignore = "release stage profile; approved measurement window only"]
 fn vanilla_stages() {
     stage_profile(&[712816, 5617830, 42], 3, Solids::Alone);

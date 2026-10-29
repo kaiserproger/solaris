@@ -643,6 +643,9 @@ pub fn place_piece(
         .map(|(index, chest)| (world_position(chest.pos, settings), index))
         .collect();
 
+    // Processors can produce states not present in the template palette. Cache
+    // the final state transform per piece, after processing and before waterlogging.
+    let mut transformed_states = HashMap::new();
     let mut written = 0;
     for block in &processed {
         if let Some(clip) = settings.clip
@@ -650,12 +653,18 @@ pub fn place_piece(
         {
             continue;
         }
-        let state = mirror_state(registry, block.state, settings.mirror)
-            .and_then(|state| rotate_state(registry, state, settings.rotation))
-            .ok_or(PieceError::UnresolvableState {
-                pos: block.pos,
-                state: block.state,
-            })?;
+        let state = if settings.mirror == Mirror::None && settings.rotation == Rotation::None {
+            Some(block.state)
+        } else {
+            *transformed_states.entry(block.state).or_insert_with(|| {
+                mirror_state(registry, block.state, settings.mirror)
+                    .and_then(|state| rotate_state(registry, state, settings.rotation))
+            })
+        }
+        .ok_or(PieceError::UnresolvableState {
+            pos: block.pos,
+            state: block.state,
+        })?;
         let state = if settings.liquid_settings
             == mc_data::village_data::LiquidSettings::ApplyWaterlogging
         {

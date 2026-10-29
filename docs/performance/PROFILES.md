@@ -296,6 +296,18 @@ generate them with the shared solids cache (one density fill per chunk, timed
 apart), and `vanilla_stages_gpu_density` (`--features gpu`) with GPU density;
 every mode also prints `bake=`, the light a worker bakes with no neighbours.
 
+Village placement caches the mirror/rotation result for each processed block
+state for the duration of one piece, after processors and before waterlogging.
+This avoids repeated registry/property resolution for repeated palette states;
+the cache is discarded after the piece and can be removed if that resolution
+ceases to dominate. A seed-712816 CPU offline pregeneration diagnostic at
+radius 256, including startup validation, used 183.051/182.354 billion
+user-space instructions before and 172.012/172.018 billion after (two fresh
+worlds per leg, `perf stat`, serialized `mem-run -p` lane). Most affected
+lookups were in startup village validation, so this is not a per-chunk or live
+server speedup claim. Wall time was contaminated by host contention.
+The fixed-seed region block fingerprint and village placement tests fence output.
+
 Use the same memory/quiet-window rules as above. The separate GenBench
 Java-versus-Solaris server experiment has no completed Solaris result in this
 publication; no server-throughput ratio is claimed.
