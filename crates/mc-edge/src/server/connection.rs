@@ -74,14 +74,18 @@ async fn run_connection(
     peer: String,
     lifecycle: &mut ConnectionLifecycle<'_>,
 ) -> anyhow::Result<()> {
-    let ip = stream.peer_addr()?.ip();
-    if !server.pre_play_addresses.admit(ip) {
-        warn!(%ip, "too many simultaneous pre-play connections from this address");
-        anyhow::bail!("Too many simultaneous pre-play connections from this address");
-    }
-    let permit = PrePlayPermit {
-        limiter: &server.pre_play_addresses,
-        ip,
+    let permit = if server.velocity.is_none() {
+        let ip = stream.peer_addr()?.ip();
+        if !server.pre_play_addresses.admit(ip) {
+            warn!(%ip, "too many simultaneous pre-play connections from this address");
+            anyhow::bail!("Too many simultaneous pre-play connections from this address");
+        }
+        Some(PrePlayPermit {
+            limiter: &server.pre_play_addresses,
+            ip,
+        })
+    } else {
+        None
     };
     let mut conn = crate::connection::Connection::new(stream);
     let pre_play = async {
@@ -150,37 +154,36 @@ async fn run_connection(
             return Ok(None);
         };
 
-        // --- Configuration (registries, tags, finish). A 26.1.2 session
-        // --- announces its own release's registries and tags.
-        let legacy = conn.legacy().cloned();
-        let (data, tags) = match &legacy {
-            Some(profile) => (&profile.data, &profile.tags),
-            None => (&*server.data, &*server.tags),
-        };
-        let config_outcome = match crate::configuration::handle_configuration(
-            &mut conn,
-            data,
-            tags,
-            server.loader_manifest.as_ref(),
-            server.loader_required,
-            &server.cfg.resource_pack,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                warn!(%peer, connection = id.0, stage = "configuration", name = %outcome.name, %error, "connection closed");
-                return Err(error);
-            }
-        };
-        Ok(Some((outcome, config_outcome)))
+        Ok(Some(outcome))
     };
-    let Some((outcome, config_outcome)) =
-        tokio::time::timeout(crate::connection::PRE_PLAY_TOTAL_TIMEOUT, pre_play)
-            .await
-            .map_err(|_| anyhow::anyhow!("total pre-play deadline exceeded"))??
+    let Some(outcome) = tokio::time::timeout(crate::connection::PRE_PLAY_TOTAL_TIMEOUT, pre_play)
+        .await
+        .map_err(|_| anyhow::anyhow!("total login deadline exceeded"))??
     else {
         return Ok(());
+    };
+
+    // Configuration has its own per-read and resource-pack deadlines.
+    let legacy = conn.legacy().cloned();
+    let (data, tags) = match &legacy {
+        Some(profile) => (&profile.data, &profile.tags),
+        None => (&*server.data, &*server.tags),
+    };
+    let config_outcome = match crate::configuration::handle_configuration(
+        &mut conn,
+        data,
+        tags,
+        server.loader_manifest.as_ref(),
+        server.loader_required,
+        &server.cfg.resource_pack,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            warn!(%peer, connection = id.0, stage = "configuration", name = %outcome.name, %error, "connection closed");
+            return Err(error);
+        }
     };
     drop(permit);
     // Access-list changes during Configuration revoke admission before Join.
