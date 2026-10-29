@@ -332,7 +332,7 @@ async fn run_connection(
             .admin
             .register(id, outcome.uuid, outcome.name.clone(), ip);
     }
-    server.feedback(id, "Поселения: /settlement guide")?;
+    server.feedback(id, "Settlements / Поселения: /settlement guide")?;
     if *server.stop.borrow() {
         server.kick(
             id,
