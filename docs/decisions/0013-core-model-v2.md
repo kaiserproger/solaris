@@ -3292,6 +3292,37 @@ Block edits use the existing commit/journal/container paths and reject fills
 above `max_block_modifications` (32,768 by default) before mutation. Forced spawn points and world spawn rotation
 survive checkpoint/recovery. Command feedback uses vanilla translatable components.
 
+The limited command-locality pilot keeps the closed `Command` enum and static
+dispatcher. `command_feedback.rs` only builds neutral text/translatable NBT;
+callers retain styling, translation keys, argument order and delivery. The
+existing `command_enchant.rs` owns enchant parsing, held-item validation and
+local target orchestration. It still uses `Player::apply_command` and the
+existing tick-owned `apply_player_effects` path, without moving inventory,
+commit, world-custody or protocol authority. Shared selector/name/delivery
+helpers remain in `command_execution.rs`; other families are not migrated.
+Enchant returns `Success(count)` for successful targets and `Failed` when none
+succeed; execute-store admission for enchant remains rejected.
+
+Native permission hardening shares the unchanged root-level policy in
+`commands::ROOTS` between edge advertisement/admission and native execution.
+`command_context::native` checks each leaf against its inherited numeric
+`Context.permission` before parsing, cross-world dispatch or handler mutation;
+execute admission uses the same policy. In particular, `tick` and `co` require
+level three even through execute/function continuations. Boolean parser
+permissions still control the existing selector/syntax behavior, not final
+numeric authorization. Plugin-owned roots retain their first routing and
+retirement reservation. Functions inherit the invoking Context, while command
+blocks and load/tick/scheduled functions retain their existing level-two source;
+the trusted console remains level four. This changes neither budgets nor
+execution/commit ordering.
+
+`DifficultyQuery` returns the numeric difficulty ID after its unchanged
+translated feedback, matching the official Java 26.1.2 query: peaceful/easy/
+normal/hard produce `Success(0/1/2/3)`. Execute-store success is one even for
+the successful peaceful result zero. The query does not mutate gameplay state;
+the difficulty setter returns `Success(1)` on change and retains its existing
+same-value failure. Execute-store admission for the setter remains rejected.
+
 `/advancement grant|revoke <targets>` supports `everything`, `only <id>
 [criterion]`, `from <id>`, `through <id>` and `until <id>`. `from` selects the
 named node and descendants, `until` its ancestors and itself, and `through`

@@ -91,30 +91,15 @@ jobs:
         with:
           distribution: temurin
           java-version: "25"
-      - name: Extract local vanilla test data (never redistributed)
+      - name: Import the canonical 26.3 content cache as local test data (never redistributed)
         run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          from urllib.request import urlopen
-
-          version = "26.1.2"
-          with urlopen("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json") as response:
-              versions = json.load(response)["versions"]
-          metadata_url = next(entry["url"] for entry in versions if entry["id"] == version)
-          with urlopen(metadata_url) as response:
-              server = json.load(response)["downloads"]["server"]
-          with urlopen(server["url"]) as response:
-              content = response.read()
-          if hashlib.sha1(content).hexdigest() != server["sha1"]:
-              raise SystemExit("Minecraft server checksum mismatch")
-          destination = Path(".analysis/server.jar")
-          destination.parent.mkdir(parents=True, exist_ok=True)
-          destination.write_bytes(content)
-          print(f"Verified Minecraft {version} server: {server['sha1']}")
-          PY
-          tools/extract-vanilla-data.sh .analysis/server.jar
+          set -euo pipefail
+          # `content import` verifies Mojang's size/sha1 and derives the same
+          # composite cache operators use (26.3 identity, 26.1.2 gameplay pack).
+          XDG_DATA_HOME="$RUNNER_TEMP/xdg" cargo run --locked -p mc-edge --bin solaris-v2 -- content import --version 26.3 --download
+          rm -rf data/vanilla
+          mkdir -p data
+          cp -a "$RUNNER_TEMP/xdg/solaris/content/26.3" data/vanilla
       - run: python3 -m tools.harness run test --workspace --all-targets --partition count:${{ matrix.shard }}/4
       - name: Retain failed test receipts
         if: failure()

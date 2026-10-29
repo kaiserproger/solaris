@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 
 use crate::boundary::{ConnectionId, EntityId, PlayerChange};
+use crate::command_feedback::{text, translated};
 use crate::commands::CommandError;
 use crate::tick::TickState;
 use mc_data::Identifier;
@@ -1420,24 +1421,6 @@ fn found_distance(origin: (i32, i32, i32), found: (i32, i32, i32), include_y: bo
     } else {
         (dx * dx + dz * dz).sqrt().floor() as i32
     }
-}
-
-fn text(value: impl ToString) -> Tag {
-    Tag::Compound(vec![("text".into(), Tag::String(value.to_string()))])
-}
-
-fn translated(key: &str, arguments: Vec<Tag>) -> Tag {
-    let mut fields = vec![("translate".into(), Tag::String(key.into()))];
-    if !arguments.is_empty() {
-        fields.push((
-            "with".into(),
-            Tag::List(ListTag {
-                element_type: mc_nbt::tag_type::COMPOUND,
-                elements: arguments,
-            }),
-        ));
-    }
-    Tag::Compound(fields)
 }
 
 /// Vanilla `sendFailure`: red translatable component.

@@ -6,9 +6,10 @@
 use mc_nbt::Tag;
 
 use crate::boundary::{ConnectionId, PlayerChange};
+use crate::command_feedback::{text, translated};
 use crate::commands::CommandError;
 use crate::tick::TickState;
-use crate::tick_control::{announce_state, announce_step, text};
+use crate::tick_control::{announce_state, announce_step};
 
 const MAX_RATE: f32 = 10_000.0;
 
@@ -88,20 +89,6 @@ pub(crate) fn parse(args: &[&str]) -> Result<TickCommand, CommandError> {
         ["freeze"] => Ok(TickCommand::Freeze),
         _ => Err(CommandError::Usage(USAGE)),
     }
-}
-
-fn translated(key: &str, arguments: Vec<Tag>) -> Tag {
-    let mut fields = vec![("translate".into(), Tag::String(key.into()))];
-    if !arguments.is_empty() {
-        fields.push((
-            "with".into(),
-            Tag::List(mc_nbt::ListTag {
-                element_type: mc_nbt::tag_type::COMPOUND,
-                elements: arguments,
-            }),
-        ));
-    }
-    Tag::Compound(fields)
 }
 
 fn success(state: &mut TickState, connection: ConnectionId, key: &str, arguments: Vec<Tag>) {

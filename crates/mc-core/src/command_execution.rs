@@ -1,11 +1,12 @@
 //! Tick-owned vanilla command execution and target selection.
 use crate::boundary::{ChangeSet, ConnectionId, EntityId, PlayerChange};
+use crate::command_feedback::{text, translated};
 use crate::commands::{
     Command, Destination, Selector, SelectorKind, SelectorSort, Target, Weather,
 };
 use crate::entities::EntityKind;
 use crate::tick::{DamagePiece, TickState};
-use mc_nbt::{ListTag, Tag};
+use mc_nbt::Tag;
 
 /// Native execution outcome, independent of translated player feedback.
 /// `Success(0)` is distinct from failure; unavailable results are rejected
@@ -57,24 +58,6 @@ pub(crate) fn supports_store_result(command: &Command) -> bool {
     }
 }
 
-fn text(value: impl ToString) -> Tag {
-    Tag::Compound(vec![("text".into(), Tag::String(value.to_string()))])
-}
-
-fn translated(key: impl Into<String>, arguments: Vec<Tag>) -> Tag {
-    let mut fields = vec![("translate".into(), Tag::String(key.into()))];
-    if !arguments.is_empty() {
-        fields.push((
-            "with".into(),
-            Tag::List(ListTag {
-                element_type: mc_nbt::tag_type::COMPOUND,
-                elements: arguments,
-            }),
-        ));
-    }
-    Tag::Compound(fields)
-}
-
 pub(crate) fn feedback(
     state: &mut TickState,
     connection: ConnectionId,
@@ -89,7 +72,7 @@ pub(crate) fn feedback(
     );
 }
 
-fn error(state: &mut TickState, connection: ConnectionId, message: impl Into<String>) {
+pub(crate) fn error(state: &mut TickState, connection: ConnectionId, message: impl Into<String>) {
     state.push_player(
         connection,
         PlayerChange::Chat {
@@ -182,7 +165,7 @@ pub(crate) fn entity_name(state: &TickState, entity: EntityId) -> Tag {
     translated(format!("entity.{name}"), Vec::new())
 }
 
-fn targets_label(state: &TickState, targets: &[EntityId]) -> Tag {
+pub(crate) fn targets_label(state: &TickState, targets: &[EntityId]) -> Tag {
     if targets.len() == 1 {
         entity_name(state, targets[0])
     } else {
@@ -508,80 +491,14 @@ pub(crate) fn execute(
             return Success(amount);
         }
         Command::Enchant(enchant_command) => {
-            let targets = resolve_target(state, executor, &enchant_command.target);
-            if targets.is_empty() {
-                feedback(
-                    state,
-                    connection,
-                    "argument.entity.notfound.entity",
-                    Vec::new(),
-                );
-                return Failed;
-            }
-            let single = targets.len() == 1;
-            let mut successful = Vec::new();
-            for target in targets {
-                let Some(player) = state.players.get(&target) else {
-                    if single {
-                        feedback(
-                            state,
-                            connection,
-                            "commands.enchant.failed.itemless",
-                            vec![entity_name(state, target)],
-                        );
-                        return Failed;
-                    }
-                    continue;
-                };
-                if let Err(message) = crate::command_enchant::validate(
-                    &state.registry.item_rules(),
-                    &player.inventory,
-                    enchant_command,
-                ) {
-                    if single {
-                        error(state, connection, message);
-                    }
-                    continue;
-                }
-                let effects = state
-                    .players
-                    .get_mut(&target)
-                    .expect("checked player exists")
-                    .apply_command(&state.registry.item_rules(), command);
-                if let Some(target_connection) = state.connections.entity_connection(target) {
-                    crate::tick::apply_player_effects(
-                        state,
-                        target_connection,
-                        target,
-                        effects,
-                        changes,
-                    );
-                }
-                successful.push(target);
-            }
-            if !successful.is_empty() {
-                let enchantment = translated(
-                    format!(
-                        "enchantment.{}",
-                        enchant_command.enchantment.as_str().replace(':', ".")
-                    ),
-                    Vec::new(),
-                );
-                feedback(
-                    state,
-                    connection,
-                    if successful.len() == 1 {
-                        "commands.enchant.success.single"
-                    } else {
-                        "commands.enchant.success.multiple"
-                    },
-                    vec![enchantment, targets_label(state, &successful)],
-                );
-                return Success(successful.len() as i32);
-            } else if !single {
-                feedback(state, connection, "commands.enchant.failed", Vec::new());
-            }
-            return Failed;
+            return crate::command_enchant::execute(
+                state,
+                connection,
+                executor,
+                command,
+                enchant_command,
+                changes,
+            );
         }
         Command::DebugGive {
             item,
@@ -848,12 +765,15 @@ pub(crate) fn execute(
             );
             return Success(1);
         }
-        Command::DifficultyQuery => feedback(
-            state,
-            connection,
-            "commands.difficulty.query",
-            vec![difficulty_name(state.difficulty)],
-        ),
+        Command::DifficultyQuery => {
+            feedback(
+                state,
+                connection,
+                "commands.difficulty.query",
+                vec![difficulty_name(state.difficulty)],
+            );
+            return Success(i32::from(state.difficulty.id()));
+        }
         Command::GameRule { name, value } => {
             if let Some(value) = value
                 && state.gamerules.get(name) != Some(value)

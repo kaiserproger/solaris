@@ -52,6 +52,8 @@ mod command_block_entity;
 mod command_blocks;
 pub mod command_border;
 pub mod command_bossbar;
+#[cfg(test)]
+mod command_characterization_tests;
 pub mod command_console;
 mod command_context;
 pub mod command_damage;
@@ -62,8 +64,11 @@ mod command_sound;
 mod command_storage;
 mod command_tag;
 pub(crate) use command_debug::{Profiler as DebugProfiler, TraceArtifact as DebugTraceArtifact};
+#[cfg(test)]
+mod command_difficulty_tests;
 pub mod command_enchant;
 mod command_execution;
+mod command_feedback;
 mod command_item_replace;
 pub mod command_items;
 pub mod command_locate;

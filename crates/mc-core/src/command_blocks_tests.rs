@@ -194,6 +194,36 @@ fn impulse_rising_edge_drives_unconditional_chain_once() {
     advance(&mut state);
     assert_eq!(state.day_time, 10);
 }
+
+#[test]
+fn command_block_level_two_allows_time_but_denies_direct_and_nested_tick() {
+    let mut state = fixture();
+    for (x, text) in [
+        (0, "time set 321"),
+        (2, "tick freeze"),
+        (4, "execute run tick freeze"),
+    ] {
+        let pos = place(&mut state, x, "command_block", text, true);
+        schedule(&mut state, pos);
+        advance(&mut state);
+        assert!(
+            matches!(mc_data::item_nbt::field(&read(&state, pos).unwrap(), "LastExecution"),
+            Some(Tag::Long(tick)) if *tick == state.tick as i64),
+            "block actually fired"
+        );
+        if x == 0 {
+            assert_eq!(
+                state.day_time, 321,
+                "ordinary level2 block command executes"
+            );
+        }
+        assert!(
+            !state.tick_control.frozen(),
+            "command-block permission: {text}"
+        );
+        assert!(state.command_context.current.is_none());
+    }
+}
 #[test]
 fn repeating_auto_uses_durable_ticks_and_disable_gate() {
     let mut state = fixture();

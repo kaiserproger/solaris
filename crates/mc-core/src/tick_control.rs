@@ -19,6 +19,7 @@
 use std::time::Duration;
 
 use crate::boundary::{ConnectionId, PlayerChange};
+use crate::command_feedback::text;
 use crate::tick::TickState;
 
 /// Vanilla `TickRateManager.tickrate` default.
@@ -268,13 +269,6 @@ fn announce_state_if_changed(state: &mut TickState, was_frozen: bool) {
     if was_frozen != state.tick_control.frozen() {
         announce_state(state);
     }
-}
-
-pub(crate) fn text(value: impl ToString) -> mc_nbt::Tag {
-    mc_nbt::Tag::Compound(vec![(
-        "text".into(),
-        mc_nbt::Tag::String(value.to_string()),
-    )])
 }
 
 /// Whether the simulated day clock advances this tick.

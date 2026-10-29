@@ -28,6 +28,7 @@
 //! teleport facing and fill strict) are intentionally not advertised.
 
 use mc_core::command_rules::{RuleKind, rules};
+use mc_core::commands::{ROOTS, root_permitted};
 use mc_data::Identifier;
 use mc_protocol::packets::play::{
     ClientboundCommandSuggestions, ClientboundCommands, CommandArgumentParser as Parser,
@@ -37,83 +38,6 @@ mod subtrees;
 use subtrees::*;
 mod suggest;
 pub(crate) use suggest::*;
-
-const ROOTS: &[(&str, u8)] = &[
-    ("help", 0),
-    ("list", 0),
-    ("me", 0),
-    ("msg", 0),
-    ("tell", 0),
-    ("w", 0),
-    ("teammsg", 0),
-    ("tm", 0),
-    ("settlement", 0),
-    ("trigger", 0),
-    ("gamemode", 2),
-    ("teleport", 2),
-    ("tp", 2),
-    ("execute", 2),
-    ("give", 2),
-    ("item", 2),
-    ("loot", 2),
-    ("attribute", 2),
-    ("clear", 2),
-    ("kill", 2),
-    ("damage", 2),
-    ("time", 2),
-    ("weather", 2),
-    ("difficulty", 2),
-    ("gamerule", 2),
-    ("summon", 2),
-    ("worldborder", 2),
-    ("setblock", 2),
-    ("fill", 2),
-    ("clone", 2),
-    ("experience", 2),
-    ("xp", 2),
-    ("spawnpoint", 2),
-    ("setworldspawn", 2),
-    ("forceload", 2),
-    ("say", 2),
-    ("seed", 2),
-    ("enchant", 2),
-    ("effect", 2),
-    ("advancement", 2),
-    ("debug", 2),
-    ("team", 2),
-    ("tps", 2),
-    ("mspt", 2),
-    ("scoreboard", 2),
-    ("locate", 2),
-    ("tellraw", 2),
-    ("title", 2),
-    ("bossbar", 2),
-    ("function", 2),
-    ("schedule", 2),
-    ("datapack", 2),
-    ("reload", 2),
-    ("data", 2),
-    ("tag", 2),
-    ("playsound", 2),
-    ("particle", 2),
-    ("tick", 3),
-    ("kick", 3),
-    ("mute", 3),
-    ("unmute", 3),
-    ("warn", 3),
-    ("transfer", 3),
-    ("ban", 3),
-    ("ban-ip", 3),
-    ("pardon", 3),
-    ("pardon-ip", 3),
-    ("op", 3),
-    ("deop", 3),
-    ("whitelist", 3),
-    ("banlist", 3),
-    ("co", 3),
-    ("stop", 4),
-    ("save-all", 4),
-];
 
 const SETTLEMENT_HELP: &[(&str, &str)] = &[
     ("guide", "Step-by-step in-game settlement tutorial."),
@@ -246,9 +170,7 @@ pub(crate) fn permitted(command: &str, op_level: u8, plugins: &[(String, u8)]) -
             if let Some((_, required)) = plugins.iter().find(|(name, _)| root == name) {
                 op_level >= *required
             } else {
-                ROOTS
-                    .iter()
-                    .any(|&(name, required)| root == name && op_level >= required)
+                root_permitted(root, op_level)
             }
         })
 }

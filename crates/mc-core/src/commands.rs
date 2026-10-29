@@ -9,6 +9,93 @@ use mc_physics::mth;
 use crate::inventory::{ItemRules, PlayerInventory};
 use crate::survival::{Difficulty, Experience};
 
+/// Shared root permission policy for native execution and edge advertisement.
+/// Edge-only administration is listed too; this does not add native handlers.
+pub const ROOTS: &[(&str, u8)] = &[
+    ("help", 0),
+    ("list", 0),
+    ("me", 0),
+    ("msg", 0),
+    ("tell", 0),
+    ("w", 0),
+    ("teammsg", 0),
+    ("tm", 0),
+    ("settlement", 0),
+    ("trigger", 0),
+    ("gamemode", 2),
+    ("teleport", 2),
+    ("tp", 2),
+    ("execute", 2),
+    ("give", 2),
+    ("item", 2),
+    ("loot", 2),
+    ("attribute", 2),
+    ("clear", 2),
+    ("kill", 2),
+    ("damage", 2),
+    ("time", 2),
+    ("weather", 2),
+    ("difficulty", 2),
+    ("gamerule", 2),
+    ("summon", 2),
+    ("worldborder", 2),
+    ("setblock", 2),
+    ("fill", 2),
+    ("clone", 2),
+    ("experience", 2),
+    ("xp", 2),
+    ("spawnpoint", 2),
+    ("setworldspawn", 2),
+    ("forceload", 2),
+    ("say", 2),
+    ("seed", 2),
+    ("enchant", 2),
+    ("effect", 2),
+    ("advancement", 2),
+    ("debug", 2),
+    ("team", 2),
+    ("tps", 2),
+    ("mspt", 2),
+    ("scoreboard", 2),
+    ("locate", 2),
+    ("tellraw", 2),
+    ("title", 2),
+    ("bossbar", 2),
+    ("function", 2),
+    ("schedule", 2),
+    ("datapack", 2),
+    ("reload", 2),
+    ("data", 2),
+    ("tag", 2),
+    ("playsound", 2),
+    ("particle", 2),
+    ("tick", 3),
+    ("kick", 3),
+    ("mute", 3),
+    ("unmute", 3),
+    ("warn", 3),
+    ("transfer", 3),
+    ("ban", 3),
+    ("ban-ip", 3),
+    ("pardon", 3),
+    ("pardon-ip", 3),
+    ("op", 3),
+    ("deop", 3),
+    ("whitelist", 3),
+    ("banlist", 3),
+    ("co", 3),
+    ("stop", 4),
+    ("save-all", 4),
+];
+
+/// Check a bare root; plugin-owned roots retain their separate first routing.
+#[must_use]
+pub fn root_permitted(root: &str, permission: u8) -> bool {
+    ROOTS
+        .iter()
+        .any(|&(name, required)| name == root && permission >= required)
+}
+
 /// Who a command applies to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
