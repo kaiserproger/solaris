@@ -285,6 +285,191 @@ fn admin_attribute_unknown_reports_error() {
 }
 
 #[test]
+fn player_attribute_command_updates_and_publishes() {
+    let (mut state, alice, _) = fixture();
+    command(
+        &mut state,
+        alice,
+        "attribute @s minecraft:movement_speed base set 0.2",
+    );
+    command(
+        &mut state,
+        alice,
+        "attribute @s minecraft:movement_speed modifier add test:bonus 0.5 add_multiplied_total",
+    );
+    command(
+        &mut state,
+        alice,
+        "attribute @s minecraft:movement_speed get",
+    );
+    assert!(chat_contains(&state, "value: 0.3"));
+    let (_, outbox, _) = crate::tick::run_tick(&mut state, &[]);
+    assert!(outbox.iter().any(|(_, changes)| changes.iter().any(|change|
+        matches!(change, PlayerChange::Attributes { attributes } if attributes.iter().any(|attribute|
+            attribute.kind == "movement_speed" && attribute.base == 0.2 && attribute.modifiers.iter().any(|modifier| modifier.id == "test:bonus"))))));
+    let saved = crate::core::player_record_for(&state, alice, state.tick).unwrap();
+    let restored =
+        crate::entity_loot::player_attributes_from_opaque(&saved.opaque_player_fields).unwrap();
+    assert!(restored.iter().any(|attribute| {
+        attribute.id == "minecraft:movement_speed"
+            && attribute.base == 0.2
+            && attribute
+                .modifiers
+                .iter()
+                .any(|modifier| modifier.id == "test:bonus")
+    }));
+}
+
+#[test]
+fn sprint_changes_publish_movement_speed_modifier() {
+    let (mut state, _, _) = fixture();
+    for sprinting in [true, false] {
+        let (_, outbox, _) = crate::tick::run_tick(
+            &mut state,
+            &[PlayerInput::Sprint {
+                connection: ConnectionId(1),
+                sprinting,
+            }],
+        );
+        let speed = outbox
+            .iter()
+            .flat_map(|(_, changes)| changes)
+            .find_map(|change| match change {
+                PlayerChange::Attributes { attributes } => attributes
+                    .iter()
+                    .find(|attribute| attribute.kind == "movement_speed"),
+                _ => None,
+            })
+            .expect("sprint changes movement_speed");
+        assert_eq!(
+            speed
+                .modifiers
+                .iter()
+                .any(|modifier| modifier.id == "minecraft:sprinting"),
+            sprinting
+        );
+    }
+}
+
+#[test]
+fn player_armor_attribute_changes_native_damage() {
+    let (mut state, alice, _) = fixture();
+    command(
+        &mut state,
+        alice,
+        "attribute @s minecraft:armor base set 20",
+    );
+    crate::tick::run_tick(&mut state, &[]);
+    let slot = state.entities.slot_of(alice).unwrap();
+    state.entities.row_mut(slot).protected_until = 0;
+    state.merge_damage.push((
+        slot,
+        crate::tick::DamagePiece {
+            physical: None,
+            custom_armor: false,
+            amount: 10.0,
+            kind: crate::survival::DamageKind::Melee,
+            source: None,
+        },
+    ));
+    state.commit_merge_effects();
+    assert!((state.players[&alice].vitals.health - 16.0).abs() < 0.001);
+}
+
+#[test]
+fn player_attack_attribute_drives_native_melee() {
+    let (mut state, alice, _) = fixture();
+    command(
+        &mut state,
+        alice,
+        "attribute @s minecraft:attack_damage base set 10",
+    );
+    state.tick = 40;
+    state.last_swing.insert(alice, 0);
+    let actor = state.entities.slot_of(alice).unwrap();
+    state.entities.set_ground(actor, true);
+    let victim = state.spawn_mob(state.registry.cow_type_id, [0.0, 80.0, 1.5], 100.0);
+    crate::tick::run_tick(&mut state, &[]);
+    crate::tick::run_tick(
+        &mut state,
+        &[PlayerInput::Attack {
+            connection: ConnectionId(1),
+            target: victim,
+        }],
+    );
+    let health = state
+        .entities
+        .row(state.entities.slot_of(victim).unwrap())
+        .health;
+    assert!(
+        health < 92.0,
+        "attribute attack should deal about 10 damage, got health {health}"
+    );
+}
+
+#[test]
+fn player_range_attribute_changes_block_reach() {
+    let (mut state, alice, _) = fixture();
+    let target = crate::boundary::BlockPos { x: 8, y: 80, z: 0 };
+    assert!(!crate::tick::within_block_reach(&state, alice, target));
+    command(
+        &mut state,
+        alice,
+        "attribute @s minecraft:block_interaction_range base set 10",
+    );
+    crate::tick::run_tick(&mut state, &[]);
+    assert!(crate::tick::within_block_reach(&state, alice, target));
+}
+
+#[test]
+fn max_health_attribute_allows_natural_regeneration_above_twenty() {
+    let (mut state, alice, _) = fixture();
+    command(
+        &mut state,
+        alice,
+        "attribute @s minecraft:max_health base set 30",
+    );
+    crate::tick::run_tick(&mut state, &[]);
+    {
+        let player = state.players.get_mut(&alice).unwrap();
+        player.vitals.health = 20.0;
+        player.vitals.food = 20;
+        player.vitals.saturation = 10.0;
+    }
+    for _ in 0..12 {
+        crate::tick::run_tick(&mut state, &[]);
+    }
+    assert!(state.players[&alice].vitals.health > 20.0);
+}
+
+#[test]
+fn health_boost_attribute_is_published_and_allows_healing() {
+    let (mut state, alice, _) = fixture();
+    let (_, outbox, _) = crate::tick::run_tick(
+        &mut state,
+        &[PlayerInput::Command {
+            connection: ConnectionId(1),
+            command: "effect give @s minecraft:health_boost 30".into(),
+            permission_level: 2,
+        }],
+    );
+    assert!(outbox.iter().flat_map(|(_, changes)| changes).any(|change|
+        matches!(change, PlayerChange::Attributes { attributes } if attributes.iter().any(|attribute|
+            attribute.kind == "max_health" && attribute.modifiers.iter().any(|modifier|
+                modifier.id == "minecraft:effect.health_boost" && modifier.amount == 4.0)))));
+    {
+        let player = state.players.get_mut(&alice).unwrap();
+        player.vitals.health = 20.0;
+        player.vitals.food = 20;
+        player.vitals.saturation = 10.0;
+    }
+    for _ in 0..12 {
+        crate::tick::run_tick(&mut state, &[]);
+    }
+    assert!(state.players[&alice].vitals.health > 20.0);
+}
+
+#[test]
 fn command_parity_nearest_entity_selects_closest_alive() {
     // SELECTOR-NEAREST-ENTITY: Java `@n` selects the nearest alive entity
     // with default limit 1; dead entities are excluded.

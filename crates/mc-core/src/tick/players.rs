@@ -90,7 +90,11 @@ pub(crate) fn within_block_reach(state: &TickState, entity: EntityId, target: Bl
             delta * delta
         })
         .sum();
-    let range = if player.creative() { 5.0 } else { 4.5 } + 1.0;
+    let range = player
+        .effective_attribute("block_interaction_range")
+        .unwrap_or(4.5)
+        + if player.creative() { 0.5 } else { 0.0 }
+        + 1.0;
     distance_squared < range * range
 }
 
@@ -134,7 +138,11 @@ pub(super) fn within_entity_reach(state: &TickState, entity: EntityId, target: E
             delta * delta
         })
         .sum();
-    let range = if player.creative() { 5.0 } else { 3.0 } + 3.0;
+    let range = player
+        .effective_attribute("entity_interaction_range")
+        .unwrap_or(3.0)
+        + if player.creative() { 2.0 } else { 0.0 }
+        + 3.0;
     distance_squared < range * range
 }
 
@@ -701,12 +709,14 @@ pub(super) fn tick_players(
                         &player.inventory.slots[39],
                         &mut player.enchantment_seed,
                     );
-                player.vitals.tick(
+                let max_health = player.effective_attribute("max_health").unwrap_or(20.0) as f32;
+                player.vitals.tick_with_max_health(
                     difficulty,
                     eye_in_water,
                     can_drown,
                     consume_air,
                     natural_regeneration,
+                    max_health,
                 )
             })
             .unwrap_or_default();

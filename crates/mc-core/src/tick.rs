@@ -1589,13 +1589,35 @@ fn run_dimension_tick_inner<'a>(
         .iter_mut()
         .filter_map(|(&entity, player)| {
             let connection = state.connections.entity_connection(entity)?;
-            player
-                .equipment_attributes(&state.registry.item_rules())
-                .map(|change| (connection, change))
+            let change = player.equipment_attributes(
+                &state.registry.item_rules(),
+                &state
+                    .entities
+                    .row(state.entities.slot_of(entity)?)
+                    .loot
+                    .attributes,
+            )?;
+            let max_health = player.effective_attribute("max_health").unwrap_or(20.0) as f32;
+            let health = if player.vitals.health > max_health {
+                player.vitals.health = max_health;
+                Some((max_health, player.health_change()))
+            } else {
+                None
+            };
+            Some((entity, connection, change, health))
         })
         .collect();
-    for (connection, change) in attribute_changes {
+    for (entity, connection, change, health) in attribute_changes {
         state.push_player(connection, change);
+        if let Some((health, health_change)) = health {
+            if let Some(slot) = state.entities.slot_of(entity) {
+                let row = state.entities.row_mut(slot);
+                row.health = health;
+                Arc::make_mut(&mut row.appearance).health = health;
+                changes.entities_appearance_changed.push(entity);
+            }
+            state.push_player(connection, health_change);
+        }
     }
     crate::advancements::run(state, &mut changes);
     changes.entities_spawned.append(&mut state.plugin_spawned);

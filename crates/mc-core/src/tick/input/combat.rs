@@ -96,7 +96,7 @@ pub(in crate::tick) fn attack(
         state.players[&entity].fall_distance,
         state.entities.row(actor_slot).appearance.pose == 1,
     );
-    let mut hit = crate::combat::melee_hit_with_attributes(
+    let mut hit = crate::combat::melee_hit_with_effective_attributes(
         &rules,
         &held,
         &attribute_held,
@@ -124,6 +124,9 @@ pub(in crate::tick) fn attack(
                 )
             },
         },
+        state.players[&entity]
+            .effective_attribute("attack_damage")
+            .zip(state.players[&entity].effective_attribute("attack_speed")),
     );
     if let Some(attack) = mace {
         hit.damage += crate::combat::smash_damage(&held, attack);

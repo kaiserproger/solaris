@@ -1018,6 +1018,59 @@ pub(crate) fn from_fields(
     }
     Ok(state)
 }
+pub(crate) fn player_attributes_from_opaque(bytes: &[u8]) -> Result<Vec<EntityAttribute>, String> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let (_, tag) = mc_nbt::read_named(&mut cursor).map_err(|error| error.to_string())?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err("trailing player NBT".into());
+    }
+    let mc_nbt::Tag::Compound(fields) = tag else {
+        return Err("player fields must be a compound".into());
+    };
+    from_fields(&fields)
+        .map(|state| state.attributes)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn player_attributes_to_opaque(
+    bytes: &[u8],
+    attributes: &[EntityAttribute],
+) -> Result<Vec<u8>, String> {
+    if attributes.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    let mut fields = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let (_, tag) = mc_nbt::read_named(&mut cursor).map_err(|error| error.to_string())?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err("trailing player NBT".into());
+        }
+        let mc_nbt::Tag::Compound(fields) = tag else {
+            return Err("player fields must be a compound".into());
+        };
+        fields
+    };
+    fields.retain(|(name, _)| name != "attributes");
+    let state = EntityLootState {
+        attributes: attributes.to_vec(),
+        ..Default::default()
+    };
+    let (_, value) = to_fields(&state)
+        .into_iter()
+        .find(|(name, _)| name == "attributes")
+        .expect("attribute field");
+    fields.push(("attributes".into(), value));
+    let mut output = Vec::new();
+    mc_nbt::write_named(&mut output, "", &mc_nbt::Tag::Compound(fields))
+        .map_err(|error| error.to_string())?;
+    Ok(output)
+}
+
 pub(crate) fn equipment_from_fields(
     items: &mc_data::items::ItemRegistry,
     fields: &[(String, mc_nbt::Tag)],

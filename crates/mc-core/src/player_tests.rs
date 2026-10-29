@@ -52,9 +52,10 @@ fn selecting_wooden_sword_and_empty_slot_diffs_attributes() {
     let mut player = PlayerState::new(ConnectionId(1), GameMode::Survival);
     player.inventory.slots[1] =
         ItemStack::new(items.id_of(&id("minecraft:wooden_sword")).unwrap(), 1);
-    player.equipment_attributes(&rules).unwrap();
+    player.equipment_attributes(&rules, &[]).unwrap();
     player.inventory.selected = 1;
-    let Some(PlayerChange::Attributes { attributes, .. }) = player.equipment_attributes(&rules)
+    let Some(PlayerChange::Attributes { attributes, .. }) =
+        player.equipment_attributes(&rules, &[])
     else {
         panic!("selection must publish changed attributes");
     };
@@ -69,9 +70,10 @@ fn selecting_wooden_sword_and_empty_slot_diffs_attributes() {
         speed.base + speed.modifiers[0].amount,
         4.0 + f64::from(-2.4_f32)
     );
-    assert!(player.equipment_attributes(&rules).is_none());
+    assert!(player.equipment_attributes(&rules, &[]).is_none());
     player.inventory.selected = 0;
-    let Some(PlayerChange::Attributes { attributes, .. }) = player.equipment_attributes(&rules)
+    let Some(PlayerChange::Attributes { attributes, .. }) =
+        player.equipment_attributes(&rules, &[])
     else {
         panic!("empty hand must restore base");
     };
