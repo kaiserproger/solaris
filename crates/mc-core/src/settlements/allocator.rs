@@ -1094,7 +1094,13 @@ fn acquire(
         // Only certified slots are settlement jobs. Work-point lists are
         // bounded at certification; never rescan the settlement radius here.
         cache.candidates.clear();
+        let mut needs_resources = false;
         if let Some(record) = v.settlement.and_then(|id| state.settlements.get(id)) {
+            needs_resources = v.data.profession == Profession::None
+                && !record
+                    .buildings
+                    .values()
+                    .any(|building| building.kind == super::buildings::BuildingKind::Storage);
             for building in record.buildings.values() {
                 let Some(profession) = building.kind.profession() else {
                     continue;
@@ -1138,9 +1144,19 @@ fn acquire(
             }
         }
         cache.candidates.sort_unstable_by(|a, b| {
-            b.0.total_cmp(&a.0).then_with(|| {
-                (b.1.pos.x, b.1.pos.y, b.1.pos.z).cmp(&(a.1.pos.x, a.1.pos.y, a.1.pos.z))
-            })
+            let resource = |poi: Poi| {
+                needs_resources
+                    && matches!(
+                        poi.kind,
+                        PoiKind::Job(Profession::Miner | Profession::Lumberjack)
+                    )
+            };
+            resource(a.1)
+                .cmp(&resource(b.1))
+                .then_with(|| b.0.total_cmp(&a.0))
+                .then_with(|| {
+                    (b.1.pos.x, b.1.pos.y, b.1.pos.z).cmp(&(a.1.pos.x, a.1.pos.y, a.1.pos.z))
+                })
         });
     } else {
         cache.nearby(pos, owner, |candidate| match (kind, candidate) {
@@ -1266,6 +1282,7 @@ fn acquire_pois(state: &mut TickState, cache: &mut PoiCache) {
                     }
                 }
                 1 if v.age >= 0
+                    && (2_000..9_000).contains(&state.day_time.rem_euclid(24_000))
                     && !matches!(v.data.profession, Profession::Nitwit | Profession::Soldier)
                     && v.job_site.is_none() =>
                 {

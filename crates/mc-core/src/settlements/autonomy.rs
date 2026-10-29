@@ -51,6 +51,7 @@ struct NaturalCandidate {
     bounds: ScriptWorldBounds,
     entrance: [i32; 3],
     queued_at: u64,
+    stock_proved: bool,
     after_resident: Option<uuid::Uuid>,
 }
 
@@ -699,6 +700,7 @@ fn queue_natural(
         bounds,
         entrance,
         queued_at,
+        stock_proved: false,
         after_resident: None,
     });
 }
@@ -753,15 +755,33 @@ fn prove_natural(
         candidates.pop_front();
         return;
     };
-    let target = BlockPos { x, y, z };
+    let stock_proved = candidate.stock_proved;
+    let (start, target) = if stock_proved {
+        (start, BlockPos { x, y, z })
+    } else {
+        let Some([sx, sy, sz]) = super::buildings::storage_points(state, settlement)
+            .first()
+            .copied()
+        else {
+            return;
+        };
+        (
+            [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5],
+            BlockPos {
+                x: sx,
+                y: sy,
+                z: sz,
+            },
+        )
+    };
     let from = at(start);
     let horizontal = from
         .x
-        .abs_diff(x)
-        .max(from.z.abs_diff(z))
+        .abs_diff(target.x)
+        .max(from.z.abs_diff(target.z))
         .saturating_add(8)
         .clamp(48, 512);
-    let vertical = from.y.abs_diff(y).saturating_add(4).clamp(16, 512);
+    let vertical = from.y.abs_diff(target.y).saturating_add(4).clamp(16, 512);
     let mut cache = std::mem::take(&mut state.villager_pois);
     let mut path = std::mem::take(&mut cache.candidate_path);
     let mut ctx = RouteCtx {
@@ -780,6 +800,17 @@ fn prove_natural(
     cache.candidate_path = path;
     state.villager_pois = cache;
     if !admitted {
+        return;
+    }
+    if !stock_proved {
+        if reached {
+            candidates
+                .front_mut()
+                .expect("proved candidate")
+                .stock_proved = true;
+        } else {
+            candidates.pop_front();
+        }
         return;
     }
     if reached {

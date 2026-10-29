@@ -124,6 +124,41 @@ fn species_bill(
         .collect()
 }
 
+/// A real worker load can complete the first storage bill before a stack is full.
+pub(crate) fn first_storage_funded_by_delivery(
+    state: &TickState,
+    id: SettlementId,
+    carry: &[Option<mc_data::ItemStack>],
+) -> bool {
+    let Some(record) = state.settlements.get(id) else {
+        return false;
+    };
+    if record.project.is_some()
+        || record
+            .buildings
+            .values()
+            .any(|b| b.kind == BuildingKind::Storage)
+        || carry.iter().all(Option::is_none)
+    {
+        return false;
+    }
+    let Some(level) = blueprints::get(&state.registry, "storage").and_then(|b| b.level(1)) else {
+        return false;
+    };
+    let mut images = executor::source_images(state, id);
+    let Some(chest) = images.first_mut() else {
+        return false;
+    };
+    // This is a read-only funding probe; only the regular inventory authority
+    // can transfer the actual carry to the real container.
+    chest.slots.extend(carry.iter().flatten().cloned());
+    let Some(materials) = species_bill(state, &level.materials, wood_species(state, &images))
+    else {
+        return false;
+    };
+    super::construction_crafting::can_fund(state, &materials, &images)
+}
+
 fn funding_error(state: &TickState, id: SettlementId, materials: &[(u32, u32)]) -> Option<String> {
     let images = executor::source_images(state, id);
     let Some(materials) = species_bill(state, materials, wood_species(state, &images)) else {

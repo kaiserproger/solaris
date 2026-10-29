@@ -377,7 +377,17 @@ pub(super) fn work(
     v.lumber_progress.revision = revision;
     let working =
         v.activity == Activity::Work && (2_000..9_000).contains(&state.day_time.rem_euclid(24_000));
-    if !working || mining::needs_deposit(v) {
+    if !working
+        || mining::needs_deposit(v)
+        || (state.tick.is_multiple_of(PERIOD)
+            && v.settlement.is_some_and(|id| {
+                crate::settlements::construction::first_storage_funded_by_delivery(
+                    state,
+                    id,
+                    &v.inventory,
+                )
+            }))
+    {
         v.lumber_progress.returning = true;
     }
     if v.lumber_progress.returning {

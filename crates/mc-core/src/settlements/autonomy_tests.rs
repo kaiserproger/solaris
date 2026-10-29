@@ -775,6 +775,58 @@ fn seed_100_lumberjack_deposits_real_logs() {
 }
 
 #[test]
+fn natural_mine_requires_a_route_from_entrance_to_stock() {
+    let (mut state, chunks) = fixture(
+        vec![BELL],
+        vec![(
+            generated_claim(
+                "minecraft:village/plains/houses/plains_house_1",
+                [0, 201, 0],
+            ),
+            [-7.5, 202.0, 0.5],
+            "none".into(),
+        )],
+        vec![],
+    );
+    adopt(&mut state, &chunks);
+    let id = state.settlements.records().next().unwrap().id;
+    for z in -16..=31 {
+        for y in 202..=210 {
+            state.world.set_block(-1, y, z, state.registry.states.stone);
+        }
+    }
+    let residents = state
+        .entities
+        .slots()
+        .map(|slot| state.entities.row(slot).uuid)
+        .collect();
+    let mut candidates = VecDeque::from([NaturalCandidate {
+        kind: BuildingKind::Mine,
+        bounds: ScriptWorldBounds::new([-14, 188, -10], [-2, 203, 4]).unwrap(),
+        entrance: [-14, 202, -9],
+        queued_at: 0,
+        stock_proved: false,
+        after_resident: None,
+    }]);
+    for _ in 0..8 {
+        state.tick += 20;
+        state.tick_budget.reset(state.tick);
+        prove_natural(&mut state, id, &residents, &mut candidates);
+        if candidates.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        candidates.is_empty(),
+        "unreachable stock must reject the candidate"
+    );
+    assert!(
+        !has_kind(&state, id, BuildingKind::Mine),
+        "a worker must be able to bring extracted materials to stock"
+    );
+}
+
+#[test]
 fn loaded_but_unsimulated_natural_worksite_is_not_certified() {
     let (mut state, chunks) = fixture(
         vec![BELL],
@@ -804,6 +856,7 @@ fn loaded_but_unsimulated_natural_worksite_is_not_certified() {
         bounds: ScriptWorldBounds::new([80, 188, 0], [94, 203, 14]).unwrap(),
         entrance: [80, 202, 1],
         queued_at: 0,
+        stock_proved: false,
         after_resident: None,
     }]);
     assert!(state.world.has_chunk(5, 0));
