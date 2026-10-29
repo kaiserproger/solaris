@@ -27,6 +27,9 @@ pub(crate) fn supports_store_result(command: &Command) -> bool {
     match command {
         Command::Kill { .. }
         | Command::Summon { .. }
+        | Command::Attribute(_)
+        | Command::Item(_)
+        | Command::Loot(_)
         | Command::Give { .. }
         | Command::Clear { .. }
         | Command::EffectGive { .. }
@@ -288,6 +291,34 @@ pub(crate) fn execute(
     changes: &mut ChangeSet,
 ) -> CommandResult {
     match command {
+        Command::Attribute(command) => {
+            return match crate::command_attribute::execute(state, connection, executor, command) {
+                Ok(value) => Success(value),
+                Err(message) => {
+                    error(state, connection, message);
+                    Failed
+                }
+            };
+        }
+        Command::Item(command) => {
+            return match crate::command_item_replace::execute(state, connection, executor, command)
+            {
+                Ok(value) => Success(value),
+                Err(message) => {
+                    error(state, connection, message);
+                    Failed
+                }
+            };
+        }
+        Command::Loot(command) => {
+            return match crate::command_loot::execute(state, connection, executor, command) {
+                Ok(value) => Success(value),
+                Err(message) => {
+                    error(state, connection, message);
+                    Failed
+                }
+            };
+        }
         Command::Advancement {
             target,
             grant,

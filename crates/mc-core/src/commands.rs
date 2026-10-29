@@ -196,6 +196,9 @@ pub enum AdvancementScope {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
+    Attribute(crate::command_attribute::AttributeCommand),
+    Item(crate::command_item_replace::ItemCommand),
+    Loot(crate::command_loot::LootCommand),
     Advancement {
         target: Target,
         grant: bool,
@@ -358,6 +361,9 @@ pub fn parse(command: &str, operator: bool) -> Result<Command, CommandError> {
         return Err(CommandError::Unknown);
     }
     match *name {
+        "attribute" => crate::command_attribute::parse(args).map(Command::Attribute),
+        "item" => crate::command_item_replace::parse(args).map(Command::Item),
+        "loot" => crate::command_loot::parse(args).map(Command::Loot),
         "settlement" => crate::settlements::commands::parse(args).map(Command::Settlement),
         "gamemode" => parse_gamemode(args),
         "tp" | "teleport" => parse_teleport(args),

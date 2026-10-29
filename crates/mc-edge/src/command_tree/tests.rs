@@ -2,6 +2,49 @@ use super::*;
 use mc_protocol::Packet;
 
 #[test]
+fn admin_inventory_trees_and_slot_suggestions() {
+    let packet = tree(2, &[]);
+    for root in ["item", "loot", "attribute"] {
+        assert!(!permitted(root, 1, &[]));
+        assert!(permitted(root, 2, &[]));
+    }
+    assert!(
+        node(
+            &packet,
+            &[
+                "item", "replace", "entity", "target", "slot", "with", "item"
+            ]
+        )
+        .executable
+    );
+    assert!(node(&packet, &["loot", "give", "players", "loot", "loot_table"]).executable);
+    assert!(
+        node(
+            &packet,
+            &["attribute", "target", "attribute", "base", "reset"]
+        )
+        .executable
+    );
+    let response = suggestions(
+        1,
+        "/item replace entity @s hot",
+        2,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        response
+            .suggestions
+            .iter()
+            .any(|entry| entry.text == "hotbar.0")
+    );
+}
+
+#[test]
 fn damage_tree_and_permission_match_native_grammar() {
     let packet = tree(2, &[]);
     assert!(!permitted("damage @s 1", 1, &[]));
