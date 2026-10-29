@@ -29,7 +29,12 @@ impl DensitySampler<'_> {
         )
     }
 
-    fn eval_new_batch(&mut self, id: Id, positions: &[Position; 8], active: u8) -> [f32; 8] {
+    pub(super) fn eval_new_batch(
+        &mut self,
+        id: Id,
+        positions: &[Position; 8],
+        active: u8,
+    ) -> [f32; 8] {
         self.batch_epoch += 1;
         self.eval_batch(id, positions, active, self.batch_epoch)
     }

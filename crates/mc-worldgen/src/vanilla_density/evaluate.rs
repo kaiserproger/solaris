@@ -3,6 +3,8 @@ use std::collections::HashMap;
 
 #[path = "batch.rs"]
 mod batch;
+#[path = "chunk_fill.rs"]
+pub(super) mod chunk_fill;
 #[path = "column_sampler.rs"]
 pub(super) mod column;
 

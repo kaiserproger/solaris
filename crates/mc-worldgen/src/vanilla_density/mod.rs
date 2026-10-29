@@ -132,6 +132,9 @@ pub struct VanillaDensity {
     sloped_cheese: Id,
     preliminary_surface: Id,
     lod_surface: Option<Id>,
+    /// `final_density` outside `interpolated` as straight-line ops, when
+    /// the router allows (vanilla does); `fill_density_chunk`'s fast path.
+    block_program: Option<Arc<evaluate::chunk_fill::BlockProgram>>,
 }
 
 /// One bounded interpolation lattice shared by a chunk's lazy halo columns.
@@ -165,11 +168,14 @@ impl VanillaDensity {
     }
 
     pub(crate) fn from_runtime(runtime: Arc<DensityRuntime>) -> Result<Self, String> {
+        let final_density = runtime.field("final_density")?;
         Ok(Self {
-            final_density: runtime.field("final_density")?,
+            final_density,
             sloped_cheese: runtime.field("sloped_cheese")?,
             preliminary_surface: runtime.field("preliminary_surface_level")?,
             lod_surface: runtime.field("lod_surface").ok(),
+            block_program: evaluate::chunk_fill::BlockProgram::compile(&runtime, final_density)
+                .map(Arc::new),
             runtime,
         })
     }
@@ -277,13 +283,17 @@ impl VanillaDensity {
         }
     }
 
-    /// Chunk output is Y-major, then Z, then X: `(y-min_y)*256 + z*16+x`.
-    /// Each interpolated node retains the chunk's shared lattice corners;
-    /// flat-cache nodes retain quart-column values across all vertical cells.
-    /// Eight neighbouring columns (4×2) traverse the DAG together. Branch masks
-    /// retain scalar laziness; lane arithmetic preserves scalar fp32 bits.
+    /// Chunk output is Y-major, then Z, then X: `(y-min_y)*256 + z*16+x`,
+    /// bit-identical to [`Self::fill_density_column`]. Vanilla routers take
+    /// `chunk_fill.rs`: all lattice corners in full batches, then the
+    /// block-level graph over whole layers. Other routers traverse the DAG
+    /// in eight-column batches whose branch masks retain scalar laziness.
     pub fn fill_density_chunk(&self, min_x: i32, min_z: i32, output: &mut [f32]) {
         assert_eq!(output.len(), self.height() as usize * 256);
+        if let Some(program) = &self.block_program {
+            evaluate::chunk_fill::fill(&self.runtime, program, min_x, min_z, output);
+            return;
+        }
         let mut sampler = DensitySampler::for_chunk(&self.runtime, min_x, min_z);
         let max_y = self.min_y() + self.height();
         let height = self.runtime.cell_height;
