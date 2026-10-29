@@ -514,9 +514,20 @@ fn paste_template_with_eyes(
     }
     for entity in template.block_entities() {
         if let Some((pos, _, _)) = local(entity.pos) {
-            chunk
-                .block_entities
-                .insert(pos, entity.at_world_position(pos));
+            let bytes = if entity.nbt.iter().any(|(key, _)| key == "LootTableSeed") {
+                let mut seeded = entity.clone();
+                if let Some((_, Tag::Long(value))) = seeded
+                    .nbt
+                    .iter_mut()
+                    .find(|(key, _)| key == "LootTableSeed")
+                {
+                    *value = (hash(seed, pos.x, pos.z) ^ pos.y as u64) as i64;
+                }
+                seeded.at_world_position(pos)
+            } else {
+                entity.at_world_position(pos)
+            };
+            chunk.block_entities.insert(pos, bytes);
         }
     }
     if !template.entities().is_empty() {
@@ -642,17 +653,57 @@ fn clean_template(
             }
         }
     }
+    let mut entities: Vec<_> = template
+        .block_entities()
+        .iter()
+        .filter(|e| !is_marker(e.state))
+        .cloned()
+        .collect();
+    if matches!(name, "ocean_ruin_warm" | "ocean_ruin_cold") {
+        let warm = name == "ocean_ruin_warm";
+        let ordinary = state(
+            registry,
+            if warm {
+                "minecraft:sand"
+            } else {
+                "minecraft:gravel"
+            },
+        )?;
+        let suspicious = state(
+            registry,
+            if warm {
+                "minecraft:suspicious_sand"
+            } else {
+                "minecraft:suspicious_gravel"
+            },
+        )?;
+        let table = if warm {
+            "minecraft:archaeology/ocean_ruin_warm"
+        } else {
+            "minecraft:archaeology/ocean_ruin_cold"
+        };
+        let mut candidates: Vec<_> = blocks
+            .iter_mut()
+            .filter(|block| block.state == ordinary)
+            .collect();
+        candidates.sort_by_key(|block| hash(i64::from(block.pos[1]), block.pos[0], block.pos[2]));
+        for block in candidates.into_iter().take(5) {
+            block.state = suspicious;
+            entities.push(TemplateBlockEntity {
+                pos: block.pos,
+                state: suspicious,
+                nbt: vec![
+                    ("id".into(), Tag::String("minecraft:brushable_block".into())),
+                    ("LootTable".into(), Tag::String(table.into())),
+                    ("LootTableSeed".into(), Tag::Long(0)),
+                ],
+            });
+        }
+    }
     Ok(StructureTemplate::new(template.size(), blocks)
         .with_chests(chests)
         .with_entities(template.entities().to_vec())
-        .with_block_entities(
-            template
-                .block_entities()
-                .iter()
-                .filter(|e| !is_marker(e.state))
-                .cloned()
-                .collect(),
-        ))
+        .with_block_entities(entities))
 }
 
 struct Builder<'a> {
@@ -726,6 +777,19 @@ impl<'a> Builder<'a> {
             pos,
             chest: ChestBlockEntity::default(),
             loot_table: Some(id(table)),
+        });
+        Ok(())
+    }
+    fn archaeology(&mut self, pos: [i32; 3], material: &str, table: &str) -> Result<(), String> {
+        self.put(pos, material)?;
+        self.entities.push(TemplateBlockEntity {
+            pos,
+            state: state(self.registry, material)?,
+            nbt: vec![
+                ("id".into(), Tag::String("minecraft:brushable_block".into())),
+                ("LootTable".into(), Tag::String(table.into())),
+                ("LootTableSeed".into(), Tag::Long(0)),
+            ],
         });
         Ok(())
     }

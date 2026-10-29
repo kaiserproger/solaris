@@ -10,6 +10,67 @@ fn root() -> std::path::PathBuf {
 }
 
 #[test]
+fn archaeology_pyramid_generated_with_loot() {
+    let r = registry();
+    let (templates, _) = catalog::templates(&root(), "desert_pyramid", &r).unwrap();
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        state(&r, "minecraft:stone").unwrap(),
+        id("minecraft:desert"),
+    );
+    paste_template(
+        &mut chunk,
+        &templates[0],
+        BlockPos { x: 0, y: 64, z: 0 },
+        42,
+    );
+    let found = chunk.block_entities.iter().any(|(pos, bytes)| {
+        let block = chunk.get_block(pos.x as u8, pos.y, pos.z as u8);
+        let tag = mc_nbt::read_network(&mut bytes.as_slice()).unwrap();
+        block == Some(state(&r, "minecraft:suspicious_sand").unwrap())
+            && matches!(tag, Tag::Compound(fields) if fields.iter().any(|(key, value)| key == "LootTable" && *value == Tag::String("minecraft:archaeology/desert_pyramid".into())) && fields.iter().any(|(key, value)| key == "LootTableSeed" && matches!(value, Tag::Long(_))))
+    });
+    assert!(
+        found,
+        "pyramid must generate suspicious sand with archaeology loot and seed"
+    );
+}
+
+#[test]
+fn archaeology_ocean_ruins_generate_seeded_loot() {
+    let r = registry();
+    for (family, material, table) in [
+        (
+            "ocean_ruin_warm",
+            "minecraft:suspicious_sand",
+            "minecraft:archaeology/ocean_ruin_warm",
+        ),
+        (
+            "ocean_ruin_cold",
+            "minecraft:suspicious_gravel",
+            "minecraft:archaeology/ocean_ruin_cold",
+        ),
+    ] {
+        let (templates, _) = catalog::templates(&root(), family, &r).unwrap();
+        let mut found = false;
+        for template in &templates {
+            let mut chunk = Chunk::empty(
+                ChunkPos { x: 0, z: 0 },
+                state(&r, "minecraft:stone").unwrap(),
+                id("minecraft:ocean"),
+            );
+            paste_template(&mut chunk, template, BlockPos { x: 0, y: 64, z: 0 }, 42);
+            found |= chunk.block_entities.iter().any(|(pos, bytes)| {
+                let tag = mc_nbt::read_network(&mut bytes.as_slice()).unwrap();
+                chunk.get_block(pos.x as u8, pos.y, pos.z as u8) == Some(state(&r, material).unwrap())
+                    && matches!(tag, Tag::Compound(fields) if fields.iter().any(|(key, value)| key == "LootTable" && *value == Tag::String(table.into())) && fields.iter().any(|(key, value)| key == "LootTableSeed" && matches!(value, Tag::Long(_))))
+            });
+        }
+        assert!(found, "{family}");
+    }
+}
+
+#[test]
 fn generated_fully_eyed_stronghold_activates_portal() {
     let registry = registry();
     let original = stronghold(&registry).unwrap();

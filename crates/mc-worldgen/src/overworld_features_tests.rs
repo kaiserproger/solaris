@@ -4,6 +4,31 @@ use mc_world::ChunkPos;
 fn registry() -> BlockRegistry {
     BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap()
 }
+
+#[test]
+fn archaeology_well_generated_with_loot() {
+    let r = registry();
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        state(&r, "minecraft:stone").unwrap(),
+        id("minecraft:desert"),
+    );
+    paste_template(
+        &mut chunk,
+        &well(&r).unwrap(),
+        BlockPos { x: 0, y: 64, z: 0 },
+        42,
+    );
+    let found = chunk.block_entities.iter().filter(|(pos, bytes)| {
+        let tag = mc_nbt::read_network(&mut bytes.as_slice()).unwrap();
+        chunk.get_block(pos.x as u8, pos.y, pos.z as u8) == Some(state(&r, "minecraft:suspicious_sand").unwrap())
+            && matches!(tag, Tag::Compound(fields) if fields.iter().any(|(key, value)| key == "LootTable" && *value == Tag::String("minecraft:archaeology/desert_well".into())) && fields.iter().any(|(key, value)| key == "LootTableSeed" && matches!(value, Tag::Long(_))))
+    }).count();
+    assert_eq!(
+        found, 2,
+        "well must generate two suspicious sand blocks with loot"
+    );
+}
 #[test]
 fn dungeon_requires_cavity_opening_and_preserves_it_without_neighbor_reads() {
     let r = registry();
