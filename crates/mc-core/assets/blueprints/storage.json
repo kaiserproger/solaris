@@ -24,7 +24,7 @@
       "layers": [
         ["ppppppp", "ppppppp", "ppppppp", "ppppppp", "ppppppp"],
         ["dpppppd", "pCCC.bp", "p....bp", "p.....p", "dppoppd"],
-        ["dDPDPDd", "D....bD", "D.....D", "Dw...WD", "dPDODPd"],
+        ["dDPDPDd", "D....bD", "D.....D", "D.....D", "dPDODPd"],
         ["ZZZZZZZ", "DLLLLLD", "DLLLLLD", "DLLLLLD", "XXXXXXX"],
         [".......", "ZZZZZZZ", "D.....D", "XXXXXXX", "......."],
         [".......", ".......", "DDDDDDD", ".......", "......."]
