@@ -546,9 +546,11 @@ pub(crate) fn execute(
                     },
                     vec![enchantment, targets_label(state, &successful)],
                 );
+                return Success(successful.len() as i32);
             } else if !single {
                 feedback(state, connection, "commands.enchant.failed", Vec::new());
             }
+            return Failed;
         }
         Command::DebugGive {
             item,

@@ -819,6 +819,7 @@ chains follow facing, with a bounded traversal and once-per-tick execution.
 Relative coordinates resolve at the command block, not world spawn.
 NBT updates and scheduled work use the native store and tick WAL. Conditional
 blocks check the last success count of the command block behind their facing.
+`/enchant` records success only when at least one target was enchanted.
 Commands whose native owner does not report an outcome are treated as
 unsuccessful for this check, even if they performed their action.
 Client editor packets, comparator result output and command minecarts are not

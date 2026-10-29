@@ -96,6 +96,46 @@ fn conditional_chain_tracks_predecessor_success() {
     advance(&mut state);
     assert_eq!(state.day_time, 8);
 }
+#[test]
+fn conditional_chain_follows_common_command_outcomes() {
+    let mut state = fixture();
+    let first = place(&mut state, 0, "command_block", "time add 0", true);
+    let second = place(&mut state, 1, "chain_command_block", "time add 3", true);
+    place(&mut state, 3, "command_block", "time add 0", false);
+    let id = state.world.block_at(second.x, second.y, second.z).unwrap();
+    let block = state.registry.blocks.by_id(BlockStateId(id)).unwrap();
+    let name = block.block.id.clone();
+    let mut properties = block.properties.clone();
+    properties
+        .iter_mut()
+        .find(|(key, _)| key == "conditional")
+        .unwrap()
+        .1 = "true".into();
+    let id = state
+        .registry
+        .blocks
+        .by_name_and_props(&name, &properties)
+        .unwrap();
+    state.world.set_block(second.x, second.y, second.z, id.0);
+    for (command, expected) in [
+        ("setblock 0 61 0 minecraft:diamond_block", 3),
+        ("give @a minecraft:diamond_sword", 6),
+        ("enchant @a minecraft:sharpness 1", 9),
+        ("enchant @a minecraft:sharpness 1", 9),
+        (
+            "execute if block 0 61 0 minecraft:diamond_block run say hello",
+            12,
+        ),
+        ("data merge block 3 60 0 {Command:\"time add 4\"}", 15),
+    ] {
+        let mut fields = read(&state, first).unwrap();
+        put(&mut fields, "Command", Tag::String(command.into()));
+        save(&mut state, first, fields);
+        schedule(&mut state, first);
+        advance(&mut state);
+        assert_eq!(state.day_time, expected, "{command}");
+    }
+}
 
 #[test]
 fn conditional_chain_executes_at_shared_command_boundary() {
