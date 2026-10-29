@@ -54,7 +54,7 @@ fn generator(seed: i64) -> TerrainGenerator {
 #[test]
 #[ignore = "release stage profile; approved measurement window only"]
 fn vanilla_stages() {
-    stage_profile(&[712816, 5617830, 42], 3, false);
+    stage_profile(&[712816, 5617830, 42], 3, Solids::Alone);
 }
 
 /// `vanilla_stages` with densities from the GPU: the device and program are
@@ -63,13 +63,31 @@ fn vanilla_stages() {
 #[test]
 #[ignore = "release stage profile with GPU density; needs --features gpu and a GPU"]
 fn vanilla_stages_gpu_density() {
-    stage_profile(&[712816, 5617830, 42], 3, true);
+    stage_profile(&[712816, 5617830, 42], 3, Solids::Gpu);
+}
+
+/// `vanilla_stages` as chunk workers generate with the shared solids cache in
+/// steady state: each chunk's density is filled once on the CPU and read by
+/// the generations around it. The 64 fills (profiled chunks plus one ring) are
+/// timed apart and one fill per chunk is added to `ms_per_chunk`.
+#[test]
+#[ignore = "release stage profile; approved measurement window only"]
+fn vanilla_stages_shared_solids() {
+    stage_profile(&[712816, 5617830, 42], 3, Solids::Shared);
 }
 
 #[test]
 #[ignore = "release single-threaded parity-seed profile; approved measurement window only"]
 fn parity_stages() {
-    stage_profile(&[0, 81, 497625], 1, false);
+    stage_profile(&[0, 81, 497625], 1, Solids::Alone);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Solids {
+    /// Each generation evaluates its own density and neighbour columns.
+    Alone,
+    Gpu,
+    Shared,
 }
 
 #[cfg(feature = "gpu")]
@@ -107,6 +125,19 @@ fn gpu_densities(gpu: &Gpu) -> SolidGrid {
 #[cfg(not(feature = "gpu"))]
 fn gpu_densities(_: &Gpu) -> SolidGrid {
     unreachable!()
+}
+
+/// [`gpu_densities`]'s chunks filled on the CPU.
+fn cpu_densities(generator: &TerrainGenerator) -> SolidGrid {
+    let (_, density) = generator.vanilla().expect("vanilla worldgen");
+    let mut grid = SolidGrid::default();
+    for z in -4..4 {
+        for x in -4..4 {
+            let pos = ChunkPos { x, z };
+            grid.insert(pos, std::sync::Arc::new(chunk_solids(density, pos)));
+        }
+    }
+    grid
 }
 
 /// Blocks and biomes of chunks generated through the GPU service against the
@@ -166,7 +197,7 @@ fn gpu_density_chunks_match_cpu_chunks() {
     }
 }
 
-fn stage_profile(seeds: &[i64], runs: usize, gpu: bool) {
+fn stage_profile(seeds: &[i64], runs: usize, solids: Solids) {
     let report = mc_data::blocks::solaris_required_blocks_report();
     let light_table =
         mc_data::block_light::BlockLightTable::conservative_from_blocks_report(&report);
@@ -176,16 +207,28 @@ fn stage_profile(seeds: &[i64], runs: usize, gpu: bool) {
     for &seed in seeds {
         for run in 0..runs {
             let generator = generator(seed);
-            let device = gpu.then(|| gpu_device(&generator));
+            let device = (solids == Solids::Gpu).then(|| gpu_device(&generator));
+            let shared = (solids == Solids::Shared).then(|| {
+                let start = Instant::now();
+                let grid = cpu_densities(&generator);
+                (grid, start.elapsed().as_secs_f64() * 1000.0 / 64.0)
+            });
             TOTALS.with_borrow_mut(|totals| *totals = [Duration::ZERO; 9]);
             let start = Instant::now();
             let densities = device.as_ref().map(gpu_densities);
-            let gpu_fill = start.elapsed().as_secs_f64() * 1000.0 / 36.0;
+            let fill = match &shared {
+                Some((_, per_chunk)) => *per_chunk,
+                None => start.elapsed().as_secs_f64() * 1000.0 / 36.0,
+            };
+            let grid = densities.as_ref().or(shared.as_ref().map(|(grid, _)| grid));
             let chunks: Vec<_> = positions
                 .iter()
-                .map(|&pos| generator.generate_with_solids(pos, densities.as_ref()))
+                .map(|&pos| generator.generate_with_solids(pos, grid))
                 .collect();
-            let elapsed = start.elapsed().as_secs_f64() * 1000.0 / 36.0;
+            let mut elapsed = start.elapsed().as_secs_f64() * 1000.0 / 36.0;
+            if shared.is_some() {
+                elapsed += fill;
+            }
             let stages =
                 TOTALS.with_borrow(|totals| totals.map(|v| v.as_secs_f64() * 1000.0 / 36.0));
             let mut workspace = mc_world::light::LightWorkspace::new();
@@ -204,7 +247,7 @@ fn stage_profile(seeds: &[i64], runs: usize, gpu: bool) {
             }
             let lighting = start.elapsed().as_secs_f64() * 1000.0 / 16.0;
             println!(
-                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} gpu_fill={gpu_fill} density={} climate_biome={} surface_fill={} carvers={} ores={} decorations={} structure_paste={} villages_jigsaw={} other={} lighting={lighting}",
+                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} fill={fill} density={} climate_biome={} surface_fill={} carvers={} ores={} decorations={} structure_paste={} villages_jigsaw={} other={} lighting={lighting}",
                 stages[0],
                 stages[6],
                 stages[1],
