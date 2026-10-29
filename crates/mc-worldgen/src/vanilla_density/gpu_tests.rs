@@ -18,15 +18,16 @@ fn density_shader_validates() {
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
 }
 
-/// Accuracy against `fill_density_chunk` near spawn and at far coordinates,
-/// then GPU wall time per chunk by batch size next to the CPU fill.
+/// Solid bits against `fill_density_chunk` near spawn and at far coordinates
+/// (up to the world border), then GPU wall time per chunk by batch size.
 #[test]
 #[ignore = "GPU worldgen experiment; needs a GPU, run in the serialized perf lane"]
 fn gpu_chunk_density_matches_cpu_and_reports_time() {
     for seed in [712816, 42] {
         let density = VanillaDensity::new(seed, root()).unwrap();
         let gpu = GpuDensity::new(&density).unwrap();
-        let blocks = density.height() as usize * 256;
+        let height = density.height() as usize;
+        let blocks = height * 256;
         let mut chunks: Vec<(i32, i32)> = (-3..3)
             .flat_map(|z| (-3..3).map(move |x| (x * 16, z * 16)))
             .collect();
@@ -46,33 +47,18 @@ fn gpu_chunk_density_matches_cpu_and_reports_time() {
             if index < near {
                 cpu_time += start.elapsed().as_secs_f64() * 1000.0;
             }
-            let gpu = &result.values[index * blocks..][..blocks];
-            let (mut max, mut flips, mut exact, mut over_1e5, mut over_1e3) = (0.0_f32, 0, 0, 0, 0);
-            for (c, g) in cpu.iter().zip(gpu) {
-                let diff = (c - g).abs();
-                max = max.max(diff);
-                flips += usize::from((*c > 0.0) != (*g > 0.0));
-                exact += usize::from(c.to_bits() == g.to_bits());
-                over_1e5 += usize::from(diff > 1e-5);
-                over_1e3 += usize::from(diff > 1e-3);
-            }
-            println!(
-                "ACCURACY seed={seed} chunk=({x},{z}) max_abs_diff={max:e} sign_flips={flips} exact={exact} over_1e-5={over_1e5} over_1e-3={over_1e3} of {blocks}"
-            );
-            assert!(max.is_finite(), "non-finite GPU density at ({x},{z})");
-            if index < 2 {
-                let layers: Vec<i32> = (0..density.height())
-                    .filter(|y| {
-                        let at = *y as usize * 256;
-                        cpu[at..at + 256]
-                            .iter()
-                            .zip(&gpu[at..at + 256])
-                            .any(|(c, g)| (c - g).abs() > 1e-5)
-                    })
-                    .map(|y| y + density.min_y())
-                    .collect();
-                println!("LAYERS seed={seed} chunk=({x},{z}) differing_y={layers:?}");
-            }
+            let expected = ChunkSolids::from_densities(&cpu, height);
+            let actual = &result.chunks[index];
+            let flips = (0..256)
+                .flat_map(|column| (0..height).map(move |offset| (column, offset)))
+                .filter(|&(column, offset)| {
+                    expected.solid(column, offset) != actual.solid(column, offset)
+                })
+                .count();
+            println!("ACCURACY seed={seed} chunk=({x},{z}) sign_flips={flips} of {blocks}");
+            // Earlier f32 comparisons: |gpu - cpu| <= 8e-6, flips only where
+            // |density| < 1e-6.
+            assert!(flips <= 2, "seed {seed} chunk ({x},{z}): {flips} flips");
         }
         println!(
             "CPU seed={seed} fill_density_chunk ms_per_chunk={:.3}",

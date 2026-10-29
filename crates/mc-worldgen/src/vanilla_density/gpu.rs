@@ -1,6 +1,6 @@
-//! GPU worldgen experiment (feature `gpu`): `final_density` of whole chunks
-//! on the GPU (`density.wgsl`, encoder `program_gpu.rs`), returned in the
-//! [`VanillaDensity::fill_density_chunk`] layout.
+//! GPU worldgen experiment (feature `gpu`): which blocks `final_density`
+//! makes solid in whole chunks, computed on the GPU (`density.wgsl`, encoder
+//! `program_gpu.rs`) and returned as [`ChunkSolids`].
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -8,6 +8,7 @@ use wgpu::util::DeviceExt;
 
 use super::VanillaDensity;
 use super::program::gpu::{ChunkWords, chunk_words};
+use crate::terrain::ChunkSolids;
 
 const WORKGROUP: u32 = 64;
 
@@ -21,10 +22,10 @@ pub struct GpuDensity {
     timestamps: bool,
 }
 
-/// Chunk densities, chunk after chunk, and the GPU time of the flat, corner
-/// and block passes when the adapter reports timestamps.
-pub struct ChunkDensities {
-    pub values: Vec<f32>,
+/// Solid bits of each requested chunk, in request order, and the GPU time of
+/// the flat, corner and block passes when the adapter reports timestamps.
+pub struct GpuSolids {
+    pub chunks: Vec<ChunkSolids>,
     pub pass_ms: Option<[f64; 3]>,
 }
 
@@ -33,9 +34,10 @@ impl GpuDensity {
         let program = chunk_words(density)?;
         if program.min_y.rem_euclid(program.cell_height) != 0
             || program.height % program.cell_height != 0
+            || program.height % 32 != 0
             || 16 % program.cell_width != 0
         {
-            return Err("GPU chunk density needs a cell-aligned world".into());
+            return Err("GPU chunk density needs a cell- and word-aligned world".into());
         }
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -125,18 +127,19 @@ impl GpuDensity {
         })
     }
 
-    /// Densities of the chunks at block `(min_x, min_z)`.
-    pub fn fill_chunks(&self, chunks: &[(i32, i32)]) -> Result<ChunkDensities, String> {
+    /// Solids of the chunks at block `(min_x, min_z)`.
+    pub fn fill_chunks(&self, chunks: &[(i32, i32)]) -> Result<GpuSolids, String> {
         let p = &self.program;
         let count = u32::try_from(chunks.len()).map_err(|_| "too many chunks")?;
         let side = (16 / p.cell_width + 1) as u32;
         let columns = side * side;
         let levels = (p.height / p.cell_height + 1) as u32;
-        let blocks = 256 * p.height as u64;
+        let column_words = ChunkSolids::words_per_column(p.height as usize);
+        let chunk_words = 256 * column_words;
         let jobs = [
             count * columns,
             count * columns * levels,
-            count * 256 * (levels - 1),
+            count * chunk_words as u32,
         ];
         if jobs.iter().any(|jobs| jobs.div_ceil(WORKGROUP) > 65_535) {
             return Err(format!("{count} chunks exceed one dispatch"));
@@ -196,21 +199,21 @@ impl GpuDensity {
             u64::from(count * p.slots * levels * columns) * 4,
             storage,
         );
-        let density_size = u64::from(count) * blocks * 4;
-        let density = scratch(
-            "chunk density",
-            density_size,
+        let solids_size = u64::from(count) * chunk_words as u64 * 4;
+        let solids = scratch(
+            "chunk solids",
+            solids_size,
             storage | wgpu::BufferUsages::COPY_SRC,
         );
         let readback = scratch(
-            "chunk density readback",
-            density_size,
+            "chunk solids readback",
+            solids_size,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("chunk density"),
             layout: &self.layout,
-            entries: &[&uniform, &self.data, &origins, &flat, &corners, &density]
+            entries: &[&uniform, &self.data, &origins, &flat, &corners, &solids]
                 .into_iter()
                 .enumerate()
                 .map(|(binding, buffer)| wgpu::BindGroupEntry {
@@ -254,7 +257,7 @@ impl GpuDensity {
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(jobs.div_ceil(WORKGROUP), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&density, 0, &readback, 0, density_size);
+        encoder.copy_buffer_to_buffer(&solids, 0, &readback, 0, solids_size);
         if let Some((set, resolve, read)) = &queries {
             encoder.resolve_query_set(set, 0..6, resolve, 0);
             encoder.copy_buffer_to_buffer(resolve, 0, read, 0, 48);
@@ -284,7 +287,18 @@ impl GpuDensity {
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
         }
-        let values = floats(&readback.slice(..).get_mapped_range());
+        let chunks = readback
+            .slice(..)
+            .get_mapped_range()
+            .chunks_exact(chunk_words * 4)
+            .map(|bytes| {
+                let words = bytes
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                    .collect();
+                ChunkSolids::from_words(words, p.height as usize)
+            })
+            .collect();
         readback.unmap();
         let pass_ms = queries.map(|(_, _, read)| {
             let ticks: Vec<u64> = read
@@ -298,7 +312,7 @@ impl GpuDensity {
                 ticks[pass * 2 + 1].saturating_sub(ticks[pass * 2]) as f64 * period / 1e6
             })
         });
-        Ok(ChunkDensities { values, pass_ms })
+        Ok(GpuSolids { chunks, pass_ms })
     }
 }
 
@@ -309,13 +323,6 @@ fn shader_source(registers: u32) -> String {
 
 fn words(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
-
-fn floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
-        .collect()
 }
 
 #[cfg(test)]

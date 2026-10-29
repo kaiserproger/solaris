@@ -23,8 +23,9 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> flat: array<f32>;
 // [chunk][slot][level][corner column]
 @group(0) @binding(4) var<storage, read_write> corners: array<f32>;
-// [chunk][y - min_y][z][x]
-@group(0) @binding(5) var<storage, read_write> density: array<f32>;
+// Solid bits (`density > 0`), `ChunkSolids` layout: [chunk][z * 16 + x][word],
+// bit `(y - min_y) % 32` of word `(y - min_y) / 32`.
+@group(0) @binding(5) var<storage, read_write> solids: array<u32>;
 
 const REGISTERS: u32 = REGISTER_COUNTu;
 var<private> regs: array<f32, REGISTERS>;
@@ -422,32 +423,36 @@ fn corner_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-// One invocation per block column and cell level: the cell's vertical blocks.
+// One invocation per block column and 32 vertical blocks: one output word.
 @compute @workgroup_size(64)
 fn block_pass(@builtin(global_invocation_id) id: vec3<u32>) {
-    let cells = params.shape.w - 1u;
-    let per_chunk = 256u * cells;
+    let words = u32(params.geometry.y) / 32u;
+    let per_chunk = 256u * words;
     let chunk = id.x / per_chunk;
     if chunk >= params.shape.y {
         return;
     }
     let rest = id.x % per_chunk;
-    let level = rest / 256u;
-    let column = rest % 256u;
+    let column = rest / words;
+    let word = rest % words;
     let lx = column % 16u;
     let lz = column / 16u;
     let width = u32(params.geometry.z);
     let height = u32(params.geometry.w);
-    cell = vec4(chunk, level, lx / width, lz / width);
     let origin = chunks[chunk];
     let x = origin.x + i32(lx);
     let z = origin.y + i32(lz);
     let tx = f32(lx % width) / f32(width);
     let tz = f32(lz % width) / f32(width);
-    for (var dy = 0u; dy < height; dy++) {
-        cell_t = vec3(tx, f32(dy) / f32(height), tz);
-        let offset = level * height + dy;
+    var bits = 0u;
+    for (var bit = 0u; bit < 32u; bit++) {
+        let offset = word * 32u + bit;
+        cell = vec4(chunk, offset / height, lx / width, lz / width);
+        cell_t = vec3(tx, f32(offset % height) / f32(height), tz);
         run(params.block.x, params.block.z, 0u, params.block.y, vec3(x, params.geometry.x + i32(offset), z));
-        density[(chunk * u32(params.geometry.y) + offset) * 256u + column] = regs[params.block.w];
+        if regs[params.block.w] > 0.0 {
+            bits |= 1u << bit;
+        }
     }
+    solids[(chunk * 256u + column) * words + word] = bits;
 }

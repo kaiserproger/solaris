@@ -57,8 +57,9 @@ fn vanilla_stages() {
     stage_profile(&[712816, 5617830, 42], 3, false);
 }
 
-/// `vanilla_stages` with every chunk's density prefetched on the GPU in one
-/// batch outside the timer: the CPU cost left under a pipelined GPU service.
+/// `vanilla_stages` with densities from the GPU: the device and program are
+/// built outside the timer; the GPU fill of the profiled chunks plus one ring
+/// (64 chunks), the grid and the 36 generations are timed together.
 #[test]
 #[ignore = "release stage profile with GPU density; needs --features gpu and a GPU"]
 fn vanilla_stages_gpu_density() {
@@ -71,28 +72,41 @@ fn parity_stages() {
     stage_profile(&[0, 81, 497625], 1, false);
 }
 
-/// GPU densities of the profiled chunks and a one-chunk ring around them
-/// (what an ore halo reaches), in one batch.
 #[cfg(feature = "gpu")]
-fn gpu_densities(generator: &TerrainGenerator) -> ChunkDensities {
+type Gpu = crate::vanilla_density::gpu::GpuDensity;
+#[cfg(not(feature = "gpu"))]
+type Gpu = ();
+
+#[cfg(feature = "gpu")]
+fn gpu_device(generator: &TerrainGenerator) -> Gpu {
     let (_, density) = generator.vanilla().expect("vanilla worldgen");
-    let gpu = crate::vanilla_density::gpu::GpuDensity::new(density).unwrap();
+    Gpu::new(density).unwrap()
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_device(_: &TerrainGenerator) -> Gpu {
+    panic!("GPU density profile needs --features gpu")
+}
+
+/// GPU solids of the profiled chunks and a one-chunk ring around them (what
+/// an ore halo reaches), in one batch.
+#[cfg(feature = "gpu")]
+fn gpu_densities(gpu: &Gpu) -> SolidGrid {
     let ring: Vec<ChunkPos> = (-4..4)
         .flat_map(|z| (-4..4).map(move |x| ChunkPos { x, z }))
         .collect();
     let origins: Vec<(i32, i32)> = ring.iter().map(|p| (p.x * 16, p.z * 16)).collect();
-    let values = gpu.fill_chunks(&origins).unwrap().values;
-    let blocks = values.len() / ring.len();
-    let mut densities = ChunkDensities::default();
-    for (pos, values) in ring.into_iter().zip(values.chunks_exact(blocks)) {
-        densities.insert(pos, values.to_vec());
+    let solids = gpu.fill_chunks(&origins).unwrap().chunks;
+    let mut grid = SolidGrid::default();
+    for (pos, solids) in ring.into_iter().zip(solids) {
+        grid.insert(pos, solids);
     }
-    densities
+    grid
 }
 
 #[cfg(not(feature = "gpu"))]
-fn gpu_densities(_: &TerrainGenerator) -> ChunkDensities {
-    panic!("GPU density profile needs --features gpu")
+fn gpu_densities(_: &Gpu) -> SolidGrid {
+    unreachable!()
 }
 
 /// Blocks and biomes of chunks generated from GPU densities against the CPU
@@ -102,13 +116,13 @@ fn gpu_densities(_: &TerrainGenerator) -> ChunkDensities {
 fn gpu_density_chunks_match_cpu_chunks() {
     for seed in [712816, 42] {
         let (cpu, gpu) = (generator(seed), generator(seed));
-        let densities = gpu_densities(&gpu);
+        let densities = gpu_densities(&gpu_device(&gpu));
         let (mut blocks, mut biomes) = (0, 0);
         for z in -3..3 {
             for x in -3..3 {
                 let pos = ChunkPos { x, z };
-                let expected = cpu.generate_with_densities(pos, None);
-                let actual = gpu.generate_with_densities(pos, Some(&densities));
+                let expected = cpu.generate_with_solids(pos, None);
+                let actual = gpu.generate_with_solids(pos, Some(&densities));
                 let min_y = expected.geometry().min_y();
                 for y in min_y..expected.geometry().max_y() {
                     for column in 0..256u16 {
@@ -144,12 +158,14 @@ fn stage_profile(seeds: &[i64], runs: usize, gpu: bool) {
     for &seed in seeds {
         for run in 0..runs {
             let generator = generator(seed);
-            let densities = gpu.then(|| gpu_densities(&generator));
+            let device = gpu.then(|| gpu_device(&generator));
             TOTALS.with_borrow_mut(|totals| *totals = [Duration::ZERO; 9]);
             let start = Instant::now();
+            let densities = device.as_ref().map(gpu_densities);
+            let gpu_fill = start.elapsed().as_secs_f64() * 1000.0 / 36.0;
             let chunks: Vec<_> = positions
                 .iter()
-                .map(|&pos| generator.generate_with_densities(pos, densities.as_ref()))
+                .map(|&pos| generator.generate_with_solids(pos, densities.as_ref()))
                 .collect();
             let elapsed = start.elapsed().as_secs_f64() * 1000.0 / 36.0;
             let stages =
@@ -170,7 +186,7 @@ fn stage_profile(seeds: &[i64], runs: usize, gpu: bool) {
             }
             let lighting = start.elapsed().as_secs_f64() * 1000.0 / 16.0;
             println!(
-                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} density={} climate_biome={} surface_fill={} carvers={} ores={} decorations={} structure_paste={} villages_jigsaw={} other={} lighting={lighting}",
+                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} gpu_fill={gpu_fill} density={} climate_biome={} surface_fill={} carvers={} ores={} decorations={} structure_paste={} villages_jigsaw={} other={} lighting={lighting}",
                 stages[0],
                 stages[6],
                 stages[1],

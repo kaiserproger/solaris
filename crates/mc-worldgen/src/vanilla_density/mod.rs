@@ -11,9 +11,9 @@ use crate::vanilla_climate::noise::NormalNoise;
 mod blended;
 mod compile;
 mod evaluate;
-pub mod program;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod program;
 
 use blended::BlendedNoise;
 pub(crate) use evaluate::DensitySampler;

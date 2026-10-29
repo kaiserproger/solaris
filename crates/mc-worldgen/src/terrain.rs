@@ -40,6 +40,7 @@ mod ore_rules;
 mod ore_veins;
 mod overworld;
 mod sediments;
+mod solids;
 mod trees;
 
 pub use biome_rules::BiomeRules;
@@ -53,6 +54,7 @@ use ore_rules::{
     MAX_ORE_ANCHORS_PER_CELL, MAX_ORE_VEIN_SIZE, ORE_ANCHOR_CELL_EDGE, ORE_ANCHOR_CELL_VOLUME,
 };
 use overworld::{OverworldRouter, TerrainSample};
+pub use solids::{ChunkSolids, SolidGrid};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TerrainGeneratorError {
@@ -367,8 +369,8 @@ pub(crate) struct HeightContext<'h> {
     source_heights: HashMap<(i32, i32), i32>,
     native_sampler: Option<SurfaceHeightSampler<'h>>,
     plans: HashMap<(i32, i32), Option<VillagePlanSet>>,
-    /// Precomputed densities, with the density's min y and height.
-    densities: Option<(&'h ChunkDensities, i32, i32)>,
+    /// Precomputed solids, with the density's min y.
+    solids: Option<(&'h SolidGrid, i32)>,
 }
 
 impl<'h> HeightContext<'h> {
@@ -395,34 +397,30 @@ impl<'h> HeightContext<'h> {
             source_heights,
             native_sampler,
             plans: HashMap::new(),
-            densities: None,
+            solids: None,
         }
     }
 
-    /// Answer SOURCE heights and native densities of the chunks `densities`
-    /// holds from them instead of the halo sampler (same values).
-    pub(crate) fn with_densities(
-        mut self,
-        densities: &'h ChunkDensities,
-        min_y: i32,
-        height: i32,
-    ) -> Self {
-        self.densities = Some((densities, min_y, height));
+    /// Answer SOURCE heights and cave checks of the chunks `solids` holds
+    /// from them instead of the halo sampler (same answers). `min_y` is the
+    /// density's.
+    pub(crate) fn with_solids(mut self, solids: &'h SolidGrid, min_y: i32) -> Self {
+        self.solids = Some((solids, min_y));
         self
     }
 
-    /// Native terrain density at one block through the shared halo sampler;
-    /// `None` without vanilla density.
-    fn native_density(&mut self, world_x: i32, y: i32, world_z: i32) -> Option<f32> {
-        if let Some(value) = self
-            .densities
-            .and_then(|(densities, min_y, height)| densities.at(world_x, y, world_z, min_y, height))
+    /// Whether native terrain density leaves one block empty (`<= 0`), from
+    /// held solids or the shared halo sampler; `None` without vanilla density.
+    fn native_empty(&mut self, world_x: i32, y: i32, world_z: i32) -> Option<bool> {
+        if let Some(solid) = self
+            .solids
+            .and_then(|(solids, min_y)| solids.solid(world_x, y, world_z, min_y))
         {
-            return Some(value);
+            return Some(!solid);
         }
         self.native_sampler
             .as_mut()
-            .map(|sampler| sampler.density(world_x, y, world_z))
+            .map(|sampler| sampler.density(world_x, y, world_z) <= 0.0)
     }
 
     /// The SOURCE (pre-village) surface for one column: ready central-chunk
@@ -435,9 +433,9 @@ impl<'h> HeightContext<'h> {
         }
         // ONE shared sampler: lazily computed halo columns retain lattice
         // corners across columns instead of one sampler per column.
-        let held = self.densities.and_then(|(densities, min_y, height)| {
-            densities.surface_height(world_x, world_z, min_y, height)
-        });
+        let held = self
+            .solids
+            .and_then(|(solids, min_y)| solids.surface_height(world_x, world_z, min_y));
         let raw = if let Some(held) = held.filter(|_| self.native_sampler.is_some()) {
             held
         } else if let Some(sampler) = self.native_sampler.as_mut() {
@@ -545,54 +543,6 @@ impl<'h> HeightContext<'h> {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.source_heights.len()
-    }
-}
-
-/// Precomputed [`VanillaDensity::fill_density_chunk`] outputs by chunk (the
-/// GPU worldgen experiment). Generation reads its own chunk and every held
-/// neighbour its ore halo and surfaces reach instead of evaluating density.
-#[derive(Default)]
-pub struct ChunkDensities {
-    chunks: HashMap<(i32, i32), Vec<f32>>,
-}
-
-impl ChunkDensities {
-    pub fn insert(&mut self, pos: ChunkPos, values: Vec<f32>) {
-        self.chunks.insert((pos.x, pos.z), values);
-    }
-
-    fn chunk(&self, pos: ChunkPos) -> Option<&[f32]> {
-        self.chunks.get(&(pos.x, pos.z)).map(Vec::as_slice)
-    }
-
-    fn column(&self, world_x: i32, world_z: i32) -> Option<(&[f32], usize)> {
-        let values = self.chunk(ChunkPos {
-            x: world_x.div_euclid(16),
-            z: world_z.div_euclid(16),
-        })?;
-        Some((
-            values,
-            (world_z.rem_euclid(16) * 16 + world_x.rem_euclid(16)) as usize,
-        ))
-    }
-
-    fn at(&self, world_x: i32, y: i32, world_z: i32, min_y: i32, height: i32) -> Option<f32> {
-        let offset = y
-            .checked_sub(min_y)
-            .filter(|offset| (0..height).contains(offset))?;
-        let (values, column) = self.column(world_x, world_z)?;
-        Some(values[offset as usize * 256 + column])
-    }
-
-    /// Top solid y, as [`SurfaceHeightSampler::surface_height`] answers it.
-    fn surface_height(&self, world_x: i32, world_z: i32, min_y: i32, height: i32) -> Option<i32> {
-        let (values, column) = self.column(world_x, world_z)?;
-        Some(
-            (0..height)
-                .rev()
-                .find(|offset| values[*offset as usize * 256 + column] > 0.0)
-                .map_or(min_y - 1, |offset| min_y + offset),
-        )
     }
 }
 
@@ -707,11 +657,10 @@ impl OreColumnCache<'_, '_> {
                 .or_insert_with(|| {
                     sample_y < surface_y
                         && heights
-                            .native_density(world_x, sample_y, world_z)
-                            .map_or_else(
-                                || generator.is_cave_cell(world_x, sample_y, world_z, surface_y),
-                                |density| density <= 0.0,
-                            )
+                            .native_empty(world_x, sample_y, world_z)
+                            .unwrap_or_else(|| {
+                                generator.is_cave_cell(world_x, sample_y, world_z, surface_y)
+                            })
                 });
         };
         match self.cave_samples[index] {
@@ -2867,19 +2816,16 @@ impl ChunkGenerator for TerrainGenerator {
     }
 
     fn generate(&self, pos: ChunkPos) -> Chunk {
-        self.generate_with_densities(pos, None)
+        self.generate_with_solids(pos, None)
     }
 }
 
 impl TerrainGenerator {
-    /// [`ChunkGenerator::generate`] reading [`VanillaDensity::fill_density_chunk`]
-    /// outputs computed elsewhere (the GPU worldgen experiment) for this chunk
-    /// and any held neighbour; anything not held is computed here.
-    pub fn generate_with_densities(
-        &self,
-        pos: ChunkPos,
-        densities: Option<&ChunkDensities>,
-    ) -> Chunk {
+    /// [`ChunkGenerator::generate`] reading which blocks the density makes
+    /// solid from `solids` (computed elsewhere, e.g. the GPU worldgen
+    /// experiment) for this chunk and any held neighbour; anything not held
+    /// is computed here.
+    pub fn generate_with_solids(&self, pos: ChunkPos, solids: Option<&SolidGrid>) -> Chunk {
         #[cfg(test)]
         let mut stage_clock = profile_tests::StageClock::new();
         let mut chunk =
@@ -2892,17 +2838,24 @@ impl TerrainGenerator {
             .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
         #[cfg(test)]
         stage_clock.end(5);
-        let native_density = self.vanilla().map(|(climate, noise)| {
+        let native_solids = self.vanilla().map(|(climate, noise)| {
             let min_x = world_block_coordinate(pos.x, 0);
             let min_z = world_block_coordinate(pos.z, 0);
-            let values = match densities.and_then(|densities| densities.chunk(pos)) {
+            let held = solids.and_then(|solids| solids.chunk(pos));
+            let values = match held {
                 Some(held) => std::borrow::Cow::Borrowed(held),
                 None => {
                     let mut values = vec![0.0; noise.height() as usize * 256];
                     noise.fill_density_chunk(min_x, min_z, &mut values);
-                    std::borrow::Cow::Owned(values)
+                    std::borrow::Cow::Owned(ChunkSolids::from_densities(
+                        &values,
+                        noise.height() as usize,
+                    ))
                 }
             };
+            // Density offsets inside the geometry: the top search's range.
+            let low = (self.geometry.min_y() - noise.min_y()).max(0);
+            let high = (self.geometry.max_y() - noise.min_y()).clamp(0, noise.height());
             let density = noise;
             #[cfg(test)]
             stage_clock.end(0);
@@ -2915,15 +2868,12 @@ impl TerrainGenerator {
                 let idx = (quart / 4 * 4 + inner / 4) * 16 + quart % 4 * 4 + inner % 4;
                 let x = min_x + (idx % 16) as i32;
                 let z = min_z + (idx / 16) as i32;
-                let top = (self.geometry.min_y()..self.geometry.max_y())
-                    .rev()
-                    .find(|&y| {
-                        let offset = y - density.min_y();
-                        offset >= 0
-                            && offset < density.height()
-                            && values[offset as usize * 256 + idx] > 0.0
-                    })
-                    .unwrap_or(self.geometry.min_y());
+                let top = values
+                    .top_below(idx, high as usize)
+                    .filter(|offset| *offset as i32 >= low)
+                    .map_or(self.geometry.min_y(), |offset| {
+                        density.min_y() + offset as i32
+                    });
                 let native = sampler.sample(x, top, z);
                 let biome = match parsed.iter().find(|(name, _)| *name == native.biome) {
                     Some((_, biome)) => biome.clone(),
@@ -2998,19 +2948,19 @@ impl TerrainGenerator {
                 )
             }),
         );
-        if let (Some(densities), Some((_, density))) = (densities, self.vanilla()) {
-            heights = heights.with_densities(densities, density.min_y(), density.height());
+        if let (Some(solids), Some((_, density))) = (solids, self.vanilla()) {
+            heights = heights.with_solids(solids, density.min_y());
         }
 
         for plan in &columns {
-            if let (Some(values), Some((_, density))) = (&native_density, self.vanilla()) {
+            if let (Some(values), Some((_, density))) = (&native_solids, self.vanilla()) {
                 let idx = usize::from(plan.lz) * 16 + usize::from(plan.lx);
                 let badlands = plan.biome.path().contains("badlands");
                 for y in self.geometry.min_y()..=plan.top_non_air {
                     let offset = y - density.min_y();
                     let solid = offset >= 0
                         && offset < density.height()
-                        && values[offset as usize * 256 + idx] > 0.0;
+                        && values.solid(idx, offset as usize);
                     let state = if y == self.geometry.min_y() {
                         self.bedrock
                     } else if y == plan.height {
