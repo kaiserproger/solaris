@@ -937,6 +937,7 @@ impl TerrainGenerator {
     pub fn load_vanilla_worldgen(&mut self, data_root: &std::path::Path) -> Result<(), String> {
         let climate = VanillaClimate::new(self.seed as u64, data_root)?;
         let density = VanillaDensity::from_runtime(climate.runtime())?;
+        density.validate_aquifer_fields()?;
         let structures = crate::overworld_structures::OverworldStructures::load(
             data_root,
             self.seed,
@@ -3000,6 +3001,11 @@ impl TerrainGenerator {
             heights = heights.with_solids(solids, density.min_y());
         }
 
+        // Apply the same CPU aquifer decisions to CPU and GPU solid grids.
+        let mut aquifer = self.vanilla().map(|(_, density)| {
+            crate::vanilla_density::aquifer::Aquifer::new(density, self.seed as u64)
+        });
+
         for plan in &columns {
             if let (Some(values), Some((_, density))) = (&native_solids, self.vanilla()) {
                 let idx = usize::from(plan.lz) * 16 + usize::from(plan.lx);
@@ -3025,10 +3031,14 @@ impl TerrainGenerator {
                         } else {
                             self.base_stone_for_y(plan.lx, y, plan.lz, pos)
                         }
-                    } else if y <= -54 {
-                        self.cave_lava
                     } else {
-                        self.air
+                        use crate::vanilla_density::aquifer::Fluid;
+                        match aquifer.as_mut().expect("vanilla aquifer").substance(plan.wx, y, plan.wz) {
+                            Fluid::Air => self.air,
+                            Fluid::Water => self.water,
+                            Fluid::Lava => self.cave_lava,
+                            Fluid::Solid => self.base_stone_for_y(plan.lx, y, plan.lz, pos),
+                        }
                     };
                     let _ = chunk.set_block(plan.lx, y, plan.lz, state);
                 }

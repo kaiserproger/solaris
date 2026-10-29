@@ -244,6 +244,38 @@ fn vanilla_density_height_and_ocean_water_reach_generated_blocks() {
 }
 
 #[test]
+fn overworld_aquifers_fill_underground_caves() {
+    let Some(root) = content_cache() else { return };
+    let blocks = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
+    );
+    let state = |name: &str| blocks.block(&Identifier::parse(name).unwrap()).unwrap().default;
+    let (water, lava) = (state("minecraft:water"), state("minecraft:lava"));
+    let mut terrain = TerrainGenerator::new(712816, blocks);
+    terrain.load_vanilla_worldgen(&root).unwrap();
+    let (mut water_count, mut lava_count) = (0, 0);
+    for z in -8..=8 {
+        for x in -8..=8 {
+            let chunk = terrain.generate(ChunkPos { x, z });
+            for y in -63..0 {
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let block = chunk.get_block(lx, y, lz);
+                        water_count += usize::from(block == Some(water));
+                        lava_count += usize::from(block == Some(lava) && y < -54);
+                        // 26.3 Aquifer.NoiseBasedAquifer.computeFluidType permits
+                        // lava only when the cell's exclusive level is <= -10.
+                        assert!(block != Some(lava) || y < -10, "lava at {x},{y},{z}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(water_count > 0, "no underground aquifer water");
+    assert!(lava_count > 0, "no deep lava");
+}
+
+#[test]
 fn vanilla_chunk_density_matches_columns_at_cells_and_negative_borders() {
     let Some(root) = content_cache() else { return };
     for seed in [0, 81, 497625] {
