@@ -667,6 +667,13 @@ fn prove_natural(
         candidates.pop_front();
         return;
     }
+    let [x, y, z] = candidate.entrance;
+    // A loaded route can lead beyond entity simulation. Such a job strands
+    // its worker before they can take the profession or bring stock home.
+    if !state.world.is_active(x.div_euclid(16), z.div_euclid(16)) {
+        candidates.pop_front();
+        return;
+    }
     let after = candidate.after_resident.map_or(Unbounded, Excluded);
     let resident = residents.range((after, Unbounded)).find_map(|uuid| {
         let slot = state.entities.slot_of_uuid(*uuid)?;
@@ -690,7 +697,6 @@ fn prove_natural(
         candidates.pop_front();
         return;
     };
-    let [x, y, z] = candidate.entrance;
     let target = BlockPos { x, y, z };
     let from = at(start);
     let horizontal = from

@@ -221,6 +221,7 @@ fn fixture(
         .collect();
     world.ensure_blocking(&chunks.iter().map(|chunk| (*chunk, 0)).collect());
     let mut state = TickState::new(registry, world, 2, 512);
+    state.tickets.insert("autonomy-test".into(), (ChunkPos { x: 0, z: 0 }, 4));
     state.refresh_active_chunks(0);
     (state, chunks)
 }
@@ -598,6 +599,40 @@ fn natural_lumber_and_mine_zones_certify_after_deferred_route_proofs() {
 }
 
 #[test]
+fn loaded_but_unsimulated_natural_worksite_is_not_certified() {
+    let (mut state, chunks) = fixture(
+        vec![BELL],
+        vec![(
+            generated_claim("minecraft:village/plains/houses/plains_house_1", [0, 201, 0]),
+            [6.5, 202.0, 6.5],
+            "none".into(),
+        )],
+        vec![],
+    );
+    state.world.ensure_blocking(
+        &(1..=5).map(|x| (ChunkPos { x, z: 0 }, 0)).collect(),
+    );
+    adopt(&mut state, &chunks);
+    let id = state.settlements.records().next().unwrap().id;
+    state.settlements.get_mut(id).unwrap().radius = 136;
+    let residents = state.entities.slots().map(|slot| state.entities.row(slot).uuid).collect();
+    let mut candidates = VecDeque::from([NaturalCandidate {
+        kind: BuildingKind::Mine,
+        bounds: ScriptWorldBounds::new([80, 188, 0], [94, 203, 14]).unwrap(),
+        entrance: [80, 202, 1],
+        queued_at: 0,
+        after_resident: None,
+    }]);
+    assert!(state.world.has_chunk(5, 0));
+    assert!(!state.world.is_active(5, 0));
+    state.tick = 20;
+    state.tick_budget.reset(state.tick);
+    prove_natural(&mut state, id, &residents, &mut candidates);
+    assert!(candidates.is_empty());
+    assert!(!has_kind(&state, id, BuildingKind::Mine));
+}
+
+#[test]
 fn natural_quarry_skips_an_isolated_plateau_for_a_reachable_work_point() {
     let start = [6.5, 202.0, 6.5];
     let (mut state, chunks) = fixture(
@@ -705,6 +740,8 @@ fn dense_village_finds_natural_zones_beyond_generated_footprints() {
         .flat_map(|x| (-1..=2).map(move |z| (ChunkPos { x, z }, 0)))
         .collect();
     state.world.ensure_blocking(&outside);
+    state.tickets.insert("dense-test".into(), (ChunkPos { x: 0, z: 0 }, 5));
+    state.refresh_active_chunks(state.tick);
     adopt(&mut state, &chunks);
     let id = state.settlements.records().next().unwrap().id;
     state.settlements.get_mut(id).unwrap().radius = 136;

@@ -724,12 +724,13 @@ pub(super) fn work(
     if building.kind != buildings::BuildingKind::Mine {
         return None;
     }
+    let bounds = operational_bounds(state, building)?;
     // The shaft starts in the floor interior, inside the footprint the
     // upgrade fences: digging it mid-upgrade pauses the structure for good.
-    let (id, revision, bounds, upgrading) = (
+    let (id, revision, surface_bounds, upgrading) = (
         building.id.0,
         building.revision,
-        operational_bounds(state, building)?,
+        if building.natural_zone { building.bounds } else { bounds },
         state
             .settlements
             .get(building.settlement)
@@ -804,7 +805,7 @@ pub(super) fn work(
     let origin = if column == base {
         base
     } else if pass == 0
-        && let Some(origin) = surface_origin(state, bounds, column)
+        && let Some(origin) = surface_origin(state, surface_bounds, column)
     {
         origin
     } else {

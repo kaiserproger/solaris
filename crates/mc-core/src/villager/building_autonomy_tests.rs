@@ -233,6 +233,63 @@ fn village() -> TickState {
     village_with(false)
 }
 #[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_generated_village_builds_storage_with_player_simulation_distance() {
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
+    let mut config = crate::config::CoreConfig::new(std::path::PathBuf::new(), 100);
+    config.vanilla_data_dir = Some(data.clone());
+    let registry = Arc::new(CoreRegistry::load(Some(&data)).unwrap());
+    let terrain = crate::core::overworld_terrain(&config, &registry).unwrap();
+    let world = crate::world::ChunkWorld::new(
+        100,
+        Arc::new(terrain),
+        &registry,
+        mc_world::BlockStateId(registry.states.air),
+        [128, 70, 0],
+        mc_world::OVERWORLD_GEOMETRY,
+    );
+    let mut state = TickState::new(registry, world, 4, 512);
+    // The client has loaded the outskirts, but only the 4-chunk simulation
+    // square around its final position can tick villagers and resource work.
+    let chunks: Vec<_> = (2..=11)
+        .flat_map(|x| (-4..=4).map(move |z| ChunkPos { x, z }))
+        .collect();
+    state.world.ensure_blocking(&chunks.iter().map(|p| (*p, 0)).collect());
+    for (index, chunk) in chunks.iter().filter(|p| p.x >= 3).enumerate() {
+        state.tickets.insert(format!("seed100-{index}"), (*chunk, 0));
+    }
+    state.refresh_active_chunks(0);
+    let mut changes = ChangeSet::default();
+    generated::load(&mut state, &chunks, &mut changes);
+    changes.chunks_loaded.extend(chunks);
+    crate::settlements::autonomy::tick(&mut state, &mut changes);
+    for _ in 0..12_000 {
+        crate::tick::run_tick(&mut state, &[]);
+        for record in state.settlements.records() {
+            for building in record.buildings.values().filter(|b| b.natural_zone) {
+                let [x, _, z] = building.work_points[0];
+                assert!(state.world.is_active(x.div_euclid(16), z.div_euclid(16)),
+                    "natural {:?} work point {:?} lies outside simulation", building.kind, building.work_points[0]);
+            }
+        }
+        if state.settlements.records().any(|record| {
+            record.buildings.values().any(|building| building.kind == BuildingKind::Storage)
+        }) {
+            return;
+        }
+    }
+    let record = state.settlements.records().next().expect("generated village");
+    let residents: Vec<_> = state.entities.slots().filter_map(|slot| {
+        let v = state.entities.row(slot).villager.as_ref()?;
+        (v.settlement == Some(record.id)).then(|| {
+            (state.entities.pos(slot), v.data.profession, v.job_site, v.inventory.clone())
+        })
+    }).collect();
+    panic!("seed 100: buildings={:?} project={:?} residents={residents:?}",
+        record.buildings, crate::settlements::construction::project_status(&state, record.id));
+}
+
+#[test]
 fn empty_village_gathers_and_starts_storage_through_native_ticks() {
     let mut state = village_with(true);
     let id = state.settlements.records().next().unwrap().id;
