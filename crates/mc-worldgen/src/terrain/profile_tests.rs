@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 thread_local! {
-    static TOTALS: RefCell<[Duration; 7]> = const { RefCell::new([Duration::ZERO; 7]) };
+    static TOTALS: RefCell<[Duration; 9]> = const { RefCell::new([Duration::ZERO; 9]) };
 }
 pub(super) struct StageClock(Instant);
 impl StageClock {
@@ -54,30 +54,103 @@ fn generator(seed: i64) -> TerrainGenerator {
 #[test]
 #[ignore = "release stage profile; approved measurement window only"]
 fn vanilla_stages() {
-    stage_profile(&[712816, 5617830, 42], 3);
+    stage_profile(&[712816, 5617830, 42], 3, false);
+}
+
+/// `vanilla_stages` with every chunk's density prefetched on the GPU in one
+/// batch outside the timer: the CPU cost left under a pipelined GPU service.
+#[test]
+#[ignore = "release stage profile with GPU density; needs --features gpu and a GPU"]
+fn vanilla_stages_gpu_density() {
+    stage_profile(&[712816, 5617830, 42], 3, true);
 }
 
 #[test]
 #[ignore = "release single-threaded parity-seed profile; approved measurement window only"]
 fn parity_stages() {
-    stage_profile(&[0, 81, 497625], 1);
+    stage_profile(&[0, 81, 497625], 1, false);
 }
 
-fn stage_profile(seeds: &[i64], runs: usize) {
+/// GPU densities of the profiled chunks and a one-chunk ring around them
+/// (what an ore halo reaches), in one batch.
+#[cfg(feature = "gpu")]
+fn gpu_densities(generator: &TerrainGenerator) -> ChunkDensities {
+    let (_, density) = generator.vanilla().expect("vanilla worldgen");
+    let gpu = crate::vanilla_density::gpu::GpuDensity::new(density).unwrap();
+    let ring: Vec<ChunkPos> = (-4..4)
+        .flat_map(|z| (-4..4).map(move |x| ChunkPos { x, z }))
+        .collect();
+    let origins: Vec<(i32, i32)> = ring.iter().map(|p| (p.x * 16, p.z * 16)).collect();
+    let values = gpu.fill_chunks(&origins).unwrap().values;
+    let blocks = values.len() / ring.len();
+    let mut densities = ChunkDensities::default();
+    for (pos, values) in ring.into_iter().zip(values.chunks_exact(blocks)) {
+        densities.insert(pos, values.to_vec());
+    }
+    densities
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_densities(_: &TerrainGenerator) -> ChunkDensities {
+    panic!("GPU density profile needs --features gpu")
+}
+
+/// Blocks and biomes of chunks generated from GPU densities against the CPU
+/// path, on separate generators so no cached column hides a difference.
+#[test]
+#[ignore = "GPU worldgen experiment; needs --features gpu and a GPU"]
+fn gpu_density_chunks_match_cpu_chunks() {
+    for seed in [712816, 42] {
+        let (cpu, gpu) = (generator(seed), generator(seed));
+        let densities = gpu_densities(&gpu);
+        let (mut blocks, mut biomes) = (0, 0);
+        for z in -3..3 {
+            for x in -3..3 {
+                let pos = ChunkPos { x, z };
+                let expected = cpu.generate_with_densities(pos, None);
+                let actual = gpu.generate_with_densities(pos, Some(&densities));
+                let min_y = expected.geometry().min_y();
+                for y in min_y..expected.geometry().max_y() {
+                    for column in 0..256u16 {
+                        let (lx, lz) = ((column % 16) as u8, (column / 16) as u8);
+                        blocks += usize::from(
+                            expected.get_block(lx, y, lz) != actual.get_block(lx, y, lz),
+                        );
+                    }
+                }
+                for (e, a) in expected.biomes.iter().zip(&actual.biomes) {
+                    for cell in 0..64u8 {
+                        let (cx, cy, cz) = (cell % 4, cell / 16, cell / 4 % 4);
+                        biomes += usize::from(e.get(cx, cy, cz) != a.get(cx, cy, cz));
+                    }
+                }
+            }
+        }
+        println!(
+            "EQUIVALENCE seed={seed} differing_blocks={blocks} differing_biome_cells={biomes} chunks=36"
+        );
+        assert_eq!(biomes, 0, "seed {seed}");
+        assert!(blocks <= 36, "seed {seed}: {blocks} blocks differ");
+    }
+}
+
+fn stage_profile(seeds: &[i64], runs: usize, gpu: bool) {
     let report = mc_data::blocks::solaris_required_blocks_report();
     let light_table =
         mc_data::block_light::BlockLightTable::conservative_from_blocks_report(&report);
+    let positions: Vec<ChunkPos> = (-3..3)
+        .flat_map(|z| (-3..3).map(move |x| ChunkPos { x, z }))
+        .collect();
     for &seed in seeds {
         for run in 0..runs {
             let generator = generator(seed);
-            TOTALS.with_borrow_mut(|totals| *totals = [Duration::ZERO; 7]);
+            let densities = gpu.then(|| gpu_densities(&generator));
+            TOTALS.with_borrow_mut(|totals| *totals = [Duration::ZERO; 9]);
             let start = Instant::now();
-            let mut chunks = Vec::with_capacity(36);
-            for z in -3..3 {
-                for x in -3..3 {
-                    chunks.push(generator.generate(ChunkPos { x, z }));
-                }
-            }
+            let chunks: Vec<_> = positions
+                .iter()
+                .map(|&pos| generator.generate_with_densities(pos, densities.as_ref()))
+                .collect();
             let elapsed = start.elapsed().as_secs_f64() * 1000.0 / 36.0;
             let stages =
                 TOTALS.with_borrow(|totals| totals.map(|v| v.as_secs_f64() * 1000.0 / 36.0));
@@ -97,8 +170,16 @@ fn stage_profile(seeds: &[i64], runs: usize) {
             }
             let lighting = start.elapsed().as_secs_f64() * 1000.0 / 16.0;
             println!(
-                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} density={} climate_biome={} surface_fill={} carvers={} features={} structures={} other={} lighting={lighting}",
-                stages[0], stages[6], stages[1], stages[2], stages[3], stages[4], stages[5]
+                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} density={} climate_biome={} surface_fill={} carvers={} ores={} decorations={} structure_paste={} villages_jigsaw={} other={} lighting={lighting}",
+                stages[0],
+                stages[6],
+                stages[1],
+                stages[2],
+                stages[3],
+                stages[7],
+                stages[8],
+                stages[4],
+                stages[5]
             );
         }
     }

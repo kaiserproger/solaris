@@ -367,6 +367,8 @@ pub(crate) struct HeightContext<'h> {
     source_heights: HashMap<(i32, i32), i32>,
     native_sampler: Option<SurfaceHeightSampler<'h>>,
     plans: HashMap<(i32, i32), Option<VillagePlanSet>>,
+    /// Precomputed densities, with the density's min y and height.
+    densities: Option<(&'h ChunkDensities, i32, i32)>,
 }
 
 impl<'h> HeightContext<'h> {
@@ -393,12 +395,31 @@ impl<'h> HeightContext<'h> {
             source_heights,
             native_sampler,
             plans: HashMap::new(),
+            densities: None,
         }
+    }
+
+    /// Answer SOURCE heights and native densities of the chunks `densities`
+    /// holds from them instead of the halo sampler (same values).
+    pub(crate) fn with_densities(
+        mut self,
+        densities: &'h ChunkDensities,
+        min_y: i32,
+        height: i32,
+    ) -> Self {
+        self.densities = Some((densities, min_y, height));
+        self
     }
 
     /// Native terrain density at one block through the shared halo sampler;
     /// `None` without vanilla density.
     fn native_density(&mut self, world_x: i32, y: i32, world_z: i32) -> Option<f32> {
+        if let Some(value) = self
+            .densities
+            .and_then(|(densities, min_y, height)| densities.at(world_x, y, world_z, min_y, height))
+        {
+            return Some(value);
+        }
         self.native_sampler
             .as_mut()
             .map(|sampler| sampler.density(world_x, y, world_z))
@@ -414,7 +435,12 @@ impl<'h> HeightContext<'h> {
         }
         // ONE shared sampler: lazily computed halo columns retain lattice
         // corners across columns instead of one sampler per column.
-        let raw = if let Some(sampler) = self.native_sampler.as_mut() {
+        let held = self.densities.and_then(|(densities, min_y, height)| {
+            densities.surface_height(world_x, world_z, min_y, height)
+        });
+        let raw = if let Some(held) = held.filter(|_| self.native_sampler.is_some()) {
+            held
+        } else if let Some(sampler) = self.native_sampler.as_mut() {
             sampler.surface_height(world_x, world_z)
         } else {
             self.generator.base_surface_y(world_x, world_z)
@@ -519,6 +545,54 @@ impl<'h> HeightContext<'h> {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.source_heights.len()
+    }
+}
+
+/// Precomputed [`VanillaDensity::fill_density_chunk`] outputs by chunk (the
+/// GPU worldgen experiment). Generation reads its own chunk and every held
+/// neighbour its ore halo and surfaces reach instead of evaluating density.
+#[derive(Default)]
+pub struct ChunkDensities {
+    chunks: HashMap<(i32, i32), Vec<f32>>,
+}
+
+impl ChunkDensities {
+    pub fn insert(&mut self, pos: ChunkPos, values: Vec<f32>) {
+        self.chunks.insert((pos.x, pos.z), values);
+    }
+
+    fn chunk(&self, pos: ChunkPos) -> Option<&[f32]> {
+        self.chunks.get(&(pos.x, pos.z)).map(Vec::as_slice)
+    }
+
+    fn column(&self, world_x: i32, world_z: i32) -> Option<(&[f32], usize)> {
+        let values = self.chunk(ChunkPos {
+            x: world_x.div_euclid(16),
+            z: world_z.div_euclid(16),
+        })?;
+        Some((
+            values,
+            (world_z.rem_euclid(16) * 16 + world_x.rem_euclid(16)) as usize,
+        ))
+    }
+
+    fn at(&self, world_x: i32, y: i32, world_z: i32, min_y: i32, height: i32) -> Option<f32> {
+        let offset = y
+            .checked_sub(min_y)
+            .filter(|offset| (0..height).contains(offset))?;
+        let (values, column) = self.column(world_x, world_z)?;
+        Some(values[offset as usize * 256 + column])
+    }
+
+    /// Top solid y, as [`SurfaceHeightSampler::surface_height`] answers it.
+    fn surface_height(&self, world_x: i32, world_z: i32, min_y: i32, height: i32) -> Option<i32> {
+        let (values, column) = self.column(world_x, world_z)?;
+        Some(
+            (0..height)
+                .rev()
+                .find(|offset| values[*offset as usize * 256 + column] > 0.0)
+                .map_or(min_y - 1, |offset| min_y + offset),
+        )
     }
 }
 
@@ -1551,27 +1625,32 @@ impl TerrainGenerator {
     }
 
     fn assign_biomes(&self, chunk: &mut Chunk, columns: &[ColumnPlan; 256]) {
-        let mut sampler = self.vanilla().map(|(climate, _)| climate.column_sampler());
+        let quart_ys = chunk.biomes.len() * BIOME_DIM;
+        let quart_y =
+            |q: usize| i32::try_from(i64::from(self.geometry.min_y()) + q as i64 * 4 + 2).ok();
+        // Each quart column's whole height in one pass, so the column
+        // sampler computes its Y-free climate fields once per chunk instead
+        // of once per section. Indexed `(cz * 4 + cx) * quart_ys + q`.
+        let sampled = self.vanilla().map(|(climate, _)| {
+            let mut sampler = climate.column_sampler();
+            let mut sampled = Vec::with_capacity(BIOME_DIM * BIOME_DIM * quart_ys);
+            for column in 0..BIOME_DIM * BIOME_DIM {
+                let (cz, cx) = (column / BIOME_DIM, column % BIOME_DIM);
+                let plan = &columns[(cz * 4 + 2) * 16 + cx * 4 + 2];
+                for q in 0..quart_ys {
+                    sampled.push(quart_y(q).map(|y| sampler.sample(plan.wx, y, plan.wz).biome));
+                }
+            }
+            sampled
+        });
         for (section_idx, section) in chunk.biomes.iter_mut().enumerate() {
             let mut palette: Vec<Identifier> = Vec::with_capacity(4);
+            // Raw biome names already resolved to a palette slot.
+            let mut named: Vec<(&str, usize)> = Vec::with_capacity(4);
             let mut indices = PackedBitArray::zeroed(6, BIOME_VOLUME);
-            let ys: [Option<i32>; BIOME_DIM] = std::array::from_fn(|cy| {
-                i32::try_from(
-                    i64::from(self.geometry.min_y()) + section_idx as i64 * 16 + cy as i64 * 4 + 2,
-                )
-                .ok()
-            });
-            // Sample four consecutive heights per X/Z column, then consume
-            // in the original Y/Z/X order to retain palette and packed bytes.
-            let sampled = sampler.as_mut().map(|sampler| {
-                std::array::from_fn::<_, BIOME_VOLUME, _>(|index| {
-                    let (cz, cx, cy) = (index / 16, (index / 4) % 4, index % 4);
-                    let column = &columns[(cz * 4 + 2) * 16 + cx * 4 + 2];
-                    ys[cy].map(|y| sampler.sample(column.wx, y, column.wz).biome)
-                })
-            });
-            for (cy, y) in ys.into_iter().enumerate() {
-                let Some(y) = y else {
+            for cy in 0..BIOME_DIM {
+                let q = section_idx * BIOME_DIM + cy;
+                let Some(y) = quart_y(q) else {
                     continue;
                 };
                 for cz in 0..BIOME_DIM {
@@ -1579,30 +1658,33 @@ impl TerrainGenerator {
                         let lx = cx * 4 + 2;
                         let lz = cz * 4 + 2;
                         let column = &columns[lz * 16 + lx];
-                        let biome = if let Some(sampled) = &sampled {
-                            Identifier::parse(
-                                sampled[(cz * BIOME_DIM + cx) * BIOME_DIM + cy]
-                                    .expect("same checked biome Y"),
-                            )
-                            .expect("validated vanilla biome identifier")
+                        let palette_idx = if let Some(sampled) = &sampled {
+                            let name = sampled[(cz * BIOME_DIM + cx) * quart_ys + q]
+                                .expect("same checked biome Y");
+                            match named.iter().find(|(seen, _)| *seen == name) {
+                                Some(&(_, slot)) => slot,
+                                None => {
+                                    let biome = Identifier::parse(name)
+                                        .expect("validated vanilla biome identifier");
+                                    let slot = palette_slot(&mut palette, biome);
+                                    named.push((name, slot));
+                                    slot
+                                }
+                            }
                         } else if i64::from(y) < i64::from(column.height) - 24 && y < 32 {
-                            self.biomes.pick(
-                                &self.biomes.cave,
-                                column.wx,
-                                column.wz,
-                                self.seed,
-                                0x554E_4447,
+                            palette_slot(
+                                &mut palette,
+                                self.biomes.pick(
+                                    &self.biomes.cave,
+                                    column.wx,
+                                    column.wz,
+                                    self.seed,
+                                    0x554E_4447,
+                                ),
                             )
                         } else {
-                            column.biome.clone()
+                            palette_slot(&mut palette, column.biome.clone())
                         };
-                        let palette_idx = palette
-                            .iter()
-                            .position(|entry| entry == &biome)
-                            .unwrap_or_else(|| {
-                                palette.push(biome);
-                                palette.len() - 1
-                            });
                         let idx = (cy * BIOME_DIM + cz) * BIOME_DIM + cx;
                         indices.set(idx, palette_idx as u32);
                     }
@@ -2785,6 +2867,19 @@ impl ChunkGenerator for TerrainGenerator {
     }
 
     fn generate(&self, pos: ChunkPos) -> Chunk {
+        self.generate_with_densities(pos, None)
+    }
+}
+
+impl TerrainGenerator {
+    /// [`ChunkGenerator::generate`] reading [`VanillaDensity::fill_density_chunk`]
+    /// outputs computed elsewhere (the GPU worldgen experiment) for this chunk
+    /// and any held neighbour; anything not held is computed here.
+    pub fn generate_with_densities(
+        &self,
+        pos: ChunkPos,
+        densities: Option<&ChunkDensities>,
+    ) -> Chunk {
         #[cfg(test)]
         let mut stage_clock = profile_tests::StageClock::new();
         let mut chunk =
@@ -2797,14 +2892,27 @@ impl ChunkGenerator for TerrainGenerator {
             .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
         #[cfg(test)]
         stage_clock.end(5);
-        let native_density = self.vanilla().map(|(climate, density)| {
+        let native_density = self.vanilla().map(|(climate, noise)| {
             let min_x = world_block_coordinate(pos.x, 0);
             let min_z = world_block_coordinate(pos.z, 0);
-            let mut values = vec![0.0; density.height() as usize * 256];
-            density.fill_density_chunk(min_x, min_z, &mut values);
+            let values = match densities.and_then(|densities| densities.chunk(pos)) {
+                Some(held) => std::borrow::Cow::Borrowed(held),
+                None => {
+                    let mut values = vec![0.0; noise.height() as usize * 256];
+                    noise.fill_density_chunk(min_x, min_z, &mut values);
+                    std::borrow::Cow::Owned(values)
+                }
+            };
+            let density = noise;
             #[cfg(test)]
             stage_clock.end(0);
-            for idx in 0..256 {
+            // Block columns grouped by biome quart: one column sampler then
+            // reuses each quart's Y-free climate fields for its 16 columns.
+            let mut sampler = climate.column_sampler();
+            let mut parsed: Vec<(&str, Identifier)> = Vec::new();
+            for order in 0..256 {
+                let (quart, inner) = (order / 16, order % 16);
+                let idx = (quart / 4 * 4 + inner / 4) * 16 + quart % 4 * 4 + inner % 4;
                 let x = min_x + (idx % 16) as i32;
                 let z = min_z + (idx / 16) as i32;
                 let top = (self.geometry.min_y()..self.geometry.max_y())
@@ -2816,9 +2924,16 @@ impl ChunkGenerator for TerrainGenerator {
                             && values[offset as usize * 256 + idx] > 0.0
                     })
                     .unwrap_or(self.geometry.min_y());
-                let native = climate.sample(x, top, z);
-                let biome =
-                    Identifier::parse(native.biome).expect("validated vanilla biome identifier");
+                let native = sampler.sample(x, top, z);
+                let biome = match parsed.iter().find(|(name, _)| *name == native.biome) {
+                    Some((_, biome)) => biome.clone(),
+                    None => {
+                        let biome = Identifier::parse(native.biome)
+                            .expect("validated vanilla biome identifier");
+                        parsed.push((native.biome, biome.clone()));
+                        biome
+                    }
+                };
                 let vegetation_density = self
                     .biome_supports_land_vegetation(&biome)
                     .then(|| self.vegetation_density(x, z, f64::from(native.climate[1])));
@@ -2883,6 +2998,9 @@ impl ChunkGenerator for TerrainGenerator {
                 )
             }),
         );
+        if let (Some(densities), Some((_, density))) = (densities, self.vanilla()) {
+            heights = heights.with_densities(densities, density.min_y(), density.height());
+        }
 
         for plan in &columns {
             if let (Some(values), Some((_, density))) = (&native_density, self.vanilla()) {
@@ -2972,6 +3090,8 @@ impl ChunkGenerator for TerrainGenerator {
         {
             self.apply_decorations(&mut chunk, &columns, &mut heights);
         }
+        #[cfg(test)]
+        stage_clock.end(7);
         if let Some(structures) = &self.overworld_structures {
             let heights_cell = std::cell::RefCell::new(&mut heights);
             let touched = structures.paste(
@@ -2990,13 +3110,24 @@ impl ChunkGenerator for TerrainGenerator {
             }
         }
         #[cfg(test)]
-        stage_clock.end(3);
+        stage_clock.end(8);
         chunk.status = "minecraft:full".into();
         chunk.mark_dirty();
         #[cfg(test)]
         stage_clock.end(5);
         chunk
     }
+}
+
+/// Palette index of `biome` in a biome section, appended on first use.
+fn palette_slot(palette: &mut Vec<Identifier>, biome: Identifier) -> usize {
+    palette
+        .iter()
+        .position(|entry| entry == &biome)
+        .unwrap_or_else(|| {
+            palette.push(biome);
+            palette.len() - 1
+        })
 }
 
 #[cfg(test)]

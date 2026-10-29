@@ -89,7 +89,9 @@ fn gpu_chunk_density_matches_cpu_and_reports_time() {
                 walls.push(start.elapsed().as_secs_f64() * 1000.0 / batch as f64);
                 passes.push(result.pass_ms.map(|ms| ms.map(|m| m / batch as f64)));
             }
-            println!("GPU seed={seed} batch={batch} wall_ms_per_chunk={walls:.3?} pass_ms_per_chunk(flat,corner,block)={passes:.3?}");
+            println!(
+                "GPU seed={seed} batch={batch} wall_ms_per_chunk={walls:.3?} pass_ms_per_chunk(flat,corner,block)={passes:.3?}"
+            );
         }
     }
 }

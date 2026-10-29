@@ -281,6 +281,10 @@ fn smear_delta(octave: &ImprovedNoise, y: f64, y_scale: f64, y_max: f64) -> f32 
     if y_scale == 0.0 {
         return 0.0;
     }
-    let limited = if y_max >= 0.0 && y_max < yr { y_max } else { yr };
+    let limited = if y_max >= 0.0 && y_max < yr {
+        y_max
+    } else {
+        yr
+    };
     (limited / y_scale + 1.0e-7_f32).floor() * y_scale
 }

@@ -117,6 +117,49 @@ fn vanilla_three_seed_climate_and_height_fixtures() {
     }
 }
 
+/// Every chunk biome cell and every column's surface biome is the noise
+/// biome at its own position, whatever order generation samples them in.
+#[test]
+fn generated_biomes_are_noise_biomes_at_their_cells() {
+    let Some(root) = content_cache() else { return };
+    let blocks = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
+    );
+    let mut terrain = TerrainGenerator::new(712816, blocks);
+    terrain.load_vanilla_worldgen(&root).unwrap();
+    for pos in [
+        ChunkPos { x: 0, z: 0 },
+        ChunkPos { x: -3, z: 5 },
+        ChunkPos { x: 40, z: -17 },
+    ] {
+        let chunk = terrain.generate(pos);
+        let min_y = chunk.geometry().min_y();
+        for (section, biomes) in chunk.biomes.iter().enumerate() {
+            for cell in 0..64u8 {
+                let (cx, cy, cz) = (cell % 4, cell / 16, cell / 4 % 4);
+                let x = pos.x * 16 + i32::from(cx) * 4 + 2;
+                let y = min_y + section as i32 * 16 + i32::from(cy) * 4 + 2;
+                let z = pos.z * 16 + i32::from(cz) * 4 + 2;
+                assert_eq!(
+                    biomes.get(cx, cy, cz),
+                    &terrain.noise_biome(x, y, z),
+                    "({x},{y},{z})"
+                );
+            }
+        }
+        for column in 0..256 {
+            let x = pos.x * 16 + column % 16;
+            let z = pos.z * 16 + column / 16;
+            let sample = terrain.diagnostic_sample(x, z);
+            assert_eq!(
+                sample.biome,
+                terrain.noise_biome(x, sample.surface_y, z),
+                "({x},{z})"
+            );
+        }
+    }
+}
+
 #[test]
 fn vanilla_density_height_and_ocean_water_reach_generated_blocks() {
     let Some(root) = content_cache() else { return };
