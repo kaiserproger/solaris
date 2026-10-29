@@ -12,6 +12,8 @@ mod blended;
 mod compile;
 mod evaluate;
 pub mod program;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 use blended::BlendedNoise;
 pub(crate) use evaluate::DensitySampler;

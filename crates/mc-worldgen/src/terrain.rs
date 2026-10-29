@@ -2802,6 +2802,8 @@ impl ChunkGenerator for TerrainGenerator {
             let min_z = world_block_coordinate(pos.z, 0);
             let mut values = vec![0.0; density.height() as usize * 256];
             density.fill_density_chunk(min_x, min_z, &mut values);
+            #[cfg(test)]
+            stage_clock.end(0);
             for idx in 0..256 {
                 let x = min_x + (idx % 16) as i32;
                 let z = min_z + (idx / 16) as i32;
@@ -2833,7 +2835,7 @@ impl ChunkGenerator for TerrainGenerator {
             values
         });
         #[cfg(test)]
-        stage_clock.end(0);
+        stage_clock.end(6);
         let village = self.village_plans_for_chunk(pos);
         #[cfg(test)]
         stage_clock.end(4);
@@ -2958,7 +2960,7 @@ impl ChunkGenerator for TerrainGenerator {
         stage_clock.end(3);
         self.assign_biomes(&mut chunk, &columns);
         #[cfg(test)]
-        stage_clock.end(0);
+        stage_clock.end(6);
         if let Some(plans) = village.as_ref() {
             {
                 self.apply_village_pieces(&mut chunk, plans, &mut heights);

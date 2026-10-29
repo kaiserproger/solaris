@@ -25,6 +25,9 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+# GPU worldgen experiment only (feature `gpu`); the client pins the same wgpu.
+wgpu = { version = "=27.0.1", optional = true }
+pollster = { version = "=0.4.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -33,3 +36,5 @@ tempfile = "3"
 # Gated height-context cache counters. Off by default: every increment
 # compiles out, so production generation pays nothing.
 worldgen-counters = []
+# GPU worldgen experiment: chunk density on the GPU (wgpu). Off by default.
+gpu = ["dep:wgpu", "dep:pollster"]

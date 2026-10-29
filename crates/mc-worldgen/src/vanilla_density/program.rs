@@ -81,6 +81,7 @@ pub(crate) fn encode(
         noise_ids: HashMap::new(),
         blended: Vec::new(),
         blended_ids: HashMap::new(),
+        corner: None,
     };
     let mut surface_code = Code::default();
     let surface_root = exporter.emit(&mut surface_code, surface, Context::Terrain)?;
@@ -298,6 +299,9 @@ struct Exporter<'a> {
     noise_ids: HashMap<usize, u32>,
     blended: Vec<usize>,
     blended_ids: HashMap<usize, u32>,
+    /// Chunk-fill mode only (`program_gpu.rs`): the lattice-corner code and
+    /// its roots, one per `interpolated` marker met in block context.
+    corner: Option<(Code, Vec<Reg>)>,
 }
 
 impl<'a> Exporter<'a> {
@@ -411,6 +415,24 @@ impl<'a> Exporter<'a> {
                 code.memo.insert((id, context), reg);
                 return Ok(reg);
             }
+            Node::Marker(Marker::Interpolated, input)
+                if context == Context::Raw && self.corner.is_some() =>
+            {
+                let (mut corner, mut slots) = self.corner.take().expect("guarded");
+                let inner = self.emit(&mut corner, *input, Context::Terrain);
+                let slot = slots.len() as u32;
+                if let Ok(reg) = inner {
+                    slots.push(reg);
+                }
+                self.corner = Some((corner, slots));
+                inner?;
+                (21, [Arg::Int(slot), none, none, none], [0.0; 2])
+            }
+            Node::Marker(Marker::FlatCache | Marker::Cache2D, _)
+                if context == Context::Raw && self.corner.is_some() =>
+            {
+                return Err("column caches outside `interpolated` are not supported".into());
+            }
             Node::Marker(marker, input) => {
                 let inner = match (marker, context) {
                     (Marker::FlatCache, Context::Terrain | Context::Flat) => Context::Flat,
@@ -509,3 +531,7 @@ impl Writer {
         Ok(())
     }
 }
+
+#[cfg(feature = "gpu")]
+#[path = "program_gpu.rs"]
+pub(crate) mod gpu;

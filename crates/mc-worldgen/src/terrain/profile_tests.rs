@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 thread_local! {
-    static TOTALS: RefCell<[Duration; 6]> = const { RefCell::new([Duration::ZERO; 6]) };
+    static TOTALS: RefCell<[Duration; 7]> = const { RefCell::new([Duration::ZERO; 7]) };
 }
 pub(super) struct StageClock(Instant);
 impl StageClock {
@@ -70,7 +70,7 @@ fn stage_profile(seeds: &[i64], runs: usize) {
     for &seed in seeds {
         for run in 0..runs {
             let generator = generator(seed);
-            TOTALS.with_borrow_mut(|totals| *totals = [Duration::ZERO; 6]);
+            TOTALS.with_borrow_mut(|totals| *totals = [Duration::ZERO; 7]);
             let start = Instant::now();
             let mut chunks = Vec::with_capacity(36);
             for z in -3..3 {
@@ -97,8 +97,8 @@ fn stage_profile(seeds: &[i64], runs: usize) {
             }
             let lighting = start.elapsed().as_secs_f64() * 1000.0 / 16.0;
             println!(
-                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} density_noise={} surface_fill={} carvers={} features={} structures={} other={} lighting={lighting}",
-                stages[0], stages[1], stages[2], stages[3], stages[4], stages[5]
+                "STAGES seed={seed} run={run} chunks=36 ms_per_chunk={elapsed} density={} climate_biome={} surface_fill={} carvers={} features={} structures={} other={} lighting={lighting}",
+                stages[0], stages[6], stages[1], stages[2], stages[3], stages[4], stages[5]
             );
         }
     }
