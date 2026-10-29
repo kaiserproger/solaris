@@ -8,7 +8,7 @@ use crate::boundary::{ConnectionId, PlayerInput, TickOutput};
 use crate::config::CoreConfig;
 use crate::core::Core;
 
-fn config(name: &str, pause_seconds: u32) -> (CoreConfig, std::path::PathBuf) {
+pub(crate) fn config(name: &str, pause_seconds: u32) -> (CoreConfig, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("mc-core-pause-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut config = CoreConfig::new(dir.clone(), 42);
@@ -20,7 +20,7 @@ fn config(name: &str, pause_seconds: u32) -> (CoreConfig, std::path::PathBuf) {
     (config, dir)
 }
 
-fn runtime() -> tokio::runtime::Runtime {
+pub(crate) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -29,7 +29,7 @@ fn runtime() -> tokio::runtime::Runtime {
 
 /// Drain broadcasts until the channel goes quiet (a paused world) or 40 ticks
 /// arrived. Returns the highest observed tick.
-fn drain_until_idle(
+pub(crate) fn drain_until_idle(
     rt: &tokio::runtime::Runtime,
     rx: &mut tokio::sync::broadcast::Receiver<TickOutput>,
 ) -> u64 {
@@ -45,7 +45,7 @@ fn drain_until_idle(
     })
 }
 
-fn next_tick(
+pub(crate) fn next_tick(
     rt: &tokio::runtime::Runtime,
     rx: &mut tokio::sync::broadcast::Receiver<TickOutput>,
     wait: Duration,

@@ -2,6 +2,7 @@
 //! Moved verbatim from `core.rs`.
 
 use super::*;
+use crate::singleplayer_pause::{SingleplayerPause, online_players};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Tick loop: 20 TPS, event-driven wake (no sleeps beyond the tick timer).
@@ -36,14 +37,6 @@ pub(super) struct TickChannels {
     pub(super) input_log: Option<crate::input_log::InputLog>,
 }
 
-/// Online players across every dimension; the empty-server pause counts them.
-pub(super) fn online_players(state: &TickState) -> usize {
-    std::iter::once(state)
-        .chain(state.other_dimensions.values().map(|world| &**world))
-        .map(|world| world.players.len())
-        .sum()
-}
-
 pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
     let mut next_tick = std::time::Instant::now();
     let mut admission_reserve_us = state
@@ -67,6 +60,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
     // Empty-server pause bookkeeping (vanilla `pause-when-empty-seconds`).
     let mut empty_ticks = 0u64;
     let mut paused = false;
+    let mut singleplayer_pause = SingleplayerPause::default();
     'ticks: loop {
         let wall_start = std::time::Instant::now();
         let wall_start_unix_ns = std::time::SystemTime::now()
@@ -97,6 +91,8 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
         while let Ok(input) = channels.input_rx.try_recv() {
             inputs.push(input);
         }
+        let singleplayer_runs =
+            singleplayer_pause.filter_inputs(&state, &mut inputs, &channels.outbox);
         let mut activity = !inputs.is_empty();
         while let Ok(request) = channels.moderation_selector_rx.try_recv() {
             moderation_selector::answer(&state, request);
@@ -104,7 +100,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
         // Debug/test spawns drain here (bench + tests only).
         let logging = channels.input_log.is_some();
         let mut logged_spawns = Vec::new();
-        while let Ok(request) = channels.spawn_rx.try_recv() {
+        while singleplayer_runs && let Ok(request) = channels.spawn_rx.try_recv() {
             if logging {
                 logged_spawns.push(crate::input_log::LoggedSpawn::new(&request));
             }
@@ -113,7 +109,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
         }
         // Remote tickets drain here; the journal records them each tick.
         let mut logged_tickets = Vec::new();
-        while let Ok(ticket) = channels.ticket_rx.try_recv() {
+        while singleplayer_runs && let Ok(ticket) = channels.ticket_rx.try_recv() {
             if logging {
                 logged_tickets.push(crate::input_log::LoggedTicket {
                     owner: ticket.owner.clone(),
@@ -165,7 +161,7 @@ pub(super) fn tick_loop(mut state: TickState, mut channels: TickChannels) {
             empty_ticks = 0;
             paused = false;
         }
-        if paused && !activity {
+        if (paused && !activity) || !singleplayer_runs {
             if !checkpoint_in_flight && let Ok(reply) = channels.checkpoint_rx.try_recv() {
                 checkpoint_in_flight = start_checkpoint_with_reply(
                     &mut state,

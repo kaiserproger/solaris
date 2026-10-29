@@ -184,6 +184,7 @@ mod shelf;
 pub mod shrieker;
 mod shulker;
 mod signs;
+mod singleplayer_pause;
 pub mod sleep;
 mod spawn_egg;
 pub mod special_mobs;

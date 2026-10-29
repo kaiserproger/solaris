@@ -314,4 +314,4 @@ pub(crate) fn mature(
 
 #[cfg(test)]
 #[path = "composter_tests.rs"]
-mod tests;
+pub(crate) mod tests;

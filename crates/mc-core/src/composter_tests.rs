@@ -7,7 +7,7 @@ use crate::registry::CoreRegistry;
 use crate::tick::run_tick;
 use crate::world::ChunkWorld;
 
-const POS: BlockPos = BlockPos { x: 1, y: 200, z: 0 };
+pub(crate) const POS: BlockPos = BlockPos { x: 1, y: 200, z: 0 };
 
 struct EmptyWorld(u32);
 impl mc_world::ChunkGenerator for EmptyWorld {
@@ -22,11 +22,14 @@ impl mc_world::ChunkGenerator for EmptyWorld {
     }
 }
 
-fn data_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla")
+pub(crate) fn data_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../data/vanilla")
+        .canonicalize()
+        .expect("vanilla content cache")
 }
 
-fn fixture(start: u8) -> (TickState, EntityId) {
+pub(crate) fn fixture(start: u8) -> (TickState, EntityId) {
     let registry = Arc::new(CoreRegistry::load(Some(&data_dir())).unwrap());
     let world = ChunkWorld::new(
         42,
@@ -94,7 +97,7 @@ fn use_input(sequence: i32, hand: Hand) -> PlayerInput {
     }
 }
 
-fn snapshot_block(output: &crate::boundary::TickOutput) -> Option<u32> {
+pub(crate) fn snapshot_block(output: &crate::boundary::TickOutput) -> Option<u32> {
     output
         .snapshot
         .chunks
