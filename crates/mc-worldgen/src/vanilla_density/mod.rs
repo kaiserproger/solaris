@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::vanilla_climate::noise::NormalNoise;
 
+pub(crate) mod aquifer;
 mod blended;
 mod compile;
 mod evaluate;
@@ -178,6 +179,15 @@ impl VanillaDensity {
                 .map(Arc::new),
             runtime,
         })
+    }
+
+    pub(crate) fn validate_aquifer_fields(&self) -> Result<(), String> {
+        for field in [
+            "barrier", "fluid_level_floodedness", "fluid_level_spread", "lava", "erosion", "depth",
+        ] {
+            self.runtime.field(field)?;
+        }
+        Ok(())
     }
 
     /// Far-terrain LOD height: the topmost block where the cave-free

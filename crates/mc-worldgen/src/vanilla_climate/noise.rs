@@ -40,7 +40,7 @@ impl Xoroshiro {
             }
         }
     }
-    fn positional(&mut self) -> NoiseFactory {
+    pub(crate) fn positional(&mut self) -> NoiseFactory {
         NoiseFactory {
             lo: self.next_long(),
             hi: self.next_long(),
@@ -66,6 +66,14 @@ impl NoiseFactory {
         let lo = u64::from_be_bytes(digest[..8].try_into().expect("MD5 half"));
         let hi = u64::from_be_bytes(digest[8..].try_into().expect("MD5 half"));
         Xoroshiro::halves(lo ^ self.lo, hi ^ self.hi)
+    }
+    pub(crate) fn at(&self, x: i32, y: i32, z: i32) -> Xoroshiro {
+        let seed = i64::from(x.wrapping_mul(3_129_871))
+            ^ i64::from(z).wrapping_mul(116_129_781)
+            ^ i64::from(y);
+        let seed = seed.wrapping_mul(seed).wrapping_mul(42_317_861)
+            .wrapping_add(seed.wrapping_mul(11)) >> 16;
+        Xoroshiro::halves(self.lo ^ seed as u64, self.hi)
     }
     pub(crate) fn normal(
         &self,

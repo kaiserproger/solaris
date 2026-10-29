@@ -2,9 +2,12 @@
 //!
 //! Generation pipeline, biomes, structures.
 //!
-//! Solaris-owned density-routed terrain with data-fed biomes, caves, ores,
-//! decorations, and optional structures. Generation is deterministic from
-//! seed and world coordinates and does not depend on chunk generation order.
+//! Solaris-owned density-routed terrain with data-fed biomes, caves, aquifers,
+//! ores, decorations, and optional structures. The overworld applies aquifers
+//! on the CPU after both CPU and GPU solid-grid generation. Generation is
+//! deterministic from seed and coordinates, independent of chunk order.
+//! Aquifer boundary fluids are not yet scheduled for vanilla postprocessing;
+//! Solaris has no generation-time hook that consumes those marks.
 
 pub mod blueprint;
 pub mod earth;
@@ -123,7 +126,10 @@ pub use terrain::{HeightContextStats, height_context_stats, reset_height_context
 ///
 /// 30: correct the deepslate vertical gradient to Y 0..8 with linear probability.
 /// Existing chunks are retained by the explicit offline worldgen upgrade.
-pub const WORLDGEN_REVISION: u32 = 30;
+///
+/// 31: populate overworld density caves with noise-based aquifers, including
+/// water, lava and solid pressure barriers on both CPU and GPU density paths.
+pub const WORLDGEN_REVISION: u32 = 31;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
