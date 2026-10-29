@@ -13,6 +13,21 @@ from .backends.probe_steps import ProbeSteps
 
 
 class NativeV2ProbeTests(unittest.TestCase):
+    def test_lifecycle_difficulty_query_is_ordered_and_fail_closed(self) -> None:
+        from .backends import native_lifecycle
+
+        steps = mock.Mock()
+        steps.wait.return_value = {
+            "recent_chat": ["lifecycle difficulty abc", "The difficulty is Easy"]
+        }
+        with mock.patch.object(native_lifecycle.uuid, "uuid4") as identifier:
+            identifier.return_value.hex = "abc"
+            self.assertEqual(native_lifecycle._difficulty(steps), "easy")
+            steps.fixture.assert_called_once_with("difficulty")
+            steps.wait.return_value = {"recent_chat": ["lifecycle difficulty abc", "not authorized"]}
+            with self.assertRaisesRegex(RuntimeError, "difficulty query"):
+                native_lifecycle._difficulty(steps)
+
     def test_radius_rejects_missing_or_non_eight_live_render_setting(self) -> None:
         from .backends import native_radius
 

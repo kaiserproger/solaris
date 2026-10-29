@@ -65,7 +65,7 @@ never success.
 | `core-client` | real-client | Server/own-chat continuity subset only (Java default, native subset). The receipt explicitly excludes Wasm, economy, and Loader-required rejection evidence. |
 | `inventory` | real-client | Shared crafting/cursor/selection probe (Java default, native, or named `run scenario inventory-client --client java`). Ordinary slot clicks, no `minecraft_run_scenario` in the probe. |
 | `entities` | real-client | One shared bounded pig feeding/damage/death/drop probe with declared operator fixture and UUID/type fencing (`--client native` or `java`) |
-| `native-lifecycle` | real-client | Reconnect, received death/respawn, and 30-minute RSS soak (`--client native|java`; `--soak-seconds 0` is smoke-only) |
+| `native-lifecycle` | real-client | Reconnect, received death/respawn, and 30-minute stationary RSS soak; the isolated world uses peaceful difficulty during the soak and restores its original difficulty (`--client native|java`; `--soak-seconds 0` is smoke-only) |
 | `logical-native` | functional-native | Cheap headless movement/look plus rejected-use stable-state subset. Explicitly not `playable`/`regression`/`replay`; `--windowed` is rejected. |
 | `native-scale` | functional-native | Headless native CPU/RSS canaries beside real Rust protocol bots; non-exclusive diagnostic only |
 | `loader-live` | real-client | Loader gate via `loader.run`; requires `--platform fabric|neoforge|forge`, an immutable `--server-bin`, and a matching `--plugins-dir`. `python3 -m tools.harness run loader-live --platform neoforge --server-bin /absolute/solaris-v2 --plugins-dir /absolute/packages` |

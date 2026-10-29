@@ -377,6 +377,110 @@ fn player_armor_attribute_changes_native_damage() {
 }
 
 #[test]
+fn vanilla_player_combat_numbers_through_native_tick() {
+    for (item, damage, speed) in [
+        (None, 1.0_f32, 4.0_f64),
+        (Some("wooden_sword"), 4.0, 1.6),
+        (Some("stone_sword"), 5.0, 1.6),
+        (Some("iron_sword"), 6.0, 1.6),
+        (Some("diamond_sword"), 7.0, 1.6),
+    ] {
+        let (mut state, alice, _) = fixture();
+        if let Some(item) = item {
+            command(
+                &mut state,
+                alice,
+                &format!("item replace entity @s hotbar.0 with minecraft:{item}"),
+            );
+        }
+        state.tick = 40;
+        state.last_swing.insert(alice, 0);
+        let actor = state.entities.slot_of(alice).unwrap();
+        state.entities.set_ground(actor, true);
+        let victim = state.spawn_mob(state.registry.cow_type_id, [0.0, 80.0, 1.5], 100.0);
+        crate::tick::run_tick(&mut state, &[]);
+        let player = &state.players[&alice];
+        assert_eq!(player.effective_attribute("max_health"), Some(20.0));
+        assert!((player.effective_attribute("attack_speed").unwrap() - speed).abs() < 0.000_001);
+        assert!(
+            (player.effective_attribute("attack_damage").unwrap() - f64::from(damage)).abs()
+                < 0.000_001
+        );
+        let before = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
+        crate::tick::run_tick(
+            &mut state,
+            &[PlayerInput::Attack {
+                connection: ConnectionId(1),
+                target: victim,
+            }],
+        );
+        let after = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
+        assert!((before - after - damage).abs() < 0.001, "{item:?}: dealt {}", before - after);
+        if item.is_some() {
+            let victim = state.spawn_mob(state.registry.cow_type_id, [0.0, 80.0, 1.5], 100.0);
+            let before = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
+            state.last_swing.insert(alice, state.tick - 6);
+            crate::tick::run_tick(
+                &mut state,
+                &[PlayerInput::Attack {
+                    connection: ConnectionId(1),
+                    target: victim,
+                }],
+            );
+            let after = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
+            let expected = damage * (0.2 + 0.8 * 0.52_f32.powi(2));
+            assert!((before - after - expected).abs() < 0.001, "{item:?}: partial hit dealt {}", before - after);
+        }
+    }
+}
+
+#[test]
+fn vanilla_player_armor_and_regeneration_through_native_tick() {
+    for (material, armor, expected_damage) in [("leather", 7.0, 9.2), ("iron", 15.0, 6.0)] {
+        let (mut state, alice, _) = fixture();
+        for (slot, suffix) in [
+            ("armor.feet", "boots"),
+            ("armor.legs", "leggings"),
+            ("armor.chest", "chestplate"),
+            ("armor.head", "helmet"),
+        ] {
+            command(
+                &mut state,
+                alice,
+                &format!("item replace entity @s {slot} with minecraft:{material}_{suffix}"),
+            );
+        }
+        crate::tick::run_tick(&mut state, &[]);
+        assert_eq!(
+            state.players[&alice].effective_attribute("armor"),
+            Some(armor)
+        );
+        let slot = state.entities.slot_of(alice).unwrap();
+        state.entities.row_mut(slot).protected_until = 0;
+        state.merge_damage.push((
+            slot,
+            crate::tick::DamagePiece {
+                physical: None,
+                custom_armor: false,
+                amount: 10.0,
+                kind: crate::survival::DamageKind::Melee,
+                source: None,
+            },
+        ));
+        state.commit_merge_effects();
+        let player = state.players.get_mut(&alice).unwrap();
+        assert!((20.0 - player.vitals.health - expected_damage).abs() < 0.001);
+        player.vitals.food = 20;
+        player.vitals.saturation = 6.0;
+        let before = player.vitals.health;
+        for _ in 0..10 {
+            crate::tick::run_tick(&mut state, &[]);
+        }
+        assert!((state.players[&alice].vitals.health - before - 1.0).abs() < 0.001);
+    }
+}
+
+#[test]
 fn player_attack_attribute_drives_native_melee() {
     let (mut state, alice, _) = fixture();
     command(
