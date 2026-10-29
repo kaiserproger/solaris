@@ -622,8 +622,8 @@ terminal client status before Finish Configuration. Accept/download progress
 alone does not satisfy a required pack. Decline, invalid URL, download/reload
 failure or discard disconnect a required-pack client; optional failures allow
 joining. Unknown pack IDs and malformed statuses refuse the connection.
-Negotiation is bounded to 120 seconds and 32 packets (the enclosing login
-deadline may be shorter). Required-pack policy trusts the client's protocol
+Negotiation is bounded to 120 seconds and 32 packets, with individual read
+deadlines also applying. Required-pack policy trusts the client's protocol
 acknowledgement, not a proof of rendered assets. This is independent of Solaris
 Loader bundle negotiation; it works without a Loader installation.
 
@@ -646,8 +646,8 @@ policy is checked during Login and again before native Join. A connection owns
 its cleanup before Join submission, and its Leave waits for native input capacity
 rather than being dropped. Retired connections cannot recreate pre-registration stashes.
 
-Handshake, Login and Configuration share one absolute 30-second deadline,
-in addition to individual read and write deadlines. Play sends a fresh
+Handshake, Status and Login share one absolute 30-second deadline;
+Configuration has its own individual read and resource-pack deadlines. Play sends a fresh
 keepalive challenge every 15 seconds when none is outstanding, accepts only
 its matching echo, and closes after 30 seconds without that reply. Ordinary
 traffic and partial inbound frames do not renew that challenge.
@@ -668,10 +668,11 @@ Connection admission has two optional per-address limits under `[network]`:
 `connection_throttle_ms` (minimum gap between two accepted connections from one
 address) and `max_connections_per_ip` (concurrent cap). Both default to `0`
 (disabled) and a refused connection is closed before the handshake.
-Independently, at most eight pre-play connections per socket IP are accepted;
-excess sockets close before a handshake can identify a protocol state, with a
-reason in the server log. Play sessions do not occupy this pre-play allowance.
-Velocity proxy deployments see the proxy's socket IP at this boundary.
+Independently, at most eight pre-play connections per socket IP are accepted
+for direct clients; excess sockets close before a handshake can identify a
+protocol state, with a reason in the server log. Play sessions do not occupy
+this pre-play allowance. The allowance is disabled in Velocity forwarding mode:
+the proxy is responsible for controlling connections to its trusted backend.
 
 `/gamerule randomTickSpeed` is limited to 4096 to protect tick time; Minecraft
 26.3 itself permits larger integers. Existing saved values above 4096 are

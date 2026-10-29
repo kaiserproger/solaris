@@ -163,11 +163,9 @@ async fn cancellation_while_waiting_for_join_retires_native_player() {
     core.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_play_deadline_is_absolute_across_repeated_configuration_packets() {
-    use mc_protocol::packets::configuration::{
-        ClientboundKnownPacks, ServerboundClientInformation,
-    };
+#[tokio::test(flavor = "current_thread")]
+async fn configuration_can_continue_past_login_deadline() {
+    use mc_protocol::packets::configuration::ServerboundClientInformation;
     use mc_protocol::packets::{ChatVisibility, ClientInformation, MainHand, ParticleStatus};
     let dir = tempfile::tempdir().unwrap();
     let server = Arc::new(server(dir.path()));
@@ -180,11 +178,7 @@ async fn pre_play_deadline_is_absolute_across_repeated_configuration_packets() {
     });
     let mut client = Client::connect(address).await.unwrap();
     client.drive_login(address, "Deadline").await.unwrap();
-    loop {
-        if client.read_frame().await.unwrap().id == ClientboundKnownPacks::ID {
-            break;
-        }
-    }
+    client.read_frame().await.unwrap(); // Configuration has started.
     let packet = ServerboundClientInformation {
         information: ClientInformation {
             language: "en_us".into(),
@@ -198,29 +192,66 @@ async fn pre_play_deadline_is_absolute_across_repeated_configuration_packets() {
             particle_status: ParticleStatus::All,
         },
     };
-    let mut repeated = tokio::time::interval(Duration::from_secs(8));
-    let mut accepted = accepted;
-    let result = tokio::time::timeout(Duration::from_secs(55), async {
-        loop {
-            tokio::select! {
-                result = &mut accepted => break result.unwrap(),
-                _ = repeated.tick() => {
-                    if client.write_packet(&packet).await.is_err() {
-                        break accepted.await.unwrap();
-                    }
-                }
-            }
-        }
-    })
-    .await
-    .expect("absolute pre-play timeout must terminate repeated valid packets");
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("total pre-play deadline")
-    );
+    tokio::time::pause();
+    for _ in 0..4 {
+        client.write_packet(&packet).await.unwrap();
+        tokio::time::advance(Duration::from_secs(8)).await;
+    }
+    tokio::time::resume();
+    client
+        .drive_configuration()
+        .await
+        .expect("configuration must survive the login deadline");
+    accepted.abort();
+    let _ = accepted.await;
     core.shutdown();
+}
+
+#[tokio::test]
+async fn velocity_proxy_can_start_more_than_eight_logins() {
+    use mc_protocol::packets::Packet;
+    use mc_protocol::packets::handshake::{Handshake, NextState};
+    use mc_protocol::packets::login::{LoginPluginRequest, LoginStart};
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = server(dir.path());
+    server.velocity = Some(crate::proxy::VelocityForwarding::new("test-secret").unwrap());
+    let server = Arc::new(server);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut clients = Vec::new();
+    let mut tasks = Vec::new();
+    for index in 0..9 {
+        let mut client = Client::connect(address).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        tasks.push(tokio::spawn(handle_connection(socket, Arc::clone(&server))));
+        client
+            .write_packet(&Handshake {
+                protocol_version: mc_protocol::PROTOCOL_VERSION,
+                server_address: "localhost".into(),
+                server_port: address.port(),
+                next_state: NextState::Login,
+            })
+            .await
+            .unwrap();
+        client
+            .write_packet(&LoginStart {
+                name: format!("Proxy{index}"),
+                player_uuid: uuid::Uuid::nil(),
+            })
+            .await
+            .unwrap();
+        let frame = client
+            .read_frame()
+            .await
+            .expect("proxy login must reach forwarding request");
+        assert_eq!(frame.id, LoginPluginRequest::ID);
+        clients.push(client);
+    }
+    drop(clients);
+    for task in tasks {
+        let _ = task.await;
+    }
+    server.hub.shutdown();
 }
 
 #[tokio::test]
