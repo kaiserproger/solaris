@@ -466,6 +466,8 @@ pub(crate) fn run(
                 return match native(state, text, context, changes, !stores.is_empty())? {
                     CommandResult::Success(value) => Ok(Some((true, value))),
                     CommandResult::Failed => Ok(Some((false, 0))),
+                    CommandResult::Completed if stores.is_empty() => Ok(Some((true, 0))),
+                    CommandResult::Completed => Err("Command has no execute-store result".into()),
                     CommandResult::Unavailable if stores.is_empty() => Ok(None),
                     CommandResult::Unavailable => Err("Command has no execute-store result".into()),
                 };

@@ -536,7 +536,7 @@ fn execute_inner(
                     "Set spawn point for {count} player(s) to {}, {}, {}",
                     pos.x, pos.y, pos.z
                 ),
-                crate::command_execution::CommandResult::Unavailable,
+                crate::command_execution::CommandResult::Completed,
             ))
         }
         WorldCommand::SetWorldSpawn {
@@ -562,7 +562,7 @@ fn execute_inner(
             );
             Ok((
                 format!("Set world spawn to {}, {}, {}", pos.x, pos.y, pos.z),
-                crate::command_execution::CommandResult::Unavailable,
+                crate::command_execution::CommandResult::Completed,
             ))
         }
     }

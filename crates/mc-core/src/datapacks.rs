@@ -687,7 +687,7 @@ pub(crate) fn command(
         feedback(state, connection, error);
         Failed
     } else {
-        Unavailable
+        crate::command_execution::CommandResult::Completed
     };
     drain(state, changes);
     outcome

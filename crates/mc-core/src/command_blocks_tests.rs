@@ -80,11 +80,21 @@ fn conditional_chain_tracks_predecessor_success() {
     advance(&mut state);
     assert_eq!(state.day_time, 0);
     let mut fields = read(&state, first).unwrap();
+    put(
+        &mut fields,
+        "Command",
+        Tag::String("scoreboard objectives add test dummy".into()),
+    );
+    save(&mut state, first, fields);
+    schedule(&mut state, first);
+    advance(&mut state);
+    assert_eq!(state.day_time, 3);
+    let mut fields = read(&state, first).unwrap();
     put(&mut fields, "Command", Tag::String("time add 2".into()));
     save(&mut state, first, fields);
     schedule(&mut state, first);
     advance(&mut state);
-    assert_eq!(state.day_time, 5);
+    assert_eq!(state.day_time, 8);
 }
 
 #[test]

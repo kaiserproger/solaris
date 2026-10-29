@@ -14,6 +14,8 @@ use mc_nbt::{ListTag, Tag};
 pub(crate) enum CommandResult {
     Success(i32),
     Failed,
+    /// The command succeeded, but does not expose a numerical result.
+    Completed,
     Unavailable,
 }
 
@@ -860,6 +862,7 @@ pub(crate) fn execute(
             if matches!(command, crate::command_border::BorderCommand::Get) {
                 return Success((state.border.size + 0.5).floor() as i32);
             }
+            return CommandResult::Completed;
         }
         Command::Summon {
             entity,
@@ -1194,10 +1197,12 @@ pub(crate) fn execute(
             }
         }
         Command::TellRaw { target, message } => {
-            crate::command_text::execute_tellraw(state, connection, executor, target, message);
+            return crate::command_text::execute_tellraw(
+                state, connection, executor, target, message,
+            );
         }
         Command::Title { target, action } => {
-            crate::command_text::execute_title(state, connection, executor, target, action);
+            return crate::command_text::execute_title(state, connection, executor, target, action);
         }
         Command::Settlement(command) => {
             settlement(state, connection, executor, command);
