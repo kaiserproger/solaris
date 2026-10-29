@@ -94,6 +94,26 @@ impl VanillaServerProcess {
         java: &Path,
         timeout: Duration,
     ) -> Result<Self, VanillaLaunchError> {
+        Self::launch_with_world(jar, work_dir, java, timeout, false)
+    }
+
+    /// Launch a disposable world for the configuration-only registry capture.
+    pub(crate) fn launch_for_registry_capture(
+        jar: &Path,
+        work_dir: &Path,
+        java: &Path,
+        timeout: Duration,
+    ) -> Result<Self, VanillaLaunchError> {
+        Self::launch_with_world(jar, work_dir, java, timeout, true)
+    }
+
+    fn launch_with_world(
+        jar: &Path,
+        work_dir: &Path,
+        java: &Path,
+        timeout: Duration,
+        registry_capture: bool,
+    ) -> Result<Self, VanillaLaunchError> {
         if !jar.is_file() {
             return Err(VanillaLaunchError::JarMissing {
                 path: jar.to_path_buf(),
@@ -107,10 +127,16 @@ impl VanillaServerProcess {
         std::fs::write(work_dir.join("eula.txt"), "eula=true\n")
             .map_err(|error| work_dir_error(&error))?;
         let port = reserve_local_port().map_err(|error| work_dir_error(&error))?;
+        let capture_properties = if registry_capture {
+            // The debug preset skips the normal global spawn search.
+            "level-type=minecraft:debug_all_block_states\ngenerate-structures=false\n"
+        } else {
+            ""
+        };
         std::fs::write(
             work_dir.join("server.properties"),
             format!(
-                "online-mode=false\nwhite-list=false\nserver-ip=127.0.0.1\nserver-port={port}\nlevel-name=world\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\nallow-flight=true\n"
+                "online-mode=false\nwhite-list=false\nserver-ip=127.0.0.1\nserver-port={port}\nlevel-name=world\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\nallow-flight=true\n{capture_properties}"
             ),
         )
         .map_err(|error| work_dir_error(&error))?;

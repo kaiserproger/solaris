@@ -38,6 +38,9 @@ solaris-v2 content verify --cache /path/to/cache
 Either `--from` or `--gameplay-from` may be omitted; that bundle is then
 downloaded. The 26.1.2 bundle's `version.json` is kept as
 `gameplay_version.json` and checked at startup.
+Registry capture launches a disposable vanilla debug world, without structure
+generation, solely for the configuration handshake; it does not use or change
+the server's gameplay world.
 The cache also includes 26.3 English language data for console and RCON
 feedback. Reimport older caches that do not contain `assets/minecraft/lang/en_us.json`.
 

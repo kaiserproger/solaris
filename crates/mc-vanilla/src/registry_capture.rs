@@ -71,8 +71,7 @@ use std::time::Duration;
 use bytes::Buf;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
-    AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
-    ServerboundKnownPacks, UpdateTags,
+    ClientboundKnownPacks, FinishConfiguration, RegistryData, ServerboundKnownPacks, UpdateTags,
 };
 
 use super::process::{VanillaLaunchError, VanillaServerProcess};
@@ -314,10 +313,7 @@ pub async fn capture_registry_payloads(
             let mut body = frame.body;
             let _ = FinishConfiguration::decode(&mut body).map_err(handshake_refused(addr))?;
             require_drained(body, "Finish Configuration", addr)?;
-            client
-                .write_packet(&AcknowledgeFinishConfiguration)
-                .await
-                .map_err(handshake_refused(addr))?;
+            // All configuration data is captured; there is no need to enter play.
             return Ok(captured);
         }
         return Err(RegistryCaptureError::UnexpectedFrame {
@@ -374,7 +370,7 @@ impl TemporaryServer {
         std::thread::Builder::new()
             .name("vanilla-capture-launch".into())
             .spawn(move || {
-                let launched = VanillaServerProcess::launch_with_java(
+                let launched = VanillaServerProcess::launch_for_registry_capture(
                     &jar,
                     work.path(),
                     &java,
@@ -645,6 +641,35 @@ mod tests {
         ("minecraft:dimension_type", "minecraft:the_nether", 9),
         ("minecraft:damage_type", "minecraft:in_fire", 3),
     ];
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_capture_uses_a_minimal_world() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir()?;
+        let jar = fixture.path().join("server.jar");
+        fs::write(&jar, b"fixture")?;
+        let java = fixture.path().join("java");
+        fs::write(&java, "#!/bin/sh\necho 'Done'\nread command\n")?;
+        fs::set_permissions(&java, fs::Permissions::from_mode(0o755))?;
+        let work = tempfile::tempdir()?;
+        let properties = work.path().join("server.properties");
+        let server = TemporaryServer::launch(jar, java, work, Duration::from_secs(10)).await?;
+        let settings = fs::read_to_string(properties)?;
+        server.stop().await?;
+        assert!(
+            settings
+                .lines()
+                .any(|line| line == "level-type=minecraft:debug_all_block_states")
+        );
+        assert!(
+            settings
+                .lines()
+                .any(|line| line == "generate-structures=false")
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn writes_the_payload_set_a_configuration_server_sends() -> anyhow::Result<()> {
@@ -987,7 +1012,11 @@ mod tests {
         }
         send(&mut stream, &UpdateTags::default()).await?;
         send(&mut stream, &FinishConfiguration).await?;
-        let _: AcknowledgeFinishConfiguration = recv(&mut stream, &mut rbuf).await?;
+        let mut byte = [0; 1];
+        anyhow::ensure!(
+            stream.read(&mut byte).await? == 0,
+            "registry capture must disconnect without entering play"
+        );
         Ok(())
     }
 
