@@ -129,6 +129,96 @@ fn everyday_equipment_attributes_use_the_correct_slots_and_reset_after_removal()
 }
 
 #[test]
+fn direct_equipment_write_publishes_changed_attributes_next_tick() {
+    let (mut state, player, _) = flat_player_fixture();
+    run_tick(&mut state, &[]);
+    let chestplate = stack(&state, "diamond_chestplate", &[]);
+    state.players.get_mut(&player).unwrap().inventory.slots[38] = chestplate;
+    let (_, outbox, _) = run_tick(&mut state, &[]);
+    assert!(outbox.iter().flat_map(|(_, changes)| changes).any(
+        |change| matches!(change, crate::boundary::PlayerChange::Attributes { attributes }
+            if attributes.iter().any(|attribute| attribute.kind == "armor"
+                && !attribute.modifiers.is_empty())
+            && attributes.iter().any(|attribute| attribute.kind == "armor_toughness"
+                && !attribute.modifiers.is_empty()))
+    ));
+    let (_, outbox, _) = run_tick(&mut state, &[]);
+    assert!(!outbox.iter().flat_map(|(_, changes)| changes).any(|change|
+        matches!(change, crate::boundary::PlayerChange::Attributes { attributes }
+            if attributes.iter().any(|attribute| matches!(attribute.kind, "armor" | "armor_toughness")))));
+}
+
+#[test]
+fn inventory_equipment_changes_refresh_attributes_before_damage() {
+    for equip in [true, false] {
+        let (mut state, player, _) = flat_player_fixture();
+        let chestplate = stack(&state, "diamond_chestplate", &[]);
+        if !equip {
+            state.players.get_mut(&player).unwrap().inventory.slots[38] = chestplate.clone();
+            run_tick(&mut state, &[]);
+        }
+        state.outbox.clear();
+        state.players.get_mut(&player).unwrap().inventory.slots[38] =
+            if equip { chestplate } else { ItemStack::EMPTY };
+        let slot = state.entities.slot_of(player).unwrap();
+        state.entities.row_mut(slot).protected_until = 0;
+        state.merge_damage.push((
+            slot,
+            DamagePiece {
+                physical: None,
+                custom_armor: false,
+                amount: 10.0,
+                kind: DamageKind::Melee,
+                source: None,
+            },
+        ));
+        state.commit_merge_effects();
+        let taken = 20.0 - state.players[&player].vitals.health;
+        assert!(
+            if equip { taken < 10.0 } else { taken == 10.0 },
+            "equip={equip} taken={taken}"
+        );
+        assert!(state.outbox.values().flatten().any(
+            |change| matches!(change, crate::boundary::PlayerChange::Attributes { attributes }
+                if attributes.iter().any(|attribute| attribute.kind == "armor"
+                    && (!attribute.modifiers.is_empty()) == equip))
+        ));
+    }
+}
+
+#[test]
+fn attribute_refresh_before_damage_keeps_max_health_clamp() {
+    let (mut state, player, _) = flat_player_fixture();
+    state
+        .players
+        .get_mut(&player)
+        .unwrap()
+        .give_effect(crate::effects::ActiveEffect::new(
+            crate::effects::EffectId::HealthBoost,
+            200,
+            0,
+        ));
+    run_tick(&mut state, &[]);
+    let actor = state.players.get_mut(&player).unwrap();
+    actor.vitals.health = 24.0;
+    actor.clear_effects(Some(crate::effects::EffectId::HealthBoost));
+    let slot = state.entities.slot_of(player).unwrap();
+    state.entities.row_mut(slot).protected_until = 0;
+    state.merge_damage.push((
+        slot,
+        DamagePiece {
+            physical: None,
+            custom_armor: false,
+            amount: 1.0,
+            kind: DamageKind::Melee,
+            source: None,
+        },
+    ));
+    state.commit_merge_effects();
+    assert_eq!(state.players[&player].vitals.health, 19.0);
+}
+
+#[test]
 fn respiration_spends_air_probabilistically_without_recovering_skipped_ticks() {
     let (mut state, actor, pos) = flat_player_fixture();
     let head = stack(&state, "diamond_helmet", &[("respiration", 3)]);

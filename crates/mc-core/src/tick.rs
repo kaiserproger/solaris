@@ -1209,6 +1209,48 @@ pub(crate) fn run_dimension_tick<'a>(
     result
 }
 
+/// Publish current player attributes from the inventory/effect owners.
+pub(crate) fn refresh_player_attributes(state: &mut TickState, dirty_only: bool) {
+    let attribute_changes: Vec<_> = state
+        .players
+        .iter_mut()
+        .filter_map(|(&entity, player)| {
+            if dirty_only && player.attribute_equipment.is_some() {
+                return None;
+            }
+            let connection = state.connections.entity_connection(entity)?;
+            let change = player.equipment_attributes(
+                &state.registry.item_rules(),
+                &state
+                    .entities
+                    .row(state.entities.slot_of(entity)?)
+                    .loot
+                    .attributes,
+            )?;
+            let max_health = player.effective_attribute("max_health").unwrap_or(20.0) as f32;
+            let health = if player.vitals.health > max_health {
+                player.vitals.health = max_health;
+                Some((max_health, player.health_change()))
+            } else {
+                None
+            };
+            Some((entity, connection, change, health))
+        })
+        .collect();
+    for (entity, connection, change, health) in attribute_changes {
+        state.push_player(connection, change);
+        if let Some((health, health_change)) = health {
+            if let Some(slot) = state.entities.slot_of(entity) {
+                let row = state.entities.row_mut(slot);
+                row.health = health;
+                Arc::make_mut(&mut row.appearance).health = health;
+                state.appearance_changed.push(entity);
+            }
+            state.push_player(connection, health_change);
+        }
+    }
+}
+
 fn run_dimension_tick_inner<'a>(
     state: &mut TickState,
     inputs: impl IntoIterator<Item = &'a PlayerInput>,
@@ -1219,6 +1261,7 @@ fn run_dimension_tick_inner<'a>(
     TickTimes,
 ) {
     let input_start = std::time::Instant::now();
+    refresh_player_attributes(state, false);
     // False while `/tick freeze` holds the world: only players, input, chunk
     // loading and merge/commit run; see `tick_control`.
     let sim = state.tick_control.runs_normally();
@@ -1583,46 +1626,14 @@ fn run_dimension_tick_inner<'a>(
             state.appearance_changed.push(entity);
         }
     }
+    // Effects, commands, sprint changes and joins explicitly invalidate the
+    // cache during this tick; publish those without rescanning clean players.
+    refresh_player_attributes(state, true);
     changes.entity_events.append(&mut events);
     changes
         .entities_appearance_changed
         .append(&mut state.appearance_changed);
 
-    let attribute_changes: Vec<_> = state
-        .players
-        .iter_mut()
-        .filter_map(|(&entity, player)| {
-            let connection = state.connections.entity_connection(entity)?;
-            let change = player.equipment_attributes(
-                &state.registry.item_rules(),
-                &state
-                    .entities
-                    .row(state.entities.slot_of(entity)?)
-                    .loot
-                    .attributes,
-            )?;
-            let max_health = player.effective_attribute("max_health").unwrap_or(20.0) as f32;
-            let health = if player.vitals.health > max_health {
-                player.vitals.health = max_health;
-                Some((max_health, player.health_change()))
-            } else {
-                None
-            };
-            Some((entity, connection, change, health))
-        })
-        .collect();
-    for (entity, connection, change, health) in attribute_changes {
-        state.push_player(connection, change);
-        if let Some((health, health_change)) = health {
-            if let Some(slot) = state.entities.slot_of(entity) {
-                let row = state.entities.row_mut(slot);
-                row.health = health;
-                Arc::make_mut(&mut row.appearance).health = health;
-                changes.entities_appearance_changed.push(entity);
-            }
-            state.push_player(connection, health_change);
-        }
-    }
     crate::advancements::run(state, &mut changes);
     changes.entities_spawned.append(&mut state.plugin_spawned);
     let plugin_events = crate::plugin_player::tick(state);
