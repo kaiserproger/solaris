@@ -158,12 +158,54 @@ fn conditional(state: &TickState, pos: BlockPos) -> bool {
                 .any(|(name, value)| name == "conditional" && value == "true")
         })
 }
+fn condition_met(state: &TickState, pos: BlockPos) -> bool {
+    if !conditional(state, pos) {
+        return true;
+    }
+    let Some((x, y, z)) = direction(state, pos) else {
+        return false;
+    };
+    let Some(behind) = pos
+        .x
+        .checked_sub(x)
+        .zip(pos.y.checked_sub(y))
+        .zip(pos.z.checked_sub(z))
+        .map(|((x, y), z)| BlockPos { x, y, z })
+    else {
+        return false;
+    };
+    kind(state, behind).is_some() && read(state, behind).is_ok_and(|fields| {
+        matches!(
+            mc_data::item_nbt::field(&fields, "SuccessCount"), Some(Tag::Int(count)) if *count > 0
+        )
+    })
+}
+
 /// Runs immediately after redstone drained the durable queue, before the block commit.
 pub(crate) fn run(state: &mut TickState, changes: &mut ChangeSet) {
     let mut due = std::mem::take(&mut state.command_blocks_due);
     if state.enable_command_block {
         let mut remaining = 1024;
         for start in due.drain(..) {
+            if state.dimension_globals.active && !state.command_context.shared {
+                if state.command_context.jobs.len() < crate::command_context::LIMIT {
+                    let context = crate::command_context::Context::source(
+                        state,
+                        crate::command_console::CONNECTION,
+                        crate::command_console::EXECUTOR,
+                        2,
+                    );
+                    state
+                        .command_context
+                        .jobs
+                        .push(crate::command_context::Job {
+                            text: String::new(),
+                            context,
+                            block: Some(start),
+                        });
+                }
+                continue;
+            }
             if remaining == 0 {
                 schedule(state, start);
                 continue;
@@ -194,11 +236,16 @@ pub(crate) fn run(state: &mut TickState, changes: &mut ChangeSet) {
                 if repeating && enabled {
                     schedule(state, pos);
                 }
-                // Conditional result propagation is not implemented: never execute it as unconditional.
-                if conditional(state, pos) {
-                    break;
-                }
-                if (!chain && !repeating) || enabled {
+                if ((!chain && !repeating) || enabled)
+                    && conditional(state, pos)
+                    && !condition_met(state, pos)
+                {
+                    put(&mut fields, "SuccessCount", Tag::Int(0));
+                    save(state, pos, fields);
+                    if !chain {
+                        break;
+                    }
+                } else if (!chain && !repeating) || enabled {
                     if matches!(mc_data::item_nbt::field(&fields,"LastExecution"),Some(Tag::Long(tick)) if *tick == state.tick as i64)
                     {
                         break;
@@ -208,6 +255,7 @@ pub(crate) fn run(state: &mut TickState, changes: &mut ChangeSet) {
                         _ => None,
                     };
                     put(&mut fields, "LastExecution", Tag::Long(state.tick as i64));
+                    put(&mut fields, "SuccessCount", Tag::Int(0));
                     save(state, pos, fields);
                     if let Some(command) = command {
                         let previous = state.datapacks.origin.replace([
@@ -215,7 +263,22 @@ pub(crate) fn run(state: &mut TickState, changes: &mut ChangeSet) {
                             pos.y as f64 + 0.5,
                             pos.z as f64 + 0.5,
                         ]);
-                        crate::datapacks::execute_block(state, &command, changes);
+                        let context = crate::command_context::Context::source(
+                            state,
+                            crate::command_console::CONNECTION,
+                            crate::command_console::EXECUTOR,
+                            2,
+                        );
+                        let successes = crate::command_context::run(
+                            state,
+                            command.trim_start_matches('/'),
+                            context,
+                            changes,
+                        );
+                        if let Ok(mut fields) = read(state, pos) {
+                            put(&mut fields, "SuccessCount", Tag::Int(successes));
+                            save(state, pos, fields);
+                        }
                         state.datapacks.origin = previous;
                     }
                 }
@@ -283,9 +346,6 @@ pub(crate) fn data(
             return Err("Data editing currently supports command blocks only".into());
         }
         let mut fields = read(state, pos)?;
-        if conditional(state, pos) {
-            return Err("Conditional command blocks are not supported".into());
-        }
         let raw = &text[text.find('{').ok_or("Expected NBT compound")?..];
         let Tag::Compound(patch) = crate::command_snbt::parse(raw).map_err(str::to_owned)? else {
             return Err("Expected NBT compound".into());

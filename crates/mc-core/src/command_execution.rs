@@ -366,9 +366,14 @@ pub(crate) fn execute(
             let Some(targets) = command_players(state, connection, executor, target) else {
                 return Failed;
             };
-            game_mode(
+            let changed = game_mode(
                 state, connection, executor, &targets, *mode, command, changes,
             );
+            return if changed == 0 {
+                Failed
+            } else {
+                Success(changed)
+            };
         }
         Command::Give {
             target,
@@ -731,6 +736,7 @@ pub(crate) fn execute(
                 "commands.time.set.absolute",
                 vec![text("minecraft:overworld"), text(state.day_time)],
             );
+            return Success(1);
         }
         Command::TimeMarker { name, ticks } => {
             let delta = *ticks - state.day_time.rem_euclid(24000);
@@ -744,6 +750,7 @@ pub(crate) fn execute(
                 "commands.time.set.time_marker",
                 vec![text("minecraft:overworld"), text(name)],
             );
+            return Success(1);
         }
         Command::TimeQuery(query) => {
             let value = query.value(state.tick_control.game_ticks(state.tick), state.day_time);
@@ -771,6 +778,7 @@ pub(crate) fn execute(
                 },
                 Vec::new(),
             );
+            return Success(1);
         }
         Command::Difficulty(difficulty) => {
             if state.difficulty == *difficulty {
@@ -803,6 +811,7 @@ pub(crate) fn execute(
                 "commands.difficulty.success",
                 vec![difficulty_name(*difficulty)],
             );
+            return Success(1);
         }
         Command::DifficultyQuery => feedback(
             state,
@@ -997,6 +1006,7 @@ pub(crate) fn execute(
                 error(state, connection, failure.message());
                 return Failed;
             }
+            return Success(1);
         }
         Command::World(command) => {
             return crate::command_world::execute(state, connection, executor, command, changes);
@@ -1021,8 +1031,10 @@ pub(crate) fn execute(
                         content: Tag::Compound(fields),
                     },
                 );
+                return Failed;
             } else {
                 feedback(state, connection, reply.key, args);
+                return Success(1);
             }
         }
         Command::Scoreboard(command) => {
@@ -1072,6 +1084,7 @@ pub(crate) fn execute(
                     .broadcasts
                     .push(crate::dimensions::globals::Broadcast::Chat(content));
             }
+            return Success(1);
         }
         Command::TeamMessage { message, selectors } => {
             let sender = state.connections.name_of(executor).unwrap_or("").to_owned();
@@ -1306,11 +1319,13 @@ fn game_mode(
     mode: crate::commands::GameMode,
     command: &Command,
     changes: &mut ChangeSet,
-) {
+) -> i32 {
+    let mut changed = 0;
     for &target in targets {
         if state.players[&target].game_mode == mode {
             continue;
         }
+        changed += 1;
         apply_player_command(state, target, command, changes);
         if target == executor {
             feedback(
@@ -1341,6 +1356,7 @@ fn game_mode(
             );
         }
     }
+    changed
 }
 
 fn give(

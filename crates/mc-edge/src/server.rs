@@ -434,7 +434,7 @@ impl EdgeServer {
         let legacy = crate::legacy::Profile::discover(&data);
         Ok(Self {
             admin,
-            console_state: Default::default(),
+            console_state: crate::console::ConsoleState::load(data.root())?,
             stop,
             suggestion_items,
             suggestion_blocks,

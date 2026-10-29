@@ -40,6 +40,7 @@ const WORKING_CACHE_ANCESTORS: usize = 4;
 /// `RegistryData` payloads — is rejected by name instead of being used.
 pub const REQUIRED_FILES: &[&str] = &[
     "version.json",
+    "assets/minecraft/lang/en_us.json",
     crate::content_import::GAMEPLAY_VERSION_FILE,
     "data/minecraft/tags",
     "data/minecraft/worldgen/structure_set",

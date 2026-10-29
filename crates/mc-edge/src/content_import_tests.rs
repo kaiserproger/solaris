@@ -24,6 +24,26 @@ fn write_bundle(path: &Path, version: &str) {
     .unwrap();
     archive.finish().unwrap();
 }
+#[test]
+fn imports_english_language_from_target_jar() {
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("target.jar");
+    let mut archive = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+    archive
+        .start_file(
+            "assets/minecraft/lang/en_us.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    write!(archive, "{{\"commands.time.set\":\"Set the time to %s\"}}").unwrap();
+    archive.finish().unwrap();
+    super::copy_language(&jar, dir.path()).unwrap();
+    let data: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("assets/minecraft/lang/en_us.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(data["commands.time.set"], "Set the time to %s");
+}
 
 #[test]
 fn manifest_selection_uses_the_pinned_version_not_latest() {

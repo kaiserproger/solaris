@@ -38,6 +38,8 @@ solaris-v2 content verify --cache /path/to/cache
 Either `--from` or `--gameplay-from` may be omitted; that bundle is then
 downloaded. The 26.1.2 bundle's `version.json` is kept as
 `gameplay_version.json` and checked at startup.
+The cache also includes 26.3 English language data for console and RCON
+feedback. Reimport older caches that do not contain `assets/minecraft/lang/en_us.json`.
 
 Import stages, validates and publishes the cache; a failed derivation preserves
 the previous cache. Verify is offline and checks the same content used by
@@ -461,6 +463,8 @@ Stdin lines, with or without a leading `/`, use the native command parser and
 admin path at operator level four. Feedback goes to stdout; tracing goes to
 stderr, filtered by `RUST_LOG`. There is no separate TUI or automatic
 `logs/profile.json` diagnostic capture.
+Translatable feedback is rendered in English for stdout and RCON; player
+clients continue receiving the original components.
 
 The console source has no player entity/inventory. Relative world coordinates
 and nearest selectors originate at world spawn; executor-dependent commands
@@ -788,9 +792,9 @@ At most 65536 due schedules are processed per tick. Pack compilation is limited
 to 16 MiB of text, 16384 resource/directory entries and 32 nesting levels.
 No filesystem reads or whole-world scans are added to the tick path.
 
-With `[server] enable_command_block = true`, unconditional impulse, chain and
-repeating command blocks execute through the native command owner. Ordinary
-placement requires creative mode and operator permission. Configure a placed
+With `[server] enable_command_block = true`, impulse, chain and repeating
+command blocks execute through the native command owner.
+Ordinary placement requires creative mode and operator permission. Configure a placed
 block using, for example:
 
 ```text
@@ -813,10 +817,12 @@ Impulse blocks respond to
 redstone rising edges; repeating blocks use the durable scheduled-block queue;
 chains follow facing, with a bounded traversal and once-per-tick execution.
 Relative coordinates resolve at the command block, not world spawn.
-NBT updates and scheduled work use the native store and tick WAL. Client editor
-packets, conditional execution/success counts, comparator result output and
-command minecarts are not implemented. Conditional blocks are not executed as
-unconditional blocks. Other map-making commands such as `/clone` and `/place`
+NBT updates and scheduled work use the native store and tick WAL. Conditional
+blocks check the last success count of the command block behind their facing.
+Commands whose native owner does not report an outcome are treated as
+unsuccessful for this check, even if they performed their action.
+Client editor packets, comparator result output and command minecarts are not
+implemented. Other map-making commands such as `/clone` and `/place`
 remain unsupported.
 
 Mechanics reference: [world simulation and scheduled work](https://github.com/kaiserproger/minecraft-how-it-works/blob/main/server-how-it-works-book/05-world-simulation.md).

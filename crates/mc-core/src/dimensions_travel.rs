@@ -166,6 +166,54 @@ pub(crate) fn execute_context(
     state.other_dimensions.insert(context.dimension, original);
     result
 }
+fn execute_block_chain(
+    state: &mut TickState,
+    dimension: Dimension,
+    pos: crate::boundary::BlockPos,
+    changes: &mut ChangeSet,
+) {
+    if dimension == state.dimension {
+        state.command_blocks_due.push(pos);
+        crate::command_blocks::run(state, changes);
+        return;
+    }
+    sync_wire_ids(state);
+    let source = state.dimension;
+    let Some(mut destination) = state.other_dimensions.remove(&dimension) else {
+        return;
+    };
+    std::mem::swap(&mut state.command_context, &mut destination.command_context);
+    std::mem::swap(&mut state.datapacks, &mut destination.datapacks);
+    super::runtime::swap_globals(state, &mut destination);
+    std::mem::swap(
+        &mut state.other_dimensions,
+        &mut destination.other_dimensions,
+    );
+    std::mem::swap(state, &mut destination);
+    state.other_dimensions.insert(source, destination);
+    let mut local = state
+        .command_context
+        .changes
+        .remove(&dimension)
+        .unwrap_or_default();
+    state.command_blocks_due.push(pos);
+    crate::command_blocks::run(state, &mut local);
+    sync_wire_ids(state);
+    append_changes(
+        state.command_context.changes.entry(dimension).or_default(),
+        local,
+    );
+    let mut original = state
+        .other_dimensions
+        .remove(&source)
+        .expect("source retained by execution authority");
+    std::mem::swap(state, &mut original);
+    std::mem::swap(&mut state.other_dimensions, &mut original.other_dimensions);
+    std::mem::swap(&mut state.command_context, &mut original.command_context);
+    std::mem::swap(&mut state.datapacks, &mut original.datapacks);
+    super::runtime::swap_globals(state, &mut original);
+    state.other_dimensions.insert(dimension, original);
+}
 
 fn append_changes(target: &mut ChangeSet, mut source: ChangeSet) {
     target.blocks.append(&mut source.blocks);
@@ -676,7 +724,11 @@ pub(crate) fn finish(
         let dimension = state.dimension;
         let mut local = changes.remove(&dimension).unwrap_or_default();
         state.command_context.changes = changes;
-        crate::command_context::run(state, &job.text, job.context, &mut local);
+        if let Some(pos) = job.block {
+            execute_block_chain(state, job.context.dimension, pos, &mut local);
+        } else {
+            crate::command_context::run(state, &job.text, job.context, &mut local);
+        }
         changes = std::mem::take(&mut state.command_context.changes);
         append_changes(changes.entry(dimension).or_default(), local);
     }
