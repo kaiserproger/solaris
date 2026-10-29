@@ -102,14 +102,14 @@ impl GpuSolidService {
     }
 
     /// Solids of `pos` and its eight neighbours, or `None` when this chunk
-    /// should evaluate density on the CPU: the GPU failed, or the chunk's own
-    /// solids would wait behind two capped batches (then nothing is queued, so
-    /// the queue stays within a few batches).
+    /// should evaluate density on the CPU: the GPU failed, or a missing solid
+    /// would wait behind two capped batches (then nothing is queued, so the
+    /// queue stays within a few batches).
     pub(crate) fn solids_around(&self, pos: ChunkPos) -> Option<SolidGrid> {
         let keys = ring(pos);
-        let center = (pos.x, pos.z);
         let mut state = self.shared.lock();
-        if !state.solids.contains(&center) && state.queued.len() >= state.cap * 2 {
+        let cached = keys.iter().all(|key| state.solids.contains(key));
+        if !cached && state.queued.len() >= state.cap * 2 {
             return None;
         }
         loop {
