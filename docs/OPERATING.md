@@ -212,6 +212,13 @@ resumes continuous ticking, including while only a single player is present;
 the counter counts players in every dimension. Set it to 0 to keep simulating
 an empty server.
 
+The native singleplayer client uses `solaris_pause on` and `solaris_pause off`
+to stop and resume whole world ticks while its pause menu is open. These
+requests require an online level-four operator and exactly one online player;
+a join or the operator's disconnect resumes the world. Network keepalives,
+checkpoints and shutdown remain serviced while paused. This is distinct from
+`/tick freeze`: world tick numbers and tick-based deadlines do not advance.
+
 `input_log = true` writes, per executed tick, the inputs that tick consumed to
 `<world_dir>/input-log/<start_tick>-<unix_ms>.jsonl` (one file per start): player
 inputs after the drain, synthetic leaves, debug spawns and remote chunk
