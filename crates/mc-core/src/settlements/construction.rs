@@ -67,36 +67,62 @@ fn preempt(state: &mut TickState, id: SettlementId) -> Result<(), String> {
     Ok(())
 }
 
-/// Pick the wood actually available in storage, so the placed blocks and the
-/// crafting bill have the same species rather than turning one wood into another.
-fn wood_species<'a>(state: &'a TickState, images: &[super::inventory::Image]) -> &'a str {
-    images
+/// Choose the most available wood species that can fund the complete bill.
+/// Oak is always considered, including when its materials are already crafted.
+fn funded_species<'a>(
+    state: &'a TickState,
+    materials: &[(u32, u32)],
+    images: &[super::inventory::Image],
+) -> Option<&'a str> {
+    let mut candidates = vec![("oak", 0_i64)];
+    for stack in images
         .iter()
         .flat_map(|image| &image.slots)
-        .filter(|stack| !stack.is_empty())
-        .filter_map(|stack| {
-            let name = state.registry.items.name_of(stack.item_id)?;
-            let path = name.path();
-            let (species, weight) = if let Some(species) = path.strip_suffix("_log") {
-                (species, 4)
-            } else {
-                (path.strip_suffix("_planks")?, 1)
-            };
-            if name.as_str().starts_with("minecraft:")
-                && !species.starts_with("stripped_")
-                && state
-                    .registry
-                    .items
-                    .id_of(&mc_data::Identifier::parse(format!("minecraft:{species}_log")).ok()?)
-                    .is_some()
-            {
-                Some((stack.count * weight, species))
-            } else {
-                None
-            }
-        })
-        .max_by_key(|(amount, _)| *amount)
-        .map_or("oak", |(_, species)| species)
+        .filter(|s| !s.is_empty())
+    {
+        let Some(name) = state.registry.items.name_of(stack.item_id) else {
+            continue;
+        };
+        if !name.as_str().starts_with("minecraft:") {
+            continue;
+        }
+        let path = name.path();
+        let Some((species, weight)) = [
+            ("_pressure_plate", 1),
+            ("_fence_gate", 1),
+            ("_trapdoor", 1),
+            ("_planks", 1),
+            ("_stairs", 1),
+            ("_slab", 1),
+            ("_fence", 1),
+            ("_door", 1),
+            ("_log", 4),
+        ]
+        .into_iter()
+        .find_map(|(suffix, weight)| path.strip_suffix(suffix).map(|s| (s, weight))) else {
+            continue;
+        };
+        if species.starts_with("stripped_")
+            || state
+                .registry
+                .items
+                .id_of(&mc_data::Identifier::parse(format!("minecraft:{species}_log")).ok()?)
+                .is_none()
+        {
+            continue;
+        }
+        let amount = i64::from(stack.count) * weight;
+        if let Some((_, total)) = candidates.iter_mut().find(|(known, _)| *known == species) {
+            *total += amount;
+        } else {
+            candidates.push((species, amount));
+        }
+    }
+    candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    candidates.into_iter().find_map(|(species, _)| {
+        let bill = species_bill(state, materials, species)?;
+        super::construction_crafting::can_fund(state, &bill, images).then_some(species)
+    })
 }
 
 fn species_item(state: &TickState, item: u32, species: &str) -> Option<u32> {
@@ -152,22 +178,15 @@ pub(crate) fn first_storage_funded_by_delivery(
     // This is a read-only funding probe; only the regular inventory authority
     // can transfer the actual carry to the real container.
     chest.slots.extend(carry.iter().flatten().cloned());
-    let Some(materials) = species_bill(state, &level.materials, wood_species(state, &images))
-    else {
-        return false;
-    };
-    super::construction_crafting::can_fund(state, &materials, &images)
+    funded_species(state, &level.materials, &images).is_some()
 }
 
 fn funding_error(state: &TickState, id: SettlementId, materials: &[(u32, u32)]) -> Option<String> {
     let images = executor::source_images(state, id);
-    let Some(materials) = species_bill(state, materials, wood_species(state, &images)) else {
-        return Some("wood species is unavailable for this blueprint".into());
-    };
-    if super::construction_crafting::can_fund(state, &materials, &images) {
+    if funded_species(state, materials, &images).is_some() {
         return None;
     }
-    for &(item, count) in &materials {
+    for &(item, count) in materials {
         if !super::construction_crafting::can_fund(state, &[(item, count)], &images) {
             return Some(match state.registry.items.name_of(item) {
                 Some(name) => format!("not enough: {name} x{count}"),
@@ -245,6 +264,14 @@ pub(crate) fn request_upgrade(
     ) {
         return Err(error);
     }
+    let images = executor::source_images(state, id);
+    let species = funded_species(
+        state,
+        &blueprint.level(level).expect("upgrade level").materials,
+        &images,
+    )
+    .ok_or("Construction materials changed during admission.")?
+    .to_owned();
     let project = Project {
         settlement: id,
         blueprint: blueprint.id.clone(),
@@ -258,7 +285,7 @@ pub(crate) fn request_upgrade(
     if preempting {
         preempt(state, id)?;
     }
-    if !begin(state, project) {
+    if !begin(state, project, &species) {
         return Err("Construction admission failed.".into());
     }
     Ok(())
@@ -506,13 +533,12 @@ pub(super) fn site_free(
 fn planned_cells(
     state: &TickState,
     project: &Project,
+    species: &str,
 ) -> Option<(ScriptWorldBounds, Vec<executor::PlannedCell>)> {
     let blueprint = blueprints::get(&state.registry, &project.blueprint)?;
     let level = blueprint.level(project.level)?;
     let rotated = level.rotated(Rotation::from_quarter_turns(project.rotation));
     let mut quota = level.materials.clone();
-    let images = executor::source_images(state, project.settlement);
-    let species = wood_species(state, &images);
     let mut cells: Vec<_> = rotated
         .removals
         .iter()
@@ -576,31 +602,13 @@ fn planned_cells(
         }
     }
     for (offset, block) in &rotated.blocks {
-        let original = state.registry.blocks.by_id(*block)?;
-        let placed = if species != "oak"
-            && original.block.id.as_str().starts_with("minecraft:")
-            && let Some(suffix) = original.block.id.path().strip_prefix("oak_")
-        {
-            let name = mc_data::Identifier::parse(format!("minecraft:{species}_{suffix}")).ok()?;
-            state
-                .registry
-                .blocks
-                .by_name_and_props(&name, &original.properties)?
-        } else {
-            *block
-        };
+        let placed = *block;
         let (resource, quantity) =
             if let Some((item, quantity)) = blueprints::material_for(&state.registry, *block) {
                 let (_, remaining) = quota.iter_mut().find(|(id, _)| *id == item)?;
                 *remaining = remaining.checked_sub(quantity)?;
                 (
-                    Some(
-                        state
-                            .registry
-                            .items
-                            .name_of(species_item(state, item, species)?)?
-                            .to_string(),
-                    ),
+                    Some(state.registry.items.name_of(item)?.to_string()),
                     quantity,
                 )
             } else {
@@ -618,6 +626,7 @@ fn planned_cells(
     if quota.iter().any(|(_, count)| *count != 0) {
         return None;
     }
+    apply_species(state, &mut cells, species)?;
     // Include the whole placement extent (roof crowns/yards) in executor
     // interference fencing; certification uses the narrower authored bounds.
     let bounds = ScriptWorldBounds::new(
@@ -626,6 +635,44 @@ fn planned_cells(
     )
     .ok()?;
     Some((bounds, cells))
+}
+
+/// Rewrite the already-funded authored cells, not the stored project later.
+fn apply_species(
+    state: &TickState,
+    cells: &mut [executor::PlannedCell],
+    species: &str,
+) -> Option<()> {
+    if species == "oak" {
+        return Some(());
+    }
+    for cell in cells {
+        let original = state
+            .registry
+            .blocks
+            .by_id(mc_world::BlockStateId(cell.state))?;
+        if original.block.id.as_str().starts_with("minecraft:")
+            && let Some(suffix) = original.block.id.path().strip_prefix("oak_")
+        {
+            let name = mc_data::Identifier::parse(format!("minecraft:{species}_{suffix}")).ok()?;
+            cell.state = state
+                .registry
+                .blocks
+                .by_name_and_props(&name, &original.properties)?
+                .0;
+        }
+        if let Some(resource) = &mut cell.resource {
+            let item = state
+                .registry
+                .items
+                .id_of(&mc_data::Identifier::parse(resource.as_str()).ok()?)?;
+            let mapped = species_item(state, item, species)?;
+            if mapped != item {
+                *resource = state.registry.items.name_of(mapped)?.to_string();
+            }
+        }
+    }
+    Some(())
 }
 
 fn cell_bill(state: &TickState, cells: &[executor::PlannedCell]) -> Option<Vec<(u32, u32)>> {
@@ -642,8 +689,8 @@ fn cell_bill(state: &TickState, cells: &[executor::PlannedCell]) -> Option<Vec<(
     Some(bill.into_iter().collect())
 }
 
-fn begin(state: &mut TickState, project: Project) -> bool {
-    let Some((bounds, cells)) = planned_cells(state, &project) else {
+fn begin(state: &mut TickState, project: Project, species: &str) -> bool {
+    let Some((bounds, cells)) = planned_cells(state, &project, species) else {
         return false;
     };
     begin_cells(state, project, bounds, cells)
@@ -703,29 +750,26 @@ pub(crate) fn upgrade_available(state: &TickState, id: SettlementId, building: B
         .is_some_and(|building| upgrade_blueprint(state, id, building).is_some())
 }
 
-fn upgrade_project(state: &TickState, record: &SettlementRecord) -> Option<Project> {
+fn upgrade_project(state: &TickState, record: &SettlementRecord) -> Option<(Project, String)> {
     record.buildings.values().find_map(|building| {
         let blueprint = upgrade_blueprint(state, record.id, building)?;
         let level = building.level + 1;
         let images = executor::source_images(state, record.id);
-        let materials = species_bill(
-            state,
-            &blueprint.level(level)?.materials,
-            wood_species(state, &images),
-        )?;
-        if !executor::can_fund(state, record.id, &materials) {
-            return None;
-        }
-        Some(Project {
-            settlement: record.id,
-            blueprint: blueprint.id.clone(),
-            level,
-            origin: building.bounds.min,
-            rotation: 0,
-            building: Some(building.id),
-            structure: String::new(),
-            ordered: false,
-        })
+        let species =
+            funded_species(state, &blueprint.level(level)?.materials, &images)?.to_owned();
+        Some((
+            Project {
+                settlement: record.id,
+                blueprint: blueprint.id.clone(),
+                level,
+                origin: building.bounds.min,
+                rotation: 0,
+                building: Some(building.id),
+                structure: String::new(),
+                ordered: false,
+            },
+            species,
+        ))
     })
 }
 
@@ -828,9 +872,10 @@ fn site_project(
                 structure: String::new(),
                 ordered: false,
             };
-            if let Some((bounds, cells)) = planned_cells(state, &project)
+            if let Some((bounds, mut cells)) = planned_cells(state, &project, "oak")
                 && let Some(bill) = cell_bill(state, &cells)
-                && super::construction_crafting::can_fund(state, &bill, images)
+                && let Some(species) = funded_species(state, &bill, images)
+                && apply_species(state, &mut cells, species).is_some()
             {
                 return (
                     Some(FundedSite {
@@ -864,12 +909,11 @@ fn plan(state: &mut TickState, id: SettlementId) {
     let blueprint = needed_kinds(record, residents).find_map(|kind| {
         let blueprint = catalog.iter().find(|blueprint| blueprint.kind == kind)?;
         let level = blueprint.level(1)?;
-        let materials = species_bill(state, &level.materials, wood_species(state, &images))?;
-        super::construction_crafting::can_fund(state, &materials, &images).then_some(blueprint)
+        funded_species(state, &level.materials, &images).map(|_| blueprint)
     });
     let Some(blueprint) = blueprint else {
-        if let Some(project) = upgrade_project(state, record) {
-            begin(state, project);
+        if let Some((project, species)) = upgrade_project(state, record) {
+            begin(state, project, &species);
         }
         return;
     };
@@ -1195,15 +1239,12 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
         let Some(level) = blueprint.level(1) else {
             continue;
         };
-        let Some(materials) = species_bill(state, &level.materials, wood_species(state, &images))
-        else {
-            continue;
-        };
-        if super::construction_crafting::can_fund(state, &materials, &images) {
+        if funded_species(state, &level.materials, &images).is_some() {
             continue;
         }
         let mut needs = Vec::new();
-        for (item, count) in super::construction_crafting::missing_base(state, &materials, &images)
+        for (item, count) in
+            super::construction_crafting::missing_base(state, &level.materials, &images)
         {
             if let Some(leaf) = availability::missing_source(state, id, item, &images) {
                 if let Some(name) = state.registry.items.name_of(leaf) {

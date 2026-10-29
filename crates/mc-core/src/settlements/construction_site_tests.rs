@@ -380,7 +380,7 @@ fn flat_site_keeps_bill_origin_and_same_site_upgrade() {
     let snapshot = executor::status(&state, id, &project.structure).unwrap();
     assert_eq!(snapshot.origin, project.origin);
     assert_eq!(
-        cell_bill(&state, &planned_cells(&state, &project).unwrap().1)
+        cell_bill(&state, &planned_cells(&state, &project, "oak").unwrap().1)
             .unwrap()
             .into_iter()
             .collect::<std::collections::BTreeMap<_, _>>(),

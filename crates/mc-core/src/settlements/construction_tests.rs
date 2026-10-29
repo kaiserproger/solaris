@@ -64,7 +64,8 @@ pub(crate) fn start(
             building,
             structure: String::new(),
             ordered: true,
-        }
+        },
+        "oak",
     ));
 }
 
@@ -187,6 +188,60 @@ fn storage_uses_available_acacia_logs_for_real_acacia_blocks() {
             .path(),
         "acacia_log"
     );
+}
+
+#[test]
+fn funded_oak_storage_survives_larger_acacia_stack_and_stock_changes() {
+    for ordered in [false, true] {
+        let (mut state, id, slot) = fixture();
+        fund(&mut state, "storage", 1);
+        let acacia_planks = state
+            .registry
+            .items
+            .id_of(&mc_data::Identifier::parse("minecraft:acacia_planks").unwrap())
+            .unwrap();
+        let acacia_log = state
+            .registry
+            .items
+            .id_of(&mc_data::Identifier::parse("minecraft:acacia_log").unwrap())
+            .unwrap();
+        state.block_entities.get_mut(&(1, 201, 1)).unwrap().slots[26] =
+            ItemStack::new(acacia_planks, 64);
+        state.block_entities.get_mut(&(1, 201, 1)).unwrap().slots[25] =
+            ItemStack::new(acacia_planks, 64);
+        if ordered {
+            request_build(&mut state, id, "storage").expect("oak bill funds owner order");
+        } else {
+            plan(&mut state, id);
+        }
+        let project = state
+            .settlements
+            .get(id)
+            .unwrap()
+            .project
+            .as_ref()
+            .expect("oak bill funds storage despite acacia stock");
+        assert_eq!(project.blueprint, "storage");
+        let origin = project.origin;
+        state.block_entities.get_mut(&(1, 201, 1)).unwrap().slots[25] =
+            ItemStack::new(acacia_log, 64);
+        complete(&mut state, id, slot);
+        let placed = state
+            .world
+            .block_at(origin[0], origin[1] + 1, origin[2])
+            .unwrap();
+        assert_eq!(
+            state
+                .registry
+                .blocks
+                .by_id(mc_world::BlockStateId(placed))
+                .unwrap()
+                .block
+                .id
+                .path(),
+            "oak_log"
+        );
+    }
 }
 
 #[test]
@@ -504,7 +559,7 @@ fn builder_stalls_without_stock_then_consumes_exact_materials_in_order_and_certi
     let (mut state, id, slot) = fixture();
     start(&mut state, id, "house", 1, None);
     let project = state.settlements.get(id).unwrap().project.clone().unwrap();
-    let (_, planned) = planned_cells(&state, &project).unwrap();
+    let (_, planned) = planned_cells(&state, &project, "oak").unwrap();
     let before = executor::status(&state, id, &project.structure).unwrap();
     for _ in 0..4 {
         attempt(&mut state, id, slot);
@@ -583,7 +638,7 @@ fn upgrade_uses_diff_and_certifies_level_two() {
     let old_writes = state.plugin_block_writes.len();
     start(&mut state, id, "house", 2, Some(building));
     let project = state.settlements.get(id).unwrap().project.clone().unwrap();
-    let (_, planned) = planned_cells(&state, &project).unwrap();
+    let (_, planned) = planned_cells(&state, &project, "oak").unwrap();
     fund(&mut state, "house", 2);
     complete(&mut state, id, slot);
     assert_eq!(

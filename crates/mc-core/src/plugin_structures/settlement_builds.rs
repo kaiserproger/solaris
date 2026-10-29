@@ -365,14 +365,6 @@ pub(crate) fn missing(
     missing_stock(state, id, &required)
 }
 
-pub(crate) fn can_fund(state: &TickState, id: SettlementId, requirements: &[(u32, u32)]) -> bool {
-    crate::settlements::construction_crafting::can_fund(
-        state,
-        requirements,
-        &source_images(state, id),
-    )
-}
-
 pub(super) fn remaining(record: &Structure) -> Vec<ScriptStructureMaterial> {
     let mut counts = BTreeMap::new();
     let current = record.snapshot.current_stage_index as usize;

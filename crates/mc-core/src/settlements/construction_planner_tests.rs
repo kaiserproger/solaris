@@ -484,7 +484,11 @@ fn unfunded_house_skips_to_funded_farm_without_debiting_stock() {
         .materials
         .clone();
     assert!(
-        !executor::can_fund(&state, id, &house_materials),
+        !super::super::construction_crafting::can_fund(
+            &state,
+            &house_materials,
+            &executor::source_images(&state, id)
+        ),
         "house must be unfundable without wool"
     );
     let before = state.block_entities[&(1, 201, 1)].slots.clone();
@@ -533,7 +537,11 @@ fn funded_house_retains_priority_over_later_needs() {
         .materials
         .clone();
     assert!(
-        executor::can_fund(&state, id, &house_materials),
+        super::super::construction_crafting::can_fund(
+            &state,
+            &house_materials,
+            &executor::source_images(&state, id)
+        ),
         "exact house stock funds the house"
     );
     let before = state.block_entities[&(1, 201, 1)].slots.clone();

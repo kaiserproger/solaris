@@ -2090,6 +2090,7 @@ fn missing_pois_are_not_searched_every_twenty_ticks() {
 #[test]
 fn acquisition_due_queue_retries_budget_denials_without_cooldown_or_slot_starvation() {
     let mut state = test_state();
+    state.day_time = 2000;
     for _ in 0..70 {
         let slot = villager(&mut state, [8.5, 201.0, 8.5]);
         state
