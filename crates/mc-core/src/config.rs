@@ -61,7 +61,8 @@ pub struct CoreConfig {
     pub input_log: bool,
     /// Evaluate Overworld chunk density on the GPU in shared batches when the
     /// build has GPU worldgen and an adapter is present; otherwise, and after
-    /// any GPU failure, the CPU does it. Generated terrain is the same.
+    /// any GPU failure, the CPU does it. GPU rounding can flip single blocks
+    /// where density is near zero.
     pub worldgen_gpu: bool,
 }
 

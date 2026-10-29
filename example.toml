@@ -18,7 +18,8 @@ spawn_protection = 16
 input_log = false
 # Overworld chunk density on the GPU, batched across chunk workers. Needs a
 # build with `--features gpu` and a hardware adapter; otherwise startup logs
-# why and the CPU generates. Terrain is the same either way.
+# why and the CPU generates. GPU rounding can flip single blocks where terrain
+# density is near zero (0-2 per 36 chunks in tests).
 worldgen_gpu = false
 
 [network]

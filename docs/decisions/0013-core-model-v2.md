@@ -1021,6 +1021,17 @@ Tick `t -> t+1`:
   whole-chunk batch with clean recent returns (bounded cache, 2048), then
   settles lighting before returning the resident/publishable batch. Startup
   `ensure_blocking` still joins the complete wanted set.
+  Overworld workers share chunk solids (which blocks the density makes
+  solid) through the generator: a generation reads its own and its eight
+  neighbours' solids, fills the missing ones on its own thread and waits on a
+  condvar only for ones another worker is filling; an entry leaves after its
+  ninth reader or by age past 4096 chunks. With `[server] worldgen_gpu` (build
+  feature `gpu`) one `worldgen-gpu` dispatcher thread fills queued 8×8 tiles in
+  GPU batches instead; a worker waits for its batch unless the queue is two
+  capped batches deep, and any GPU failure returns density to the CPU for the
+  rest of the run. Shared CPU solids generate exactly the chunks a worker
+  generates alone; GPU float rounding can flip a block where density is near
+  zero (0-2 blocks per 36 chunks in `gpu_density_chunks_match_cpu_chunks`).
   Player view radii are connection-local: Configuration and Play
   `ClientInformation` negotiate the client/server minimum (floor two, capped by
   the server). Edge uses that value for cache radius, streaming and forgetting;

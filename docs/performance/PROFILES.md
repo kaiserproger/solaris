@@ -291,6 +291,11 @@ cargo test -p mc-worldgen --lib --release --no-run
 "$TEST_BINARY" --ignored --exact terrain::profile_tests::vanilla_stages --nocapture --test-threads=1
 ```
 
+`vanilla_stages_shared_solids` measures the same chunks as chunk workers
+generate them with the shared solids cache (one density fill per chunk, timed
+apart), and `vanilla_stages_gpu_density` (`--features gpu`) with GPU density;
+every mode also prints `bake=`, the light a worker bakes with no neighbours.
+
 Use the same memory/quiet-window rules as above. The separate GenBench
 Java-versus-Solaris server experiment has no completed Solaris result in this
 publication; no server-throughput ratio is claimed.
