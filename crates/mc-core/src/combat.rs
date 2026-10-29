@@ -87,19 +87,36 @@ pub fn melee_hit_with_attributes(
     attribute_held: &ItemStack,
     swing: Swing,
 ) -> MeleeHit {
+    melee_hit_with_effective_attributes(rules, held, attribute_held, swing, None)
+}
+
+pub(crate) fn melee_hit_with_effective_attributes(
+    rules: &ItemRules<'_>,
+    held: &ItemStack,
+    attribute_held: &ItemStack,
+    swing: Swing,
+    attributes: Option<(f64, f64)>,
+) -> MeleeHit {
     let item = facts(rules, held);
     let attribute_item = facts(rules, attribute_held);
-    let base = (f64::from(BASE_ATTACK_DAMAGE)
-        + attribute_item
-            .and_then(|facts| facts.attack_damage_modifier)
-            .map_or(0.0, attribute)
-        + f64::from(swing.melee_bonus))
-    .max(0.0) as f32;
-    let strength = ((f64::from(swing.ticks_since_reset) + 0.5)
-        * attack_speed(rules, attribute_held)
-        * swing.attack_speed_multiplier
-        / 20.0)
-        .clamp(0.0, 1.0) as f32;
+    let base = attributes
+        .map_or_else(
+            || {
+                f64::from(BASE_ATTACK_DAMAGE)
+                    + attribute_item
+                        .and_then(|facts| facts.attack_damage_modifier)
+                        .map_or(0.0, attribute)
+                    + f64::from(swing.melee_bonus)
+            },
+            |(damage, _)| damage,
+        )
+        .max(0.0) as f32;
+    let speed = attributes.map_or_else(
+        || attack_speed(rules, attribute_held) * swing.attack_speed_multiplier,
+        |(_, speed)| speed,
+    );
+    let strength =
+        ((f64::from(swing.ticks_since_reset) + 0.5) * speed / 20.0).clamp(0.0, 1.0) as f32;
     let full = strength > 0.9;
     let enchanted = enchantment_bonus(held) * strength;
     let mut damage = base * (0.2 + strength * strength * 0.8);

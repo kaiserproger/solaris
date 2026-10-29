@@ -75,32 +75,44 @@ pub(crate) fn execute(
         return Err("Attribute requires exactly one entity".into());
     };
     let slot = state.entities.slot_of(*entity).ok_or("Entity not found")?;
-    let EntityKind::Mob { type_id } = state.entities.body(slot).kind else {
-        return Err("Attribute commands for players are not supported".into());
+    let player = matches!(state.entities.body(slot).kind, EntityKind::Player { .. });
+    let blueprint = match state.entities.body(slot).kind {
+        EntityKind::Mob { type_id } => Some(
+            state
+                .registry
+                .blueprint(type_id)
+                .ok_or("Entity has no attributes")?,
+        ),
+        EntityKind::Player { .. } => None,
+        _ => return Err("Entity has no attributes".into()),
     };
-    let blueprint = state
-        .registry
-        .blueprint(type_id)
-        .ok_or("Entity has no attributes")?;
     let name = command
         .attribute
         .as_str()
         .strip_prefix("minecraft:")
         .ok_or("Unknown attribute")?;
-    let default = match name {
-        "max_health" => f64::from(blueprint.params.max_health),
-        "movement_speed" => f64::from(blueprint.params.speed) / 10.0,
-        "attack_damage" => f64::from(blueprint.params.attack_damage),
-        "armor" => blueprint.params.armor,
-        "armor_toughness" => 0.0,
-        "follow_range" => f64::from(blueprint.sensors.sight_range),
-        "knockback_resistance" => blueprint.params.knockback_resistance,
-        _ => {
-            return Err(format!(
-                "Unknown or unsupported attribute '{}'",
-                command.attribute
-            ));
+    let default = if let Some(blueprint) = blueprint {
+        match name {
+            "max_health" => f64::from(blueprint.params.max_health),
+            "movement_speed" => f64::from(blueprint.params.speed) / 10.0,
+            "attack_damage" => f64::from(blueprint.params.attack_damage),
+            "armor" => blueprint.params.armor,
+            "armor_toughness" => 0.0,
+            "follow_range" => f64::from(blueprint.sensors.sight_range),
+            "knockback_resistance" => blueprint.params.knockback_resistance,
+            _ => {
+                return Err(format!(
+                    "Unknown or unsupported attribute '{}'",
+                    command.attribute
+                ));
+            }
         }
+    } else {
+        crate::player::PLAYER_ATTRIBUTES
+            .iter()
+            .find(|(kind, _)| *kind == name)
+            .map(|(_, default)| *default)
+            .ok_or_else(|| format!("Unknown or unsupported attribute '{}'", command.attribute))?
     };
     let row = state.entities.row(slot);
     let existing = row
@@ -112,12 +124,21 @@ pub(crate) fn execute(
     let mut changed = false;
     let (value, scale, message) = match &command.action {
         Action::Get(scale) => (
-            crate::entity_loot::effective_attribute(
-                &state.registry.item_rules(),
-                row,
-                name,
-                default,
-            ),
+            if player {
+                let mut snapshot = state.players.get(entity).ok_or("Player not found")?.clone();
+                snapshot.attribute_equipment = None;
+                snapshot.equipment_attributes(&state.registry.item_rules(), &row.loot.attributes);
+                snapshot
+                    .effective_attribute(name)
+                    .ok_or("Unknown attribute")?
+            } else {
+                crate::entity_loot::effective_attribute(
+                    &state.registry.item_rules(),
+                    row,
+                    name,
+                    default,
+                )
+            },
             *scale,
             "value",
         ),
@@ -179,8 +200,16 @@ pub(crate) fn execute(
         }
     };
     if changed {
-        crate::entity_loot::restore(state, slot);
-        state.appearance_changed.push(*entity);
+        if player {
+            state
+                .players
+                .get_mut(entity)
+                .ok_or("Player not found")?
+                .attribute_equipment = None;
+        } else {
+            crate::entity_loot::restore(state, slot);
+            state.appearance_changed.push(*entity);
+        }
     }
     state.push_player(
         connection,

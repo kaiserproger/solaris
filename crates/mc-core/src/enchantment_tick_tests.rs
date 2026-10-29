@@ -74,7 +74,24 @@ fn everyday_equipment_attributes_use_the_correct_slots_and_reset_after_removal()
     player.inventory.slots[36] = boots;
     player.inventory.slots[37] = legs;
     player.inventory.slots[39] = head;
-    player.equipment_attributes(&rules).unwrap();
+    let Some(crate::boundary::PlayerChange::Attributes { attributes }) =
+        player.equipment_attributes(&rules, &[])
+    else {
+        panic!("equipment must publish attributes");
+    };
+    for (kind, expected) in [("armor", 12.0), ("armor_toughness", 6.0)] {
+        let attribute = attributes
+            .iter()
+            .find(|attribute| attribute.kind == kind)
+            .unwrap();
+        let actual = attribute.base
+            + attribute
+                .modifiers
+                .iter()
+                .map(|modifier| modifier.amount)
+                .sum::<f64>();
+        assert_eq!(actual, expected);
+    }
     for (kind, value) in [
         ("water_movement_efficiency", 1.0),
         ("sneaking_speed", 0.75),
@@ -98,7 +115,7 @@ fn everyday_equipment_attributes_use_the_correct_slots_and_reset_after_removal()
     }
     // A curse/enchantment carried in a hand does not count as head/feet equipment.
     player.inventory.slots[0] = std::mem::take(&mut player.inventory.slots[39]);
-    player.equipment_attributes(&rules).unwrap();
+    player.equipment_attributes(&rules, &[]).unwrap();
     assert!(
         player
             .sent_attributes
@@ -108,7 +125,7 @@ fn everyday_equipment_attributes_use_the_correct_slots_and_reset_after_removal()
             .modifiers
             .is_empty()
     );
-    assert!(player.equipment_attributes(&rules).is_none());
+    assert!(player.equipment_attributes(&rules, &[]).is_none());
 }
 
 #[test]
@@ -207,7 +224,7 @@ fn soul_speed_switches_cached_attributes_and_wears_only_on_soul_ground() {
     {
         let rules = state.registry.item_rules();
         let player = state.players.get_mut(&actor).unwrap();
-        player.equipment_attributes(&rules).unwrap();
+        player.equipment_attributes(&rules, &[]).unwrap();
         let speed = player
             .sent_attributes
             .iter()

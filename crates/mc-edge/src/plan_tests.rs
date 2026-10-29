@@ -576,6 +576,39 @@ fn speed_effect_uses_existing_movement_attribute_packet_and_reset() {
     }
 }
 
+#[test]
+fn armor_and_toughness_are_presented_to_player() {
+    use mc_core::boundary::PlayerAttribute;
+    use mc_data::item_components::ItemAttributeModifier;
+    use mc_protocol::packets::play::ClientboundUpdateEntityAttributes;
+    let mut viewer = viewer_at(7, [0.0; 3]);
+    let attributes = [("armor", 3.0), ("armor_toughness", 2.0)]
+        .into_iter()
+        .map(|(kind, amount)| PlayerAttribute {
+            kind,
+            base: 0.0,
+            modifiers: vec![ItemAttributeModifier {
+                kind: format!("minecraft:{kind}"),
+                id: "minecraft:armor.helmet".into(),
+                amount,
+                operation: "add_value".into(),
+                slot: None,
+            }],
+        })
+        .collect();
+    let packets = plan_player_changes(&[PlayerChange::Attributes { attributes }], &mut viewer);
+    let mut body = body_of(&packets[0]);
+    let packet = ClientboundUpdateEntityAttributes::decode(&mut body).unwrap();
+    assert_eq!(
+        packet
+            .attributes
+            .iter()
+            .map(|attribute| (attribute.attribute_id.raw(), attribute.modifiers[0].amount))
+            .collect::<Vec<_>>(),
+        vec![(1, 3.0), (2, 2.0)]
+    );
+}
+
 fn chunk_at(x: i32, z: i32) -> (ChunkPos, Arc<mc_world::chunk::Chunk>) {
     let mut chunk = mc_world::chunk::Chunk::empty(
         mc_world::chunk::ChunkPos { x, z },

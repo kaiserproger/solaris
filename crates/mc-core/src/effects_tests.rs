@@ -226,10 +226,10 @@ fn stronger_short_effect_restores_weaker_remaining_duration() {
 fn speed_changes_existing_movement_speed_attribute_path_and_clears() {
     let data = Data::new();
     let mut player = PlayerState::new(ConnectionId(1), GameMode::Survival);
-    player.equipment_attributes(&data.rules()).unwrap();
+    player.equipment_attributes(&data.rules(), &[]).unwrap();
     player.give_effect(ActiveEffect::new(EffectId::Speed, 200, 1));
     let PlayerChange::Attributes { attributes, .. } =
-        player.equipment_attributes(&data.rules()).unwrap()
+        player.equipment_attributes(&data.rules(), &[]).unwrap()
     else {
         panic!("attribute sync")
     };
@@ -243,7 +243,7 @@ fn speed_changes_existing_movement_speed_attribute_path_and_clears() {
     assert!((speed.modifiers[0].amount - 0.4).abs() < 1e-7);
     player.clear_effects(Some(EffectId::Speed));
     let PlayerChange::Attributes { attributes, .. } =
-        player.equipment_attributes(&data.rules()).unwrap()
+        player.equipment_attributes(&data.rules(), &[]).unwrap()
     else {
         panic!("attribute reset")
     };

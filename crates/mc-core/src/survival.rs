@@ -353,6 +353,25 @@ impl Vitals {
         consume_air: bool,
         natural_regeneration: bool,
     ) -> VitalsTick {
+        self.tick_with_max_health(
+            difficulty,
+            eye_in_water,
+            can_drown,
+            consume_air,
+            natural_regeneration,
+            MAX_HEALTH,
+        )
+    }
+
+    pub(crate) fn tick_with_max_health(
+        &mut self,
+        difficulty: Difficulty,
+        eye_in_water: bool,
+        can_drown: bool,
+        consume_air: bool,
+        natural_regeneration: bool,
+        max_health: f32,
+    ) -> VitalsTick {
         let mut out = VitalsTick::default();
         if self.is_dead() {
             return out;
@@ -374,12 +393,12 @@ impl Vitals {
                 self.food = (self.food + 1).min(MAX_FOOD);
             }
             if self.peaceful_timer == 0 && natural_regeneration {
-                self.heal(1.0);
+                self.health = (self.health + 1.0).min(max_health);
             }
         } else {
             self.peaceful_timer = 0;
         }
-        if let Some(amount) = self.tick_regen(difficulty, natural_regeneration) {
+        if let Some(amount) = self.tick_regen(difficulty, natural_regeneration, max_health) {
             out.damage.push((DamageKind::Starvation, amount));
         }
         out.health_changed = before != (self.health, self.food, self.saturation);
@@ -400,7 +419,12 @@ impl Vitals {
         out
     }
 
-    fn tick_regen(&mut self, difficulty: Difficulty, natural_regeneration: bool) -> Option<f32> {
+    fn tick_regen(
+        &mut self,
+        difficulty: Difficulty,
+        natural_regeneration: bool,
+        max_health: f32,
+    ) -> Option<f32> {
         if self.food == 0
             && difficulty
                 .starvation_floor()
@@ -412,22 +436,22 @@ impl Vitals {
         if natural_regeneration
             && self.saturation > 0.0
             && self.food >= MAX_FOOD
-            && self.health < MAX_HEALTH
+            && self.health < max_health
         {
             self.regen_timer += 1;
             if self.regen_timer >= SATURATED_REGEN_TICKS {
                 self.regen_timer = 0;
                 let spent = self.saturation.min(6.0);
-                self.heal(spent / 6.0);
+                self.health = (self.health + spent / 6.0).min(max_health);
                 self.add_exhaustion(spent);
             }
             return None;
         }
-        if natural_regeneration && self.food >= 18 && self.health < MAX_HEALTH {
+        if natural_regeneration && self.food >= 18 && self.health < max_health {
             self.regen_timer += 1;
             if self.regen_timer >= HEALTH_TICK_PERIOD {
                 self.regen_timer = 0;
-                self.heal(1.0);
+                self.health = (self.health + 1.0).min(max_health);
                 self.add_exhaustion(6.0);
             }
             return None;
@@ -583,7 +607,7 @@ pub(crate) fn reduce_damage_with_breach(
     kind: DamageKind,
     breach: u32,
 ) -> f32 {
-    reduce_damage_impl(rules, armor, amount, kind, breach, false)
+    reduce_damage_impl(rules, armor, amount, kind, breach, false, None)
 }
 
 pub(crate) fn reduce_damage_after_physical(
@@ -593,7 +617,18 @@ pub(crate) fn reduce_damage_after_physical(
     kind: DamageKind,
     breach: u32,
 ) -> f32 {
-    reduce_damage_impl(rules, armor, amount, kind, breach, true)
+    reduce_damage_impl(rules, armor, amount, kind, breach, true, None)
+}
+
+pub(crate) fn reduce_damage_with_player_attributes(
+    rules: &ItemRules<'_>,
+    armor: &[ItemStack],
+    amount: f32,
+    kind: DamageKind,
+    breach: u32,
+    stats: ArmorStats,
+) -> f32 {
+    reduce_damage_impl(rules, armor, amount, kind, breach, false, Some(stats))
 }
 
 fn reduce_damage_impl(
@@ -603,6 +638,7 @@ fn reduce_damage_impl(
     kind: DamageKind,
     breach: u32,
     physical: bool,
+    attribute_stats: Option<ArmorStats>,
 ) -> f32 {
     if kind.bypasses_invulnerability()
         || matches!(kind, DamageKind::Starvation | DamageKind::SonicBoom)
@@ -664,6 +700,9 @@ fn reduce_damage_impl(
             }
             _ => 0,
         };
+    }
+    if let Some(attribute_stats) = attribute_stats {
+        stats = attribute_stats;
     }
     let after_armor = if kind.bypasses_armor() {
         amount.max(0.0)

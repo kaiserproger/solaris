@@ -169,6 +169,21 @@ impl TickState {
                         let absorption_before = player.active_effects.absorption;
                         let reduced = if custom_armor {
                             amount
+                        } else if let Some((armor, toughness)) = player
+                            .effective_attribute("armor")
+                            .zip(player.effective_attribute("armor_toughness"))
+                        {
+                            crate::survival::reduce_damage_with_player_attributes(
+                                &rules,
+                                &player.inventory.slots[36..40],
+                                amount,
+                                kind,
+                                crate::mace::breach(source),
+                                mc_data::armor::ArmorStats {
+                                    armor: armor.min(30.0) as f32,
+                                    toughness: toughness.min(20.0) as f32,
+                                },
+                            )
                         } else {
                             crate::survival::reduce_damage_with_breach(
                                 &rules,

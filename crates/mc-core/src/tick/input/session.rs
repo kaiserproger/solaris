@@ -137,6 +137,28 @@ pub(in crate::tick) fn join(
     } else {
         state.offline_players.remove(uuid)
     };
+    let attributes = match offline
+        .as_ref()
+        .map(|record| {
+            crate::entity_loot::player_attributes_from_opaque(&record.opaque_player_fields)
+        })
+        .transpose()
+    {
+        Ok(attributes) => attributes.unwrap_or_default(),
+        Err(error) => {
+            if let Some(record) = offline {
+                state.offline_players.insert(*uuid, record);
+            }
+            state.push_player(
+                *connection,
+                PlayerChange::Disconnect {
+                    reason: format!("Invalid player attributes: {error}"),
+                },
+            );
+            state.disconnects.push((*connection, state.tick));
+            return;
+        }
+    };
     let spawn = offline
         .as_ref()
         .map(|record| record.pos)
@@ -185,6 +207,7 @@ pub(in crate::tick) fn join(
             attack_reach: 3.0,
         },
     );
+    state.entities.row_mut(slot).loot.attributes = attributes;
     state.entities.row_mut(slot).protected_until =
         state.tick + crate::entities::SPAWN_INVULNERABLE_TICKS;
     state

@@ -129,6 +129,23 @@ pub(crate) fn unlock_session(state: &mut TickState, connection: ConnectionId) {
         state.disconnects.push((other, state.tick));
     }
     if let Some(record) = state.offline_players.remove(&uuid) {
+        let attributes =
+            match crate::entity_loot::player_attributes_from_opaque(&record.opaque_player_fields) {
+                Ok(attributes) => attributes,
+                Err(error) => {
+                    state.offline_players.insert(uuid, record);
+                    state.locked_sessions.insert(connection);
+                    state.push_player(
+                        connection,
+                        crate::boundary::PlayerChange::Disconnect {
+                            reason: format!("Invalid player attributes: {error}"),
+                        },
+                    );
+                    state.disconnects.push((connection, state.tick));
+                    return;
+                }
+            };
+        state.entities.row_mut(slot).loot.attributes = attributes;
         let mut player = super::hydrate_player(connection, Some(&record));
         player.inventory_menu.carried = record.carried;
         player.inventory_menu.grid = record.grid;

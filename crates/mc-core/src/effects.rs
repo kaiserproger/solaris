@@ -272,17 +272,20 @@ impl ActiveEffects {
                 }
                 EffectId::Strength => ("attack_damage", 3.0, "add_value"),
                 EffectId::Weakness => ("attack_damage", -4.0, "add_value"),
+                EffectId::HealthBoost => ("max_health", 4.0, "add_value"),
                 _ => continue,
             };
             if let Some(attribute) = attributes
                 .iter_mut()
                 .find(|attribute| attribute.kind == kind)
             {
+                let id = format!("minecraft:effect.{}", effect.id.name());
+                attribute.modifiers.retain(|modifier| modifier.id != id);
                 attribute
                     .modifiers
                     .push(mc_data::item_components::ItemAttributeModifier {
                         kind: format!("minecraft:{kind}"),
-                        id: format!("minecraft:effect.{}", effect.id.name()),
+                        id,
                         amount: amount * (f64::from(effect.amplifier) + 1.0),
                         operation: operation.into(),
                         slot: None,
@@ -824,9 +827,10 @@ pub(crate) fn run(state: &mut crate::tick::TickState, intents: &mut Vec<crate::i
                 player.vitals.saturation,
                 player.active_effects.absorption,
             );
+            let max_health = player.effective_attribute("max_health").unwrap_or(20.0) as f32;
             let out = player
                 .active_effects
-                .tick(&mut player.vitals, state.tick, 20.0);
+                .tick(&mut player.vitals, state.tick, max_health);
             let mut changes = Vec::new();
             if before.0 != player.vitals.health
                 || before.1 != player.vitals.food

@@ -19,6 +19,24 @@ pub(crate) use reservations::NativeToolWearPlan;
 const DEFAULT_EAT_TICKS: u32 = 32;
 /// Vanilla `containerCounter` wraps back to 1 after 100.
 const MAX_WINDOW: u8 = 100;
+pub(crate) const PLAYER_ATTRIBUTES: &[(&str, f64)] = &[
+    ("attack_speed", 4.0),
+    ("attack_damage", 1.0),
+    ("armor", 0.0),
+    ("armor_toughness", 0.0),
+    ("knockback_resistance", 0.0),
+    ("movement_speed", 0.1),
+    ("oxygen_bonus", 0.0),
+    ("submerged_mining_speed", 0.2),
+    ("water_movement_efficiency", 0.0),
+    ("sneaking_speed", 0.3),
+    ("movement_efficiency", 0.0),
+    ("max_health", 20.0),
+    ("scale", 1.0),
+    ("step_height", 0.6),
+    ("block_interaction_range", 4.5),
+    ("entity_interaction_range", 3.0),
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerState {
@@ -242,7 +260,11 @@ impl PlayerState {
     }
 
     /// Diff equipment after all inventory mutations (including durability breaks).
-    pub(crate) fn equipment_attributes(&mut self, rules: &ItemRules<'_>) -> Option<PlayerChange> {
+    pub(crate) fn equipment_attributes(
+        &mut self,
+        rules: &ItemRules<'_>,
+        retained: &[crate::entity_loot::EntityAttribute],
+    ) -> Option<PlayerChange> {
         let slots = [
             usize::from(self.inventory.selected.min(8)),
             OFF_HAND,
@@ -259,26 +281,34 @@ impl PlayerState {
             return None;
         }
         let equipment = slots.map(|slot| self.inventory.slots[slot].clone());
-        let mut attributes: Vec<crate::boundary::PlayerAttribute> = [
-            ("attack_speed", 4.0),
-            ("attack_damage", 1.0),
-            ("armor", 0.0),
-            ("armor_toughness", 0.0),
-            ("knockback_resistance", 0.0),
-            ("movement_speed", 0.1),
-            ("oxygen_bonus", 0.0),
-            ("submerged_mining_speed", 0.2),
-            ("water_movement_efficiency", 0.0),
-            ("sneaking_speed", 0.3),
-            ("movement_efficiency", 0.0),
-        ]
-        .into_iter()
-        .map(|(kind, base)| crate::boundary::PlayerAttribute {
-            kind,
-            base,
-            modifiers: Vec::new(),
-        })
-        .collect();
+        let mut attributes: Vec<crate::boundary::PlayerAttribute> = PLAYER_ATTRIBUTES
+            .iter()
+            .copied()
+            .map(|(kind, base)| crate::boundary::PlayerAttribute {
+                kind,
+                base,
+                modifiers: Vec::new(),
+            })
+            .collect();
+        for saved in retained {
+            if let Some(attribute) = attributes
+                .iter_mut()
+                .find(|attribute| saved.id.strip_prefix("minecraft:") == Some(attribute.kind))
+            {
+                attribute.base = saved.base;
+                attribute
+                    .modifiers
+                    .extend(saved.modifiers.iter().map(|modifier| {
+                        mc_data::item_components::ItemAttributeModifier {
+                            kind: saved.id.clone(),
+                            id: modifier.id.clone(),
+                            amount: modifier.amount,
+                            operation: modifier.operation.clone(),
+                            slot: None,
+                        }
+                    }));
+            }
+        }
         for (slot, stack) in equipment.iter().enumerate() {
             if stack.is_empty() {
                 continue;
@@ -322,6 +352,24 @@ impl PlayerState {
             &mut attributes,
         );
         self.active_effects.attribute_modifiers(&mut attributes);
+        if self.sprinting
+            && let Some(speed) = attributes
+                .iter_mut()
+                .find(|attribute| attribute.kind == "movement_speed")
+        {
+            speed
+                .modifiers
+                .retain(|modifier| modifier.id != "minecraft:sprinting");
+            speed
+                .modifiers
+                .push(mc_data::item_components::ItemAttributeModifier {
+                    kind: "minecraft:movement_speed".into(),
+                    id: "minecraft:sprinting".into(),
+                    amount: f64::from(0.3_f32),
+                    operation: "add_multiplied_total".into(),
+                    slot: None,
+                });
+        }
         let changed = attributes
             .iter()
             .filter(|attribute| !self.sent_attributes.contains(attribute))
@@ -332,6 +380,37 @@ impl PlayerState {
         (!changed.is_empty()).then_some(PlayerChange::Attributes {
             attributes: changed,
         })
+    }
+
+    pub(crate) fn effective_attribute(&self, kind: &str) -> Option<f64> {
+        let attribute = self
+            .sent_attributes
+            .iter()
+            .find(|attribute| attribute.kind == kind)?;
+        let mut add = 0.0;
+        let mut multiplied_base = 0.0;
+        let mut multiplied_total = 1.0;
+        for modifier in &attribute.modifiers {
+            match modifier.operation.as_str() {
+                "add_value" => add += modifier.amount,
+                "add_multiplied_base" => multiplied_base += modifier.amount,
+                "add_multiplied_total" => multiplied_total *= 1.0 + modifier.amount,
+                _ => {}
+            }
+        }
+        let (minimum, maximum) = match kind {
+            "max_health" => (1.0, 1024.0),
+            "movement_speed" | "attack_speed" => (0.0, 1024.0),
+            "attack_damage" => (0.0, 2048.0),
+            "armor" => (0.0, 30.0),
+            "armor_toughness" => (0.0, 20.0),
+            "scale" => (0.0625, 16.0),
+            _ => (0.0, f64::MAX),
+        };
+        Some(
+            ((attribute.base + add) * (1.0 + multiplied_base) * multiplied_total)
+                .clamp(minimum, maximum),
+        )
     }
 
     /// One accepted move's vertical travel (vanilla `checkFallDamage`):

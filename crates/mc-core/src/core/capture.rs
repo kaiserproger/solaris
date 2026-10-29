@@ -425,7 +425,11 @@ pub(super) fn player_record(
     let menu = player.open.as_ref().unwrap_or(&player.inventory_menu);
     let (carried, grid) = (menu.carried.clone(), menu.grid.clone());
     Some(crate::journal::ReplayPlayer {
-        opaque_player_fields: player.opaque_player_fields.clone(),
+        opaque_player_fields: crate::entity_loot::player_attributes_to_opaque(
+            &player.opaque_player_fields,
+            &state.entities.row(slot).loot.attributes,
+        )
+        .ok()?,
         statistics: if include_statistics {
             player.statistics.at_tick(tick)
         } else {

@@ -474,8 +474,10 @@ pub(in crate::tick) fn sprint(
     if let Some(entity) = state.connections.entity_of(*connection)
         && state.entities.slot_of(entity).is_some()
         && let Some(player) = state.players.get_mut(&entity)
+        && player.sprinting != *sprinting
     {
         player.sprinting = *sprinting;
+        player.attribute_equipment = None;
     }
 }
 
