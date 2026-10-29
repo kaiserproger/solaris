@@ -137,7 +137,11 @@ pub(super) fn storage(state: &mut TickState, v: &VillagerState, position: [i32; 
 #[test]
 fn miner_skips_cave_below_certified_surface_when_trying_alternate_lane() {
     let (mut state, slot, mut v) = fixture(BuildingKind::Mine);
-    state.settlements.get_mut(v.settlement.unwrap()).unwrap().radius = 100;
+    state
+        .settlements
+        .get_mut(v.settlement.unwrap())
+        .unwrap()
+        .radius = 100;
     let mut changes = ChangeSet::default();
     state.tick = 100;
     mining::work(&mut state, slot, &mut v, &mut changes);
@@ -154,8 +158,11 @@ fn miner_skips_cave_below_certified_surface_when_trying_alternate_lane() {
     v.mining_progress.layer = 0;
     v.mining_progress.last_open = None;
     let target = mining::work(&mut state, slot, &mut v, &mut changes);
-    assert_ne!(target, Some(BlockPos { x: 3, y: 185, z: 4 }),
-        "an underground cave outside the certified surface cannot be a new entrance");
+    assert_ne!(
+        target,
+        Some(BlockPos { x: 3, y: 185, z: 4 }),
+        "an underground cave outside the certified surface cannot be a new entrance"
+    );
     assert_eq!(v.mining_progress.lane, 2);
 }
 

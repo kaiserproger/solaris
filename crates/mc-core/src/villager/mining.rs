@@ -740,7 +740,11 @@ pub(super) fn work(
     let (id, revision, surface_bounds, upgrading) = (
         building.id.0,
         building.revision,
-        if building.natural_zone { building.bounds } else { bounds },
+        if building.natural_zone {
+            building.bounds
+        } else {
+            bounds
+        },
         state
             .settlements
             .get(building.settlement)
