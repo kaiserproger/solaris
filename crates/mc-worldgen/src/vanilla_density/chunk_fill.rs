@@ -179,7 +179,7 @@ pub(crate) fn fill(
             fraction(z, width),
         )
     });
-    for (offset, layer) in output.chunks_exact_mut(LANES).enumerate() {
+    for (offset, layer) in output.as_chunks_mut::<LANES>().0.iter_mut().enumerate() {
         let y = min_y + offset as i32;
         let level = (y.div_euclid(height) - level_0) as usize;
         let ty = fraction(y, height);
@@ -203,7 +203,7 @@ pub(crate) fn fill(
             }
         }
         run(&program.ops, &mut regs, &slot_layers, y);
-        layer.copy_from_slice(&regs[program.root]);
+        *layer = regs[program.root];
     }
 }
 
