@@ -128,7 +128,9 @@ pub use terrain::{HeightContextStats, height_context_stats, reset_height_context
 /// Existing chunks are retained by the explicit offline worldgen upgrade.
 ///
 /// 31: populate overworld density caves with noise-based aquifers, including
-/// water, lava and solid pressure barriers on both CPU and GPU density paths.
+/// water, lava and solid pressure barriers on both CPU and GPU density paths;
+/// place shipwrecks and ocean ruins on the seabed, cap the monument below sea
+/// level, and generate mineshaft loot as chest minecarts.
 pub const WORLDGEN_REVISION: u32 = 31;
 
 /// Crate version, exposed so other crates and the binary can report it.
