@@ -519,6 +519,10 @@ pub(crate) fn recover_with_reader(
             tick: manifest.tick,
             players: players.clone(),
             scoreboard: Some(scoreboard.clone()),
+            command_storage: checkpoint
+                .globals
+                .get("command_storage")
+                .map(|record| record.payload.clone()),
             saved_maps: if dimension == Dimension::Overworld {
                 crate::maps::recover(&checkpoint.globals)?
             } else {
@@ -919,6 +923,12 @@ pub(crate) fn encode_checkpoint(
                 .to_nbt(),
         )?,
     );
+    if let Some(storage) = &root.command_storage {
+        let tag = crate::command_storage::to_tag(
+            &crate::command_storage::decode(storage).map_err(CoreError::Storage)?,
+        );
+        globals.insert("command_storage".into(), tag_record(tick, &tag)?);
+    }
     globals.insert(
         "bossbars".into(),
         tag_record(

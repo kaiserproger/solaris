@@ -45,6 +45,49 @@ fn admin_inventory_trees_and_slot_suggestions() {
 }
 
 #[test]
+fn map_command_trees_and_suggestions_match_implemented_paths() {
+    let packet = tree(2, &[]);
+    for root in ["tag", "playsound", "particle", "data"] {
+        assert!(permitted(root, 2, &[]));
+        assert!(!permitted(root, 1, &[]));
+    }
+    assert!(node(&packet, &["tag", "targets", "add", "name"]).executable);
+    assert!(node(&packet, &["particle", "name"]).executable);
+    assert!(
+        node(
+            &packet,
+            &[
+                "playsound",
+                "sound",
+                "master",
+                "targets",
+                "pos",
+                "volume",
+                "pitch",
+                "minVolume"
+            ]
+        )
+        .executable
+    );
+    assert!(
+        node(
+            &packet,
+            &[
+                "data", "modify", "storage", "target", "path", "set", "value", "value"
+            ]
+        )
+        .executable
+    );
+    let response = suggestions(1, "/particle minecraft:fl", 2, &[], &[], &[], &[], &[], &[]);
+    assert!(
+        response
+            .suggestions
+            .iter()
+            .any(|entry| entry.text == "minecraft:flame")
+    );
+}
+
+#[test]
 fn damage_tree_and_permission_match_native_grammar() {
     let packet = tree(2, &[]);
     assert!(!permitted("damage @s 1", 1, &[]));

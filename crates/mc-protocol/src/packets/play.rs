@@ -114,11 +114,11 @@ pub use entity::{
 };
 pub use env_state::{
     ClientboundBlockDestruction, ClientboundBlockEntityData, ClientboundBlockEvent,
-    ClientboundChangeDifficulty, ClientboundCooldown, ClientboundExplode,
-    ClientboundInitializeBorder, ClientboundOpenSignEditor, ClientboundPlayerAbilities,
-    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetTime, ClientboundSound,
-    ClientboundSoundEntity, ClientboundSweepParticle, ExplosionBlockParticle, GameEvent,
-    OVERWORLD_WORLD_CLOCK_ID, THE_END_WORLD_CLOCK_ID, WorldClockUpdate,
+    ClientboundChangeDifficulty, ClientboundCommandParticle, ClientboundCooldown,
+    ClientboundExplode, ClientboundInitializeBorder, ClientboundOpenSignEditor,
+    ClientboundPlayerAbilities, ClientboundSetExperience, ClientboundSetHealth, ClientboundSetTime,
+    ClientboundSound, ClientboundSoundEntity, ClientboundSweepParticle, ExplosionBlockParticle,
+    GameEvent, OVERWORLD_WORLD_CLOCK_ID, THE_END_WORLD_CLOCK_ID, WorldClockUpdate,
 };
 pub use interaction::{
     ClientCommandAction, ConfirmTeleportation, MovePlayerFlags, PlayerActionKind,

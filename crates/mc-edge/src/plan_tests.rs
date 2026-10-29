@@ -2535,6 +2535,38 @@ fn sweep_event_encodes_vanilla_sound_and_single_directional_particle() {
 }
 
 #[test]
+fn command_sound_and_particle_changes_encode_packets() {
+    use mc_protocol::packets::play::{ClientboundCommandParticle, ClientboundSound};
+    let changes = [
+        PlayerChange::CommandSound {
+            sound: mc_data::Identifier::parse("minecraft:block.bell.use").unwrap(),
+            source: 4,
+            position: [8, 480, 16],
+            volume: 1.0,
+            pitch: 1.0,
+        },
+        PlayerChange::CommandParticle {
+            particle_id: 77,
+            position: [1.0, 60.0, 2.0],
+            delta: [0.0; 3],
+            speed: 0.0,
+            count: 1,
+            force: false,
+        },
+    ];
+    let packets = plan_player_changes(&changes, &mut viewer_at(1, [1.0, 60.0, 2.0]));
+    assert_eq!(packets.len(), 2);
+    assert_eq!(packets[0].id, ClientboundSound::ID);
+    let sound = ClientboundSound::decode(&mut &body_of(&packets[0])[..]).unwrap();
+    assert_eq!(sound.sound.as_str(), "minecraft:block.bell.use");
+    assert_eq!(sound.position, [8, 480, 16]);
+    assert_eq!(packets[1].id, ClientboundCommandParticle::ID);
+    let particle = ClientboundCommandParticle::decode(&mut &body_of(&packets[1])[..]).unwrap();
+    assert_eq!(particle.particle_id, 77);
+    assert_eq!(particle.count, 1);
+}
+
+#[test]
 fn shield_events_send_vanilla_entity_sound_not_removed_status_bytes() {
     use mc_protocol::packets::play::ClientboundSoundEntity;
     for disabled in [false, true] {

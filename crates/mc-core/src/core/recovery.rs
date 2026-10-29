@@ -189,6 +189,10 @@ pub(super) fn load_dimension_state(
         climate.restore(&mut tick_state)?;
     }
     tick_state.scoreboard = replay.scoreboard.unwrap_or_default();
+    tick_state.command_storage = match replay.command_storage {
+        Some(bytes) => crate::command_storage::decode(&bytes).map_err(CoreError::Storage)?,
+        None => Default::default(),
+    };
     tick_state.maps = crate::maps::Maps::restore(
         replay.saved_maps,
         crate::maps::sequence(settlement_globals)?,

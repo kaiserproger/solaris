@@ -484,6 +484,7 @@ fn entry_heap(entry: &JournalEntry) -> usize {
                     .map_or(0, crate::settlements::SettlementRecord::heap_estimate)
         }
         E::Scoreboard { value } => scoreboard_heap(value),
+        E::CommandStorage { value } => value.capacity(),
         E::SavedMap { value, .. } => {
             value.colors.capacity()
                 + value.original_nbt.capacity()

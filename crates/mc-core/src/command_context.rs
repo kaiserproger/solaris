@@ -702,6 +702,24 @@ pub(crate) fn native(
         return crate::dimensions::travel::execute_context(state, text, context, require_result);
     }
     state.command_context.current = Some(context);
+    if text.split_whitespace().next() == Some("tag") {
+        if context.permission < 2 {
+            return Err(crate::commands::CommandError::Unknown.message());
+        }
+        return Ok(crate::command_tag::execute(state, context, text));
+    }
+    if text.split_whitespace().next() == Some("playsound") {
+        if context.permission < 2 {
+            return Err(crate::commands::CommandError::Unknown.message());
+        }
+        return Ok(crate::command_sound::execute(state, context, text));
+    }
+    if text.split_whitespace().next() == Some("particle") {
+        if context.permission < 2 {
+            return Err(crate::commands::CommandError::Unknown.message());
+        }
+        return Ok(crate::command_particle::execute(state, context, text));
+    }
     if matches!(
         text.split_whitespace().next(),
         Some("function" | "schedule" | "reload" | "datapack" | "data")
