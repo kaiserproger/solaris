@@ -406,7 +406,10 @@ fn vanilla_player_combat_numbers_through_native_tick() {
             (player.effective_attribute("attack_damage").unwrap() - f64::from(damage)).abs()
                 < 0.000_001
         );
-        let before = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
+        let before = state
+            .entities
+            .row(state.entities.slot_of(victim).unwrap())
+            .health;
         crate::tick::run_tick(
             &mut state,
             &[PlayerInput::Attack {
@@ -414,11 +417,21 @@ fn vanilla_player_combat_numbers_through_native_tick() {
                 target: victim,
             }],
         );
-        let after = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
-        assert!((before - after - damage).abs() < 0.001, "{item:?}: dealt {}", before - after);
+        let after = state
+            .entities
+            .row(state.entities.slot_of(victim).unwrap())
+            .health;
+        assert!(
+            (before - after - damage).abs() < 0.001,
+            "{item:?}: dealt {}",
+            before - after
+        );
         if item.is_some() {
             let victim = state.spawn_mob(state.registry.cow_type_id, [0.0, 80.0, 1.5], 100.0);
-            let before = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
+            let before = state
+                .entities
+                .row(state.entities.slot_of(victim).unwrap())
+                .health;
             state.last_swing.insert(alice, state.tick - 6);
             crate::tick::run_tick(
                 &mut state,
@@ -427,9 +440,16 @@ fn vanilla_player_combat_numbers_through_native_tick() {
                     target: victim,
                 }],
             );
-            let after = state.entities.row(state.entities.slot_of(victim).unwrap()).health;
+            let after = state
+                .entities
+                .row(state.entities.slot_of(victim).unwrap())
+                .health;
             let expected = damage * (0.2 + 0.8 * 0.52_f32.powi(2));
-            assert!((before - after - expected).abs() < 0.001, "{item:?}: partial hit dealt {}", before - after);
+            assert!(
+                (before - after - expected).abs() < 0.001,
+                "{item:?}: partial hit dealt {}",
+                before - after
+            );
         }
     }
 }
