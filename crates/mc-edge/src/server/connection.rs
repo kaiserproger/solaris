@@ -31,6 +31,17 @@ pub(super) fn accept_failure(error: &std::io::Error, open_sessions: usize) -> Ac
     }
 }
 
+struct PrePlayPermit<'a> {
+    limiter: &'a crate::conn_limit::AddressLimiter,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for PrePlayPermit<'_> {
+    fn drop(&mut self) {
+        self.limiter.release(self.ip);
+    }
+}
+
 /// Per-connection pipeline. Status connections return after the ping;
 /// Play connections run until disconnect or overflow.
 pub(super) async fn handle_connection(
@@ -63,6 +74,15 @@ async fn run_connection(
     peer: String,
     lifecycle: &mut ConnectionLifecycle<'_>,
 ) -> anyhow::Result<()> {
+    let ip = stream.peer_addr()?.ip();
+    if !server.pre_play_addresses.admit(ip) {
+        warn!(%ip, "too many simultaneous pre-play connections from this address");
+        anyhow::bail!("Too many simultaneous pre-play connections from this address");
+    }
+    let permit = PrePlayPermit {
+        limiter: &server.pre_play_addresses,
+        ip,
+    };
     let mut conn = crate::connection::Connection::new(stream);
     let pre_play = async {
         // --- Handshake: route to status or login. Every `?` below logs the
@@ -114,11 +134,7 @@ async fn run_connection(
                         serde_json::json!({"translate":"multiplayer.disconnect.server_shutdown"}),
                     );
                 }
-                server
-                    .connections
-                    .admit(id, server.cfg.server.max_players as usize, |full| {
-                        server.admin.admission(uuid, ip, full)
-                    })
+                server.admin.admission(uuid, ip, false)
             },
         )
         .await
@@ -166,13 +182,27 @@ async fn run_connection(
     else {
         return Ok(());
     };
+    drop(permit);
     // Access-list changes during Configuration revoke admission before Join.
-    if let Some(reason) = server.admin.admission(
-        outcome.uuid,
-        outcome.remote_address.or(stream_peer_ip(&peer)),
-        false,
-    ) {
-        anyhow::bail!("admission revoked during Configuration: {reason}");
+    if let Some(reason) =
+        server
+            .connections
+            .admit(id, server.cfg.server.max_players as usize, |full| {
+                server.admin.admission(
+                    outcome.uuid,
+                    outcome.remote_address.or(stream_peer_ip(&peer)),
+                    full,
+                )
+            })
+    {
+        warn!(%peer, %reason, "admission refused after configuration");
+        conn.send_packet(&mc_protocol::packets::play::PlayDisconnect {
+            reason_nbt: crate::connection::text_component_nbt(
+                "Server is full or access was revoked",
+            )?,
+        })
+        .await?;
+        return Ok(());
     }
 
     // The radius and locale precede Join on the reliable queue: the first

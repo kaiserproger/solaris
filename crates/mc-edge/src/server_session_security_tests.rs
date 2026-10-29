@@ -2,13 +2,13 @@ use super::*;
 use std::time::Duration;
 
 #[test]
-fn pending_login_reserves_capacity_until_retirement_finishes() {
+fn pending_join_reserves_capacity_until_retirement_finishes() {
     let registry = ConnectionRegistry::new();
     let a = registry.alloc_id();
     let b = registry.alloc_id();
     let policy = |full: bool| full.then(|| serde_json::json!({"text":"full"}));
     assert!(registry.admit(a, 1, policy).is_none());
-    assert_eq!(registry.len(), 0, "Configuration has no Play handles yet");
+    assert_eq!(registry.len(), 0, "pending Join has no Play handles yet");
     assert!(registry.admit(b, 1, policy).is_some());
     registry.remove(a);
     assert!(

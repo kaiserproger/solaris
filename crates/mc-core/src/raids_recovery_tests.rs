@@ -268,3 +268,18 @@ fn raids_idle_ticks_skip_wal_and_restore_exact_elapsed_counters() {
         "wave transition is durable"
     );
 }
+
+#[test]
+fn persisted_unsafe_random_tick_speed_is_clamped_on_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut state, _, _) = crate::raids::tests::fixture(Some(root.path()));
+    state
+        .gamerules
+        .insert("random_tick_speed".into(), i32::MAX.to_string());
+    state.gamerules_dirty = true;
+    checkpoint(root.path(), &mut state);
+    let config = CoreConfig::new(root.path().to_owned(), 42);
+    let recovered = crate::core::recover_dimension_state(&config, Dimension::Overworld).unwrap();
+    assert_eq!(recovered.gamerules["random_tick_speed"], "4096");
+    assert!(recovered.gamerules_dirty);
+}

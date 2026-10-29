@@ -29,6 +29,7 @@ fn fixture() -> (EdgeServer, std::path::PathBuf) {
         dashboard: dashboard_state(&cfg),
         cfg,
         connections: Arc::new(ConnectionRegistry::new()),
+        pre_play_addresses: crate::conn_limit::AddressLimiter::new(0, 8),
         tick_stats: Arc::new(TickStats::new()),
         net_counters: Arc::new(NetCounters::new()),
         admin: crate::admin::Admin::open(&dir).unwrap(),

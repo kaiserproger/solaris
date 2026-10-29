@@ -23,7 +23,7 @@ use crate::crypto::MinecraftCipher;
 /// Per-packet read timeout before play.
 pub const PRE_PLAY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total deadline for the whole pre-play (handshake/login/configuration) phase.
-pub const PRE_PLAY_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
+pub const PRE_PLAY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum packets accepted during pre-play.
 pub const MAX_PRE_PLAY_PACKETS: usize = 96;
 /// Maximum decoded body bytes accepted during pre-play.
