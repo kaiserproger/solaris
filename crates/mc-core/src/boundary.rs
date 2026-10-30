@@ -585,6 +585,8 @@ pub struct EntityAppearance {
     pub saddle: Option<ItemStack>,
     pub passengers: Vec<EntityId>,
     pub leash_holder: Option<EntityId>,
+    /// Transient presentation-only stair seat; never part of entity persistence.
+    pub villager_seat: Option<BlockPos>,
     pub baby: bool,
     /// Vanilla pose ordinal (standing, sleeping, swimming, crouching, ...).
     pub pose: u8,

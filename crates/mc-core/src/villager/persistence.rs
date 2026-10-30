@@ -444,6 +444,7 @@ pub(crate) fn journal_image(state: &VillagerState) -> VillagerState {
         last_gossip: state.last_gossip,
         activity: state.activity,
         sleeping: state.sleeping,
+        seat: None,
         courtship_until: state.courtship_until,
         partner: state.partner,
         navigation_path: Vec::new(),

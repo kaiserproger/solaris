@@ -80,7 +80,7 @@ pub(crate) struct LabelBaseline {
 }
 
 impl LabelBaseline {
-    fn alloc(&mut self) -> Option<i32> {
+    pub(crate) fn alloc(&mut self) -> Option<i32> {
         self.next = self.next.checked_sub(1)?;
         Some(self.next)
     }

@@ -651,6 +651,7 @@ pub(super) fn restore_appearance(
         saddle: record.state.loot.saddle.as_deref().cloned(),
         passengers: Vec::new(),
         leash_holder: None,
+        villager_seat: None,
         baby: image.baby,
         pose: image.pose,
         shared_flags: image.shared_flags,

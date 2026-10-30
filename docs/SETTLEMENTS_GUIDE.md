@@ -9,6 +9,7 @@
 - House/work/bell labels appear within 48 blocks after the chunk loads / подписи домов, рабочих мест и колокола видны в 48 блоках после загрузки чанка.
 - Generated `Name · profession · activity` plates follow the villager brain and are not saved as name tags / автоматические имя, профессия и занятие следуют поведению жителя и не заменяют сохранённое имя от бирки.
 - Children show `ребёнок` instead of a profession until they grow up / у детей вместо профессии написано «ребёнок», пока они не вырастут.
+- Resting or idle villagers can sit on nearby roofed stairs; the seat is presentation-only and disappears when they leave or change activity / отдыхающие или свободные жители могут сидеть на ступеньках под крышей; сиденье существует только для отображения и исчезает при уходе или смене занятия.
 - `/settlement rename <name> <new>` / `remove <name>` — rename or dissolve / переименовать или удалить.
 - Stand next to a villager (≤8 blocks): `/settlement bind <name>` / `/settlement unbind` assigns/releases the nearest; optional UUID selects one explicitly / встаньте рядом: привязать/отвязать ближайшего, UUID необязателен.
 - `/settlement relocate <source> <household> <destination>` — move a household; housing claims are reacquired / переселить семью, жильё выбирается заново.

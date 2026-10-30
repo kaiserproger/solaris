@@ -281,6 +281,29 @@ fn roofed(state: &TickState, pos: BlockPos) -> bool {
     })
 }
 
+fn stair_seat(state: &TickState, pos: [f64; 3]) -> Option<BlockPos> {
+    let origin = at(pos);
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            for dy in -1..=0 {
+                let seat = BlockPos { x: origin.x + dx, y: origin.y + dy, z: origin.z + dz };
+                let Some(block) = state.world.block_at(seat.x, seat.y, seat.z)
+                    .and_then(|id| state.registry.blocks.by_id(mc_world::BlockStateId(id)))
+                else {
+                    continue;
+                };
+                if block.block.id.path().ends_with("_stairs")
+                    && block.properties.iter().any(|(key, value)| key == "half" && value == "bottom")
+                    && roofed(state, seat)
+                {
+                    return Some(seat);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn night_shelter(
     state: &mut TickState,
     cache: &mut PoiCache,
@@ -584,6 +607,19 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
             cache.resident_data[index].profession,
             state.day_time,
         );
+        let clear_seat = state.entities.row(slot).villager.as_ref().is_some_and(|v| {
+            v.seat.is_some_and(|seat| {
+                merchant_busy
+                    || v.sleeping
+                    || state.tick < v.panic_until
+                    || !matches!(schedule(v.age, v.data.profession, state.day_time), Activity::Rest | Activity::Idle)
+                    || distance(state.entities.pos(slot), centre(seat)) > 4.0
+                    || stair_seat(state, state.entities.pos(slot)) != Some(seat)
+            })
+        });
+        if clear_seat {
+            state.entities.row_mut(slot).villager.as_mut().unwrap().seat = None;
+        }
         if state
             .entities
             .row(slot)
@@ -798,9 +834,33 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
                 }
             }
         }
+        let changing_seated_activity = old_activity != v.activity && v.seat.is_some();
+        let can_sit = !merchant_busy && !v.sleeping
+            && !changing_seated_activity
+            && matches!(v.activity, Activity::Rest | Activity::Idle)
+            && v.navigation_path.is_empty();
+        if !can_sit || v.seat.is_some_and(|seat| {
+            distance(state.entities.pos(slot), centre(seat)) > 4.0
+                || stair_seat(state, state.entities.pos(slot)) != Some(seat)
+        }) {
+            v.seat = None;
+        }
+        if can_sit && v.seat.is_none() {
+            v.seat = stair_seat(state, state.entities.pos(slot)).filter(|seat| {
+                !cache.residents.iter().copied().any(|other| {
+                    other != slot
+                        && state.entities.row(other).villager.as_ref().is_some_and(|resident| resident.seat == Some(*seat))
+                })
+            });
+            if let Some(seat) = v.seat {
+                state.entities.set_pos(slot, [f64::from(seat.x) + 0.5, f64::from(seat.y) + 0.5, f64::from(seat.z) + 0.5]);
+                state.entities.set_vel(slot, [0.0; 3]);
+                v.navigation_target = None;
+            }
+        }
         if v.sleeping {
             v.last_slept = Some(state.tick);
-        } else {
+        } else if v.seat.is_none() {
             let pickup_pos = state.entities.pos(slot);
             decision_phase!(cache, 3, {
                 cache.items_near(pickup_pos);
