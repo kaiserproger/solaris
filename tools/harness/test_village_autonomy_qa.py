@@ -1,6 +1,7 @@
 """Causal client observations and fail-closed autonomous-village receipts."""
 from __future__ import annotations
 
+import io
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from .backends import village_autonomy_qa as qa
+from .backends import probe_steps
 
 
 class VillageAutonomyQaTests(unittest.TestCase):
@@ -93,6 +95,25 @@ class VillageAutonomyQaTests(unittest.TestCase):
         predicate = probe.wait.call_args.args[0]
         self.assertFalse(predicate(probe.observe.return_value))
         self.assertTrue(predicate(probe.wait.return_value))
+        self.assertEqual(probe.wait.call_args.kwargs["timeout_seconds"], 15.0)
+
+    def test_container_wait_expires_even_when_state_keeps_changing(self) -> None:
+        clock = Mock(return_value=0.0)
+        with patch.object(probe_steps.time, "monotonic", clock):
+            probe = qa.ProbeSteps(Mock(), Path("unused"), 3600.0, "bounded-menu")
+            probe.observe = Mock(return_value={"state_version": 1})
+
+            def changed(*args):
+                clock.return_value += 1.0
+                return {}
+
+            probe.call = Mock(side_effect=changed)
+            with self.assertRaisesRegex(TimeoutError, "missing_menu"):
+                probe.wait(lambda state: False, "missing_menu", timeout_seconds=15.0)
+        self.assertFalse(probe.report["assertions"]["missing_menu"])
+        self.assertEqual(probe.call.call_count, 15)
+        self.assertTrue(all(0 < call.args[1]["timeout_seconds"] <= 15.0
+                            for call in probe.call.call_args_list))
 
     def test_receipt_cannot_pass_with_failed_or_missing_required_behaviour(self) -> None:
         required = (
@@ -318,7 +339,7 @@ class VillageAutonomyQaTests(unittest.TestCase):
 
 
 class SettlementStockObservationTests(unittest.TestCase):
-    def test_sums_founding_chest_and_every_owned_storage_container(self) -> None:
+    def test_sums_storage_without_navigating_or_opening_its_containers(self) -> None:
         probe = Mock()
         buildings = [
             "Buildings: #1 storage level 1 [10, 64, 0]-[13, 66, 3], "
@@ -330,17 +351,19 @@ class SettlementStockObservationTests(unittest.TestCase):
             {"x": 99, "y": 64, "z": 1, "block_id": "minecraft:chest"},
         ]}
         contents = {
-            (1, 64, 1): {0: {"item_id": "minecraft:cobblestone", "count": 2}},
-            (10, 64, 1): {0: {"item_id": "minecraft:cobblestone", "count": 64}},
-            (12, 64, 1): {0: {"item_id": "minecraft:birch_log", "count": 16}},
+            (10, 64, 1): {"minecraft:cobblestone": 64},
+            (12, 64, 1): {"minecraft:birch_log": 16},
         }
+        reader = Mock(side_effect=contents.__getitem__)
         detail = {}
         with patch.object(qa, "_read", return_value={"block_id": "minecraft:chest"}), patch.object(
-            qa, "_open_chest", side_effect=lambda _, pos: contents[pos],
+            qa, "_open_chest", return_value={0: {"item_id": "minecraft:cobblestone", "count": 2}},
         ) as opened:
-            totals = qa._settlement_stock(probe, detail, (1, 64, 1), buildings)
+            totals = qa._settlement_stock(probe, detail, (1, 64, 1), buildings, reader)
         self.assertEqual(totals, {"minecraft:cobblestone": 66, "minecraft:birch_log": 16})
-        self.assertEqual({call.args[1] for call in opened.call_args_list}, set(contents))
+        opened.assert_called_once_with(probe, (1, 64, 1))
+        self.assertEqual({call.args[0] for call in reader.call_args_list}, set(contents))
+        self.assertTrue(detail["storage_observation"]["complete"])
         self.assertEqual(len(detail["storage_observation"]["containers"]), 3)
         probe.call.assert_called_once_with("minecraft_scan_blocks", {
             "min_x": 10, "min_y": 64, "min_z": 0,
@@ -356,6 +379,7 @@ class SettlementStockObservationTests(unittest.TestCase):
              "properties": {"type": "right", "facing": "north"}},
         ]}
         detail = {}
+        reader = Mock()
         with patch.object(qa, "_open_chest", return_value={
             0: {"item_id": "minecraft:coal", "count": 4},
             27: {"item_id": "minecraft:birch_log", "count": 16},
@@ -363,9 +387,10 @@ class SettlementStockObservationTests(unittest.TestCase):
             totals = qa._settlement_stock(probe, detail, (10, 64, 1), [
                 "Buildings: #1 storage level 1 [10, 64, 0]-[12, 66, 3].",
                 "Buildings: #1 storage level 1 [10, 64, 0]-[12, 66, 3].",
-            ])
+            ], reader)
         self.assertEqual(totals, {"minecraft:coal": 4, "minecraft:birch_log": 16})
-        opened.assert_called_once()
+        opened.assert_called_once_with(probe, (10, 64, 1))
+        reader.assert_not_called()
         self.assertEqual(detail["storage_observation"]["containers"][0]["positions"],
                          [[10, 64, 1], [11, 64, 1]])
 
@@ -375,46 +400,123 @@ class SettlementStockObservationTests(unittest.TestCase):
         first = {"blocks": [], "truncated": True, "next_offset": 128}
         last = {"blocks": [{"x": 12, "y": 64, "z": 1, "block_id": "minecraft:barrel"}]}
         probe.call.side_effect = [first, last]
+        reader = Mock(return_value={"minecraft:coal": 1})
         with patch.object(qa, "_read", return_value={"block_id": "minecraft:chest"}), patch.object(
             qa, "_open_chest", return_value={0: {"item_id": "minecraft:coal", "count": 1}},
         ):
-            self.assertEqual(qa._settlement_stock(probe, {}, (1, 64, 1), buildings),
+            self.assertEqual(qa._settlement_stock(probe, {}, (1, 64, 1), buildings, reader),
                              {"minecraft:coal": 2})
         self.assertEqual(probe.call.call_args_list[-1].args[1]["offset"], 128)
         probe.call.side_effect = None
         probe.call.return_value = {"blocks": [], "truncated": True, "next_offset": 0}
         with self.assertRaisesRegex(RuntimeError, "pagination"):
-            qa._settlement_stock(probe, {}, (1, 64, 1), buildings)
+            qa._settlement_stock(probe, {}, (1, 64, 1), buildings, reader)
 
-
-    def test_adjacent_large_chests_do_not_pair_across_inventory_boundaries(self) -> None:
+    def test_adjacent_large_chests_sum_each_physical_half_once(self) -> None:
         probe = Mock()
         probe.call.return_value = {"blocks": [
             {"x": x, "y": 64, "z": 1, "block_id": "minecraft:chest",
              "properties": {"type": "left" if x % 2 == 0 else "right", "facing": "north"}}
             for x in range(10, 14)
         ]}
-        with patch.object(qa, "_read", return_value={"block_id": "minecraft:air"}), patch.object(
-            qa, "_open_chest", return_value={0: {"item_id": "minecraft:coal", "count": 4}},
-        ) as opened:
+        reader = Mock(return_value={"minecraft:coal": 2})
+        with patch.object(qa, "_open_chest", return_value={
+            0: {"item_id": "minecraft:coal", "count": 4},
+        }) as opened:
             totals = qa._settlement_stock(probe, {}, (10, 64, 1), [
                 "Buildings: #1 storage level 1 [10, 64, 0]-[13, 66, 3].",
-            ])
+            ], reader)
         self.assertEqual(totals, {"minecraft:coal": 8})
-        self.assertEqual(opened.call_count, 2)
+        opened.assert_called_once_with(probe, (10, 64, 1))
+        self.assertEqual([call.args[0] for call in reader.call_args_list], [(12, 64, 1), (13, 64, 1)])
+
+    def test_storage_read_failure_records_reason_without_partial_total(self) -> None:
+        probe = Mock()
+        probe.call.return_value = {"blocks": [
+            {"x": 12, "y": 64, "z": 1, "block_id": "minecraft:barrel"},
+        ]}
+        detail = {}
+        with patch.object(qa, "_read", return_value={"block_id": "minecraft:chest"}), patch.object(
+            qa, "_open_chest", return_value={},
+        ), self.assertRaisesRegex(TimeoutError, "storage read"):
+            qa._settlement_stock(probe, detail, (1, 64, 1), [
+                "Buildings: #1 storage level 1 [10, 64, 0]-[13, 66, 3].",
+            ], Mock(side_effect=TimeoutError("storage read timed out")))
+        observation = detail["storage_observation"]
+        self.assertFalse(observation["complete"])
+        self.assertNotIn("totals", observation)
+        self.assertIn("storage read timed out", observation["containers"][-1]["error"])
 
     def test_planner_receipt_uses_the_aggregate_storage_observation(self) -> None:
         detail = {}
-        probe = Mock()
+        probe, reader = Mock(), Mock()
         buildings = ["Buildings: #1 storage level 1 [10, 64, 0]-[13, 66, 3]."]
         with patch.object(qa, "_send", side_effect=[
             {"recent_chat": ["Projects"]}, {"recent_chat": buildings},
         ]), patch.object(qa, "_settlement_stock", return_value={
             "minecraft:cobblestone": 190, "minecraft:acacia_log": 37,
         }) as stock:
-            status = qa._planner_status(probe, detail, (1, 64, 1))
-        stock.assert_called_once_with(probe, detail, (1, 64, 1), buildings)
+            status = qa._planner_status(probe, detail, (1, 64, 1), reader)
+        stock.assert_called_once_with(probe, detail, (1, 64, 1), buildings, reader)
         self.assertEqual(status["storage_now"]["minecraft:cobblestone"], 190)
+
+
+class ServerStorageReadTests(unittest.TestCase):
+    def test_snbt_reads_only_direct_item_fields_not_nested_component_decoys(self) -> None:
+        source = ('{Items: [{Slot: 0b, components: {"example:metadata": '
+                  '{id: "minecraft:diamond", count: 999, text: "escaped \\"[,]}" }}, '
+                  'count: 4, id: "minecraft:coal"}, '
+                  '{Slot: 1b, count: 2, id: "minecraft:coal"}], id: "minecraft:chest", x: 12}')
+        self.assertEqual(qa._container_totals(source), {"minecraft:coal": 6})
+        self.assertEqual(qa._container_totals('{id: "minecraft:chest"}'), {})
+        self.assertEqual(qa._container_totals('{Items: []}'), {})
+        for malformed in ('{Items: [', '{Items: [{id: "minecraft:coal"}]}',
+                          '{Items: [{id: "minecraft:coal", count: -1}]}'):
+            with self.subTest(source=malformed), self.assertRaises(ValueError):
+                qa._container_totals(malformed)
+
+    def test_console_reads_fresh_live_block_response_without_player_tools(self) -> None:
+        with TemporaryDirectory() as folder:
+            log = Path(folder) / "server.log"
+            prefix = "12, 64, 1 has the following block data: "
+            log.write_text(prefix + '{Items: [{count: 999, id: "minecraft:diamond"}]}\n')
+            server = SimpleNamespace(stdin=io.BytesIO())
+
+            def event(path, timeout, condition):
+                self.assertEqual(path, log)
+                self.assertEqual(timeout, 15.0)
+                self.assertFalse(condition()[0], "a stale answer must not satisfy this read")
+                with log.open("a") as stream:
+                    stream.write(prefix + '{Items: [{count: 4, id: "minecraft:coal"}]}\n')
+                reached, value = condition()
+                self.assertTrue(reached)
+                return value
+
+            with patch.object(qa.runtime, "wait_for_path_condition", side_effect=event):
+                self.assertEqual(qa._read_storage_container(server, log, (12, 64, 1), 15.0),
+                                 {"minecraft:coal": 4})
+            self.assertEqual(server.stdin.getvalue(), b"data get block 12 64 1\n")
+
+    def test_console_timeout_and_refusal_fail_closed_with_bounded_wait(self) -> None:
+        with TemporaryDirectory() as folder:
+            log = Path(folder) / "server.log"
+            log.touch()
+            server = SimpleNamespace(stdin=io.BytesIO())
+            with patch.object(qa.runtime, "wait_for_path_condition",
+                              side_effect=TimeoutError("storage read timed out")) as wait:
+                with self.assertRaisesRegex(TimeoutError, "storage read"):
+                    qa._read_storage_container(server, log, (12, 64, 1), 15.0)
+            self.assertEqual(wait.call_args.args[1], 15.0)
+
+            def refused(path, timeout, condition):
+                log.write_text("That position is not loaded\n")
+                reached, value = condition()
+                self.assertTrue(reached)
+                return value
+
+            with patch.object(qa.runtime, "wait_for_path_condition", side_effect=refused):
+                with self.assertRaisesRegex(RuntimeError, "That position is not loaded"):
+                    qa._read_storage_container(server, log, (12, 64, 1), 15.0)
 
 
 if __name__ == "__main__":

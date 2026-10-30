@@ -54,15 +54,28 @@ class ProbeSteps:
             raise RuntimeError(f"{self.report['id']} assertion failed: {name}")
 
     def wait(self, predicate: Callable[[dict[str, Any]], bool], label: str,
-             *, wait_for_play: bool = False) -> dict[str, Any]:
-        state = self.observe(wait_for_play=wait_for_play)
-        while not predicate(state):
-            self.call("minecraft_wait_for_state_change", {
-                "observed_version": state["state_version"], "timeout_seconds": self.remaining(),
-            })
-            state = self.observe(wait_for_play=wait_for_play)
-        self.check(label, True)
-        return state
+             *, wait_for_play: bool = False,
+             timeout_seconds: float | None = None) -> dict[str, Any]:
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        try:
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"{self.report['id']} timed out waiting for {label}")
+                state = self.observe(wait_for_play=wait_for_play)
+                if predicate(state):
+                    self.check(label, True)
+                    return state
+                remaining = self.remaining()
+                if deadline is not None:
+                    remaining = min(remaining, deadline - time.monotonic())
+                    if remaining <= 0:
+                        continue
+                self.call("minecraft_wait_for_state_change", {
+                    "observed_version": state["state_version"], "timeout_seconds": remaining,
+                })
+        except TimeoutError:
+            self.report["assertions"][label] = False
+            raise
 
     def fixture(self, command: str) -> None:
         """Record privileged fixture setup separately from player action evidence."""

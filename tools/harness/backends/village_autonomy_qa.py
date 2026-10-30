@@ -273,6 +273,7 @@ def _open_chest(probe: ProbeSteps, chest: tuple[int, int, int]) -> dict[int, dic
             and (observed.get("container") or {}).get("container_id", 0) > 0
         ),
         "founding_chest_opened",
+        timeout_seconds=15.0,
     )
     container = state["container"]
     storage_slots = int(container["slot_count"]) - 36
@@ -339,11 +340,104 @@ def _chest_totals(slots: dict[int, dict[str, Any]]) -> dict[str, int]:
     return totals
 
 
+def _snbt_parts(source: str) -> list[str]:
+    """Split the server's SNBT at top-level commas, not inside components."""
+    parts, stack = [], []
+    start, quoted, escaped = 0, False, False
+    for index, char in enumerate(source):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if not stack or stack.pop() != char:
+                raise ValueError("unbalanced container SNBT")
+        elif char == "," and not stack:
+            parts.append(source[start:index].strip())
+            start = index + 1
+    if quoted or stack:
+        raise ValueError("incomplete container SNBT")
+    if source.strip():
+        parts.append(source[start:].strip())
+    if any(not part for part in parts):
+        raise ValueError("empty container SNBT field")
+    return parts
+
+
+def _snbt_fields(source: str) -> dict[str, str]:
+    source = source.strip()
+    if not (source.startswith("{") and source.endswith("}")):
+        raise ValueError("expected container SNBT compound")
+    fields = {}
+    for part in _snbt_parts(source[1:-1]):
+        match = re.fullmatch(r'("(?:\\.|[^"\\])*"|[A-Za-z0-9._+-]+)\s*:\s*(.+)', part, re.S)
+        if match is None:
+            raise ValueError("invalid container SNBT field")
+        key, value = match.groups()
+        key = json.loads(key) if key.startswith('"') else key
+        if key in fields:
+            raise ValueError(f"duplicate container SNBT field: {key}")
+        fields[key] = value
+    return fields
+
+
+def _container_totals(source: str) -> dict[str, int]:
+    """Read one physical block's live Items; absent Items means an empty block."""
+    items = _snbt_fields(source).get("Items", "[]").strip()
+    if not (items.startswith("[") and items.endswith("]")):
+        raise ValueError("expected container Items list")
+    totals: dict[str, int] = {}
+    for item in _snbt_parts(items[1:-1]):
+        fields = _snbt_fields(item)
+        item_id = json.loads(fields.get("id", "null"))
+        count = int(fields.get("count", ""))
+        if not isinstance(item_id, str) or not item_id or count <= 0:
+            raise ValueError("invalid container item identity or count")
+        if item_id != "minecraft:air":
+            totals[item_id] = totals.get(item_id, 0) + count
+    return totals
+
+
+def _read_storage_container(
+    server: subprocess.Popen[Any], log_path: Path, pos: tuple[int, int, int], timeout: float,
+) -> dict[str, int]:
+    """Read live storage through the existing read-only server console command."""
+    if server.stdin is None:
+        raise RuntimeError("server console is unavailable for storage observation")
+    offset = log_path.stat().st_size
+    x, y, z = pos
+    command = f"data get block {x} {y} {z}"
+    prefix = f"{x}, {y}, {z} has the following block data: "
+    server.stdin.write((command + "\n").encode())
+    server.stdin.flush()
+
+    def replied() -> tuple[bool, str]:
+        with log_path.open("rb") as stream:
+            stream.seek(offset)
+            lines = stream.read().decode(errors="replace").splitlines()
+        for line in lines:
+            if line.startswith(prefix):
+                return True, line
+            if line in ("That position is not loaded", "The target block is not a block entity") or line.startswith("Command failed:"):
+                raise RuntimeError(f"storage read refused {command!r}: {line}")
+        return False, ""
+
+    answer = runtime.wait_for_path_condition(log_path, timeout, replied)
+    return _container_totals(answer.removeprefix(prefix))
+
+
 def _settlement_stock(
     probe: ProbeSteps, detail: dict[str, Any], founding: tuple[int, int, int],
-    building_lines: list[str],
+    building_lines: list[str], read_container: Callable[[tuple[int, int, int]], dict[str, int]],
 ) -> dict[str, int]:
-    """Observe real container menus in the founding chest and owned Storage bounds."""
+    """Keep the founding menu proof; read inaccessible Storage from the live server."""
     storage_blocks = {"minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel"}
     blocks: dict[tuple[int, int, int], dict[str, Any]] = {}
     for building in _listed_buildings(building_lines):
@@ -373,6 +467,8 @@ def _settlement_stock(
 
     totals: dict[str, int] = {}
     containers = []
+    observation: dict[str, Any] = {"containers": containers, "complete": False}
+    detail["storage_observation"] = observation
     observed = set()
     for pos, block in sorted(blocks.items()):
         members = {pos}
@@ -396,11 +492,27 @@ def _settlement_stock(
         if identity in observed:
             continue
         observed.add(identity)
-        stock = _chest_totals(_open_chest(probe, pos))
-        containers.append({"positions": [list(member) for member in identity], "totals": stock})
+        entry: dict[str, Any] = {
+            "positions": [list(member) for member in identity],
+            "source": "client-menu" if founding in members else "server-data-get-block",
+        }
+        containers.append(entry)
+        try:
+            if founding in members:
+                stock = _chest_totals(_open_chest(probe, founding))
+            else:
+                stock = {}
+                # /data reads a physical block, unlike the client's merged menu.
+                for member in identity:
+                    for item, count in read_container(member).items():
+                        stock[item] = stock.get(item, 0) + count
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        entry["totals"] = stock
         for item, count in stock.items():
             totals[item] = totals.get(item, 0) + count
-    detail["storage_observation"] = {"containers": containers, "totals": totals}
+    observation.update(totals=totals, complete=True)
     return totals
 
 
@@ -495,8 +607,9 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         env = os.environ.copy()
         env["SOLARIS_HARNESS_LOG_STDOUT"] = "1"
         server = subprocess.Popen(
-            [str(binary), "--config", str(config), "--no-console"],
+            [str(binary), "--config", str(config)],
             cwd=runtime.REPO_ROOT,
+            stdin=subprocess.PIPE,
             stdout=server_log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -518,7 +631,10 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
                 native_client.capture(mcp, artifact, "autonomy-spawn")
             detail: dict[str, Any] = {"behaviour": {}, "evidence": {}, "repro": {}}
             probe.report["autonomy_acceptance"] = detail
-            _scenario(probe, detail, ctx, artifact, address, display, timeout, capture_peer)
+            def read_container(pos: tuple[int, int, int]) -> dict[str, int]:
+                return _read_storage_container(server, server_log_path, pos, min(15.0, probe.remaining()))
+
+            _scenario(probe, detail, ctx, artifact, address, display, timeout, read_container, capture_peer)
             if ctx.windowed:
                 native_client.capture(mcp, artifact, "autonomy-final")
             before = _wait_project_started(probe)
@@ -542,12 +658,14 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
             runtime.stop_process(server, interrupt=True, timeout_seconds=90.0)
             detail["restart_shutdown_seconds"] = time.monotonic() - shutdown_started
             probe.check("restart_server_cleanly_stopped", server.returncode == 0)
+            if server.stdin is not None:
+                server.stdin.close()
             server_log.close()
             server_log_path = artifact / "server-restart.log"
             server_log = server_log_path.open("wb")
             server = subprocess.Popen(
-                [str(binary), "--config", str(config), "--no-console"],
-                cwd=runtime.REPO_ROOT, stdout=server_log, stderr=subprocess.STDOUT,
+                [str(binary), "--config", str(config)],
+                cwd=runtime.REPO_ROOT, stdin=subprocess.PIPE, stdout=server_log, stderr=subprocess.STDOUT,
                 start_new_session=True, env=env,
             )
             ctx.logs.append(str(server_log_path))
@@ -595,6 +713,8 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
             ctx.exits[active_client_evidence["command_index"]] = client_process.returncode
             _client_log.close()
         runtime.stop_process(server, interrupt=True)
+        if server is not None and server.stdin is not None:
+            server.stdin.close()
         runtime.stop_process(xvfb)
         if peer_log is not None:
             try:
@@ -707,6 +827,7 @@ def _scenario(
     address: str,
     display: str | None,
     timeout: float,
+    read_container: Callable[[tuple[int, int, int]], dict[str, int]],
     peer_ready: Callable[[tuple[Any, Any, Any], int], None],
 ) -> None:
     from . import native_client as _nc
@@ -887,7 +1008,7 @@ def _scenario(
             last_check = time.monotonic()
             growth_rounds += 1
             buildings = _recent_chat(_send(probe, "settlement building list"), 25)
-            totals_now = _settlement_stock(probe, detail, chest_pos, buildings)
+            totals_now = _settlement_stock(probe, detail, chest_pos, buildings, read_container)
             produced = {k: v for k, v in totals_now.items() if v > 0}
             state_now = probe.observe()
             time_info = state_now.get("time", {})
@@ -918,7 +1039,7 @@ def _scenario(
     any_stock = bool(totals_now)
     _verdict(detail, "workers_produce_unfunded", "PASS" if grown else "FAIL",
              f"storage={totals_now} over {detail['storage_observe_ticks']} game ticks (time add {day_advanced})",
-             "open all settlement storage containers; combined stock must cover Storage-L1 base needs with no /give")
+             "observe founding menu and live server Storage items; combined stock must cover Storage-L1 base needs with no /give")
     if not grown:
         # Builders consume stock while workers deliver it. A later, fully
         # client-verified Storage also proves its canonical material bill.
@@ -947,7 +1068,7 @@ def _scenario(
     if not storage_done:
         # Fail-closed but observed: record planner status + census, then stop
         # before the progress waiter (it needs the storage record).
-        detail["planner_status"] = _planner_status(probe, detail, chest_pos)
+        detail["planner_status"] = _planner_status(probe, detail, chest_pos, read_container)
         detail["residents_at_storage_fail"] = _resident_census(probe, detail)
         probe.check("storage_l1_built", False)
         return None
@@ -966,7 +1087,7 @@ def _scenario(
         probe, detail, ctx, artifact, 180.0 if _skip_to_growth else 1500.0)
     # Non-gating observations: record what the planner is doing (active
     # project? funded? waiting on which material?) without failing the run.
-    detail["planner_status"] = _planner_status(probe, detail, chest_pos)
+    detail["planner_status"] = _planner_status(probe, detail, chest_pos, read_container)
     _verdict(detail, "builder_completes_further_building", "PASS" if further else "FAIL",
              str(detail.get("further_building")), "another authored building must match before claim")
     _verdict(detail, "builder_completes_autonomous_upgrade", "PASS" if upgraded else "FAIL",
@@ -1442,7 +1563,10 @@ def _wait_autonomous_progress(
     return further, upgraded
 
 
-def _planner_status(probe: ProbeSteps, detail: dict[str, Any], chest_pos: tuple[int, int, int]) -> dict[str, Any]:
+def _planner_status(
+    probe: ProbeSteps, detail: dict[str, Any], chest_pos: tuple[int, int, int],
+    read_container: Callable[[tuple[int, int, int]], dict[str, int]],
+) -> dict[str, Any]:
     """Non-gating read of what the autonomous planner is doing right now."""
     status: dict[str, Any] = {}
     try:
@@ -1452,7 +1576,7 @@ def _planner_status(probe: ProbeSteps, detail: dict[str, Any], chest_pos: tuple[
     status["buildings_now"] = _recent_chat(_send(probe, "settlement building list"), 25)
     try:
         status["storage_now"] = _settlement_stock(
-            probe, detail, chest_pos, status["buildings_now"],
+            probe, detail, chest_pos, status["buildings_now"], read_container,
         )
     except Exception as exc:
         status["storage_error"] = str(exc)[:300]
