@@ -100,6 +100,12 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     server_view = scenario.get("server_view_distance", 4)
     if type(server_view) is not int or not 2 <= server_view <= 32:
         raise ValueError("server_view_distance must be in 2..32")
+    spawn_protection = scenario.get("spawn_protection", 0)
+    if type(spawn_protection) is not int or spawn_protection < 0:
+        raise ValueError("spawn_protection must be a non-negative integer")
+    operator = scenario.get("operator", True)
+    if type(operator) is not bool:
+        raise ValueError("operator must be true or false")
     settings = scenario.get("client_settings", {})
     if not isinstance(settings, dict) or set(settings) - {"graphics_preset", "render_distance"}:
         raise ValueError("unsupported client settings")
@@ -123,7 +129,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     port = runtime.reserve_port()
     config = artifact / "scene-shot.toml"
     source = (runtime.REPO_ROOT / "playable.toml").read_text()
-    replacements = (("[server]", "[server]\nspawn_protection = 0"),
+    replacements = (("[server]", f"[server]\nspawn_protection = {spawn_protection}"),
                     ("view_distance = 4", f"view_distance = {server_view}"),
                     ("port = 25565", f"port = {port}"),
                     ('world_dir = ".analysis/test-world-v12"', f'world_dir = {json.dumps(str(artifact / "world"))}'),
@@ -137,7 +143,8 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     if scenario.get("world"):
         shutil.copytree(Path(scenario["world"]).expanduser().resolve(), artifact / "world")
     (artifact / "plugins").mkdir()
-    prepare_operator_fixture(ctx, [USERNAME])
+    if operator:
+        prepare_operator_fixture(ctx, [USERNAME])
     xdg = artifact / "xdg"
     settings_path = xdg / "solaris-client" / "client-settings.json"
     source_root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "solaris-client"
