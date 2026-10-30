@@ -43,6 +43,18 @@ pass. Unknown profiles, unlaunchable or nonzero commands, and missing
 scenario evidence fail closed with a nonzero exit. Every timeout is failure,
 never success.
 
+`scene-shot` runs scripted real native-client captures: set `SOLARIS_SERVER_BINARY`,
+`SOLARIS_CLIENT_BINARY`, the native resource environment and `SCENE_SHOT_SCENARIO`
+to a JSON file, then run `python3 -m tools.harness run scene-shot --client native
+--windowed`. The JSON contains `steps` with one of `cmd`, `tp` (five coordinates),
+`wait_ticks`, `wait_play`, `shot`, `observe`, `use_item_on`,
+`click_screen_button`, `scan_blocks`, `read_block`, `navigate_to_block`,
+`list_entities`, or `key` (`keys` and `ticks` MCP arguments; released when
+the step finishes). Optional `seed` defaults to 100, `world` copies an existing
+world, `server_view_distance` defaults to 4, and `client_settings` accepts
+`graphics_preset` and `render_distance`. PNG paths are recorded in `result.json`;
+settings and world are isolated per run.
+
 ## Profiles
 
 | Profile | Scope | Recipe |

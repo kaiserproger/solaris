@@ -440,7 +440,7 @@ def cmd_run(argv: list[str]) -> int:
             raise ValueError("--plugins-dir requires native gameplay, java-v2-p5-towns, loader-live or graves")
         if ctx.windowed and client != "native":
             raise ValueError("--windowed requires --client native")
-        if client == "native" and profile not in {"survival", "inventory", "entities", "core-client", "native-lifecycle", "logical-native", "native-scale", "title-connect", "dialogs", "admin-commands", "chisel", "anti-xray", "block-log", "village-qa", "village-autonomy-qa", "claim-only-qa", "buildings-qa", "army-qa"}:
+        if client == "native" and profile not in {"survival", "inventory", "entities", "core-client", "native-lifecycle", "logical-native", "native-scale", "title-connect", "dialogs", "admin-commands", "chisel", "anti-xray", "block-log", "village-qa", "village-autonomy-qa", "scene-shot", "claim-only-qa", "buildings-qa", "army-qa"}:
             raise RuntimeError(
                 f"profile {profile!r} is not enabled for native; "
                 "supported shared Python minecraft_* profiles: survival, inventory, entities, core-client subset, native-lifecycle, logical-native, native-scale. "
