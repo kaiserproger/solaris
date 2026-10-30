@@ -468,9 +468,15 @@ def start_client(
         )
     task = ":fabric-agent:runClientMcp" if platform is None else f":loader-{platform}:runClientMcp"
     env = os.environ.copy()
+    # The client must only ever use the harness-owned Xvfb, never the owner's desktop.
+    env.pop("WAYLAND_DISPLAY", None)
     env.update(
         {
             "DISPLAY": display,
+            "SDL_VIDEODRIVER": "x11",
+            "SDL_VIDEO_DRIVER": "x11",
+            "GDK_BACKEND": "x11",
+            "XDG_SESSION_TYPE": "x11",
             "SOLARIS_CLIENT_MCP_TOKEN": token,
             "SOLARIS_CLIENT_MCP_PORT": str(mcp_port),
             "SOLARIS_CLIENT_MCP_GAME_DIR": str(game_dir),
