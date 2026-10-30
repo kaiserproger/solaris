@@ -64,6 +64,7 @@ async fn writer_pair() -> (
         Arc::new(NetCounters::new()),
         Arc::new(ConnectionRegistry::new()),
         ConnectionId(1),
+        uuid::Uuid::nil(),
         PlayReceivers {
             reliable: reliable_rx,
             world: world_rx,
@@ -82,6 +83,71 @@ async fn writer_pair() -> (
 }
 
 #[tokio::test]
+async fn keepalive_round_trip_reaches_player_info_wire() {
+    use mc_protocol::packets::play::{ClientboundKeepAlive, PlayerInfoActions, PlayerInfoUpdate};
+    let (mut client, _reader, _task, replies, _reliable, _world) = writer_pair().await;
+    tokio::time::pause();
+    let challenge = client.read_frame_play().await.unwrap();
+    let challenge = ClientboundKeepAlive::decode(&mut &challenge.body[..]).unwrap();
+    tokio::time::advance(Duration::from_millis(160)).await;
+    replies.send(challenge.id).await.unwrap();
+    tokio::task::yield_now().await;
+    let frame = client.read_frame_play().await.unwrap();
+    assert_eq!(frame.id, PlayerInfoUpdate::ID);
+    let update = PlayerInfoUpdate::decode(&mut &frame.body[..]).unwrap();
+    assert_eq!(update.actions, PlayerInfoActions::UPDATE_LATENCY);
+    assert_eq!(update.entries.len(), 1);
+    assert!(update.entries[0].latency >= 40);
+    assert_eq!(update.entries[0].profile_id, uuid::Uuid::nil());
+}
+
+#[tokio::test]
+async fn measured_latency_is_broadcast_to_other_players() {
+    use mc_protocol::frame::{Compression, try_decode_frame};
+    use mc_protocol::packets::play::{ClientboundKeepAlive, PlayerInfoActions, PlayerInfoUpdate};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let (_, writer) = crate::connection::Connection::new(socket).into_play_halves();
+    let registry = Arc::new(ConnectionRegistry::new());
+    let other = registry.joining_id();
+    let (other_tx, mut other_rx) = mpsc::channel(4);
+    registry.register(other, ConnectionHandles {
+        reliable_tx: other_tx,
+        world_tx: mpsc::channel(1).0,
+    }).unwrap();
+    let (replies, reply_rx) = mpsc::channel(1);
+    let (_reliable, reliable_rx) = mpsc::channel(1);
+    let (_world, world_rx) = mpsc::channel(1);
+    let profile = uuid::Uuid::from_u128(42);
+    let _task = tokio::spawn(play_writer(
+        writer, Arc::new(NetCounters::new()), registry, ConnectionId(99), profile,
+        PlayReceivers { reliable: reliable_rx, world: world_rx, dh: mpsc::channel(1).1, keepalive: reply_rx },
+    ));
+    let mut client = crate::connection::Connection::new(client);
+    tokio::time::pause();
+    let frame = client.read_frame_play().await.unwrap();
+    let challenge = ClientboundKeepAlive::decode(&mut &frame.body[..]).unwrap();
+    tokio::time::advance(Duration::from_millis(160)).await;
+    replies.send(challenge.id).await.unwrap();
+    tokio::task::yield_now().await;
+    let wire = other_rx.recv().await.unwrap();
+    let mut wire = bytes::BytesMut::from(&wire[..]);
+    let frame = try_decode_frame(&mut wire, Compression::Threshold(256)).unwrap().unwrap();
+    assert_eq!(frame.id, PlayerInfoUpdate::ID);
+    let update = PlayerInfoUpdate::decode(&mut &frame.body[..]).unwrap();
+    assert_eq!(update.actions, PlayerInfoActions::UPDATE_LATENCY);
+    assert_eq!(update.entries[0].profile_id, profile);
+    assert!(update.entries[0].latency >= 40);
+}
+
+#[test]
+fn keepalive_latency_uses_weighted_round_trip() {
+    assert_eq!(smooth_latency(0, 160), 40);
+    assert_eq!(smooth_latency(40, 80), 50);
+}
+
+#[tokio::test]
 async fn keepalive_requires_matching_echo_and_times_out_quiet_readers() {
     let (mut client, _reader, task, replies, _reliable, _world) = writer_pair().await;
     tokio::time::pause();
@@ -93,6 +159,8 @@ async fn keepalive_requires_matching_echo_and_times_out_quiet_readers() {
     let mut body = frame.body;
     let first = mc_protocol::packets::play::ClientboundKeepAlive::decode(&mut body).unwrap();
     replies.send(first.id).await.unwrap();
+    let update = client.read_frame_play().await.unwrap();
+    assert_eq!(update.id, mc_protocol::packets::play::PlayerInfoUpdate::ID);
     let frame = client.read_frame_play().await.unwrap();
     let mut body = frame.body;
     let second = mc_protocol::packets::play::ClientboundKeepAlive::decode(&mut body).unwrap();
@@ -144,6 +212,8 @@ async fn checkpoint_wait_keeps_play_echoes_live_and_preserves_queued_input_order
     // The checkpoint completion remains withheld for four 15-second heartbeat
     // intervals: longer than both the observed 45s save and the 30s echo deadline.
     for _ in 0..4 {
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
         let frame = client
             .read_frame_play()
             .await
@@ -154,6 +224,9 @@ async fn checkpoint_wait_keeps_play_echoes_live_and_preserves_queued_input_order
             .send_packet(&ServerboundKeepAlive { id: challenge.id })
             .await
             .unwrap();
+        let update = client.read_frame_play().await.unwrap();
+        assert_eq!(update.id, mc_protocol::packets::play::PlayerInfoUpdate::ID);
+        tokio::time::pause();
     }
     finish.send(()).unwrap();
     let (result, mut pending) = waiting.await.unwrap();
@@ -273,6 +346,7 @@ async fn edge_kick_flushes_terminal_packet_after_an_earlier_reliable_batch() {
             Arc::new(NetCounters::new()),
             Arc::clone(&server.connections),
             id,
+            uuid::Uuid::nil(),
             PlayReceivers {
                 reliable: reliable_rx,
                 world: world_rx,

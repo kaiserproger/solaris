@@ -1526,6 +1526,73 @@ async fn start_minimal_server(
 
 #[test]
 #[ignore = "real TCP server gate; needs the native content cache"]
+fn spawn_protected_door_repairs_both_halves_before_ack_on_wire() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let directory = TestDirectory::new();
+            let name = "DoorWire";
+            let (core, address, task) = start_minimal_server(
+                &directory,
+                "door-wire",
+                |cfg| cfg.server.spawn_protection = 256,
+                |admin| admin.set_op(crate::crypto::offline_uuid(name), name, true).unwrap(),
+            ).await;
+            let manifest = mc_loader::LoaderManifest::from_script_bundles(core.plugin_client_bundles()).unwrap();
+            let mut client = WireClient::connect(address, name, &manifest).await;
+            let [x, _, z] = core.world_spawn();
+            client.command("op SpareOperator", &["Command op completed"]).await;
+            client.command(&format!("setblock {x} 200 {z} minecraft:stone"), &["Changed 1 block(s)"]).await;
+            for (y, half) in [(201, "lower"), (202, "upper")] {
+                client.command(
+                    &format!("setblock {x} {y} {z} minecraft:oak_door[facing=north,half={half},hinge=left,open=false,powered=false]"),
+                    &["Changed 1 block(s)"],
+                ).await;
+            }
+            let position = [f64::from(x) + 0.5, 201.0, f64::from(z) + 2.5];
+            client.command(
+                &format!("tp {name} {} {} {}", position[0], position[1], position[2]),
+                &["commands.teleport.success", name],
+            ).await;
+            client.position(position).await;
+            client.command(&format!("deop {name}"), &["Command deop completed"]).await;
+            client.pending.clear();
+            client.send(&ServerboundUseItemOn {
+                hand: InteractionHand::MainHand,
+                position: pack_block_pos(x, 201, z),
+                direction: Direction::South,
+                cursor_x: 0.5,
+                cursor_y: 0.5,
+                cursor_z: 0.5,
+                inside: false,
+                world_border_hit: false,
+                sequence: 37,
+            }).await;
+            let mut lower = false;
+            let mut upper = false;
+            tokio::time::timeout(DEADLINE, async {
+                loop {
+                    match client.next().await {
+                        WireEvent::Block(update) if update.position == pack_block_pos(x, 201, z) => lower = true,
+                        WireEvent::Block(update) if update.position == pack_block_pos(x, 202, z) => upper = true,
+                        WireEvent::Ack(ack) if ack.sequence == 37 => break,
+                        WireEvent::Disconnect(reason) => panic!("unexpected disconnect: {reason}"),
+                        _ => {}
+                    }
+                }
+            }).await.expect("protected use must receive its ack");
+            assert!(lower && upper, "both authoritative door updates must precede ack: lower={lower}, upper={upper}");
+            core.shutdown();
+            task.abort();
+        });
+}
+
+#[test]
+#[ignore = "real TCP server gate; needs the native content cache"]
 fn real_moderation_limits_gate() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
