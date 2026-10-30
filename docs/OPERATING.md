@@ -667,7 +667,9 @@ Handshake, Status and Login share one absolute 30-second deadline;
 Configuration has its own individual read and resource-pack deadlines. Play sends a fresh
 keepalive challenge every 15 seconds when none is outstanding, accepts only
 its matching echo, and closes after 30 seconds without that reply. Ordinary
-traffic and partial inbound frames do not renew that challenge.
+traffic and partial inbound frames do not renew that challenge. Each matching
+echo measures the round trip; the smoothed value (vanilla weighting) is what
+the player list shows as every player's ping.
 
 With `require_plugin_login`, a pending claimant receives an empty, temporary
 presentation at a fresh spawn, not the saved inventory, vitals, XP, position or
