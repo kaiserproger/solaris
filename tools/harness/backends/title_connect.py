@@ -156,7 +156,6 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
                 "expected_title": direct["screen"]["title"],
                 "button_label": "Join Server",
             })
-            native_client.capture(mcp, artifact, "step-title-loading")
             play = probe.call("minecraft_wait_for_play", {
                 "timeout_seconds": probe.remaining(),
             })
@@ -186,7 +185,6 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
                 "expected_title": direct["screen"]["title"],
                 "button_label": "Join Server",
             })
-            native_client.capture(mcp, artifact, "step-title-rejoin-loading")
             rejoined = probe.call("minecraft_wait_for_play", {"timeout_seconds": probe.remaining()})
             probe.check("remembered_connection_rejoins", rejoined.get("in_play") is True)
             native_client.capture(mcp, artifact, "step-title-rejoined")
