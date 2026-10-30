@@ -146,7 +146,8 @@ pub(crate) fn upgrade(
 }
 
 /// List the executor's settlement buildings. Public: no actor needed.
-/// Every entry shows id, kind, level and bounds.
+/// Every entry shows id, kind, level and bounds; autonomous natural worksites
+/// (a wild grove or quarry, not a built structure) end with `natural`.
 pub(crate) fn list(state: &TickState, executor: EntityId) -> Result<String, String> {
     let Some(id) = containing(state, executor) else {
         return Err(NO_SETTLEMENT.to_owned());
@@ -160,12 +161,17 @@ pub(crate) fn list(state: &TickState, executor: EntityId) -> Result<String, Stri
     let mut entries = Vec::with_capacity(record.buildings.len());
     for (building_id, building) in &record.buildings {
         entries.push(format!(
-            "#{} {} level {} {:?}-{:?}",
+            "#{} {} level {} {:?}-{:?}{}",
             building_id.0,
             building.kind.name(),
             building.level,
             building.bounds.min,
             building.bounds.max,
+            if building.natural_zone {
+                " natural"
+            } else {
+                ""
+            },
         ));
     }
     Ok(format!("Buildings: {}.", entries.join(", ")))

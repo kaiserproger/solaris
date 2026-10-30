@@ -223,6 +223,12 @@ fn list_is_public_and_shows_id_kind_level_bounds() {
     assert!(reply.starts_with("Buildings: #"), "{reply}");
     assert!(reply.contains("farmer level 1"), "{reply}");
     assert!(reply.contains("[3, 200, 3]-[7, 204, 7]"), "{reply}");
+    assert!(!reply.contains("natural"), "{reply}");
+    let id = state.settlements.records().next().unwrap().id;
+    let record = state.settlements.get_mut(id).unwrap();
+    record.buildings.values_mut().next().unwrap().natural_zone = true;
+    let reply = list(&state, executor).unwrap();
+    assert!(reply.contains("[3, 200, 3]-[7, 204, 7] natural"), "{reply}");
     let outsider = player(&mut state, [200.0, 201.0, 0.0]);
     assert_eq!(list(&state, outsider).unwrap_err(), NO_SETTLEMENT);
 }

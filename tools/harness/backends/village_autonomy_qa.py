@@ -1095,36 +1095,29 @@ NATURAL_STONE = ("stone", "andesite", "diorite", "granite", "deepslate", "tuff")
 
 
 def _natural_zones(probe: ProbeSteps, detail: dict[str, Any], lines: list[str]) -> bool:
-    """Client scan of the autonomous worksites: the lumber camp holds a wild tree
-    (a log under a non-persistent leaf crown, or the sapling its lumberjack
-    replanted) and the mine natural stone or ore. Authored camps and mines are
-    built from logs, planks and cobblestone, without leaves or saplings."""
-    sites = {r["kind"]: r for r in _listed_buildings(lines) if r["kind"] in ("lumber_camp", "mine")}
+    """The settlement lists a natural (autonomous, not built) lumber camp and
+    mine, and the client sees their resource: a log or the replanted sapling in
+    the camp, natural stone or ore in the mine."""
+    sites = {
+        r["kind"]: r for r in _listed_buildings(lines)
+        if r["kind"] in ("lumber_camp", "mine") and r["natural"]
+    }
     evidence: dict[str, Any] = {}
     for kind in ("lumber_camp", "mine"):
         record = sites.get(kind)
         if record is None:
-            evidence[kind] = "not listed"
+            evidence[kind] = "no natural site listed"
             continue
         lo, hi = list(record["min"]), list(record["max"])
-        if kind == "lumber_camp":
-            # The crown spreads two blocks around the trunk and above its top.
-            lo = [lo[0] - 2, lo[1], lo[2] - 2]
-            hi = [hi[0] + 2, hi[1] + 3, hi[2] + 2]
         if (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 4096:
             hi = [hi[0], min(hi[1], lo[1] + 1), hi[2]]
         scan = probe.call("minecraft_scan_blocks", {
             "min_x": lo[0], "min_y": lo[1], "min_z": lo[2],
             "max_x": hi[0], "max_y": hi[1], "max_z": hi[2],
         })
-        cells = [(_block_id(cell).removeprefix("minecraft:"), cell.get("properties") or {})
-                 for cell in scan.get("blocks", [])]
-        ids = {name for name, _ in cells}
+        ids = {_block_id(cell).removeprefix("minecraft:") for cell in scan.get("blocks", [])}
         if kind == "lumber_camp":
-            wild_crown = any(name.endswith("_leaves") and str(props.get("persistent")) == "false"
-                             for name, props in cells)
-            logs = [i for i in ids if i.endswith("_log") and not i.startswith("stripped_")]
-            found = (logs if wild_crown else []) + [i for i in ids if i.endswith("_sapling")]
+            found = [i for i in ids if (i.endswith("_log") and not i.startswith("stripped_")) or i.endswith("_sapling")]
         else:
             found = [i for i in ids if i in NATURAL_STONE or i.endswith("_ore")]
         evidence[kind] = {"bounds": [record["min"], record["max"]], "resource_blocks": sorted(found)}
@@ -1216,7 +1209,7 @@ def _wait_building_level(
 def _listed_buildings(lines: list[str]) -> list[dict[str, Any]]:
     pattern = re.compile(
         r"#(\d+)\s+(\w+)\s+level\s+(\d+)\s+"
-        r"\[(-?\d+),\s*(-?\d+),\s*(-?\d+)\]-\[(-?\d+),\s*(-?\d+),\s*(-?\d+)\]"
+        r"\[(-?\d+),\s*(-?\d+),\s*(-?\d+)\]-\[(-?\d+),\s*(-?\d+),\s*(-?\d+)\]( natural)?"
     )
     records = []
     seen = set()
@@ -1230,6 +1223,7 @@ def _listed_buildings(lines: list[str]) -> list[dict[str, Any]]:
                 "id": identity, "kind": match[2], "level": int(match[3]),
                 "min": [int(match[n]) for n in (4, 5, 6)],
                 "max": [int(match[n]) for n in (7, 8, 9)],
+                "natural": match[10] is not None,
             })
     return records
 
