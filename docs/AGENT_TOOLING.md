@@ -54,6 +54,8 @@ the step finishes). Optional `seed` defaults to 100, `world` copies an existing
 world, `server_view_distance` defaults to 4, and `client_settings` accepts
 `graphics_preset` and `render_distance`. PNG paths are recorded in `result.json`;
 settings and world are isolated per run.
+With a client supporting held MCP input, `{"shot":"tab","hold_keys":["key.keyboard.tab"]}`
+captures the visible player list and releases the key even if capture fails.
 
 ## Profiles
 

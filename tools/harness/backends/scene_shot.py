@@ -108,6 +108,22 @@ def wait_play(probe: ProbeSteps) -> None:
 def execute(probe: ProbeSteps, artifact: Path, steps: list[dict[str, Any]]) -> list[str]:
     shots = []
     for step in steps:
+        if isinstance(step, dict) and set(step) == {"shot", "hold_keys"}:
+            name, keys = step["shot"], step["hold_keys"]
+            if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
+                    or not isinstance(keys, list) or not keys or any(not isinstance(k, str) for k in keys)):
+                raise ValueError(f"invalid held screenshot: {step!r}")
+            args = {"keys": keys, "ticks": 1, "hold": True}
+            probe.call("minecraft_press_inputs", args)
+            try:
+                if "key.keyboard.tab" in keys:
+                    probe.wait(lambda state: any(str(node.get("id", "")).startswith("tab/player/")
+                                                  for node in state.get("ui_nodes", [])),
+                               "tab_list_visible")
+                shots.append(native_client.capture(probe.client, artifact, name)["retained_path"])
+            finally:
+                probe.call("minecraft_press_inputs", {**args, "hold": False})
+            continue
         if not isinstance(step, dict) or len(step) != 1:
             raise ValueError(f"invalid scene step: {step!r}")
         kind, value = next(iter(step.items()))

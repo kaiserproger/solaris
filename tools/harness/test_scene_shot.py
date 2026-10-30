@@ -91,3 +91,18 @@ class SceneShotTests(unittest.TestCase):
         self.assertEqual(probe.ticks, [("minecraft_wait_ticks", 100),
                                       ("minecraft_wait_ticks", 100),
                                       ("minecraft_wait_ticks", 50)])
+
+    def test_screenshot_holds_and_releases_tab_even_on_capture_failure(self):
+        events = []
+        class Probe:
+            client = object()
+            def call(self, name, args):
+                events.append(args["hold"])
+            def wait(self, predicate, label):
+                self.assert_visible = predicate({"ui_nodes": [{"id": "tab/player/1"}]})
+                assert self.assert_visible
+        probe = Probe()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(scene_shot.native_client, "capture", side_effect=RuntimeError("capture failed")):
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                scene_shot.execute(probe, Path(tmp), [{"shot": "tab", "hold_keys": ["key.keyboard.tab"]}])
+        self.assertEqual(events, [True, False])
