@@ -1,11 +1,14 @@
-"""Script a windowed native-client scene on an isolated v2 world."""
+"""Script a windowed native or vanilla-Java client scene on an isolated v2 world."""
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -13,10 +16,17 @@ from pathlib import Path
 from typing import Any
 
 from .. import runtime
+from ..mcp import McpClient
 from ..profiles import ProfileContext
-from . import native_client
+from . import java_p5, native_client
 from .gameplay import prepare_operator_fixture
 from .probe_steps import ProbeSteps
+
+# Both clients render the same fixed window; the vanilla client is only a
+# rendering oracle, so its camera/GUI options are pinned to the native defaults.
+WINDOW = (1280, 720)
+NATIVE_FOV = 70
+NATIVE_GUI_SCALE = 3
 
 USERNAME = "SceneShot"
 
@@ -100,6 +110,59 @@ class LatencyProxy:
         self.thread.join()
 
 
+def java_options(render_distance: int, fov: int) -> str:
+    # Java stores fov normalized: 70 -> 0.0 and 110 -> 1.0.
+    return (
+        "version:4790\nonboardAccessibility:false\n"
+        f"overrideWidth:{WINDOW[0]}\noverrideHeight:{WINDOW[1]}\n"
+        f"fov:{(fov - 70) / 40}\nguiScale:{NATIVE_GUI_SCALE}\nrenderDistance:{render_distance}\n"
+        f"simulationDistance:{min(render_distance, 12)}\nmaxFps:60\nenableVsync:false\n"
+        "pauseOnLostFocus:false\ntutorialStep:none\nsoundCategory_master:0.0\n"
+    )
+
+
+def find_java_window(display: str) -> int | None:
+    """The harness Xvfb hosts only this client: its largest top-level window is the game."""
+    tree = subprocess.run(["xwininfo", "-display", display, "-root", "-children"], check=True,
+                          capture_output=True, text=True).stdout
+    windows = [(int(w) * int(h), int(ident, 16))
+               for ident, w, h in re.findall(r"^\s+(0x[0-9a-f]+) .*?\s(\d+)x(\d+)\+-?\d+\+-?\d+", tree, re.M)]
+    return max(windows)[1] if windows else None
+
+
+def resize_java_window(owned: dict[str, Any]) -> None:
+    """OpenGL Java clients (26.1.x Loader) launch at 854x480 despite options.txt; match the native window."""
+    x = ctypes.CDLL(ctypes.util.find_library("X11"))
+    x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x.XResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]
+    x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    connection = x.XOpenDisplay(owned["display"].encode())
+    if not connection:
+        raise RuntimeError("cannot open the Java scenario's private Xvfb")
+    try:
+        x.XResizeWindow(connection, owned["window_id"], *WINDOW)
+        x.XSync(connection, 0)
+    finally:
+        x.XCloseDisplay(connection)
+
+
+def png_size(path: str) -> tuple[int, int]:
+    with open(path, "rb") as image:
+        header = image.read(24)
+    return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+
+
+def capture_java(probe: ProbeSteps, artifact: Path, name: str) -> str:
+    path = java_p5.capture(probe, name)
+    if png_size(path) != WINDOW:
+        raise RuntimeError(f"Java screenshot {path} is {png_size(path)}, expected {WINDOW}")
+    return path
+
+
+def capture_native(probe: ProbeSteps, artifact: Path, name: str) -> str:
+    return native_client.capture(probe.client, artifact, name)["retained_path"]
 
 
 def wait_play(probe: ProbeSteps) -> None:
@@ -112,10 +175,13 @@ def wait_play(probe: ProbeSteps) -> None:
             raise RuntimeError(f"client disconnected before play: {result['disconnect_reason']}")
 
 
-def execute(probe: ProbeSteps, artifact: Path, steps: list[dict[str, Any]]) -> list[str]:
+def execute(probe: ProbeSteps, artifact: Path, steps: list[dict[str, Any]], client: str = "native") -> list[str]:
+    capture = capture_java if client == "java" else capture_native
     shots = []
     for step in steps:
         if isinstance(step, dict) and set(step) == {"shot", "hold_keys"}:
+            if client == "java":
+                raise ValueError("hold_keys screenshots need the native tab-list state; unsupported for --client java")
             name, keys = step["shot"], step["hold_keys"]
             if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
                     or not isinstance(keys, list) or not keys or any(not isinstance(k, str) for k in keys)):
@@ -127,7 +193,7 @@ def execute(probe: ProbeSteps, artifact: Path, steps: list[dict[str, Any]]) -> l
                     probe.wait(lambda state: any(str(node.get("id", "")).startswith("tab/player/")
                                                   for node in state.get("ui_nodes", [])),
                                "tab_list_visible")
-                shots.append(native_client.capture(probe.client, artifact, name)["retained_path"])
+                shots.append(capture(probe, artifact, name))
             finally:
                 probe.call("minecraft_press_inputs", {**args, "hold": False})
             continue
@@ -138,7 +204,7 @@ def execute(probe: ProbeSteps, artifact: Path, steps: list[dict[str, Any]]) -> l
             if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
                 raise ValueError(f"invalid {kind} name: {value!r}")
             if kind == "shot":
-                shots.append(native_client.capture(probe.client, artifact, value)["retained_path"])
+                shots.append(capture(probe, artifact, value))
             else:
                 (artifact / f"{value}.json").write_text(json.dumps(probe.observe(), indent=2) + "\n")
         elif kind == "cmd" and isinstance(value, str) and value and not value.startswith("/"):
@@ -185,9 +251,41 @@ def execute(probe: ProbeSteps, artifact: Path, steps: list[dict[str, Any]]) -> l
     return shots
 
 
+def start_java(ctx: ProfileContext, artifact: Path, address: str, username: str, timeout: float,
+               display: str, render_distance: int, fov: int) -> tuple[Any, Any, McpClient]:
+    """Launch the vanilla Java client (loader MCP) and connect it to `address`."""
+    game_dir = artifact / "game"
+    game_dir.mkdir()
+    (game_dir / "options.txt").write_text(java_options(render_distance, fov))
+    token, mcp_port = secrets.token_urlsafe(32), runtime.reserve_port()
+    log_path = artifact / "client.log"
+    ctx.client_evidence["command_index"] = len(ctx.commands)
+    ctx.commands.append([str(runtime.AGENT_ROOT / "gradlew"), ":fabric-agent:runClientMcp"])
+    ctx.cwds.append(str(runtime.REPO_ROOT))
+    ctx.exits.append(None)
+    ctx.logs.append(str(log_path))
+    process, log = runtime.start_client(game_dir=game_dir, log_path=log_path, token=token,
+                                        mcp_port=mcp_port, username=username, display=display)
+    mcp = None
+    try:
+        mcp = McpClient(f"http://127.0.0.1:{mcp_port}/mcp", token, timeout + 10)
+        mcp.initialize()
+        runtime.wait_client_ready_for_connect(mcp, timeout)
+        if "video driver: wayland" in log_path.read_text(errors="replace").lower():
+            raise RuntimeError("Java client opened its window on Wayland (the owner's desktop), not the harness Xvfb")
+        mcp.call_tool("minecraft_connect", {"server_addr": address})
+    except BaseException:
+        if mcp is not None:
+            mcp.close()
+        runtime.stop_process(process)
+        log.close()
+        raise
+    return process, log, mcp
+
+
 def run(ctx: ProfileContext) -> dict[str, Any]:
-    if ctx.client != "native" or not ctx.windowed or ctx.platform is not None:
-        raise ValueError("scene-shot requires --client native --windowed")
+    if ctx.client not in ("native", "java") or not ctx.windowed or ctx.platform is not None:
+        raise ValueError("scene-shot requires --client native|java --windowed")
     args = ctx.extra_args
     if args and args[0] == "--":
         args = args[1:]
@@ -216,8 +314,10 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     if type(client_latency_ms) is not int or not 0 <= client_latency_ms <= 5000:
         raise ValueError("client_latency_ms must be an integer in 0..5000")
     settings = scenario.get("client_settings", {})
-    if not isinstance(settings, dict) or set(settings) - {"graphics_preset", "render_distance"}:
+    if not isinstance(settings, dict) or set(settings) - {"graphics_preset", "render_distance", "fov"}:
         raise ValueError("unsupported client settings")
+    if "fov" in settings and (type(settings["fov"]) is not int or not 30 <= settings["fov"] <= 110):
+        raise ValueError("fov must be an integer in 30..110")
     if "graphics_preset" in settings:
         preset = settings["graphics_preset"]
         if not isinstance(preset, str) or preset.lower() not in ("low", "medium", "high"):
@@ -267,7 +367,10 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     else:
         base_path = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "solaris-client" / "client-settings.json"
         base = json.loads(base_path.read_text()) if base_path.is_file() else {}
-    base.update(settings)
+    # The owner's personal fov must not leak into a reference comparison.
+    base.update({"fov": NATIVE_FOV, **settings})
+    if ctx.client == "java" and "graphics_preset" in settings:
+        raise ValueError("graphics_preset is a native-client setting; the Java client keeps its default")
     settings_path.write_text(json.dumps(base, indent=2) + "\n")
     server = client = xvfb = mcp = log = client_log = proxy = None
     server_index = len(ctx.commands)
@@ -291,7 +394,12 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         try:
             os.environ["XDG_DATA_HOME"] = str(xdg)
             os.environ["SOLARIS_CLIENT_SETTINGS"] = str(settings_path)
-            client, client_log, mcp = native_client.start(ctx, native_client.resolve_binary(ctx), f"127.0.0.1:{client_port}", username, timeout, display=display)
+            if ctx.client == "java":
+                client, client_log, mcp = start_java(
+                    ctx, artifact, f"127.0.0.1:{client_port}", username, timeout, display,
+                    base.get("render_distance", 12), base["fov"])
+            else:
+                client, client_log, mcp = native_client.start(ctx, native_client.resolve_binary(ctx), f"127.0.0.1:{client_port}", username, timeout, display=display)
         finally:
             for key, old in (("XDG_DATA_HOME", old_xdg), ("SOLARIS_CLIENT_SETTINGS", old_settings)):
                 if old is None:
@@ -301,13 +409,21 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         mcp.request_timeout_seconds = min(timeout + 10, 130.0)
         with ProbeSteps(mcp, artifact / "scene-shot", timeout, "scene-shot") as probe:
             wait_play(probe)
-            from . import native_focus
-            ctx.client_evidence["window_focus"] = native_focus.acquire(display, client.pid, probe.remaining())
+            if ctx.client == "java":
+                window_id = find_java_window(display)
+                if window_id is None:
+                    raise RuntimeError(f"Java client opened no window on the harness Xvfb {display}; refusing to run")
+                ctx.client_evidence["window_focus"] = mcp.p4_window = {"display": display, "window_id": window_id}
+                resize_java_window(mcp.p4_window)
+                probe.call("minecraft_wait_ticks", {"ticks": 10})
+            else:
+                from . import native_focus
+                ctx.client_evidence["window_focus"] = native_focus.acquire(display, client.pid, probe.remaining())
             before = probe.observe()
             probe.call("minecraft_wait_for_state_change", {
                 "observed_version": before["state_version"], "timeout_seconds": probe.remaining(),
             })
-            shots = execute(probe, artifact, scenario["steps"])
+            shots = execute(probe, artifact, scenario["steps"], ctx.client)
         return {"screenshots": shots, "scenario": probe.report, "seed": seed, "settings": settings, "client_latency_ms": client_latency_ms}
     finally:
         if mcp is not None:

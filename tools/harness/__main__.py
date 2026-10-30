@@ -438,8 +438,8 @@ def cmd_run(argv: list[str]) -> int:
         if (ctx.plugins_dir is not None and client != "native"
                 and ctx.scenario_id != "java-v2-p5-towns" and profile not in {"loader-live", "graves"}):
             raise ValueError("--plugins-dir requires native gameplay, java-v2-p5-towns, loader-live or graves")
-        if ctx.windowed and client != "native":
-            raise ValueError("--windowed requires --client native")
+        if ctx.windowed and client != "native" and not (client == "java" and profile == "scene-shot"):
+            raise ValueError("--windowed requires --client native (or --client java for scene-shot)")
         if client == "native" and profile not in {"survival", "inventory", "entities", "core-client", "native-lifecycle", "logical-native", "native-scale", "title-connect", "dialogs", "admin-commands", "chisel", "anti-xray", "block-log", "village-qa", "village-autonomy-qa", "scene-shot", "claim-only-qa", "buildings-qa", "army-qa"}:
             raise RuntimeError(
                 f"profile {profile!r} is not enabled for native; "

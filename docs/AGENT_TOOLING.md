@@ -52,10 +52,16 @@ to a JSON file, then run `python3 -m tools.harness run scene-shot --client nativ
 `list_entities`, or `key` (`keys` and `ticks` MCP arguments; released when
 the step finishes). Optional `seed` defaults to 100, `world` copies an existing
 world, `server_view_distance` defaults to 4, and `client_settings` accepts
-`graphics_preset` and `render_distance`. PNG paths are recorded in `result.json`;
-settings and world are isolated per run.
+`graphics_preset`, `render_distance` and `fov` (default 70: the owner's saved fov is never
+inherited). PNG paths are recorded in `result.json`; settings and world are isolated per run.
 With a client supporting held MCP input, `{"shot":"tab","hold_keys":["key.keyboard.tab"]}`
-captures the visible player list and releases the key even if capture fails.
+captures the visible player list and releases the key even if capture fails (native only).
+
+`--client java --windowed` runs the same scenario against the vanilla Java client
+(Loader `:fabric-agent:runClientMcp`) as a rendering oracle: `shot` uses
+`minecraft_screenshot`, and the client gets the same 1280x720 window, fov, GUI scale 3 and render
+distance through its `options.txt`. Run the same scenario with both clients and compare the
+PNGs; Mojang's client is a test-time reference only, never a source for Solaris models.
 
 ## Profiles
 

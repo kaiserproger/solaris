@@ -798,7 +798,7 @@ PROFILES: dict[str, dict[str, Any]] = {
     },
     "scene-shot": {
         "scope": "real-client",
-        "description": "Scripted windowed native-client scene captures on an isolated world",
+        "description": "Scripted windowed native or vanilla-Java (--client java, rendering oracle) scene captures on an isolated world",
         "run": run_scene_shot,
     },
     "claim-only-qa": {

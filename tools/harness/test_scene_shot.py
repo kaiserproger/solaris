@@ -113,3 +113,30 @@ class SceneShotTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "capture failed"):
                 scene_shot.execute(probe, Path(tmp), [{"shot": "tab", "hold_keys": ["key.keyboard.tab"]}])
         self.assertEqual(events, [True, False])
+
+    def test_java_shot_uses_minecraft_screenshot(self):
+        class Probe:
+            client = object()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(scene_shot.java_p5, "capture", return_value="/x/a.png") as java_capture, \
+                patch.object(scene_shot, "png_size", return_value=scene_shot.WINDOW), \
+                patch.object(scene_shot.native_client, "capture") as native_capture:
+            probe = Probe()
+            self.assertEqual(scene_shot.execute(probe, Path(tmp), [{"shot": "a"}], "java"), ["/x/a.png"])
+            java_capture.assert_called_once_with(probe, "a")
+            native_capture.assert_not_called()
+
+    def test_java_shot_with_wrong_window_size_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(scene_shot.java_p5, "capture", return_value="/x/a.png"), \
+                patch.object(scene_shot, "png_size", return_value=(854, 480)):
+            with self.assertRaisesRegex(RuntimeError, "expected"):
+                scene_shot.execute(object(), Path(tmp), [{"shot": "a"}], "java")
+
+    def test_java_rejects_native_only_held_screenshot(self):
+        with self.assertRaisesRegex(ValueError, "unsupported for --client java"):
+            scene_shot.execute(None, Path("/tmp"), [{"shot": "tab", "hold_keys": ["key.keyboard.tab"]}], "java")
+
+    def test_java_options_pin_window_fov_gui_and_distance(self):
+        options = dict(line.split(":", 1) for line in scene_shot.java_options(32, 70).splitlines())
+        self.assertEqual((options["overrideWidth"], options["overrideHeight"]), ("1280", "720"))
+        self.assertEqual((options["fov"], options["guiScale"], options["renderDistance"]), ("0.0", "3", "32"))
+        self.assertEqual(scene_shot.java_options(8, 110).count("fov:1.0"), 1)
