@@ -24,10 +24,22 @@ fn child_nameplate_changes_when_growing_up() {
     let (id, slot) = villager(&mut state, "minecraft:villager");
     state.entities.row_mut(slot).villager.as_mut().unwrap().age = -1;
     let child = appearance(&mut state, id);
-    assert!(child.custom_name.as_deref().unwrap().contains(" · ребёнок · "));
+    assert!(
+        child
+            .custom_name
+            .as_deref()
+            .unwrap()
+            .contains(" · ребёнок · ")
+    );
     state.entities.row_mut(slot).villager.as_mut().unwrap().age = 0;
     let adult = appearance(&mut state, id);
-    assert!(adult.custom_name.as_deref().unwrap().contains(" · безработный · "));
+    assert!(
+        adult
+            .custom_name
+            .as_deref()
+            .unwrap()
+            .contains(" · безработный · ")
+    );
 }
 
 #[test]

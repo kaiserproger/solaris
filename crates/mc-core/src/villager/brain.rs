@@ -275,7 +275,9 @@ pub(super) fn bodies_near(
 
 fn roofed(state: &TickState, pos: BlockPos) -> bool {
     (pos.y + 1..state.world.geometry().max_y()).any(|y| {
-        state.world.block_at(pos.x, y, pos.z)
+        state
+            .world
+            .block_at(pos.x, y, pos.z)
             .and_then(|id| state.registry.collision_boxes.get(id as usize))
             .is_some_and(|shapes| !shapes.is_empty())
     })
@@ -286,14 +288,23 @@ fn stair_seat(state: &TickState, pos: [f64; 3]) -> Option<BlockPos> {
     for dx in -1..=1 {
         for dz in -1..=1 {
             for dy in -1..=0 {
-                let seat = BlockPos { x: origin.x + dx, y: origin.y + dy, z: origin.z + dz };
-                let Some(block) = state.world.block_at(seat.x, seat.y, seat.z)
+                let seat = BlockPos {
+                    x: origin.x + dx,
+                    y: origin.y + dy,
+                    z: origin.z + dz,
+                };
+                let Some(block) = state
+                    .world
+                    .block_at(seat.x, seat.y, seat.z)
                     .and_then(|id| state.registry.blocks.by_id(mc_world::BlockStateId(id)))
                 else {
                     continue;
                 };
                 if block.block.id.path().ends_with("_stairs")
-                    && block.properties.iter().any(|(key, value)| key == "half" && value == "bottom")
+                    && block
+                        .properties
+                        .iter()
+                        .any(|(key, value)| key == "half" && value == "bottom")
                     && roofed(state, seat)
                 {
                     return Some(seat);
@@ -333,7 +344,11 @@ fn night_shelter(
             let origin = cells[next];
             next += 1;
             for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let target = BlockPos { x: origin.x + dx, y: bed.y, z: origin.z + dz };
+                let target = BlockPos {
+                    x: origin.x + dx,
+                    y: bed.y,
+                    z: origin.z + dz,
+                };
                 if cells[..count].contains(&target)
                     || !roofed(state, target)
                     || standing(&state.world, &state.registry, target, width, height).is_none()
@@ -343,12 +358,20 @@ fn night_shelter(
                 cells[count] = target;
                 count += 1;
                 let reserved = cache.residents.iter().copied().any(|other| {
-                    other != slot && state.entities.row(other).villager.as_ref().is_some_and(|resident| {
-                        resident.navigation_target == Some(target)
-                            || at(state.entities.pos(other)) == target
-                    })
+                    other != slot
+                        && state
+                            .entities
+                            .row(other)
+                            .villager
+                            .as_ref()
+                            .is_some_and(|resident| {
+                                resident.navigation_target == Some(target)
+                                    || at(state.entities.pos(other)) == target
+                            })
                 });
-                let doorway = state.world.block_at(target.x, target.y, target.z)
+                let doorway = state
+                    .world
+                    .block_at(target.x, target.y, target.z)
                     .and_then(|id| state.registry.blocks.by_id(mc_world::BlockStateId(id)))
                     .is_some_and(|block| block.block.id.path().ends_with("_door"));
                 if !reserved && !doorway {
@@ -356,7 +379,13 @@ fn night_shelter(
                         cache.candidates = candidates;
                         return (Some(target), true);
                     }
-                    candidates.push((distance(pos, centre(bed)), Poi { pos: target, kind: PoiKind::Home }));
+                    candidates.push((
+                        distance(pos, centre(bed)),
+                        Poi {
+                            pos: target,
+                            kind: PoiKind::Home,
+                        },
+                    ));
                 }
                 if count == cells.len() {
                     break;
@@ -365,9 +394,8 @@ fn night_shelter(
         }
     }
     candidates.sort_unstable_by(|a, b| {
-        a.0.total_cmp(&b.0).then_with(|| {
-            (a.1.pos.x, a.1.pos.y, a.1.pos.z).cmp(&(b.1.pos.x, b.1.pos.y, b.1.pos.z))
-        })
+        a.0.total_cmp(&b.0)
+            .then_with(|| (a.1.pos.x, a.1.pos.y, a.1.pos.z).cmp(&(b.1.pos.x, b.1.pos.y, b.1.pos.z)))
     });
     let mut path = std::mem::take(&mut cache.candidate_path);
     let mut selected = None;
@@ -391,8 +419,8 @@ fn night_shelter(
             budget: &mut state.tick_budget,
         };
         if allocator::find_path_ctx(
-            &mut ctx, cache, pos, poi.pos, width, height, &mut path, true, horizontal,
-            vertical, true,
+            &mut ctx, cache, pos, poi.pos, width, height, &mut path, true, horizontal, vertical,
+            true,
         ) {
             std::mem::swap(&mut path, &mut v.navigation_path);
             v.navigation_target = Some(poi.pos);
@@ -612,7 +640,10 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
                 merchant_busy
                     || v.sleeping
                     || state.tick < v.panic_until
-                    || !matches!(schedule(v.age, v.data.profession, state.day_time), Activity::Rest | Activity::Idle)
+                    || !matches!(
+                        schedule(v.age, v.data.profession, state.day_time),
+                        Activity::Rest | Activity::Idle
+                    )
                     || distance(state.entities.pos(slot), centre(seat)) > 4.0
                     || stair_seat(state, state.entities.pos(slot)) != Some(seat)
             })
@@ -835,25 +866,40 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
             }
         }
         let changing_seated_activity = old_activity != v.activity && v.seat.is_some();
-        let can_sit = !merchant_busy && !v.sleeping
+        let can_sit = !merchant_busy
+            && !v.sleeping
             && !changing_seated_activity
             && matches!(v.activity, Activity::Rest | Activity::Idle)
             && v.navigation_path.is_empty();
-        if !can_sit || v.seat.is_some_and(|seat| {
-            distance(state.entities.pos(slot), centre(seat)) > 4.0
-                || stair_seat(state, state.entities.pos(slot)) != Some(seat)
-        }) {
+        if !can_sit
+            || v.seat.is_some_and(|seat| {
+                distance(state.entities.pos(slot), centre(seat)) > 4.0
+                    || stair_seat(state, state.entities.pos(slot)) != Some(seat)
+            })
+        {
             v.seat = None;
         }
         if can_sit && v.seat.is_none() {
             v.seat = stair_seat(state, state.entities.pos(slot)).filter(|seat| {
                 !cache.residents.iter().copied().any(|other| {
                     other != slot
-                        && state.entities.row(other).villager.as_ref().is_some_and(|resident| resident.seat == Some(*seat))
+                        && state
+                            .entities
+                            .row(other)
+                            .villager
+                            .as_ref()
+                            .is_some_and(|resident| resident.seat == Some(*seat))
                 })
             });
             if let Some(seat) = v.seat {
-                state.entities.set_pos(slot, [f64::from(seat.x) + 0.5, f64::from(seat.y) + 0.5, f64::from(seat.z) + 0.5]);
+                state.entities.set_pos(
+                    slot,
+                    [
+                        f64::from(seat.x) + 0.5,
+                        f64::from(seat.y) + 0.5,
+                        f64::from(seat.z) + 0.5,
+                    ],
+                );
                 state.entities.set_vel(slot, [0.0; 3]);
                 v.navigation_target = None;
             }

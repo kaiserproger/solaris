@@ -678,19 +678,40 @@ fn villager_stair_seat_spawns_links_and_removes_in_order() {
     with_cache(|cache| {
         let (pos, chunk) = chunk_at(0, 0);
         let mut resident = entity(42, [8.5, 64.5, 8.5]);
-        resident.type_id = mc_data::entity_types::entity_type_contract_26_1_2_by_name("minecraft:villager").unwrap().protocol_id;
+        resident.type_id =
+            mc_data::entity_types::entity_type_contract_26_1_2_by_name("minecraft:villager")
+                .unwrap()
+                .protocol_id;
         resident.appearance = Arc::new(EntityAppearance {
             villager_seat: Some(mc_core::boundary::BlockPos { x: 8, y: 64, z: 8 }),
             ..Default::default()
         });
         let mut viewer = viewer_at(1, [8.0, 64.0, 8.0]);
-        let first = output(vec![(pos, Arc::clone(&chunk))], vec![resident.clone()], ChangeSet::default());
+        let first = output(
+            vec![(pos, Arc::clone(&chunk))],
+            vec![resident.clone()],
+            ChangeSet::default(),
+        );
         let packets = plan_viewer(&first, &mut viewer, 1, cache);
-        let spawn = packets.iter().position(|p| p.id == AddEntity::ID
-            && AddEntity::decode(&mut body_of(p)).unwrap().entity_id < 0).expect("seat spawn");
-        let seat = AddEntity::decode(&mut body_of(&packets[spawn])).unwrap().entity_id;
-        let link = packets.iter().position(|p| p.id == ClientboundSetPassengers::ID
-            && ClientboundSetPassengers::decode(&mut body_of(p)).unwrap().passenger_ids == [42]).expect("mount");
+        let spawn = packets
+            .iter()
+            .position(|p| {
+                p.id == AddEntity::ID && AddEntity::decode(&mut body_of(p)).unwrap().entity_id < 0
+            })
+            .expect("seat spawn");
+        let seat = AddEntity::decode(&mut body_of(&packets[spawn]))
+            .unwrap()
+            .entity_id;
+        let link = packets
+            .iter()
+            .position(|p| {
+                p.id == ClientboundSetPassengers::ID
+                    && ClientboundSetPassengers::decode(&mut body_of(p))
+                        .unwrap()
+                        .passenger_ids
+                        == [42]
+            })
+            .expect("mount");
         assert!(spawn < link);
         let attached = ClientboundSetPassengers::decode(&mut body_of(&packets[link])).unwrap();
         assert_eq!(attached.vehicle_id, seat);
@@ -698,14 +719,35 @@ fn villager_stair_seat_spawns_links_and_removes_in_order() {
         let second = output(vec![(pos, chunk)], vec![resident], ChangeSet::default());
         viewer.world_credit = 1;
         let deferred = plan_viewer(&second, &mut viewer, 2, cache);
-        assert!(!deferred.iter().any(|p| p.id == RemoveEntities::ID
-            && RemoveEntities::decode(&mut body_of(p)).unwrap().entity_ids.contains(&seat)));
+        assert!(!deferred.iter().any(|p| {
+            p.id == RemoveEntities::ID
+                && RemoveEntities::decode(&mut body_of(p))
+                    .unwrap()
+                    .entity_ids
+                    .contains(&seat)
+        }));
         viewer.world_credit = usize::MAX;
         let packets = plan_viewer(&second, &mut viewer, 2, cache);
-        let dismount = packets.iter().position(|p| p.id == ClientboundSetPassengers::ID
-            && ClientboundSetPassengers::decode(&mut body_of(p)).unwrap().passenger_ids.is_empty()).expect("dismount");
-        let removal = packets.iter().position(|p| p.id == RemoveEntities::ID
-            && RemoveEntities::decode(&mut body_of(p)).unwrap().entity_ids.contains(&seat)).expect("seat removal");
+        let dismount = packets
+            .iter()
+            .position(|p| {
+                p.id == ClientboundSetPassengers::ID
+                    && ClientboundSetPassengers::decode(&mut body_of(p))
+                        .unwrap()
+                        .passenger_ids
+                        .is_empty()
+            })
+            .expect("dismount");
+        let removal = packets
+            .iter()
+            .position(|p| {
+                p.id == RemoveEntities::ID
+                    && RemoveEntities::decode(&mut body_of(p))
+                        .unwrap()
+                        .entity_ids
+                        .contains(&seat)
+            })
+            .expect("seat removal");
         assert!(dismount < removal);
     });
 }

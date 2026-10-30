@@ -57,10 +57,14 @@ fn sleeping_villager_publishes_pose_and_bed_head_then_clears_them() {
             index: ENTITY_DATA_POSE_INDEX,
             pose,
         }));
-        assert!(decoded.values.contains(&WireEntityDataValue::OptionalBlockPosition {
-            index: 14,
-            value: bed,
-        }));
+        assert!(
+            decoded
+                .values
+                .contains(&WireEntityDataValue::OptionalBlockPosition {
+                    index: 14,
+                    value: bed,
+                })
+        );
     }
 }
 

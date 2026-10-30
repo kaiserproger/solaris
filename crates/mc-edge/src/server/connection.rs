@@ -793,7 +793,6 @@ pub(super) fn smooth_latency(previous: i32, rtt: i32) -> i32 {
     ((i64::from(previous) * 3 + i64::from(rtt)) / 4) as i32
 }
 
-
 /// Play writer task: keepalive first, then reliable before world, so a
 /// reliable frame never waits behind a world backlog. Frames already queued
 /// go out together in one write (one syscall instead of one per frame),

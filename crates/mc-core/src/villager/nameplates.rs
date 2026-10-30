@@ -45,33 +45,34 @@ impl Nameplate {
     pub(crate) fn new(row: &ColdRow) -> Self {
         let key = Key::of(row);
         let seat = row.villager.as_ref().and_then(|v| v.seat);
-        let appearance = if key == Key::Named && row.appearance.custom_name_visible && seat.is_none() {
-            Arc::clone(&row.appearance)
-        } else {
-            let mut appearance = (*row.appearance).clone();
-            appearance.villager_seat = seat;
-            if let Key::Generated {
-                uuid,
-                profession,
-                baby,
-                activity,
-                sleeping,
-            } = key
-            {
-                appearance.custom_name = Some(format!(
-                    "{} · {} · {}",
-                    crate::settlements::presentation::villager_name(uuid),
-                    if baby {
-                        "ребёнок"
-                    } else {
-                        crate::settlements::presentation::profession_name(profession)
-                    },
-                    activity_name(activity, sleeping),
-                ));
-            }
-            appearance.custom_name_visible = true;
-            Arc::new(appearance)
-        };
+        let appearance =
+            if key == Key::Named && row.appearance.custom_name_visible && seat.is_none() {
+                Arc::clone(&row.appearance)
+            } else {
+                let mut appearance = (*row.appearance).clone();
+                appearance.villager_seat = seat;
+                if let Key::Generated {
+                    uuid,
+                    profession,
+                    baby,
+                    activity,
+                    sleeping,
+                } = key
+                {
+                    appearance.custom_name = Some(format!(
+                        "{} · {} · {}",
+                        crate::settlements::presentation::villager_name(uuid),
+                        if baby {
+                            "ребёнок"
+                        } else {
+                            crate::settlements::presentation::profession_name(profession)
+                        },
+                        activity_name(activity, sleeping),
+                    ));
+                }
+                appearance.custom_name_visible = true;
+                Arc::new(appearance)
+            };
         Self {
             source: Arc::clone(&row.appearance),
             key,

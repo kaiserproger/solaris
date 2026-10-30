@@ -929,7 +929,9 @@ fn resting_villager_moves_onto_nearby_indoor_stair() {
     let mut state = test_state();
     let stair = block(&state, "minecraft:oak_stairs", &[("half", "bottom")]);
     state.world.set_block(9, 201, 8, stair);
-    state.world.set_block(9, 204, 8, state.registry.states.stone);
+    state
+        .world
+        .set_block(9, 204, 8, state.registry.states.stone);
     state.world.fold_overlay();
     let slot = villager(&mut state, [8.5, 201.0, 8.5]);
     state.day_time = 18000;
@@ -938,26 +940,87 @@ fn resting_villager_moves_onto_nearby_indoor_stair() {
     assert_eq!((position[0], position[2]), (9.5, 8.5));
     let id = state.entities.body(slot).id;
     let seat = BlockPos { x: 9, y: 201, z: 8 };
-    assert_eq!(state.entities.views().get(id).unwrap().appearance.villager_seat, Some(seat));
+    assert_eq!(
+        state
+            .entities
+            .views()
+            .get(id)
+            .unwrap()
+            .appearance
+            .villager_seat,
+        Some(seat)
+    );
     let v = state.entities.row(slot).villager.as_ref().unwrap();
     assert!(serde_json::to_value(v).unwrap().get("seat").is_none());
-    assert!(crate::villager::persistence::journal_image(v).seat.is_none());
-    assert!(crate::villager::persistence::journal_eq(v, &crate::villager::persistence::journal_image(v)));
+    assert!(
+        crate::villager::persistence::journal_image(v)
+            .seat
+            .is_none()
+    );
+    assert!(crate::villager::persistence::journal_eq(
+        v,
+        &crate::villager::persistence::journal_image(v)
+    ));
     state.day_time = 1000;
     step(&mut state);
-    assert_eq!(state.entities.views().get(id).unwrap().appearance.villager_seat, None);
+    assert_eq!(
+        state
+            .entities
+            .views()
+            .get(id)
+            .unwrap()
+            .appearance
+            .villager_seat,
+        None
+    );
     state.day_time = 18000;
     step(&mut state);
-    assert_eq!(state.entities.views().get(id).unwrap().appearance.villager_seat, Some(seat));
+    assert_eq!(
+        state
+            .entities
+            .views()
+            .get(id)
+            .unwrap()
+            .appearance
+            .villager_seat,
+        Some(seat)
+    );
     state.day_time = 3000;
     step(&mut state);
-    assert_eq!(state.entities.views().get(id).unwrap().appearance.villager_seat, None);
+    assert_eq!(
+        state
+            .entities
+            .views()
+            .get(id)
+            .unwrap()
+            .appearance
+            .villager_seat,
+        None
+    );
     state.day_time = 18000;
     step(&mut state);
-    assert_eq!(state.entities.views().get(id).unwrap().appearance.villager_seat, Some(seat));
+    assert_eq!(
+        state
+            .entities
+            .views()
+            .get(id)
+            .unwrap()
+            .appearance
+            .villager_seat,
+        Some(seat)
+    );
     state.entities.set_pos(slot, [13.5, 201.0, 8.5]);
     step(&mut state);
-    assert_eq!(state.entities.views().get(id).unwrap().appearance.villager_seat, None);
+    assert_eq!(
+        state
+            .entities
+            .views()
+            .get(id)
+            .unwrap()
+            .appearance
+            .villager_seat,
+        None
+    );
 }
 
 #[test]

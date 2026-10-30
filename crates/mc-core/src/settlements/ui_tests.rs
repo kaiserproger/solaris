@@ -1102,28 +1102,37 @@ fn projects_screen_keeps_every_order_button_above_the_status_lines() {
     assert!(!status.has("project_order") && !status.has("project_upgrade"));
 }
 
-
 #[test]
 fn project_status_waiting_uses_translatable_material_names_without_truncation() {
     let mut state = joined(0);
     let id = town(&mut state, PLAYER);
     prep_projects_site(&mut state, id);
     let changes = click(&mut state, id, "project_status", &[]);
-    let dialog = changes.iter().rev().find_map(|change| match change {
-        PlayerChange::ShowDialog { dialog } => Some(dialog),
-        _ => None,
-    }).expect("project status dialog");
+    let dialog = changes
+        .iter()
+        .rev()
+        .find_map(|change| match change {
+            PlayerChange::ShowDialog { dialog } => Some(dialog),
+            _ => None,
+        })
+        .expect("project status dialog");
     let body = format!("{:?}", field(dialog, "body").unwrap());
     assert!(list(field(dialog, "body")).len() <= 64, "{body}");
     assert!(body.contains("needs a mine"), "{body}");
     assert!(body.contains("translate"), "{body}");
     assert!(!body.contains("minecraft:cobblestone"), "{body}");
     assert!(!body.contains("more)"), "{body}");
-    let planks = list(field(dialog, "body")).iter()
+    let planks = list(field(dialog, "body"))
+        .iter()
         .flat_map(|paragraph| list(field(field(paragraph, "contents").unwrap(), "extra")))
-        .find(|item| field(item, "translate").is_some_and(|key| text(key) == "block.minecraft.oak_planks"))
+        .find(|item| {
+            field(item, "translate").is_some_and(|key| text(key) == "block.minecraft.oak_planks")
+        })
         .expect("planks requirement");
-    assert!(format!("{planks:?}").contains("block.minecraft.oak_log"), "{planks:?}");
+    assert!(
+        format!("{planks:?}").contains("block.minecraft.oak_log"),
+        "{planks:?}"
+    );
     assert!(format!("{planks:?}").contains("needs, e.g."), "{planks:?}");
 }
 
@@ -1132,7 +1141,9 @@ fn project_status_does_not_claim_all_candidates_lack_materials_when_one_is_funde
     let mut state = joined(0);
     let id = town(&mut state, PLAYER);
     prep_projects_site(&mut state, id);
-    assert!(!super::super::construction::has_funded_candidate(&state, id));
+    assert!(!super::super::construction::has_funded_candidate(
+        &state, id
+    ));
     crate::settlements::construction::tests::fund(&mut state, "storage", 1);
     assert!(super::super::construction::has_funded_candidate(&state, id));
 }
@@ -1143,9 +1154,18 @@ fn project_status_active_shows_readable_progress() {
     let id = town(&mut state, PLAYER);
     prep_projects_site(&mut state, id);
     crate::settlements::construction::tests::fund(&mut state, "watch_tower", 1);
-    click(&mut state, id, "project_order", &[("blueprint", string("watch_tower"))]);
+    click(
+        &mut state,
+        id,
+        "project_order",
+        &[("blueprint", string("watch_tower"))],
+    );
     let status = last_dialog(&click(&mut state, id, "project_status", &[]));
-    assert!(status.body.contains("Watchtower · level 1 · "), "{}", status.body);
+    assert!(
+        status.body.contains("Watchtower · level 1 · "),
+        "{}",
+        status.body
+    );
     assert!(status.body.contains("Site: "), "{}", status.body);
     assert!(!status.body.contains("minecraft:"), "{}", status.body);
 }

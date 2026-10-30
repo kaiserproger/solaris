@@ -101,7 +101,9 @@ fn bound_bedless_nitwit_enters_occupied_house_at_night() {
             state.world.set_block(x, y, 14, state.registry.states.stone);
         }
         for z in 8..=14 {
-            state.world.set_block(x, 204, z, state.registry.states.stone);
+            state
+                .world
+                .set_block(x, 204, z, state.registry.states.stone);
         }
     }
     let home = bed(&mut state, 8, 12);
@@ -134,7 +136,12 @@ fn bound_bedless_nitwit_enters_occupied_house_at_night() {
         },
     );
     let outdoor_owner = villager(&mut state, [12.5, 201.0, 5.5]);
-    let v = state.entities.row_mut(outdoor_owner).villager.as_mut().unwrap();
+    let v = state
+        .entities
+        .row_mut(outdoor_owner)
+        .villager
+        .as_mut()
+        .unwrap();
     v.settlement = Some(settlement);
     v.home = Some(outdoor);
     let owner = villager(&mut state, [8.5, 201.0, 12.5]);
@@ -146,7 +153,13 @@ fn bound_bedless_nitwit_enters_occupied_house_at_night() {
     v.settlement = Some(settlement);
     v.data.profession = Profession::Nitwit;
     let unemployed = villager(&mut state, [7.5, 201.0, 4.5]);
-    state.entities.row_mut(unemployed).villager.as_mut().unwrap().settlement = Some(settlement);
+    state
+        .entities
+        .row_mut(unemployed)
+        .villager
+        .as_mut()
+        .unwrap()
+        .settlement = Some(settlement);
     let child = villager(&mut state, [9.5, 201.0, 4.5]);
     let v = state.entities.row_mut(child).villager.as_mut().unwrap();
     v.settlement = Some(settlement);
@@ -201,11 +214,23 @@ fn night_shelter_does_not_override_panic_or_soldier_duty() {
     state.day_time = 18000;
     crate::tick::run_tick(&mut state, &[]);
     assert_eq!(
-        state.entities.row(panicking).villager.as_ref().unwrap().activity,
+        state
+            .entities
+            .row(panicking)
+            .villager
+            .as_ref()
+            .unwrap()
+            .activity,
         Activity::Panic
     );
     assert_eq!(
-        state.entities.row(soldier).villager.as_ref().unwrap().activity,
+        state
+            .entities
+            .row(soldier)
+            .villager
+            .as_ref()
+            .unwrap()
+            .activity,
         Activity::Work
     );
 }

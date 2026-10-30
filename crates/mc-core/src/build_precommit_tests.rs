@@ -774,9 +774,14 @@ async fn spawn_protected_door_use_repairs_both_halves_before_ack() {
     assert!(crate::spawn_protection::protected(&state, actor, POS));
     let (_, drains, _) = run_tick(&mut state, &[use_on(POS, Hand::Main, 3)]);
     let changes = changes_for_player(drains);
-    let ack = changes.iter().position(|change| matches!(change,
-        PlayerChange::BlockActionsAcked { sequence } if *sequence == SEQUENCE
-    )).expect("refused use must be acknowledged");
+    let ack = changes
+        .iter()
+        .position(|change| {
+            matches!(change,
+                PlayerChange::BlockActionsAcked { sequence } if *sequence == SEQUENCE
+            )
+        })
+        .expect("refused use must be acknowledged");
     for (position, expected) in [(POS, lower), (UPPER, upper)] {
         let repair = changes.iter().position(|change| matches!(change,
             PlayerChange::BlockResynced { position: cell, block } if *cell == position && *block == expected

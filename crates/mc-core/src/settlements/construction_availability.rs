@@ -120,30 +120,35 @@ pub(super) fn missing_explanation(
         return Some((leaf, SourceReason::Unknown));
     };
     let caps = caps(state, id, record);
-    let reason = state.registry.items.name_of(leaf).map(|name| {
-        let path = name.path();
-        if name.namespace() != "minecraft" {
-            SourceReason::Unknown
-        } else if mine_raw(path) && !caps.mine {
-            SourceReason::Mine
-        } else if mine_raw(path) && !caps.miner {
-            SourceReason::Miner
-        } else if log_raw(path) && !caps.camp {
-            SourceReason::LumberCamp
-        } else if log_raw(path) && !caps.lumberjack {
-            SourceReason::Lumberjack
-        } else if farmer_raw(path) && !caps.farm {
-            SourceReason::Farm
-        } else if farmer_raw(path) && !caps.farmer {
-            SourceReason::Farmer
-        } else if path.ends_with("_wool") && !caps.shepherd {
-            SourceReason::Shepherd
-        } else if path.ends_with("_wool") {
-            SourceReason::Sheep
-        } else {
-            SourceReason::Unknown
-        }
-    }).unwrap_or(SourceReason::Unknown);
+    let reason = state
+        .registry
+        .items
+        .name_of(leaf)
+        .map(|name| {
+            let path = name.path();
+            if name.namespace() != "minecraft" {
+                SourceReason::Unknown
+            } else if mine_raw(path) && !caps.mine {
+                SourceReason::Mine
+            } else if mine_raw(path) && !caps.miner {
+                SourceReason::Miner
+            } else if log_raw(path) && !caps.camp {
+                SourceReason::LumberCamp
+            } else if log_raw(path) && !caps.lumberjack {
+                SourceReason::Lumberjack
+            } else if farmer_raw(path) && !caps.farm {
+                SourceReason::Farm
+            } else if farmer_raw(path) && !caps.farmer {
+                SourceReason::Farmer
+            } else if path.ends_with("_wool") && !caps.shepherd {
+                SourceReason::Shepherd
+            } else if path.ends_with("_wool") {
+                SourceReason::Sheep
+            } else {
+                SourceReason::Unknown
+            }
+        })
+        .unwrap_or(SourceReason::Unknown);
     Some((leaf, reason))
 }
 
@@ -518,7 +523,11 @@ fn resolve_ingredients(
             }
         }
         if !satisfied {
-            return Err(if any_candidate { supported_failure.unwrap_or(failure) } else { parent });
+            return Err(if any_candidate {
+                supported_failure.unwrap_or(failure)
+            } else {
+                parent
+            });
         }
     }
     Ok(())

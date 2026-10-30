@@ -1226,7 +1226,9 @@ pub(crate) fn has_funded_candidate(state: &TickState, id: SettlementId) -> bool 
     let images = executor::source_images(state, id);
     let catalog = blueprints::all(&state.registry);
     needed_kinds(record, state.settlements.member_count(id)).any(|kind| {
-        catalog.iter().find(|blueprint| blueprint.kind == kind)
+        catalog
+            .iter()
+            .find(|blueprint| blueprint.kind == kind)
             .and_then(|blueprint| blueprint.level(1))
             .is_some_and(|level| funded_species(state, &level.materials, &images).is_some())
     }) || upgrade_project(state, record).is_some()
@@ -1263,7 +1265,9 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
             super::construction_crafting::missing_base(state, &level.materials, &images)
         {
             if let Some(name) = state.registry.items.name_of(item) {
-                let total = level.materials.iter()
+                let total = level
+                    .materials
+                    .iter()
                     .find(|(id, _)| *id == item)
                     .map_or(u64::from(count), |(_, total)| u64::from(*total));
                 let missing = availability::missing_explanation(state, id, item, &images);
@@ -1271,7 +1275,11 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
                     item: name.to_string(),
                     have: total.saturating_sub(u64::from(count)),
                     total,
-                    source_item: missing.and_then(|(leaf, _)| (leaf != item).then(|| state.registry.items.name_of(leaf).map(ToString::to_string)).flatten()),
+                    source_item: missing.and_then(|(leaf, _)| {
+                        (leaf != item)
+                            .then(|| state.registry.items.name_of(leaf).map(ToString::to_string))
+                            .flatten()
+                    }),
                     no_source: missing.map(|(_, reason)| reason),
                 });
             }
@@ -1293,8 +1301,15 @@ fn waiting_materials(state: &TickState, id: SettlementId, lines: &mut Vec<String
         for need in kind.needs {
             lines.push(format!(
                 "Waiting {}: needs {} x{} — {} — {}",
-                kind.blueprint, need.item, need.total - need.have, need.source_item.as_deref().unwrap_or(&need.item),
-                if need.no_source.is_some() { "no source" } else { "awaiting production" },
+                kind.blueprint,
+                need.item,
+                need.total - need.have,
+                need.source_item.as_deref().unwrap_or(&need.item),
+                if need.no_source.is_some() {
+                    "no source"
+                } else {
+                    "awaiting production"
+                },
             ));
         }
     }

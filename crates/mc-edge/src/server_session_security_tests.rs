@@ -106,23 +106,39 @@ async fn measured_latency_is_broadcast_to_other_players() {
     use mc_protocol::frame::{Compression, try_decode_frame};
     use mc_protocol::packets::play::{ClientboundKeepAlive, PlayerInfoActions, PlayerInfoUpdate};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
     let (socket, _) = listener.accept().await.unwrap();
     let (_, writer) = crate::connection::Connection::new(socket).into_play_halves();
     let registry = Arc::new(ConnectionRegistry::new());
     let other = registry.joining_id();
     let (other_tx, mut other_rx) = mpsc::channel(4);
-    registry.register(other, ConnectionHandles {
-        reliable_tx: other_tx,
-        world_tx: mpsc::channel(1).0,
-    }).unwrap();
+    registry
+        .register(
+            other,
+            ConnectionHandles {
+                reliable_tx: other_tx,
+                world_tx: mpsc::channel(1).0,
+            },
+        )
+        .unwrap();
     let (replies, reply_rx) = mpsc::channel(1);
     let (_reliable, reliable_rx) = mpsc::channel(1);
     let (_world, world_rx) = mpsc::channel(1);
     let profile = uuid::Uuid::from_u128(42);
     let _task = tokio::spawn(play_writer(
-        writer, Arc::new(NetCounters::new()), registry, ConnectionId(99), profile,
-        PlayReceivers { reliable: reliable_rx, world: world_rx, dh: mpsc::channel(1).1, keepalive: reply_rx },
+        writer,
+        Arc::new(NetCounters::new()),
+        registry,
+        ConnectionId(99),
+        profile,
+        PlayReceivers {
+            reliable: reliable_rx,
+            world: world_rx,
+            dh: mpsc::channel(1).1,
+            keepalive: reply_rx,
+        },
     ));
     let mut client = crate::connection::Connection::new(client);
     tokio::time::pause();
@@ -133,7 +149,9 @@ async fn measured_latency_is_broadcast_to_other_players() {
     tokio::task::yield_now().await;
     let wire = other_rx.recv().await.unwrap();
     let mut wire = bytes::BytesMut::from(&wire[..]);
-    let frame = try_decode_frame(&mut wire, Compression::Threshold(256)).unwrap().unwrap();
+    let frame = try_decode_frame(&mut wire, Compression::Threshold(256))
+        .unwrap()
+        .unwrap();
     assert_eq!(frame.id, PlayerInfoUpdate::ID);
     let update = PlayerInfoUpdate::decode(&mut &frame.body[..]).unwrap();
     assert_eq!(update.actions, PlayerInfoActions::UPDATE_LATENCY);

@@ -186,12 +186,24 @@ fn missing_explanation_reports_the_same_leaf_and_its_missing_capability() {
     let id = settle(&mut state);
     let cobble = item(&state, "minecraft:cobblestone");
     let log = item(&state, "minecraft:oak_log");
-    assert_eq!(missing_explanation(&state, id, cobble, &[]), Some((cobble, SourceReason::Mine)));
-    assert_eq!(missing_explanation(&state, id, log, &[]), Some((log, SourceReason::LumberCamp)));
+    assert_eq!(
+        missing_explanation(&state, id, cobble, &[]),
+        Some((cobble, SourceReason::Mine))
+    );
+    assert_eq!(
+        missing_explanation(&state, id, log, &[]),
+        Some((log, SourceReason::LumberCamp))
+    );
     certify(&mut state, id, BuildingKind::Mine);
     certify(&mut state, id, BuildingKind::LumberCamp);
-    assert_eq!(missing_explanation(&state, id, cobble, &[]), Some((cobble, SourceReason::Miner)));
-    assert_eq!(missing_explanation(&state, id, log, &[]), Some((log, SourceReason::Lumberjack)));
+    assert_eq!(
+        missing_explanation(&state, id, cobble, &[]),
+        Some((cobble, SourceReason::Miner))
+    );
+    assert_eq!(
+        missing_explanation(&state, id, log, &[]),
+        Some((log, SourceReason::Lumberjack))
+    );
     worker(&mut state, id, VillagerProfession::Miner);
     worker(&mut state, id, VillagerProfession::Lumberjack);
     assert_eq!(missing_explanation(&state, id, cobble, &[]), None);
