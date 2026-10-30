@@ -151,8 +151,9 @@ def run(client: Any, artifact: Path, timeout: float, *, owned_window: dict[str, 
         fov_label_before = next(
             (n.get("label", "") for n in options.get("ui_nodes", [])
              if n.get("id") == "settings/fov"), "")
-        # First press only persists the default (null -> 70.0, no visible
-        # change); press TWICE so the value really changes (70 -> 75).
+        # With no saved settings the first press only persists the default
+        # (null -> 70.0, no visible change); with saved settings it steps.
+        # Press until the value moves (at most twice), then require one step.
         for _ in range(2):
             probe.call("minecraft_click_screen_button", {
                 "expected_screen_class": OPTIONS_CLASS,
@@ -165,9 +166,11 @@ def run(client: Any, artifact: Path, timeout: float, *, owned_window: dict[str, 
             fov_label_before = next(
                 (n.get("label", "") for n in options.get("ui_nodes", [])
                  if n.get("id") == "settings/fov"), fov_label_before)
+            if options["client_settings"]["fov"] != fov_before:
+                break
         changed = options
         probe.check("options_fov_applied",
-                    changed.get("client_settings", {}).get("fov") == 75.0)
+                    changed.get("client_settings", {}).get("fov") == fov_before + 5.0)
         record("options", fov_before=fov_before,
                fov_after=changed.get("client_settings", {}).get("fov"))
         scale_node = next(n for n in changed.get("ui_nodes", []) if n.get("id") == "settings/ui_scale")
