@@ -114,11 +114,19 @@ def java_options(render_distance: int, fov: int) -> str:
     # Java stores fov normalized: 70 -> 0.0 and 110 -> 1.0.
     return (
         "version:4790\nonboardAccessibility:false\n"
+        'graphicsPreset:"custom"\n'
         f"overrideWidth:{WINDOW[0]}\noverrideHeight:{WINDOW[1]}\n"
         f"fov:{(fov - 70) / 40}\nguiScale:{NATIVE_GUI_SCALE}\nrenderDistance:{render_distance}\n"
         f"simulationDistance:{min(render_distance, 12)}\nmaxFps:60\nenableVsync:false\n"
         "pauseOnLostFocus:false\ntutorialStep:none\nsoundCategory_master:0.0\n"
     )
+
+
+def check_java_render_distance(options_path: Path, requested: int) -> None:
+    values = [line.partition(":")[2] for line in options_path.read_text().splitlines()
+              if line.startswith("renderDistance:")]
+    if values != [str(requested)]:
+        raise RuntimeError(f"Java renderDistance is {values!r}, expected {requested} in {options_path}")
 
 
 def find_java_window(display: str) -> int | None:
@@ -432,7 +440,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
                 "observed_version": before["state_version"], "timeout_seconds": probe.remaining(),
             })
             shots = execute(probe, artifact, scenario["steps"], ctx.client)
-        return {"screenshots": shots, "scenario": probe.report, "seed": seed, "settings": settings, "client_latency_ms": client_latency_ms}
+        result = {"screenshots": shots, "scenario": probe.report, "seed": seed, "settings": settings, "client_latency_ms": client_latency_ms}
     finally:
         if mcp is not None:
             mcp.close()
@@ -449,3 +457,6 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         runtime.stop_process(xvfb)
         if log is not None:
             log.close()
+    if ctx.client == "java":
+        check_java_render_distance(artifact / "game" / "options.txt", base.get("render_distance", 12))
+    return result

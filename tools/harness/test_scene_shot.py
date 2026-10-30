@@ -139,4 +139,17 @@ class SceneShotTests(unittest.TestCase):
         options = dict(line.split(":", 1) for line in scene_shot.java_options(32, 70).splitlines())
         self.assertEqual((options["overrideWidth"], options["overrideHeight"]), ("1280", "720"))
         self.assertEqual((options["fov"], options["guiScale"], options["renderDistance"]), ("0.0", "3", "32"))
+        self.assertEqual(options["graphicsPreset"], '"custom"')
         self.assertEqual(scene_shot.java_options(8, 110).count("fov:1.0"), 1)
+
+    def test_java_effective_render_distance_is_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            options = Path(tmp) / "options.txt"
+            options.write_text("fov:0.0\nrenderDistance:32\n")
+            scene_shot.check_java_render_distance(options, 32)
+            options.write_text("renderDistance:16\n")
+            with self.assertRaisesRegex(RuntimeError, "renderDistance.*16.*32"):
+                scene_shot.check_java_render_distance(options, 32)
+            options.write_text("fov:0.0\n")
+            with self.assertRaisesRegex(RuntimeError, "renderDistance"):
+                scene_shot.check_java_render_distance(options, 32)
