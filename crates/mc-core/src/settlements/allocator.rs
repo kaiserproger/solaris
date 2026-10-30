@@ -647,9 +647,11 @@ fn body_clear(
                 let Some(id) = world.block_at(x, y, z) else {
                     return false;
                 };
+                // Fractional-height floors put water in the sampled row below
+                // the feet; it cannot obstruct a walking body above the floor.
                 match registry.materials.classify(id) {
                     mc_physics::BlockMaterial::Lava => return false,
-                    mc_physics::BlockMaterial::Water if !wade || y != foot => return false,
+                    mc_physics::BlockMaterial::Water if !wade || y > foot => return false,
                     _ => {}
                 }
                 let Some(boxes) = registry.collision_boxes.get(id as usize) else {

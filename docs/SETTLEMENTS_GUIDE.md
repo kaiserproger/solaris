@@ -50,6 +50,7 @@ The single empty founding chest is an explicit infrastructure exemption, like th
 Natural mine and lumber-camp candidates become jobs only after an ordinary unemployed bound adult villager has a proven route to their entrance, and that entrance is in an entity-simulated chunk. Loaded terrain outside simulation cannot support a working villager. Chunk adoption queues candidates without path searches; later 20-tick planner passes attempt one resident/candidate through the shared pathfinder budget. An isolated cliff-top resource does not permanently occupy the village's only production zone. Existing certified zones are not retroactively revoked.
 Natural mine candidates must also pass the miner's ordinary first-cut safety check before a job is queued; a flooded or otherwise unsafe entrance is skipped in favor of another site.
 Before either natural worksite is certified, the entrance must also have a walkable route to settlement storage; workers cannot fund construction with resources they cannot bring home. The stock and resident routes are checked on separate bounded planner passes.
+Villager walking routes can cross a path or other partial-height floor with water beneath it; water above the villager's feet remains impassable to ground navigation.
 
 
 Numeric settlement IDs use the same monotonic sequence for founded towns and adopted villages. Adoption first looks up the saved worldgen source, so claiming, renaming and restarting do not create a second settlement.

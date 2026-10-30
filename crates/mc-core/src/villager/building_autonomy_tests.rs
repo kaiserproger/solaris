@@ -232,9 +232,7 @@ fn village_with(sparse: bool) -> TickState {
 fn village() -> TickState {
     village_with(false)
 }
-#[test]
-#[ignore = "requires the local vanilla 26.1.2 content cache"]
-fn seed_100_generated_village_builds_storage_with_player_simulation_distance() {
+fn seed_100_village() -> TickState {
     let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
     let mut config = crate::config::CoreConfig::new(std::path::PathBuf::new(), 100);
     config.vanilla_data_dir = Some(data.clone());
@@ -267,6 +265,177 @@ fn seed_100_generated_village_builds_storage_with_player_simulation_distance() {
     generated::load(&mut state, &chunks, &mut changes);
     changes.chunks_loaded.extend(chunks);
     crate::settlements::autonomy::tick(&mut state, &mut changes);
+    state
+}
+
+#[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_west_residents_can_route_to_founding_storage() {
+    use crate::boundary::BlockPos;
+    use crate::settlements::allocator::{PoiCache, RouteCtx, find_path_ctx};
+    use crate::tick_budget::{Budget, Consumer};
+
+    let state = seed_100_village();
+    for start in [[95.5, 63.0, 5.5], [86.5, 63.0, 10.5]] {
+        let mut budget = Budget::default();
+        let mut ctx = RouteCtx {
+            world: &state.world,
+            registry: &state.registry,
+            dimension: state.dimension,
+            consumer: Consumer::Allocator,
+            budget: &mut budget,
+        };
+        let mut cache = PoiCache::default();
+        let mut path = Vec::new();
+        assert!(ctx.admit());
+        assert!(
+            find_path_ctx(
+                &mut ctx,
+                &mut cache,
+                start,
+                BlockPos {
+                    x: 117,
+                    y: 70,
+                    z: 5
+                },
+                0.3,
+                1.95,
+                &mut path,
+                false,
+                48,
+                16,
+                true,
+            ),
+            "west resident at {start:?} cannot reach storage; partial path: {path:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_west_unemployed_resident_is_assigned_to_funded_storage() {
+    let mut state = seed_100_village();
+    let id = state.settlements.records().next().unwrap().id;
+    let chest = state
+        .settlements
+        .get(id)
+        .unwrap()
+        .bootstrap_storage
+        .unwrap();
+    assert_eq!(chest, [117, 70, 5]);
+    let west = crate::settlements::allocator::tests::villager(&mut state, [86.5, 63.0, 10.5]);
+    let central = crate::settlements::allocator::tests::villager(&mut state, [118.5, 70.0, 5.5]);
+    for slot in [west, central] {
+        let entity = state.entities.body(slot).id;
+        crate::settlements::bind(&mut state, id, entity).unwrap();
+    }
+    state
+        .entities
+        .row_mut(central)
+        .villager
+        .as_mut()
+        .unwrap()
+        .data
+        .profession = VillagerProfession::Farmer;
+    let stock = &mut state
+        .block_entities
+        .get_mut(&(chest[0], chest[1], chest[2]))
+        .unwrap()
+        .slots;
+    for (index, (name, count)) in [
+        ("cobblestone", 64),
+        ("cobblestone", 50),
+        ("acacia_log", 43),
+        ("coal", 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let item = state
+            .registry
+            .items
+            .id_of(&mc_data::Identifier::parse(format!("minecraft:{name}")).unwrap())
+            .unwrap();
+        stock[index] = mc_data::ItemStack::new(item, count);
+    }
+    state.day_time = 3000;
+    for tick in (0..4000).step_by(20) {
+        state.tick = tick;
+        crate::settlements::construction::tick(&mut state);
+        let assigned = state
+            .entities
+            .row(west)
+            .villager
+            .as_ref()
+            .unwrap()
+            .data
+            .profession
+            == VillagerProfession::Builder;
+        let started = state
+            .settlements
+            .get(id)
+            .unwrap()
+            .project
+            .as_ref()
+            .is_some_and(|project| project.blueprint == "storage" && project.level == 1);
+        if assigned && started {
+            return;
+        }
+    }
+    panic!(
+        "west unemployed resident was not assigned to funded Storage L1; project={:?}",
+        state.settlements.get(id).unwrap().project
+    );
+}
+
+#[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_farmer_delivers_from_west_bridge() {
+    let mut state = seed_100_village();
+    let id = state.settlements.records().next().unwrap().id;
+    let chest = state
+        .settlements
+        .get(id)
+        .unwrap()
+        .bootstrap_storage
+        .unwrap();
+    let slot = crate::settlements::allocator::tests::villager(&mut state, [95.5, 63.0, 5.5]);
+    let entity = state.entities.body(slot).id;
+    crate::settlements::bind(&mut state, id, entity).unwrap();
+    let carrot = state
+        .registry
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:carrot").unwrap())
+        .unwrap();
+    let v = state.entities.row_mut(slot).villager.as_mut().unwrap();
+    v.data.profession = VillagerProfession::Farmer;
+    v.job_site = Some(crate::boundary::BlockPos { x: 66, y: 69, z: 3 });
+    v.inventory[0] = Some(mc_data::ItemStack::new(carrot, 2));
+    state.day_time = 3000;
+    for _ in 0..4000 {
+        crate::tick::run_tick(&mut state, &[]);
+        if state.block_entities[&(chest[0], chest[1], chest[2])]
+            .slots
+            .iter()
+            .any(|stack| stack.item_id == carrot && stack.count >= 2)
+        {
+            return;
+        }
+    }
+    let v = state.entities.row(slot).villager.as_ref().unwrap();
+    panic!(
+        "farmer failed to deliver: pos={:?} target={:?} path={} inventory={:?}",
+        state.entities.pos(slot),
+        v.navigation_target,
+        v.navigation_path.len(),
+        v.inventory
+    );
+}
+
+#[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_generated_village_builds_storage_with_player_simulation_distance() {
+    let mut state = seed_100_village();
     for _ in 0..12_000 {
         crate::tick::run_tick(&mut state, &[]);
         for record in state.settlements.records() {
