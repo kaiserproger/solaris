@@ -1217,6 +1217,20 @@ pub(crate) struct WaitingNeed {
     pub(crate) no_source: Option<SourceReason>,
 }
 
+/// Whether the planner can fund at least one of its current candidates.
+pub(crate) fn has_funded_candidate(state: &TickState, id: SettlementId) -> bool {
+    let Some(record) = state.settlements.get(id) else {
+        return false;
+    };
+    let images = executor::source_images(state, id);
+    let catalog = blueprints::all(&state.registry);
+    needed_kinds(record, state.settlements.member_count(id)).any(|kind| {
+        catalog.iter().find(|blueprint| blueprint.kind == kind)
+            .and_then(|blueprint| blueprint.level(1))
+            .is_some_and(|level| funded_species(state, &level.materials, &images).is_some())
+    }) || upgrade_project(state, record).is_some()
+}
+
 /// Needed authored kinds the settlement cannot fund yet, one entry per kind.
 /// Formatting (translation, per-line cap) belongs to the dialog.
 pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {

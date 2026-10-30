@@ -1739,10 +1739,12 @@ fn project_status_screen(state: &mut TickState, connection: ConnectionId, ctx: &
     } else {
         let text = if state.settlements.member_count(ctx.id) == 0 {
             match ctx.lang { Lang::En => "No active project: no residents.", Lang::Ru => "Нет стройки: нет жителей." }
+        } else if super::construction::has_funded_candidate(state, ctx.id) {
+            match ctx.lang { Lang::En => "No active project: waiting for the planner.", Lang::Ru => "Нет стройки: ожидание планирования." }
         } else if !waiting.is_empty() {
             match ctx.lang { Lang::En => "No active project: waiting for materials.", Lang::Ru => "Нет стройки: не хватает материалов." }
         } else {
-            match ctx.lang { Lang::En => "No active project: waiting for planning or a site.", Lang::Ru => "Нет стройки: ожидание планирования или места." }
+            match ctx.lang { Lang::En => "No active project: no building currently needed.", Lang::Ru => "Нет стройки: сейчас новые здания не нужны." }
         };
         dialog = dialog.text(text);
     }

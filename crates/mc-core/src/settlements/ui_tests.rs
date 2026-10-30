@@ -1122,6 +1122,16 @@ fn project_status_waiting_uses_translatable_material_names_without_truncation() 
 }
 
 #[test]
+fn project_status_does_not_claim_all_candidates_lack_materials_when_one_is_funded() {
+    let mut state = joined(0);
+    let id = town(&mut state, PLAYER);
+    prep_projects_site(&mut state, id);
+    assert!(!super::super::construction::has_funded_candidate(&state, id));
+    crate::settlements::construction::tests::fund(&mut state, "storage", 1);
+    assert!(super::super::construction::has_funded_candidate(&state, id));
+}
+
+#[test]
 fn project_status_active_shows_readable_progress() {
     let mut state = joined(0);
     let id = town(&mut state, PLAYER);
