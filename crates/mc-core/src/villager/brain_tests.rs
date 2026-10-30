@@ -1024,6 +1024,28 @@ fn resting_villager_moves_onto_nearby_indoor_stair() {
 }
 
 #[test]
+fn resting_villager_walks_to_its_own_bed_past_a_seat() {
+    let mut state = test_state();
+    let home = bed(&mut state, 15, 8);
+    let stair = block(&state, "minecraft:oak_stairs", &[("half", "bottom")]);
+    state.world.set_block(9, 201, 8, stair);
+    state
+        .world
+        .set_block(9, 204, 8, state.registry.states.stone);
+    state.world.fold_overlay();
+    let slot = villager(&mut state, [8.5, 201.0, 8.5]);
+    state.entities.row_mut(slot).villager.as_mut().unwrap().home = Some(home);
+    state.day_time = 18000;
+    step(&mut state);
+    let v = state.entities.row(slot).villager.as_ref().unwrap();
+    assert_eq!(v.seat, None, "its own bed comes before a nearby seat");
+    assert!(
+        !v.navigation_path.is_empty(),
+        "the resident is routed towards its bed"
+    );
+}
+
+#[test]
 fn stair_under_a_solid_block_is_not_a_seat() {
     let mut state = test_state();
     let stair = block(&state, "minecraft:oak_stairs", &[("half", "bottom")]);

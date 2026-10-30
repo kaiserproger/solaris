@@ -882,8 +882,11 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
             }
         }
         let changing_seated_activity = old_activity != v.activity && v.seat.is_some();
+        // A resident heading to its own bed at rest never stops on a seat.
+        let bed_bound = v.activity == Activity::Rest && sleep_home_allowed && home.is_some();
         let can_sit = !merchant_busy
             && !v.sleeping
+            && !bed_bound
             && !changing_seated_activity
             && matches!(v.activity, Activity::Rest | Activity::Idle)
             && v.navigation_path.is_empty();
