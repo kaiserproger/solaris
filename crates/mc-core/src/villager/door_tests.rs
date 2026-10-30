@@ -167,6 +167,14 @@ fn bound_bedless_nitwit_enters_occupied_house_at_night() {
             state.entities.pos(resident)
         );
     }
+    let cells: std::collections::BTreeSet<_> = [nitwit, unemployed, child]
+        .into_iter()
+        .map(|slot| {
+            let [x, _, z] = state.entities.pos(slot);
+            (x.floor() as i32, z.floor() as i32)
+        })
+        .collect();
+    assert_eq!(cells.len(), 3, "bedless residents must not share a cell");
 }
 
 #[test]

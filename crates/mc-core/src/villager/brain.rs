@@ -303,16 +303,41 @@ fn night_shelter(
         {
             continue;
         }
-        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let target = BlockPos { x: bed.x + dx, y: bed.y, z: bed.z + dz };
-            if roofed(state, target)
-                && standing(&state.world, &state.registry, target, width, height).is_some()
-            {
-                if v.navigation_target == Some(target) {
-                    cache.candidates = candidates;
-                    return (Some(target), true);
+        let mut cells = [bed; 17];
+        let mut count = 1;
+        let mut next = 0;
+        while next < count && count < cells.len() {
+            let origin = cells[next];
+            next += 1;
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let target = BlockPos { x: origin.x + dx, y: bed.y, z: origin.z + dz };
+                if cells[..count].contains(&target)
+                    || !roofed(state, target)
+                    || standing(&state.world, &state.registry, target, width, height).is_none()
+                {
+                    continue;
                 }
-                candidates.push((distance(pos, centre(bed)), Poi { pos: target, kind: PoiKind::Home }));
+                cells[count] = target;
+                count += 1;
+                let reserved = cache.residents.iter().copied().any(|other| {
+                    other != slot && state.entities.row(other).villager.as_ref().is_some_and(|resident| {
+                        resident.navigation_target == Some(target)
+                            || at(state.entities.pos(other)) == target
+                    })
+                });
+                let doorway = state.world.block_at(target.x, target.y, target.z)
+                    .and_then(|id| state.registry.blocks.by_id(mc_world::BlockStateId(id)))
+                    .is_some_and(|block| block.block.id.path().ends_with("_door"));
+                if !reserved && !doorway {
+                    if v.navigation_target == Some(target) {
+                        cache.candidates = candidates;
+                        return (Some(target), true);
+                    }
+                    candidates.push((distance(pos, centre(bed)), Poi { pos: target, kind: PoiKind::Home }));
+                }
+                if count == cells.len() {
+                    break;
+                }
             }
         }
     }
