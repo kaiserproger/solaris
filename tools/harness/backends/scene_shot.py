@@ -1,12 +1,14 @@
 """Script a windowed native-client scene on an isolated v2 world."""
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,79 @@ from .gameplay import prepare_operator_fixture
 from .probe_steps import ProbeSteps
 
 USERNAME = "SceneShot"
+
+class LatencyProxy:
+    """Delay traffic in each direction without changing host networking."""
+
+    def __init__(self, target_port: int, delay_ms: int):
+        self.target_port = target_port
+        self.delay = delay_ms / 1000
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        self.error = None
+        self.port = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    async def _forward(self, reader, writer):
+        while data := await reader.read(65536):
+            ready = self.loop.create_future()
+            timer = self.loop.call_later(self.delay, ready.set_result, None)
+            try:
+                await ready
+            finally:
+                timer.cancel()
+            writer.write(data)
+            await writer.drain()
+
+    async def _connection(self, reader, writer):
+        upstream = None
+        try:
+            upstream_reader, upstream = await asyncio.open_connection("127.0.0.1", self.target_port)
+            tasks = [
+                asyncio.create_task(self._forward(reader, upstream)),
+                asyncio.create_task(self._forward(upstream_reader, writer)),
+            ]
+            _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            writer.close()
+            if upstream is not None:
+                upstream.close()
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        try:
+            server = self.loop.run_until_complete(asyncio.start_server(self._connection, "127.0.0.1", 0))
+            self.port = server.sockets[0].getsockname()[1]
+        except Exception as error:
+            self.error = error
+            self.ready.set()
+            self.loop.close()
+            return
+        self.ready.set()
+        self.loop.run_forever()
+        server.close()
+        self.loop.run_until_complete(server.wait_closed())
+        tasks = asyncio.all_tasks(self.loop)
+        for task in tasks:
+            task.cancel()
+        self.loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        self.loop.close()
+
+    def start(self):
+        self.thread.start()
+        self.ready.wait()
+        if self.error is not None:
+            raise RuntimeError("starting latency proxy failed") from self.error
+        return self.port
+
+    def close(self):
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join()
+
 
 
 
@@ -106,6 +181,9 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     operator = scenario.get("operator", True)
     if type(operator) is not bool:
         raise ValueError("operator must be true or false")
+    client_latency_ms = scenario.get("client_latency_ms", 0)
+    if type(client_latency_ms) is not int or not 0 <= client_latency_ms <= 5000:
+        raise ValueError("client_latency_ms must be an integer in 0..5000")
     settings = scenario.get("client_settings", {})
     if not isinstance(settings, dict) or set(settings) - {"graphics_preset", "render_distance"}:
         raise ValueError("unsupported client settings")
@@ -160,7 +238,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         base = json.loads(base_path.read_text()) if base_path.is_file() else {}
     base.update(settings)
     settings_path.write_text(json.dumps(base, indent=2) + "\n")
-    server = client = xvfb = mcp = log = client_log = None
+    server = client = xvfb = mcp = log = client_log = proxy = None
     server_index = len(ctx.commands)
     server_command = [str(binary), "--config", str(config), "--no-console"]
     ctx.commands.append(server_command)
@@ -171,6 +249,10 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         ctx.logs.append(str(artifact / "server.log"))
         server = subprocess.Popen(server_command, cwd=runtime.REPO_ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         runtime.wait_port(port, timeout, server, log_path=artifact / "server.log")
+        client_port = port
+        if client_latency_ms:
+            proxy = LatencyProxy(port, client_latency_ms)
+            client_port = proxy.start()
         xvfb, display, _ = runtime.start_xvfb(artifact)
         ctx.logs.append(str(artifact / "xvfb.log"))
         old_xdg = os.environ.get("XDG_DATA_HOME")
@@ -178,7 +260,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         try:
             os.environ["XDG_DATA_HOME"] = str(xdg)
             os.environ["SOLARIS_CLIENT_SETTINGS"] = str(settings_path)
-            client, client_log, mcp = native_client.start(ctx, native_client.resolve_binary(ctx), f"127.0.0.1:{port}", USERNAME, timeout, display=display)
+            client, client_log, mcp = native_client.start(ctx, native_client.resolve_binary(ctx), f"127.0.0.1:{client_port}", USERNAME, timeout, display=display)
         finally:
             for key, old in (("XDG_DATA_HOME", old_xdg), ("SOLARIS_CLIENT_SETTINGS", old_settings)):
                 if old is None:
@@ -195,7 +277,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
                 "observed_version": before["state_version"], "timeout_seconds": probe.remaining(),
             })
             shots = execute(probe, artifact, scenario["steps"])
-        return {"screenshots": shots, "scenario": probe.report, "seed": seed, "settings": settings}
+        return {"screenshots": shots, "scenario": probe.report, "seed": seed, "settings": settings, "client_latency_ms": client_latency_ms}
     finally:
         if mcp is not None:
             mcp.close()
@@ -204,6 +286,8 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
             ctx.exits[ctx.client_evidence["command_index"]] = client.returncode
         if client_log is not None:
             client_log.close()
+        if proxy is not None:
+            proxy.close()
         runtime.stop_process(server, interrupt=True)
         if server is not None:
             ctx.exits[server_index] = server.returncode

@@ -1,5 +1,8 @@
 import json
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +11,29 @@ from tools.harness.backends import scene_shot
 
 
 class SceneShotTests(unittest.TestCase):
+    def test_latency_proxy_delays_both_directions(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        def echo():
+            with listener:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.sendall(connection.recv(32))
+        thread = threading.Thread(target=echo)
+        thread.start()
+        proxy = scene_shot.LatencyProxy(listener.getsockname()[1], 75)
+        try:
+            port = proxy.start()
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                started = time.monotonic()
+                client.sendall(b"ping")
+                self.assertEqual(client.recv(4), b"ping")
+                self.assertGreaterEqual(time.monotonic() - started, 0.14)
+        finally:
+            proxy.close()
+            thread.join()
+
     def test_steps_dispatch_and_retain_evidence(self):
         class Probe:
             def __init__(self):
