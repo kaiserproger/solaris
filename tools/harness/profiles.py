@@ -384,6 +384,12 @@ def run_village_autonomy_qa(ctx: ProfileContext) -> dict[str, Any]:
     return village_autonomy_qa.run(ctx)
 
 
+def run_scene_shot(ctx: ProfileContext) -> dict[str, Any]:
+    from .backends import scene_shot
+
+    return scene_shot.run(ctx)
+
+
 def run_claim_only_qa(ctx: ProfileContext) -> dict[str, Any]:
     """Claim/fencing/restart checklist on a settled autonomous world (native)."""
     from .backends import claim_only_qa
@@ -789,6 +795,11 @@ PROFILES: dict[str, dict[str, Any]] = {
         "scope": "real-client",
         "description": "Generated-village autonomy: walk-to-village adoption, unfunded Storage L1 + House L1, dialog claim, second-claim refusal (native --client, windowed for screenshots)",
         "run": run_village_autonomy_qa,
+    },
+    "scene-shot": {
+        "scope": "real-client",
+        "description": "Scripted windowed native-client scene captures on an isolated world",
+        "run": run_scene_shot,
     },
     "claim-only-qa": {
         "scope": "real-client",
