@@ -1333,7 +1333,9 @@ def _planner_status(probe: ProbeSteps, detail: dict[str, Any], chest_pos: tuple[
 
 
 def _wait_project_started(probe: ProbeSteps) -> dict[str, Any]:
-    deadline = time.monotonic() + 600.0
+    # Builders work only during the 2000..9000 day-time shift; an order placed
+    # in the evening waits out the night (24000 ticks ≈ 1200 s at 20 TPS).
+    deadline = time.monotonic() + 1300.0
     while time.monotonic() < deadline:
         state = _project_status(probe)
         project = _project_progress(state)
@@ -1353,7 +1355,7 @@ def _wait_project_resumed(
     detail["restart_info_chat"] = info
     probe.check("claimed_owner_survives_restart", old_owner is not None and old_owner != "autonomous" and new_owner == old_owner)
     blueprint = next(blueprint for blueprint in _authored_blueprints() if blueprint["id"] == before["blueprint"])
-    deadline = time.monotonic() + 600.0
+    deadline = time.monotonic() + 1300.0
     while time.monotonic() < deadline:
         state = _project_status(probe)
         after = _project_progress(state)
