@@ -283,8 +283,11 @@ fn roofed(state: &TickState, pos: BlockPos) -> bool {
     })
 }
 
-fn stair_seat(state: &TickState, pos: [f64; 3]) -> Option<BlockPos> {
-    let origin = at(pos);
+/// A roofed bottom stair beside the villager with body room above it (a stair
+/// under a low ceiling or inside a wall is not a seat).
+fn stair_seat(state: &TickState, slot: EntitySlot) -> Option<BlockPos> {
+    let origin = at(state.entities.pos(slot));
+    let body = state.entities.body(slot);
     for dx in -1..=1 {
         for dz in -1..=1 {
             for dy in -1..=0 {
@@ -306,6 +309,17 @@ fn stair_seat(state: &TickState, pos: [f64; 3]) -> Option<BlockPos> {
                         .iter()
                         .any(|(key, value)| key == "half" && value == "bottom")
                     && roofed(state, seat)
+                    && standing(
+                        &state.world,
+                        &state.registry,
+                        BlockPos {
+                            y: seat.y + 1,
+                            ..seat
+                        },
+                        body.half_width,
+                        body.height,
+                    )
+                    .is_some()
                 {
                     return Some(seat);
                 }
@@ -645,7 +659,7 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
                         Activity::Rest | Activity::Idle
                     )
                     || distance(state.entities.pos(slot), centre(seat)) > 4.0
-                    || stair_seat(state, state.entities.pos(slot)) != Some(seat)
+                    || stair_seat(state, slot) != Some(seat)
             })
         });
         if clear_seat {
@@ -876,13 +890,13 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
         if !can_sit
             || v.seat.is_some_and(|seat| {
                 distance(state.entities.pos(slot), centre(seat)) > 4.0
-                    || stair_seat(state, state.entities.pos(slot)) != Some(seat)
+                    || stair_seat(state, slot) != Some(seat)
             })
         {
             v.seat = None;
         }
         if can_sit && v.seat.is_none() {
-            v.seat = stair_seat(state, state.entities.pos(slot)).filter(|seat| {
+            v.seat = stair_seat(state, slot).filter(|seat| {
                 !cache.residents.iter().copied().any(|other| {
                     other != slot
                         && state

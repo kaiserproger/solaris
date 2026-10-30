@@ -1024,6 +1024,33 @@ fn resting_villager_moves_onto_nearby_indoor_stair() {
 }
 
 #[test]
+fn stair_under_a_solid_block_is_not_a_seat() {
+    let mut state = test_state();
+    let stair = block(&state, "minecraft:oak_stairs", &[("half", "bottom")]);
+    state.world.set_block(9, 201, 8, stair);
+    state
+        .world
+        .set_block(9, 202, 8, state.registry.states.stone);
+    state.world.fold_overlay();
+    let slot = villager(&mut state, [8.5, 201.0, 8.5]);
+    state.day_time = 18000;
+    step(&mut state);
+    let id = state.entities.body(slot).id;
+    assert_eq!(
+        state
+            .entities
+            .views()
+            .get(id)
+            .unwrap()
+            .appearance
+            .villager_seat,
+        None
+    );
+    let position = state.entities.pos(slot);
+    assert_ne!((position[0], position[2]), (9.5, 8.5));
+}
+
+#[test]
 fn foreign_dimension_pois_do_not_steer_overworld_villagers() {
     let mut state = test_state();
     let slot = villager(&mut state, [8.5, 201.0, 8.5]);
