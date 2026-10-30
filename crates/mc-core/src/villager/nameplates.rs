@@ -10,6 +10,7 @@ enum Key {
     Generated {
         uuid: uuid::Uuid,
         profession: VillagerProfession,
+        baby: bool,
         activity: Activity,
         sleeping: bool,
     },
@@ -24,6 +25,7 @@ impl Key {
         Self::Generated {
             uuid: row.uuid,
             profession: v.data.profession,
+            baby: v.age < 0,
             activity: v.activity,
             sleeping: v.sleeping,
         }
@@ -48,6 +50,7 @@ impl Nameplate {
             if let Key::Generated {
                 uuid,
                 profession,
+                baby,
                 activity,
                 sleeping,
             } = key
@@ -55,7 +58,11 @@ impl Nameplate {
                 appearance.custom_name = Some(format!(
                     "{} · {} · {}",
                     crate::settlements::presentation::villager_name(uuid),
-                    crate::settlements::presentation::profession_name(profession),
+                    if baby {
+                        "ребёнок"
+                    } else {
+                        crate::settlements::presentation::profession_name(profession)
+                    },
                     activity_name(activity, sleeping),
                 ));
             }

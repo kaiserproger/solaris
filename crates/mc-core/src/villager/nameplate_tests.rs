@@ -19,6 +19,18 @@ fn appearance(state: &mut TickState, id: EntityId) -> Arc<EntityAppearance> {
 }
 
 #[test]
+fn child_nameplate_changes_when_growing_up() {
+    let mut state = state();
+    let (id, slot) = villager(&mut state, "minecraft:villager");
+    state.entities.row_mut(slot).villager.as_mut().unwrap().age = -1;
+    let child = appearance(&mut state, id);
+    assert!(child.custom_name.as_deref().unwrap().contains(" · ребёнок · "));
+    state.entities.row_mut(slot).villager.as_mut().unwrap().age = 0;
+    let adult = appearance(&mut state, id);
+    assert!(adult.custom_name.as_deref().unwrap().contains(" · безработный · "));
+}
+
+#[test]
 fn uuid_name_profession_and_activity_are_visible_but_not_saved() {
     let mut state = state();
     let (id, slot) = villager(&mut state, "minecraft:villager");
