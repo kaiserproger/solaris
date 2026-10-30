@@ -318,6 +318,9 @@ pub(super) fn move_to(
         let new_target = v.navigation_target != Some(target);
         let due = state.tick >= v.navigation_repath_at;
         let changed = route_changed(state, v);
+        if new_target || changed {
+            v.navigation_search_failed = false;
+        }
         unchanged = !changed;
         // Progress is observed only at due checks, never every brain step: a
         // shorter path or a closer next cell means the villager is still
@@ -376,6 +379,7 @@ pub(super) fn move_to(
             if found || !exhausted || new_target || changed || v.navigation_path.is_empty() {
                 std::mem::swap(&mut seek_path, &mut v.navigation_path);
                 v.navigation_target = Some(target);
+                v.navigation_search_failed = !found && !exhausted;
                 capture_route(state, v, pos, true);
             }
             seek_path.clear();
@@ -400,6 +404,7 @@ pub(super) fn move_to(
         v.navigation_path.clear();
         v.navigation_target = None;
         v.navigation_chunks.clear();
+        v.navigation_search_failed = false;
     }
     let scheduled = cache.activity_for(v.age, v.data.profession, state.day_time);
     move_committed_with_route(state, slot, v, scheduled, unchanged);

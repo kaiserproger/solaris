@@ -26,6 +26,8 @@ pub(crate) mod harvest;
 mod harvest_tests;
 pub(crate) mod lumber;
 #[cfg(test)]
+mod lumber_autonomy_tests;
+#[cfg(test)]
 mod lumber_tests;
 pub(crate) mod mining;
 #[cfg(test)]
@@ -401,6 +403,9 @@ pub struct VillagerState {
     pub(crate) navigation_target: Option<BlockPos>,
     #[serde(skip)]
     pub(crate) navigation_chunks: Vec<(crate::boundary::ChunkPos, u64)>,
+    /// The last completed bounded search failed; budget deferral is not failure.
+    #[serde(skip)]
+    pub(crate) navigation_search_failed: bool,
     #[serde(skip)]
     pub(crate) motion_geometry: brain::MotionGeometryCache,
     #[serde(skip)]
@@ -478,6 +483,7 @@ impl Default for VillagerState {
             navigation_path: Vec::new(),
             navigation_target: None,
             navigation_chunks: Vec::new(),
+            navigation_search_failed: false,
             motion_geometry: brain::MotionGeometryCache::default(),
             navigation_repath_at: 0,
             navigation_can_open_doors: false,

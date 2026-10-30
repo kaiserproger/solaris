@@ -214,7 +214,12 @@ def wait_for_path_condition(path: Path, timeout_seconds: float, condition: Any) 
         os.close(notify_fd)
 
 
-def stop_process(process: subprocess.Popen[Any] | None, *, interrupt: bool = False) -> None:
+def stop_process(
+    process: subprocess.Popen[Any] | None,
+    *,
+    interrupt: bool = False,
+    timeout_seconds: float = 8.0,
+) -> None:
     if process is None or process.poll() is not None:
         return
     try:
@@ -222,7 +227,7 @@ def stop_process(process: subprocess.Popen[Any] | None, *, interrupt: bool = Fal
     except (ProcessLookupError, PermissionError):
         return
     try:
-        process.wait(timeout=8)
+        process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)

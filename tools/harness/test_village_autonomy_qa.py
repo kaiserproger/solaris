@@ -317,5 +317,105 @@ class VillageAutonomyQaTests(unittest.TestCase):
         probe.call.assert_any_call("minecraft_close_screen", {})
 
 
+class SettlementStockObservationTests(unittest.TestCase):
+    def test_sums_founding_chest_and_every_owned_storage_container(self) -> None:
+        probe = Mock()
+        buildings = [
+            "Buildings: #1 storage level 1 [10, 64, 0]-[13, 66, 3], "
+            "#2 farmer level 1 [20, 64, 0]-[25, 68, 5].",
+        ]
+        probe.call.return_value = {"blocks": [
+            {"x": 10, "y": 64, "z": 1, "block_id": "minecraft:chest"},
+            {"x": 12, "y": 64, "z": 1, "block_id": "minecraft:barrel"},
+            {"x": 99, "y": 64, "z": 1, "block_id": "minecraft:chest"},
+        ]}
+        contents = {
+            (1, 64, 1): {0: {"item_id": "minecraft:cobblestone", "count": 2}},
+            (10, 64, 1): {0: {"item_id": "minecraft:cobblestone", "count": 64}},
+            (12, 64, 1): {0: {"item_id": "minecraft:birch_log", "count": 16}},
+        }
+        detail = {}
+        with patch.object(qa, "_read", return_value={"block_id": "minecraft:chest"}), patch.object(
+            qa, "_open_chest", side_effect=lambda _, pos: contents[pos],
+        ) as opened:
+            totals = qa._settlement_stock(probe, detail, (1, 64, 1), buildings)
+        self.assertEqual(totals, {"minecraft:cobblestone": 66, "minecraft:birch_log": 16})
+        self.assertEqual({call.args[1] for call in opened.call_args_list}, set(contents))
+        self.assertEqual(len(detail["storage_observation"]["containers"]), 3)
+        probe.call.assert_called_once_with("minecraft_scan_blocks", {
+            "min_x": 10, "min_y": 64, "min_z": 0,
+            "max_x": 13, "max_y": 66, "max_z": 3, "offset": 0,
+        })
+
+    def test_double_chest_and_overlapping_founding_position_are_counted_once(self) -> None:
+        probe = Mock()
+        probe.call.return_value = {"blocks": [
+            {"x": 10, "y": 64, "z": 1, "block_id": "minecraft:chest",
+             "properties": {"type": "left", "facing": "north"}},
+            {"x": 11, "y": 64, "z": 1, "block_id": "minecraft:chest",
+             "properties": {"type": "right", "facing": "north"}},
+        ]}
+        detail = {}
+        with patch.object(qa, "_open_chest", return_value={
+            0: {"item_id": "minecraft:coal", "count": 4},
+            27: {"item_id": "minecraft:birch_log", "count": 16},
+        }) as opened:
+            totals = qa._settlement_stock(probe, detail, (10, 64, 1), [
+                "Buildings: #1 storage level 1 [10, 64, 0]-[12, 66, 3].",
+                "Buildings: #1 storage level 1 [10, 64, 0]-[12, 66, 3].",
+            ])
+        self.assertEqual(totals, {"minecraft:coal": 4, "minecraft:birch_log": 16})
+        opened.assert_called_once()
+        self.assertEqual(detail["storage_observation"]["containers"][0]["positions"],
+                         [[10, 64, 1], [11, 64, 1]])
+
+    def test_storage_scans_page_until_complete_and_reject_stalled_pagination(self) -> None:
+        probe = Mock()
+        buildings = ["Buildings: #1 storage level 1 [10, 64, 0]-[12, 66, 3]."]
+        first = {"blocks": [], "truncated": True, "next_offset": 128}
+        last = {"blocks": [{"x": 12, "y": 64, "z": 1, "block_id": "minecraft:barrel"}]}
+        probe.call.side_effect = [first, last]
+        with patch.object(qa, "_read", return_value={"block_id": "minecraft:chest"}), patch.object(
+            qa, "_open_chest", return_value={0: {"item_id": "minecraft:coal", "count": 1}},
+        ):
+            self.assertEqual(qa._settlement_stock(probe, {}, (1, 64, 1), buildings),
+                             {"minecraft:coal": 2})
+        self.assertEqual(probe.call.call_args_list[-1].args[1]["offset"], 128)
+        probe.call.side_effect = None
+        probe.call.return_value = {"blocks": [], "truncated": True, "next_offset": 0}
+        with self.assertRaisesRegex(RuntimeError, "pagination"):
+            qa._settlement_stock(probe, {}, (1, 64, 1), buildings)
+
+
+    def test_adjacent_large_chests_do_not_pair_across_inventory_boundaries(self) -> None:
+        probe = Mock()
+        probe.call.return_value = {"blocks": [
+            {"x": x, "y": 64, "z": 1, "block_id": "minecraft:chest",
+             "properties": {"type": "left" if x % 2 == 0 else "right", "facing": "north"}}
+            for x in range(10, 14)
+        ]}
+        with patch.object(qa, "_read", return_value={"block_id": "minecraft:air"}), patch.object(
+            qa, "_open_chest", return_value={0: {"item_id": "minecraft:coal", "count": 4}},
+        ) as opened:
+            totals = qa._settlement_stock(probe, {}, (10, 64, 1), [
+                "Buildings: #1 storage level 1 [10, 64, 0]-[13, 66, 3].",
+            ])
+        self.assertEqual(totals, {"minecraft:coal": 8})
+        self.assertEqual(opened.call_count, 2)
+
+    def test_planner_receipt_uses_the_aggregate_storage_observation(self) -> None:
+        detail = {}
+        probe = Mock()
+        buildings = ["Buildings: #1 storage level 1 [10, 64, 0]-[13, 66, 3]."]
+        with patch.object(qa, "_send", side_effect=[
+            {"recent_chat": ["Projects"]}, {"recent_chat": buildings},
+        ]), patch.object(qa, "_settlement_stock", return_value={
+            "minecraft:cobblestone": 190, "minecraft:acacia_log": 37,
+        }) as stock:
+            status = qa._planner_status(probe, detail, (1, 64, 1))
+        stock.assert_called_once_with(probe, detail, (1, 64, 1), buildings)
+        self.assertEqual(status["storage_now"]["minecraft:cobblestone"], 190)
+
+
 if __name__ == "__main__":
     unittest.main()

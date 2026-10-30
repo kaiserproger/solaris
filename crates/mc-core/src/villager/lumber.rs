@@ -427,6 +427,17 @@ pub(super) fn work(
         return None;
     }
     if !mining::near(state, slot, base, REACH) {
+        // The brain has exhausted its approach and reached a retry deadline
+        // without getting into harvesting reach. Keep the sweep cursor, not
+        // an inaccessible tree that would pin this worker for every workday.
+        if v.navigation_target == Some(base)
+            && v.navigation_search_failed
+            && v.navigation_path.is_empty()
+            && state.tick >= v.navigation_repath_at
+        {
+            drop_target(v);
+            return None;
+        }
         return Some(base);
     }
     if state.tick < v.harvest_at {

@@ -25,6 +25,37 @@ from .backends import driver
 from types import SimpleNamespace
 
 
+class ProcessStopTests(unittest.TestCase):
+    def test_server_restart_can_wait_for_the_production_stop_deadline(self) -> None:
+        process = mock.Mock(pid=123, returncode=0)
+        process.poll.return_value = None
+        with mock.patch.object(runtime.os, "killpg") as kill:
+            runtime.stop_process(process, interrupt=True, timeout_seconds=90.0)
+        kill.assert_called_once_with(123, signal.SIGINT)
+        process.wait.assert_called_once_with(timeout=90.0)
+
+    def test_server_stop_deadline_still_kills_a_process_that_does_not_exit(self) -> None:
+        process = mock.Mock(pid=123)
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("server", 90.0), -9]
+        with mock.patch.object(runtime.os, "killpg") as kill:
+            runtime.stop_process(process, interrupt=True, timeout_seconds=90.0)
+        self.assertEqual(kill.call_args_list, [
+            mock.call(123, signal.SIGINT), mock.call(123, signal.SIGKILL),
+        ])
+        self.assertEqual(process.wait.call_args_list, [
+            mock.call(timeout=90.0), mock.call(timeout=5),
+        ])
+
+    def test_other_processes_keep_the_short_cleanup_deadline(self) -> None:
+        process = mock.Mock(pid=123, returncode=0)
+        process.poll.return_value = None
+        with mock.patch.object(runtime.os, "killpg") as kill:
+            runtime.stop_process(process)
+        kill.assert_called_once_with(123, signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=8.0)
+
+
 class ClientSettingsTests(unittest.TestCase):
     def test_invalid_username_rejected(self) -> None:
         with mock.patch.dict(os.environ, {
