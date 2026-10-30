@@ -339,6 +339,71 @@ def _chest_totals(slots: dict[int, dict[str, Any]]) -> dict[str, int]:
     return totals
 
 
+def _settlement_stock(
+    probe: ProbeSteps, detail: dict[str, Any], founding: tuple[int, int, int],
+    building_lines: list[str],
+) -> dict[str, int]:
+    """Observe real container menus in the founding chest and owned Storage bounds."""
+    storage_blocks = {"minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel"}
+    blocks: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for building in _listed_buildings(building_lines):
+        if building["kind"] != "storage":
+            continue
+        lo, hi = building["min"], building["max"]
+        offset = 0
+        while True:
+            scan = probe.call("minecraft_scan_blocks", {
+                "min_x": lo[0], "min_y": lo[1], "min_z": lo[2],
+                "max_x": hi[0], "max_y": hi[1], "max_z": hi[2], "offset": offset,
+            })
+            for block in scan.get("blocks", []):
+                if not isinstance(block, dict) or _block_id(block) not in storage_blocks:
+                    continue
+                pos = (int(block["x"]), int(block["y"]), int(block["z"]))
+                if all(lo[axis] <= pos[axis] <= hi[axis] for axis in range(3)):
+                    blocks[pos] = block
+            if not scan.get("truncated"):
+                break
+            following = scan.get("next_offset")
+            if not isinstance(following, int) or following <= offset:
+                raise RuntimeError("owned storage scan pagination did not advance")
+            offset = following
+    if founding not in blocks:
+        blocks[founding] = _read(probe, founding)
+
+    totals: dict[str, int] = {}
+    containers = []
+    observed = set()
+    for pos, block in sorted(blocks.items()):
+        members = {pos}
+        properties = block.get("properties") or {}
+        half, facing = properties.get("type"), properties.get("facing")
+        if (_block_id(block) != "minecraft:barrel" and half in ("left", "right")
+                and facing in ("north", "east", "south", "west")):
+            # Match native chests::connected: left joins clockwise from its
+            # facing, right counter-clockwise. Adjacent pairs stay distinct.
+            dx, dz = {"north": (1, 0), "east": (0, 1),
+                      "south": (-1, 0), "west": (0, -1)}[facing]
+            sign = 1 if half == "left" else -1
+            adjacent = (pos[0] + sign * dx, pos[1], pos[2] + sign * dz)
+            other = blocks[adjacent] if adjacent in blocks else _read(probe, adjacent)
+            other_properties = other.get("properties") or {}
+            if (_block_id(other) == _block_id(block)
+                    and other_properties.get("facing") == facing
+                    and other_properties.get("type") == ("right" if half == "left" else "left")):
+                members.add(adjacent)
+        identity = tuple(sorted(members))
+        if identity in observed:
+            continue
+        observed.add(identity)
+        stock = _chest_totals(_open_chest(probe, pos))
+        containers.append({"positions": [list(member) for member in identity], "totals": stock})
+        for item, count in stock.items():
+            totals[item] = totals.get(item, 0) + count
+    detail["storage_observation"] = {"containers": containers, "totals": totals}
+    return totals
+
+
 def _verdict(
     detail: dict[str, Any], name: str, verdict: str, evidence: str = "", repro: str = ""
 ) -> None:
@@ -471,7 +536,11 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
             ctx.exits[active_client_evidence["command_index"]] = client_process.returncode
             _client_log.close()
             before_pid = server.pid
-            runtime.stop_process(server, interrupt=True)
+            # A settled world's queued WAL and final checkpoint share the
+            # production server's 90-second stop allowance, not client cleanup's 8s.
+            shutdown_started = time.monotonic()
+            runtime.stop_process(server, interrupt=True, timeout_seconds=90.0)
+            detail["restart_shutdown_seconds"] = time.monotonic() - shutdown_started
             probe.check("restart_server_cleanly_stopped", server.returncode == 0)
             server_log.close()
             server_log_path = artifact / "server-restart.log"
@@ -817,17 +886,17 @@ def _scenario(
         if time.monotonic() - last_check >= 60.0:
             last_check = time.monotonic()
             growth_rounds += 1
-            slots = _open_chest(probe, chest_pos)
-            totals_now = _chest_totals(slots)
+            buildings = _recent_chat(_send(probe, "settlement building list"), 25)
+            totals_now = _settlement_stock(probe, detail, chest_pos, buildings)
             produced = {k: v for k, v in totals_now.items() if v > 0}
             state_now = probe.observe()
             time_info = state_now.get("time", {})
-            buildings = _recent_chat(_send(probe, "settlement building list"), 25)
             detail["storage_rounds"].append({
                 "round": growth_rounds,
                 "totals": dict(totals_now),
                 "game_time": time_info.get("game_time") if isinstance(time_info, dict) else None,
                 "buildings": buildings,
+                "containers": detail["storage_observation"]["containers"],
             })
             if detail["behaviour"].get("natural_zones") != "PASS" and _natural_zones(probe, detail, buildings[:1]):
                 _verdict(detail, "natural_zones", "PASS", str(detail["natural_zones"]))
@@ -849,7 +918,7 @@ def _scenario(
     any_stock = bool(totals_now)
     _verdict(detail, "workers_produce_unfunded", "PASS" if grown else "FAIL",
              f"storage={totals_now} over {detail['storage_observe_ticks']} game ticks (time add {day_advanced})",
-             "open founding chest; storage must cover Storage-L1 base needs with no /give")
+             "open all settlement storage containers; combined stock must cover Storage-L1 base needs with no /give")
     if not grown:
         # Builders consume stock while workers deliver it. A later, fully
         # client-verified Storage also proves its canonical material bill.
@@ -1380,12 +1449,13 @@ def _planner_status(probe: ProbeSteps, detail: dict[str, Any], chest_pos: tuple[
         status["projects_chat"] = _recent_chat(_send(probe, "settlement menu projects"), 25)
     except Exception as exc:
         status["projects_error"] = str(exc)[:300]
-    try:
-        slots = _open_chest(probe, chest_pos)
-        status["chest_now"] = _chest_totals(slots)
-    except Exception as exc:
-        status["chest_error"] = str(exc)[:300]
     status["buildings_now"] = _recent_chat(_send(probe, "settlement building list"), 25)
+    try:
+        status["storage_now"] = _settlement_stock(
+            probe, detail, chest_pos, status["buildings_now"],
+        )
+    except Exception as exc:
+        status["storage_error"] = str(exc)[:300]
     return status
 
 
