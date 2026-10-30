@@ -1119,6 +1119,12 @@ fn project_status_waiting_uses_translatable_material_names_without_truncation() 
     assert!(body.contains("translate"), "{body}");
     assert!(!body.contains("minecraft:cobblestone"), "{body}");
     assert!(!body.contains("more)"), "{body}");
+    let planks = list(field(dialog, "body")).iter()
+        .flat_map(|paragraph| list(field(field(paragraph, "contents").unwrap(), "extra")))
+        .find(|item| field(item, "translate").is_some_and(|key| text(key) == "block.minecraft.oak_planks"))
+        .expect("planks requirement");
+    assert!(format!("{planks:?}").contains("block.minecraft.oak_log"), "{planks:?}");
+    assert!(format!("{planks:?}").contains("needs, e.g."), "{planks:?}");
 }
 
 #[test]

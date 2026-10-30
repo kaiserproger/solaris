@@ -484,6 +484,7 @@ fn resolve_ingredients(
         }
         let mut satisfied = false;
         let mut failure = parent;
+        let mut supported_failure = None;
         let mut any_candidate = false;
         for (_, candidate) in state.registry.items.iter() {
             if !mc_data::recipes::ingredient_accepts_item(
@@ -506,6 +507,9 @@ fn resolve_ingredients(
                     break;
                 }
                 Some(leaf) => {
+                    if raw_producible(state, caps, leaf).is_some() {
+                        supported_failure.get_or_insert(leaf);
+                    }
                     failure = leaf;
                     if *work > MAX_WORK {
                         break;
@@ -514,7 +518,7 @@ fn resolve_ingredients(
             }
         }
         if !satisfied {
-            return Err(if any_candidate { failure } else { parent });
+            return Err(if any_candidate { supported_failure.unwrap_or(failure) } else { parent });
         }
     }
     Ok(())

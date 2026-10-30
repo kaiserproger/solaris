@@ -1751,7 +1751,18 @@ fn project_status_screen(state: &mut TickState, connection: ConnectionId, ctx: &
     for kind in &waiting {
         let items = kind.needs.iter().map(|need| {
             let reason = source_reason(ctx.lang, need.no_source);
-            material_text(state, &need.item, format!(" {}/{} — {reason}\n", need.have, need.total))
+            if let Some(source) = &need.source_item {
+                let needs = match ctx.lang { Lang::En => "needs, e.g.", Lang::Ru => "нужно, например," };
+                let mut text = material_text(state, &need.item, format!(" {}/{} — {needs} ", need.have, need.total));
+                if let Tag::Compound(fields) = &mut text
+                    && let Some((_, Tag::List(extra))) = fields.iter_mut().find(|(key, _)| key == "extra")
+                {
+                    extra.elements.push(material_text(state, source, format!(" — {reason}\n")));
+                }
+                text
+            } else {
+                material_text(state, &need.item, format!(" {}/{} — {reason}\n", need.have, need.total))
+            }
         }).collect();
         dialog = dialog.text(material_group(&format!("{}:\n", blueprint_label(ctx, &kind.blueprint)), items));
     }
@@ -1787,16 +1798,16 @@ fn source_reason(lang: Lang, reason: Option<super::construction::SourceReason>) 
     match (lang, reason) {
         (Lang::En, None) => "awaiting production",
         (Lang::Ru, None) => "ожидается производство",
-        (Lang::En, Some(SourceReason::Mine)) => "no source: needs a mine",
-        (Lang::Ru, Some(SourceReason::Mine)) => "нет источника: нужна шахта",
+        (Lang::En, Some(SourceReason::Mine)) => "needs a mine",
+        (Lang::Ru, Some(SourceReason::Mine)) => "нужна шахта",
         (Lang::En, Some(SourceReason::Miner)) => "no miner",
         (Lang::Ru, Some(SourceReason::Miner)) => "нет шахтёра",
-        (Lang::En, Some(SourceReason::LumberCamp)) => "no source: needs a lumber camp",
-        (Lang::Ru, Some(SourceReason::LumberCamp)) => "нет источника: нужна лесопилка",
+        (Lang::En, Some(SourceReason::LumberCamp)) => "needs a lumber camp",
+        (Lang::Ru, Some(SourceReason::LumberCamp)) => "нужна лесопилка",
         (Lang::En, Some(SourceReason::Lumberjack)) => "no lumberjack",
         (Lang::Ru, Some(SourceReason::Lumberjack)) => "нет лесоруба",
-        (Lang::En, Some(SourceReason::Farm)) => "no source: needs a farm",
-        (Lang::Ru, Some(SourceReason::Farm)) => "нет источника: нужна ферма",
+        (Lang::En, Some(SourceReason::Farm)) => "needs a farm",
+        (Lang::Ru, Some(SourceReason::Farm)) => "нужна ферма",
         (Lang::En, Some(SourceReason::Farmer)) => "no farmer",
         (Lang::Ru, Some(SourceReason::Farmer)) => "нет фермера",
         (Lang::En, Some(SourceReason::Shepherd)) => "no shepherd",

@@ -1214,6 +1214,7 @@ pub(crate) struct WaitingNeed {
     pub(crate) item: String,
     pub(crate) have: u64,
     pub(crate) total: u64,
+    pub(crate) source_item: Option<String>,
     pub(crate) no_source: Option<SourceReason>,
 }
 
@@ -1265,11 +1266,13 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
                 let total = level.materials.iter()
                     .find(|(id, _)| *id == item)
                     .map_or(u64::from(count), |(_, total)| u64::from(*total));
+                let missing = availability::missing_explanation(state, id, item, &images);
                 needs.push(WaitingNeed {
                     item: name.to_string(),
                     have: total.saturating_sub(u64::from(count)),
                     total,
-                    no_source: availability::missing_explanation(state, id, item, &images).map(|(_, reason)| reason),
+                    source_item: missing.and_then(|(leaf, _)| (leaf != item).then(|| state.registry.items.name_of(leaf).map(ToString::to_string)).flatten()),
+                    no_source: missing.map(|(_, reason)| reason),
                 });
             }
         }
@@ -1289,8 +1292,8 @@ fn waiting_materials(state: &TickState, id: SettlementId, lines: &mut Vec<String
     for kind in waiting(state, id) {
         for need in kind.needs {
             lines.push(format!(
-                "Waiting {}: needs {} x{} — {}",
-                kind.blueprint, need.item, need.total - need.have,
+                "Waiting {}: needs {} x{} — {} — {}",
+                kind.blueprint, need.item, need.total - need.have, need.source_item.as_deref().unwrap_or(&need.item),
                 if need.no_source.is_some() { "no source" } else { "awaiting production" },
             ));
         }
