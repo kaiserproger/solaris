@@ -829,12 +829,19 @@ def _scenario(
                 "game_time": time_info.get("game_time") if isinstance(time_info, dict) else None,
                 "buildings": buildings,
             })
+            if detail["behaviour"].get("natural_zones") != "PASS" and _natural_zones(probe, detail, buildings[:1]):
+                _verdict(detail, "natural_zones", "PASS", str(detail["natural_zones"]))
             # Builders spend the stock as it arrives; a listed Storage moves on
             # to the client-verified Storage check below.
             if _storage_covers(produced) or any(
                 b["kind"] == "storage" for b in _listed_buildings(buildings[:1])
             ):
                 break
+    if detail["behaviour"].get("natural_zones") != "PASS":
+        lines = _recent_chat(_send(probe, "settlement building list"), 25)
+        passed = _natural_zones(probe, detail, lines[:1])
+        _verdict(detail, "natural_zones", "PASS" if passed else "FAIL", str(detail.get("natural_zones")),
+                 "settlement building list + minecraft_scan_blocks over each lumber_camp/mine")
     detail["storage_growth_totals"] = totals_now
     detail["storage_time_add_ticks"] = day_advanced
     detail["storage_observe_ticks"] = _gametime(probe) - storage_start_tick
@@ -1081,6 +1088,36 @@ def _probe_ecology(probe: ProbeSteps, detail: dict[str, Any], building_lines: li
         if "lumber" in low:
             ecology["lumber_zone"] = line[:200]
     return ecology
+
+
+NATURAL_STONE = ("stone", "andesite", "diorite", "granite", "deepslate", "tuff", "cobblestone")
+
+
+def _natural_zones(probe: ProbeSteps, detail: dict[str, Any], lines: list[str]) -> bool:
+    """Client scan of the autonomous worksites: the lumber camp holds a wild tree
+    (a log, or the sapling its lumberjack replanted) and the mine holds stone."""
+    sites = {r["kind"]: r for r in _listed_buildings(lines) if r["kind"] in ("lumber_camp", "mine")}
+    evidence: dict[str, Any] = {}
+    for kind in ("lumber_camp", "mine"):
+        record = sites.get(kind)
+        if record is None:
+            evidence[kind] = "not listed"
+            continue
+        lo, hi = record["min"], record["max"]
+        if (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 4096:
+            hi = [hi[0], min(hi[1], lo[1] + 1), hi[2]]
+        scan = probe.call("minecraft_scan_blocks", {
+            "min_x": lo[0], "min_y": lo[1], "min_z": lo[2],
+            "max_x": hi[0], "max_y": hi[1], "max_z": hi[2],
+        })
+        ids = {_block_id(cell).removeprefix("minecraft:") for cell in scan.get("blocks", [])}
+        if kind == "lumber_camp":
+            found = [i for i in ids if (i.endswith("_log") and not i.startswith("stripped_")) or i.endswith("_sapling")]
+        else:
+            found = [i for i in ids if i in NATURAL_STONE or i.endswith("_ore")]
+        evidence[kind] = {"bounds": [record["min"], record["max"]], "resource_blocks": sorted(found)}
+    detail["natural_zones"] = evidence
+    return all(isinstance(e, dict) and e["resource_blocks"] for e in evidence.values())
 
 
 def _storage_covers(totals: dict[str, int]) -> bool:
