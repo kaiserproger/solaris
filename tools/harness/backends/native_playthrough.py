@@ -173,6 +173,15 @@ def run(client: Any, artifact: Path, timeout: float, *, owned_window: dict[str, 
                     changed.get("client_settings", {}).get("fov") == fov_before + 5.0)
         record("options", fov_before=fov_before,
                fov_after=changed.get("client_settings", {}).get("fov"))
+        # GUI scale lives on the Interface tab of the tabbed Options screen.
+        probe.call("minecraft_click_screen_button", {
+            "expected_screen_class": OPTIONS_CLASS,
+            "expected_title": changed["screen"].get("title", ""),
+            "button_label": "Interface",
+        })
+        changed = probe.wait(
+            lambda s: any(n.get("id") == "settings/ui_scale" for n in s.get("ui_nodes", [])),
+            "options_interface_tab")
         scale_node = next(n for n in changed.get("ui_nodes", []) if n.get("id") == "settings/ui_scale")
         scale_before = changed.get("client_settings", {}).get("ui_scale", 0.0)
         probe.call("minecraft_click_screen_button", {

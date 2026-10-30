@@ -357,10 +357,18 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     xdg = artifact / "xdg"
     settings_path = xdg / "solaris-client" / "client-settings.json"
     source_root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "solaris-client"
+    settings_path.parent.mkdir(parents=True)
     if source_root.is_dir():
-        shutil.copytree(source_root, settings_path.parent, ignore_dangling_symlinks=True)
-    else:
-        settings_path.parent.mkdir(parents=True)
+        # Downloaded content is read-only and ~650 MB: link it. Copy the rest
+        # (settings, caches the client writes) so runs never share state.
+        for entry in source_root.iterdir():
+            target = settings_path.parent / entry.name
+            if entry.name in {"facts", "assets", "resources", "mojang"}:
+                target.symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
+            elif entry.is_dir():
+                shutil.copytree(entry, target, ignore_dangling_symlinks=True)
+            elif entry.exists():
+                shutil.copy2(entry, target)
     original = os.environ.get("SOLARIS_CLIENT_SETTINGS")
     if original and Path(original).is_file():
         base = json.loads(Path(original).read_text())
