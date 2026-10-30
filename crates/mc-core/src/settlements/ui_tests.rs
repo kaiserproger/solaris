@@ -1095,92 +1095,43 @@ fn projects_screen_keeps_every_order_button_above_the_status_lines() {
     assert_eq!(status.title, "Project status - oak");
     assert!(status.has("projects"));
     assert!(
-        status.body.contains("No active project."),
+        status.body.contains("No active project:"),
         "{}",
         status.body
     );
     assert!(!status.has("project_order") && !status.has("project_upgrade"));
 }
 
-#[test]
-fn project_status_lines_cite_three_needs_then_count_the_rest() {
-    use crate::settlements::construction::{WaitingKind, WaitingNeed};
-
-    let kind = WaitingKind {
-        blueprint: "house".into(),
-        needs: vec![
-            WaitingNeed::Awaiting {
-                item: "oak_planks".into(),
-                count: 4,
-            },
-            WaitingNeed::NoSource {
-                item: "white_wool".into(),
-            },
-            WaitingNeed::Awaiting {
-                item: "oak_door".into(),
-                count: 1,
-            },
-            WaitingNeed::Awaiting {
-                item: "cobblestone".into(),
-                count: 12,
-            },
-        ],
-    };
-    let mut ctx = Ctx {
-        id: SettlementId(1),
-        manage: true,
-        lang: Lang::En,
-    };
-    let english = waiting_line(&ctx, &kind);
-    assert_eq!(
-        english,
-        "Waiting house: needs oak_planks x4, white_wool — no source, oak_door x1 … (+1 more)"
-    );
-    ctx.lang = Lang::Ru;
-    let russian = waiting_line(&ctx, &kind);
-    assert_eq!(
-        russian,
-        "Ожидание house: нужно oak_planks ×4, white_wool — нет источника, oak_door ×1 … (ещё 1)"
-    );
-
-    // Two needs fit without the ellipsis; every line stays one short row.
-    let short = WaitingKind {
-        blueprint: "mine".into(),
-        needs: vec![
-            WaitingNeed::Awaiting {
-                item: "oak_planks".into(),
-                count: 4,
-            },
-            WaitingNeed::NoSource {
-                item: "white_wool".into(),
-            },
-        ],
-    };
-    assert_eq!(
-        waiting_line(&ctx, &short),
-        "Ожидание mine: нужно oak_planks ×4, white_wool — нет источника"
-    );
-}
 
 #[test]
-fn project_status_screen_keeps_every_waiting_line_within_the_cap() {
+fn project_status_waiting_uses_translatable_material_names_without_truncation() {
     let mut state = joined(0);
     let id = town(&mut state, PLAYER);
     prep_projects_site(&mut state, id);
+    let changes = click(&mut state, id, "project_status", &[]);
+    let dialog = changes.iter().rev().find_map(|change| match change {
+        PlayerChange::ShowDialog { dialog } => Some(dialog),
+        _ => None,
+    }).expect("project status dialog");
+    let body = format!("{:?}", field(dialog, "body").unwrap());
+    assert!(list(field(dialog, "body")).len() <= 64, "{body}");
+    assert!(body.contains("needs a mine"), "{body}");
+    assert!(body.contains("translate"), "{body}");
+    assert!(!body.contains("minecraft:cobblestone"), "{body}");
+    assert!(!body.contains("more)"), "{body}");
+}
+
+#[test]
+fn project_status_active_shows_readable_progress() {
+    let mut state = joined(0);
+    let id = town(&mut state, PLAYER);
+    prep_projects_site(&mut state, id);
+    crate::settlements::construction::tests::fund(&mut state, "watch_tower", 1);
+    click(&mut state, id, "project_order", &[("blueprint", string("watch_tower"))]);
     let status = last_dialog(&click(&mut state, id, "project_status", &[]));
-    let waiting: Vec<&str> = status
-        .body
-        .lines()
-        .filter(|line| line.starts_with("Waiting "))
-        .collect();
-    assert!(!waiting.is_empty(), "{}", status.body);
-    for line in waiting {
-        let items = line
-            .split_once(": needs ")
-            .unwrap_or_else(|| panic!("{line}"))
-            .1;
-        assert!(items.split(", ").count() <= 3, "{line}");
-    }
+    assert!(status.body.contains("Watchtower · level 1 · "), "{}", status.body);
+    assert!(status.body.contains("Site: "), "{}", status.body);
+    assert!(!status.body.contains("minecraft:"), "{}", status.body);
 }
 
 #[test]

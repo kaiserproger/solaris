@@ -5,7 +5,7 @@
 //! representative supported/unsupported raws, plus the recipe-expansion
 //! diagnostic (bed reports wool, not planks, when wood is covered).
 
-use super::{can_produce, missing_source};
+use super::{SourceReason, can_produce, missing_explanation, missing_source};
 use crate::entities::EntitySlot;
 use crate::settlements::SettlementId;
 use crate::settlements::allocator::tests::{test_state, villager};
@@ -178,6 +178,24 @@ fn miner_plus_mine_supplies_cobble_but_lumber_needs_camp() {
     assert_eq!(missing_source(&state, id, cobble, &[]), None);
     assert!(!can_produce(&state, id, log, &[]));
     assert_eq!(missing_source(&state, id, log, &[]), Some(log));
+}
+
+#[test]
+fn missing_explanation_reports_the_same_leaf_and_its_missing_capability() {
+    let mut state = state();
+    let id = settle(&mut state);
+    let cobble = item(&state, "minecraft:cobblestone");
+    let log = item(&state, "minecraft:oak_log");
+    assert_eq!(missing_explanation(&state, id, cobble, &[]), Some((cobble, SourceReason::Mine)));
+    assert_eq!(missing_explanation(&state, id, log, &[]), Some((log, SourceReason::LumberCamp)));
+    certify(&mut state, id, BuildingKind::Mine);
+    certify(&mut state, id, BuildingKind::LumberCamp);
+    assert_eq!(missing_explanation(&state, id, cobble, &[]), Some((cobble, SourceReason::Miner)));
+    assert_eq!(missing_explanation(&state, id, log, &[]), Some((log, SourceReason::Lumberjack)));
+    worker(&mut state, id, VillagerProfession::Miner);
+    worker(&mut state, id, VillagerProfession::Lumberjack);
+    assert_eq!(missing_explanation(&state, id, cobble, &[]), None);
+    assert_eq!(missing_explanation(&state, id, log, &[]), None);
 }
 
 #[test]

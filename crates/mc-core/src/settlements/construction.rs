@@ -12,6 +12,7 @@ use mc_script::{ScriptStructureState, ScriptWorldBounds};
 
 #[path = "construction_availability.rs"]
 mod availability;
+pub(crate) use availability::SourceReason;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1209,11 +1210,11 @@ pub(crate) struct WaitingKind {
 }
 
 /// One unfunded bill entry of [`WaitingKind`].
-pub(crate) enum WaitingNeed {
-    /// A supported source can produce it, but it is not in settlement storage.
-    Awaiting { item: String, count: u64 },
-    /// Nothing can source this bill entry; `item` is the first missing link.
-    NoSource { item: String },
+pub(crate) struct WaitingNeed {
+    pub(crate) item: String,
+    pub(crate) have: u64,
+    pub(crate) total: u64,
+    pub(crate) no_source: Option<SourceReason>,
 }
 
 /// Needed authored kinds the settlement cannot fund yet, one entry per kind.
@@ -1246,16 +1247,15 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
         for (item, count) in
             super::construction_crafting::missing_base(state, &level.materials, &images)
         {
-            if let Some(leaf) = availability::missing_source(state, id, item, &images) {
-                if let Some(name) = state.registry.items.name_of(leaf) {
-                    needs.push(WaitingNeed::NoSource {
-                        item: name.to_string(),
-                    });
-                }
-            } else if let Some(name) = state.registry.items.name_of(item) {
-                needs.push(WaitingNeed::Awaiting {
+            if let Some(name) = state.registry.items.name_of(item) {
+                let total = level.materials.iter()
+                    .find(|(id, _)| *id == item)
+                    .map_or(u64::from(count), |(_, total)| u64::from(*total));
+                needs.push(WaitingNeed {
                     item: name.to_string(),
-                    count: u64::from(count),
+                    have: total.saturating_sub(u64::from(count)),
+                    total,
+                    no_source: availability::missing_explanation(state, id, item, &images).map(|(_, reason)| reason),
                 });
             }
         }
@@ -1274,16 +1274,11 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
 fn waiting_materials(state: &TickState, id: SettlementId, lines: &mut Vec<String>) {
     for kind in waiting(state, id) {
         for need in kind.needs {
-            match need {
-                WaitingNeed::NoSource { item } => lines.push(format!(
-                    "Waiting {}: needs {item} — no source",
-                    kind.blueprint
-                )),
-                WaitingNeed::Awaiting { item, count } => lines.push(format!(
-                    "Waiting {}: needs {item} x{count} — awaiting production",
-                    kind.blueprint
-                )),
-            }
+            lines.push(format!(
+                "Waiting {}: needs {} x{} — {}",
+                kind.blueprint, need.item, need.total - need.have,
+                if need.no_source.is_some() { "no source" } else { "awaiting production" },
+            ));
         }
     }
 }
@@ -1297,8 +1292,8 @@ pub(crate) fn project_status(state: &TickState, id: SettlementId) -> Vec<String>
     lines
 }
 
-/// Project progress and material state without the waiting block: what the
-/// Projects dialog shows before its capped, translated waiting lines.
+/// Plain-text progress diagnostics for construction tests.
+#[cfg(test)]
 pub(crate) fn project_summary(state: &TickState, id: SettlementId) -> Vec<String> {
     let Some(record) = state.settlements.get(id) else {
         return vec!["Settlement not found.".into()];

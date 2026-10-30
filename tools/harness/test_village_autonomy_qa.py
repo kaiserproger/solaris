@@ -116,14 +116,14 @@ class VillageAutonomyQaTests(unittest.TestCase):
     def test_project_progress_comes_from_live_projects_dialog(self) -> None:
         observed = {"ui_nodes": [{
             "id": "dialog/body/0",
-            "label": "mason · level 1 · 5%\nBlocks: 5/100 · Building\nSite: -12, 70, 24\nMissing materials:\nminecraft:oak_log: 3",
+            "label": "Mason's workshop · level 1 · 5/100\nSite: -12, 70, 24",
         }]}
         self.assertEqual(qa._project_progress(observed), {
             "blueprint": "mason", "level": 1, "done": 5, "total": 100, "origin": [-12, 70, 24],
         })
         self.assertIsNone(qa._project_progress({"ui_nodes": []}))
         self.assertIsNone(qa._project_progress({
-            "ui_nodes": [{"id": "dialog/body/0", "label": "No active project.\nQueued 1: farm"}],
+            "ui_nodes": [{"id": "dialog/body/0", "label": "No active project: no residents."}],
         }))
 
     def test_owner_order_retries_until_current_started_response(self) -> None:
@@ -134,7 +134,7 @@ class VillageAutonomyQaTests(unittest.TestCase):
             {"recent_chat": ["Not enough materials for the builder plan.", "Queued storage construction."]},
             {"recent_chat": ["Started storage construction."]},
             {"ui_nodes": [{"id": "dialog/body/0", "label":
-                          "storage · level 1 · 0%\nBlocks: 0/100 · Building\nSite: 12, 70, 24"}]},
+                          "Storage · level 1 · 0/100\nSite: 12, 70, 24"}]},
         ]
         with patch.object(qa, "_send", side_effect=observations) as send, patch.object(
             qa.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 2.0],
@@ -160,7 +160,7 @@ class VillageAutonomyQaTests(unittest.TestCase):
             {"recent_chat": ["not enough: shared recipe ingredients"]},
             {"recent_chat": ["Started wall construction."]},
             {"ui_nodes": [{"id": "dialog/body/0", "label":
-                          "wall · level 1 · 0%\nBlocks: 0/130 · Building\nSite: 12, 70, 24"}]},
+                          "Wall · level 1 · 0/130\nSite: 12, 70, 24"}]},
         ]
         with patch.object(qa, "_send", side_effect=observations) as send, patch.object(
             qa.time, "monotonic", side_effect=[0.0, 0.0],
@@ -176,7 +176,7 @@ class VillageAutonomyQaTests(unittest.TestCase):
     def test_owner_order_acceptance_requires_live_matching_project(self) -> None:
         probe = Mock()
         for project in ({}, {"ui_nodes": [{"id": "dialog/body/0", "label":
-                         "house · level 1 · 0%\nBlocks: 0/100 · Building\nSite: 12, 70, 24"}]}):
+                         "House · level 1 · 0/100\nSite: 12, 70, 24"}]}):
             with self.subTest(project=project), patch.object(
                 qa, "_send", side_effect=[{"recent_chat": ["Started storage construction."]}, project],
             ), patch.object(qa.time, "monotonic", side_effect=[0.0, 0.0]):
@@ -294,7 +294,7 @@ class VillageAutonomyQaTests(unittest.TestCase):
         status = {
             "screen": {"class": qa.DIALOG_CLASS, "title": "Project status - village_7"},
             "ui_nodes": [{"id": "dialog/body/0", "label": (
-                "storage · level 1 · 12%\nBlocks: 3/25 · Building\nSite: 1, 70, 2\nMaterials ready.")}],
+                "Storage · level 1 · 3/25\nSite: 1, 70, 2")}],
         }
         probe = Mock()
         probe.call.return_value = {"status": "ok"}

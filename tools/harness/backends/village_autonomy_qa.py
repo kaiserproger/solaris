@@ -1240,13 +1240,27 @@ def _project_progress(observed: dict[str, Any]) -> dict[str, Any] | None:
         if node.get("id", "").startswith("dialog/body/")
     )
     match = re.search(
-        r"(?m)^(\w+) · level (\d+) · \d+%\nBlocks: (\d+)/(\d+) · [^\n]+\n"
-        r"Site: (-?\d+), (-?\d+), (-?\d+)(?:\n|$)", body,
+        r"(?m)^(.+?) · (?:level|уровень) (\d+) · (\d+)/(\d+)\n"
+        r"(?:Site|Место): (-?\d+), (-?\d+), (-?\d+)(?:\n|$)", body,
     )
     if match is None:
         return None
+    names = {
+        "House": "house", "Дом": "house",
+        "Storage": "storage", "Склад": "storage",
+        "Farm": "farm", "Ферма": "farm",
+        "Mason's workshop": "mason", "Мастерская каменщика": "mason",
+        "Lumber camp": "lumber_camp", "Лесопилка": "lumber_camp",
+        "Mine": "mine", "Шахта": "mine",
+        "Barracks": "barracks", "Казарма": "barracks",
+        "Wall": "wall", "Стена": "wall",
+        "Watchtower": "watch_tower", "Сторожевая башня": "watch_tower",
+    }
+    blueprint = names.get(match[1])
+    if blueprint is None:
+        return None
     return {
-        "blueprint": match[1], "level": int(match[2]),
+        "blueprint": blueprint, "level": int(match[2]),
         "done": int(match[3]), "total": int(match[4]),
         "origin": [int(match[n]) for n in (5, 6, 7)],
     }
