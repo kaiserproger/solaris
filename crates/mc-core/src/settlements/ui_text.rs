@@ -179,10 +179,6 @@ pub(crate) enum Key {
     UpgradeStarted,
     Status,
     TitleProjectStatus,
-    WaitingLine,
-    WaitingItem,
-    WaitingNoSource,
-    WaitingMore,
 
     SettingsBody,
     Rename,
@@ -491,13 +487,6 @@ const fn pair(key: Key) -> (&'static str, &'static str) {
         Key::UpgradeStarted => ("Upgrade for #{id} started.", "Улучшение #{id} начато."),
         Key::Status => ("Status", "Статус"),
         Key::TitleProjectStatus => ("Project status - {name}", "Статус стройки — {name}"),
-        Key::WaitingLine => (
-            "Waiting {blueprint}: needs {items}",
-            "Ожидание {blueprint}: нужно {items}",
-        ),
-        Key::WaitingItem => ("{item} x{count}", "{item} ×{count}"),
-        Key::WaitingNoSource => ("{item} — no source", "{item} — нет источника"),
-        Key::WaitingMore => ("{items} … (+{n} more)", "{items} … (ещё {n})"),
 
         Key::SettingsBody => (
             "Name: {name}\nRadius: {radius} blocks (grows with population)\nRevision: {revision}",

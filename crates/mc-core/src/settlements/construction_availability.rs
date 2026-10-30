@@ -95,6 +95,58 @@ pub(super) fn missing_source(
     resolve(state, &caps, item, images, 0, &mut work, &mut visiting)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceReason {
+    Mine,
+    Miner,
+    LumberCamp,
+    Lumberjack,
+    Farm,
+    Farmer,
+    Shepherd,
+    Sheep,
+    Unknown,
+}
+
+/// Explain the same missing leaf as `missing_source`, without changing admission.
+pub(super) fn missing_explanation(
+    state: &TickState,
+    id: SettlementId,
+    item: u32,
+    images: &[Image],
+) -> Option<(u32, SourceReason)> {
+    let leaf = missing_source(state, id, item, images)?;
+    let Some(record) = state.settlements.get(id) else {
+        return Some((leaf, SourceReason::Unknown));
+    };
+    let caps = caps(state, id, record);
+    let reason = state.registry.items.name_of(leaf).map(|name| {
+        let path = name.path();
+        if name.namespace() != "minecraft" {
+            SourceReason::Unknown
+        } else if mine_raw(path) && !caps.mine {
+            SourceReason::Mine
+        } else if mine_raw(path) && !caps.miner {
+            SourceReason::Miner
+        } else if log_raw(path) && !caps.camp {
+            SourceReason::LumberCamp
+        } else if log_raw(path) && !caps.lumberjack {
+            SourceReason::Lumberjack
+        } else if farmer_raw(path) && !caps.farm {
+            SourceReason::Farm
+        } else if farmer_raw(path) && !caps.farmer {
+            SourceReason::Farmer
+        } else if path.ends_with("_wool") && !caps.shepherd {
+            SourceReason::Shepherd
+        } else if path.ends_with("_wool") {
+            SourceReason::Sheep
+        } else {
+            SourceReason::Unknown
+        }
+    }).unwrap_or(SourceReason::Unknown);
+    Some((leaf, reason))
+}
+
 fn caps(state: &TickState, id: SettlementId, record: &SettlementRecord) -> Caps {
     let mut caps = Caps {
         miner: false,
@@ -432,6 +484,7 @@ fn resolve_ingredients(
         }
         let mut satisfied = false;
         let mut failure = parent;
+        let mut supported_failure = None;
         let mut any_candidate = false;
         for (_, candidate) in state.registry.items.iter() {
             if !mc_data::recipes::ingredient_accepts_item(
@@ -454,6 +507,9 @@ fn resolve_ingredients(
                     break;
                 }
                 Some(leaf) => {
+                    if raw_producible(state, caps, leaf).is_some() {
+                        supported_failure.get_or_insert(leaf);
+                    }
                     failure = leaf;
                     if *work > MAX_WORK {
                         break;
@@ -462,7 +518,7 @@ fn resolve_ingredients(
             }
         }
         if !satisfied {
-            return Err(if any_candidate { failure } else { parent });
+            return Err(if any_candidate { supported_failure.unwrap_or(failure) } else { parent });
         }
     }
     Ok(())

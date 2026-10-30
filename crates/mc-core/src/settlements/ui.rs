@@ -38,8 +38,6 @@ pub(crate) const OWNER: &str = "settlement";
 pub(crate) type Marks = [Option<[i32; 3]>; 2];
 
 const MAX_LISTED: usize = 12;
-/// Unfunded items one waiting line cites before `(+N more)`.
-const WAITING_ITEMS: usize = 3;
 const MAX_RESIDENTS: usize = 30;
 const MAX_STATIONS: usize = 4;
 const MAX_MARKS: usize = 64;
@@ -1692,62 +1690,148 @@ fn projects_screen(state: &mut TickState, connection: ConnectionId, ctx: &Ctx, n
     present(state, connection, frame(ctx, title, note, text, buttons));
 }
 
-/// Live project progress and one short line per unmet need, reached from the
-/// Projects grid so no status text precedes the order buttons.
+/// Live project progress and all unmet bill entries.
 fn project_status_screen(state: &mut TickState, connection: ConnectionId, ctx: &Ctx) {
     let Some(record) = state.settlements.get(ctx.id) else {
         return;
     };
-    let mut lines = super::construction::project_summary(state, ctx.id);
-    lines.extend(waiting_lines(state, ctx));
-    let buttons = vec![button(ctx.t(Key::Back), "projects", ctx.id)];
+    let waiting = super::construction::waiting(state, ctx.id);
     let title = ctx.f(Key::TitleProjectStatus, &[("name", &record.name)]);
-    present(
-        state,
-        connection,
-        frame(ctx, title, "", lines.join("\n"), buttons),
-    );
-}
-
-/// One translated line per waiting kind, citing at most [`WAITING_ITEMS`]
-/// unfunded items and a `+N more` count for the rest: a level-one bill can name
-/// dozens of items, and the whole line must stay readable in one row.
-fn waiting_lines(state: &TickState, ctx: &Ctx) -> Vec<String> {
-    super::construction::waiting(state, ctx.id)
-        .iter()
-        .map(|kind| waiting_line(ctx, kind))
-        .collect()
-}
-
-fn waiting_line(ctx: &Ctx, kind: &super::construction::WaitingKind) -> String {
-    let extra = kind.needs.len().saturating_sub(WAITING_ITEMS);
-    let items = kind
-        .needs
-        .iter()
-        .take(WAITING_ITEMS)
-        .map(|need| match need {
-            super::construction::WaitingNeed::Awaiting { item, count } => ctx.f(
-                Key::WaitingItem,
-                &[("item", item), ("count", &count.to_string())],
-            ),
-            super::construction::WaitingNeed::NoSource { item } => {
-                ctx.f(Key::WaitingNoSource, &[("item", item)])
+    let buttons = vec![button(ctx.t(Key::Back), "projects", ctx.id)];
+    let mut dialog = Dialog::multi_action(title, buttons);
+    if let Some(project) = &record.project {
+        match crate::plugin_structures::settlement_builds::status(state, ctx.id, &project.structure) {
+            Ok(snapshot) => {
+                let total: u64 = snapshot.stages.iter().map(|stage| stage.work_units).sum();
+                let done: u64 = snapshot.stages.iter()
+                    .take(snapshot.current_stage_index as usize)
+                    .map(|stage| stage.work_units).sum::<u64>() + snapshot.completed_work_units;
+                let name = blueprint_label(ctx, &project.blueprint);
+                let text = match ctx.lang {
+                    Lang::En => format!("{name} · level {} · {done}/{total}\nSite: {}, {}, {}", project.level, project.origin[0], project.origin[1], project.origin[2]),
+                    Lang::Ru => format!("{name} · уровень {} · {done}/{total}\nМесто: {}, {}, {}", project.level, project.origin[0], project.origin[1], project.origin[2]),
+                };
+                dialog = dialog.text(text);
+                match crate::plugin_structures::settlement_builds::missing(state, ctx.id, &project.structure) {
+                    Ok(missing) => {
+                        if !missing.is_empty() {
+                            let items = missing.into_iter().map(|(item, count)| {
+                                let suffix = match ctx.lang {
+                                    Lang::En => format!(" — missing {count}\n"),
+                                    Lang::Ru => format!(" — не хватает {count}\n"),
+                                };
+                                material_text(state, &item, suffix)
+                            }).collect();
+                            dialog = dialog.text(material_group("", items));
+                        }
+                    }
+                    Err(_) => dialog = dialog.text(match ctx.lang {
+                        Lang::En => "Storage unavailable.",
+                        Lang::Ru => "Склад недоступен.",
+                    }),
+                }
             }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let items = if extra > 0 {
-        ctx.f(
-            Key::WaitingMore,
-            &[("items", &items), ("n", &extra.to_string())],
-        )
+            Err(_) => dialog = dialog.text(match ctx.lang {
+                Lang::En => "Project records unavailable; construction paused.",
+                Lang::Ru => "Данные стройки недоступны; строительство приостановлено.",
+            }),
+        }
     } else {
-        items
+        let text = if state.settlements.member_count(ctx.id) == 0 {
+            match ctx.lang { Lang::En => "No active project: no residents.", Lang::Ru => "Нет стройки: нет жителей." }
+        } else if super::construction::has_funded_candidate(state, ctx.id) {
+            match ctx.lang { Lang::En => "No active project: waiting for the planner.", Lang::Ru => "Нет стройки: ожидание планирования." }
+        } else if !waiting.is_empty() {
+            match ctx.lang { Lang::En => "No active project: waiting for materials.", Lang::Ru => "Нет стройки: не хватает материалов." }
+        } else {
+            match ctx.lang { Lang::En => "No active project: no building currently needed.", Lang::Ru => "Нет стройки: сейчас новые здания не нужны." }
+        };
+        dialog = dialog.text(text);
+    }
+    for kind in &waiting {
+        let items = kind.needs.iter().map(|need| {
+            let reason = source_reason(ctx.lang, need.no_source);
+            if let Some(source) = &need.source_item {
+                let needs = match ctx.lang { Lang::En => "needs, e.g.", Lang::Ru => "нужно, например," };
+                let mut text = material_text(state, &need.item, format!(" {}/{} — {needs} ", need.have, need.total));
+                if let Tag::Compound(fields) = &mut text
+                    && let Some((_, Tag::List(extra))) = fields.iter_mut().find(|(key, _)| key == "extra")
+                {
+                    extra.elements.push(material_text(state, source, format!(" — {reason}\n")));
+                }
+                text
+            } else {
+                material_text(state, &need.item, format!(" {}/{} — {reason}\n", need.have, need.total))
+            }
+        }).collect();
+        dialog = dialog.text(material_group(&format!("{}:\n", blueprint_label(ctx, &kind.blueprint)), items));
+    }
+    present(state, connection, dialog.exit(Button::plain(ctx.t(Key::Close))));
+}
+
+fn material_group(title: &str, items: Vec<Tag>) -> Tag {
+    Tag::Compound(vec![
+        ("text".into(), Tag::String(title.into())),
+        ("extra".into(), Tag::List(mc_nbt::ListTag {
+            element_type: mc_nbt::tag_type::COMPOUND,
+            elements: items,
+        })),
+    ])
+}
+
+fn material_text(state: &TickState, item: &str, suffix: String) -> Tag {
+    let Ok(id) = Identifier::parse(item) else {
+        return Tag::String("Unknown material".into());
     };
-    ctx.f(
-        Key::WaitingLine,
-        &[("blueprint", &kind.blueprint), ("items", &items)],
-    )
+    let prefix = if state.registry.blocks.block(&id).is_some() { "block" } else { "item" };
+    Tag::Compound(vec![
+        ("translate".into(), Tag::String(format!("{prefix}.{}.{}", id.namespace(), id.path()))),
+        ("extra".into(), Tag::List(mc_nbt::ListTag {
+            element_type: mc_nbt::tag_type::COMPOUND,
+            elements: vec![Tag::Compound(vec![("text".into(), Tag::String(suffix))])],
+        })),
+    ])
+}
+
+fn source_reason(lang: Lang, reason: Option<super::construction::SourceReason>) -> &'static str {
+    use super::construction::SourceReason;
+    match (lang, reason) {
+        (Lang::En, None) => "awaiting production",
+        (Lang::Ru, None) => "ожидается производство",
+        (Lang::En, Some(SourceReason::Mine)) => "needs a mine",
+        (Lang::Ru, Some(SourceReason::Mine)) => "нужна шахта",
+        (Lang::En, Some(SourceReason::Miner)) => "no miner",
+        (Lang::Ru, Some(SourceReason::Miner)) => "нет шахтёра",
+        (Lang::En, Some(SourceReason::LumberCamp)) => "needs a lumber camp",
+        (Lang::Ru, Some(SourceReason::LumberCamp)) => "нужна лесопилка",
+        (Lang::En, Some(SourceReason::Lumberjack)) => "no lumberjack",
+        (Lang::Ru, Some(SourceReason::Lumberjack)) => "нет лесоруба",
+        (Lang::En, Some(SourceReason::Farm)) => "needs a farm",
+        (Lang::Ru, Some(SourceReason::Farm)) => "нужна ферма",
+        (Lang::En, Some(SourceReason::Farmer)) => "no farmer",
+        (Lang::Ru, Some(SourceReason::Farmer)) => "нет фермера",
+        (Lang::En, Some(SourceReason::Shepherd)) => "no shepherd",
+        (Lang::Ru, Some(SourceReason::Shepherd)) => "нет пастуха",
+        (Lang::En, Some(SourceReason::Sheep)) => "no sheep of the required color",
+        (Lang::Ru, Some(SourceReason::Sheep)) => "нет овцы нужного цвета",
+        (Lang::En, Some(SourceReason::Unknown)) => "no source",
+        (Lang::Ru, Some(SourceReason::Unknown)) => "нет источника",
+    }
+}
+
+fn blueprint_label(ctx: &Ctx, blueprint: &str) -> &'static str {
+    match (ctx.lang, blueprint) {
+        (Lang::En, "house") => "House", (Lang::Ru, "house") => "Дом",
+        (Lang::En, "storage") => "Storage", (Lang::Ru, "storage") => "Склад",
+        (Lang::En, "farm") => "Farm", (Lang::Ru, "farm") => "Ферма",
+        (Lang::En, "mason") => "Mason's workshop", (Lang::Ru, "mason") => "Мастерская каменщика",
+        (Lang::En, "lumber_camp") => "Lumber camp", (Lang::Ru, "lumber_camp") => "Лесопилка",
+        (Lang::En, "mine") => "Mine", (Lang::Ru, "mine") => "Шахта",
+        (Lang::En, "barracks") => "Barracks", (Lang::Ru, "barracks") => "Казарма",
+        (Lang::En, "wall") => "Wall", (Lang::Ru, "wall") => "Стена",
+        (Lang::En, "watch_tower") => "Watchtower", (Lang::Ru, "watch_tower") => "Сторожевая башня",
+        (Lang::En, _) => "Building", (Lang::Ru, _) => "Здание",
+    }
 }
 
 fn project_order(
