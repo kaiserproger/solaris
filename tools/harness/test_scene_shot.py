@@ -11,6 +11,13 @@ from tools.harness.backends import scene_shot
 
 
 class SceneShotTests(unittest.TestCase):
+    def test_scenario_username(self):
+        self.assertEqual(scene_shot.scene_username({}), "SceneShot")
+        self.assertEqual(scene_shot.scene_username({"username": "Other_Player"}), "Other_Player")
+        for name in ("", "bad name", "a" * 17, 42):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                scene_shot.scene_username({"username": name})
+
     def test_latency_proxy_delays_both_directions(self):
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))

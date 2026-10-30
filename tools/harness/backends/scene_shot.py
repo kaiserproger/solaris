@@ -20,6 +20,13 @@ from .probe_steps import ProbeSteps
 
 USERNAME = "SceneShot"
 
+def scene_username(scenario: dict[str, Any]) -> str:
+    name = scenario.get("username", USERNAME)
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_]{1,16}", name) is None:
+        raise ValueError("username must be 1..16 ASCII letters, digits or underscores")
+    return name
+
+
 class LatencyProxy:
     """Delay traffic in each direction without changing host networking."""
 
@@ -153,6 +160,13 @@ def execute(probe: ProbeSteps, artifact: Path, steps: list[dict[str, Any]]) -> l
                 remaining -= ticks
         elif kind == "wait_play" and value is True:
             wait_play(probe)
+        elif kind == "wait_screen" and isinstance(value, str) and value:
+            # Server-driven screens (dialogs, menus) open asynchronously; wait for
+            # the client's own screen state whose class or title names `value`.
+            probe.wait(lambda state: bool((state.get("screen") or {}).get("open"))
+                       and (value in str(state["screen"].get("class", ""))
+                            or value in str(state["screen"].get("title", ""))),
+                       "screen_open")
         elif kind == "key" and isinstance(value, dict) and set(value) == {"keys", "ticks"}:
             probe.call("minecraft_press_inputs", value)
         elif kind == "use_item_on" and isinstance(value, dict):
@@ -197,6 +211,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     operator = scenario.get("operator", True)
     if type(operator) is not bool:
         raise ValueError("operator must be true or false")
+    username = scene_username(scenario)
     client_latency_ms = scenario.get("client_latency_ms", 0)
     if type(client_latency_ms) is not int or not 0 <= client_latency_ms <= 5000:
         raise ValueError("client_latency_ms must be an integer in 0..5000")
@@ -238,7 +253,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         shutil.copytree(Path(scenario["world"]).expanduser().resolve(), artifact / "world")
     (artifact / "plugins").mkdir()
     if operator:
-        prepare_operator_fixture(ctx, [USERNAME])
+        prepare_operator_fixture(ctx, [username])
     xdg = artifact / "xdg"
     settings_path = xdg / "solaris-client" / "client-settings.json"
     source_root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "solaris-client"
@@ -276,7 +291,7 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
         try:
             os.environ["XDG_DATA_HOME"] = str(xdg)
             os.environ["SOLARIS_CLIENT_SETTINGS"] = str(settings_path)
-            client, client_log, mcp = native_client.start(ctx, native_client.resolve_binary(ctx), f"127.0.0.1:{client_port}", USERNAME, timeout, display=display)
+            client, client_log, mcp = native_client.start(ctx, native_client.resolve_binary(ctx), f"127.0.0.1:{client_port}", username, timeout, display=display)
         finally:
             for key, old in (("XDG_DATA_HOME", old_xdg), ("SOLARIS_CLIENT_SETTINGS", old_settings)):
                 if old is None:
