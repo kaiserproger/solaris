@@ -388,6 +388,9 @@ pub struct VillagerState {
     pub last_gossip: u64,
     pub activity: Activity,
     pub sleeping: bool,
+    /// Presentation-only stair seat; never retained across recovery.
+    #[serde(skip)]
+    pub(crate) seat: Option<BlockPos>,
     pub courtship_until: Option<u64>,
     #[serde(with = "persistence::entity_id_option")]
     pub partner: Option<crate::boundary::EntityId>,
@@ -469,6 +472,7 @@ impl Default for VillagerState {
             last_gossip: 0,
             activity: Activity::Idle,
             sleeping: false,
+            seat: None,
             courtship_until: None,
             partner: None,
             navigation_path: Vec::new(),

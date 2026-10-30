@@ -35,6 +35,7 @@ impl Key {
 #[derive(Debug)]
 pub(crate) struct Nameplate {
     // Retaining the source Arc makes pointer equality immune to allocator reuse.
+    seat: Option<crate::boundary::BlockPos>,
     source: Arc<EntityAppearance>,
     key: Key,
     pub(crate) appearance: Arc<EntityAppearance>,
@@ -43,10 +44,12 @@ pub(crate) struct Nameplate {
 impl Nameplate {
     pub(crate) fn new(row: &ColdRow) -> Self {
         let key = Key::of(row);
-        let appearance = if key == Key::Named && row.appearance.custom_name_visible {
+        let seat = row.villager.as_ref().and_then(|v| v.seat);
+        let appearance = if key == Key::Named && row.appearance.custom_name_visible && seat.is_none() {
             Arc::clone(&row.appearance)
         } else {
             let mut appearance = (*row.appearance).clone();
+            appearance.villager_seat = seat;
             if let Key::Generated {
                 uuid,
                 profession,
@@ -72,12 +75,16 @@ impl Nameplate {
         Self {
             source: Arc::clone(&row.appearance),
             key,
+            seat,
             appearance,
         }
     }
 
     pub(crate) fn refresh(&mut self, row: &ColdRow) {
-        if self.key != Key::of(row) || !Arc::ptr_eq(&self.source, &row.appearance) {
+        if self.key != Key::of(row)
+            || self.seat != row.villager.as_ref().and_then(|v| v.seat)
+            || !Arc::ptr_eq(&self.source, &row.appearance)
+        {
             *self = Self::new(row);
         }
     }

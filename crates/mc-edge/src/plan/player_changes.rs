@@ -933,6 +933,7 @@ fn plan_respawn(respawn: &Respawn, viewer: &mut ViewerState, out: &mut Vec<Plann
         viewer.chunk_sync = None;
         viewer.chunk_repairs.clear();
         viewer.tracked_entities.clear();
+        viewer.seats.clear();
         viewer.entity_tick = None;
         viewer.pending_blocks.clear();
         viewer.block_entity_updates.clear();
