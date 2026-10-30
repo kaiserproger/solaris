@@ -793,9 +793,11 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
         } else {
             cache.activity_for(v.age, v.data.profession, state.day_time)
         };
+        // Residents with a roofed home bed go to that bed; the rest shelter beside one.
         let shelter_night = v.settlement.is_some()
             && (12_000..24_000).contains(&state.day_time.rem_euclid(24_000))
-            && matches!(v.activity, Activity::Rest | Activity::Idle);
+            && matches!(v.activity, Activity::Rest | Activity::Idle)
+            && !home.is_some_and(|bed| roofed(state, bed));
         if shelter_night {
             v.activity = Activity::Rest;
         }
@@ -811,7 +813,7 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
             v.navigation_path.clear();
             v.navigation_chunks.clear();
         }
-        let sleep_home_allowed = !shelter_night || home.is_some_and(|bed| roofed(state, bed));
+        let sleep_home_allowed = !shelter_night;
         let was_sleeping = v.sleeping;
         if merchant_busy || v.activity != Activity::Rest || home.is_none() || !sleep_home_allowed {
             v.sleeping = false;
