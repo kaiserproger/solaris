@@ -87,6 +87,130 @@ fn wooden_door_route_reaches_other_side_but_iron_remains_blocked() {
 }
 
 #[test]
+fn bound_bedless_nitwit_enters_occupied_house_at_night() {
+    let mut state = control_state();
+    doorway(&mut state, "minecraft:oak_door");
+    for z in 9..=14 {
+        for y in 201..=203 {
+            state.world.set_block(6, y, z, state.registry.states.stone);
+            state.world.set_block(10, y, z, state.registry.states.stone);
+        }
+    }
+    for x in 6..=10 {
+        for y in 201..=203 {
+            state.world.set_block(x, y, 14, state.registry.states.stone);
+        }
+        for z in 8..=14 {
+            state.world.set_block(x, 204, z, state.registry.states.stone);
+        }
+    }
+    let home = bed(&mut state, 8, 12);
+    let outdoor = bed(&mut state, 12, 5);
+    state.world.fold_overlay();
+    let settlement = state
+        .settlements
+        .create(
+            &mut state.settlement_sequence,
+            "town".into(),
+            "owner".into(),
+            [8, 201, 8],
+            32,
+        )
+        .unwrap();
+    let building_id = crate::settlements::buildings::BuildingId((settlement.0 << 32) | 1);
+    let record = state.settlements.get_mut(settlement).unwrap();
+    record.building_sequence = 1;
+    record.buildings.insert(
+        building_id,
+        crate::settlements::buildings::Building {
+            id: building_id,
+            settlement,
+            kind: crate::settlements::buildings::BuildingKind::Workshop(Profession::Farmer),
+            level: 1,
+            bounds: mc_script::ScriptWorldBounds::new([6, 200, 8], [10, 204, 14]).unwrap(),
+            work_points: vec![],
+            revision: 1,
+            natural_zone: false,
+        },
+    );
+    let outdoor_owner = villager(&mut state, [12.5, 201.0, 5.5]);
+    let v = state.entities.row_mut(outdoor_owner).villager.as_mut().unwrap();
+    v.settlement = Some(settlement);
+    v.home = Some(outdoor);
+    let owner = villager(&mut state, [8.5, 201.0, 12.5]);
+    let v = state.entities.row_mut(owner).villager.as_mut().unwrap();
+    v.settlement = Some(settlement);
+    v.home = Some(home);
+    let nitwit = villager(&mut state, [8.5, 201.0, 5.5]);
+    let v = state.entities.row_mut(nitwit).villager.as_mut().unwrap();
+    v.settlement = Some(settlement);
+    v.data.profession = Profession::Nitwit;
+    let unemployed = villager(&mut state, [7.5, 201.0, 4.5]);
+    state.entities.row_mut(unemployed).villager.as_mut().unwrap().settlement = Some(settlement);
+    let child = villager(&mut state, [9.5, 201.0, 4.5]);
+    let v = state.entities.row_mut(child).villager.as_mut().unwrap();
+    v.settlement = Some(settlement);
+    v.age = -10_000;
+    state.day_time = 18000;
+    for _ in 0..600 {
+        crate::tick::run_tick(&mut state, &[]);
+    }
+    for resident in [nitwit, unemployed, child, outdoor_owner] {
+        let v = state.entities.row(resident).villager.as_ref().unwrap();
+        if resident != outdoor_owner {
+            assert!(v.home.is_none(), "all beds belong to other residents");
+        }
+        let [x, _, z] = state.entities.pos(resident);
+        assert!(
+            x > 6.0 && x < 10.0 && z > 8.5 && z < 14.0,
+            "resident stayed outside: {:?}",
+            state.entities.pos(resident)
+        );
+    }
+    let cells: std::collections::BTreeSet<_> = [nitwit, unemployed, child]
+        .into_iter()
+        .map(|slot| {
+            let [x, _, z] = state.entities.pos(slot);
+            (x.floor() as i32, z.floor() as i32)
+        })
+        .collect();
+    assert_eq!(cells.len(), 3, "bedless residents must not share a cell");
+}
+
+#[test]
+fn night_shelter_does_not_override_panic_or_soldier_duty() {
+    let mut state = control_state();
+    let settlement = state
+        .settlements
+        .create(
+            &mut state.settlement_sequence,
+            "town".into(),
+            "owner".into(),
+            [8, 201, 8],
+            32,
+        )
+        .unwrap();
+    let panicking = villager(&mut state, [7.5, 201.0, 5.5]);
+    let v = state.entities.row_mut(panicking).villager.as_mut().unwrap();
+    v.settlement = Some(settlement);
+    v.panic_until = state.tick + 1_000;
+    let soldier = villager(&mut state, [9.5, 201.0, 5.5]);
+    let v = state.entities.row_mut(soldier).villager.as_mut().unwrap();
+    v.settlement = Some(settlement);
+    v.data.profession = Profession::Soldier;
+    state.day_time = 18000;
+    crate::tick::run_tick(&mut state, &[]);
+    assert_eq!(
+        state.entities.row(panicking).villager.as_ref().unwrap().activity,
+        Activity::Panic
+    );
+    assert_eq!(
+        state.entities.row(soldier).villager.as_ref().unwrap().activity,
+        Activity::Work
+    );
+}
+
+#[test]
 fn resident_opens_both_door_halves_and_closes_after_entering_bed_at_night() {
     let mut state = control_state();
     let door = doorway(&mut state, "minecraft:oak_door");

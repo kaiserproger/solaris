@@ -273,6 +273,119 @@ pub(super) fn bodies_near(
     })
 }
 
+fn roofed(state: &TickState, pos: BlockPos) -> bool {
+    (pos.y + 1..state.world.geometry().max_y()).any(|y| {
+        state.world.block_at(pos.x, y, pos.z)
+            .and_then(|id| state.registry.collision_boxes.get(id as usize))
+            .is_some_and(|shapes| !shapes.is_empty())
+    })
+}
+
+fn night_shelter(
+    state: &mut TickState,
+    cache: &mut PoiCache,
+    slot: EntitySlot,
+    v: &mut VillagerState,
+    pos: [f64; 3],
+) -> (Option<BlockPos>, bool) {
+    let Some(record) = v.settlement.and_then(|id| state.settlements.get(id)) else {
+        return (None, true);
+    };
+    let body = state.entities.body(slot);
+    let (width, height) = (body.half_width, body.height);
+    let mut candidates = std::mem::take(&mut cache.candidates);
+    candidates.clear();
+    for poi in cache.chunks.values().flat_map(|chunk| &chunk.pois) {
+        let bed = poi.pos;
+        if poi.kind != PoiKind::Home
+            || !record.contains([bed.x, bed.y, bed.z])
+            || !roofed(state, bed)
+        {
+            continue;
+        }
+        let mut cells = [bed; 17];
+        let mut count = 1;
+        let mut next = 0;
+        while next < count && count < cells.len() {
+            let origin = cells[next];
+            next += 1;
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let target = BlockPos { x: origin.x + dx, y: bed.y, z: origin.z + dz };
+                if cells[..count].contains(&target)
+                    || !roofed(state, target)
+                    || standing(&state.world, &state.registry, target, width, height).is_none()
+                {
+                    continue;
+                }
+                cells[count] = target;
+                count += 1;
+                let reserved = cache.residents.iter().copied().any(|other| {
+                    other != slot && state.entities.row(other).villager.as_ref().is_some_and(|resident| {
+                        resident.navigation_target == Some(target)
+                            || at(state.entities.pos(other)) == target
+                    })
+                });
+                let doorway = state.world.block_at(target.x, target.y, target.z)
+                    .and_then(|id| state.registry.blocks.by_id(mc_world::BlockStateId(id)))
+                    .is_some_and(|block| block.block.id.path().ends_with("_door"));
+                if !reserved && !doorway {
+                    if v.navigation_target == Some(target) {
+                        cache.candidates = candidates;
+                        return (Some(target), true);
+                    }
+                    candidates.push((distance(pos, centre(bed)), Poi { pos: target, kind: PoiKind::Home }));
+                }
+                if count == cells.len() {
+                    break;
+                }
+            }
+        }
+    }
+    candidates.sort_unstable_by(|a, b| {
+        a.0.total_cmp(&b.0).then_with(|| {
+            (a.1.pos.x, a.1.pos.y, a.1.pos.z).cmp(&(b.1.pos.x, b.1.pos.y, b.1.pos.z))
+        })
+    });
+    let mut path = std::mem::take(&mut cache.candidate_path);
+    let mut selected = None;
+    for &(_, poi) in &candidates {
+        if !cache.spend_path(state, Consumer::Brain) {
+            break;
+        }
+        let from = at(pos);
+        let horizontal = from
+            .x
+            .abs_diff(poi.pos.x)
+            .max(from.z.abs_diff(poi.pos.z))
+            .saturating_add(8)
+            .clamp(48, 512);
+        let vertical = from.y.abs_diff(poi.pos.y).saturating_add(4).clamp(16, 512);
+        let mut ctx = allocator::RouteCtx {
+            world: &state.world,
+            registry: &state.registry,
+            dimension: state.dimension,
+            consumer: Consumer::Brain,
+            budget: &mut state.tick_budget,
+        };
+        if allocator::find_path_ctx(
+            &mut ctx, cache, pos, poi.pos, width, height, &mut path, true, horizontal,
+            vertical, true,
+        ) {
+            std::mem::swap(&mut path, &mut v.navigation_path);
+            v.navigation_target = Some(poi.pos);
+            v.navigation_repath_at = state.tick + 40;
+            capture_route(state, v, pos, true);
+            selected = Some(poi.pos);
+            break;
+        }
+    }
+    path.clear();
+    cache.candidate_path = path;
+    candidates.clear();
+    cache.candidates = candidates;
+    (selected, true)
+}
+
 pub(super) fn schedule(age: i32, profession: Profession, day_time: i64) -> Activity {
     let time = day_time.rem_euclid(24_000);
     if profession == Profession::Soldier && age >= 0 {
@@ -606,11 +719,19 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
                 v.panic_until = state.tick.saturating_add(100);
             }
         }
-        v.activity = if state.tick < v.panic_until {
+        v.activity = if v.data.profession == Profession::Soldier && v.age >= 0 {
+            Activity::Work
+        } else if state.tick < v.panic_until {
             Activity::Panic
         } else {
             cache.activity_for(v.age, v.data.profession, state.day_time)
         };
+        let shelter_night = v.settlement.is_some()
+            && (12_000..24_000).contains(&state.day_time.rem_euclid(24_000))
+            && matches!(v.activity, Activity::Rest | Activity::Idle);
+        if shelter_night {
+            v.activity = Activity::Rest;
+        }
         // Reach the newly assigned workstation before running an old resource
         // role: its independent work target must not prevent profession takeover.
         let awaiting_profession = v.activity == Activity::Work
@@ -623,11 +744,13 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
             v.navigation_path.clear();
             v.navigation_chunks.clear();
         }
+        let sleep_home_allowed = !shelter_night || home.is_some_and(|bed| roofed(state, bed));
         let was_sleeping = v.sleeping;
-        if merchant_busy || v.activity != Activity::Rest || home.is_none() {
+        if merchant_busy || v.activity != Activity::Rest || home.is_none() || !sleep_home_allowed {
             v.sleeping = false;
         }
         if !merchant_busy
+            && sleep_home_allowed
             && !v.sleeping
             && v.activity == Activity::Rest
             && let Some(home) = home
@@ -721,7 +844,11 @@ pub(crate) fn tick(state: &mut TickState, changes: &mut ChangeSet) {
             };
             let mut short_wander = false;
             let mut exact_target = false;
-            let target = if v.activity == Activity::Panic {
+            let target = if shelter_night {
+                let (target, exact) = night_shelter(state, &mut cache, slot, &mut v, pos);
+                exact_target = exact;
+                target
+            } else if v.activity == Activity::Panic {
                 let retreat = home.or(job_site).or(meeting_point);
                 // A flee route that found no step (a shaft or tunnel whose
                 // "away" side is rock) would freeze the villager beside the

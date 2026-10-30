@@ -10,6 +10,61 @@ fn body(packet: &PlannedPacket) -> bytes::Bytes {
         .body
 }
 #[test]
+fn sleeping_villager_publishes_pose_and_bed_head_then_clears_them() {
+    let entity = EntityId(42);
+    let type_id = mc_data::entity_types::entity_type_contract_26_1_2_by_name("minecraft:villager")
+        .unwrap()
+        .protocol_id;
+    let sleeping = EntityAppearance {
+        pose: 2,
+        extra: vec![(
+            14,
+            mc_core::boundary::EntityDataValue::OptionalBlockPos(Some([8, 201, 12])),
+        )],
+        ..Default::default()
+    };
+    let awake = EntityAppearance {
+        extra: vec![(
+            14,
+            mc_core::boundary::EntityDataValue::OptionalBlockPos(None),
+        )],
+        ..Default::default()
+    };
+    for (appearance, previous, pose, bed) in [
+        (
+            &sleeping,
+            None,
+            EntityPose::Sleeping,
+            Some(mc_protocol::packets::play::pack_block_pos(8, 201, 12)),
+        ),
+        (&awake, Some(&sleeping), EntityPose::Standing, None),
+    ] {
+        let mut packets = Vec::new();
+        push_appearance_for(
+            &mut packets,
+            ConnectionId(7),
+            entity,
+            appearance,
+            type_id,
+            previous,
+        );
+        let packet = packets
+            .iter()
+            .find(|packet| packet.id == ClientboundSetEntityData::ID)
+            .unwrap();
+        let decoded = ClientboundSetEntityData::decode(&mut body(packet)).unwrap();
+        assert!(decoded.values.contains(&WireEntityDataValue::Pose {
+            index: ENTITY_DATA_POSE_INDEX,
+            pose,
+        }));
+        assert!(decoded.values.contains(&WireEntityDataValue::OptionalBlockPosition {
+            index: 14,
+            value: bed,
+        }));
+    }
+}
+
+#[test]
 fn pairing_and_skipped_snapshot_links_converge_with_explicit_detach_packets() {
     let conn = ConnectionId(7);
     let entity = EntityId(42);
