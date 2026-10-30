@@ -763,6 +763,29 @@ async fn real_two_cell_door_placement_and_break_report_the_whole_native_batch() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn spawn_protected_door_use_repairs_both_halves_before_ack() {
+    let (mut state, actor) = fixture(None);
+    state.spawn_protection = 256;
+    state.spawn_operators.insert(uuid::Uuid::new_v4());
+    let lower = block(&state, "oak_door", &[("half", "lower"), ("open", "false")]);
+    let upper = block(&state, "oak_door", &[("half", "upper"), ("open", "false")]);
+    plant(&mut state, POS, lower);
+    plant(&mut state, UPPER, upper);
+    assert!(crate::spawn_protection::protected(&state, actor, POS));
+    let (_, drains, _) = run_tick(&mut state, &[use_on(POS, Hand::Main, 3)]);
+    let changes = changes_for_player(drains);
+    let ack = changes.iter().position(|change| matches!(change,
+        PlayerChange::BlockActionsAcked { sequence } if *sequence == SEQUENCE
+    )).expect("refused use must be acknowledged");
+    for (position, expected) in [(POS, lower), (UPPER, upper)] {
+        let repair = changes.iter().position(|change| matches!(change,
+            PlayerChange::BlockResynced { position: cell, block } if *cell == position && *block == expected
+        )).expect("both door cells must be repaired");
+        assert!(repair < ack, "repair must precede its acknowledgement");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn denied_two_cell_door_repairs_even_the_unwritten_upper_prediction() {
     let (mut state, actor) = fixture(None);
     held(&mut state, actor, "oak_door", 3);
