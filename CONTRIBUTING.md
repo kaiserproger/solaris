@@ -31,8 +31,9 @@ On the shared owner workstation, use the memory runner described in AGENTS.md.
 Documentation-only changes need static path/link checks, not a Cargo build.
 
 Graphical, oracle and performance gates prove only their named scope. Consult
-[agent tooling](docs/AGENT_TOOLING.md) and the [QA protocol](docs/QA_AGENT_PROTOCOL.md)
-for prerequisites. Do not widen a bound, add retries or replace real-client
+[agent tooling](docs/AGENT_TOOLING.md) and the [break-it QA protocol](docs/QA_AGENT_PROTOCOL.md):
+player-visible changes and releases need a separate breaker, not just their own
+happy-path pass. Do not widen a bound, add retries or replace real-client
 coverage with protocol bots to turn a failing gate green.
 
 ## Changes and commits

@@ -33,7 +33,7 @@ installation and a source quick start.
 
 - [Contributing](../CONTRIBUTING.md) and [agent working rules](../AGENTS.md).
 - [Agent tooling and harness](AGENT_TOOLING.md): commands, profiles and prerequisites.
-- [Definition of done](DEFINITION_OF_DONE.md) and [real-client QA protocol](QA_AGENT_PROTOCOL.md).
+- [Definition of done](DEFINITION_OF_DONE.md) and [break-it QA protocol](QA_AGENT_PROTOCOL.md): breaker role, attack matrix, gate hygiene.
 - [Quirk and farm parity gate](QUIRK_PARITY.md): vanilla-oracle proof that player-relied quirks and farm rates are preserved.
 - [Vanilla compatibility matrix](COMPATIBILITY.md): 26.1.2 mechanics coverage per area.
 - [Playable scenarios](playable/README.md) and [real-client regression manifests](real-client-regression/README.md).

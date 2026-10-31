@@ -79,8 +79,10 @@ python3 -m tools.harness run correctness                  # L2: major phase/code
   `.analysis/validation/<UTC>-<profile>-<unique>/result.json` (`status`, `commands`, `exits`, `logs`, `details`, `error`).
   `prepared`/`--check`/`--prepare` is not a pass; unknown/unlaunchable/failing commands and timeouts fail closed.
   `code-health` is an architecture tripwire, not behavior/parity/performance proof; structural checks must not compare Rust statement text/order.
-- Actual-client surfaces need actual-client gates under the [QA protocol](docs/QA_AGENT_PROTOCOL.md):
-  graphical Minecraft under Xvfb, exact scenario + evidence, then one bounded adversarial pass with severity-ranked findings.
+- Actual-client surfaces need actual-client gates (graphical Minecraft under Xvfb, exact scenario + evidence) and a
+  separate breaker under the [break-it QA protocol](docs/QA_AGENT_PROTOCOL.md): an attack-matrix pass with repro'd,
+  severity-ranked findings before push to `main` or a release tag. A happy-path gate alone is not acceptance; new or
+  changed gates need a negative control, no pre-existing pass, every new branch on a real client, and ≥3 runs when variable.
   PrismLauncher 26.1.2 owner testing or approved client MCP must be identified as owner-run, agent-run or not run.
   Graphical prerequisites include Linux inotify/pidfd/Xvfb, MCP events and client credentials; TCP/unit tests never substitute.
 - Owner field testing precedes fixed-seed tuning, followed by varied-seed exploration with seeds/repros recorded.
