@@ -306,58 +306,125 @@ fn funded_owner_order_starts_the_single_project_without_world_or_stock_debit() {
 }
 
 #[test]
-fn unfunded_owner_order_is_not_saved_and_cannot_obstruct_autonomous_planning() {
+fn pending_owner_order_blocks_autonomy_then_starts_after_funding() {
     let (mut state, id, _) = fixture();
-    let revision = state.settlements.get(id).unwrap().revision;
     let stock = state.block_entities[&(1, 201, 1)].slots.clone();
-    state.settlements.take_images();
-    let error = request_build(&mut state, id, "house").unwrap_err();
-    assert!(error.starts_with("not enough:"), "{error}");
-    assert!(state.settlements.get(id).unwrap().project.is_none());
-    assert_eq!(state.settlements.get(id).unwrap().revision, revision);
     assert!(
-        state.settlements.take_images().is_empty(),
-        "unfunded order has no saved request"
+        request_build(&mut state, id, "house").is_ok(),
+        "unfunded order is queued"
     );
+    assert!(state.settlements.get(id).unwrap().project.is_none());
     assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
     fund(&mut state, "storage", 1);
+    for _ in 0..200 {
+        plan(&mut state, id);
+    }
+    assert!(
+        state.settlements.get(id).unwrap().project.is_none(),
+        "autonomy must wait"
+    );
+    fund(&mut state, "house", 1);
     plan_until_started(&mut state, id);
+    let project = state.settlements.get(id).unwrap().project.as_ref().unwrap();
+    assert_eq!(project.blueprint, "house");
+    assert!(project.ordered);
+}
+
+#[test]
+fn funded_pending_owner_order_searches_sites_in_bounded_planning_passes() {
+    let (mut state, id, _) = fixture();
+    assert!(matches!(
+        request_build(&mut state, id, "farm").unwrap(),
+        OrderOutcome::Queued { .. }
+    ));
+    // Block every site in the initially loaded chunk throughout the terrain
+    // search band; leave the storage chest accessible for the funding check.
+    for x in 0..16 {
+        for z in 0..16 {
+            if (x, z) != (1, 1) {
+                for y in 201..=216 {
+                    state.world.set_block(x, y, z, state.registry.states.stone);
+                }
+            }
+        }
+    }
+    state.world.fold_overlay();
+    fund(&mut state, "farm", 1);
+
+    let before = state.settlements.get(id).unwrap().clone();
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
     assert_eq!(
-        state
-            .settlements
-            .get(id)
-            .unwrap()
-            .project
-            .as_ref()
-            .unwrap()
-            .blueprint,
-        "storage"
+        pending_reason(&state, id).as_deref(),
+        Some("waiting for a site")
+    );
+    assert_eq!(state.settlements.get(id).unwrap(), &before);
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+
+    plan(&mut state, id);
+    let record = state.settlements.get(id).unwrap();
+    assert_eq!(record.construction_cursor, SITE_ATTEMPTS);
+    assert_eq!(record.pending_order, before.pending_order);
+    assert!(record.project.is_none(), "autonomy must not take the slot");
+
+    // The newly loaded area is beyond the first bounded search. Reporting a
+    // reason is observational, even when a suitable site now exists.
+    extend_planning_site(&mut state);
+    let before_reason = state.settlements.get(id).unwrap().clone();
+    assert_eq!(
+        pending_reason(&state, id).as_deref(),
+        Some("waiting for a site")
+    );
+    assert_eq!(state.settlements.get(id).unwrap(), &before_reason);
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+
+    plan_until_started(&mut state, id);
+    let record = state.settlements.get(id).unwrap();
+    assert!(record.pending_order.is_none());
+    let project = record.project.as_ref().unwrap();
+    assert_eq!(project.blueprint, "farm");
+    assert_eq!(project.level, 1);
+    assert!(project.ordered);
+    assert!(
+        project.origin[2] >= 16,
+        "site must be in the newly loaded area"
     );
 }
 
 #[test]
-fn active_project_refuses_owner_build_and_upgrade_without_mutation() {
+fn active_project_queues_owner_build_and_invalid_upgrade_keeps_it() {
     let (mut state, id, _) = fixture();
     start(&mut state, id, "storage", 1, None);
     fund(&mut state, "storage", 1);
     let before = state.settlements.get(id).unwrap().project.clone();
-    let revision = state.settlements.get(id).unwrap().revision;
     let stock = state.block_entities[&(1, 201, 1)].slots.clone();
-    state.settlements.take_images();
-    assert_eq!(request_build(&mut state, id, "house").unwrap_err(), "Busy.");
     assert_eq!(
-        request_upgrade(&mut state, id, BuildingId(123)).unwrap_err(),
-        "Busy."
+        request_build(&mut state, id, "house").unwrap(),
+        OrderOutcome::Queued {
+            reason: "busy".into(),
+            replaced: false,
+        }
     );
-    assert_eq!(state.settlements.get(id).unwrap().project, before);
-    assert_eq!(state.settlements.get(id).unwrap().revision, revision);
+    let record = state.settlements.get(id).unwrap();
+    let pending = record.pending_order.as_ref().unwrap();
+    assert_eq!(
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("house", 1, None)
+    );
+    assert!(request_upgrade(&mut state, id, BuildingId(123)).is_err());
+    assert!(request_build(&mut state, id, "not-a-blueprint").is_err());
+    let record = state.settlements.get(id).unwrap();
+    let pending = record.pending_order.as_ref().unwrap();
+    assert_eq!(
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("house", 1, None)
+    );
+    assert_eq!(record.project, before);
     assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
-    assert!(state.settlements.take_images().is_empty());
     assert!(state.plugin_block_writes.is_empty());
 }
 
 #[test]
-fn requested_upgrade_requires_present_materials_and_starts_immediately() {
+fn requested_upgrade_queues_without_materials_then_starts_after_funding() {
     let (mut state, id, slot) = fixture();
     start(&mut state, id, "house", 1, None);
     fund(&mut state, "house", 1);
@@ -377,23 +444,150 @@ fn requested_upgrade_requires_present_materials_and_starts_immediately() {
         .unwrap()
         .slots
         .fill(mc_data::ItemStack::EMPTY);
-    let revision = state.settlements.get(id).unwrap().revision;
-    state.settlements.take_images();
-    let error = request_upgrade(&mut state, id, building).unwrap_err();
-    assert!(error.starts_with("not enough:"), "{error}");
-    assert!(state.settlements.get(id).unwrap().project.is_none());
-    assert_eq!(state.settlements.get(id).unwrap().revision, revision);
-    assert!(state.settlements.take_images().is_empty());
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+    let writes = state.plugin_block_writes.len();
+    let outcome = request_upgrade(&mut state, id, building).unwrap();
+    assert!(
+        matches!(outcome, OrderOutcome::Queued { ref reason, replaced: false } if reason.starts_with("not enough:"))
+    );
+    let record = state.settlements.get(id).unwrap();
+    assert!(record.project.is_none());
+    let pending = record.pending_order.as_ref().unwrap();
+    assert_eq!(
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("house", 2, Some(building))
+    );
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+    assert_eq!(state.plugin_block_writes.len(), writes);
     fund(&mut state, "house", 2);
-    request_upgrade(&mut state, id, building).unwrap();
-    let project = state.settlements.get(id).unwrap().project.as_ref().unwrap();
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+    plan_until_started(&mut state, id);
+    let record = state.settlements.get(id).unwrap();
+    assert!(record.pending_order.is_none());
+    let project = record.project.as_ref().unwrap();
+    assert_eq!(project.blueprint, "house");
     assert_eq!(project.building, Some(building));
     assert_eq!(project.level, 2);
+    assert!(project.ordered);
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
     complete(&mut state, id, slot);
     let record = state.settlements.get(id).unwrap();
     assert!(record.project.is_none());
     assert_eq!(record.buildings[&building].level, 2);
     assert_eq!(record.buildings.len(), 1);
+}
+
+#[test]
+fn queued_upgrade_targets_next_level_after_active_upgrade_finishes() {
+    let (mut state, id, slot) = fixture();
+    start(&mut state, id, "house", 1, None);
+    fund(&mut state, "house", 1);
+    complete(&mut state, id, slot);
+    let building = *state
+        .settlements
+        .get(id)
+        .unwrap()
+        .buildings
+        .keys()
+        .next()
+        .unwrap();
+    fund(&mut state, "house", 2);
+    assert_eq!(
+        request_upgrade(&mut state, id, building).unwrap(),
+        OrderOutcome::Started
+    );
+    let active = state.settlements.get(id).unwrap().project.clone();
+    assert_eq!(active.as_ref().unwrap().level, 2);
+    assert_eq!(
+        request_upgrade(&mut state, id, building).unwrap(),
+        OrderOutcome::Queued {
+            reason: "busy".into(),
+            replaced: false,
+        }
+    );
+    let record = state.settlements.get(id).unwrap();
+    assert_eq!(record.project, active);
+    let pending = record.pending_order.as_ref().unwrap();
+    assert_eq!(
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("house", 3, Some(building))
+    );
+    complete(&mut state, id, slot);
+    assert_eq!(
+        state.settlements.get(id).unwrap().buildings[&building].level,
+        2
+    );
+    fund(&mut state, "house", 3);
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+    plan_until_started(&mut state, id);
+    let record = state.settlements.get(id).unwrap();
+    assert!(record.pending_order.is_none());
+    let project = record.project.as_ref().unwrap();
+    assert_eq!(
+        (project.blueprint.as_str(), project.level, project.building),
+        ("house", 3, Some(building))
+    );
+    assert!(project.ordered);
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+    assert_eq!(
+        request_upgrade(&mut state, id, building).unwrap_err(),
+        "No blueprint upgrade available for this building."
+    );
+    complete(&mut state, id, slot);
+    assert_eq!(
+        state.settlements.get(id).unwrap().buildings[&building].level,
+        3
+    );
+}
+
+#[test]
+fn stale_pending_upgrade_is_dropped_and_autonomous_planning_resumes() {
+    for remove_building in [true, false] {
+        let (mut state, id, slot) = fixture();
+        extend_planning_site(&mut state);
+        start(&mut state, id, "house", 1, None);
+        fund(&mut state, "house", 1);
+        complete(&mut state, id, slot);
+        let building = *state
+            .settlements
+            .get(id)
+            .unwrap()
+            .buildings
+            .keys()
+            .next()
+            .unwrap();
+        state
+            .block_entities
+            .get_mut(&(1, 201, 1))
+            .unwrap()
+            .slots
+            .fill(mc_data::ItemStack::EMPTY);
+        assert!(matches!(
+            request_upgrade(&mut state, id, building).unwrap(),
+            OrderOutcome::Queued {
+                replaced: false,
+                ..
+            }
+        ));
+        let record = state.settlements.get_mut(id).unwrap();
+        if remove_building {
+            record.buildings.remove(&building);
+        } else {
+            record.buildings.get_mut(&building).unwrap().level = 3;
+        }
+        fund(&mut state, "storage", 1);
+        let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+        plan_until_started(&mut state, id);
+        let record = state.settlements.get(id).unwrap();
+        assert!(
+            record.pending_order.is_none(),
+            "remove_building={remove_building}"
+        );
+        let project = record.project.as_ref().unwrap();
+        assert_eq!(project.blueprint, "storage");
+        assert!(!project.ordered);
+        assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+    }
 }
 
 #[test]
@@ -725,7 +919,10 @@ fn owner_order_preempts_an_autonomous_project_that_placed_nothing() {
         .structure
         .clone();
     let stock = state.block_entities[&(1, 201, 1)].slots.clone();
-    request_build(&mut state, id, "house").expect("untouched autonomous project yields");
+    assert_eq!(
+        request_build(&mut state, id, "house").unwrap(),
+        OrderOutcome::Started
+    );
     let project = state.settlements.get(id).unwrap().project.as_ref().unwrap();
     assert_eq!(project.blueprint, "house");
     assert!(project.ordered);
@@ -767,7 +964,25 @@ fn owner_order_is_busy_once_an_autonomous_project_placed_a_block() {
             .completed_work_units
             > 0
     );
-    assert_eq!(request_build(&mut state, id, "house").unwrap_err(), "Busy.");
+    let before = state.settlements.get(id).unwrap().project.clone();
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+    let writes = state.plugin_block_writes.len();
+    assert_eq!(
+        request_build(&mut state, id, "house").unwrap(),
+        OrderOutcome::Queued {
+            reason: "busy".into(),
+            replaced: false,
+        }
+    );
+    let record = state.settlements.get(id).unwrap();
+    assert_eq!(record.project, before);
+    let pending = record.pending_order.as_ref().unwrap();
+    assert_eq!(
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("house", 1, None)
+    );
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+    assert_eq!(state.plugin_block_writes.len(), writes);
     assert_eq!(
         state
             .settlements
@@ -782,31 +997,89 @@ fn owner_order_is_busy_once_an_autonomous_project_placed_a_block() {
 }
 
 #[test]
-fn ordered_project_is_never_preempted_by_planner_or_a_second_order() {
-    let (mut state, id, _) = fixture();
+fn ordered_project_finishes_before_replacement_order_starts() {
+    let (mut state, id, slot) = fixture();
     extend_planning_site(&mut state);
     fund_all(&mut state, &["storage", "house"]);
-    request_build(&mut state, id, "house").unwrap();
+    assert_eq!(
+        request_build(&mut state, id, "storage").unwrap(),
+        OrderOutcome::Started
+    );
     let before = state.settlements.get(id).unwrap().project.clone();
     assert!(before.as_ref().unwrap().ordered);
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+    assert_eq!(
+        request_build(&mut state, id, "watch_tower").unwrap(),
+        OrderOutcome::Queued {
+            reason: "busy".into(),
+            replaced: false,
+        }
+    );
+    let pending = state
+        .settlements
+        .get(id)
+        .unwrap()
+        .pending_order
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("watch_tower", 1, None)
+    );
+    assert_eq!(
+        request_build(&mut state, id, "house").unwrap(),
+        OrderOutcome::Queued {
+            reason: "busy".into(),
+            replaced: true,
+        }
+    );
     for _ in 0..200 {
         plan(&mut state, id);
     }
+    let record = state.settlements.get(id).unwrap();
+    assert_eq!(record.project, before);
+    let pending = record.pending_order.as_ref().unwrap();
     assert_eq!(
-        request_build(&mut state, id, "storage").unwrap_err(),
-        "Busy."
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("house", 1, None)
     );
-    assert_eq!(state.settlements.get(id).unwrap().project, before);
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+    assert!(state.plugin_block_writes.is_empty());
+    complete(&mut state, id, slot);
+    assert!(state.settlements.get(id).unwrap().project.is_none());
+    fund(&mut state, "house", 1);
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+    plan_until_started(&mut state, id);
+    let record = state.settlements.get(id).unwrap();
+    assert!(record.pending_order.is_none());
+    let project = record.project.as_ref().unwrap();
+    assert_eq!(
+        (project.blueprint.as_str(), project.level, project.building),
+        ("house", 1, None)
+    );
+    assert!(project.ordered);
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
 }
 
 #[test]
-fn refused_owner_order_keeps_the_autonomous_project() {
+fn unfunded_owner_order_keeps_the_autonomous_project() {
     let (mut state, id, _) = fixture();
     autonomous_storage(&mut state, id);
     let before = state.settlements.get(id).unwrap().project.clone();
-    let error = request_build(&mut state, id, "watch_tower").unwrap_err();
-    assert!(error.starts_with("not enough:"), "{error}");
-    assert_eq!(state.settlements.get(id).unwrap().project, before);
+    let stock = state.block_entities[&(1, 201, 1)].slots.clone();
+    let outcome = request_build(&mut state, id, "watch_tower").unwrap();
+    assert!(
+        matches!(outcome, OrderOutcome::Queued { ref reason, replaced: false } if reason.starts_with("not enough:"))
+    );
+    let record = state.settlements.get(id).unwrap();
+    assert_eq!(record.project, before);
+    let pending = record.pending_order.as_ref().unwrap();
+    assert_eq!(
+        (pending.blueprint.as_str(), pending.level, pending.building),
+        ("watch_tower", 1, None)
+    );
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+    assert!(state.plugin_block_writes.is_empty());
 }
 
 #[test]
@@ -986,5 +1259,48 @@ fn running_structure_neither_certifies_nor_admits_an_upgrade() {
     assert_eq!(
         (kept.level, kept.structure.as_str()),
         (1, project.structure.as_str())
+    );
+}
+
+#[test]
+fn owner_order_does_not_preempt_after_a_completed_clear_stage() {
+    let (mut state, id, slot) = fixture();
+    state
+        .world
+        .set_block(3, 201, 3, state.registry.states.stone);
+    state.world.fold_overlay();
+    start(&mut state, id, "storage", 1, None);
+    let record = state.settlements.get_mut(id).unwrap();
+    record.project.as_mut().unwrap().ordered = false;
+    let project = record.project.clone().unwrap();
+    for _ in 0..400 {
+        let snapshot = executor::status(&state, id, &project.structure).unwrap();
+        if snapshot.current_stage_index > 0 && snapshot.completed_work_units == 0 {
+            break;
+        }
+        attempt(&mut state, id, slot);
+    }
+    let snapshot = executor::status(&state, id, &project.structure).unwrap();
+    assert!(snapshot.current_stage_index > 0, "{snapshot:?}");
+    assert_eq!(snapshot.completed_work_units, 0);
+    fund(&mut state, "house", 1);
+    assert_eq!(
+        request_build(&mut state, id, "house").unwrap(),
+        OrderOutcome::Queued {
+            reason: "busy".into(),
+            replaced: false,
+        }
+    );
+    plan(&mut state, id);
+    assert_eq!(
+        state
+            .settlements
+            .get(id)
+            .unwrap()
+            .project
+            .as_ref()
+            .unwrap()
+            .structure,
+        project.structure
     );
 }

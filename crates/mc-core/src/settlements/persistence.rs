@@ -143,6 +143,8 @@ pub(crate) fn hydrate_dimension(
             return Err(invalid(format!("row {key} identity mismatch")));
         }
         validate_record(&row.value).map_err(|error| invalid(format!("row {key}: {error}")))?;
+        super::construction::validate_pending(&state.registry, &row.value)
+            .map_err(|error| invalid(format!("row {key}: {error}")))?;
         if row.dimension != state.dimension {
             continue;
         }
@@ -164,6 +166,8 @@ pub(crate) fn hydrate_dimension(
                 return Err(invalid(format!("WAL image identity mismatch for id {id}")));
             }
             validate_record(value)
+                .map_err(|error| invalid(format!("WAL image id {id}: {error}")))?;
+            super::construction::validate_pending(&state.registry, value)
                 .map_err(|error| invalid(format!("WAL image id {id}: {error}")))?;
         }
         state.settlements.apply_image(image);
@@ -319,6 +323,8 @@ pub(crate) fn finish_recovery(state: &mut TickState) -> Result<(), CoreError> {
         let mut names = std::collections::BTreeSet::new();
         for record in world.settlements.records() {
             validate_record(record)
+                .map_err(|error| CoreError::Storage(format!("native settlement: {error}")))?;
+            super::construction::validate_pending(&world.registry, record)
                 .map_err(|error| CoreError::Storage(format!("native settlement: {error}")))?;
             if !names.insert(record.name.clone()) {
                 return Err(CoreError::Storage(format!(

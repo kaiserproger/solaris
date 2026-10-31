@@ -453,13 +453,24 @@ construction, recruit or battle simulation and no new abstract catch-up domain.
 The typed settlement snapshot exposes `owner: option<string>` through WIT as
 well as Rust: absence is not represented by an invented owner identity.
 
-Owner build/upgrade requests require an idle settlement and a whole bill funded
-by existing real storage ingredients, including supported crafting chains.
-Busy or unfunded requests are refused immediately, never persisted as pending
-work and never allowed to block autonomous planning. Accepted work uses the same
-canonical project, structure ledger, Builder carry and checkpoint/WAL recovery.
-The unshipped prototype `construction_queue` field is removed without a migration:
-unknown fields still fail closed, and QA regenerates its prototype world.
+Owner build/upgrade requests start immediately when the slot is free and the
+whole bill is funded by real storage ingredients, including supported crafting
+chains. An untouched autonomous project still yields to a funded owner request.
+Otherwise the settlement persists one pending owner order; a new order replaces
+it and `settlement build cancel` clears it. Planning tries that order first and
+starts no new autonomous work while it waits; an existing project finishes.
+Projects/Status show the order and its missing materials. Starting queued work
+notifies the online owner. The pending order uses the existing settlement
+checkpoint/WAL post-image (an absent field means none; corrupt data fails closed).
+Accepted work retains the same canonical project, structure ledger and Builder
+carry: queueing never fabricates, reserves or debits materials.
+Queued upgrades retain the target building and take its next level when they
+start (an active L2 upgrade previews the queued request as L3). An order whose
+building is gone or already at maximum level is dropped on the next planning
+pass, notifying the online owner and allowing autonomy to continue.
+Queued site selection shares the autonomous planner's `SITE_ATTEMPTS` budget
+and existing durable construction cursor. Dialog status never searches terrain:
+a funded free order reports waiting for site admission until the planner starts it.
 
 ## Native districts and stages — Decision 006, S3 (2026-10-17)
 

@@ -7,6 +7,7 @@ use super::*;
 use crate::config::CoreConfig;
 use crate::dimensions::Dimension;
 use crate::journal::{JournalEntry, JournalWriter, Replay};
+use crate::settlements::construction;
 use std::sync::Arc;
 
 fn registry() -> Arc<crate::registry::CoreRegistry> {
@@ -76,6 +77,41 @@ fn crash_block(state: &TickState, name: &str, props: &[(&str, &str)]) -> u32 {
         .by_name_and_props(&id, &full)
         .unwrap()
         .0
+}
+
+#[test]
+fn pending_owner_order_survives_native_checkpoint_and_rejects_corruption() {
+    let mut live = state();
+    let id = town(&mut live, "queued");
+    let _ = construction::request_build(&mut live, id, "house");
+    let rows = checkpoint_rows(&live, 9).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&rows[&row_key(id)].payload).unwrap();
+    assert_eq!(value["value"]["pending_order"]["blueprint"], "house");
+    let mut restored = state();
+    hydrate_dimension(&mut restored, &rows, &Replay::default(), id.0).unwrap();
+    assert_eq!(restored.settlements.get(id), live.settlements.get(id));
+    let mut old_rows = rows.clone();
+    let mut old_value = value.clone();
+    old_value["value"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pending_order");
+    old_rows.get_mut(&row_key(id)).unwrap().payload = serde_json::to_vec(&old_value).unwrap();
+    hydrate_dimension(&mut state(), &old_rows, &Replay::default(), id.0).unwrap();
+    for corrupt in [
+        serde_json::json!({"blueprint": "", "level": 1, "building": null}),
+        serde_json::json!({"blueprint": "unknown", "level": 1, "building": null}),
+        serde_json::json!({"blueprint": "house", "level": 0, "building": null}),
+        serde_json::json!({"blueprint": "house", "level": 2, "building": 42}),
+        serde_json::json!({"blueprint": "house", "level": 1, "building": null, "extra": true}),
+    ] {
+        let mut corrupt_rows = rows.clone();
+        let mut corrupt_value = value.clone();
+        corrupt_value["value"]["pending_order"] = corrupt;
+        corrupt_rows.get_mut(&row_key(id)).unwrap().payload =
+            serde_json::to_vec(&corrupt_value).unwrap();
+        assert!(hydrate_dimension(&mut state(), &corrupt_rows, &Replay::default(), id.0).is_err());
+    }
 }
 
 #[test]
@@ -249,6 +285,7 @@ fn hydrate_validates_rows_and_keeps_sequence_monotonic() {
                     village_source: None,
                     bootstrap_storage: None,
                     project: None,
+                    pending_order: None,
                     construction_cursor: 0,
                 },
             })
@@ -282,6 +319,7 @@ fn hydrate_validates_rows_and_keeps_sequence_monotonic() {
                 village_source: None,
                 bootstrap_storage: None,
                 project: None,
+                pending_order: None,
                 construction_cursor: 0,
             }),
         });
@@ -312,6 +350,7 @@ fn hydrate_validates_rows_and_keeps_sequence_monotonic() {
             village_source: None,
             bootstrap_storage: None,
             project: None,
+            pending_order: None,
             construction_cursor: 0,
         }),
     });
@@ -336,6 +375,7 @@ fn hydrate_validates_rows_and_keeps_sequence_monotonic() {
             village_source: None,
             bootstrap_storage: None,
             project: None,
+            pending_order: None,
             construction_cursor: 0,
         }),
     });

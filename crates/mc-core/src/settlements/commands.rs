@@ -72,12 +72,12 @@ pub enum SettlementCommand {
         id: u64,
     },
     BuildingList,
-    /// Start an idle, presently funded owner blueprint project in the
-    /// executor's settlement; a bounded planner scan picks its site.
+    /// Start or queue an owner blueprint project in the executor's settlement.
+    /// The reserved `cancel` argument clears only its pending owner order.
     Build {
         blueprint: String,
     },
-    /// Start a funded blueprint upgrade for a globally addressed building,
+    /// Start or queue a blueprint upgrade for a globally addressed building,
     /// authorized against the enclosing settlement. Builders later apply
     /// geometry and debit storage; `building upgrade` only recertifies blocks.
     BuildUpgrade {

@@ -55,9 +55,7 @@ def _parse_center(text: str, fallback: tuple[int, int, int]) -> tuple[int, int, 
 USERNAME = "VillageAuto"
 SECOND_USERNAME = "VillageAutoB"
 SEED = QA_SEED
-# Owner-order candidates, preferred first. Storage needs ~25 logs of stock; Wall
-# is cobblestone-only, which the founding chest keeps after autonomous growth.
-OWNER_ORDER_BLUEPRINTS = ("storage", "wall")
+OWNER_ORDER_BLUEPRINT = "storage"
 # Survey receipt: seed 100 safe spawn (128,69,0); village site start chunk (7,0),
 # bounds x 35..206, y 50..118, z -74..89, 160 pieces. Recorded 2026-10-20 by a
 # temporary in-tree survey test (since removed).
@@ -220,31 +218,41 @@ def _project_status(probe: ProbeSteps) -> dict[str, Any]:
 
 
 def _wait_owner_order(
-    probe: ProbeSteps, detail: dict[str, Any], blueprints: str | tuple[str, ...],
-    timeout: float = 600.0,
+    probe: ProbeSteps, detail: dict[str, Any], blueprint: str,
+    timeout: float = 1300.0,
 ) -> bool:
-    """Order the first blueprint the settlement can fund, retrying every refusal.
-
-    Funding is the settlement's real stock: after a long autonomous run the
-    founding chest can hold plenty of cobblestone yet too few logs for Storage,
-    and the non-operator owner cannot add stock. Each pass therefore offers the
-    candidates in preference order, and only a live project of the started
-    blueprint counts.
-    """
-    candidates = (blueprints,) if isinstance(blueprints, str) else blueprints
+    """Submit one order and wait for its level-one project to become active."""
+    lines = _recent_chat(_send(probe, f"settlement build {blueprint}"), 20)
+    detail["owner_order_attempts"] = [lines]
+    detail["post_claim_order_chat"] = lines
+    if not lines or not (
+        lines[0] == f"Started {blueprint} construction."
+        or lines[0].startswith(f"Queued {blueprint}: ")
+    ):
+        return False
+    started = lines[0] == f"Started {blueprint} construction."
+    previous_chat = lines
+    # The current project may need a full workday before the queued order starts.
     deadline = time.monotonic() + timeout
-    attempts: list[list[str]] = []
-    detail["owner_order_attempts"] = attempts
     while time.monotonic() < deadline:
-        for blueprint in candidates:
-            lines = _recent_chat(_send(probe, f"settlement build {blueprint}"), 8)
-            attempts.append(lines)
-            detail["post_claim_order_chat"] = lines
-            if lines and lines[0] == f"Started {blueprint} construction.":
-                project = _project_progress(_project_status(probe))
-                detail["owner_order_project"] = project
-                return bool(project and project["blueprint"] == blueprint and project["level"] == 1)
-        probe.call("minecraft_wait_ticks", {"ticks": 200})
+        if started:
+            project = _project_progress(_project_status(probe))
+            detail["owner_order_project"] = project
+            if project and project["blueprint"] == blueprint and project["level"] == 1:
+                return True
+        probe.call("minecraft_wait_ticks", {"ticks": 100})
+        if not started:
+            chat = _recent_chat(probe.observe(), 20)
+            # Chat is newest first. Only lines before the shared history are new;
+            # old Started messages must not certify a queued order.
+            overlap = next(
+                (n for n in range(min(len(chat), len(previous_chat)), 0, -1)
+                 if chat[-n:] == previous_chat[:n]),
+                0,
+            )
+            if overlap and f"Started {blueprint} construction." in chat[:-overlap]:
+                started = True
+            previous_chat = chat
     return False
 
 
@@ -526,7 +534,7 @@ def _verdict(
         detail["repro"][name] = repro
 
 
-def run(ctx: ProfileContext) -> dict[str, Any]:
+def run(ctx: ProfileContext, *, owner_order: bool = False) -> dict[str, Any]:
     if ctx.client != "native":
         raise ValueError("village-autonomy-qa requires --client native")
     if ctx.extra_args or ctx.platform is not None:
@@ -537,6 +545,8 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
     if not 0 < timeout <= 3600:
         raise ValueError("village-autonomy-qa --timeout-seconds must be in (0, 3600]")
     artifact = ctx.artifact_dir
+    if owner_order and (SEED != 100 or QA_VILLAGE or os.environ.get("VILLAGE_AUTONOMY_RESUME_WORLD")):
+        raise ValueError("village-owner-order-qa requires a fresh seed-100 world and default center")
     resume_world = os.environ.get("VILLAGE_AUTONOMY_RESUME_WORLD", "")
     override = os.environ.get("SOLARIS_SERVER_BINARY")
     if not override:
@@ -625,19 +635,24 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
             ctx, native_client.resolve_binary(ctx), address, USERNAME, timeout, display=display
         )
         mcp.request_timeout_seconds = min(timeout + 10, 130.0)
-        with ProbeSteps(mcp, artifact / "village-autonomy-qa", timeout, "village-autonomy") as probe:
+        scenario_name = "village-owner-order-qa" if owner_order else "village-autonomy-qa"
+        with ProbeSteps(mcp, artifact / scenario_name, timeout, scenario_name) as probe:
             probe.call("minecraft_wait_for_play", {"timeout_seconds": probe.remaining()})
             if ctx.windowed:
                 native_client.capture(mcp, artifact, "autonomy-spawn")
             detail: dict[str, Any] = {"behaviour": {}, "evidence": {}, "repro": {}}
-            probe.report["autonomy_acceptance"] = detail
+            probe.report["owner_order_acceptance" if owner_order else "autonomy_acceptance"] = detail
             def read_container(pos: tuple[int, int, int]) -> dict[str, int]:
                 return _read_storage_container(server, server_log_path, pos, min(15.0, probe.remaining()))
 
-            _scenario(probe, detail, ctx, artifact, address, display, timeout, read_container, capture_peer)
-            if ctx.windowed:
-                native_client.capture(mcp, artifact, "autonomy-final")
-            before = _wait_project_started(probe)
+            if owner_order:
+                _owner_order_before_restart(probe, detail, artifact)
+                before = None
+            else:
+                _scenario(probe, detail, ctx, artifact, address, display, timeout, read_container, capture_peer)
+                if ctx.windowed:
+                    native_client.capture(mcp, artifact, "autonomy-final")
+                before = _wait_project_started(probe)
             detail["restart_before"] = before
             if peer_mcp is not None:
                 peer_mcp.close()
@@ -684,13 +699,16 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
             }
             probe.client = mcp
             probe.call("minecraft_wait_for_play", {"timeout_seconds": probe.remaining()})
-            resumed = _wait_project_resumed(probe, detail, before)
-            _verdict(detail, "restart_resume", "PASS" if resumed else "FAIL",
-                     str(detail.get("restart_after")), "real server/client restart on the same world")
-            probe.check("project_resumes_after_process_restart", resumed)
-            native_client.capture(mcp, artifact, "autonomy-restarted-resumed")
-            detail["total_game_ticks"] = _gametime(probe) - detail["start_tick"]
-            probe.check("all_autonomy_acceptance_behaviours", all_behaviours_pass(detail["behaviour"]))
+            if owner_order:
+                _owner_order_after_restart(probe, detail, artifact, server, server_log_path)
+            else:
+                resumed = _wait_project_resumed(probe, detail, before)
+                _verdict(detail, "restart_resume", "PASS" if resumed else "FAIL",
+                         str(detail.get("restart_after")), "real server/client restart on the same world")
+                probe.check("project_resumes_after_process_restart", resumed)
+                native_client.capture(mcp, artifact, "autonomy-restarted-resumed")
+                detail["total_game_ticks"] = _gametime(probe) - detail["start_tick"]
+                probe.check("all_autonomy_acceptance_behaviours", all_behaviours_pass(detail["behaviour"]))
         if ctx.windowed:
             evidence["capture"] = native_client.capture(mcp, artifact)
         if client_process is not None:
@@ -723,6 +741,164 @@ def run(ctx: ProfileContext) -> dict[str, Any]:
                 pass
         if server_log is not None:
             server_log.close()
+
+
+def _pending_dialog(state: dict[str, Any]) -> dict[str, Any]:
+    body = "\n".join(str(n.get("label", "")) for n in state.get("ui_nodes", [])
+                     if str(n.get("id", "")).startswith("dialog/body/"))
+    missing = [line.strip() for line in body.splitlines()
+               if re.search(r"\S.+\s+\d+/\d+\s+—", line)]
+    return {"body": body, "missing": missing, "pending": "Pending: " in body}
+
+
+def _owner_projects(probe: ProbeSteps, detail: dict[str, Any], key: str, artifact: Path) -> dict[str, Any]:
+    state = _send(probe, "settlement menu projects")
+    probe.check(f"{key}_projects_open", (state.get("screen") or {}).get("class") == DIALOG_CLASS)
+    observed = _pending_dialog(state)
+    detail[key] = observed
+    native_client.capture(probe.client, artifact, key)
+    return observed
+
+
+def _founding_storage(probe: ProbeSteps, anchor: tuple[int, int, int]) -> tuple[int, int, int]:
+    # Adoption registers the nearest chest/barrel within eight blocks of the bell.
+    x, y, z = anchor
+    offset = 0
+    candidates = []
+    while True:
+        scan = probe.call("minecraft_scan_blocks", {
+            "min_x": x - 8, "min_y": y - 4, "min_z": z - 8,
+            "max_x": x + 8, "max_y": y + 4, "max_z": z + 8, "offset": offset,
+        })
+        for block in scan.get("blocks", []):
+            if _block_id(block) not in ("minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel"):
+                continue
+            pos = (int(block["x"]), int(block["y"]), int(block["z"]))
+            distance = sum((pos[i] - anchor[i]) ** 2 for i in range(3))
+            if distance <= 64:
+                candidates.append((distance, pos))
+        if not scan.get("truncated"):
+            break
+        following = scan.get("next_offset")
+        if not isinstance(following, int) or following <= offset:
+            raise RuntimeError("founding storage scan pagination did not advance")
+        offset = following
+    if not candidates:
+        raise RuntimeError("no founding storage near settlement anchor")
+    return min(candidates)[1]
+
+
+def _owner_order_before_restart(probe: ProbeSteps, detail: dict[str, Any], artifact: Path) -> None:
+    probe.wait(lambda s: isinstance((s.get("player") or {}).get("x"), float), "player_present")
+    _walk_to(probe, detail, tuple(float(v) for v in VILLAGE_CENTER), "approach")
+    deadline = time.monotonic() + 180
+    name = None
+    while time.monotonic() < deadline and not name:
+        lines = _recent_chat(_send(probe, "settlement list"), 20)
+        for line in lines:
+            if line.startswith("Settlements:"):
+                name = line.split(":", 1)[1].split(",")[0].strip().rstrip(".")
+                break
+        if not name:
+            probe.call("minecraft_wait_ticks", {"ticks": 100})
+    probe.check("settlement_listed", bool(name))
+    detail["settlement_name"] = name
+    lines = _recent_chat(_send(probe, f"settlement info {name}"), 20)
+    detail["settlement_info"] = lines
+    match = next((m for line in lines if (m := re.search(
+        r"anchor=\[(-?\d+),\s*(-?\d+),\s*(-?\d+)\]", line))), None)
+    probe.check("settlement_anchor", match is not None)
+    anchor = tuple(int(match.group(i)) for i in range(1, 4))
+    probe.call("minecraft_navigate_to_block", {"x": anchor[0], "y": anchor[1], "z": anchor[2]})
+    probe.call("minecraft_wait_ticks", {"ticks": 100})
+    detail["founding_chest"] = list(_founding_storage(probe, anchor))
+    claim = _recent_chat(_send(probe, "settlement claim"), 20)
+    detail["claim_chat"] = claim
+    probe.check("owner_claimed", bool(claim) and claim[0].startswith("Claimed "))
+    queued = _recent_chat(_send(probe, "settlement build house"), 20)
+    detail["queued_chat"] = queued
+    probe.check("house_queued_unfunded", bool(queued) and queued[0].startswith("Queued house: not enough:"))
+    pending = _owner_projects(probe, detail, "pending_before_restart", artifact)
+    probe.check("pending_before_restart", "Pending: House L1" in pending["body"] and bool(pending["missing"]))
+    probe.call("minecraft_close_screen", {})
+
+
+def _new_chat_lines(previous: list[str], current: list[str]) -> list[str]:
+    if not previous:
+        return current
+    overlap = next((n for n in range(min(len(current), len(previous)), 0, -1)
+                    if current[-n:] == previous[:n]), 0)
+    return current[:-overlap] if overlap else []
+
+
+def _owner_order_after_restart(
+    probe: ProbeSteps, detail: dict[str, Any], artifact: Path,
+    server: subprocess.Popen[Any], log_path: Path,
+) -> None:
+    pending = _owner_projects(probe, detail, "pending_after_restart", artifact)
+    probe.check("pending_survives_restart", "Pending: House L1" in pending["body"] and bool(pending["missing"]))
+    probe.call("minecraft_close_screen", {})
+    previous = _recent_chat(probe.observe(), 20)
+    chest = tuple(detail["founding_chest"])
+    # Exact authored L1 base bill plus bounded dirt for real site preparation.
+    import ast
+    result = subprocess.run(
+        ["python3", "tools/blueprints.py", "materials", "house"],
+        cwd=runtime.REPO_ROOT, text=True, capture_output=True, check=True,
+    )
+    line = next(line for line in result.stdout.splitlines() if "L1:" in line and "base" in line)
+    base = ast.literal_eval(line.split("base", 1)[1].split(";", 1)[0].strip())
+    base["dirt"] = base.get("dirt", 0) + 256
+    slots = _open_chest(probe, chest)
+    free = [slot for slot in range(27) if slot not in slots or
+            slots[slot].get("item_id") in (None, "minecraft:air")]
+    commands = []
+    for item, amount in sorted(base.items()):
+        while amount > 0:
+            if not free:
+                raise RuntimeError("founding chest lacks space for bounded house fixture")
+            count = min(64, amount)
+            slot = free.pop(0)
+            commands.append(f"item replace block {chest[0]} {chest[1]} {chest[2]} "
+                            f"container.{slot} with minecraft:{item} {count}")
+            amount -= count
+    probe.call("minecraft_close_screen", {})
+    if server.stdin is None:
+        raise RuntimeError("server console unavailable for material fixture")
+    detail["material_fixture_commands"] = commands
+    probe.report["fixture_commands"].extend(commands)
+    server.stdin.write(("\n".join(commands) + "\n").encode())
+    server.stdin.flush()
+    probe.call("minecraft_wait_ticks", {"ticks": 40})
+    detail["funded_storage"] = _read_storage_container(server, log_path, chest, min(15.0, probe.remaining()))
+    deadline = time.monotonic() + 180
+    started = False
+    while time.monotonic() < deadline:
+        chat = _recent_chat(probe.observe(), 20)
+        fresh = _new_chat_lines(previous, chat)
+        if "Started house construction." in fresh:
+            detail["started_chat"] = fresh
+            started = True
+            break
+        previous = chat
+        probe.call("minecraft_wait_ticks", {"ticks": 40})
+    probe.check("fresh_house_started", started)
+    project = _project_progress(_project_status(probe))
+    detail["started_status"] = project
+    probe.check("house_status_after_started", bool(project) and project["blueprint"] == "house" and project["level"] == 1)
+    native_client.capture(probe.client, artifact, "owner-order-started")
+    queued = _recent_chat(_send(probe, "settlement build farm"), 20)
+    detail["second_queued_chat"] = queued
+    probe.check("second_order_queued", bool(queued) and queued[0].startswith("Queued farm:"))
+    pending = _owner_projects(probe, detail, "second_pending", artifact)
+    probe.check("second_pending_unfunded", "Pending: Farm L1" in pending["body"] and bool(pending["missing"]))
+    probe.call("minecraft_close_screen", {})
+    cancelled = _recent_chat(_send(probe, "settlement build cancel"), 20)
+    detail["cancel_chat"] = cancelled
+    probe.check("order_cancelled", bool(cancelled) and cancelled[0] == "Cancelled pending construction order.")
+    pending = _owner_projects(probe, detail, "after_cancel", artifact)
+    probe.check("pending_gone_after_cancel", not pending["pending"])
+    probe.call("minecraft_close_screen", {})
 
 
 def _nearest_loaded_waypoint(probe: ProbeSteps, target: tuple[float, float, float]) -> tuple[int, int, int] | None:
@@ -1169,10 +1345,10 @@ def _scenario(
     probe.check("second_claim_refused", second_refused)
 
     # --- (9) owner can now order a building ---
-    order_ok = _wait_owner_order(probe, detail, OWNER_ORDER_BLUEPRINTS)
+    order_ok = _wait_owner_order(probe, detail, OWNER_ORDER_BLUEPRINT)
     order_chat = detail["post_claim_order_chat"]
     _verdict(detail, "owner_orders_building", "PASS" if order_ok else "FAIL",
-             f"chat={order_chat}", "settlement build <storage|wall> after claim must start a funded project")
+             f"chat={order_chat}", "settlement build storage after claim must start a level-one project")
     probe.check("owner_can_order", order_ok)
 
     # --- (10) restart mid-project resumes: stop server, restart same world ---

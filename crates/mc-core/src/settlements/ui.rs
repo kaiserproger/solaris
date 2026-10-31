@@ -53,6 +53,7 @@ const MUTATING: &[&str] = &[
     "upgrade",
     "project_order",
     "project_upgrade",
+    "project_cancel_pending",
     "order_start",
     "order_pick",
     "order_create",
@@ -237,6 +238,13 @@ fn dispatch(
         "upgrade" => upgrade(state, connection, ctx, payload),
         "project_order" => project_order(state, connection, ctx, payload),
         "project_upgrade" => project_upgrade(state, connection, ctx, payload),
+        "project_cancel_pending" => {
+            let note = match super::construction::cancel_pending(state, ctx.id) {
+                Ok(()) => ctx.t(Key::PendingCancelled).to_owned(),
+                Err(error) => error,
+            };
+            projects_screen(state, connection, ctx, &note);
+        }
         "order_start" => order_start(state, connection, ctx),
         "order_pick" => order_pick(state, connection, ctx, payload),
         "order_create" => order_create(state, connection, ctx, payload),
@@ -1634,10 +1642,7 @@ fn army_order(
 /// Owner order buttons for every authored blueprint, `Upgrade` buttons for
 /// blueprint-built buildings with a next level, and the `Status` page.
 ///
-/// A dialog renders its body above the action grid, in one scroll column, so a
-/// status block here would push every button below the fold. The body therefore
-/// holds only the click note: the grid stays the first thing in the column, and
-/// the live project status sits behind `Status` ([`project_status_screen`]).
+/// Show pending materials only when an owner order is waiting.
 /// Clicks route through the `MUTATING` allowlist; forged payloads revalidate.
 fn projects_screen(state: &mut TickState, connection: ConnectionId, ctx: &Ctx, note: &str) {
     let Some(record) = state.settlements.get(ctx.id) else {
@@ -1655,10 +1660,13 @@ fn projects_screen(state: &mut TickState, connection: ConnectionId, ctx: &Ctx, n
                 .with("blueprint", Tag::String(blueprint.id.clone())),
             );
         }
-        for building in record
+        for (building, next) in record
             .buildings
             .values()
-            .filter(|building| super::construction::upgrade_available(state, ctx.id, building.id))
+            .filter_map(|building| {
+                super::construction::owner_upgrade_level(state, ctx.id, building.id)
+                    .map(|level| (building, level))
+            })
             .take(MAX_LISTED)
         {
             buttons.push(
@@ -1668,8 +1676,8 @@ fn projects_screen(state: &mut TickState, connection: ConnectionId, ctx: &Ctx, n
                         &[
                             ("id", &short(building.id).to_string()),
                             ("kind", &kind_label(ctx, building.kind)),
-                            ("level", &building.level.to_string()),
-                            ("next", &(building.level + 1).to_string()),
+                            ("level", &(next - 1).to_string()),
+                            ("next", &next.to_string()),
                         ],
                     ),
                     "project_upgrade",
@@ -1678,16 +1686,52 @@ fn projects_screen(state: &mut TickState, connection: ConnectionId, ctx: &Ctx, n
                 .with("b", Tag::String(building.id.0.to_string())),
             );
         }
+        if record.pending_order.is_some() {
+            buttons.push(button(
+                ctx.t(Key::CancelPending),
+                "project_cancel_pending",
+                ctx.id,
+            ));
+        }
     }
     buttons.push(button(ctx.t(Key::Status), "project_status", ctx.id));
     buttons.push(button(ctx.t(Key::Back), "main", ctx.id));
-    let text = if ctx.manage {
-        String::new()
-    } else {
-        ctx.t(Key::ViewOnly).to_owned()
-    };
+    let mut text = pending_order_text(state, ctx).unwrap_or_default();
+    if !ctx.manage {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(ctx.t(Key::ViewOnly));
+    }
     let title = ctx.f(Key::TitleProjects, &[("name", &record.name)]);
-    present(state, connection, frame(ctx, title, note, text, buttons));
+    let mut dialog = frame(ctx, title, note, text, buttons);
+    if let Some(order) = &record.pending_order {
+        let waiting = super::construction::waiting(state, ctx.id);
+        dialog = waiting_materials_dialog(state, ctx, dialog, &waiting, Some(&order.blueprint));
+    }
+    present(state, connection, dialog);
+}
+
+fn pending_order_text(state: &TickState, ctx: &Ctx) -> Option<String> {
+    let order = state.settlements.get(ctx.id)?.pending_order.as_ref()?;
+    let raw_reason = super::construction::pending_reason(state, ctx.id).unwrap_or_default();
+    let reason = if raw_reason == "busy" {
+        ctx.t(Key::PendingBusy)
+    } else if raw_reason.starts_with("not enough:") {
+        ctx.t(Key::PendingMaterials)
+    } else if raw_reason == "waiting for a site" {
+        ctx.t(Key::PendingSite)
+    } else {
+        raw_reason.as_str()
+    };
+    Some(ctx.f(
+        Key::PendingOrder,
+        &[
+            ("blueprint", blueprint_label(ctx, &order.blueprint)),
+            ("level", &order.level.to_string()),
+            ("reason", reason),
+        ],
+    ))
 }
 
 /// Live project progress and all unmet bill entries.
@@ -1699,6 +1743,9 @@ fn project_status_screen(state: &mut TickState, connection: ConnectionId, ctx: &
     let title = ctx.f(Key::TitleProjectStatus, &[("name", &record.name)]);
     let buttons = vec![button(ctx.t(Key::Back), "projects", ctx.id)];
     let mut dialog = Dialog::multi_action(title, buttons);
+    if let Some(pending) = pending_order_text(state, ctx) {
+        dialog = dialog.text(pending);
+    }
     if let Some(project) = &record.project {
         match crate::plugin_structures::settlement_builds::status(state, ctx.id, &project.structure)
         {
@@ -1758,7 +1805,7 @@ fn project_status_screen(state: &mut TickState, connection: ConnectionId, ctx: &
                 })
             }
         }
-    } else {
+    } else if record.pending_order.is_none() {
         let text = if state.settlements.member_count(ctx.id) == 0 {
             match ctx.lang {
                 Lang::En => "No active project: no residents.",
@@ -1782,7 +1829,34 @@ fn project_status_screen(state: &mut TickState, connection: ConnectionId, ctx: &
         };
         dialog = dialog.text(text);
     }
-    for kind in &waiting {
+    dialog = waiting_materials_dialog(
+        state,
+        ctx,
+        dialog,
+        &waiting,
+        record
+            .pending_order
+            .as_ref()
+            .map(|order| order.blueprint.as_str()),
+    );
+    present(
+        state,
+        connection,
+        dialog.exit(Button::plain(ctx.t(Key::Close))),
+    );
+}
+
+fn waiting_materials_dialog(
+    state: &TickState,
+    ctx: &Ctx,
+    mut dialog: Dialog,
+    waiting: &[super::construction::WaitingKind],
+    pending_blueprint: Option<&str>,
+) -> Dialog {
+    for kind in waiting {
+        if pending_blueprint.is_some_and(|blueprint| blueprint != kind.blueprint) {
+            continue;
+        }
         let items = kind
             .needs
             .iter()
@@ -1821,11 +1895,7 @@ fn project_status_screen(state: &mut TickState, connection: ConnectionId, ctx: &
             items,
         ));
     }
-    present(
-        state,
-        connection,
-        dialog.exit(Button::plain(ctx.t(Key::Close))),
-    );
+    dialog
 }
 
 fn material_group(title: &str, items: Vec<Tag>) -> Tag {
@@ -1926,7 +1996,7 @@ fn project_order(
         return projects_screen(state, connection, ctx, ctx.t(Key::ChooseBlueprint));
     };
     let note = match super::construction::request_build(state, ctx.id, blueprint) {
-        Ok(()) => ctx.f(Key::BlueprintOrdered, &[("blueprint", blueprint)]),
+        Ok(outcome) => outcome.message(blueprint),
         Err(error) => error,
     };
     projects_screen(state, connection, ctx, &note);
@@ -1941,8 +2011,30 @@ fn project_upgrade(
     let Some(id) = building_of(state, ctx, payload) else {
         return projects_screen(state, connection, ctx, ctx.t(Key::BuildingGone));
     };
+    let blueprint = state
+        .settlements
+        .get(ctx.id)
+        .and_then(|record| record.buildings.get(&id))
+        .and_then(|building| {
+            super::blueprints::all(&state.registry)
+                .iter()
+                .find(|blueprint| blueprint.kind == building.kind)
+        })
+        .map(|blueprint| blueprint.id.clone())
+        .unwrap_or_default();
     let note = match super::construction::request_upgrade(state, ctx.id, id) {
-        Ok(()) => ctx.f(Key::UpgradeStarted, &[("id", &short(id).to_string())]),
+        Ok(outcome) => {
+            let label = match &outcome {
+                super::construction::OrderOutcome::Queued { .. } => state
+                    .settlements
+                    .get(ctx.id)
+                    .and_then(|record| record.pending_order.as_ref())
+                    .map(|order| format!("{blueprint} L{}", order.level))
+                    .unwrap_or_else(|| blueprint.clone()),
+                super::construction::OrderOutcome::Started => blueprint,
+            };
+            outcome.message(&label)
+        }
         Err(error) => error,
     };
     projects_screen(state, connection, ctx, &note);

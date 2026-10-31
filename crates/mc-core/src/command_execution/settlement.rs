@@ -367,10 +367,9 @@ pub(super) fn settlement(
 /// executor's enclosing settlement (closest anchor within its radius, like
 /// building/army commands). Both variants need an authenticated actor and
 /// `can_manage`, which also refuses ownerless settlements; operators of an
-/// owned settlement pass per existing semantics. Orders start immediately via
-/// `construction::request_build/request_upgrade` (no stock debit or placement
-/// here); the reply reports the started order or the real refusal (`Busy.`,
-/// missing materials, no free site).
+/// owned settlement pass per existing semantics. Orders start immediately when
+/// funded and free, or replace the single pending owner order. `build cancel`
+/// cancels only that pending order; active work and real stock stay unchanged.
 pub(super) fn build_command(
     state: &mut TickState,
     connection: ConnectionId,
@@ -397,12 +396,15 @@ pub(super) fn build_command(
             "Only the owner or an operator orders construction.",
         );
     }
+    if blueprint == "cancel" {
+        let message = crate::settlements::construction::cancel_pending(state, id).map_or_else(
+            |message| message,
+            |()| "Cancelled pending construction order.".into(),
+        );
+        return error(state, connection, message);
+    }
     match crate::settlements::construction::request_build(state, id, blueprint) {
-        Ok(()) => error(
-            state,
-            connection,
-            format!("Started {blueprint} construction."),
-        ),
+        Ok(outcome) => error(state, connection, outcome.message(blueprint)),
         Err(message) => error(state, connection, message),
     }
 }
@@ -410,8 +412,8 @@ pub(super) fn build_command(
 /// Native `/settlement build upgrade <buildingId>` execution. The building id
 /// is global (`settlement << 32 | sequence`, like `/settlement building
 /// upgrade`), but authorization runs against the executor's enclosing
-/// settlement: the target must belong to it. Starts the funded upgrade
-/// immediately (no stock debit or placement here); refusals surface directly.
+/// settlement: the target must belong to it. Starts a funded free upgrade or
+/// queues it without stock debit or placement.
 /// Kept separate from the geometric `/settlement building upgrade` path.
 pub(super) fn build_upgrade_command(
     state: &mut TickState,
@@ -445,12 +447,29 @@ pub(super) fn build_upgrade_command(
     if home != enclosing {
         return error(state, connection, "Building not found.");
     }
+    let blueprint = state
+        .settlements
+        .get(enclosing)
+        .and_then(|record| record.buildings.get(&building))
+        .and_then(|target| {
+            crate::settlements::blueprints::all(&state.registry)
+                .iter()
+                .find(|bp| bp.kind == target.kind)
+        })
+        .map(|bp| bp.id.clone());
     match crate::settlements::construction::request_upgrade(state, enclosing, building) {
-        Ok(()) => error(
-            state,
-            connection,
-            format!("Started upgrade for building #{id}."),
-        ),
+        Ok(outcome) => {
+            let mut label = blueprint.expect("accepted blueprint");
+            if let Some(order) = state
+                .settlements
+                .get(enclosing)
+                .and_then(|record| record.pending_order.as_ref())
+            {
+                use std::fmt::Write;
+                write!(label, " L{}", order.level).expect("string write");
+            }
+            error(state, connection, outcome.message(&label));
+        }
         Err(message) => error(state, connection, message),
     }
 }

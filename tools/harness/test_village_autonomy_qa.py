@@ -162,61 +162,80 @@ class VillageAutonomyQaTests(unittest.TestCase):
         })
         self.assertEqual(status["project_ui"], observed["ui_nodes"])
 
-    def test_owner_order_retries_until_current_started_response(self) -> None:
+    def test_owner_order_waits_for_started_blueprint(self) -> None:
         probe = Mock()
         detail = {}
-        observations = [
-            {"recent_chat": ["Construction busy: an active project already exists.", "Started storage construction."]},
-            {"recent_chat": ["Not enough materials for the builder plan.", "Queued storage construction."]},
-            {"recent_chat": ["Started storage construction."]},
-            {"ui_nodes": [{"id": "dialog/body/0", "label":
-                          "Storage · level 1 · 0/100\nSite: 12, 70, 24"}]},
+        other = {"ui_nodes": [{"id": "dialog/body/0", "label":
+                 "House · level 1 · 0/100\nSite: 12, 70, 24"}]}
+        wrong_level = {"ui_nodes": [{"id": "dialog/body/0", "label":
+                       "Storage · level 2 · 0/100\nSite: 12, 70, 24"}]}
+        target = {"ui_nodes": [{"id": "dialog/body/0", "label":
+                  "Storage · level 1 · 0/100\nSite: 12, 70, 24"}]}
+        with patch.object(qa, "_send", return_value={
+            "recent_chat": ["Started storage construction."],
+        }) as send, patch.object(
+            qa, "_project_status", side_effect=[other, wrong_level, target],
+        ), patch.object(qa.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 2.0]):
+            self.assertTrue(qa._wait_owner_order(probe, detail, "storage", 5.0))
+        send.assert_called_once_with(probe, "settlement build storage")
+        self.assertEqual(detail["owner_order_project"]["blueprint"], "storage")
+        self.assertEqual(detail["owner_order_project"]["level"], 1)
+        self.assertEqual(probe.call.call_count, 2)
+        probe.call.assert_called_with("minecraft_wait_ticks", {"ticks": 100})
+
+    def test_queued_order_rejects_matching_incumbent_without_fresh_started(self) -> None:
+        probe = Mock()
+        old_chat = ["Queued storage: busy", "Started storage construction."]
+        probe.observe.return_value = {"recent_chat": old_chat}
+        target = {"ui_nodes": [{"id": "dialog/body/0", "label":
+                  "Storage · level 1 · 0/100\nSite: 12, 70, 24"}]}
+        with patch.object(qa, "_send", return_value={"recent_chat": old_chat}) as send, patch.object(
+            qa, "_project_status", return_value=target,
+        ), patch.object(qa.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 2.0]):
+            self.assertFalse(qa._wait_owner_order(probe, {}, "storage", 2.0))
+        send.assert_called_once_with(probe, "settlement build storage")
+
+    def test_queued_order_requires_fresh_started_before_matching_project(self) -> None:
+        probe = Mock()
+        probe.observe.side_effect = [
+            {"recent_chat": ["Queued storage: busy", "Started storage construction."]},
+            {"recent_chat": ["Started storage construction.", "Queued storage: busy",
+                             "Started storage construction."]},
         ]
-        with patch.object(qa, "_send", side_effect=observations) as send, patch.object(
+        target = {"ui_nodes": [{"id": "dialog/body/0", "label":
+                  "Storage · level 1 · 0/100\nSite: 12, 70, 24"}]}
+        with patch.object(qa, "_send", return_value={
+            "recent_chat": ["Queued storage: busy", "Started storage construction."],
+        }) as send, patch.object(qa, "_project_status", return_value=target), patch.object(
             qa.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 2.0],
         ):
-            self.assertTrue(qa._wait_owner_order(probe, detail, "storage", 5.0))
-        self.assertEqual(send.call_count, 4)
-        self.assertEqual(detail["post_claim_order_chat"], ["Started storage construction."])
-        self.assertEqual(len(detail["owner_order_attempts"]), 3)
-        self.assertEqual(detail["owner_order_project"]["blueprint"], "storage")
+            self.assertTrue(qa._wait_owner_order(probe, {}, "storage", 5.0))
+        send.assert_called_once_with(probe, "settlement build storage")
+        self.assertEqual(probe.observe.call_count, 2)
 
     def test_owner_order_refusal_cannot_reuse_older_acceptance(self) -> None:
         probe = Mock()
-        detail = {}
         with patch.object(qa, "_send", return_value={
-            "recent_chat": ["Not enough materials for the builder plan.", "Started storage construction."],
-        }), patch.object(qa.time, "monotonic", side_effect=[0.0, 0.0, 3.0]):
-            self.assertFalse(qa._wait_owner_order(probe, detail, "storage", 2.0))
+            "recent_chat": ["Not enough materials.", "Started storage construction."],
+        }) as send, patch.object(qa, "_project_status") as status:
+            self.assertFalse(qa._wait_owner_order(probe, {}, "storage", 2.0))
+        send.assert_called_once_with(probe, "settlement build storage")
+        status.assert_not_called()
 
-    def test_owner_order_falls_back_to_blueprint_the_stock_can_fund(self) -> None:
+    def test_owner_order_times_out_without_matching_level_one_project(self) -> None:
         probe = Mock()
         detail = {}
-        observations = [
-            {"recent_chat": ["not enough: shared recipe ingredients"]},
-            {"recent_chat": ["Started wall construction."]},
-            {"ui_nodes": [{"id": "dialog/body/0", "label":
-                          "Wall · level 1 · 0/130\nSite: 12, 70, 24"}]},
-        ]
-        with patch.object(qa, "_send", side_effect=observations) as send, patch.object(
-            qa.time, "monotonic", side_effect=[0.0, 0.0],
+        wrong = {"ui_nodes": [{"id": "dialog/body/0", "label":
+                 "Storage · level 2 · 0/100\nSite: 12, 70, 24"}]}
+        with patch.object(qa, "_send", return_value={
+            "recent_chat": ["Started storage construction."],
+        }) as send, patch.object(qa, "_project_status", return_value=wrong), patch.object(
+            qa.time, "monotonic", side_effect=[0.0, 0.0, 1.0, 2.0],
         ):
-            self.assertTrue(qa._wait_owner_order(probe, detail, ("storage", "wall"), 5.0))
-        self.assertEqual(
-            [call.args[1] for call in send.call_args_list[:2]],
-            ["settlement build storage", "settlement build wall"],
-        )
-        self.assertEqual(detail["owner_order_project"]["blueprint"], "wall")
-        probe.call.assert_not_called()
-
-    def test_owner_order_acceptance_requires_live_matching_project(self) -> None:
-        probe = Mock()
-        for project in ({}, {"ui_nodes": [{"id": "dialog/body/0", "label":
-                         "House · level 1 · 0/100\nSite: 12, 70, 24"}]}):
-            with self.subTest(project=project), patch.object(
-                qa, "_send", side_effect=[{"recent_chat": ["Started storage construction."]}, project],
-            ), patch.object(qa.time, "monotonic", side_effect=[0.0, 0.0]):
-                self.assertFalse(qa._wait_owner_order(probe, {}, "storage", 2.0))
+            self.assertFalse(qa._wait_owner_order(probe, detail, "storage", 2.0))
+        send.assert_called_once_with(probe, "settlement build storage")
+        self.assertEqual(detail["owner_order_project"]["level"], 2)
+        self.assertEqual(probe.call.call_count, 2)
 
     def test_failed_second_player_check_still_closes_owned_clients(self) -> None:
         with TemporaryDirectory(prefix="autonomy-lifecycle-", dir=qa.runtime.REPO_ROOT / ".analysis") as folder:
@@ -351,6 +370,41 @@ class VillageAutonomyQaTests(unittest.TestCase):
             ("storage", 1, 3, 25),
         )
         probe.call.assert_any_call("minecraft_close_screen", {})
+
+
+class OwnerOrderScenarioTests(unittest.TestCase):
+    def test_pending_dialog_requires_order_and_records_material_labels_and_counts(self) -> None:
+        state = {"ui_nodes": [
+            {"id": "dialog/body/0", "label": "Pending: House L1 — waiting for materials"},
+            {"id": "dialog/body/1", "label": "House:\nWhite Wool 0/3 — no source\nOak Log 2/12 — awaiting production"},
+            {"id": "other", "label": "Ignored 1/2"},
+        ]}
+        pending = qa._pending_dialog(state)
+        self.assertTrue(pending["pending"])
+        self.assertEqual(pending["missing"], [
+            "White Wool 0/3 — no source", "Oak Log 2/12 — awaiting production",
+        ])
+        self.assertFalse(qa._pending_dialog({"ui_nodes": []})["pending"])
+
+    def test_only_fresh_started_chat_can_certify_admission(self) -> None:
+        old = ["Queued house: not enough: wool", "Started house construction."]
+        self.assertEqual(qa._new_chat_lines(old, old), [])
+        self.assertEqual(qa._new_chat_lines(old, ["Started house construction.", *old]),
+                         ["Started house construction."])
+        self.assertEqual(qa._new_chat_lines(old, ["Started house construction."]), [])
+        self.assertEqual(qa._new_chat_lines([], ["Started house construction."]),
+                         ["Started house construction."])
+
+    def test_founding_storage_uses_nearest_then_coordinate_tiebreak(self) -> None:
+        probe = Mock()
+        probe.call.side_effect = [
+            {"blocks": [{"block_id": "minecraft:chest", "x": 2, "y": 64, "z": 0}],
+             "truncated": True, "next_offset": 1},
+            {"blocks": [{"block_id": "minecraft:barrel", "x": -1, "y": 64, "z": 0},
+                        {"block_id": "minecraft:chest", "x": 1, "y": 64, "z": 0}],
+             "truncated": False},
+        ]
+        self.assertEqual(qa._founding_storage(probe, (0, 64, 0)), (-1, 64, 0))
 
 
 class SettlementStockObservationTests(unittest.TestCase):

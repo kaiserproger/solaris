@@ -2481,6 +2481,27 @@ fn fund_at(state: &mut TickState, pos: (i32, i32, i32), blueprint: &str, level: 
         }
     }
 }
+#[test]
+fn pending_owner_order_cancel_uses_authorized_command_path() {
+    let (mut state, alice, bob) = fixture();
+    command(&mut state, alice, "settlement create queued");
+    command(&mut state, alice, "settlement build house");
+    command(&mut state, bob, "settlement build cancel");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(2)),
+        "Only the owner or an operator orders construction."
+    );
+    command(&mut state, alice, "settlement build cancel");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(1)),
+        "Cancelled pending construction order."
+    );
+    command(&mut state, alice, "settlement build cancel");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(1)),
+        "No pending construction order."
+    );
+}
 
 #[test]
 fn settlement_build_starts_funded_order_without_touching_blocks_or_stock() {
@@ -2514,8 +2535,7 @@ fn settlement_build_starts_funded_order_without_touching_blocks_or_stock() {
     state
         .world
         .set_block(1, 201, 1, block(&state, "minecraft:chest", &[]));
-    // A chest with weak stock proves unfunded orders refuse with a named
-    // shortage and never persist.
+    // Weak stock queues the order with a named shortage.
     state.block_entities.insert(
         (1, 201, 1),
         crate::tick::BlockEntityState {
@@ -2535,12 +2555,22 @@ fn settlement_build_starts_funded_order_without_touching_blocks_or_stock() {
     state.settlements.get_mut(id).unwrap().bootstrap_storage = Some([1, 201, 1]);
     command(&mut state, alice, "settlement build house");
     assert!(
-        build_last_chat(&state, ConnectionId(1)).starts_with("not enough:"),
-        "unfunded order names its shortage"
+        build_last_chat(&state, ConnectionId(1)).starts_with("Queued house: not enough:"),
+        "unfunded order is accepted with its shortage"
     );
     assert!(
         state.settlements.get(id).unwrap().project.is_none(),
-        "unfunded orders never persist"
+        "queued order has not started"
+    );
+    command(&mut state, alice, "settlement build cancel");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(1)),
+        "Cancelled pending construction order."
+    );
+    command(&mut state, alice, "settlement build cancel");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(1)),
+        "No pending construction order."
     );
     // Full house L1 funding starts the single project with no debit here.
     fund_at(&mut state, (1, 201, 1), "house", 1);
@@ -2556,9 +2586,12 @@ fn settlement_build_starts_funded_order_without_touching_blocks_or_stock() {
     assert_eq!(record.project.as_ref().unwrap().level, 1);
     assert_eq!(state.plugin_block_writes.len(), before_writes);
     assert_eq!(build_chest_stock(&state), before_stock);
-    // A second order while the project runs is Busy and changes nothing.
+    // A second order queues without changing the active project or stock.
     command(&mut state, alice, "settlement build house");
-    assert_eq!(build_last_chat(&state, ConnectionId(1)), "Busy.");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(1)),
+        "Queued house: busy"
+    );
     assert_eq!(
         state
             .settlements
@@ -2574,7 +2607,10 @@ fn settlement_build_starts_funded_order_without_touching_blocks_or_stock() {
     assert_eq!(build_chest_stock(&state), before_stock);
     // Real validation errors surface instead of a started reply.
     command(&mut state, alice, "settlement build not-a-blueprint");
-    assert_eq!(build_last_chat(&state, ConnectionId(1)), "Busy.");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(1)),
+        "Unknown blueprint."
+    );
     // Foreign owners and unowned records refuse; operators of an owned
     // settlement pass per existing semantics.
     let bob_slot = state.entities.slot_of(bob).unwrap();
@@ -2588,7 +2624,10 @@ fn settlement_build_starts_funded_order_without_touching_blocks_or_stock() {
     assert_eq!(build_chest_stock(&state), before_stock);
     state.plugin_players.observe_permission(ConnectionId(2), 2);
     command(&mut state, bob, "settlement build house");
-    assert_eq!(build_last_chat(&state, ConnectionId(2)), "Busy.");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(2)),
+        "Queued house: busy (replaced previous order)"
+    );
     // Execution outside every settlement radius selects nothing.
     state.entities.set_pos(bob_slot, [200.0, 80.0, 0.0]);
     command(&mut state, bob, "settlement build house");
@@ -2749,11 +2788,14 @@ fn settlement_build_upgrade_owner_command_starts_a_real_blueprint_upgrade() {
     assert_eq!(state.block_entities[&(1, 201, 1)].slots, before_stock);
     assert_eq!(
         build_last_chat(&state, ConnectionId(1)),
-        format!("Started upgrade for building #{}.", building.0)
+        "Started house construction."
     );
-    // While the upgrade runs, another order is Busy and changes nothing.
+    // Another order queues while the upgrade runs, preserving active work.
     command(&mut state, alice, "settlement build house");
-    assert_eq!(build_last_chat(&state, ConnectionId(1)), "Busy.");
+    assert_eq!(
+        build_last_chat(&state, ConnectionId(1)),
+        "Queued house: busy"
+    );
     assert_eq!(state.plugin_block_writes.len(), before_writes);
     assert_eq!(state.block_entities[&(1, 201, 1)].slots, before_stock);
 }

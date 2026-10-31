@@ -47,6 +47,9 @@ pub struct SettlementRecord {
     pub bootstrap_storage: Option<[i32; 3]>,
     #[serde(default)]
     pub project: Option<super::construction::Project>,
+    /// One owner request, retried before autonomous planning.
+    #[serde(default)]
+    pub pending_order: Option<super::construction::OwnerOrder>,
     #[serde(default)]
     pub construction_cursor: u32,
 }
@@ -251,6 +254,10 @@ impl SettlementRecord {
             + self.project.as_ref().map_or(0, |project| {
                 project.blueprint.capacity() + project.structure.capacity()
             })
+            + self
+                .pending_order
+                .as_ref()
+                .map_or(0, |order| order.blueprint.capacity())
             + roots
             + households
             + district
@@ -439,6 +446,7 @@ impl Registry {
             village_source: None,
             bootstrap_storage: None,
             project: None,
+            pending_order: None,
             construction_cursor: 0,
         };
         validate_record(&record)?;
@@ -482,6 +490,7 @@ impl Registry {
             village_source: Some(source.to_owned()),
             bootstrap_storage: None,
             project: None,
+            pending_order: None,
             construction_cursor: 0,
         };
         validate_record(&record)?;

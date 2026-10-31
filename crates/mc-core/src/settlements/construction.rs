@@ -31,6 +31,258 @@ pub struct Project {
     #[serde(default)]
     pub ordered: bool,
 }
+/// The sole pending owner request, stored in the settlement post-image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerOrder {
+    pub blueprint: String,
+    pub level: u8,
+    pub building: Option<BuildingId>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum OrderOutcome {
+    Started,
+    Queued { reason: String, replaced: bool },
+}
+
+impl OrderOutcome {
+    pub(crate) fn message(&self, blueprint: &str) -> String {
+        match self {
+            Self::Started => format!("Started {blueprint} construction."),
+            Self::Queued { reason, replaced } => format!(
+                "Queued {blueprint}: {reason}{}",
+                if *replaced {
+                    " (replaced previous order)"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+}
+
+pub(crate) fn request_build(
+    state: &mut TickState,
+    id: SettlementId,
+    blueprint: &str,
+) -> Result<OrderOutcome, String> {
+    blueprints::get(&state.registry, blueprint).ok_or("Unknown blueprint.")?;
+    submit_order(
+        state,
+        id,
+        OwnerOrder {
+            blueprint: blueprint.to_owned(),
+            level: 1,
+            building: None,
+        },
+    )
+}
+
+pub(crate) fn request_upgrade(
+    state: &mut TickState,
+    id: SettlementId,
+    building: BuildingId,
+) -> Result<OrderOutcome, String> {
+    let record = state.settlements.get(id).ok_or("Settlement not found.")?;
+    let target = record
+        .buildings
+        .get(&building)
+        .ok_or("Building not found.")?;
+    let blueprint = upgrade_blueprint(state, id, target)
+        .ok_or("No blueprint upgrade available for this building.")?;
+    let level = owner_upgrade_level(state, id, building)
+        .ok_or("No blueprint upgrade available for this building.")?;
+    submit_order(
+        state,
+        id,
+        OwnerOrder {
+            blueprint: blueprint.id.clone(),
+            level,
+            building: Some(building),
+        },
+    )
+}
+
+/// Owner admission and its dialog preview share the same next-level choice.
+pub(crate) fn owner_upgrade_level(
+    state: &TickState,
+    id: SettlementId,
+    building: BuildingId,
+) -> Option<u8> {
+    let record = state.settlements.get(id)?;
+    let target = record.buildings.get(&building)?;
+    let blueprint = upgrade_blueprint(state, id, target)?;
+    let current = if claim_slot(state, id).is_err() {
+        record
+            .project
+            .as_ref()
+            .filter(|project| project.building == Some(building))
+            .map_or(target.level, |project| project.level)
+    } else {
+        target.level
+    };
+    blueprint.level(current + 1).map(|_| current + 1)
+}
+
+fn start_order(
+    state: &mut TickState,
+    id: SettlementId,
+    order: &OwnerOrder,
+    planning_cursor: Option<u32>,
+) -> Result<(), String> {
+    match order.building {
+        Some(building) => start_upgrade(state, id, building),
+        None => start_build(state, id, &order.blueprint, planning_cursor),
+    }
+}
+
+fn submit_order(
+    state: &mut TickState,
+    id: SettlementId,
+    order: OwnerOrder,
+) -> Result<OrderOutcome, String> {
+    match start_order(state, id, &order, None) {
+        Ok(()) => {
+            let record = state.settlements.get_mut(id).expect("admitted settlement");
+            record.pending_order = None;
+            Ok(OrderOutcome::Started)
+        }
+        Err(reason) if reason == "Busy." || reason.starts_with("not enough:") => {
+            let record = state
+                .settlements
+                .get_mut(id)
+                .ok_or("Settlement not found.")?;
+            let replaced = record.pending_order.replace(order).is_some();
+            record.revision = record.revision.saturating_add(1);
+            Ok(OrderOutcome::Queued {
+                reason: if reason == "Busy." {
+                    "busy".into()
+                } else {
+                    reason
+                },
+                replaced,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn cancel_pending(state: &mut TickState, id: SettlementId) -> Result<(), String> {
+    let record = state
+        .settlements
+        .get_mut(id)
+        .ok_or("Settlement not found.")?;
+    record
+        .pending_order
+        .take()
+        .ok_or("No pending construction order.")?;
+    record.revision = record.revision.saturating_add(1);
+    Ok(())
+}
+
+pub(crate) fn pending_reason(state: &TickState, id: SettlementId) -> Option<String> {
+    let record = state.settlements.get(id)?;
+    let order = record.pending_order.as_ref()?;
+    if claim_slot(state, id).is_err() {
+        return Some("busy".into());
+    }
+    let blueprint = blueprints::get(&state.registry, &order.blueprint)?;
+    let level = blueprint.level(order.level)?;
+    if let Some(reason) = funding_error(state, id, &level.materials) {
+        return Some(reason);
+    }
+    Some(
+        if order.building.is_none() {
+            "waiting for a site"
+        } else {
+            "ready"
+        }
+        .into(),
+    )
+}
+
+/// Returns true whenever the pending order owns this planning turn.
+fn plan_order(state: &mut TickState, id: SettlementId) -> bool {
+    let Some(record) = state.settlements.get(id) else {
+        return false;
+    };
+    let Some(order) = &record.pending_order else {
+        return false;
+    };
+    let level_number = if let Some(building) = order.building {
+        let target = record.buildings.get(&building);
+        let next = target.and_then(|target| {
+            blueprints::get(&state.registry, &order.blueprint)
+                .and_then(|blueprint| blueprint.level(target.level + 1))
+                .map(|_| target.level + 1)
+        });
+        let Some(next) = next else {
+            let blueprint = order.blueprint.clone();
+            cancel_pending(state, id).expect("pending order");
+            notify_owner(
+                state,
+                id,
+                format!("Dropped {blueprint} order: building gone or no upgrade available."),
+            );
+            return false;
+        };
+        next
+    } else {
+        1
+    };
+    if claim_slot(state, id).is_err() {
+        return true;
+    }
+    let Some(level) =
+        blueprints::get(&state.registry, &order.blueprint).and_then(|bp| bp.level(level_number))
+    else {
+        return true;
+    };
+    if funding_error(state, id, &level.materials).is_some() {
+        return true;
+    }
+    let mut order = state
+        .settlements
+        .get_mut(id)
+        .expect("pending settlement")
+        .pending_order
+        .take()
+        .expect("pending order");
+    order.level = level_number;
+    let cursor = state
+        .settlements
+        .get(id)
+        .expect("pending settlement")
+        .construction_cursor;
+    if start_order(state, id, &order, Some(cursor)).is_err() {
+        state
+            .settlements
+            .get_mut(id)
+            .expect("pending settlement")
+            .pending_order = Some(order);
+        return true;
+    }
+    notify_owner(state, id, OrderOutcome::Started.message(&order.blueprint));
+    true
+}
+
+fn notify_owner(state: &mut TickState, id: SettlementId, message: String) {
+    let record = state.settlements.get(id).expect("settlement");
+    let owner = record
+        .owner
+        .as_deref()
+        .and_then(|owner| owner.parse::<uuid::Uuid>().ok());
+    let connection = owner.and_then(|uuid| {
+        state
+            .connections
+            .all_connections()
+            .find(|connection| state.connections.uuid_of(*connection) == Some(uuid))
+    });
+    if let Some(connection) = connection {
+        state.push_player(connection, crate::boundary::PlayerChange::Chat { message });
+    }
+}
 
 /// `Busy.` unless the active project is autonomous and has placed nothing.
 /// Returns whether such a project must be cancelled to admit the order.
@@ -40,8 +292,9 @@ fn claim_slot(state: &TickState, id: SettlementId) -> Result<bool, String> {
         return Ok(false);
     };
     let untouched = !project.ordered
-        && executor::status(state, id, &project.structure)
-            .is_ok_and(|snapshot| snapshot.completed_work_units == 0);
+        && executor::status(state, id, &project.structure).is_ok_and(|snapshot| {
+            snapshot.current_stage_index == 0 && snapshot.completed_work_units == 0
+        });
     if untouched {
         Ok(true)
     } else {
@@ -193,10 +446,11 @@ fn funding_error(state: &TickState, id: SettlementId, materials: &[(u32, u32)]) 
 
 /// Owner/operator entrypoints check `can_manage`; admission starts the sole
 /// funded project immediately, without withdrawing or placing any material.
-pub(crate) fn request_build(
+fn start_build(
     state: &mut TickState,
     id: SettlementId,
     blueprint: &str,
+    planning_cursor: Option<u32>,
 ) -> Result<(), String> {
     let preempting = claim_slot(state, id)?;
     if preempting {
@@ -216,9 +470,20 @@ pub(crate) fn request_build(
     }
     let record = state.settlements.get(id).expect("claimed settlement");
     let images = executor::source_images(state, id);
-    let (site, cursor) = site_project(state, record, blueprint, 0, u32::MAX, &images);
-    let mut site =
-        site.ok_or("No free loaded construction site is available within the material budget.")?;
+    // A direct owner request searches once for immediate admission. Retried
+    // pending work shares the autonomous planner's bounded, resumable scan.
+    let (start, attempts) = planning_cursor.map_or((0, u32::MAX), |cursor| (cursor, SITE_ATTEMPTS));
+    let (site, cursor) = site_project(state, record, blueprint, start, attempts, &images);
+    let Some(mut site) = site else {
+        if planning_cursor.is_some() {
+            let record = state.settlements.get_mut(id).expect("planned settlement");
+            record.construction_cursor = cursor;
+            record.revision = record.revision.saturating_add(1);
+        }
+        return Err(
+            "No free loaded construction site is available within the material budget.".into(),
+        );
+    };
     site.project.ordered = true;
     if !begin_cells(state, site.project, site.bounds, site.cells) {
         return Err("Construction admission failed.".into());
@@ -231,8 +496,8 @@ pub(crate) fn request_build(
     Ok(())
 }
 
-/// A rejected upgrade is never stored and cannot obstruct autonomous planning.
-pub(crate) fn request_upgrade(
+/// Admit a funded upgrade through the canonical structure executor.
+fn start_upgrade(
     state: &mut TickState,
     id: SettlementId,
     building: BuildingId,
@@ -734,6 +999,7 @@ fn upgrade_blueprint<'a>(
     .then_some(blueprint)
 }
 
+#[cfg(test)]
 pub(crate) fn upgrade_available(state: &TickState, id: SettlementId, building: BuildingId) -> bool {
     state
         .settlements
@@ -817,13 +1083,10 @@ struct FundedSite {
     cells: Vec<executor::PlannedCell>,
 }
 
-/// The same bounded site search serves autonomous planning and immediate
-/// owner admission: the nearest free, fully funded site to the settlement anchor, searched
-/// outward in rings from ring index `start`. `attempts` bounds the columns
-/// examined; the owner order starts at the anchor with `u32::MAX` and so finds
-/// a funded loaded site on the first try when any exists. A rejected owner order does
-/// not save a search cursor; success returns cursor 0 so the next search
-/// starts at the anchor again.
+/// Shared site search, outward in rings from `start`, examining at most
+/// `attempts` columns. Autonomous and pending-owner planning use SITE_ATTEMPTS
+/// and retain the returned cursor on failure. A direct owner command searches
+/// once from the anchor for immediate admission. Success resets the cursor.
 fn site_project(
     state: &TickState,
     record: &SettlementRecord,
@@ -886,6 +1149,9 @@ fn site_project(
 }
 
 fn plan(state: &mut TickState, id: SettlementId) {
+    if plan_order(state, id) {
+        return;
+    }
     let Some(record) = state.settlements.get(id) else {
         return;
     };
@@ -896,8 +1162,8 @@ fn plan(state: &mut TickState, id: SettlementId) {
     if residents == 0 {
         return;
     }
-    // Probe one canonical storage image set; an unfundable early need cannot
-    // monopolize the single project slot, including after a refused order.
+    // Probe one canonical storage image set; an unfundable early autonomous
+    // need cannot monopolize the single project slot.
     let images = executor::source_images(state, id);
     let catalog = blueprints::all(&state.registry);
     let blueprint = needed_kinds(record, residents).find_map(|kind| {
@@ -1236,6 +1502,11 @@ fn funded_candidate(
     record: &SettlementRecord,
     images: &[super::inventory::Image],
 ) -> bool {
+    if let Some(order) = &record.pending_order {
+        return blueprints::get(&state.registry, &order.blueprint)
+            .and_then(|blueprint| blueprint.level(order.level))
+            .is_some_and(|level| funded_species(state, &level.materials, images).is_some());
+    }
     let catalog = blueprints::all(&state.registry);
     needed_kinds(record, state.settlements.member_count(record.id)).any(|kind| {
         catalog
@@ -1259,14 +1530,17 @@ pub(crate) fn waiting(state: &TickState, id: SettlementId) -> Vec<WaitingKind> {
         .as_ref()
         .map(|project| project.blueprint.as_str());
     let mut kinds = Vec::new();
-    for kind in needed_kinds(record, state.settlements.member_count(id)) {
-        let Some(blueprint) = catalog.iter().find(|blueprint| blueprint.kind == kind) else {
-            continue;
-        };
-        if active == Some(blueprint.id.as_str()) {
-            continue;
-        }
-        let Some(level) = blueprint.level(1) else {
+    let pending = record.pending_order.as_ref();
+    let queued = pending.and_then(|order| {
+        blueprints::get(&state.registry, &order.blueprint).map(|blueprint| (blueprint, order.level))
+    });
+    let autonomous = needed_kinds(record, state.settlements.member_count(id))
+        .filter(|_| pending.is_none())
+        .filter_map(|kind| catalog.iter().find(|blueprint| blueprint.kind == kind))
+        .filter(|blueprint| active != Some(blueprint.id.as_str()))
+        .map(|blueprint| (blueprint, 1));
+    for (blueprint, level) in queued.into_iter().chain(autonomous) {
+        let Some(level) = blueprint.level(level) else {
             continue;
         };
         if funded_species(state, &level.materials, &images).is_some() {
@@ -1408,6 +1682,39 @@ pub(super) fn validate_record(record: &SettlementRecord) -> Result<(), &'static 
             || (project.level > 1) != project.building.is_some())
     {
         return Err("invalid settlement construction project");
+    }
+    if let Some(order) = &record.pending_order
+        && (record.owner.is_none()
+            || order.blueprint.is_empty()
+            || order.blueprint.len() > 128
+            || !(1..=3).contains(&order.level)
+            || (order.level > 1) != order.building.is_some()
+            || order
+                .building
+                .is_some_and(|id| id.0 >> 32 != record.id.0 || id.0 as u32 == 0))
+    {
+        return Err("invalid pending owner construction order");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_pending(
+    registry: &crate::registry::CoreRegistry,
+    record: &SettlementRecord,
+) -> Result<(), &'static str> {
+    let Some(order) = &record.pending_order else {
+        return Ok(());
+    };
+    let blueprint = blueprints::get(registry, &order.blueprint)
+        .filter(|blueprint| blueprint.level(order.level).is_some())
+        .ok_or("unknown pending owner blueprint or level")?;
+    if let Some(id) = order.building
+        && record
+            .buildings
+            .get(&id)
+            .is_some_and(|building| building.kind != blueprint.kind)
+    {
+        return Err("invalid pending owner upgrade target");
     }
     Ok(())
 }
