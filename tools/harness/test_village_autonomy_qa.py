@@ -147,6 +147,21 @@ class VillageAutonomyQaTests(unittest.TestCase):
             "ui_nodes": [{"id": "dialog/body/0", "label": "No active project: no residents."}],
         }))
 
+    def test_planner_diagnostic_reads_status_instead_of_stale_chat(self) -> None:
+        observed = {"ui_nodes": [{
+            "id": "dialog/body/0",
+            "label": "Mason's workshop · level 1 · 5/100\nSite: -12, 70, 24",
+        }], "recent_chat": ["Buildings: stale list"]}
+        with patch.object(qa, "_project_status", return_value=observed) as project, patch.object(
+            qa, "_send", return_value={"recent_chat": ["Buildings: current list"]},
+        ), patch.object(qa, "_settlement_stock", return_value={"minecraft:coal": 4}):
+            status = qa._planner_status(Mock(), {}, (1, 2, 3), Mock())
+        project.assert_called_once()
+        self.assertEqual(status["project"], {
+            "blueprint": "mason", "level": 1, "done": 5, "total": 100, "origin": [-12, 70, 24],
+        })
+        self.assertEqual(status["project_ui"], observed["ui_nodes"])
+
     def test_owner_order_retries_until_current_started_response(self) -> None:
         probe = Mock()
         detail = {}

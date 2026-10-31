@@ -151,8 +151,8 @@ fn species_bill(
         .collect()
 }
 
-/// A real worker load can complete the first storage bill before a stack is full.
-pub(crate) fn first_storage_funded_by_delivery(
+/// A real worker load can fund the next building or upgrade before a stack is full.
+pub(crate) fn candidate_funded_by_delivery(
     state: &TickState,
     id: SettlementId,
     carry: &[Option<mc_data::ItemStack>],
@@ -160,18 +160,9 @@ pub(crate) fn first_storage_funded_by_delivery(
     let Some(record) = state.settlements.get(id) else {
         return false;
     };
-    if record.project.is_some()
-        || record
-            .buildings
-            .values()
-            .any(|b| b.kind == BuildingKind::Storage)
-        || carry.iter().all(Option::is_none)
-    {
+    if record.project.is_some() || carry.iter().all(Option::is_none) {
         return false;
     }
-    let Some(level) = blueprints::get(&state.registry, "storage").and_then(|b| b.level(1)) else {
-        return false;
-    };
     let mut images = executor::source_images(state, id);
     let Some(chest) = images.first_mut() else {
         return false;
@@ -179,7 +170,7 @@ pub(crate) fn first_storage_funded_by_delivery(
     // This is a read-only funding probe; only the regular inventory authority
     // can transfer the actual carry to the real container.
     chest.slots.extend(carry.iter().flatten().cloned());
-    funded_species(state, &level.materials, &images).is_some()
+    funded_candidate(state, record, &images)
 }
 
 fn funding_error(state: &TickState, id: SettlementId, materials: &[(u32, u32)]) -> Option<String> {
@@ -751,13 +742,15 @@ pub(crate) fn upgrade_available(state: &TickState, id: SettlementId, building: B
         .is_some_and(|building| upgrade_blueprint(state, id, building).is_some())
 }
 
-fn upgrade_project(state: &TickState, record: &SettlementRecord) -> Option<(Project, String)> {
+fn upgrade_project(
+    state: &TickState,
+    record: &SettlementRecord,
+    images: &[super::inventory::Image],
+) -> Option<(Project, String)> {
     record.buildings.values().find_map(|building| {
         let blueprint = upgrade_blueprint(state, record.id, building)?;
         let level = building.level + 1;
-        let images = executor::source_images(state, record.id);
-        let species =
-            funded_species(state, &blueprint.level(level)?.materials, &images)?.to_owned();
+        let species = funded_species(state, &blueprint.level(level)?.materials, images)?.to_owned();
         Some((
             Project {
                 settlement: record.id,
@@ -913,7 +906,7 @@ fn plan(state: &mut TickState, id: SettlementId) {
         funded_species(state, &level.materials, &images).map(|_| blueprint)
     });
     let Some(blueprint) = blueprint else {
-        if let Some((project, species)) = upgrade_project(state, record) {
+        if let Some((project, species)) = upgrade_project(state, record, &images) {
             begin(state, project, &species);
         }
         return;
@@ -1012,9 +1005,8 @@ fn reaches_storage(
 /// Residents tried per pass; the rest wait for the next planning pass.
 const BUILDER_CANDIDATES: usize = 8;
 
-/// A builder that is on shift but cannot walk to storage is shut in (a house
-/// door under a tree crown) and holds the single builder slot without ever
-/// building. It is released so a resident who can reach storage takes over.
+/// Release a builder outside simulation, or an on-shift builder that cannot
+/// walk to storage, so an active reachable resident can take the project.
 fn release_trapped_builder(state: &mut TickState, id: SettlementId) -> bool {
     let incumbent = residents(state, id).find(|&slot| {
         state.entities.body(slot).alive
@@ -1036,7 +1028,9 @@ fn release_trapped_builder(state: &mut TickState, id: SettlementId) -> bool {
         .is_some_and(|v| crate::villager::building::working(state, v));
     let mut cache = super::allocator::PoiCache::default();
     let mut path = Vec::new();
-    if !on_shift || reaches_storage(state, id, slot, &mut cache, &mut path) {
+    if resident_simulated(state, slot)
+        && (!on_shift || reaches_storage(state, id, slot, &mut cache, &mut path))
+    {
         return true;
     }
     let released = detach(
@@ -1051,12 +1045,22 @@ fn release_trapped_builder(state: &mut TickState, id: SettlementId) -> bool {
     !released
 }
 
+fn resident_simulated(state: &TickState, slot: crate::entities::EntitySlot) -> bool {
+    let at = super::allocator::at(state.entities.pos(slot));
+    state
+        .world
+        .is_active(at.x.div_euclid(16), at.z.div_euclid(16))
+}
+
 fn assign_builder(state: &mut TickState, id: SettlementId) {
     if release_trapped_builder(state, id) {
         return;
     }
     let mut candidates = Vec::new();
     for slot in residents(state, id) {
+        if !resident_simulated(state, slot) {
+            continue;
+        }
         let body = state.entities.body(slot);
         let Some(v) = state.entities.row(slot).villager.as_ref() else {
             continue;
@@ -1224,14 +1228,22 @@ pub(crate) fn has_funded_candidate(state: &TickState, id: SettlementId) -> bool 
         return false;
     };
     let images = executor::source_images(state, id);
+    funded_candidate(state, record, &images)
+}
+
+fn funded_candidate(
+    state: &TickState,
+    record: &SettlementRecord,
+    images: &[super::inventory::Image],
+) -> bool {
     let catalog = blueprints::all(&state.registry);
-    needed_kinds(record, state.settlements.member_count(id)).any(|kind| {
+    needed_kinds(record, state.settlements.member_count(record.id)).any(|kind| {
         catalog
             .iter()
             .find(|blueprint| blueprint.kind == kind)
             .and_then(|blueprint| blueprint.level(1))
-            .is_some_and(|level| funded_species(state, &level.materials, &images).is_some())
-    }) || upgrade_project(state, record).is_some()
+            .is_some_and(|level| funded_species(state, &level.materials, images).is_some())
+    }) || upgrade_project(state, record, images).is_some()
 }
 
 /// Needed authored kinds the settlement cannot fund yet, one entry per kind.

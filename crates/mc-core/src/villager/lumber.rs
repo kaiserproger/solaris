@@ -381,7 +381,7 @@ pub(super) fn work(
         || mining::needs_deposit(v)
         || (state.tick.is_multiple_of(PERIOD)
             && v.settlement.is_some_and(|id| {
-                crate::settlements::construction::first_storage_funded_by_delivery(
+                crate::settlements::construction::candidate_funded_by_delivery(
                     state,
                     id,
                     &v.inventory,

@@ -338,6 +338,43 @@ fn lumberjack_delivers_substack_that_funds_first_storage() {
 }
 
 #[test]
+fn lumberjack_delivers_substack_that_funds_next_building_after_storage() {
+    let (mut state, slot, mut v) = fixture(BuildingKind::LumberCamp);
+    storage(&mut state, &v, [4, 201, 3]);
+    let id = v.settlement.unwrap();
+    state.settlements.get_mut(id).unwrap().owner = None;
+    let oak = mining::item_id(&state, "oak_log").unwrap();
+    let cobble = mining::item_id(&state, "cobblestone").unwrap();
+    let coal = mining::item_id(&state, "coal").unwrap();
+    let slots = &mut state.block_entities.get_mut(&(4, 201, 3)).unwrap().slots;
+    slots[0] = ItemStack::new(cobble, 64);
+    slots[1] = ItemStack::new(cobble, 64);
+    slots[2] = ItemStack::new(coal, 4);
+    assert!(!crate::settlements::construction::has_funded_candidate(
+        &state, id
+    ));
+    v.inventory[0] = Some(ItemStack::new(oak, 37));
+    lumber::work(&mut state, slot, &mut v, &mut ChangeSet::default());
+    assert!(
+        v.inventory[0].is_none(),
+        "wood that funds the next project must be delivered during the work shift"
+    );
+    assert!(crate::settlements::construction::has_funded_candidate(
+        &state, id
+    ));
+    assert_eq!(
+        state.block_entities[&(4, 201, 3)]
+            .slots
+            .iter()
+            .filter(|s| s.item_id == oak)
+            .map(|s| s.count)
+            .sum::<i32>(),
+        37,
+        "the real carry moved to storage without adding stock"
+    );
+}
+
+#[test]
 fn lumberjack_completes_trunk_and_replants_across_stack_haul() {
     let (mut state, slot, mut v) = fixture(BuildingKind::LumberCamp);
     tree(&mut state, 10, 10, 5);

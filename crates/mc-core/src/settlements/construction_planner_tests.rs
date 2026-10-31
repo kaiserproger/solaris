@@ -193,6 +193,92 @@ fn builder_choice_skips_the_trapped_resident(starved_tick_budget: bool) {
 }
 
 #[test]
+fn inactive_incumbent_yields_to_an_active_builder_and_construction_advances() {
+    use crate::boundary::{ChangeSet, ChunkPos};
+    use crate::settlements::allocator::tests::villager;
+    let (mut state, id, incumbent) = fixture();
+    let inactive = ChunkPos { x: 1, z: 0 };
+    state
+        .world
+        .ensure_blocking(&rustc_hash::FxHashMap::from_iter([(inactive, 0)]));
+    for x in 16..32 {
+        for z in 0..16 {
+            state
+                .world
+                .set_block(x, 200, z, state.registry.states.stone);
+            for y in 201..224 {
+                state.world.set_block(x, y, z, state.registry.states.air);
+            }
+        }
+    }
+    state.world.fold_overlay();
+    state.entities.set_pos(incumbent, [20.5, 201.0, 2.5]);
+    state
+        .entities
+        .row_mut(incumbent)
+        .villager
+        .as_mut()
+        .unwrap()
+        .activity = crate::villager::Activity::Idle;
+    let candidate = villager(&mut state, [1.5, 201.0, 2.5]);
+    let entity = state.entities.body(candidate).id;
+    crate::settlements::bind(&mut state, id, entity).unwrap();
+    let v = state.entities.row_mut(candidate).villager.as_mut().unwrap();
+    v.data.profession = Profession::Mason;
+    v.activity = crate::villager::Activity::Work;
+    assert!(!state.world.is_active(inactive.x, inactive.z));
+    assert!(state.world.is_active(0, 0));
+    start(&mut state, id, "storage", 1, None);
+    fund(&mut state, "storage", 1);
+    let handle = state
+        .settlements
+        .get(id)
+        .unwrap()
+        .project
+        .as_ref()
+        .unwrap()
+        .structure
+        .clone();
+    for now in 0..400 {
+        state.tick = now;
+        state.tick_budget.reset(now);
+        tick(&mut state);
+        crate::villager::brain::tick(&mut state, &mut ChangeSet::default());
+        state.world.fold_overlay();
+    }
+    let status = executor::status(&state, id, &handle).unwrap();
+    let total: u64 = status.stages.iter().map(|stage| stage.work_units).sum();
+    eprintln!("INACTIVE_BUILDER progress={}/{total}", status.watermark);
+    assert!(
+        status.watermark > 0,
+        "inactive incumbent keeps the funded Storage at 0/{total}"
+    );
+    assert_eq!(
+        state
+            .entities
+            .row(incumbent)
+            .villager
+            .as_ref()
+            .unwrap()
+            .data
+            .profession,
+        Profession::None,
+        "the inactive resident must not be selected again"
+    );
+    assert_eq!(
+        state
+            .entities
+            .row(candidate)
+            .villager
+            .as_ref()
+            .unwrap()
+            .data
+            .profession,
+        Profession::Builder
+    );
+}
+
+#[test]
 fn funded_owner_order_starts_the_single_project_without_world_or_stock_debit() {
     let (mut state, id, _) = fixture();
     fund(&mut state, "watch_tower", 1);
@@ -355,6 +441,34 @@ fn autonomous_upgrade_requires_blueprint_provenance_and_materials() {
         state.settlements.get(id).unwrap().buildings[&house].level,
         2
     );
+}
+
+#[test]
+fn partial_delivery_funds_a_blueprint_proven_upgrade_without_mutating_stock() {
+    let (mut state, id, slot) = fixture();
+    start(&mut state, id, "storage", 1, None);
+    fund(&mut state, "storage", 1);
+    complete(&mut state, id, slot);
+    for [x, y, z] in buildings::storage_points(&state, id) {
+        if let Some(container) = state.block_entities.get_mut(&(x, y, z)) {
+            container.slots.fill(mc_data::ItemStack::EMPTY);
+        }
+    }
+    fund(&mut state, "storage", 2);
+    let plank = state
+        .registry
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:oak_planks").unwrap())
+        .unwrap();
+    let slots = &mut state.block_entities.get_mut(&(1, 201, 1)).unwrap().slots;
+    let index = slots.iter().position(|s| s.item_id == plank).unwrap();
+    let carried = slots[index].clone();
+    slots[index] = mc_data::ItemStack::EMPTY;
+    let stock = slots.clone();
+    assert!(!has_funded_candidate(&state, id));
+    assert!(candidate_funded_by_delivery(&state, id, &[Some(carried)]));
+    assert_eq!(state.block_entities[&(1, 201, 1)].slots, stock);
+    assert!(state.settlements.get(id).unwrap().project.is_none());
 }
 
 #[test]

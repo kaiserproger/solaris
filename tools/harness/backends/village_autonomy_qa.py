@@ -1570,7 +1570,9 @@ def _planner_status(
     """Non-gating read of what the autonomous planner is doing right now."""
     status: dict[str, Any] = {}
     try:
-        status["projects_chat"] = _recent_chat(_send(probe, "settlement menu projects"), 25)
+        observed = _project_status(probe)
+        status["project"] = _project_progress(observed)
+        status["project_ui"] = observed.get("ui_nodes", [])
     except Exception as exc:
         status["projects_error"] = str(exc)[:300]
     status["buildings_now"] = _recent_chat(_send(probe, "settlement building list"), 25)

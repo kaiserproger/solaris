@@ -4384,6 +4384,21 @@ autonomous planner examines 64 terrain-following site candidates per pass
 (solid ground within ±8 blocks of the bell) and a builder candidate must have a
 walkable route to settlement storage.
 
+Seed-100 ownerless continuation (2026-10-31): a lumberjack's partial load must
+return to storage when it can fund any currently needed authored building or
+blueprint-proven upgrade, not only the first Storage. The read-only delivery
+probe uses the planner's same real-storage crafting and species proof with
+the carried items included; only the normal inventory transfer delivers them.
+Otherwise a sub-stack can remain in carry until the 9000 work cutoff, admitting
+funded construction only after the builder's shift and delaying it another day.
+This does not extend work hours, supply materials or relax site admission.
+
+The same gate exposed a separate first-Storage stall: its incumbent Builder
+was Idle in loaded but unsimulated chunk `[2,1]`, holding the project at 0/181.
+Construction releases an incumbent outside the simulation area and considers
+only simulated residents for replacement. An active incumbent still keeps the
+slot while off-shift; neither simulation tickets nor work hours are expanded.
+
 Seed-87122 follow-up replay (2026-10-21): a jump step in `find_path_ctx`
 (above `STEP_HEIGHT`) requires body clearance over the edge at the highest
 rise the departure column permits (1.16, 1.10 or 1.05 blocks), because a

@@ -486,6 +486,85 @@ fn seed_100_generated_village_builds_storage_with_player_simulation_distance() {
 }
 
 #[test]
+#[ignore = "requires the local vanilla 26.1.2 content cache"]
+fn seed_100_builder_continues_after_first_storage_through_native_ticks() {
+    let mut state = seed_100_village();
+    let id = state.settlements.records().next().unwrap().id;
+    let mut first_storage = None;
+    let mut second_building = None;
+    let mut upgrade = None;
+    let mut previous: Option<(String, u8, [i32; 3])> = None;
+    for _ in 0..60_000 {
+        crate::tick::run_tick(&mut state, &[]);
+        let record = state.settlements.get(id).unwrap();
+        let current = record
+            .project
+            .as_ref()
+            .map(|p| (p.blueprint.as_str(), p.level, p.origin));
+        if current
+            != previous
+                .as_ref()
+                .map(|(name, level, origin)| (name.as_str(), *level, *origin))
+        {
+            eprintln!(
+                "PACE_PROJECT tick={} day={} project={current:?} status={:?}",
+                state.tick,
+                state.day_time,
+                crate::settlements::construction::project_status(&state, id)
+            );
+            previous = current.map(|(name, level, origin)| (name.to_owned(), level, origin));
+        } else if current.is_some() && state.tick.is_multiple_of(2000) {
+            eprintln!(
+                "PACE_PROGRESS tick={} day={} status={:?}",
+                state.tick,
+                state.day_time,
+                crate::settlements::construction::project_status(&state, id)
+            );
+        }
+        let authored = record
+            .buildings
+            .values()
+            .filter(|b| {
+                crate::settlements::construction::upgrade_available(&state, id, b.id)
+                    || (b.kind == BuildingKind::Storage && !b.natural_zone)
+            })
+            .count();
+        if first_storage.is_none()
+            && record
+                .buildings
+                .values()
+                .any(|b| b.kind == BuildingKind::Storage && !b.natural_zone)
+        {
+            first_storage = Some(state.tick);
+            eprintln!("FIRST_STORAGE {first_storage:?}");
+        }
+        if second_building.is_none() && authored >= 2 {
+            second_building = Some(state.tick);
+            eprintln!("SECOND_BUILDING {second_building:?}");
+        }
+        if upgrade.is_none() && record.buildings.values().any(|b| b.level > 1) {
+            upgrade = Some(state.tick);
+        }
+        if second_building.is_some() && upgrade.is_some() {
+            break;
+        }
+    }
+    eprintln!(
+        "PACE_RESULT first={first_storage:?} second={second_building:?} upgrade={upgrade:?} tick={} status={:?}",
+        state.tick,
+        crate::settlements::construction::project_status(&state, id)
+    );
+    let first = first_storage.expect("village must complete its first Storage");
+    let second = second_building.expect("village must complete a second authored building");
+    let upgraded = upgrade.expect("village must eventually complete an autonomous upgrade");
+    assert!(
+        first < second && second <= first + 30_000,
+        "second building must complete within 30,000 ticks after Storage"
+    );
+    assert!(upgraded > first, "upgrade must follow the first Storage");
+}
+
+#[test]
 fn empty_village_gathers_and_starts_storage_through_native_ticks() {
     let mut state = village_with(true);
     let id = state.settlements.records().next().unwrap().id;
