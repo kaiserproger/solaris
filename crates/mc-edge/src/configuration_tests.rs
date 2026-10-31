@@ -71,6 +71,7 @@ async fn vanilla_configuration_completes_with_only_native_optional_bundle() {
         .read_frame_in(mc_protocol::State::Configuration)
         .await
         .unwrap();
+    read_channel_register(&mut client).await;
     // The optional-only manifest is probed before known-pack negotiation.
     let probe = client
         .read_frame_in(mc_protocol::State::Configuration)
@@ -235,6 +236,34 @@ async fn channels_until_finish(client: &mut Connection) -> Vec<String> {
     }
 }
 
+/// Reads the `minecraft:register` frame that declares every serverbound Loader
+/// channel: NeoForge clients send a custom payload only on a declared channel.
+async fn read_channel_register(client: &mut Connection) {
+    let register = client
+        .read_frame_in(mc_protocol::State::Configuration)
+        .await
+        .unwrap();
+    match mc_protocol::packets::CustomPayload::decode(&mut register.body.clone()).unwrap() {
+        mc_protocol::packets::CustomPayload::Unknown { channel, payload } => {
+            assert_eq!(channel.to_string(), "minecraft:register");
+            let declared: Vec<&[u8]> = payload.split(|byte| *byte == 0).collect();
+            for serverbound in [
+                "solaris:loader/hello",
+                "solaris:loader/request",
+                "solaris:loader/ack",
+                "solaris:loader/view_action",
+            ] {
+                assert!(
+                    declared.contains(&serverbound.as_bytes()),
+                    "{serverbound} is declared: {:?}",
+                    String::from_utf8_lossy(&payload)
+                );
+            }
+        }
+        other => panic!("expected minecraft:register, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn vanilla_client_completes_configuration_with_only_optional_bundles() {
     let (mut client, mut server) = loopback_pair().await;
@@ -257,6 +286,7 @@ async fn vanilla_client_completes_configuration_with_only_optional_bundles() {
         .read_frame_in(mc_protocol::State::Configuration)
         .await
         .unwrap();
+    read_channel_register(&mut client).await;
     // The probe precedes the known-pack request.
     let probe = client
         .read_frame_in(mc_protocol::State::Configuration)
@@ -314,6 +344,7 @@ async fn loader_hello_before_known_packs_starts_negotiation_of_optional_bundles(
         .read_frame_in(mc_protocol::State::Configuration)
         .await
         .unwrap();
+    read_channel_register(&mut client).await;
     let probe = client
         .read_frame_in(mc_protocol::State::Configuration)
         .await
@@ -391,6 +422,7 @@ async fn required_bundles_skip_the_probe_and_negotiate_with_every_client() {
         .read_frame_in(mc_protocol::State::Configuration)
         .await
         .unwrap();
+    read_channel_register(&mut client).await;
     let next = client
         .read_frame_in(mc_protocol::State::Configuration)
         .await

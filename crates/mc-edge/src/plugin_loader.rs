@@ -11,6 +11,32 @@ use mc_protocol::packets::{CustomPayload, Packet};
 
 use crate::connection::{Connection, text_component_nbt};
 
+/// Declare the serverbound Loader channels with `minecraft:register`. NeoForge
+/// clients send a custom payload only on a channel the server declared; vanilla
+/// clients ignore the payload.
+pub(crate) async fn send_channel_register(conn: &mut Connection) -> anyhow::Result<()> {
+    let channels = [
+        mc_loader::loader_hello_channel(),
+        mc_loader::loader_request_channel(),
+        mc_loader::loader_ack_channel(),
+        mc_loader::loader_view_action_channel(),
+    ];
+    let payload = channels
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\0")
+        .into_bytes();
+    conn.send_packet(&ClientboundCustomPayload {
+        payload: CustomPayload::Unknown {
+            channel: mc_data::Identifier::parse("minecraft:register")?,
+            payload,
+        },
+    })
+    .await?;
+    Ok(())
+}
+
 /// Ask whether the client speaks the Loader. Vanilla clients ignore the unknown
 /// configuration payload; a Loader client answers `solaris:loader/hello`.
 pub(crate) async fn send_probe(conn: &mut Connection) -> anyhow::Result<()> {

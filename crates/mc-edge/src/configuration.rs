@@ -89,12 +89,16 @@ pub async fn handle_configuration(
     })
     .await?;
 
-    // Optional-only Loader content: ask whether the client speaks the Loader before
-    // known-pack negotiation, so its hello (sent while handling the probe) is read
-    // ahead of its known-pack reply.
+    // Loader content first declares its serverbound channels. Optional-only content
+    // then asks whether the client speaks the Loader before known-pack negotiation,
+    // so its hello (sent while handling the probe) is read ahead of its known-pack
+    // reply.
     let mut loader_hello = false;
-    if loader_manifest.is_some() && !loader_required {
-        crate::plugin_loader::send_probe(conn).await?;
+    if loader_manifest.is_some() {
+        crate::plugin_loader::send_channel_register(conn).await?;
+        if !loader_required {
+            crate::plugin_loader::send_probe(conn).await?;
+        }
     }
 
     // Step 1: advertise our known data packs (a 26.1.2 session's own release).
